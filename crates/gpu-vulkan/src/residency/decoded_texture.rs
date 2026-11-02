@@ -163,9 +163,14 @@ impl VulkanResidency {
             .map(|p| p.end().expect("encoded plane"))
             .max()
             .expect("encoded planes");
+        let cpu_only = geometry
+            .iter()
+            .all(|footprint| !self.authority.has_writers(footprint));
         let mut parts = Vec::new();
-        for footprint in &geometry {
-            parts.extend(self.authority.resolve_footprint(footprint)?);
+        if !cpu_only {
+            for footprint in &geometry {
+                parts.extend(self.authority.resolve_footprint(footprint)?);
+            }
         }
         let device = vec![
             self.authority
@@ -177,19 +182,13 @@ impl VulkanResidency {
                 footprint.mapping().observed_pages(footprint, &mut inputs)?;
             }
             let inputs = nixe_gpu::physical::pin_selected_pages(inputs)?;
-            let copies: Vec<_> = parts
-                .iter()
-                .map(|p| nixe_memory::PhysicalCapture {
-                    source: nixe_memory::Extent {
-                        start: p.start,
-                        bytes: p.bytes,
-                    },
-                    destination: p.logical as usize,
-                })
-                .collect();
             let mut bytes = vec![0; bytes as usize];
-            self.memory
-                .capture_resource_scattered(&inputs, &copies, &mut bytes)?;
+            self.memory.capture_resource(&inputs, |reader| {
+                for footprint in &geometry {
+                    footprint.capture_resource(reader, 0, &mut bytes)?;
+                }
+                Ok(())
+            })?;
             bytes
         } else {
             // Software decoding is an actual CPU consumer of the encoded bytes.

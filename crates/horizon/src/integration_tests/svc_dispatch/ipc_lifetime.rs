@@ -32,7 +32,7 @@ fn a_hle_map_alias_output_keeps_its_capture_separate_from_the_command() {
 fn remapped_command_output(map_alias: bool) {
     let (_directory, mut process) = fixture_process(&[svc(0x22)]);
     let events = process.driver_mut().event_sender();
-    let dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let dispatcher = support::dispatcher(&process).with_host_events(events);
     let session = process
         .handles()
         .insert(crate::ServiceSession::new(if map_alias {
@@ -142,7 +142,7 @@ fn remapped_command_output(map_alias: bool) {
 fn native_hle_user_buffers_read_a_bounded_prefix_and_only_separate_receive_metadata() {
     let (_directory, mut process) = fixture_process(&[svc(0x22)]);
     let events = process.driver_mut().event_sender();
-    let dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let dispatcher = support::dispatcher(&process).with_host_events(events);
     let session = process
         .handles()
         .insert(nixe_horizon::ServiceSession::new(
@@ -252,7 +252,7 @@ fn kernel_transport_does_not_read_the_emitters_single_receive_descriptor() {
 fn capture_emitted_message(mode: u32, list_offset: usize) {
     let (_directory, mut process) = fixture_process(&[svc(0x22)]);
     let events = process.driver_mut().event_sender();
-    let dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let dispatcher = support::dispatcher(&process).with_host_events(events);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let handle = process.handles().insert(client).unwrap();
     let buffer = process.main_thread().stack_bottom;
@@ -337,7 +337,7 @@ fn a_pending_guest_receive_keeps_its_request_until_output_publication() {
 fn a_device_owned_user_message_captures_only_its_header_and_declared_data() {
     let (_directory, mut process) = fixture_process(&[svc(0x22)]);
     let events = process.driver_mut().event_sender();
-    let dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let dispatcher = support::dispatcher(&process).with_host_events(events);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let handle = process.handles().insert(client).unwrap();
     let buffer = process.main_thread().stack_bottom;
@@ -409,7 +409,7 @@ enum ReceiveEnd {
 fn a_pending_reply_retains_its_endpoint_and_completed_result_after_the_last_handle_closes() {
     let (_directory, mut process) = fixture_process(&[svc(0x43)]);
     let events = process.driver_mut().event_sender();
-    let dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let dispatcher = support::dispatcher(&process).with_host_events(events);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     client
         .request(request_owner(991), SessionMessage::Buffer(vec![0; 8]))
@@ -496,7 +496,7 @@ fn a_pending_reply_retains_its_endpoint_and_completed_result_after_the_last_hand
 fn guest_receive(ending: ReceiveEnd) {
     let (_directory, mut process) = fixture_process(&[svc(0x43)]);
     let events = process.driver_mut().event_sender();
-    let dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let dispatcher = support::dispatcher(&process).with_host_events(events);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let handle = process.handles().insert(server.clone()).unwrap();
     let count = process.handles().len();
@@ -677,7 +677,7 @@ fn pending_reply(ending: Stop) {
     }
     process.thread(child).unwrap().start().unwrap();
     let events = process.driver_mut().event_sender();
-    let dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let dispatcher = support::dispatcher(&process).with_host_events(events);
     let manager = crate::ServiceManagerSession::new();
     manager.register_client();
     let session = process
@@ -864,7 +864,7 @@ fn pending_thread_creation(exit: bool, fail: bool) {
         }
     }
     let events = process.driver_mut().event_sender();
-    let dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let dispatcher = support::dispatcher(&process).with_host_events(events);
     let stop = process.run_slice().unwrap().stop;
     let page = GuestVirtualAddress::new(main.tls_base.get() & !(nixe_memory::PAGE_SIZE - 1));
     let ranges = process

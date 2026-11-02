@@ -149,11 +149,41 @@ pub struct MappingVersion {
 pub enum CodeFetch {
     Ready {
         word: u32,
+        page: NativeCodePage,
     },
     Capture {
         ranges: Vec<AllocationRange>,
         device_owned: bool,
     },
+}
+/// The current executable, watched RAM page selected under native admission.
+/// This retains a translation, never immutable references or cached guest bytes.
+/// Every reuse checks the address space and its quiescence sequence: remapping,
+/// protection changes and writes to watched code all invalidate the selection.
+/// Eden likewise retains its current instruction page in MemoryReadCode.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+pub struct NativeCodePage {
+    space: AddressSpaceId,
+    start: u64,
+    source: crate::HostAddress,
+    sequence: u64,
+}
+impl NativeCodePage {
+    #[inline]
+    pub fn read(&self, native: &NativeAdmission<'_>, address: GuestVirtualAddress) -> Option<u32> {
+        if address.get() & !(PAGE_SIZE - 1) != self.start
+            || !address.get().is_multiple_of(4)
+            || native.address_space().identity() != self.space
+            || native.sequence() != Some(self.sequence)
+        {
+            return None;
+        }
+        // SAFETY: active admission retains this space's mappings/allocations.
+        // The unchanged sequence proves this executable CPU-owned page still
+        // has its code watch. Writers must drain native admission and advance
+        // the sequence before changing either its mapping or watched contents.
+        Some(unsafe { self.source.read_u32((address.get() - self.start) as usize) })
+    }
 }
 #[derive(Clone)]
 pub struct MappingObservation {
@@ -572,14 +602,19 @@ impl AddressSpace {
                 .machine()
                 .arena()
                 .host_address(
-                    ArenaOffset::new(
-                        u64::from(entry.physical_page) * PAGE_SIZE + address.get() % PAGE_SIZE,
-                    ),
-                    4,
+                    ArenaOffset::new(u64::from(entry.physical_page) * PAGE_SIZE),
+                    PAGE_SIZE,
                 )
                 .expect("admitted code input");
+            let page = NativeCodePage {
+                space: self.identity(),
+                start: address.get() & !(PAGE_SIZE - 1),
+                source,
+                sequence: native.sequence().expect("active native code admission"),
+            };
             return Ok(CodeFetch::Ready {
-                word: unsafe { crate::raw::read_value(source.as_ptr(), 4) } as u32,
+                word: unsafe { source.read_u32((address.get() % PAGE_SIZE) as usize) },
+                page,
             });
         }
         unsafe {
@@ -1005,8 +1040,8 @@ impl AddressSpace {
         unsafe { self.write_admitted(start.get(), end, source) };
         Ok(Access::Ready(()))
     }
-    /// Complete ordinary stores or collect device-dependent overwrites without
-    /// leaving native execution. Observation invalidation and collection
+    /// Complete ordinary stores or collect cache-dependent overwrites without
+    /// leaving native execution. Immutable observation invalidation and collection
     /// contention defer without writing. Validate cross-page stores in full.
     pub fn write_native(
         &self,
@@ -1026,11 +1061,11 @@ impl AddressSpace {
         if source.len() > 16 {
             return Ok(false);
         }
+        let first = start.get() & !(PAGE_SIZE - 1);
+        let count = (end - first).div_ceil(PAGE_SIZE) as usize;
+        let mut physical_pages = [ArenaOffset::new(0); 2];
         let mut guards = [None, None];
-        for (index, page) in (start.get() & !(PAGE_SIZE - 1)..end)
-            .step_by(PAGE_SIZE as usize)
-            .enumerate()
-        {
+        for (index, page) in (first..end).step_by(PAGE_SIZE as usize).enumerate() {
             let entry = unsafe { self.entry(page) };
             entry.require(
                 GuestVirtualAddress::new(page.max(start.get())),
@@ -1043,21 +1078,60 @@ impl AddressSpace {
             let Some(guard) = self.machine().physical_access().try_enter(extent) else {
                 return Ok(false);
             };
+            physical_pages[index] = extent.start;
             guards[index] = Some(guard);
         }
-        let kinds = self.validate_access(start.get(), end, MemoryPermissions::WRITE)?;
-        if kinds & MappedPage::OBSERVED != 0 {
-            return Ok(false);
+        // Native admission retains translations and guest permissions. Tracking
+        // may change before short physical admission, so inspect its current
+        // physical bits after every selected page has been admitted. Reuse the
+        // resolved pages for both the journal and store, without more PTE walks.
+        let mut tracked = false;
+        for physical in &physical_pages[..count] {
+            let Some(journal) = self
+                .machine()
+                .tracking()
+                .native_store_tracking(physical.get() / PAGE_SIZE)
+            else {
+                return Ok(false);
+            };
+            tracked |= journal;
         }
-        if kinds & MappedPage::DEVICE != 0 {
+        let write = || {
+            let mut consumed = 0;
+            for (index, &physical) in physical_pages[..count].iter().enumerate() {
+                let offset = if index == 0 {
+                    start.get() % PAGE_SIZE
+                } else {
+                    0
+                };
+                let bytes = (source.len() - consumed).min((PAGE_SIZE - offset) as usize);
+                // SAFETY: native admission retains these translations, each
+                // guest page permits writing and its physical guard is live.
+                unsafe {
+                    self.machine().write_admitted(
+                        Extent {
+                            start: ArenaOffset::new(physical.get() + offset),
+                            bytes: bytes as u64,
+                        },
+                        &source[consumed..consumed + bytes],
+                    );
+                }
+                consumed += bytes;
+            }
+        };
+        // Retain cache-page protection while journaling native stores, rather
+        // than reopening and protecting each page again at its next GPU use.
+        // Extend the existing per-core GPU-dirty collection to RAM-backed cache
+        // inputs; immutable CPU/code observations still require invalidation.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/gpu_dirty_memory_manager.h
+        if tracked {
             return native.cpu_writes().write(
                 self.machine(),
                 start.get(),
                 source.len(),
                 |page| {
-                    ArenaOffset::new(
-                        u64::from(unsafe { self.entry(page) }.physical_page) * PAGE_SIZE,
-                    )
+                    debug_assert!(page == first || page == first + PAGE_SIZE);
+                    physical_pages[usize::from(page != first)]
                 },
                 |page| {
                     let mut ranges = unsafe {
@@ -1070,13 +1144,13 @@ impl AddressSpace {
                     }
                     Ok(ranges.remove(0))
                 },
-                || unsafe { self.write_admitted(start.get(), end, source) },
+                write,
             );
         }
         // SAFETY: native admission retains the mappings; short physical guards
         // exclude tracking changes. Contention defers outside Run, never waits
         // inside the native invocation on the writer draining its accesses.
-        unsafe { self.write_admitted(start.get(), end, source) };
+        write();
         Ok(true)
     }
     /// Caller holds native/host admission and has validated all target pages
@@ -1629,6 +1703,111 @@ impl Drop for AddressSpace {
 mod tests {
     use super::*;
     #[test]
+    fn native_cached_ram_stores_keep_protection_and_collect_exact_alias_bytes() {
+        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(2 * PAGE_SIZE)
+            .unwrap()
+            .allocate(2 * PAGE_SIZE)
+            .unwrap();
+        let input = AllocationRange::new(allocation.pin(), 0, 2 * PAGE_SIZE).unwrap();
+        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
+        for address in [PAGE_SIZE, 4 * PAGE_SIZE] {
+            space
+                .map(
+                    GuestVirtualAddress::new(address),
+                    allocation.clone(),
+                    0,
+                    2 * PAGE_SIZE,
+                    MemoryPermissions::READ_WRITE,
+                )
+                .unwrap();
+        }
+        machine.enable_cpu_write_collection().unwrap();
+        machine
+            .capture_resource_scattered(std::slice::from_ref(&input), &[], &mut [])
+            .unwrap();
+        let protections = machine.tracking_statistics().protection_calls;
+        let core = space.register_core(Arc::new(|| {}));
+        let native = core.enter_native().unwrap();
+        assert!(
+            space
+                .write_native(
+                    &native,
+                    GuestVirtualAddress::new(5 * PAGE_SIZE - 2),
+                    &[1, 2, 3, 4, 5, 6],
+                )
+                .unwrap()
+        );
+        let dirty = machine.collect_cpu_writes().unwrap();
+        assert_eq!(
+            dirty
+                .iter()
+                .map(|r| (r.offset(), r.bytes()))
+                .collect::<Vec<_>>(),
+            [(PAGE_SIZE - 2, 2), (PAGE_SIZE, 4)]
+        );
+        let mut bytes = [0; 6];
+        machine
+            .capture_stream(&[input.slice(PAGE_SIZE - 2, 6).unwrap()], &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4, 5, 6]);
+        machine
+            .capture_resource_scattered(std::slice::from_ref(&input), &[], &mut [])
+            .unwrap();
+        assert_eq!(machine.tracking_statistics().protection_calls, protections);
+        drop(native);
+
+        // A later immutable observation still invalidates before its first store.
+        let field = input.slice(PAGE_SIZE, 4).unwrap();
+        let observed = crate::Observation::default();
+        machine
+            .access_captured(
+                std::slice::from_ref(&field),
+                AccessOperation::ReadObserved(observed.clone()),
+            )
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        let native = core.enter_native().unwrap();
+        assert!(
+            !space
+                .write_native(&native, GuestVirtualAddress::new(2 * PAGE_SIZE), &[9; 4])
+                .unwrap()
+        );
+        assert!(!observed.is_invalid());
+        assert!(machine.collect_cpu_writes().unwrap().is_empty());
+        drop(native);
+        machine.write_resolved(&[field], &[9; 4]).unwrap();
+        assert!(observed.is_invalid());
+        space
+            .protect(
+                GuestVirtualAddress::new(2 * PAGE_SIZE),
+                PAGE_SIZE,
+                MemoryPermissions::READ,
+            )
+            .unwrap();
+        let native = core.enter_native().unwrap();
+        assert!(matches!(
+            space.write_native(
+                &native,
+                GuestVirtualAddress::new(2 * PAGE_SIZE - 2),
+                &[7; 6],
+            ),
+            Err(MemoryError::PermissionDenied { address, required })
+                if address == GuestVirtualAddress::new(2 * PAGE_SIZE)
+                    && required == MemoryPermissions::WRITE
+        ));
+        assert!(machine.collect_cpu_writes().unwrap().is_empty());
+        drop(native);
+        machine
+            .capture_stream(&[input.slice(PAGE_SIZE - 2, 6).unwrap()], &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [1, 2, 9, 9, 9, 9]);
+        machine.disable_cpu_write_collection();
+    }
+
+    #[test]
     fn native_callback_never_waits_for_the_code_capture_draining_its_core() {
         let machine = Machine::new(PAGE_SIZE).unwrap();
         let allocation = machine
@@ -1902,10 +2081,17 @@ mod tests {
         );
         assert!(!observation.is_invalid());
         native.resume().unwrap();
-        let CodeFetch::Ready { word } = code.fetch_code_native(&native, pc).unwrap() else {
+        let CodeFetch::Ready { word, page } = code.fetch_code_native(&native, pc).unwrap() else {
             panic!("tracked CPU code was not reusable");
         };
         assert_eq!(word, 0x11223344);
+        assert_eq!(page.read(&native, pc), Some(word));
+        assert_eq!(page.read(&native, GuestVirtualAddress::new(0x1001)), None);
+        assert_eq!(page.read(&native, GuestVirtualAddress::new(0x2000)), None);
+        let other = data.register_core(Arc::new(|| panic!("foreign native transition")));
+        let other_native = other.enter_native().unwrap();
+        assert_eq!(page.read(&other_native, pc), None);
+        drop(other_native);
         assert_eq!(
             code.capture_native(&native, pc, 4, MemoryPermissions::EXECUTE)
                 .unwrap()[0]
@@ -1919,6 +2105,7 @@ mod tests {
                 .is_err()
         );
         native.suspend();
+        assert_eq!(page.read(&native, pc), None);
         assert!(
             code.read_value(pc, 4).is_err(),
             "execute permission must not grant data reads"
@@ -1944,6 +2131,7 @@ mod tests {
         );
         assert!(observation.is_invalid());
         native.resume().unwrap();
+        assert_eq!(page.read(&native, pc), None);
         let mut invalidated = Vec::new();
         native
             .synchronize_code(|range| {
@@ -1963,6 +2151,113 @@ mod tests {
             CodeFetch::Capture { .. }
         ));
     }
+    #[test]
+    fn native_code_page_rechecks_protection_remapping_and_device_ownership() {
+        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(2 * PAGE_SIZE)
+            .unwrap()
+            .allocate(2 * PAGE_SIZE)
+            .unwrap();
+        for (offset, word) in [(0, 11u32), (PAGE_SIZE - 4, 33), (PAGE_SIZE, 22)] {
+            machine
+                .write_resolved(
+                    &[AllocationRange::new(allocation.pin(), offset, 4).unwrap()],
+                    &word.to_le_bytes(),
+                )
+                .unwrap();
+        }
+        let code = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
+        let pc = GuestVirtualAddress::new(PAGE_SIZE);
+        code.map(
+            pc,
+            allocation.clone(),
+            0,
+            2 * PAGE_SIZE,
+            MemoryPermissions::EXECUTE,
+        )
+        .unwrap();
+        let ranges = code
+            .capture(pc, 2 * PAGE_SIZE, MemoryPermissions::EXECUTE)
+            .unwrap();
+        let (access, _watch) = machine.access_code_captured(ranges).unwrap();
+        access.into_ready().unwrap();
+        let context =
+            code.register_core(Arc::new(|| panic!("transition with active native reader")));
+        let native = context.enter_native().unwrap();
+        let CodeFetch::Ready { page, .. } = code.fetch_code_native(&native, pc).unwrap() else {
+            panic!("watched code required capture");
+        };
+        assert_eq!(page.read(&native, pc), Some(11));
+        assert_eq!(
+            page.read(&native, GuestVirtualAddress::new(2 * PAGE_SIZE - 4)),
+            Some(33)
+        );
+        assert_eq!(
+            page.read(&native, GuestVirtualAddress::new(2 * PAGE_SIZE)),
+            None
+        );
+        native.suspend();
+        assert_eq!(page.read(&native, pc), None);
+        native.resume().unwrap();
+        assert_eq!(page.read(&native, pc), Some(11));
+
+        native.suspend();
+        code.protect(pc, PAGE_SIZE, MemoryPermissions::READ)
+            .unwrap();
+        native.resume().unwrap();
+        assert_eq!(page.read(&native, pc), None);
+        assert!(matches!(
+            code.fetch_code_native(&native, pc),
+            Err(MemoryError::PermissionDenied { .. })
+        ));
+        native.suspend();
+        code.protect(pc, PAGE_SIZE, MemoryPermissions::EXECUTE)
+            .unwrap();
+        native.resume().unwrap();
+        assert_eq!(page.read(&native, pc), None);
+        let CodeFetch::Ready { page, .. } = code.fetch_code_native(&native, pc).unwrap() else {
+            panic!("executable code required capture");
+        };
+        native.suspend();
+        code.remap(
+            pc,
+            allocation.clone(),
+            PAGE_SIZE,
+            PAGE_SIZE,
+            MemoryPermissions::EXECUTE,
+        )
+        .unwrap();
+        native.resume().unwrap();
+        assert_eq!(page.read(&native, pc), None);
+        let CodeFetch::Ready { word, page } = code.fetch_code_native(&native, pc).unwrap() else {
+            panic!("remapped watched code required capture");
+        };
+        assert_eq!(word, 22);
+        assert_eq!(page.read(&native, pc), Some(22));
+
+        native.suspend();
+        let device = AllocationRange::new(allocation.pin(), PAGE_SIZE, 4).unwrap();
+        machine.publish_device_write(&[device], || Ok(())).unwrap();
+        native.resume().unwrap();
+        assert_eq!(page.read(&native, pc), None);
+        assert!(matches!(
+            code.fetch_code_native(&native, pc).unwrap(),
+            CodeFetch::Capture {
+                device_owned: true,
+                ..
+            }
+        ));
+        native.suspend();
+        code.unmap(pc, PAGE_SIZE).unwrap();
+        native.resume().unwrap();
+        assert_eq!(page.read(&native, pc), None);
+        assert!(matches!(
+            code.fetch_code_native(&native, pc),
+            Err(MemoryError::Unmapped(_))
+        ));
+    }
+
     #[test]
     fn captured_versions_split_permission_changes_without_changing_physical_inputs() {
         let machine = Machine::new(3 * PAGE_SIZE).unwrap();

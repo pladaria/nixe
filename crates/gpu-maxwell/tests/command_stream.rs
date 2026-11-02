@@ -245,8 +245,11 @@ fn malformed_tail_reports_source_after_consuming_the_valid_prefix() {
         })
         .unwrap_err();
     assert_eq!(waits, 2);
+    let MaxwellFrontendDispatchError::PacketDecode(error) = error else {
+        panic!("expected a packet decode failure")
+    };
     assert!(
-        matches!(error,MaxwellFrontendDispatchError::PacketDecode(MaxwellPushbufferDecodeError::TruncatedPacket {source,expected_arguments:3,available_arguments:2}) if source.entry_index==0 && source.word_offset==0)
+        matches!(*error,MaxwellPushbufferDecodeError::TruncatedPacket {source,expected_arguments:3,available_arguments:2} if source.entry_index==0 && source.word_offset==0)
     );
 }
 
@@ -583,9 +586,8 @@ fn scalar_and_bulk_inline_ram_writes_do_not_allocate_per_word() {
             );
         }
         assert_eq!(
-            allocations / 100,
-            1,
-            "only the command-entry pin may allocate"
+            allocations, 0,
+            "RAM command admission and inline writes must reuse their storage"
         );
         eprintln!(
             "inline RAM count={count} bulk={bulk}: allocations/list={} controls/list={}",

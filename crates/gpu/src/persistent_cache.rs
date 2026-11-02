@@ -1,6 +1,6 @@
 //! Optional bounded derived-data storage. Corruption is a miss, never an input
 //! to Vulkan. This wire format contains only explicit scalars/bytes, not IR layout.
-use nixe_gpu::shader_identity::ContentId;
+use crate::shader_identity::ContentId;
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -12,7 +12,7 @@ use std::{
 const MAGIC: &[u8; 8] = b"NXVCACH1";
 const HEADER: usize = 8 + 32 + 8 + 32;
 
-pub(super) struct Store {
+pub struct Store {
     directory: PathBuf,
     budget: u64,
     lock: Mutex<()>,
@@ -27,6 +27,41 @@ impl Store {
     }
     pub fn path(&self, key: ContentId) -> PathBuf {
         self.directory.join(format!("{}.cache", key.hex()))
+    }
+    pub fn keys(&self, limit: usize) -> std::io::Result<Vec<ContentId>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let entries = match std::fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut keys = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension() != Some(std::ffi::OsStr::new("cache")) {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            let mut bytes = [0; 32];
+            if bytes.iter_mut().enumerate().all(|(index, byte)| {
+                u8::from_str_radix(&name[index * 2..index * 2 + 2], 16)
+                    .map(|value| *byte = value)
+                    .is_ok()
+            }) {
+                keys.push(ContentId(bytes));
+                if keys.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(keys)
     }
     pub fn read(&self, key: ContentId) -> Option<Vec<u8>> {
         let mut f = std::fs::File::open(self.path(key)).ok()?;
@@ -102,10 +137,10 @@ impl Store {
         Ok(())
     }
 }
-pub(super) fn store(directory: Option<&Path>, child: &str, budget: u64) -> Option<Store> {
+pub fn store(directory: Option<&Path>, child: &str, budget: u64) -> Option<Store> {
     directory.map(|dir| Store::new(dir.join(child), budget))
 }
 
-pub(super) fn word(bytes: &mut Vec<u8>, value: u32) {
+pub fn word(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }

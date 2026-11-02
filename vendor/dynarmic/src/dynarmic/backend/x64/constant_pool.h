@@ -12,7 +12,8 @@
 
 #include <mcl/stdint.hpp>
 #include <tsl/robin_map.h>
-#include <xbyak/xbyak.h>
+
+#include "dynarmic/backend/x64/xbyak.h"
 
 namespace Dynarmic::Backend::X64 {
 

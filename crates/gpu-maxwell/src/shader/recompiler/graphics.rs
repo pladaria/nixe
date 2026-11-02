@@ -4,10 +4,22 @@ use crate::{
     MaxwellThreeDSamplerBindingMode, MaxwellThreeDState, MaxwellThreeDViewportScaleOffsetEnable,
 };
 
-pub fn graphics_request(
+/// Shader selection facts, without capturing unused constant-buffer bindings.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct GraphicsSource {
+    pub stage: Stage,
+    pub address: u64,
+    pub group: Option<u8>,
+    start_address: u32,
+    texture_cbuf: u32,
+    viewport_transform: Option<u32>,
+    geometry_passthrough_mask: Option<[u32; 8]>,
+}
+
+pub(crate) fn graphics_source(
     state: &MaxwellThreeDState,
     pipeline_index: usize,
-) -> Result<CaptureRequest> {
+) -> Result<GraphicsSource> {
     let bindings = state.shader_bindings();
     if pipeline_index >= crate::MAXWELL_PIPELINE_SHADER_COUNT {
         return Err(invalid("Graphics pipeline slot is out of range"));
@@ -48,32 +60,48 @@ pub fn graphics_request(
         .value()
         .copied()
         .unwrap_or(0);
+    Ok(GraphicsSource {
+        stage,
+        address,
+        group: pipeline.effective_group(),
+        start_address: offset & 31,
+        texture_cbuf: u32::from(texture_cbuf),
+        viewport_transform: viewport_transform(state),
+        geometry_passthrough_mask: (stage == Stage::Geometry)
+            .then(|| bindings.geometry_passthrough_mask())
+            .flatten(),
+    })
+}
+
+pub fn graphics_request(
+    state: &MaxwellThreeDState,
+    pipeline_index: usize,
+) -> Result<CaptureRequest> {
+    let source = graphics_source(state, pipeline_index)?;
+    let bindings = state.shader_bindings();
     let mut capture_bindings = CaptureBindings {
         texture_pool: texture_pool(state),
-        viewport_transform: viewport_transform(state),
-        geometry_passthrough_mask: bindings.geometry_passthrough_mask(),
+        viewport_transform: source.viewport_transform,
+        geometry_passthrough_mask: source.geometry_passthrough_mask,
         ..Default::default()
     };
-    if let Some(group) = pipeline.effective_group() {
+    if let Some(group) = source.group {
         let group = bindings
             .groups()
             .get(group as usize)
             .ok_or_else(|| invalid("Graphics constant buffer group is out of range"))?;
         for index in 0..group.constant_buffers().len() {
-            (
-                capture_bindings.constant_buffers[index],
-                capture_bindings.invalid_constant_buffers[index],
-            ) = constant_buffer(state, pipeline.effective_group(), index);
+            capture_bindings.constant_buffers[index] = constant_buffer(state, source.group, index);
         }
     }
 
     Ok(CaptureRequest {
-        address,
+        address: source.address,
         metadata: EnvironmentMetadata {
-            stage,
-            start_address: ProgramOffset(offset & 31),
-            texture_bound_buffer: CbufIndex(u32::from(texture_cbuf)),
-            is_proprietary_driver: texture_cbuf == 2,
+            stage: source.stage,
+            start_address: ProgramOffset(source.start_address),
+            texture_bound_buffer: CbufIndex(source.texture_cbuf),
+            is_proprietary_driver: source.texture_cbuf == 2,
             ..Default::default()
         },
         bindings: capture_bindings,
@@ -108,35 +136,22 @@ fn constant_buffer(
     state: &MaxwellThreeDState,
     group: Option<u8>,
     index: usize,
-) -> (Option<BufferBinding>, Option<&'static str>) {
+) -> Option<BufferBinding> {
     let binding = group
         .and_then(|group| state.shader_bindings().groups().get(group as usize))
         .and_then(|group| group.constant_buffers().get(index))
         .copied()
-        .flatten()
-        .filter(|binding| binding.enabled());
-    match binding {
-        None => (None, None),
-        Some(binding) => match binding.address().zip(binding.size()) {
-            Some((address, size)) => (
-                Some(BufferBinding {
-                    address: address.get(),
-                    size: u64::from(size),
-                }),
-                None,
-            ),
-            None => (
-                None,
-                Some("enabled graphics binding has incomplete address or size"),
-            ),
-        },
-    }
+        .flatten()?;
+    Some(BufferBinding {
+        address: binding.address().get(),
+        size: u64::from(binding.size()),
+    })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn graphics_state_captures_header_and_tracks_passthrough_register_changes() {
+    fn graphics_sources_track_consumed_compilation_parameters_and_header_offsets() {
         let (allocation, space, base) = crate::shader::test_support::mapped_memory();
         crate::test_memory::write(
             &allocation,
@@ -158,10 +173,8 @@ mod tests {
             crate::engines::tests::program_three_d(&mut channel, 0x1240 + index * 4, index + 1);
         }
         let request = graphics_request(channel.three_d(), 0).unwrap();
-        assert_eq!(
-            request.bindings.geometry_passthrough_mask,
-            Some([1, 2, 3, 4, 5, 6, 7, 8])
-        );
+        let vertex = graphics_source(channel.three_d(), 0).unwrap();
+        assert_eq!(request.bindings.geometry_passthrough_mask, None);
         assert_eq!(request.metadata.start_address, ProgramOffset(0x10));
         let mut compiler = Compiler::new().unwrap();
         let (captured, _) = capture(
@@ -185,6 +198,9 @@ mod tests {
             vec![ProgramOffset(0x68)]
         );
         crate::engines::tests::program_three_d(&mut channel, 0x1240, 99);
+        assert_eq!(graphics_source(channel.three_d(), 0).unwrap(), vertex);
+        crate::engines::tests::program_three_d(&mut channel, 0x2000, 0x41);
+        let geometry = graphics_source(channel.three_d(), 0).unwrap();
         assert_eq!(
             graphics_request(channel.three_d(), 0)
                 .unwrap()
@@ -193,5 +209,10 @@ mod tests {
                 .unwrap()[0],
             99
         );
+        crate::engines::tests::program_three_d(&mut channel, 0x1240, 77);
+        assert_ne!(graphics_source(channel.three_d(), 0).unwrap(), geometry);
+        crate::engines::tests::program_three_d(&mut channel, 0x2000, 0x11);
+        crate::engines::tests::program_three_d(&mut channel, 0x192c, 1);
+        assert_ne!(graphics_source(channel.three_d(), 0).unwrap(), vertex);
     }
 }

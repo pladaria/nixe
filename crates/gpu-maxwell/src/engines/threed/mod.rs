@@ -109,7 +109,11 @@ pub use render_targets::{
     MaxwellThreeDRenderTargetLayerControl, MaxwellThreeDRenderTargetState,
     MaxwellThreeDSeparateFragmentData, MaxwellThreeDZCompressionMode,
 };
-pub(crate) use resource::{ComputeTextures, MaxwellThreeDResolvedResourceCache};
+pub(crate) use resource::{
+    ComputeTextures, MaxwellThreeDBindingLocation, MaxwellThreeDDrawResourceSlots,
+    MaxwellThreeDResolvedBinding, MaxwellThreeDResolvedResourceCache,
+    MaxwellThreeDResourceSelection,
+};
 pub use resource::{
     MaxwellThreeDGuestImageFormat, MaxwellThreeDMappingReference,
     MaxwellThreeDPreservedImageLayout, MaxwellThreeDResolvedBuffer, MaxwellThreeDResolvedImage,
@@ -135,8 +139,8 @@ pub use state::{
     MaxwellThreeDFillViaTriangleMode, MaxwellThreeDPointCenterMode, MaxwellThreeDPointSize,
     MaxwellThreeDPointSpriteOrigin, MaxwellThreeDPointSpriteRMode, MaxwellThreeDPointSpriteSelect,
     MaxwellThreeDRasterBoundingBox, MaxwellThreeDRasterBoundingBoxMode, MaxwellThreeDRasterState,
-    MaxwellThreeDRegister, MaxwellThreeDState, MaxwellThreeDStateWrite,
-    MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportState, MaxwellThreeDViewportZClipRange,
+    MaxwellThreeDRegister, MaxwellThreeDState, MaxwellThreeDViewportPixelCenter,
+    MaxwellThreeDViewportState, MaxwellThreeDViewportZClipRange,
 };
 pub(crate) use state::{MaxwellThreeDFrontendState, MaxwellThreeDResourceStateIdentity};
 pub use vertex::{
@@ -149,9 +153,8 @@ pub use vertex::{
     MaxwellThreeDVertexArrayPrimitiveRestartEnable, MaxwellThreeDVertexAssemblyState,
     MaxwellThreeDVertexAttributeFormat, MaxwellThreeDVertexComponentWidths,
     MaxwellThreeDVertexIdUsesArrayStart, MaxwellThreeDVertexInputState,
-    MaxwellThreeDVertexInputWrite, MaxwellThreeDVertexNumericalType,
-    MaxwellThreeDVertexStreamFormat, MaxwellThreeDVertexStreamState,
-    MaxwellThreeDVertexStreamSubstituteState,
+    MaxwellThreeDVertexNumericalType, MaxwellThreeDVertexStreamFormat,
+    MaxwellThreeDVertexStreamState, MaxwellThreeDVertexStreamSubstituteState,
 };
 
 use nixe_gpu::{GpuClassId, GpuMethodId};
@@ -1097,6 +1100,7 @@ pub(super) async fn preflight_mme_call<E>(
             source,
             candidate,
             consume,
+            pending: None,
             _error: std::marker::PhantomData,
         };
         match program.execute(macro_index, parameters, &mut host).await {
@@ -1121,7 +1125,42 @@ struct MmeDispatchHost<'a, E, F> {
     source: crate::MaxwellMethodSource,
     candidate: &'a mut MaxwellThreeDFrontendState,
     consume: &'a mut F,
+    pending: Option<PendingEngineOperation>,
     _error: std::marker::PhantomData<E>,
+}
+
+impl<E, F> MmeDispatchHost<'_, E, F> {
+    // Keep effect admission out of the ISA loop's ordinary register send. Both
+    // routes still update the same canonical bank and consume effects in order.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
+    #[inline(never)]
+    fn emit_effect(
+        &mut self,
+        method: GpuMethodId,
+        argument: u32,
+    ) -> Result<bool, MaxwellThreeDMmePreflightError<E>> {
+        if is_mme_aperture(method) {
+            return Err(MaxwellThreeDMmePreflightError::dispatch(
+                MaxwellEngineDispatchError::MmeExecution {
+                    source: self.source,
+                    error: MaxwellThreeDMmeExecutionError::RecursiveMacroCall {
+                        method_dword: (method.0 / 4) as u16,
+                    },
+                },
+            ));
+        }
+        let mut source = self.source.emitted_by_mme(method, argument);
+        let prepared = admit_effect(self.profile, &mut source, self.candidate)
+            .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
+        if let Some(operation) = prepared {
+            if !draw::defer(self.candidate, &operation) {
+                self.pending = Some(operation);
+                return Ok(false);
+            }
+            self.candidate.complete_inline_draw();
+        }
+        Ok(true)
+    }
 }
 
 impl<E, F> MaxwellThreeDMmeHost for MmeDispatchHost<'_, E, F>
@@ -1140,53 +1179,42 @@ where
         })
     }
 
-    fn emit_register(&mut self, method_dword: u16, argument: u32) -> Result<bool, Self::Error> {
-        if draw::is_pending(self.candidate) {
-            return Ok(false);
-        }
+    #[inline(always)]
+    fn try_emit_method(&mut self, method_dword: u16, argument: u32) -> Result<bool, Self::Error> {
+        debug_assert!(self.pending.is_none());
         let method = GpuMethodId(u32::from(method_dword) * 4);
-        if !is_plain_method(method) {
+        if !draw::admit_method(self.candidate, method, argument) {
             return Ok(false);
         }
-        let origin = &self.source;
-        write_plain_register(method, argument, self.candidate, || {
-            origin.emitted_by_mme(method, argument)
-        })
-        .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
-        Ok(true)
+        if let Some(info) = registers::info(method).filter(|info| info.passive) {
+            let origin = &self.source;
+            write_plain_register(method, argument, info, self.candidate, || {
+                origin.emitted_by_mme(method, argument)
+            })
+            .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
+            return Ok(true);
+        }
+        // The engine and method class are already known for a macro send.
+        // Share raw effect admission with PFIFO, without another classification
+        // or a descriptive dispatch object.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
+        self.emit_effect(method, argument)
     }
 
-    async fn emit_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error> {
-        let method = GpuMethodId(u32::from(method_dword) * 4);
-        if is_mme_aperture(method) {
-            return Err(MaxwellThreeDMmePreflightError::dispatch(
-                MaxwellEngineDispatchError::MmeExecution {
-                    source: self.source,
-                    error: MaxwellThreeDMmeExecutionError::RecursiveMacroCall { method_dword },
-                },
-            ));
-        }
-        let source = self.source.emitted_by_mme(method, argument);
-        draw::before_method(self.candidate, source, self.consume)
-            .await
-            .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
-        if is_plain_method(method) {
-            write_plain_register(method, argument, self.candidate, || source)
-                .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
-            return Ok(());
-        }
-        let mut dispatch = MaxwellMethodDispatch::class_method(source, CLASS);
-        // MME sends use the same method path, including shadow tracking/replay,
-        // as pushbuffer writes. The interpreter and JIT both call CallMethod:
-        // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/video_core/macro.cpp#L664-L666
-        let prepared = preflight(self.profile, &mut dispatch, self.candidate)
-            .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
-        if let Some(operation) = prepared {
-            draw::operation(self.candidate, operation, self.consume)
+    async fn finish_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error> {
+        if self.pending.is_none() {
+            draw::flush(self.candidate, self.consume)
                 .await
                 .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
-            self.candidate.complete_inline_draw();
+            if self.try_emit_method(method_dword, argument)? {
+                return Ok(());
+            }
         }
+        let operation = self.pending.take().expect("admitted MME effect");
+        draw::operation(self.candidate, operation, self.consume)
+            .await
+            .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
+        self.candidate.complete_inline_draw();
         Ok(())
     }
 }
@@ -1200,10 +1228,22 @@ pub(super) fn preflight(
     if write_plain_method(method, candidate)? {
         return Ok(None);
     }
-    let source = method.source();
+    let mut source = method.source();
+    let result = admit_effect(profile, &mut source, candidate);
+    method.set_effective_argument(source.argument());
+    result
+}
+
+#[inline]
+fn admit_effect(
+    profile: &MaxwellGpuProfile,
+    source: &mut crate::MaxwellMethodSource,
+    candidate: &mut MaxwellThreeDFrontendState,
+) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
+    debug_assert!(!is_plain_method(source.method()));
     if is_mme_aperture(source.method()) {
         return Err(MaxwellEngineDispatchError::MmeExecution {
-            source,
+            source: *source,
             error: MaxwellThreeDMmeExecutionError::DataWithoutCall,
         });
     }
@@ -1212,8 +1252,8 @@ pub(super) fn preflight(
         .mme()
         .resolve_shadow_argument(source.method(), source.argument());
 
-    method.set_effective_argument(effective_argument);
-    let effective_source = method.source();
+    source.set_argument(effective_argument);
+    let effective_source = *source;
     let prepared = preflight_register(profile, effective_source, candidate)?;
     // Every executed method updates its live register, including triggers. MME
     // reads this same bank; effects are not a second register-storage policy.
@@ -1237,11 +1277,14 @@ pub(super) fn write_plain_method(
     method: &mut MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<bool, MaxwellEngineDispatchError> {
-    if !registers::passive(method.source().method()) {
-        return Ok(false);
-    }
     let source = method.source();
-    let argument = write_plain_register(source.method(), source.argument(), candidate, || source)?;
+    let Some(info) = registers::info(source.method()).filter(|info| info.passive) else {
+        return Ok(false);
+    };
+    let argument =
+        write_plain_register(source.method(), source.argument(), info, candidate, || {
+            source
+        })?;
     method.set_effective_argument(argument);
     Ok(true)
 }
@@ -1250,10 +1293,11 @@ pub(super) fn write_plain_method(
 fn write_plain_register(
     method: GpuMethodId,
     submitted_argument: u32,
+    info: &registers::MethodInfo,
     candidate: &mut MaxwellThreeDFrontendState,
     source: impl FnOnce() -> crate::MaxwellMethodSource,
 ) -> Result<u32, MaxwellEngineDispatchError> {
-    debug_assert!(registers::passive(method));
+    debug_assert!(info.passive);
     let control = candidate.mme().shadow_ram_control().value().copied();
     let argument = candidate
         .mme()
@@ -1267,7 +1311,7 @@ fn write_plain_register(
             "pending notification requires completion of a method other than NO_OPERATION",
         ));
     }
-    candidate.write_register(method, argument);
+    candidate.write_classified_register(method, argument, info);
     candidate
         .mme_mut()
         .track_shadow_register(control, method, argument);
@@ -1279,9 +1323,9 @@ pub(super) fn write_plain_span(
     words: crate::MaxwellMethodSpan<'_>,
     candidate: &mut MaxwellThreeDFrontendState,
     #[cfg(test)] mut observe: impl FnMut(crate::MaxwellMethodSource, u32),
-) -> Result<usize, MaxwellEngineDispatchError> {
+) -> usize {
     match candidate.mme().shadow_ram_control().value().copied() {
-        Some(MaxwellThreeDMmeShadowRamControl::MethodReplay) => write_plain_words::<true, false>(
+        Some(MaxwellThreeDMmeShadowRamControl::MethodReplay) => write_plain_mode::<true, false>(
             #[cfg(test)]
             subchannel,
             words,
@@ -1292,7 +1336,7 @@ pub(super) fn write_plain_span(
         Some(
             MaxwellThreeDMmeShadowRamControl::MethodTrack
             | MaxwellThreeDMmeShadowRamControl::MethodTrackWithFilter,
-        ) => write_plain_words::<false, true>(
+        ) => write_plain_mode::<false, true>(
             #[cfg(test)]
             subchannel,
             words,
@@ -1300,7 +1344,7 @@ pub(super) fn write_plain_span(
             #[cfg(test)]
             &mut observe,
         ),
-        _ => write_plain_words::<false, false>(
+        _ => write_plain_mode::<false, false>(
             #[cfg(test)]
             subchannel,
             words,
@@ -1311,32 +1355,77 @@ pub(super) fn write_plain_span(
     }
 }
 
-fn write_plain_words<const REPLAY: bool, const TRACK: bool>(
+fn write_plain_mode<const REPLAY: bool, const TRACK: bool>(
     #[cfg(test)] subchannel: crate::MaxwellPushbufferSubchannel,
     words: crate::MaxwellMethodSpan<'_>,
     candidate: &mut MaxwellThreeDFrontendState,
     #[cfg(test)] observe: &mut impl FnMut(crate::MaxwellMethodSource, u32),
-) -> Result<usize, MaxwellEngineDispatchError> {
+) -> usize {
     // Normalize the packet's address evolution once. Increment-once tails
     // become constant methods, including tails continued in a later GPFIFO entry.
-    let first = words.method_at(0).0;
-    let (stride, maximum_step) = match words.mode() {
-        crate::MaxwellMethodPacketMode::Incrementing => (4, u32::MAX),
-        crate::MaxwellMethodPacketMode::IncrementOnce => (4, 1),
-        _ => (0, 0),
-    };
+    match words.mode() {
+        crate::MaxwellMethodPacketMode::Incrementing => write_plain_words::<REPLAY, TRACK, true>(
+            #[cfg(test)]
+            subchannel,
+            words,
+            candidate,
+            #[cfg(test)]
+            observe,
+        ),
+        crate::MaxwellMethodPacketMode::IncrementOnce if !words.is_empty() => {
+            let first = write_plain_words::<REPLAY, TRACK, false>(
+                #[cfg(test)]
+                subchannel,
+                words.slice(..1),
+                candidate,
+                #[cfg(test)]
+                observe,
+            );
+            if first == 0 {
+                return 0;
+            }
+            first
+                + write_plain_words::<REPLAY, TRACK, false>(
+                    #[cfg(test)]
+                    subchannel,
+                    words.slice(1..),
+                    candidate,
+                    #[cfg(test)]
+                    observe,
+                )
+        }
+        _ => write_plain_words::<REPLAY, TRACK, false>(
+            #[cfg(test)]
+            subchannel,
+            words,
+            candidate,
+            #[cfg(test)]
+            observe,
+        ),
+    }
+}
+
+fn write_plain_words<const REPLAY: bool, const TRACK: bool, const INCREMENT: bool>(
+    #[cfg(test)] subchannel: crate::MaxwellPushbufferSubchannel,
+    words: crate::MaxwellMethodSpan<'_>,
+    candidate: &mut MaxwellThreeDFrontendState,
+    #[cfg(test)] observe: &mut impl FnMut(crate::MaxwellMethodSource, u32),
+) -> usize {
+    if words.is_empty() {
+        return 0;
+    }
+    let mut method = words.method_at(0);
     let mut consumed = 0;
     for index in 0..words.len() {
-        let method = GpuMethodId(first + (index as u32).min(maximum_step) * stride);
-        if !registers::passive(method) {
+        let Some(info) = registers::info(method).filter(|info| info.passive) else {
             break;
-        }
+        };
         let argument = if REPLAY {
             candidate.mme().shadow_word(method)
         } else {
             words.argument_at(index)
         };
-        candidate.write_register(method, argument);
+        candidate.write_classified_register(method, argument, info);
         if TRACK {
             candidate.mme_mut().write_shadow_register(method, argument);
         }
@@ -1346,8 +1435,11 @@ fn write_plain_words<const REPLAY: bool, const TRACK: bool>(
             argument,
         );
         consumed += 1;
+        if INCREMENT {
+            method.0 += 4;
+        }
     }
-    Ok(consumed)
+    consumed
 }
 
 pub(super) fn is_plain_method(method: GpuMethodId) -> bool {
@@ -1493,14 +1585,14 @@ fn preflight_register(
         && let Some((write, upload)) =
             inline_to_memory::preflight(source, &candidate.operation_state().inline_to_memory())?
     {
-        candidate.apply(write);
+        candidate.apply_inline(write);
         let operation = upload.map(PendingEngineOperation::InlineToMemory);
         return Ok(operation);
     }
     if family == RegisterFamily::Mme
         && let Some(write) = preflight_mme_state(source, candidate)?
     {
-        candidate.apply(write);
+        candidate.mme_mut().apply(write);
         return Ok(None);
     }
     if family == RegisterFamily::ConstantBuffer {
@@ -1511,9 +1603,8 @@ fn preflight_register(
         )));
     }
     if family == RegisterFamily::VertexAndBinding
-        && let Some(write) = preflight_vertex_and_binding_state(source, candidate)?
+        && execute_vertex_and_binding_method(source, candidate)?
     {
-        candidate.apply(write);
         return Ok(None);
     }
     if source.method().0 == 0x19d0 {
@@ -1755,12 +1846,9 @@ fn preflight_register(
                     defined_mask: declaration.defined_mask,
                 },
             )?;
-            let write =
-                MaxwellThreeDStateWrite::Mme(MaxwellThreeDMmeStateWrite::ShadowRamControl {
-                    value,
-                    source,
-                });
-            candidate.apply(write);
+            candidate
+                .mme_mut()
+                .apply(MaxwellThreeDMmeStateWrite::ShadowRamControl { value, source });
             None
         }
         MethodAction::MutableMethodControl => {
@@ -1771,12 +1859,9 @@ fn preflight_register(
                     defined_mask: declaration.defined_mask,
                 },
             )?;
-            let write =
-                MaxwellThreeDStateWrite::Mme(MaxwellThreeDMmeStateWrite::MutableMethodControl {
-                    value,
-                    source,
-                });
-            candidate.apply(write);
+            candidate
+                .mme_mut()
+                .apply(MaxwellThreeDMmeStateWrite::MutableMethodControl { value, source });
             None
         }
         MethodAction::FalconFirmwareCall4 => {
@@ -1977,7 +2062,7 @@ fn preflight_register(
 fn preflight_mme_state(
     source: crate::MaxwellMethodSource,
     candidate: &MaxwellThreeDFrontendState,
-) -> Result<Option<MaxwellThreeDStateWrite>, MaxwellEngineDispatchError> {
+) -> Result<Option<MaxwellThreeDMmeStateWrite>, MaxwellEngineDispatchError> {
     let mme = candidate.mme();
     let write = match source.method().0 {
         0x0114 => MaxwellThreeDMmeStateWrite::InstructionPointer {
@@ -2054,7 +2139,7 @@ fn preflight_mme_state(
         }
         _ => return Ok(None),
     };
-    Ok(Some(MaxwellThreeDStateWrite::Mme(write)))
+    Ok(Some(write))
 }
 
 fn preflight_constant_buffer_load(
@@ -2121,11 +2206,10 @@ fn preflight_constant_buffer_load(
     ))
 }
 
-fn preflight_vertex_and_binding_state(
+fn execute_vertex_and_binding_method(
     source: crate::MaxwellMethodSource,
-    candidate: &MaxwellThreeDFrontendState,
-) -> Result<Option<MaxwellThreeDStateWrite>, MaxwellEngineDispatchError> {
-    use MaxwellThreeDVertexInputWrite as V;
+    candidate: &mut MaxwellThreeDFrontendState,
+) -> Result<bool, MaxwellEngineDispatchError> {
     let method = source.method().0;
     let raw = source.argument();
     if (0x2400..0x2500).contains(&method) && (method - 0x2400) % 0x20 == 0x10 {
@@ -2140,7 +2224,7 @@ fn preflight_vertex_and_binding_state(
         let enabled = raw & 1 != 0;
         let slot = ((raw >> 4) & 0x1f) as u8;
         let selector = candidate.operation_state().shader_bindings().selector();
-        let (address, size) = if enabled {
+        let binding = if enabled {
             let address = selector.address().ok_or_else(|| {
                 invalid_encoding(
                     source,
@@ -2167,34 +2251,30 @@ fn preflight_vertex_and_binding_state(
                     "constant-buffer range is empty or overflows",
                 ));
             }
-            (Some(address), Some(size))
-        } else {
-            (None, None)
-        };
-        return Ok(Some(MaxwellThreeDStateWrite::BindConstantBuffer {
-            group,
-            slot,
-            binding: MaxwellThreeDConstantBufferBinding {
-                enabled,
+            Some(MaxwellThreeDConstantBufferBinding {
                 address,
-                size,
-                source,
-            },
-        }));
+                size: std::num::NonZeroU32::new(size).expect("validated binding size"),
+            })
+        } else {
+            None
+        };
+        candidate.bind_constant_buffer(group, slot, binding);
+        return Ok(true);
     }
-    Ok(match method {
-        0x1614 => Some(MaxwellThreeDStateWrite::VertexInput(V::End {
-            value: checked_bool(source, "END")?,
-            source,
-        })),
-        0x1618 => Some(MaxwellThreeDStateWrite::VertexInput(V::Begin {
-            value: MaxwellThreeDBegin::parse(raw).ok_or_else(|| {
+    match method {
+        0x1614 => {
+            checked_bool(source, "END")?;
+            candidate.end_primitive(raw);
+        }
+        0x1618 => {
+            let value = MaxwellThreeDBegin::parse(raw).ok_or_else(|| {
                 invalid_encoding(source, "BEGIN", "invalid topology or begin modifier")
-            })?,
-            source,
-        })),
-        _ => None,
-    })
+            })?;
+            candidate.begin_primitive(raw, value);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn invalid_encoding(

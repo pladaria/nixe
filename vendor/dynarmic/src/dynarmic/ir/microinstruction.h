@@ -10,6 +10,7 @@
 #include <mcl/container/intrusive_list.hpp>
 #include <mcl/stdint.hpp>
 
+#include "dynarmic/ir/opcodes.h"
 #include "dynarmic/ir/value.h"
 
 namespace Dynarmic::IR {
@@ -131,9 +132,19 @@ public:
     /// Get the type this instruction returns.
     Type GetType() const;
     /// Get the number of arguments this instruction has.
-    size_t NumArgs() const;
+    size_t NumArgs() const { return GetNumArgsOf(op); }
 
-    Value GetArg(size_t index) const;
+    // IR construction/verification owns these invariants. Keep the ordinary
+    // access inline, as Eden does, without repeating argument/type checks in
+    // every emitter and register allocator use.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/ir/microinstruction.h
+    Value GetArg(size_t index) const {
+#ifndef NDEBUG
+        ASSERT_MSG(index < GetNumArgsOf(op), "Inst::GetArg: index {} >= number of arguments of {} ({})", index, op, GetNumArgsOf(op));
+        ASSERT_MSG(!args[index].IsEmpty() || GetArgTypeOf(op, index) == IR::Type::Opaque, "Inst::GetArg: index {} is empty", index, args[index].GetType());
+#endif
+        return args[index];
+    }
     void SetArg(size_t index, Value value);
 
     void Invalidate();
@@ -143,13 +154,28 @@ public:
 
     // IR name (i.e. instruction number in block). This is set in the naming pass. Treat 0 as an invalid name.
     // This is used for debugging and fastmem instruction identification.
-    void SetName(unsigned value) { name = value; }
-    unsigned GetName() const { return name; }
+    void SetName(unsigned value) {
+        name = value;
+    }
+    unsigned GetName() const {
+        return name;
+    }
+
+    // Backend assignment belongs to this value during block emission. Moves,
+    // aliases and retirement update it with the owning location's value list.
+    static constexpr u8 InvalidAllocationLocation = 255;
+    void SetAllocationLocation(u8 value) {
+        allocation_location = value;
+    }
+    u8 GetAllocationLocation() const {
+        return allocation_location;
+    }
 
 private:
     void Use(const Value& value);
     void UndoUse(const Value& value);
 
+    u8 allocation_location = InvalidAllocationLocation;
     Opcode op;
     unsigned use_count = 0;
     unsigned name = 0;

@@ -10,7 +10,7 @@ use nixe_shader_recompiler::{
 
 pub(crate) struct ComputeTextures {
     pub resources: MaxwellThreeDResolvedResources,
-    pub bindings: Vec<(ResourceId, MaxwellThreeDResourceRole)>,
+    pub bindings: Vec<(ResourceId, MaxwellThreeDBindingLocation)>,
     reads: Box<[MaxwellThreeDDescriptorRead]>,
     pools: [Option<crate::recompiler::TexturePool>; 2],
     address_space: crate::MaxwellAddressSpaceId,
@@ -218,6 +218,15 @@ impl MaxwellThreeDResolvedResourceCache {
         let mapping_generation = builder.mapping_generation;
         let (resources, reads) = builder.finish()?;
         bindings.sort_unstable_by_key(|(id, _)| *id);
+        let bindings = bindings
+            .into_iter()
+            .map(|(id, role)| {
+                resources
+                    .binding_location(role)
+                    .map(|location| (id, location))
+                    .ok_or(MaxwellThreeDResourceError::IncompleteState { role })
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Some(ComputeTextures {
             resources,
             bindings,

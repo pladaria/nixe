@@ -18,12 +18,12 @@
 #include <mcl/mp/typelist/lower_to_tuple.hpp>
 #include <mcl/type_traits/function_info.hpp>
 #include <mcl/type_traits/integer_of_size.hpp>
-#include <xbyak/xbyak.h>
 
 #include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/constants.h"
 #include "dynarmic/backend/x64/emit_x64.h"
+#include "dynarmic/backend/x64/xbyak.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/common/fp/info.h"
 #include "dynarmic/common/fp/op.h"
@@ -112,7 +112,7 @@ void HandleNaNs(BlockOfCode& code, EmitContext& ctx, bool fpcr_controlled, std::
         code.cmp(bitmask, 0);
     }
 
-    SharedLabel end = GenSharedLabel(), nan = GenSharedLabel();
+    const auto end = ctx.GenLabel(), nan = ctx.GenLabel();
 
     code.jnz(*nan, code.T_NEAR);
     code.L(*end);
@@ -1348,7 +1348,7 @@ void EmitFPVectorMulAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
             const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
             const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm();
 
-            SharedLabel end = GenSharedLabel(), fallback = GenSharedLabel();
+            const auto end = ctx.GenLabel(), fallback = ctx.GenLabel();
 
             MaybeStandardFPSCRValue(code, ctx, fpcr_controlled, [&] {
                 code.movaps(result, xmm_a);
@@ -1621,7 +1621,7 @@ static void EmitRecipStepFused(BlockOfCode& code, EmitContext& ctx, IR::Inst* in
             const Xbyak::Xmm operand2 = ctx.reg_alloc.UseXmm(args[1]);
             const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm();
 
-            SharedLabel end = GenSharedLabel(), fallback = GenSharedLabel();
+            const auto end = ctx.GenLabel(), fallback = ctx.GenLabel();
 
             MaybeStandardFPSCRValue(code, ctx, fpcr_controlled, [&] {
                 code.movaps(result, GetVectorOf<fsize, false, 0, 2>(code));
@@ -1788,7 +1788,7 @@ static void EmitRSqrtEstimate(BlockOfCode& code, EmitContext& ctx, IR::Inst* ins
             const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
             const Xbyak::Xmm value = ctx.reg_alloc.ScratchXmm();
 
-            SharedLabel bad_values = GenSharedLabel(), end = GenSharedLabel();
+            const auto bad_values = ctx.GenLabel(), end = ctx.GenLabel();
 
             code.movaps(value, operand);
 
@@ -1879,7 +1879,7 @@ static void EmitRSqrtStepFused(BlockOfCode& code, EmitContext& ctx, IR::Inst* in
             const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm();
             const Xbyak::Xmm mask = ctx.reg_alloc.ScratchXmm();
 
-            SharedLabel end = GenSharedLabel(), fallback = GenSharedLabel();
+            const auto end = ctx.GenLabel(), fallback = ctx.GenLabel();
 
             MaybeStandardFPSCRValue(code, ctx, fpcr_controlled, [&] {
                 code.vmovaps(result, GetVectorOf<fsize, false, 0, 3>(code));

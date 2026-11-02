@@ -352,6 +352,20 @@ impl HorizonSvcDispatcher {
         })
     }
 
+    /// Wake the host supervisor for asynchronous input and display publications.
+    #[must_use]
+    pub fn with_host_events(
+        self: std::sync::Arc<Self>,
+        events: nixe_runtime::ExternalEventSender,
+    ) -> std::sync::Arc<Self> {
+        self.resources
+            .graphics
+            .video
+            .set_host_events(events.clone());
+        self.resources.system.hid.set_completion_events(events);
+        self
+    }
+
     #[must_use]
     pub fn with_keyboard_host(
         mut self: std::sync::Arc<Self>,

@@ -117,6 +117,23 @@ pub(crate) unsafe fn copy_words_to_host(source: *const u8, target: *mut u32, cou
 }
 #[cfg(target_arch = "x86_64")]
 unsafe fn words(source: *const u8, destination: *mut u8, count: usize) {
+    // Descriptors and small uniforms should not pay the string instruction's
+    // startup cost. Keep the same scalar access width and raw-memory semantics.
+    if count <= 8 {
+        for index in 0..count {
+            unsafe {
+                asm!(
+                    "mov {value}, qword ptr [{source}]",
+                    "mov qword ptr [{destination}], {value}",
+                    value = out(reg) _,
+                    source = in(reg) source.add(index * 8),
+                    destination = in(reg) destination.add(index * 8),
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+        return;
+    }
     // The System V ABI keeps DF clear. REP MOVSQ performs eight-byte transfers
     // without expressing guest bytes as a Rust allocation/reference or memcpy.
     unsafe {
@@ -151,7 +168,36 @@ pub(crate) unsafe fn copy(source: *const u8, destination: *mut u8, bytes: usize)
 /// # Safety
 /// The source is admitted guest RAM with stable physical lifetime. Destination
 /// is exclusively owned host memory, disjoint from the guest backing.
+#[inline]
 pub(crate) unsafe fn capture(mut source: *const u8, destination: &mut [u8]) {
+    // Block-linear textures copy adjacent 16-byte runs. Load/store the whole
+    // accepted run without references to guest RAM or a scalar word loop.
+    // Unaligned moves stay within the exact admitted source and destination.
+    if destination.len() == 16 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            asm!(
+                "movdqu xmm0, [{source}]",
+                "movdqu [{destination}], xmm0",
+                source = in(reg) source,
+                destination = in(reg) destination.as_mut_ptr(),
+                out("xmm0") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            asm!(
+                "ldr q0, [{source}]",
+                "str q0, [{destination}]",
+                source = in(reg) source,
+                destination = in(reg) destination.as_mut_ptr(),
+                out("v0") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        return;
+    }
     let mut offset = 0;
     while offset < destination.len() {
         let remaining = destination.len() - offset;
@@ -317,4 +363,40 @@ pub(crate) unsafe fn compare_exchange(
         }
     }
     u128::from(previous)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn short_and_bulk_copies_preserve_unaligned_bytes_and_destination_boundaries() {
+        let source: [u8; 192] = std::array::from_fn(|index| index as u8);
+        for bytes in 0..=160 {
+            for source_offset in 0..16 {
+                for destination_offset in 0..16 {
+                    let mut destination = [0x5a; 192];
+                    let mut expected = destination;
+                    expected[destination_offset..destination_offset + bytes]
+                        .copy_from_slice(&source[source_offset..source_offset + bytes]);
+                    // SAFETY: both arrays retain disjoint ranges covering the
+                    // requested bytes, including each deliberately unaligned start.
+                    unsafe {
+                        super::copy(
+                            source.as_ptr().add(source_offset),
+                            destination.as_mut_ptr().add(destination_offset),
+                            bytes,
+                        );
+                    }
+                    assert_eq!(destination, expected);
+                    destination.fill(0x5a);
+                    unsafe {
+                        super::capture(
+                            source.as_ptr().add(source_offset),
+                            &mut destination[destination_offset..destination_offset + bytes],
+                        );
+                    }
+                    assert_eq!(destination, expected);
+                }
+            }
+        }
+    }
 }

@@ -296,6 +296,11 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
             device,
             nixe_gpu_maxwell::MAXWELL_SHADER_NAMESPACE,
             nixe_gpu_vulkan::cache::CacheConfiguration {
+                directory: Some(config.gpu.cache_directory.clone()),
+                pipeline_namespace: Some(nixe_gpu::shader_identity::ContentId::of(
+                    b"nixe-application-pipelines",
+                    &[title.identifier.to_string().as_bytes()],
+                )),
                 shader_entries: config.gpu.shader_entries,
                 pipeline_entries: config.gpu.pipeline_entries,
                 persistent_bytes: config.gpu.persistent_bytes,
@@ -309,8 +314,16 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
                 .attach_presentation(client, config.video.vsync)
                 .map_err(|e| e.to_string())?;
         }
-        let maxwell = nixe_gpu_maxwell::MaxwellNativeFrontend::new(
+        let mut maxwell = nixe_gpu_maxwell::MaxwellNativeFrontend::new(
             renderer.device_profile().shader_compiler.clone(),
+        );
+        maxwell.set_capture_cache(
+            &config.gpu.cache_directory,
+            nixe_gpu::shader_identity::ContentId::of(
+                b"nixe-application-pipelines",
+                &[title.identifier.to_string().as_bytes()],
+            ),
+            config.gpu.persistent_bytes,
         );
         let gpu_diagnostics = (renderer.cache_monitor(), renderer.frame_metrics());
         let video = VideoSystem::with_gpu_frontend(
@@ -701,7 +714,7 @@ fn execute(
         horizon_environment.settings,
         video_system,
     )
-    .with_input_completions(runtime.event_sender())
+    .with_host_events(runtime.event_sender())
     .with_system_archives(horizon_environment.system_archives)
     .with_diagnostics(horizon_environment.diagnostics)
     .with_audio_backend(audio_backend.clone())

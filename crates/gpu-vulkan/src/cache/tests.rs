@@ -443,7 +443,7 @@ fn captured_kernel(
     };
     Arc::new(ShaderInputs::new(
         vec![StageSource {
-            environment: SnapshotEnvironment::new(
+            environment: Arc::new(SnapshotEnvironment::new(
                 EnvironmentMetadata {
                     stage: Stage::Compute,
                     workgroup_size: size,
@@ -453,8 +453,8 @@ fn captured_kernel(
                     instructions: [(ProgramOffset(8), 0xe300_0000_0007_000f)].into(),
                     ..Default::default()
                 },
-            ),
-            info: ShaderInfo::default(),
+            )),
+            info: Arc::new(ShaderInfo::default()),
             binding_group: None,
         }]
         .into(),
@@ -573,8 +573,8 @@ fn guest_link_variants_reuse_unchanged_stages_before_emission() {
                 )
                 .unwrap();
             StageSource {
-                environment,
-                info: compiler.program(id).unwrap().info.clone(),
+                environment: Arc::new(environment),
+                info: Arc::new(compiler.program(id).unwrap().info.clone()),
                 binding_group: Some(0),
             }
         });

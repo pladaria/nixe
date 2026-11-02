@@ -110,7 +110,12 @@ void EmitA32Cond(biscuit::Assembler& as, EmitContext&, IR::Cond cond, biscuit::L
     }
 }
 
-void EmitA32Terminal(biscuit::Assembler& as, EmitContext& ctx, IR::Term::Terminal terminal, IR::LocationDescriptor initial_location, bool is_single_step);
+void EmitA32Terminal(biscuit::Assembler& as, EmitContext& ctx, const IR::Term::Terminal& terminal, IR::LocationDescriptor initial_location, bool is_single_step);
+void EmitA32Terminal(biscuit::Assembler& as, EmitContext& ctx, const IR::Term::LeafTerminal& terminal, IR::LocationDescriptor initial_location, bool is_single_step);
+
+void EmitA32Terminal(biscuit::Assembler&, EmitContext&, IR::Term::Invalid, IR::LocationDescriptor, bool) {
+    ASSERT_FALSE("Invalid terminal");
+}
 
 void EmitA32Terminal(biscuit::Assembler&, EmitContext&, IR::Term::Interpret, IR::LocationDescriptor, bool) {
     ASSERT_FALSE("Interpret should never be emitted.");
@@ -196,8 +201,12 @@ void EmitA32Terminal(biscuit::Assembler& as, EmitContext& ctx, IR::Term::CheckHa
     EmitRelocation(as, ctx, LinkTarget::ReturnFromRunCode);
 }
 
-void EmitA32Terminal(biscuit::Assembler& as, EmitContext& ctx, IR::Term::Terminal terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
-    boost::apply_visitor([&](const auto& t) { EmitA32Terminal(as, ctx, t, initial_location, is_single_step); }, terminal);
+void EmitA32Terminal(biscuit::Assembler& as, EmitContext& ctx, const IR::Term::LeafTerminal& terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    std::visit([&](const auto& t) { EmitA32Terminal(as, ctx, t, initial_location, is_single_step); }, terminal);
+}
+
+void EmitA32Terminal(biscuit::Assembler& as, EmitContext& ctx, const IR::Term::Terminal& terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    std::visit([&](const auto& t) { EmitA32Terminal(as, ctx, t, initial_location, is_single_step); }, terminal);
 }
 
 void EmitA32Terminal(biscuit::Assembler& as, EmitContext& ctx) {

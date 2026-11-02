@@ -46,7 +46,8 @@ namespace {
 using namespace Dynarmic;
 
 bool ShouldTestInst(IR::Block& block) {
-    if (auto terminal = block.GetTerminal(); boost::get<IR::Term::Interpret>(&terminal)) {
+    const auto* leaf = std::get_if<IR::Term::LeafTerminal>(&block.GetTerminal());
+    if (leaf && std::holds_alternative<IR::Term::Interpret>(*leaf)) {
         return false;
     }
 

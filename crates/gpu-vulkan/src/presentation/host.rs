@@ -219,7 +219,10 @@ impl Host {
                 .layer_count(1)
                 .color_attachments(&attachments);
             unsafe {
-                cache.device_mut().dispatch.begin_rendering(&info);
+                cache
+                    .device_mut()
+                    .dispatch
+                    .begin_rendering(&info, Default::default());
                 cache.device_mut().dispatch.end_rendering();
             }
         }

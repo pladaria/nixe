@@ -37,39 +37,19 @@
 	#define XBYAK_GNUC_PREREQ(major, minor) 0
 #endif
 
-// This covers -std=(gnu|c)++(0x|11|1y), -stdlib=libc++, and modern Microsoft.
-#if ((defined(_MSC_VER) && (_MSC_VER >= 1600)) || defined(_LIBCPP_VERSION) ||\
-	 			 ((__cplusplus >= 201103) || defined(__GXX_EXPERIMENTAL_CXX0X__)))
+// Container hooks are shared by every translation unit through Dynarmic's
+// native assembler header. The project requires modern standard containers.
+#ifndef XBYAK_STD_UNORDERED_SET
 	#include <unordered_set>
 	#define XBYAK_STD_UNORDERED_SET std::unordered_set
+#endif
+#ifndef XBYAK_STD_UNORDERED_MAP
 	#include <unordered_map>
 	#define XBYAK_STD_UNORDERED_MAP std::unordered_map
-	#define XBYAK_STD_UNORDERED_MULTIMAP std::unordered_multimap
-
-/*
-	Clang/llvm-gcc and ICC-EDG in 'GCC-mode' always claim to be GCC 4.2, using
-	libstdcxx 20070719 (from GCC 4.2.1, the last GPL 2 version).
-*/
-#elif XBYAK_GNUC_PREREQ(4, 5) || (XBYAK_GNUC_PREREQ(4, 2) && __GLIBCXX__ >= 20070719) || defined(__INTEL_COMPILER) || defined(__llvm__)
-	#include <tr1/unordered_set>
-	#define XBYAK_STD_UNORDERED_SET std::tr1::unordered_set
-	#include <tr1/unordered_map>
-	#define XBYAK_STD_UNORDERED_MAP std::tr1::unordered_map
-	#define XBYAK_STD_UNORDERED_MULTIMAP std::tr1::unordered_multimap
-
-#elif defined(_MSC_VER) && (_MSC_VER >= 1500) && (_MSC_VER < 1600)
-	#include <unordered_set>
-	#define XBYAK_STD_UNORDERED_SET std::tr1::unordered_set
+#endif
+#ifndef XBYAK_STD_UNORDERED_MULTIMAP
 	#include <unordered_map>
-	#define XBYAK_STD_UNORDERED_MAP std::tr1::unordered_map
-	#define XBYAK_STD_UNORDERED_MULTIMAP std::tr1::unordered_multimap
-
-#else
-	#include <set>
-	#define XBYAK_STD_UNORDERED_SET std::set
-	#include <map>
-	#define XBYAK_STD_UNORDERED_MAP std::map
-	#define XBYAK_STD_UNORDERED_MULTIMAP std::multimap
+	#define XBYAK_STD_UNORDERED_MULTIMAP std::unordered_multimap
 #endif
 #ifdef _WIN32
 	#ifndef WIN32_LEAN_AND_MEAN
@@ -1516,7 +1496,7 @@ class LabelManager {
 		if (i->second.refCount == 1) {
 			clabelDefList_.erase(id);
 		} else {
-			--i->second.refCount;
+			--clabelDefList_.at(id).refCount;
 		}
 	}
 	template<class T>

@@ -3,6 +3,100 @@ use crate::pushbuffer::packet::PacketView;
 use std::convert::Infallible;
 
 #[test]
+fn split_plain_packets_track_and_replay_the_effective_method_addresses() {
+    for (packet, addresses, replayed) in [
+        (
+            incrementing_packet(0x3400 / 4, &[11, 22, 33]),
+            [0x3400, 0x3404, 0x3408],
+            [11, 22, 33],
+        ),
+        (
+            non_incrementing_packet_on_subchannel(0, 0x3400 / 4, &[11, 22, 33]),
+            [0x3400; 3],
+            [33; 3],
+        ),
+        (
+            increment_once_packet(0x3400 / 4, &[11, 22, 33]),
+            [0x3400, 0x3404, 0x3404],
+            [11, 33, 33],
+        ),
+    ] {
+        for split in 1..=3 {
+            let mut channel = three_d_channel();
+            program_three_d(&mut channel, 0x124, 0);
+            let PacketView::Methods {
+                header,
+                subchannel,
+                methods,
+                ..
+            } = packet.packets()[0].view()
+            else {
+                panic!("method packet")
+            };
+            let mut pending = None;
+            let mut parameters = Vec::new();
+            for replay in [false, true] {
+                if replay {
+                    program_three_d(&mut channel, 0x124, 2);
+                    for method in [0x3400, 0x3404, 0x3408] {
+                        program_three_d(&mut channel, method, 99);
+                    }
+                    program_three_d(&mut channel, 0x124, 3);
+                }
+                let mut observed = Vec::new();
+                for (begin, end) in [(0, split), (split, 3)] {
+                    if begin == end {
+                        continue;
+                    }
+                    crate::test_memory::ready(stream_maxwell_engine_entry(
+                        &mut channel,
+                        &mut crate::pushbuffer::packet::CommandStream::fixture(
+                            PacketView::Methods {
+                                header,
+                                subchannel,
+                                methods: methods.slice(begin..end),
+                                last: end == 3,
+                            },
+                        ),
+                        Some(&mut observed),
+                        &mut pending,
+                        &mut parameters,
+                        &mut async |_| -> Result<(), Infallible> {
+                            panic!("plain registers must not suspend for an effect")
+                        },
+                    ))
+                    .unwrap_or_else(|_| panic!("split packet admission"));
+                }
+                let expected = if replay { replayed } else { [11, 22, 33] };
+                for (index, dispatch) in observed.iter().enumerate() {
+                    let source = dispatch.source();
+                    assert_eq!(source.method(), GpuMethodId(addresses[index]));
+                    assert_eq!(source.argument(), expected[index]);
+                    assert_eq!(
+                        source.location(),
+                        methods.get(index).unwrap().argument_source()
+                    );
+                }
+                assert_eq!(observed.len(), 3);
+                for method in [0x3400, 0x3404, 0x3408] {
+                    // The last write to a repeated method owns its canonical value.
+                    let value = addresses
+                        .iter()
+                        .rposition(|&address| address == method)
+                        .map_or(if replay { 99 } else { 0 }, |last| expected[last]);
+                    assert_eq!(
+                        channel
+                            .three_d_mut()
+                            .raw_register_value(GpuMethodId(method)),
+                        Some(value),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn one_entry_consumes_many_packets_and_large_payloads_before_the_ordered_effect() {
     let mut channel = three_d_channel();
     let values = vec![1.0_f32.to_bits(); 8191];
@@ -39,6 +133,73 @@ fn one_entry_consumes_many_packets_and_large_payloads_before_the_ordered_effect(
     stream
         .finish(&mut crate::MaxwellCommandSourceScratch::default())
         .unwrap();
+}
+
+#[test]
+fn suspended_effect_keeps_the_register_prefix_visible_until_completion() {
+    use std::{
+        cell::Cell,
+        future::{Future, poll_fn},
+        task::{Context, Poll, Waker},
+    };
+    let mut channel = three_d_channel();
+    let mut words = Vec::new();
+    for value in [1.0_f32.to_bits(), 2.0_f32.to_bits()] {
+        for _ in 0..64 {
+            words.extend([(1 << 29) | (1 << 16) | (0x1518 / 4), value]);
+        }
+        words.push((4 << 29) | (0x110 / 4));
+    }
+    let mut stream = crate::pushbuffer::packet::CommandStream::fixture_words(
+        word(0, 0).unwrap().location(),
+        &words,
+    );
+    let ready = Cell::new(false);
+    let calls = Cell::new(0);
+    let mut consume = async |event: MaxwellEngineEvent<'_>| {
+        assert!(matches!(
+            event.operation,
+            PendingEngineOperation::ThreeDSynchronization(_)
+        ));
+        let index = calls.get();
+        calls.set(index + 1);
+        let expected = ((index + 1) as f32).to_bits();
+        assert_eq!(event.three_d.raster().point_size().raw(), Some(expected));
+        if index == 0 {
+            poll_fn(|_| {
+                assert_eq!(event.three_d.raster().point_size().raw(), Some(expected));
+                if ready.get() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+        Ok::<_, Infallible>(())
+    };
+    let mut pending = None;
+    let mut parameters = Vec::new();
+    let future = stream_maxwell_engine_entry(
+        &mut channel,
+        &mut stream,
+        None,
+        &mut pending,
+        &mut parameters,
+        &mut consume,
+    );
+    let mut future = std::pin::pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..3 {
+        assert!(future.as_mut().poll(&mut context).is_pending());
+        assert_eq!(calls.get(), 1);
+    }
+    ready.set(true);
+    assert!(matches!(
+        future.as_mut().poll(&mut context),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(calls.get(), 2);
 }
 
 #[test]

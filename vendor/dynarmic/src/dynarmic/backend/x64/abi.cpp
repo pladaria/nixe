@@ -10,9 +10,9 @@
 
 #include <mcl/iterator/reverse.hpp>
 #include <mcl/stdint.hpp>
-#include <xbyak/xbyak.h>
 
 #include "dynarmic/backend/x64/block_of_code.h"
+#include "dynarmic/backend/x64/xbyak.h"
 
 namespace Dynarmic::Backend::X64 {
 

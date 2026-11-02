@@ -15,12 +15,12 @@
 #include <mcl/bitsizeof.hpp>
 #include <mcl/stdint.hpp>
 #include <mcl/type_traits/function_info.hpp>
-#include <xbyak/xbyak.h>
 
 #include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/constants.h"
 #include "dynarmic/backend/x64/emit_x64.h"
+#include "dynarmic/backend/x64/xbyak.h"
 #include "dynarmic/common/math_util.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/microinstruction.h"

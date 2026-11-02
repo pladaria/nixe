@@ -53,7 +53,7 @@ fn a_registered_affinity_pin_wait_survives_sleep_until_actual_unpin() {
         .pin_thread(VirtualCpuId::new(0), target)
         .unwrap();
     let dispatcher =
-        fixed_time_dispatcher(&process).with_input_completions(process.driver_mut().event_sender());
+        fixed_time_dispatcher(&process).with_host_events(process.driver_mut().event_sender());
     let (thread, handling) = next_call(&mut process, &dispatcher);
     assert_eq!(thread, caller);
     assert!(matches!(handling, ExceptionHandlingResult::Suspended));
@@ -182,8 +182,8 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
             .scheduler()
             .pin_thread(VirtualCpuId::new(0), target)
             .unwrap();
-        let dispatcher = fixed_time_dispatcher(&process)
-            .with_input_completions(process.driver_mut().event_sender());
+        let dispatcher =
+            fixed_time_dispatcher(&process).with_host_events(process.driver_mut().event_sender());
         for (thread, blocks) in [(first, true), (second, true), (controller, false)] {
             process.thread(thread).unwrap().start().unwrap();
             let (caller, handling) = next_call(&mut process, &dispatcher);

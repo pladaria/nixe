@@ -32,7 +32,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     }
     let events = process.driver_mut().event_sender();
     let dispatcher = support::dispatcher(&process)
-        .with_input_completions(events)
+        .with_host_events(events)
         .with_audio_backend(std::sync::Arc::new(Backend));
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");

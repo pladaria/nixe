@@ -583,6 +583,7 @@ impl NativeGpuExecution {
             let destination_planes = Arc::clone(&self.residency.image(destination)?.planes);
             let selected = source_planes[0];
             let selected_destination = destination_planes[0];
+            let mut planes = smallvec::SmallVec::<[(usize, usize); 2]>::new();
             for (plane, p) in source_planes.iter().enumerate().filter(|(_, p)| {
                 p.mip_level == selected.mip_level && p.array_layer == selected.array_layer
             }) {
@@ -596,20 +597,20 @@ impl NativeGpuExecution {
                     .ok_or(VulkanError::InvalidResource(
                         "blit destination aspect is absent",
                     ))?;
-                self.residency.blit_image(
-                    source,
-                    plane,
-                    rect(src),
-                    destination,
-                    destination_plane,
-                    rect(dst),
-                    if linear {
-                        vk::Filter::LINEAR
-                    } else {
-                        vk::Filter::NEAREST
-                    },
-                )?;
+                planes.push((plane, destination_plane));
             }
+            self.residency.blit_image(
+                source,
+                destination,
+                &planes,
+                rect(src),
+                rect(dst),
+                if linear {
+                    vk::Filter::LINEAR
+                } else {
+                    vk::Filter::NEAREST
+                },
+            )?;
             Ok(())
         })();
         self.residency.constructing.truncate(retained);
@@ -818,9 +819,10 @@ mod tests {
         for z in 0..4 {
             execution
                 .residency
-                .copy_image_region(
+                .copy_image_regions(
                     native,
-                    z,
+                    target,
+                    &[(z, 0)],
                     vk::Rect2D {
                         offset: Default::default(),
                         extent: vk::Extent2D {
@@ -828,8 +830,6 @@ mod tests {
                             height: 8,
                         },
                     },
-                    target,
-                    0,
                     Default::default(),
                 )
                 .unwrap();

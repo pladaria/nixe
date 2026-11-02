@@ -18,8 +18,8 @@ mod tracking;
 mod transition;
 mod virtual_arena;
 pub use address_space::{
-    AddressSpace, AllocationRange, CodeFetch, MappingObservation, MappingVersion, PageEntry,
-    Translation, capture_subrange,
+    AddressSpace, AllocationRange, CodeFetch, MappingObservation, MappingVersion, NativeCodePage,
+    PageEntry, Translation, capture_subrange,
 };
 pub use captured::CapturedMemory;
 pub use device_access::{
@@ -32,11 +32,12 @@ pub use host::{HostAddress, PhysicalArena};
 pub use intervals::{IntervalIndex, IntervalKey};
 pub use machine::{
     Allocation, AllocationFuture, AllocationObservation, AllocationPin, Machine, MemoryAccount,
-    MemoryError, MemoryStatistics, WeakAllocation,
+    MemoryError, MemoryStatistics, RamSource, WeakAllocation,
 };
 
 pub use tracking::{
-    MappedRamReader, Observation, PhysicalCapture, TrackingStatistics, WriteSource,
+    MappedRamReader, Observation, PhysicalCapture, ResourceRead, ResourceReader,
+    TrackingStatistics, WriteSource,
 };
 pub use transition::{CodeInvalidation, CoreContext, NativeAdmission};
 pub use virtual_arena::{AddressWidth, MemoryPermissions, VirtualArena};

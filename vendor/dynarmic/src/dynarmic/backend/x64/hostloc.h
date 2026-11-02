@@ -4,9 +4,12 @@
  */
 #pragma once
 
+#include <bitset>
+
 #include <mcl/assert.hpp>
 #include <mcl/stdint.hpp>
-#include <xbyak/xbyak.h>
+
+#include "dynarmic/backend/x64/xbyak.h"
 
 namespace Dynarmic::Backend::X64 {
 
@@ -101,45 +104,19 @@ inline size_t HostLocBitWidth(HostLoc loc) {
     UNREACHABLE();
 }
 
-using HostLocList = std::initializer_list<HostLoc>;
+using HostLocSet = std::bitset<32>;
+
+inline HostLocSet HostLocBit(HostLoc loc) {
+    ASSERT(HostLocIsRegister(loc));
+    return HostLocSet{u64{1} << static_cast<size_t>(loc)};
+}
 
 // RSP is preserved for function calls
 // R15 contains the JitState pointer
-const HostLocList any_gpr = {
-    HostLoc::RAX,
-    HostLoc::RBX,
-    HostLoc::RCX,
-    HostLoc::RDX,
-    HostLoc::RSI,
-    HostLoc::RDI,
-    HostLoc::RBP,
-    HostLoc::R8,
-    HostLoc::R9,
-    HostLoc::R10,
-    HostLoc::R11,
-    HostLoc::R12,
-    HostLoc::R13,
-    HostLoc::R14,
-};
+constexpr HostLocSet any_gpr{0x7fef};
 
 // XMM0 is reserved for use by instructions that implicitly use it as an argument
-const HostLocList any_xmm = {
-    HostLoc::XMM1,
-    HostLoc::XMM2,
-    HostLoc::XMM3,
-    HostLoc::XMM4,
-    HostLoc::XMM5,
-    HostLoc::XMM6,
-    HostLoc::XMM7,
-    HostLoc::XMM8,
-    HostLoc::XMM9,
-    HostLoc::XMM10,
-    HostLoc::XMM11,
-    HostLoc::XMM12,
-    HostLoc::XMM13,
-    HostLoc::XMM14,
-    HostLoc::XMM15,
-};
+constexpr HostLocSet any_xmm{0xfffe0000};
 
 Xbyak::Reg64 HostLocToReg64(HostLoc loc);
 Xbyak::Xmm HostLocToXmm(HostLoc loc);

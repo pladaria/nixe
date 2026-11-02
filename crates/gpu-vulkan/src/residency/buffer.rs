@@ -1,5 +1,61 @@
 //! Physical buffer interpretations, immutable uploads and native alias reconstruction.
 use super::*;
+// Desktop Eden caches buffers in 64 KiB pages, independently of CPU protection
+// pages. Keep native allocation growth coarse while importing only used ranges.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache_base.h
+const CACHE_PAGE_SIZE: u64 = 64 * 1024;
+
+/// Buffer geometry selection is independent of byte ownership. Unlike Eden's
+/// contiguous device-address ranges, physical mappings can share a page without
+/// sharing their logical order, so each page retains all selectable buffer slots.
+/// Producer and CPU invalidation queries continue to use the resource authority.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L1536-L1565
+pub(super) struct BufferIndex {
+    pages: Vec<smallvec::SmallVec<[usize; 1]>>,
+}
+impl BufferIndex {
+    pub(super) fn new(physical_bytes: u64) -> Self {
+        Self {
+            pages: vec![
+                smallvec::SmallVec::new();
+                physical_bytes.div_ceil(CACHE_PAGE_SIZE) as usize
+            ],
+        }
+    }
+    fn pages(mapping: &PhysicalMapping) -> impl Iterator<Item = usize> + '_ {
+        mapping.spans().iter().flat_map(|span| {
+            (span.start.get() / CACHE_PAGE_SIZE) as usize
+                ..(span.start.get() + span.bytes).div_ceil(CACHE_PAGE_SIZE) as usize
+        })
+    }
+    fn at(&self, start: nixe_memory::ArenaOffset) -> &[usize] {
+        self.pages
+            .get((start.get() / CACHE_PAGE_SIZE) as usize)
+            .map_or(&[], |page| page.as_slice())
+    }
+    fn insert(&mut self, slot: usize, mapping: &PhysicalMapping) {
+        for page in Self::pages(mapping) {
+            let entries = &mut self.pages[page];
+            if !entries.contains(&slot) {
+                entries.push(slot);
+            }
+        }
+    }
+    pub(super) fn remove(&mut self, slot: usize, mapping: &PhysicalMapping) {
+        for page in Self::pages(mapping) {
+            self.pages[page].retain(|entry| *entry != slot);
+        }
+    }
+    fn candidates(&self, mapping: &PhysicalMapping) -> Vec<usize> {
+        let mut slots = Vec::new();
+        for page in Self::pages(mapping) {
+            slots.extend_from_slice(&self.pages[page]);
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+}
 /// A retained native buffer and the addressed subrange within it.
 #[derive(Clone, Copy, Debug)]
 pub struct BufferRange {
@@ -53,31 +109,26 @@ impl VulkanResidency {
         // Look up retained coverage before expanding or pinning a new mapping.
         // Any containing interpretation must cover the first requested byte.
         let mut found = None;
-        self.authority.visit_resource_overlaps(
-            nixe_memory::Extent {
-                start: requested.spans()[0].start,
-                bytes: 1,
-            },
-            |resource, _, _| {
-                if found.is_some() {
-                    return;
-                }
-                let Resource::Buffer(id) = resource else {
-                    return;
-                };
-                let Ok(entry) = self.buffer(id) else { return };
-                let [old] = entry.contents.geometry.as_slice() else {
-                    return;
-                };
-                if entry.binding_valid
-                    && entry.usage.contains(usage)
-                    && matches!(old.domain(), nixe_gpu::physical::WriteDomain::Buffer { .. })
-                    && let Some(offset) = old.mapping().containing_offset(&requested)
-                {
-                    found = Some((id, offset));
-                }
-            },
-        );
+        for &slot in self.buffer_index.at(requested.spans()[0].start) {
+            let buffer = &self.buffers[slot];
+            let entry = buffer.entry.as_ref().expect("indexed buffer");
+            debug_assert!(entry.binding_valid);
+            if entry.usage.contains(usage)
+                && let Some(offset) = entry.contents.geometry[0]
+                    .mapping()
+                    .containing_offset(&requested)
+            {
+                found = Some((
+                    BufferId {
+                        instance: self.instance,
+                        slot,
+                        generation: buffer.generation,
+                    },
+                    offset,
+                ));
+                break;
+            }
+        }
         if let Some((id, offset)) = found {
             if initialize {
                 self.ensure_buffer_range(id, offset, requested.bytes())?;
@@ -90,36 +141,29 @@ impl VulkanResidency {
                 size: requested.bytes(),
             });
         }
-        let mut mapping = requested.expanded_buffer(nixe_memory::PAGE_SIZE)?;
+        if requested.machine() != self.memory.identity() {
+            return Err(VulkanError::InvalidResource(
+                "buffer mapping belongs to another machine",
+            ));
+        }
+        let mut mapping = requested.expanded_buffer(CACHE_PAGE_SIZE)?;
         let mut overlaps = Vec::new();
         let mut growth = 0u32;
         loop {
-            let footprint = Footprint::new(
-                Arc::clone(&mapping),
-                nixe_gpu::physical::WriteDomain::Buffer {
-                    start: 0,
-                    bytes: mapping.bytes(),
-                },
-            )?;
             let mut expanded = false;
-            for resource in self.authority.resource_candidates(&footprint) {
-                let Resource::Buffer(id) = resource else {
-                    continue;
+            for slot in self.buffer_index.candidates(&mapping) {
+                let buffer = &self.buffers[slot];
+                let id = BufferId {
+                    instance: self.instance,
+                    slot,
+                    generation: buffer.generation,
                 };
-                let entry = self.buffer(id)?;
-                if !entry.binding_valid {
-                    continue;
-                }
-                let [old] = entry.contents.geometry.as_slice() else {
-                    continue;
-                };
-                if !matches!(old.domain(), nixe_gpu::physical::WriteDomain::Buffer { .. }) {
-                    continue;
-                }
+                let entry = buffer.entry.as_ref().expect("indexed buffer");
+                debug_assert!(entry.binding_valid);
                 if overlaps.contains(&id) {
                     continue;
                 }
-                let joined = join_buffers(&mapping, old.mapping())?;
+                let joined = join_buffers(&mapping, entry.contents.geometry[0].mapping())?;
                 let Some(joined) = joined else { continue };
                 if entry.contents.touched + 1 >= self.epoch {
                     growth = growth.max(entry.growth.saturating_add(1));
@@ -297,7 +341,7 @@ impl VulkanResidency {
         self.authority
             .register(Resource::Buffer(id), geometry.clone())
             .map_err(memory_error)?;
-
+        self.buffer_index.insert(id.slot, geometry[0].mapping());
         self.authority.track_buffer_changes(Resource::Buffer(id));
         self.statistics.buffer_allocations += 1;
         self.touch(Resource::Buffer(id));
@@ -373,30 +417,25 @@ impl VulkanResidency {
             return Ok(None);
         }
         let mapping = Arc::clone(full.mapping());
-        let result = (|| {
-            mapping.pin_into(request.offset, request.size, &mut self.stream_inputs)?;
-            let slice = self.device.submission.reserve_slice(
-                &mut self.device.dispatch,
-                request.size,
-                true,
-                request.alignment.max(4),
-            )?;
-            let upload = self.device.submission.staging_buffer(&slice);
-            unsafe {
-                upload.write_with(slice.offset, request.size, |bytes| {
-                    self.memory
-                        .capture_stream(&self.stream_inputs, bytes)
-                        .map_err(memory_error)
-                })?;
-            }
-            self.device.submission.retain_stream_upload(&slice);
-            let native = Arc::clone(self.device.submission.staging_buffer(&slice));
-            self.touch(Resource::Buffer(request.id));
-            self.statistics.cpu_streamed_bytes += request.size;
-            Ok(Some((native, slice.offset)))
-        })();
-        self.stream_inputs.clear();
-        result
+        let slice = self.device.submission.reserve_slice(
+            &mut self.device.dispatch,
+            request.size,
+            true,
+            request.alignment.max(4),
+        )?;
+        let upload = self.device.submission.staging_buffer(&slice);
+        unsafe {
+            upload.write_with(slice.offset, request.size, |bytes| {
+                mapping
+                    .capture_stream(request.offset, bytes)
+                    .map_err(memory_error)
+            })?;
+        }
+        self.device.submission.retain_stream_upload(&slice);
+        let native = Arc::clone(self.device.submission.staging_buffer(&slice));
+        self.touch(Resource::Buffer(request.id));
+        self.statistics.cpu_streamed_bytes += request.size;
+        Ok(Some((native, slice.offset)))
     }
     pub(super) fn aligned_uniform_copy(
         &mut self,
@@ -546,67 +585,54 @@ impl VulkanResidency {
             0,
         );
         self.invalidate_cpu_resources(&[])?;
-        let mut geometry = self.buffer(id)?.contents.geometry.clone();
+        let mapping = Arc::clone(self.buffer(id)?.contents.geometry[0].mapping());
         let size = self.buffer(id)?.native.size();
         self.consume_buffer_changes(id)?;
         let page = nixe_memory::PAGE_SIZE;
         let begin = offset / page * page;
         let end = ((offset + requested_size).div_ceil(page) * page).min(size);
-        geometry[0] = Footprint::new(
-            Arc::clone(geometry[0].mapping()),
-            nixe_gpu::physical::WriteDomain::Buffer {
-                start: begin,
-                bytes: end - begin,
-            },
-        )?;
-        let mut parts = Vec::new();
-        for footprint in &geometry {
-            parts.extend(self.authority.resolve_footprint(footprint)?);
-        }
-        parts.sort_unstable_by_key(|part| part.logical);
-        let mut copies = Vec::new();
-        let mut windows: Vec<(u64, usize, usize)> = Vec::new();
+        // Keep page-granular prefetch, but resolve only invalid bytes within it.
+        // Already valid native ranges need no producer sweep or alias copy.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+        let invalid = &self.buffer(id)?.invalid;
+        let first = invalid.partition_point(|&(start, bytes)| start + bytes <= begin);
+        let demand: smallvec::SmallVec<[(u64, u64); 8]> = invalid[first..]
+            .iter()
+            .take_while(|&&(start, _)| start < end)
+            .map(|&(start, bytes)| {
+                let low = start.max(begin);
+                let high = (start + bytes).min(end);
+                (low, high - low)
+            })
+            .collect();
+        let mut parts = std::mem::take(&mut self.buffer_resolution);
+        self.authority
+            .resolve_buffer_ranges(&mapping, &demand, &mut parts)?;
+        let mut copies = smallvec::SmallVec::<[nixe_memory::PhysicalCapture; 8]>::new();
+        let mut windows = smallvec::SmallVec::<[(u64, usize, usize); 8]>::new();
         let mut packed = 0;
-        let mut inputs = Vec::new();
-        let invalid = self.buffer(id)?.invalid.clone();
+        let mut inputs = smallvec::SmallVec::<[nixe_memory::AllocationRange; 8]>::new();
         for part in parts.iter().filter(|p| p.producer.is_none()) {
-            let first = invalid
-                .partition_point(|&(offset, bytes)| offset + bytes <= part.logical.max(begin));
-            for &(offset, bytes) in &invalid[first..] {
-                if offset >= (part.logical + part.bytes).min(end) {
-                    break;
-                }
-                let begin = part.logical.max(offset).max(begin);
-                let end = (part.logical + part.bytes).min(offset + bytes).min(end);
-                if begin >= end {
-                    continue;
-                }
-                let source = nixe_memory::ArenaOffset::new(part.start.get() + begin - part.logical);
-                let mapping = geometry[0].mapping();
-                let span = mapping
-                    .spans()
-                    .partition_point(|span| span.logical + span.bytes <= begin);
-                let pin = mapping.pin_span(span, source, end - begin)?;
-                inputs
-                    .push(pin.ok_or(VulkanError::InvalidResource("CPU upload input has retired"))?);
-                copies.push(nixe_memory::PhysicalCapture {
-                    source: nixe_memory::Extent {
-                        start: nixe_memory::ArenaOffset::new(
-                            part.start.get() + begin - part.logical,
-                        ),
-                        bytes: end - begin,
-                    },
-                    destination: packed,
-                });
-                if let Some((offset, _, bytes)) = windows.last_mut()
-                    && *offset + *bytes as u64 == begin
-                {
-                    *bytes += (end - begin) as usize;
-                } else {
-                    windows.push((begin, packed, (end - begin) as usize));
-                }
-                packed += (end - begin) as usize;
+            let span = mapping
+                .spans()
+                .partition_point(|span| span.logical + span.bytes <= part.logical);
+            let pin = mapping.pin_span(span, part.start, part.bytes)?;
+            inputs.push(pin.ok_or(VulkanError::InvalidResource("CPU upload input has retired"))?);
+            copies.push(nixe_memory::PhysicalCapture {
+                source: nixe_memory::Extent {
+                    start: part.start,
+                    bytes: part.bytes,
+                },
+                destination: packed,
+            });
+            if let Some((offset, _, bytes)) = windows.last_mut()
+                && *offset + *bytes as u64 == part.logical
+            {
+                *bytes += part.bytes as usize;
+            } else {
+                windows.push((part.logical, packed, part.bytes as usize));
             }
+            packed += part.bytes as usize;
         }
         let self_alias = parts.iter().any(|part| {
             part.producer
@@ -641,14 +667,14 @@ impl VulkanResidency {
             None
         };
         self.upload_buffer_captures(id, &inputs, &copies, &windows, packed)?;
-        let native_valid: Vec<_> = parts
+        let native_valid: smallvec::SmallVec<[(u64, u64); 8]> = parts
             .iter()
             .filter(|p| p.producer.is_some())
             .map(|p| (p.logical, p.bytes))
             .collect();
         let mut images = rustc_hash::FxHashMap::<ImageId, Vec<(u64, u64, u64)>>::default();
-        let mut buffers: Vec<(Resource, u64, u64, u64)> = Vec::new();
-        for part in parts {
+        let mut buffers = smallvec::SmallVec::<[(Resource, u64, u64, u64); 8]>::new();
+        for part in &parts {
             let Some(source) = part.producer else {
                 continue;
             };
@@ -713,6 +739,8 @@ impl VulkanResidency {
         // Publish the captured version before consuming racing CPU stores. The
         // persistent page watch keeps future stores dirty without a new observer.
         self.invalidate_cpu_resources(&[])?;
+        parts.clear();
+        self.buffer_resolution = parts;
         Ok(())
     }
     pub fn buffer_lease(&self, id: BufferId) -> Result<Arc<AllocatedBuffer>, VulkanError> {

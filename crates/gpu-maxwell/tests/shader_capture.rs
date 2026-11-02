@@ -9,7 +9,7 @@ use nixe_shader_recompiler::{Compiler, Stage, environment::EnvironmentMetadata};
 use std::sync::Arc;
 
 #[test]
-fn owned_shader_capture_rechecks_code_pages_and_reuses_equal_instructions() {
+fn owned_shader_capture_tracks_exact_code_bytes_and_reuses_equal_instructions() {
     let machine = Machine::new(PAGE_SIZE).unwrap();
     let allocation = machine
         .account(PAGE_SIZE)
@@ -87,18 +87,12 @@ fn owned_shader_capture_rechecks_code_pages_and_reuses_equal_instructions() {
     machine
         .write_resolved(&[input.slice(0x800, 1).unwrap()], &[1])
         .unwrap();
-    assert!(!captured.stages[0].request_is_current(&request()[0].1, address_space.memory()));
-    let refreshed = captured
-        .refresh(&request(), address_space.memory(), &mut memory, &mut access)
-        .unwrap()
-        .unwrap();
-    assert!(Arc::ptr_eq(&captured.inputs, &refreshed.inputs));
-    assert!(refreshed.stages[0].request_is_current(&request()[0].1, address_space.memory()));
+    assert!(captured.stages[0].request_is_current(&request()[0].1, address_space.memory()));
     machine
         .write_resolved(&[input.slice(8, 8).unwrap()], &exit.to_le_bytes())
         .unwrap();
-    assert!(!refreshed.stages[0].request_is_current(&request()[0].1, address_space.memory()));
-    let refreshed = refreshed
+    assert!(!captured.stages[0].request_is_current(&request()[0].1, address_space.memory()));
+    let refreshed = captured
         .refresh(&request(), address_space.memory(), &mut memory, &mut access)
         .unwrap()
         .unwrap();

@@ -13,6 +13,7 @@ use std::{
 
 const MAX_THREADS: usize = 64;
 const EVENTS_PER_THREAD: usize = 1_048_576;
+const EVENTS_PER_BLOCK: usize = 4096;
 static CAPTURE: OnceLock<Capture> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static FRAMES_ONLY: AtomicBool = AtomicBool::new(false);
@@ -31,7 +32,8 @@ struct Capture {
 struct Buffer {
     name: String,
     host_tid: u64,
-    events: Vec<Event>,
+    events: Vec<Vec<Event>>,
+    recorded: usize,
     dropped: u64,
 }
 struct Event {
@@ -40,6 +42,23 @@ struct Event {
     name: &'static str,
     values: [u64; 3],
     caller: Option<&'static Location<'static>>,
+}
+impl Buffer {
+    fn record(&mut self, event: Event) {
+        if self.recorded == EVENTS_PER_THREAD {
+            self.dropped += 1;
+            return;
+        }
+        if self
+            .events
+            .last()
+            .is_none_or(|block| block.len() == EVENTS_PER_BLOCK)
+        {
+            self.events.push(Vec::with_capacity(EVENTS_PER_BLOCK));
+        }
+        self.events.last_mut().unwrap().push(event);
+        self.recorded += 1;
+    }
 }
 
 /// `NIXE_EXECUTION_TRACE` selects the output. Optional comma-separated
@@ -94,7 +113,7 @@ pub fn start() -> io::Result<()> {
         .as_nanos() as u64;
     // Keep the OS monotonic clock alongside realtime so external process/thread
     // samples can align without assuming the wall clock cannot change.
-    event("clock_sync", unix_ns, monotonic_ns()?, 3);
+    event("clock_sync", unix_ns, monotonic_ns()?, 7);
     if let Some(path) = std::env::var_os("NIXE_EXECUTION_TRACE_CONTROL") {
         let worker = std::thread::Builder::new()
             .name("nixe-trace-control".into())
@@ -182,22 +201,17 @@ fn record(event: Event) {
                 host_tid: unsafe { libc::gettid() as u64 },
                 #[cfg(not(target_os = "linux"))]
                 host_tid: 0,
-                events: Vec::with_capacity(if FRAMES_ONLY.load(Ordering::Relaxed) {
-                    65_536
-                } else {
-                    EVENTS_PER_THREAD
-                }),
+                // Small fixed blocks avoid copying a growing multi-megabyte
+                // allocation and committing huge pages in the measured path.
+                events: Vec::with_capacity(EVENTS_PER_THREAD / EVENTS_PER_BLOCK),
+                recorded: 0,
                 dropped: 0,
             }));
             buffers.push(Arc::clone(&buffer));
             *slot = Some(buffer);
         }
         let mut buffer = slot.as_ref().unwrap().lock().unwrap();
-        if buffer.events.len() == EVENTS_PER_THREAD {
-            buffer.dropped += 1;
-        } else {
-            buffer.events.push(event);
-        }
+        buffer.record(event);
     });
 }
 
@@ -220,6 +234,8 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
                 | "performance_clock_sync"
                 | "shader_compile"
                 | "pipeline_compile"
+                | "shader_capture"
+                | "shader_capture_restore"
                 | "queue_buffer"
                 | "queue_options"
                 | "requested_interval"
@@ -231,11 +247,6 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
                 | "gpu_submission_queued"
                 | "gpu_command_begin"
                 | "gpu_command_end"
-                | "gpu_execution"
-                | "gpu_calibration_error"
-                | "queue_schedule"
-                | "queue_submit"
-                | "queue_complete"
         )
     {
         return;
@@ -284,6 +295,11 @@ pub fn span(name: &'static str, a: u64, b: u64, c: u64) -> Span {
         }),
     }
 }
+
+/// Guard expensive diagnostics using the same scope as detailed spans.
+pub fn detailed_active() -> bool {
+    now(true).is_some()
+}
 impl Drop for Span {
     fn drop(&mut self) {
         if let Some(mut event) = self.event.take() {
@@ -310,7 +326,7 @@ pub fn finish() -> io::Result<()> {
     let mut dropped = 0;
     for buffer in capture.buffers.lock().unwrap().iter() {
         let buffer = buffer.lock().unwrap();
-        for e in &buffer.events {
+        for e in buffer.events.iter().flatten() {
             write!(
                 output,
                 "{},{},{},{},{},{},{},",

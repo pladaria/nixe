@@ -506,14 +506,6 @@ impl HorizonSvcDispatcher {
             },
         )
     }
-    #[must_use]
-    pub fn with_input_completions(
-        self: Arc<Self>,
-        events: nixe_runtime::ExternalEventSender,
-    ) -> Arc<Self> {
-        self.resources.system.hid.set_completion_events(events);
-        self
-    }
     pub(super) fn set_heap_size(
         self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,

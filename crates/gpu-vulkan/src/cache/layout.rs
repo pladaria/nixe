@@ -201,6 +201,10 @@ pub(crate) fn binding_origins(
         .collect()
 }
 
+pub(crate) struct UniformBinding {
+    pub resource: usize,
+    pub dynamic_offset: Option<usize>,
+}
 pub struct PipelineLayout {
     pub(crate) owner: Arc<DeviceOwner>,
     pub(crate) handle: vk::PipelineLayout,
@@ -208,6 +212,7 @@ pub struct PipelineLayout {
     pub(crate) update_template: vk::DescriptorUpdateTemplate,
     pub key: LayoutKey,
     pub(crate) dynamic_bindings: Box<[usize]>,
+    pub(crate) uniform_bindings: Box<[UniformBinding]>,
 }
 impl PipelineLayout {
     /// Separate the stable descriptor base from the command's uint32 offset.
@@ -236,20 +241,33 @@ impl PipelineLayout {
                     "dynamic storage binding requires a buffer",
                 ));
             };
-            let alignment = buffer_alignment(self.key.bindings[index].kind, limits);
-            if !offset.is_multiple_of(alignment)
-                || offset
-                    .checked_add(*range)
-                    .is_none_or(|end| end > buffer.size())
-            {
-                return Err(VulkanError::InvalidResource(
-                    "dynamic buffer range/alignment exceeds host contract",
-                ));
-            }
-            offsets.push(*offset as u32);
-            *offset &= !u64::from(u32::MAX);
+            let (base, dynamic) =
+                self.split_buffer_offset(index, buffer.size(), *offset, *range, limits)?;
+            offsets.push(dynamic);
+            *offset = base;
         }
         Ok(offsets)
+    }
+
+    pub(crate) fn split_buffer_offset(
+        &self,
+        index: usize,
+        buffer_bytes: u64,
+        offset: u64,
+        range: u64,
+        limits: &vk::PhysicalDeviceLimits,
+    ) -> Result<(u64, u32), VulkanError> {
+        let alignment = buffer_alignment(self.key.bindings[index].kind, limits);
+        if !offset.is_multiple_of(alignment)
+            || offset
+                .checked_add(range)
+                .is_none_or(|end| end > buffer_bytes)
+        {
+            return Err(VulkanError::InvalidResource(
+                "dynamic buffer range/alignment exceeds host contract",
+            ));
+        }
+        Ok((offset & !u64::from(u32::MAX), offset as u32))
     }
 }
 impl Drop for PipelineLayout {
@@ -380,12 +398,29 @@ impl LayoutCache {
             )
         }
         .map_err(|e| VulkanError::vk("native descriptor layout", e))?;
+        let dynamic_bindings = key.dynamic_bindings();
+        let uniform_bindings = key
+            .bindings
+            .iter()
+            .enumerate()
+            .filter(|(_, binding)| {
+                matches!(
+                    binding.kind,
+                    vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                )
+            })
+            .map(|(resource, _)| UniformBinding {
+                resource,
+                dynamic_offset: dynamic_bindings.iter().position(|&index| index == resource),
+            })
+            .collect();
         let mut layout = PipelineLayout {
             owner: Arc::clone(&self.owner),
             handle: vk::PipelineLayout::null(),
             set,
             update_template: vk::DescriptorUpdateTemplate::null(),
-            dynamic_bindings: key.dynamic_bindings(),
+            dynamic_bindings,
+            uniform_bindings,
             key,
         };
         let sets = [set];

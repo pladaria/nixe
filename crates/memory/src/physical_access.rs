@@ -229,6 +229,100 @@ mod tests {
     }
 
     #[test]
+    fn mapped_ram_reader_releases_all_prior_regions_before_waiting() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let bytes = 1 << REGION_SHIFT;
+        let machine = crate::Machine::new(3 * bytes).unwrap();
+        let allocation = machine
+            .account(3 * bytes)
+            .unwrap()
+            .allocate(3 * bytes)
+            .unwrap();
+        let first = allocation.physical_extents(0, 16).unwrap().next().unwrap();
+        let second = allocation
+            .physical_extents(bytes, 16)
+            .unwrap()
+            .next()
+            .unwrap();
+        let third = allocation
+            .physical_extents(2 * bytes, 16)
+            .unwrap()
+            .next()
+            .unwrap();
+        let blocked = machine.physical_access().close(&[third]);
+        let (started, start) = mpsc::channel();
+        let reader_machine = machine.clone();
+        let reader = std::thread::spawn(move || {
+            let _allocation = allocation;
+            let mut reader = reader_machine.mapped_ram_reader();
+            let mut output = [0; 16];
+            // SAFETY: the allocation retains all three disjoint physical regions.
+            unsafe {
+                assert!(reader.try_read(first.start, &mut output).unwrap());
+                assert!(reader.try_read(second.start, &mut output).unwrap());
+                started.send(()).unwrap();
+                assert!(reader.try_read(third.start, &mut output).unwrap());
+            }
+        });
+        start.recv().unwrap();
+        let (drained, drain) = mpsc::channel();
+        let writer_machine = machine.clone();
+        let writer = std::thread::spawn(move || {
+            let closed = writer_machine.physical_access().close(&[first, second]);
+            closed.wait();
+            drained.send(()).unwrap();
+        });
+        let released_previous = drain.recv_timeout(Duration::from_secs(2));
+        // Always unblock and join both threads, including a failed regression.
+        drop(blocked);
+        reader.join().unwrap();
+        writer.join().unwrap();
+        released_previous.expect("a reader waiting on another region must release all old guards");
+    }
+
+    #[test]
+    fn mapped_ram_reader_refreshes_bytes_across_retained_regions() {
+        let bytes = 1 << REGION_SHIFT;
+        let machine = crate::Machine::new(5 * bytes).unwrap();
+        let allocation = machine
+            .account(5 * bytes)
+            .unwrap()
+            .allocate(5 * bytes)
+            .unwrap();
+        let starts: Vec<_> = (0..5)
+            .map(|region| {
+                allocation
+                    .physical_extents(region * bytes, 16)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .start
+            })
+            .collect();
+        let mut reader = machine.mapped_ram_reader();
+        let mut output = [0; 16];
+        for revision in [0x31, 0x42] {
+            for index in [0, 1, 2, 0, 3, 4, 0, 2] {
+                let start = starts[index];
+                let range = crate::AllocationRange::new(allocation.pin(), index as u64 * bytes, 16)
+                    .unwrap();
+                machine.write_resolved(&[range], &[revision; 16]).unwrap();
+                // SAFETY: the allocation retains every physical region.
+                assert!(unsafe { reader.try_read(start, &mut output) }.unwrap());
+                assert_eq!(output, [revision; 16]);
+            }
+        }
+        reader.release();
+        let extents = starts
+            .into_iter()
+            .map(|start| Extent { start, bytes: 16 })
+            .collect::<Vec<_>>();
+        let closed = machine.physical_access().close(&extents);
+        closed.wait();
+    }
+
+    #[test]
     fn nonblocking_cross_region_access_releases_its_partial_admission() {
         let bytes = 1 << REGION_SHIFT;
         let access = PhysicalAccess::new(bytes * 2);

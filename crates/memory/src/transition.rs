@@ -350,6 +350,15 @@ impl NativeAdmission<'_> {
     pub(crate) fn is_active(&self) -> bool {
         self.active.get()
     }
+    pub(crate) fn sequence(&self) -> Option<u64> {
+        self.active.get().then(|| {
+            self.context
+                .space
+                .quiescence
+                .sequence
+                .load(Ordering::Acquire)
+        })
+    }
     /// Capture/pin the consumed physical operation before suspending. A memory
     /// callback may wait with its native frame suspended: its caller must queue
     /// code invalidations until native return and synchronize them after resume.

@@ -138,6 +138,7 @@ fn raster_sample(
                 })
                 .layer_count(1)
                 .color_attachments(&attachments),
+            Default::default(),
         );
     }
     device.bind_native_pipeline(pipeline).unwrap();
@@ -489,8 +490,8 @@ pub(super) fn captured_graphics(
                 environment.metadata().stage
             );
             StageSource {
-                environment,
-                info: compiler.program(id).unwrap().info.clone(),
+                environment: Arc::new(environment),
+                info: Arc::new(compiler.program(id).unwrap().info.clone()),
                 binding_group: None,
             }
         })

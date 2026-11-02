@@ -132,7 +132,7 @@ const Block::InstructionList& Block::Instructions() const {
     return instructions;
 }
 
-Terminal Block::GetTerminal() const {
+const Terminal& Block::GetTerminal() const {
     return terminal;
 }
 
@@ -147,7 +147,7 @@ void Block::ReplaceTerminal(Terminal term) {
 }
 
 bool Block::HasTerminal() const {
-    return terminal.which() != 0;
+    return !std::holds_alternative<Term::Invalid>(terminal);
 }
 
 size_t& Block::CycleCount() {
@@ -159,7 +159,7 @@ const size_t& Block::CycleCount() const {
 }
 
 static std::string TerminalToString(const Terminal& terminal_variant) {
-    struct : boost::static_visitor<std::string> {
+    struct {
         std::string operator()(const Term::Invalid&) const {
             return "<invalid terminal>";
         }
@@ -181,6 +181,9 @@ static std::string TerminalToString(const Terminal& terminal_variant) {
         std::string operator()(const Term::FastDispatchHint&) const {
             return "FastDispatchHint{}";
         }
+        std::string operator()(const Term::LeafTerminal& terminal) const {
+            return std::visit(*this, terminal);
+        }
         std::string operator()(const Term::If& terminal) const {
             return fmt::format("If{{{}, {}, {}}}", A64::CondToString(terminal.if_), TerminalToString(terminal.then_), TerminalToString(terminal.else_));
         }
@@ -192,7 +195,7 @@ static std::string TerminalToString(const Terminal& terminal_variant) {
         }
     } visitor;
 
-    return boost::apply_visitor(visitor, terminal_variant);
+    return std::visit(visitor, terminal_variant);
 }
 
 std::string DumpBlock(const IR::Block& block) {

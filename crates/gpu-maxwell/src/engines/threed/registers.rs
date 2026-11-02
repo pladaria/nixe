@@ -158,23 +158,30 @@ pub(super) const fn passive_action(action: MethodAction) -> bool {
 // Like Eden's execution mask and dirty tables, method routing is fixed at build time.
 // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
 pub(super) struct MethodInfo {
-    passive: bool,
+    pub(super) passive: bool,
     pub(super) family: RegisterFamily,
-    domains: u16,
+    pub(super) domains: u16,
+    pub(super) parameter_index: u16,
 }
-const METHODS: [MethodInfo; 4096] = {
+static METHODS: [MethodInfo; 4096] = {
     let mut table = [const {
         MethodInfo {
             passive: false,
             family: RegisterFamily::Other,
             domains: 0,
+            parameter_index: u16::MAX,
         }
     }; 4096];
     let mut index = 0;
+    let mut parameter_index = 0;
     while index < table.len() {
         let method = index as u32 * 4;
         table[index].family = classify_family(method);
         table[index].domains = dirty_domains(method);
+        if table[index].domains & PARAMETERS != 0 {
+            table[index].parameter_index = parameter_index;
+            parameter_index += 1;
+        }
         table[index].passive = if output_state(method) {
             true
         } else if matches!(table[index].family, RegisterFamily::VertexAndBinding) {
@@ -259,13 +266,11 @@ pub(in crate::engines) fn embedded_words(
     let upload = upload.expect("embedded inline data produces an upload");
     debug_assert!(count != 0);
     let last = crate::MaxwellMethodSource::decoded(words.get(count - 1).unwrap(), subchannel);
-    candidate.apply(MaxwellThreeDStateWrite::InlineToMemory(
-        MaxwellThreeDInlineToMemoryStateWrite::Data {
-            value: last.argument(),
-            next_offset: upload.offset() + upload.remaining_bytes().min(count as u32 * 4),
-            source: last,
-        },
-    ));
+    candidate.apply_inline(MaxwellThreeDInlineToMemoryStateWrite::Data {
+        value: last.argument(),
+        next_offset: upload.offset() + upload.remaining_bytes().min(count as u32 * 4),
+        source: last,
+    });
     candidate.record_raw_register(last);
     let control = candidate.mme().shadow_ram_control().value().copied();
     candidate
@@ -332,7 +337,11 @@ const fn dirty_domains(method: u32) -> u16 {
             flags &= !PARAMETERS;
         }
     }
-    if matches!(method, 0x1160..=0x11dc | 0x13ac | 0x192c | 0x1608 | 0x160c | 0x2000..=0x217c | 0x2608 | 0x1240..=0x125c)
+    // Code capture consumes program selection and environment observations.
+    // Vertex formats and window origin specialize the native pipeline instead.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+    if matches!(method, 0x192c | 0x1608 | 0x160c | 0x2608 | 0x1240..=0x125c)
+        || (method >= 0x2000 && method < 0x2180 && matches!((method - 0x2000) % 0x40, 0 | 4 | 16))
     {
         flags |= SHADERS;
     }
@@ -406,16 +415,100 @@ const fn dirty_domains(method: u32) -> u16 {
     {
         flags |= DRAW | PARAMETERS;
     }
+    // Physical attachment addresses select views, not rasterization semantics.
+    if matches!(method, 0x0fe0 | 0x0fe4)
+        || (method >= 0x0800 && method < 0x0a00 && (method - 0x0800) % 0x40 <= 4)
+    {
+        flags &= !PARAMETERS;
+    }
+    // The current raster path consumes viewport/scissor zero. Window clipping
+    // is rejected by its enable control; its rectangle words are not consumed.
+    // Keep other words canonical for MME and future consumers without treating
+    // their programming as a change to the current draw's raster parameters.
+    if matches!(method, 0x0a20..=0x0bfc | 0x0c10..=0x0cfc | 0x0e10..=0x0efc | 0x1700..=0x177c) {
+        flags &= !(DRAW | PARAMETERS);
+    }
     flags
 }
-pub(super) fn domains(method: GpuMethodId) -> u16 {
-    METHODS[(method.0 / 4) as usize].domains
+pub(super) const PARAMETER_METHOD_COUNT: usize = {
+    let mut count = 0;
+    let mut i = 0;
+    while i < METHODS.len() {
+        count += (METHODS[i].domains & PARAMETERS != 0) as usize;
+        i += 1;
+    }
+    count
+};
+
+/// Lookup hint only: reuse still compares every consumed register exactly.
+pub(super) fn normalized_parameter_hash(method: GpuMethodId, value: u32) -> u64 {
+    let mut word = (u64::from(method.0) << 32) | u64::from(value);
+    word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    word ^ (word >> 31)
+}
+
+pub(super) fn parameter_word(method: GpuMethodId, value: u32) -> u32 {
+    // BEGIN is validated synchronously. Its instance-counter transition changes
+    // draw arguments, while topology, split and primitive-ID semantics remain.
+    if method.0 == 0x1618 {
+        value & !(3 << 26)
+    } else {
+        value
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engines::tests::{program_three_d, three_d_channel};
+
+    #[test]
+    fn parameter_snapshot_compares_every_consumed_word_exactly() {
+        let mut channel = three_d_channel();
+        let words = channel.three_d().parameter_words();
+        let fingerprint = channel.three_d().parameter_fingerprint();
+        for (index, info) in METHODS.iter().enumerate() {
+            if info.domains & PARAMETERS != 0 {
+                let method = GpuMethodId(index as u32 * 4);
+                let state = channel.three_d_mut();
+                let original = state.raw_register_value(method).unwrap();
+                state.write_register(method, original ^ 0x8000_0000);
+                assert!(
+                    !state.operation_state().matches_parameter_words(&words),
+                    "{method:?}"
+                );
+                state.write_register(method, original);
+                assert!(state.operation_state().matches_parameter_words(&words));
+                assert_eq!(state.operation_state().parameter_fingerprint(), fingerprint);
+            }
+        }
+        assert!(
+            !channel
+                .three_d()
+                .matches_parameter_words(&words[..words.len() - 1])
+        );
+    }
+
+    #[test]
+    fn inactive_viewport_and_window_clip_words_do_not_invalidate_raster_preparation() {
+        let mut channel = three_d_channel();
+        program_three_d(&mut channel, 0x0d78, 3);
+        let before = channel.three_d().draw_state_identity();
+        let words = channel.three_d().parameter_words();
+        for method in [0x0a20, 0x0c10, 0x0e10, 0x1700] {
+            program_three_d(&mut channel, method, u32::MAX);
+            assert_eq!(
+                channel
+                    .three_d_mut()
+                    .raw_register_value(GpuMethodId(method)),
+                Some(u32::MAX)
+            );
+        }
+        program_three_d(&mut channel, 0x0d78, 3);
+        assert!(before.matches_parameters(channel.three_d()));
+        assert!(channel.three_d().matches_parameter_words(&words));
+    }
 
     #[test]
     fn passive_configuration_is_immediately_visible_without_replaying_methods() {

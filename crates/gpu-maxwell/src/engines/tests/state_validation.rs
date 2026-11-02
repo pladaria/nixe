@@ -40,7 +40,7 @@ fn pipe_nop_records_payload_without_execution_effects() {
     use_mme_shadow_passthrough(&mut channel);
 
     for argument in [0, 1, 0x8000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let dispatch = dispatch_method(&mut channel, 0x1a2c / 4, argument).unwrap();
@@ -48,7 +48,7 @@ fn pipe_nop_records_payload_without_execution_effects() {
         assert_eq!(dispatch.methods().len(), 1);
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert!(
             three_d_before
@@ -214,7 +214,7 @@ fn sph_version_check_is_typed_profile_validated_and_state_neutral() {
         (0x0002_0003, 3, 2),
         (0x0002_0004, 4, 2),
     ] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let dispatch = dispatch_method(&mut channel, 0x16a8 / 4, argument).unwrap();
@@ -236,7 +236,7 @@ fn sph_version_check_is_typed_profile_validated_and_state_neutral() {
                 .shader_state_identity()
                 .matches_code(channel.three_d())
         );
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
     }
 }
 
@@ -245,7 +245,7 @@ fn malformed_incompatible_and_suffixed_sph_checks_stop_at_the_invalid_method() {
     let mut channel = three_d_channel();
     use_mme_shadow_passthrough(&mut channel);
 
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = packet(0x16a8 / 4, 0x0003_0002);
@@ -257,7 +257,7 @@ fn malformed_incompatible_and_suffixed_sph_checks_stop_at_the_invalid_method() {
             ..
         }) if source.argument() == 0x0003_0002
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert!(
         three_d_before
@@ -271,7 +271,7 @@ fn malformed_incompatible_and_suffixed_sph_checks_stop_at_the_invalid_method() {
     );
 
     for argument in [0x0002_0002, 0x0004_0004] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let decoded = packet(0x16a8 / 4, argument);
@@ -288,7 +288,7 @@ fn malformed_incompatible_and_suffixed_sph_checks_stop_at_the_invalid_method() {
                 && requested.raw() == argument
                 && supported.raw() == 0x0003_0003
         ));
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert!(
             three_d_before
@@ -302,7 +302,7 @@ fn malformed_incompatible_and_suffixed_sph_checks_stop_at_the_invalid_method() {
         );
     }
 
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = incrementing_packet(0x16a8 / 4, &[0x0003_0003, 0]);
@@ -311,7 +311,7 @@ fn malformed_incompatible_and_suffixed_sph_checks_stop_at_the_invalid_method() {
         Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
             if source.method() == GpuMethodId(0x16ac)
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert!(
         three_d_before
@@ -335,7 +335,7 @@ fn aam_version_check_is_typed_profile_validated_and_state_neutral() {
         (0x0001_0002, 2, 1),
         (0x0001_0003, 3, 1),
     ] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let dispatch = dispatch_method(&mut channel, 0x1794 / 4, argument).unwrap();
@@ -346,7 +346,7 @@ fn aam_version_check_is_typed_profile_validated_and_state_neutral() {
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(requested.raw(), argument);
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert!(
             three_d_before
@@ -366,7 +366,7 @@ fn malformed_incompatible_and_suffixed_aam_checks_stop_at_the_invalid_method() {
     let mut channel = three_d_channel();
     use_mme_shadow_passthrough(&mut channel);
 
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = packet(0x1794 / 4, 0x0003_0002);
@@ -378,7 +378,7 @@ fn malformed_incompatible_and_suffixed_aam_checks_stop_at_the_invalid_method() {
             ..
         }) if source.argument() == 0x0003_0002
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert!(
         three_d_before
@@ -392,7 +392,7 @@ fn malformed_incompatible_and_suffixed_aam_checks_stop_at_the_invalid_method() {
     );
 
     for argument in [0x0001_0001, 0x0003_0003] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let decoded = packet(0x1794 / 4, argument);
@@ -407,7 +407,7 @@ fn malformed_incompatible_and_suffixed_aam_checks_stop_at_the_invalid_method() {
                 && requested.raw() == argument
                 && supported.raw() == 0x0002_0002
         ));
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert!(
             three_d_before
@@ -421,7 +421,7 @@ fn malformed_incompatible_and_suffixed_aam_checks_stop_at_the_invalid_method() {
         );
     }
 
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = incrementing_packet(0x1794 / 4, &[0x0002_0002, 0]);
@@ -430,7 +430,7 @@ fn malformed_incompatible_and_suffixed_aam_checks_stop_at_the_invalid_method() {
         Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
             if source.method() == GpuMethodId(0x1798)
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert!(
         three_d_before
@@ -487,7 +487,7 @@ fn invalid_two_d_notify_address_upper_rejects_atomically() {
     let mut channel = two_d_channel();
 
     for argument in [0x0200_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let decoded = packet_on_subchannel(3, 0x0104 / 4, argument);
@@ -500,7 +500,7 @@ fn invalid_two_d_notify_address_upper_rejects_atomically() {
                 ..
             }) if source.argument() == argument
         ));
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert_eq!(channel.three_d(), &three_d_before);
     }
@@ -562,7 +562,7 @@ fn incrementing_notify_address_fragments_commit_together() {
 #[test]
 fn unsupported_notify_trigger_keeps_both_address_fragments() {
     let mut channel = two_d_channel();
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = incrementing_packet_on_subchannel(3, 0x0104 / 4, &[1, 0x0820_2010, 0]);
@@ -574,7 +574,7 @@ fn unsupported_notify_trigger_keeps_both_address_fragments() {
             class_name: "FERMI_TWOD_A",
         }) if source.method() == GpuMethodId(0x010c)
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_ne!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 }
@@ -649,7 +649,7 @@ fn invalid_two_d_render_enable_modes_are_rejected_atomically() {
     let mut channel = two_d_channel();
 
     for argument in [5, 6, 7, 8, u32::MAX] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let decoded = packet_on_subchannel(3, 0x026c / 4, argument);
@@ -662,7 +662,7 @@ fn invalid_two_d_render_enable_modes_are_rejected_atomically() {
                 ..
             }) if source.argument() == argument
         ));
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert_eq!(channel.three_d(), &three_d_before);
     }
@@ -673,7 +673,7 @@ fn unsupported_render_enable_address_methods_remain_typed_fatal_errors() {
     let mut channel = two_d_channel();
 
     for method in [0x0264, 0x0268] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let decoded = packet_on_subchannel(3, method / 4, 0);
@@ -685,7 +685,7 @@ fn unsupported_render_enable_address_methods_remain_typed_fatal_errors() {
                 class_name: "FERMI_TWOD_A",
             }) if source.method() == GpuMethodId(method)
         ));
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert_eq!(channel.three_d(), &three_d_before);
     }
@@ -817,7 +817,7 @@ fn two_d_clip_enable_values_are_typed_state_without_execution() {
 #[test]
 fn invalid_two_d_clip_enable_rejects_without_mutating_channel_state() {
     let mut channel = two_d_channel();
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = packet_on_subchannel(3, 0x0290 / 4, 2);
@@ -830,7 +830,7 @@ fn invalid_two_d_clip_enable_rejects_without_mutating_channel_state() {
             ..
         }) if source.argument() == 2
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 }
@@ -878,7 +878,7 @@ fn two_d_color_key_enable_values_are_typed_state_without_execution() {
 #[test]
 fn invalid_two_d_color_key_enable_rejects_without_mutating_channel_state() {
     let mut channel = two_d_channel();
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = packet_on_subchannel(3, 0x029c / 4, 2);
@@ -891,7 +891,7 @@ fn invalid_two_d_color_key_enable_rejects_without_mutating_channel_state() {
             ..
         }) if source.argument() == 2
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 }
@@ -932,7 +932,7 @@ fn invalid_two_d_corral_size_rejects_without_mutating_channel_state() {
     let mut channel = two_d_channel();
 
     for argument in [0x0400, u32::MAX] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let decoded = packet_on_subchannel(3, 0x0884 / 4, argument);
@@ -945,7 +945,7 @@ fn invalid_two_d_corral_size_rejects_without_mutating_channel_state() {
                 ..
             }) if source.argument() == argument
         ));
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert_eq!(channel.three_d(), &three_d_before);
     }
@@ -986,7 +986,7 @@ fn invalid_two_d_safe_overlap_rejects_without_mutating_channel_state() {
     let mut channel = two_d_channel();
 
     for argument in [2, u32::MAX] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let decoded = packet_on_subchannel(3, 0x0888 / 4, argument);
@@ -999,7 +999,7 @@ fn invalid_two_d_safe_overlap_rejects_without_mutating_channel_state() {
                 ..
             }) if source.argument() == argument
         ));
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert_eq!(channel.three_d(), &three_d_before);
     }
@@ -1008,7 +1008,7 @@ fn invalid_two_d_safe_overlap_rejects_without_mutating_channel_state() {
 #[test]
 fn unsupported_pixels_from_memory_method_remains_a_typed_fatal_error() {
     let mut channel = two_d_channel();
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = packet_on_subchannel(3, 0x0880 / 4, 0);
@@ -1020,7 +1020,7 @@ fn unsupported_pixels_from_memory_method_remains_a_typed_fatal_error() {
             class_name: "FERMI_TWOD_A",
         }) if source.method() == GpuMethodId(0x0880)
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 }
@@ -1030,7 +1030,7 @@ fn invalid_two_d_operation_values_are_rejected_atomically() {
     let mut channel = two_d_channel();
 
     for argument in [7, 8] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let decoded = packet_on_subchannel(3, 0x02ac / 4, argument);
@@ -1043,7 +1043,7 @@ fn invalid_two_d_operation_values_are_rejected_atomically() {
                 ..
             }) if source.argument() == argument
         ));
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert_eq!(channel.three_d(), &three_d_before);
     }
@@ -1052,7 +1052,7 @@ fn invalid_two_d_operation_values_are_rejected_atomically() {
 #[test]
 fn unsupported_method_after_two_d_operation_keeps_the_packet_prefix() {
     let mut channel = two_d_channel();
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = incrementing_packet_on_subchannel(3, 0x02ac / 4, &[3, 0]);
@@ -1064,7 +1064,7 @@ fn unsupported_method_after_two_d_operation_keeps_the_packet_prefix() {
             class_name: "FERMI_TWOD_A",
         }) if source.method() == GpuMethodId(0x02b0)
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_ne!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 }
@@ -1072,7 +1072,7 @@ fn unsupported_method_after_two_d_operation_keeps_the_packet_prefix() {
 #[test]
 fn invalid_two_d_value_rejects_without_mutating_any_channel_state() {
     let mut channel = two_d_channel();
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = packet_on_subchannel(3, 0x0260 / 4, 2);
@@ -1085,7 +1085,7 @@ fn invalid_two_d_value_rejects_without_mutating_any_channel_state() {
             ..
         }) if source.argument() == 2
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 }
@@ -1093,7 +1093,7 @@ fn invalid_two_d_value_rejects_without_mutating_any_channel_state() {
 #[test]
 fn unsupported_two_d_suffix_keeps_the_valid_packet_prefix() {
     let mut channel = two_d_channel();
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = incrementing_packet_on_subchannel(3, 0x0260 / 4, &[1, 0]);
@@ -1105,7 +1105,7 @@ fn unsupported_two_d_suffix_keeps_the_valid_packet_prefix() {
             class_name: "FERMI_TWOD_A",
         }) if source.method() == GpuMethodId(0x0264)
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_ne!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 }
@@ -1153,7 +1153,7 @@ fn invalid_three_d_render_enable_modes_are_rejected_atomically() {
     let mut channel = three_d_channel();
 
     for argument in [5, 6, 7, 8, u32::MAX] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
         let three_d_before = channel.three_d().clone();
         let decoded = packet(0x1558 / 4, argument);
@@ -1166,7 +1166,7 @@ fn invalid_three_d_render_enable_modes_are_rejected_atomically() {
                 ..
             }) if source.argument() == argument
         ));
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
         assert_eq!(channel.three_d(), &three_d_before);
     }

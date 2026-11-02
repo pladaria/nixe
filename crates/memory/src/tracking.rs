@@ -111,21 +111,26 @@ pub struct Observation(Arc<AtomicBool>);
 /// The caller retains the allocation or the mapping for every read.
 pub struct MappedRamReader<'a> {
     machine: &'a Machine,
-    guard: Option<PhysicalGuard<'a>>,
+    current: Option<PhysicalGuard<'a>>,
+    retained: [Option<PhysicalGuard<'a>>; 3],
+    next: usize,
 }
 
 impl Machine {
     pub fn mapped_ram_reader(&self) -> MappedRamReader<'_> {
         MappedRamReader {
             machine: self,
-            guard: None,
+            current: None,
+            retained: [const { None }; 3],
+            next: 0,
         }
     }
 }
 
 impl MappedRamReader<'_> {
     pub fn release(&mut self) {
-        self.guard = None;
+        self.current = None;
+        self.retained = [const { None }; 3];
     }
 
     /// # Safety
@@ -149,11 +154,31 @@ impl MappedRamReader<'_> {
             return Ok(true);
         }
         if !self
-            .guard
+            .current
             .as_ref()
             .is_some_and(|guard| guard.covers(extent))
         {
-            self.guard = Some(self.machine.physical_access().enter(extent));
+            if let Some(index) = self
+                .retained
+                .iter()
+                .position(|guard| guard.as_ref().is_some_and(|guard| guard.covers(extent)))
+            {
+                std::mem::swap(&mut self.current, &mut self.retained[index]);
+            } else {
+                // Handles, image headers and samplers commonly alternate between
+                // a few regions in one draw. Retain their short admissions, not
+                // their bytes. Never wait with a partial set: a protection writer
+                // may have closed both an earlier region and this new one.
+                // This is the same admission rule as PhysicalAccess::enter_many.
+                if let Some(guard) = self.machine.physical_access().try_enter(extent) {
+                    self.retained[self.next] = self.current.take();
+                    self.current = Some(guard);
+                    self.next = (self.next + 1) % self.retained.len();
+                } else {
+                    self.release();
+                    self.current = Some(self.machine.physical_access().enter(extent));
+                }
+            }
         }
         if pages(extent).any(|page| self.machine.tracking().device.get(page)) {
             return Ok(false);
@@ -205,6 +230,118 @@ impl WriteSource<'_> {
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+/// A graphics-owner capture retains and admits these physical regions until the
+/// callback returns. RAM is read through instruction primitives, never borrowed
+/// as a Rust slice; other guest accesses can use mixed widths concurrently.
+pub struct ResourceReader<'a> {
+    machine: &'a Machine,
+    retained: Vec<Extent>,
+    #[cfg(any(test, feature = "performance-counters"))]
+    captured: std::cell::Cell<u64>,
+}
+/// A validated region within the current capture. It cannot outlive admission.
+pub struct ResourceRead<'a> {
+    source: crate::HostAddress,
+    bytes: u64,
+    _capture: std::marker::PhantomData<&'a ()>,
+    #[cfg(any(test, feature = "performance-counters"))]
+    captured: &'a std::cell::Cell<u64>,
+}
+impl ResourceReader<'_> {
+    fn new<'a>(
+        machine: &'a Machine,
+        inputs: &[AllocationRange],
+    ) -> Result<ResourceReader<'a>, MemoryError> {
+        machine.validate_ranges(inputs)?;
+        let mut extents: Vec<_> = inputs
+            .iter()
+            .flat_map(AllocationRange::physical_extents)
+            .collect();
+        extents.sort_unstable_by_key(|extent| extent.start);
+        let mut retained: Vec<Extent> = Vec::new();
+        for extent in extents {
+            if let Some(last) = retained.last_mut()
+                && last.start.get() + last.bytes >= extent.start.get()
+            {
+                last.bytes = (extent.start.get() + extent.bytes).max(last.start.get() + last.bytes)
+                    - last.start.get();
+            } else {
+                retained.push(extent);
+            }
+        }
+        Ok(ResourceReader {
+            machine,
+            retained,
+            #[cfg(any(test, feature = "performance-counters"))]
+            captured: std::cell::Cell::new(0),
+        })
+    }
+    pub fn machine(&self) -> crate::MachineId {
+        self.machine.identity()
+    }
+    pub fn regions(&self) -> &[Extent] {
+        &self.retained
+    }
+    fn validate(&self, extent: Extent) -> Result<(), MemoryError> {
+        let index = self
+            .retained
+            .partition_point(|retained| retained.start <= extent.start);
+        if extent.bytes == 0
+            || index == 0
+            || extent
+                .start
+                .get()
+                .checked_add(extent.bytes)
+                .is_none_or(|end| {
+                    end > self.retained[index - 1].start.get() + self.retained[index - 1].bytes
+                })
+        {
+            return Err(MemoryError::Invalid(
+                "physical capture exceeds retained input",
+            ));
+        }
+        Ok(())
+    }
+    pub fn region(&self, extent: Extent) -> Result<ResourceRead<'_>, MemoryError> {
+        self.validate(extent)?;
+        Ok(self.validated_region(extent))
+    }
+    fn validated_region(&self, extent: Extent) -> ResourceRead<'_> {
+        ResourceRead {
+            source: self
+                .machine
+                .arena()
+                .host_address(extent.start, extent.bytes)
+                .expect("retained physical region"),
+            bytes: extent.bytes,
+            _capture: std::marker::PhantomData,
+            #[cfg(any(test, feature = "performance-counters"))]
+            captured: &self.captured,
+        }
+    }
+}
+impl ResourceRead<'_> {
+    #[inline]
+    pub fn copy(&self, offset: u64, destination: &mut [u8]) -> Result<(), MemoryError> {
+        if offset
+            .checked_add(destination.len() as u64)
+            .is_none_or(|end| end > self.bytes)
+        {
+            return Err(MemoryError::Invalid(
+                "physical capture exceeds admitted region",
+            ));
+        }
+        // SAFETY: the region is retained/admitted for this callback; the checked
+        // destination is exclusive host memory. No guest RAM references escape.
+        unsafe {
+            crate::raw::capture(self.source.as_ptr().add(offset as usize), destination);
+        }
+        #[cfg(any(test, feature = "performance-counters"))]
+        self.captured
+            .set(self.captured.get() + destination.len() as u64);
+        Ok(())
     }
 }
 /// A checked copy from retained physical input into an owned native snapshot.
@@ -299,6 +436,15 @@ impl Tracking {
     }
     pub fn observed(&self, page: u64) -> bool {
         self.observed.get(page) || self.resource_observed.get(page)
+    }
+    /// Immutable observations require invalidation outside native execution.
+    /// Otherwise cache/device pages can journal stores under physical admission.
+    pub fn native_store_tracking(&self, page: u64) -> Option<bool> {
+        if self.observed.get(page) {
+            None
+        } else {
+            Some(self.resource_observed.get(page) || self.device.get(page))
+        }
     }
     fn all_observed(&self, extent: Extent) -> bool {
         bitmap_words(extent).all(|(word, mask)| {
@@ -1109,28 +1255,6 @@ impl Machine {
             .any(|extent| self.tracking().device.any(extent)))
     }
 
-    /// Return a contiguous RAM source for consumption on the graphics owner.
-    /// The retained range must outlive every raw load through this pointer.
-    /// Subsequent owner effects can change coherence, just as for a native
-    /// command span; this is neither a byte snapshot nor a CPU visibility grant.
-    pub fn try_ram_pointer(
-        &self,
-        range: &AllocationRange,
-    ) -> Result<Option<crate::HostAddress>, MemoryError> {
-        self.validate_ranges(std::slice::from_ref(range))?;
-        let mut extents = range.physical_extents();
-        let Some(extent) = extents.next() else {
-            return Ok(None);
-        };
-        if extents.next().is_some() {
-            return Ok(None);
-        }
-        let _access = self.physical_access().enter(extent);
-        if self.tracking().device.any(extent) {
-            return Ok(None);
-        }
-        Ok(self.arena().host_address(extent.start, extent.bytes))
-    }
     /// Write on the graphics owner while the caller holds the original mappings.
     /// Returns whether device coverage must be subtracted before another effect.
     /// Cache invalidations accumulate in the existing dirty-page queue.
@@ -1446,90 +1570,75 @@ impl Machine {
         copies: &[PhysicalCapture],
         destination: &mut [u8],
     ) -> Result<(), MemoryError> {
-        self.validate_ranges(inputs)?;
-        let mut extents: Vec<_> = inputs
-            .iter()
-            .flat_map(AllocationRange::physical_extents)
-            .collect();
-        extents.sort_unstable_by_key(|extent| extent.start);
-        let mut retained: Vec<Extent> = Vec::new();
-        for extent in extents {
-            if let Some(last) = retained.last_mut()
-                && last.start.get() + last.bytes >= extent.start.get()
-            {
-                last.bytes = (extent.start.get() + extent.bytes).max(last.start.get() + last.bytes)
-                    - last.start.get();
-            } else {
-                retained.push(extent);
-            }
-        }
+        let reader = ResourceReader::new(self, inputs)?;
         for copy in copies {
-            let index = retained.partition_point(|extent| extent.start <= copy.source.start);
-            if copy.source.bytes == 0
-                || index == 0
-                || copy
-                    .source
-                    .start
-                    .get()
-                    .checked_add(copy.source.bytes)
-                    .is_none_or(|end| {
-                        end > retained[index - 1].start.get() + retained[index - 1].bytes
-                    })
-                || copy
-                    .destination
-                    .checked_add(copy.source.bytes as usize)
-                    .is_none_or(|end| end > destination.len())
+            reader.validate(copy.source)?;
+            if copy
+                .destination
+                .checked_add(copy.source.bytes as usize)
+                .is_none_or(|end| end > destination.len())
             {
-                return Err(MemoryError::Invalid(
-                    "physical capture exceeds retained input or destination",
-                ));
+                return Err(MemoryError::Invalid("physical capture exceeds destination"));
             }
         }
-        let capture = |destination: &mut [u8]| {
-            for &extent in &retained {
+        self.capture_resource_with(inputs, reader, |reader| {
+            for copy in copies {
+                let end = copy.destination + copy.source.bytes as usize;
+                reader
+                    .validated_region(copy.source)
+                    .copy(0, &mut destination[copy.destination..end])?;
+            }
+            Ok(())
+        })
+    }
+    /// Capture layouts directly while their physical inputs remain admitted.
+    /// The graphics owner resolves native producers before entering. The reader
+    /// permits tiled imports without building a list of every 16-byte copy.
+    pub fn capture_resource<T>(
+        &self,
+        inputs: &[AllocationRange],
+        capture: impl FnOnce(&ResourceReader<'_>) -> Result<T, MemoryError>,
+    ) -> Result<T, MemoryError> {
+        let reader = ResourceReader::new(self, inputs)?;
+        self.capture_resource_with(inputs, reader, capture)
+    }
+    fn capture_resource_with<T>(
+        &self,
+        inputs: &[AllocationRange],
+        reader: ResourceReader<'_>,
+        capture: impl FnOnce(&ResourceReader<'_>) -> Result<T, MemoryError>,
+    ) -> Result<T, MemoryError> {
+        let observe = || {
+            for &extent in &reader.retained {
                 self.tracking()
                     .resource_observed
                     .update_range(extent, true, |_| {});
             }
-            for copy in copies {
-                let source = self
-                    .arena()
-                    .host_address(copy.source.start, copy.source.bytes)
-                    .expect("validated physical capture");
-                let end = copy.destination + copy.source.bytes as usize;
-                // Physical exclusion and existing/new write protection keep
-                // every writer outside this copy. The destination is borrowed
-                // only for the duration of this capture.
-                unsafe {
-                    crate::raw::capture(source.as_ptr(), &mut destination[copy.destination..end]);
-                }
-                #[cfg(any(test, feature = "performance-counters"))]
-                self.tracking()
-                    .captured_bytes
-                    .fetch_add(copy.source.bytes, Ordering::Relaxed);
-            }
+        };
+        let read = || {
+            let result = capture(&reader);
+            #[cfg(any(test, feature = "performance-counters"))]
+            self.tracking()
+                .captured_bytes
+                .fetch_add(reader.captured.get(), Ordering::Relaxed);
+            result
         };
         {
-            let _access = self.physical_access().enter_many(&retained);
-            if retained
+            let _access = self.physical_access().enter_many(&reader.retained);
+            if reader
+                .retained
                 .iter()
                 .all(|&extent| self.tracking().all_observed(extent))
             {
-                capture(destination);
-                return Ok(());
+                observe();
+                return read();
             }
         }
         self.tracking_transition(inputs, |batch, _| {
-            for &extent in &retained {
-                self.tracking()
-                    .resource_observed
-                    .update_range(extent, true, |_| {});
-            }
+            observe();
             batch.refresh()?;
-            capture(destination);
-            Ok(())
-        })?;
-        Ok(())
+            read()
+        })
     }
     /// Streaming captures keep dirty RAM dirty and do not install observers or
     /// change native protection. Callers supply the owned upload destination.
@@ -1543,26 +1652,50 @@ impl Machine {
                 "physical capture destination size mismatch",
             ));
         }
+        // SAFETY: the caller's ranges retain all of these physical extents.
+        unsafe {
+            self.capture_stream_extents(
+                ranges.iter().flat_map(AllocationRange::physical_extents),
+                destination,
+            )
+        }
+    }
+    /// # Safety
+    /// Every source extent is retained until this synchronous copy finishes,
+    /// belongs to this machine, and their total length equals the destination.
+    pub(crate) unsafe fn capture_stream_extents(
+        &self,
+        extents: impl Iterator<Item = Extent>,
+        destination: &mut [u8],
+    ) -> Result<(), MemoryError> {
         let mut offset = 0;
-        for range in ranges {
-            for extent in range.physical_extents() {
-                let _access = self.physical_access().enter(extent);
-                let bytes = extent.bytes as usize;
-                let source = self
-                    .arena()
-                    .host_address(extent.start, extent.bytes)
-                    .expect("retained physical extent");
-                unsafe {
-                    crate::raw::capture(source.as_ptr(), &mut destination[offset..offset + bytes]);
-                }
-                offset += bytes;
+        for extent in extents {
+            let _access = self.physical_access().enter(extent);
+            let bytes = extent.bytes as usize;
+            // SAFETY: the caller retains the extent and admission is held.
+            unsafe {
+                self.capture_stream_admitted(extent, &mut destination[offset..offset + bytes]);
             }
+            offset += bytes;
+        }
+        Ok(())
+    }
+    /// # Safety
+    /// The extent must stay live through this synchronous read, physical
+    /// admission must cover it, and the destination must match its size.
+    pub(crate) unsafe fn capture_stream_admitted(&self, extent: Extent, destination: &mut [u8]) {
+        debug_assert_eq!(extent.bytes, destination.len() as u64);
+        let source = self
+            .arena()
+            .host_address(extent.start, extent.bytes)
+            .expect("retained physical extent");
+        unsafe {
+            crate::raw::capture(source.as_ptr(), destination);
         }
         #[cfg(any(test, feature = "performance-counters"))]
         self.tracking()
             .captured_bytes
             .fetch_add(destination.len() as u64, Ordering::Relaxed);
-        Ok(())
     }
     // Caller either holds physical admission with established write protection,
     // or has closed physical access and established protection on every alias.
@@ -3104,12 +3237,16 @@ mod tests {
             .allocate(2 * PAGE_SIZE)
             .unwrap();
         let ranges = [AllocationRange::new(allocation.pin(), 0, 2 * PAGE_SIZE).unwrap()];
+        let weak = allocation.pin().downgrade();
         let before = machine.tracking_statistics();
         for byte in 0..8 {
             let source = vec![byte; (2 * PAGE_SIZE) as usize];
             machine.write_resolved(&ranges, &source).unwrap();
             let mut destination = vec![0; source.len()];
             machine.capture_stream(&ranges, &mut destination).unwrap();
+            assert_eq!(source, destination);
+            destination.fill(0xff);
+            weak.capture_stream(0, &mut destination).unwrap();
             assert_eq!(source, destination);
         }
         assert_eq!(

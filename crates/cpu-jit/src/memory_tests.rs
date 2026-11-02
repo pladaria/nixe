@@ -398,6 +398,58 @@ fn mixed_page_repeated_reads_reuse_coherency_without_caching_values() {
 }
 
 #[test]
+fn cached_ram_stores_reuse_protection_through_faults_aliases_and_cross_page_callbacks() {
+    // STR X0,[X1]; LDR X2,[X1]; SVC.
+    for address in [ALIAS + 24, DATA + PAGE_SIZE - 4] {
+        let (space, process, mut state) = fixture(&[0xf9000020, 0xf9400022, 0xd4000001]);
+        state.write_x(x(1), address);
+        assert!(matches!(
+            run(&process, &mut state),
+            CpuExit::SupervisorCall { .. }
+        ));
+        let machine = space.machine();
+        machine.enable_cpu_write_collection().unwrap();
+        let inputs = capture(&space, DATA, 2 * PAGE_SIZE);
+        machine
+            .capture_resource_scattered(&inputs, &[], &mut [])
+            .unwrap();
+        let protections = machine.tracking_statistics().protection_calls;
+        for value in 100..120 {
+            state.set_pc(CODE);
+            state.write_x(x(0), value);
+            assert!(matches!(
+                run(&process, &mut state),
+                CpuExit::SupervisorCall { .. }
+            ));
+            assert_eq!(state.read_x(x(2)), value);
+            assert_eq!(read(&space, address, 8), u128::from(value));
+            let dirty = machine.collect_cpu_writes().unwrap();
+            assert_eq!(dirty.iter().map(AllocationRange::bytes).sum::<u64>(), 8);
+            assert_eq!(machine.tracking_statistics().protection_calls, protections);
+        }
+        let observed = nixe_memory::Observation::default();
+        machine
+            .access_captured(
+                &capture(&space, address, 8),
+                AccessOperation::ReadObserved(observed.clone()),
+            )
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        state.set_pc(CODE);
+        state.write_x(x(0), 200);
+        assert!(matches!(
+            run(&process, &mut state),
+            CpuExit::SupervisorCall { .. }
+        ));
+        assert!(observed.is_invalid());
+        assert_eq!(state.read_x(x(2)), 200);
+        assert!(machine.collect_cpu_writes().unwrap().is_empty());
+        machine.disable_cpu_write_collection();
+    }
+}
+
+#[test]
 fn write_only_guest_mapping_uses_the_checked_native_store() {
     let (space, process, mut state) = fixture(&[0xf9000020, 0xd4000001]);
     space

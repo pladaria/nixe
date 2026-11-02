@@ -25,18 +25,41 @@ pub(in crate::engines) async fn before_method<E>(
         Option<(u32, u32)>,
     ) -> Result<(), E>,
 ) -> Result<(), E> {
+    if !admit_method(state, source.method(), source.argument()) {
+        flush(state, consume).await?;
+    }
+    Ok(())
+}
+
+/// Admit methods that preserve a deferred instance run without constructing an
+/// asynchronous effect. Only an actual draw boundary requires the consumer.
+#[inline]
+pub(super) fn admit_method(
+    state: &mut MaxwellThreeDFrontendState,
+    method: GpuMethodId,
+    argument: u32,
+) -> bool {
     let Some(run) = state.instance_run else {
-        return Ok(());
+        return true;
     };
-    let method = source.method().0;
-    let argument = source.argument();
-    if super::registers::passive(source.method())
+    admit_pending_method(state, run, method, argument)
+}
+
+#[inline(never)]
+fn admit_pending_method(
+    state: &mut MaxwellThreeDFrontendState,
+    run: InstanceRun,
+    method: GpuMethodId,
+    argument: u32,
+) -> bool {
+    if super::registers::passive(method)
         && state.mme().shadow_ram_control().value()
             != Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay)
-        && state.raw_register_value(source.method()) == Some(argument)
+        && state.raw_register_value(method) == Some(argument)
     {
-        return Ok(());
+        return true;
     }
+    let method = method.0;
     let continuing = state.mme().shadow_ram_control().value()
         != Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay)
         && match method {
@@ -76,12 +99,10 @@ pub(in crate::engines) async fn before_method<E>(
             }
             _ => false,
         };
-    if !continuing {
-        flush(state, consume).await?;
-    } else if method == 0x1618 {
+    if continuing && method == 0x1618 {
         state.complete_draw_end();
     }
-    Ok(())
+    continuing
 }
 
 pub(in crate::engines) async fn operation<E>(
@@ -93,7 +114,18 @@ pub(in crate::engines) async fn operation<E>(
         Option<(u32, u32)>,
     ) -> Result<(), E>,
 ) -> Result<(), E> {
-    if let PendingEngineOperation::ThreeD(trigger) = operation
+    if defer(state, &operation) {
+        return Ok(());
+    }
+    flush(state, consume).await?;
+    consume(operation, state.operation_state(), None).await
+}
+
+pub(super) fn defer(
+    state: &mut MaxwellThreeDFrontendState,
+    operation: &PendingEngineOperation,
+) -> bool {
+    if let PendingEngineOperation::ThreeD(trigger) = *operation
         && trigger.is_draw()
         && state.operation_state().inline_index().is_none()
     {
@@ -110,10 +142,9 @@ pub(in crate::engines) async fn operation<E>(
                 count: 1,
             });
         }
-        return Ok(());
+        return true;
     }
-    flush(state, consume).await?;
-    consume(operation, state.operation_state(), None).await
+    false
 }
 
 pub(in crate::engines) async fn flush<E>(
@@ -204,10 +235,18 @@ mod tests {
             source: source(),
             candidate: &mut state,
             consume: &mut consume,
+            pending: None,
             _error: std::marker::PhantomData,
         };
         for &(method, value) in methods {
-            match crate::test_memory::ready(host.emit_method((method / 4) as u16, value)) {
+            let method = (method / 4) as u16;
+            if host
+                .try_emit_method(method, value)
+                .unwrap_or_else(|_| panic!("admit method"))
+            {
+                continue;
+            }
+            match crate::test_memory::ready(host.finish_method(method, value)) {
                 Ok(()) => {}
                 Err(MaxwellThreeDMmePreflightError::Dispatch(error)) => panic!("{error}"),
                 Err(MaxwellThreeDMmePreflightError::Consumer(never)) => match never {},

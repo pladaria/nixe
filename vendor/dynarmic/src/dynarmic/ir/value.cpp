@@ -92,9 +92,15 @@ bool Value::IsIdentity() const {
 }
 
 bool Value::IsImmediate() const {
-    if (IsIdentity())
-        return inner.inst->GetArg(0).IsImmediate();
-    return type != Type::Opaque;
+    // Resolve identities iteratively, as Eden does, without recursive queries.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/ir/value.cpp
+    Value current = *this;
+    while (current.type == Type::Opaque) {
+        if (current.inner.inst->GetOpcode() != Opcode::Identity)
+            return false;
+        current = current.inner.inst->GetArg(0);
+    }
+    return true;
 }
 
 bool Value::IsEmpty() const {
@@ -102,11 +108,13 @@ bool Value::IsEmpty() const {
 }
 
 Type Value::GetType() const {
-    if (IsIdentity())
-        return inner.inst->GetArg(0).GetType();
-    if (type == Type::Opaque)
-        return inner.inst->GetType();
-    return type;
+    Value current = *this;
+    while (current.type == Type::Opaque) {
+        if (current.inner.inst->GetOpcode() != Opcode::Identity)
+            return current.inner.inst->GetType();
+        current = current.inner.inst->GetArg(0);
+    }
+    return current.type;
 }
 
 A32::Reg Value::GetA32RegRef() const {
@@ -136,9 +144,12 @@ Inst* Value::GetInst() const {
 
 Inst* Value::GetInstRecursive() const {
     ASSERT(type == Type::Opaque);
-    if (IsIdentity())
-        return inner.inst->GetArg(0).GetInstRecursive();
-    return inner.inst;
+    Value current = *this;
+    while (current.type == Type::Opaque && current.inner.inst->GetOpcode() == Opcode::Identity) {
+        current = current.inner.inst->GetArg(0);
+    }
+    ASSERT(current.type == Type::Opaque);
+    return current.inner.inst;
 }
 
 bool Value::GetU1() const {

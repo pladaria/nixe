@@ -1,12 +1,19 @@
 use super::*;
+use crate::engines::threed::MaxwellThreeDBindingLocation;
 use nixe_gpu::shader_compilation::ShaderInputs;
 use nixe_shader_recompiler::{Environment, Stage, artifact::ResourceSource, types::TextureType};
 use std::collections::BTreeMap;
 
+pub(super) struct ShaderBinding {
+    pub id: ResourceId,
+    pub role: MaxwellThreeDResourceRole,
+    pub location: MaxwellThreeDBindingLocation,
+}
+
 pub(super) struct ShaderInterface {
-    pub bindings: Arc<[(ResourceId, MaxwellThreeDResourceRole)]>,
-    pub sizes: Box<[(MaxwellThreeDResourceRole, MaxwellShaderBufferSize)]>,
-    pub roles: Vec<MaxwellThreeDResourceRole>,
+    pub bindings: Arc<[ShaderBinding]>,
+    pub resources: MaxwellThreeDResourceSelection,
+    pub vertex_attributes: u32,
     pub pixel_depth: bool,
 }
 impl ShaderInterface {
@@ -14,8 +21,17 @@ impl ShaderInterface {
         let mut bindings = BTreeMap::new();
         let mut sizes = BTreeMap::new();
         let mut pixel_depth = false;
+        let mut vertex_attributes = 0;
         for program in &inputs.stages {
             let stage = program.environment.metadata().stage;
+            // Capture has already merged Vertex A into Vertex B's metadata.
+            if stage == Stage::VertexB {
+                for location in 0..32 {
+                    if program.info.loads.generic(location) {
+                        vertex_attributes |= 1 << location;
+                    }
+                }
+            }
             if stage == Stage::VertexA {
                 continue;
             }
@@ -155,17 +171,47 @@ impl ShaderInterface {
             .collect();
         roles.sort_unstable();
         roles.dedup();
+        // Draw fetch and attachment slots occupy separate groups. Program
+        // resource positions therefore survive address, content and enable
+        // changes, just like Eden's indexed channel bindings.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+        let bindings = bindings
+            .into_iter()
+            .map(|(id, role)| {
+                let sampler = matches!(role, MaxwellThreeDResourceRole::Sampler(_));
+                let position = if let MaxwellThreeDResourceRole::Sampler(texture) = role {
+                    roles.iter().position(|r| matches!(r,
+                        MaxwellThreeDResourceRole::SampledImage { texture: found, with_sampler: true, .. }
+                        if *found == texture))
+                } else {
+                    roles.binary_search(&role).ok()
+                }
+                .ok_or_else(|| compilation("shader binding has no resource slot"))?;
+                let group = role.binding_group();
+                let begin = roles.partition_point(|r| r.binding_group() < group);
+                Ok(ShaderBinding {
+                    id,
+                    role,
+                    location: MaxwellThreeDBindingLocation {
+                        group,
+                        index: position - begin,
+                        sampler,
+                    },
+                })
+            })
+            .collect::<Result<Arc<[_]>, Error>>()?;
+        let resources =
+            MaxwellThreeDResourceSelection::new(&roles, &sizes.into_iter().collect::<Vec<_>>());
         Ok(Self {
-            bindings: bindings.into_iter().collect(),
-            sizes: sizes.into_iter().collect(),
-            roles,
+            bindings,
+            resources,
+            vertex_attributes,
             pixel_depth,
         })
     }
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + std::mem::size_of_val(self.bindings.as_ref())
-            + std::mem::size_of_val(self.sizes.as_ref())
-            + self.roles.capacity() * std::mem::size_of::<MaxwellThreeDResourceRole>()
+            + self.resources.retained_bytes()
     }
 }

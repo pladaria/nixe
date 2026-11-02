@@ -1,4 +1,5 @@
 use super::*;
+use crate::engines::threed::MaxwellThreeDResourceSelection;
 
 pub(super) fn fixture_roles(
     state: &MaxwellThreeDState,
@@ -10,7 +11,10 @@ pub(super) fn fixture_roles(
     roles.sort_unstable();
     roles.dedup();
     super::super::threed::MaxwellThreeDResolvedResourceCache::new(1)
-        .select(&roles, &[])
+        .select(
+            &MaxwellThreeDResourceSelection::new(&roles, &[]),
+            Default::default(),
+        )
         .resolve(state, space, 4096, access)
         .cloned()
 }

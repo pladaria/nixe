@@ -415,7 +415,7 @@ where
                     );
                 }
                 let error = result.as_ref().err().cloned();
-                let _ = reply.send(result);
+                reply.complete(result);
                 return error.map_or(Ok(()), |detail| {
                     Err(owner.borrow().failure(FrontendSubmissionId::new(0), detail))
                 });
@@ -575,7 +575,7 @@ where
                     let _ = reply.send(Err("GPU owner is shutting down".into()));
                 }
                 GpuMessage::PresentImage { reply, .. } => {
-                    let _ = reply.send(Err("GPU owner is shutting down".into()));
+                    reply.complete(Err("GPU owner is shutting down".into()));
                 }
                 _ => {}
             }

@@ -218,30 +218,22 @@ impl MaxwellThreeDInlineConstantBufferUpload {
     }
 }
 
+/// Complete active selection; `None` in a channel slot means disabled.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDConstantBufferBinding {
-    pub(super) enabled: bool,
-    pub(super) address: Option<MaxwellThreeDUnresolvedAddress>,
-    pub(super) size: Option<u32>,
-    pub(super) source: MaxwellMethodSource,
+    pub(super) address: MaxwellThreeDUnresolvedAddress,
+    pub(super) size: std::num::NonZeroU32,
 }
 
 impl MaxwellThreeDConstantBufferBinding {
     #[must_use]
-    pub const fn enabled(self) -> bool {
-        self.enabled
-    }
-    #[must_use]
-    pub const fn address(self) -> Option<MaxwellThreeDUnresolvedAddress> {
+    pub const fn address(self) -> MaxwellThreeDUnresolvedAddress {
         self.address
     }
     #[must_use]
-    pub const fn size(self) -> Option<u32> {
-        self.size
-    }
-    #[must_use]
-    pub const fn source(self) -> MaxwellMethodSource {
-        self.source
+    pub const fn size(self) -> u32 {
+        self.size.get()
     }
 }
 

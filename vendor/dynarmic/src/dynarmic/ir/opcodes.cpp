@@ -17,9 +17,8 @@ namespace Dynarmic::IR {
 namespace OpcodeInfo {
 
 struct Meta {
-    const char* name;
-    Type type;
     std::vector<Type> arg_types;
+    Type type;
 };
 
 constexpr Type Void = Type::Void;
@@ -40,10 +39,13 @@ constexpr Type Cond = Type::Cond;
 constexpr Type Table = Type::Table;
 constexpr Type AccType = Type::AccType;
 
-static const std::array opcode_info{
-#define OPCODE(name, type, ...) Meta{#name, type, {__VA_ARGS__}},
-#define A32OPC(name, type, ...) Meta{#name, type, {__VA_ARGS__}},
-#define A64OPC(name, type, ...) Meta{#name, type, {__VA_ARGS__}},
+// Keep diagnostic names outside the hot metadata and use the IR opcode/operand
+// invariants, as Eden does, rather than checked container lookups at every use.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/ir/opcodes.cpp
+alignas(64) static const std::array opcode_info{
+#define OPCODE(name, type, ...) Meta{{__VA_ARGS__}, type},
+#define A32OPC(name, type, ...) Meta{{__VA_ARGS__}, type},
+#define A64OPC(name, type, ...) Meta{{__VA_ARGS__}, type},
 #include "./opcodes.inc"
 #undef OPCODE
 #undef A32OPC
@@ -53,19 +55,28 @@ static const std::array opcode_info{
 }  // namespace OpcodeInfo
 
 Type GetTypeOf(Opcode op) {
-    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).type;
+    return OpcodeInfo::opcode_info[static_cast<size_t>(op)].type;
 }
 
 size_t GetNumArgsOf(Opcode op) {
-    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).arg_types.size();
+    return OpcodeInfo::opcode_info[static_cast<size_t>(op)].arg_types.size();
 }
 
 Type GetArgTypeOf(Opcode op, size_t arg_index) {
-    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).arg_types.at(arg_index);
+    return OpcodeInfo::opcode_info[static_cast<size_t>(op)].arg_types[arg_index];
 }
 
 std::string GetNameOf(Opcode op) {
-    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).name;
+    static constexpr std::array names{
+#define OPCODE(name, type, ...) #name,
+#define A32OPC(name, type, ...) #name,
+#define A64OPC(name, type, ...) #name,
+#include "./opcodes.inc"
+#undef OPCODE
+#undef A32OPC
+#undef A64OPC
+    };
+    return names.at(static_cast<size_t>(op));
 }
 
 }  // namespace Dynarmic::IR

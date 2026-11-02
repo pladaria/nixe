@@ -65,7 +65,7 @@ if ("riscv" IN_LIST ARCHITECTURE)
 endif()
 
 if ("x86_64" IN_LIST ARCHITECTURE)
-    target_link_libraries(dynarmic_tests PRIVATE xbyak::xbyak)
+    target_link_libraries(dynarmic_tests PRIVATE xbyak::xbyak tsl::robin_map)
 
     target_architecture_specific_sources(dynarmic_tests "x86_64"
         x64_cpu_info.cpp

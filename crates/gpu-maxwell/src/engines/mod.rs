@@ -501,7 +501,7 @@ impl std::error::Error for MaxwellEngineDispatchError {}
 pub(crate) enum MaxwellEngineStreamError<E> {
     Dispatch(Box<MaxwellEngineDispatchError>),
     Consumer(E),
-    Decode(crate::MaxwellPushbufferDecodeError),
+    Decode(Box<crate::MaxwellPushbufferDecodeError>),
 }
 
 impl<E> MaxwellEngineStreamError<E> {
@@ -604,6 +604,75 @@ pub(crate) async fn finish_maxwell_engine_stream<E>(
     .await
 }
 
+/// Advance the DMA cursor through ordinary state packets in one synchronous loop.
+/// Keep this loop outside the effect future: its live state is only the channel
+/// and DMA cursor, not the suspended draw, macro and consumer frames. Returning a
+/// position leaves the current packet borrowed from its original accepted entry.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp
+#[inline(never)]
+fn admit_register_packets<E>(
+    channel: &mut MaxwellGpuChannel,
+    stream: &mut crate::pushbuffer::packet::CommandStream,
+    macro_pending: bool,
+    #[cfg(test)] mut methods: Option<&mut Vec<MaxwellMethodDispatch>>,
+) -> Result<Option<usize>, MaxwellEngineStreamError<E>> {
+    while !stream.needs_entry() {
+        if let Some(operation) = stream
+            .next()
+            .map_err(|error| MaxwellEngineStreamError::Decode(Box::new(error)))?
+        {
+            match operation {
+                crate::MaxwellPushbufferControl::Nop
+                | crate::MaxwellPushbufferControl::EndSegment => continue,
+                _ => {
+                    return Err(MaxwellEngineStreamError::dispatch(
+                        MaxwellMethodDispatchError::UnsupportedControl {
+                            operation,
+                            source: stream.header_location(),
+                        }
+                        .into(),
+                    ));
+                }
+            }
+        }
+        let span = stream.methods();
+        if span.is_empty() {
+            continue;
+        }
+        let subchannel = stream
+            .subchannel()
+            .expect("nonempty hardware method packet");
+        if macro_pending
+            || span.method_at(0).0 < 0x100
+            || channel.frontend().subchannel_binding(subchannel) != Some(threed::CLASS)
+            || !threed::is_plain_method(span.method_at(0))
+            || (span.len() >= 2 && bulk::port(span.method_at(0)).is_some())
+            || threed::draw::is_pending(channel.three_d_mut())
+            || channel.three_d_mut().pending_notification.is_some()
+        {
+            return Ok(Some(0));
+        }
+        let consumed = threed::write_plain_span(
+            #[cfg(test)]
+            subchannel,
+            span,
+            channel.three_d_mut(),
+            #[cfg(test)]
+            |source, argument| {
+                if let Some(observed) = methods.as_deref_mut() {
+                    let mut dispatch = MaxwellMethodDispatch::class_method(source, threed::CLASS);
+                    dispatch.set_effective_argument(argument);
+                    observed.push(dispatch);
+                }
+            },
+        );
+        if consumed < span.len() {
+            return Ok(Some(consumed));
+        }
+    }
+    Ok(None)
+}
+
 /// Consume the current command entry directly, suspending only at engine effects.
 ///
 /// Unsupported semantics terminate the guest process, so successfully applied
@@ -620,27 +689,16 @@ pub(crate) async fn stream_maxwell_engine_entry<E>(
 ) -> Result<(), MaxwellEngineStreamError<E>> {
     #[cfg(test)]
     let mut methods = methods;
-    'packets: while !stream.needs_entry() {
-        if let Some(operation) = stream.next().map_err(MaxwellEngineStreamError::Decode)? {
-            match operation {
-                crate::MaxwellPushbufferControl::Nop
-                | crate::MaxwellPushbufferControl::EndSegment => continue,
-                _ => {
-                    return Err(MaxwellEngineStreamError::dispatch(
-                        MaxwellMethodDispatchError::UnsupportedControl {
-                            operation,
-                            source: stream.header_location(),
-                        }
-                        .into(),
-                    ));
-                }
-            }
-        }
+    let profile = channel.profile();
+    'packets: while let Some(mut cursor) = admit_register_packets(
+        channel,
+        stream,
+        mme_methods.is_some(),
+        #[cfg(test)]
+        methods.as_deref_mut(),
+    )? {
         let last = stream.last();
         let span = stream.methods();
-        if span.is_empty() {
-            continue;
-        }
         let subchannel = stream
             .subchannel()
             .expect("nonempty hardware method packet");
@@ -666,7 +724,8 @@ pub(crate) async fn stream_maxwell_engine_entry<E>(
             None
         };
         {
-            if mme_methods.is_none()
+            if cursor == 0
+                && mme_methods.is_none()
                 && let Some(class) = plain_class
                 && span.len() >= 2
                 && let Some(port) = bulk::port(first)
@@ -737,8 +796,6 @@ pub(crate) async fn stream_maxwell_engine_entry<E>(
                     continue 'packets;
                 }
             }
-            let profile = channel.profile();
-            let mut cursor = 0;
             while cursor < span.len() {
                 if mme_methods.is_none()
                     && plain_class == Some(threed::CLASS)
@@ -761,8 +818,7 @@ pub(crate) async fn stream_maxwell_engine_entry<E>(
                                 observed.push(dispatch);
                             }
                         },
-                    )
-                    .map_err(MaxwellEngineStreamError::dispatch)?;
+                    );
                     cursor += count;
                     continue;
                 }

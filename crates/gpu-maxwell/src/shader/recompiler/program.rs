@@ -10,16 +10,20 @@ pub struct CapturedProgram {
 }
 impl CapturedProgram {
     pub fn retained_bytes(&self) -> usize {
-        use nixe_gpu::shader_compilation::{environment_heap_bytes, info_heap_bytes};
+        use nixe_gpu::shader_compilation::info_heap_bytes;
         std::mem::size_of::<Self>()
             + self.inputs.retained_bytes()
             + self
                 .stages
                 .iter()
-                .map(|stage| {
+                .zip(&self.inputs.stages)
+                .map(|(stage, input)| {
                     std::mem::size_of::<CapturedStage>()
-                        + environment_heap_bytes(&stage.environment)
-                        + info_heap_bytes(&stage.info)
+                        + if Arc::ptr_eq(&stage.info, &input.info) {
+                            0
+                        } else {
+                            info_heap_bytes(&stage.info)
+                        }
                         + stage.code_dependencies.len() * std::mem::size_of::<MaxwellShaderRead>()
                         + stage
                             .code_dependencies
@@ -69,6 +73,8 @@ pub fn capture_program(
     memory: &mut MemoryCache,
     access: &mut nixe_gpu::MemoryAccess<'_>,
 ) -> Result<CapturedProgram> {
+    nixe_gpu::trace::event("shader_capture", 1, 0, 0);
+    let _trace = nixe_gpu::trace::span("shader_capture_translate", 0, 0, 0);
     compiler.reset()?;
     let mut stages = Vec::new();
     let mut inputs = Vec::new();
@@ -98,7 +104,7 @@ pub fn capture_program(
             memory,
             access,
         )?;
-        let mut info = (*captured.info).clone();
+        let mut info = Arc::clone(&captured.info);
         if stage == Stage::VertexA {
             vertex_a = Some((id, group));
         } else if stage == Stage::VertexB
@@ -115,13 +121,13 @@ pub fn capture_program(
                 captured.environment.as_ref(),
                 &configuration.settings,
             )?;
-            info = compiler.inspect_program(
+            info = Arc::new(compiler.inspect_program(
                 merged,
                 nixe_gpu::shader_compilation::resources::resource_info,
-            )?;
+            )?);
         }
         inputs.push(StageSource {
-            environment: (*captured.environment).clone(),
+            environment: Arc::clone(&captured.environment),
             info,
             binding_group: group,
         });
@@ -203,13 +209,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(capture.inputs.stages.len(), 3);
+        for (stage, input) in capture.stages.iter().zip(&capture.inputs.stages) {
+            assert!(Arc::ptr_eq(&stage.environment, &input.environment));
+            if stage.environment.metadata().stage != Stage::VertexB {
+                assert!(Arc::ptr_eq(&stage.info, &input.info));
+            }
+        }
         assert!(capture.stages[0].request_is_current(&request(0, Stage::VertexA), space.memory()));
         assert!(
             !capture.stages[0].request_is_current(&request(0x100, Stage::VertexA), space.memory())
         );
         compiler.reset().unwrap();
-        let output = capture
-            .inputs
+        let bytes = nixe_gpu::shader_encoding::encode_inputs(&capture.inputs);
+        let restored = nixe_gpu::shader_encoding::decode_inputs(&bytes, &configuration).unwrap();
+        assert_eq!(restored.identity, capture.inputs.identity);
+        for (original, restored) in capture.inputs.stages.iter().zip(&restored.stages) {
+            assert_eq!(original.info, restored.info);
+            assert_eq!(original.environment, restored.environment);
+        }
+        assert!(
+            nixe_gpu::shader_encoding::decode_inputs(&bytes[..bytes.len() - 1], &configuration)
+                .is_none()
+        );
+        let mut incompatible = configuration.clone();
+        incompatible.profile.supported_spirv ^= 1;
+        assert!(nixe_gpu::shader_encoding::decode_inputs(&bytes, &incompatible).is_none());
+        let output = restored
             .compile(&mut compiler, &configuration, Some(&Default::default()))
             .unwrap();
         assert_eq!(output.len(), 2);

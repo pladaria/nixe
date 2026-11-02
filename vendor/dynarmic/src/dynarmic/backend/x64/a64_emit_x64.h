@@ -6,9 +6,7 @@
 #pragma once
 
 #include <array>
-#include <map>
 #include <optional>
-#include <tuple>
 
 #include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
@@ -23,10 +21,11 @@ namespace Dynarmic::Backend::X64 {
 class RegAlloc;
 
 struct A64EmitContext final : public EmitContext {
-    A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block);
+    A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits);
 
     A64::LocationDescriptor Location() const;
     bool IsSingleStep() const;
+    bool CanOmitFastmemBoundsCheck(IR::Value address) const;
     FP::FPCR FPCR(bool fpcr_controlled = true) const override;
 
     bool HasOptimization(OptimizationFlag flag) const override {
@@ -61,8 +60,12 @@ protected:
         const void* code_ptr = nullptr;
     };
     static_assert(sizeof(FastDispatchEntry) == 0x10);
-    static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
-    static constexpr size_t fast_dispatch_table_size = 0x100000;
+    // Keep Eden's full-tag direct cache while bounding the sparse lookup's
+    // page working set independently of the generated-code cache capacity.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+    static constexpr size_t fast_dispatch_table_size = 0x40000;
+    static constexpr u64 fast_dispatch_table_mask =
+        (fast_dispatch_table_size - 1) * sizeof(FastDispatchEntry);
     std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
     void ClearFastDispatchTable();
 
@@ -71,9 +74,9 @@ protected:
     void (*memory_exclusive_write_128)();
     void GenMemory128Accessors();
 
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
+    MemoryFallbacks read_fallbacks{};
+    MemoryFallbacks write_fallbacks{};
+    MemoryFallbacks exclusive_write_fallbacks{};
     void GenFastmemFallbacks();
 
     const void* terminal_handler_pop_rsb_hint;
@@ -95,7 +98,6 @@ protected:
     std::string LocationDescriptorToFriendlyName(const IR::LocationDescriptor&) const override;
 
     // Fastmem information
-    using DoNotFastmemMarker = std::tuple<IR::LocationDescriptor, unsigned>;
     struct FastmemPatchInfo {
         u64 resume_rip;
         u64 callback;
@@ -103,16 +105,18 @@ protected:
         bool recompile;
     };
     tsl::robin_map<u64, FastmemPatchInfo> fastmem_patch_info;
-    std::set<DoNotFastmemMarker> do_not_fastmem;
+    // Eden uses a hash set for faulted instruction sites; no ordering is consumed.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+    tsl::robin_set<DoNotFastmemMarker, FastmemMarkerHash> do_not_fastmem;
     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
     FakeCall FastmemCallback(u64 rip);
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
     template<std::size_t bitsize, auto callback>
-    void EmitMemoryRead(A64EmitContext& ctx, IR::Inst* inst);
+    void EmitMemoryRead(A64EmitContext& ctx, IR::Inst* inst, const std::optional<DoNotFastmemMarker>& fastmem_marker);
     template<std::size_t bitsize, auto callback>
-    void EmitMemoryWrite(A64EmitContext& ctx, IR::Inst* inst);
+    void EmitMemoryWrite(A64EmitContext& ctx, IR::Inst* inst, const std::optional<DoNotFastmemMarker>& fastmem_marker);
     template<std::size_t bitsize, auto callback>
     void EmitExclusiveReadMemory(A64EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>

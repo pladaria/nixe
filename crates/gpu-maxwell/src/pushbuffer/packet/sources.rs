@@ -13,10 +13,7 @@ impl MaxwellCommandSourceScratch {
     }
 }
 pub(crate) enum EntryWords {
-    Ram {
-        address: nixe_memory::HostAddress,
-        _pin: nixe_memory::AllocationRange,
-    },
+    Ram(nixe_memory::RamSource),
     Gathered(Vec<u8>),
 }
 #[derive(Default)]
@@ -26,7 +23,6 @@ pub(crate) struct CommandStream {
     origin: Option<MaxwellGpfifoSourceLocation>,
     offset: usize,
     end: usize,
-    direct: Option<crate::MaxwellResolvedMapping>,
     source: Option<MaxwellResolvedRange>,
     words: Option<EntryWords>,
     address: Option<nixe_memory::HostAddress>,
@@ -42,7 +38,7 @@ pub(crate) struct CommandStream {
 impl CommandStream {
     fn set_words(&mut self, words: EntryWords) {
         self.address = Some(match &words {
-            EntryWords::Ram { address, .. } => *address,
+            EntryWords::Ram(source) => source.address(),
             EntryWords::Gathered(bytes) => {
                 nixe_memory::HostAddress::from_pointer(bytes.as_ptr().cast_mut())
             }
@@ -158,7 +154,6 @@ impl CommandStream {
         if let Some(EntryWords::Gathered(bytes)) = self.words.take() {
             scratch.bytes = bytes;
         }
-        self.direct = None;
         self.source = None;
         while let Some(entry) = submission.decoded().entries().get(self.next_entry).copied() {
             self.entry = self.next_entry;
@@ -168,7 +163,7 @@ impl CommandStream {
             if self.end == 0 {
                 continue;
             }
-            if let Some((segment, address, pin)) = memory
+            if let Some((segment, source)) = memory
                 .command_ram_direct(entry.address(), entry.byte_count())
                 .map_err(|error| MaxwellGpfifoSourceError::Resolution {
                     channel: submission.channel(),
@@ -188,8 +183,7 @@ impl CommandStream {
                     mapping: segment.mapping().id(),
                     generation: segment.mapping().generation(),
                 });
-                self.direct = Some(segment);
-                self.set_words(EntryWords::Ram { address, _pin: pin });
+                self.set_words(EntryWords::Ram(source));
                 return Ok(true);
             }
             let source = memory
@@ -220,11 +214,11 @@ impl CommandStream {
                 generation: first.mapping().generation(),
             };
             self.set_words(
-                if let Some((address, pin)) = memory
+                if let Some(source) = memory
                     .command_ram(&source)
                     .map_err(|error| MaxwellGpfifoSourceError::Access { location, error })?
                 {
-                    EntryWords::Ram { address, _pin: pin }
+                    EntryWords::Ram(source)
                 } else {
                     scratch
                         .bytes
@@ -490,9 +484,34 @@ mod tests {
             right.id()
         );
         assert_eq!(methods.get(2).unwrap().argument_source().word_offset, 3);
+        let tail = methods.slice(1..).slice(1..);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail.method_at(0), GpuMethodId(0x0a08));
+        assert_eq!(tail.gathered_bytes().unwrap(), 33u32.to_le_bytes());
+        assert_eq!(tail.get(0).unwrap().argument_source().word_offset, 3);
+        assert!(tail.slice(1..).is_empty());
         assert!(stream.needs_entry());
         stream
             .finish(&mut MaxwellCommandSourceScratch::default())
             .unwrap();
+        let mut once = CommandStream::fixture_words(
+            origin,
+            &[(5 << 29) | (3 << 16) | (0x0a00 / 4), 11, 22, 33],
+        );
+        once.next().unwrap();
+        let methods = once.methods();
+        let tail = methods.slice(1..).slice(1..);
+        assert_eq!(tail.mode(), MaxwellMethodPacketMode::NonIncrementing);
+        assert_eq!(tail.method_at(0), GpuMethodId(0x0a04));
+        assert_eq!(tail.argument_at(0), 33);
+        assert_eq!(tail.get(0).unwrap().argument_source().word_offset, 3);
+        assert_eq!(tail.gathered_bytes().unwrap(), 33u32.to_le_bytes());
+        assert_eq!(
+            methods
+                .last_writes()
+                .map(|method| (method.method(), method.argument()))
+                .collect::<Vec<_>>(),
+            [(GpuMethodId(0x0a04), 33), (GpuMethodId(0x0a00), 11)],
+        );
     }
 }

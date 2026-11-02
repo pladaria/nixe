@@ -58,7 +58,6 @@ add_library(dynarmic
     common/string_util.h
     common/u128.cpp
     common/u128.h
-    common/variant_util.h
     frontend/A32/a32_types.cpp
     frontend/A32/a32_types.h
     frontend/A64/a64_types.cpp
@@ -273,6 +272,7 @@ if ("x86_64" IN_LIST ARCHITECTURE)
         backend/x64/block_of_code.h
         backend/x64/callback.cpp
         backend/x64/callback.h
+        backend/x64/deferred_emit.h
         backend/x64/constant_pool.cpp
         backend/x64/constant_pool.h
         backend/x64/constants.h
@@ -528,7 +528,7 @@ target_compile_definitions(dynarmic PRIVATE FMT_USE_USER_DEFINED_LITERALS=1)
 if (DYNARMIC_USE_PRECOMPILED_HEADERS)
     set(PRECOMPILED_HEADERS "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/ir/ir_emitter.h>")
     if ("x86_64" IN_LIST ARCHITECTURE)
-        list(PREPEND PRECOMPILED_HEADERS "$<$<COMPILE_LANGUAGE:CXX>:<xbyak/xbyak.h$<ANGLE-R>>")
+        list(PREPEND PRECOMPILED_HEADERS "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/backend/x64/xbyak.h>")
     endif()
     if ("arm64" IN_LIST ARCHITECTURE)
         list(PREPEND PRECOMPILED_HEADERS "$<$<COMPILE_LANGUAGE:CXX>:<oaknut/oaknut.hpp$<ANGLE-R>>")

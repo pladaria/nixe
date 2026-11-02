@@ -7,8 +7,6 @@
 
 #include <array>
 #include <optional>
-#include <set>
-#include <tuple>
 
 #include <tsl/robin_map.h>
 
@@ -25,7 +23,7 @@ namespace Dynarmic::Backend::X64 {
 class RegAlloc;
 
 struct A32EmitContext final : public EmitContext {
-    A32EmitContext(const A32::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block);
+    A32EmitContext(const A32::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits);
 
     A32::LocationDescriptor Location() const;
     A32::LocationDescriptor EndLocation() const;
@@ -74,9 +72,9 @@ protected:
     void (*memory_read_128)() = nullptr;   // Dummy
     void (*memory_write_128)() = nullptr;  // Dummy
 
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
+    MemoryFallbacks read_fallbacks{};
+    MemoryFallbacks write_fallbacks{};
+    MemoryFallbacks exclusive_write_fallbacks{};
     void GenFastmemFallbacks();
 
     const void* terminal_handler_pop_rsb_hint;
@@ -97,7 +95,6 @@ protected:
     std::string LocationDescriptorToFriendlyName(const IR::LocationDescriptor&) const override;
 
     // Fastmem information
-    using DoNotFastmemMarker = std::tuple<IR::LocationDescriptor, unsigned>;
     struct FastmemPatchInfo {
         u64 resume_rip;
         u64 callback;
@@ -105,16 +102,18 @@ protected:
         bool recompile;
     };
     tsl::robin_map<u64, FastmemPatchInfo> fastmem_patch_info;
-    std::set<DoNotFastmemMarker> do_not_fastmem;
+    // Eden uses a hash set for faulted instruction sites; no ordering is consumed.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+    tsl::robin_set<DoNotFastmemMarker, FastmemMarkerHash> do_not_fastmem;
     std::optional<DoNotFastmemMarker> ShouldFastmem(A32EmitContext& ctx, IR::Inst* inst) const;
     FakeCall FastmemCallback(u64 rip);
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A32EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
     template<std::size_t bitsize, auto callback>
-    void EmitMemoryRead(A32EmitContext& ctx, IR::Inst* inst);
+    void EmitMemoryRead(A32EmitContext& ctx, IR::Inst* inst, const std::optional<DoNotFastmemMarker>& fastmem_marker);
     template<std::size_t bitsize, auto callback>
-    void EmitMemoryWrite(A32EmitContext& ctx, IR::Inst* inst);
+    void EmitMemoryWrite(A32EmitContext& ctx, IR::Inst* inst, const std::optional<DoNotFastmemMarker>& fastmem_marker);
     template<std::size_t bitsize, auto callback>
     void EmitExclusiveReadMemory(A32EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>

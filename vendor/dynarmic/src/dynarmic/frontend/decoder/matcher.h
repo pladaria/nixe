@@ -5,8 +5,6 @@
 
 #pragma once
 
-#include <functional>
-
 #include <mcl/assert.hpp>
 
 namespace Dynarmic::Decoder {
@@ -27,10 +25,10 @@ public:
     using opcode_type = OpcodeType;
     using visitor_type = Visitor;
     using handler_return_type = typename Visitor::instruction_return_type;
-    using handler_function = std::function<handler_return_type(Visitor&, opcode_type)>;
+    using handler_function = handler_return_type (*)(Visitor&, opcode_type);
 
     Matcher(const char* const name, opcode_type mask, opcode_type expected, handler_function func)
-            : name{name}, mask{mask}, expected{expected}, fn{std::move(func)} {}
+            : name{name}, mask{mask}, expected{expected}, fn{func} {}
 
     /// Gets the name of this type of instruction.
     const char* GetName() const {
@@ -45,6 +43,10 @@ public:
     /// Gets the expected value after masking for this instruction.
     opcode_type GetExpected() const {
         return expected;
+    }
+
+    handler_function GetHandler() const {
+        return fn;
     }
 
     /**

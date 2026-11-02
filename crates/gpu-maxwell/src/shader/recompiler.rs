@@ -1,11 +1,13 @@
 //! Canonical guest observations for shader compilation. Mutable memory access
 //! ends at capture; workers receive owned environments and immutable metadata.
 
+pub(crate) mod archive;
 mod graphics;
 mod program;
 mod texture;
 pub use super::memory::MaxwellShaderMemoryCache as MemoryCache;
 pub use graphics::graphics_request;
+pub(crate) use graphics::{GraphicsSource, graphics_source};
 pub use program::{CapturedProgram, capture_program};
 
 pub const MAXWELL_SHADER_NAMESPACE: nixe_gpu::shader_identity::ShaderNamespace =
@@ -130,20 +132,7 @@ pub fn capture(
         code_dependencies: Vec::new(),
         textures: BTreeMap::new(),
     };
-    if source.metadata.stage != Stage::Compute {
-        let bytes = source.read_code(source.address, 80)?;
-        source.metadata.sph = ProgramHeader::from_bytes(bytes.as_ref().try_into().unwrap());
-        source.metadata.local_memory_size =
-            EnvironmentMetadata::graphics_local_memory_size(&source.metadata.sph)?;
-        if source.metadata.stage == Stage::Geometry
-            && source.metadata.sph.geometry_passthrough() != 0
-        {
-            source.metadata.gp_passthrough_mask = source
-                .bindings
-                .geometry_passthrough_mask
-                .ok_or_else(|| invalid("Geometry passthrough attribute mask was not captured"))?;
-        }
-    }
+    source.initialize_metadata()?;
     let mut recorder = RecordingEnvironment::new(&mut source);
     let program = compiler.translate(&mut recorder, host, settings)?;
     let environment = recorder.into_snapshot();
@@ -175,6 +164,109 @@ struct CaptureEnvironment<'a, 'm> {
 }
 
 impl CaptureEnvironment<'_, '_> {
+    fn initialize_metadata(&mut self) -> Result<()> {
+        if self.metadata.stage != Stage::Compute {
+            let bytes = self.read_code(self.address, 80)?;
+            self.metadata.sph = ProgramHeader::from_bytes(bytes.as_ref().try_into().unwrap());
+            self.metadata.local_memory_size =
+                EnvironmentMetadata::graphics_local_memory_size(&self.metadata.sph)?;
+            if self.metadata.stage == Stage::Geometry
+                && self.metadata.sph.geometry_passthrough() != 0
+            {
+                self.metadata.gp_passthrough_mask =
+                    self.bindings.geometry_passthrough_mask.ok_or_else(|| {
+                        invalid("Geometry passthrough attribute mask was not captured")
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn matches_snapshot(&mut self, snapshot: &SnapshotEnvironment) -> Result<bool> {
+        self.initialize_metadata()?;
+        if &self.metadata != snapshot.metadata() {
+            return Ok(false);
+        }
+        let observed = snapshot.observations();
+        let Some((&first, _)) = observed.instructions.first_key_value() else {
+            return Ok(false);
+        };
+        let last = observed.instructions.last_key_value().unwrap().0.0;
+        let begin = first
+            .0
+            .checked_sub(self.metadata.start_address.0)
+            .ok_or_else(|| invalid("Cached instruction precedes program start"))?;
+        let size = u64::from(last) + 8 - u64::from(first.0);
+        if size > 16 * 1024 * 1024 {
+            return Ok(false);
+        }
+        let address = self
+            .address
+            .checked_add(u64::from(begin))
+            .ok_or_else(|| invalid("Cached shader address overflows"))?;
+        let bytes = self.read_code(address, size as usize)?;
+        for (&offset, &word) in &observed.instructions {
+            let at = (offset.0 - first.0) as usize;
+            if bytes[at..at + 8] != word.to_le_bytes() {
+                return Ok(false);
+            }
+        }
+        for (key, &word) in &observed.cbuf_words {
+            if self.read_cbuf_value(key.index, key.offset)? != word {
+                return Ok(false);
+            }
+        }
+        for (&key, &handle) in &observed.texture_handles {
+            // Handles locate mutable resources; they are not shader constants.
+            // Validate precisely the properties observed through each expression.
+            let current = self.read_texture_handle(key)?;
+            if let Some(&kind) = observed.texture_types.get(&handle)
+                && self.read_texture_type(current)? != kind
+            {
+                return Ok(false);
+            }
+            if let Some(&format) = observed.texture_pixel_formats.get(&handle)
+                && self.read_texture_pixel_format(current)? != format
+            {
+                return Ok(false);
+            }
+            if let Some(&integer) = observed.texture_integer_formats.get(&handle)
+                && self.is_texture_pixel_format_integer(current)? != integer
+            {
+                return Ok(false);
+            }
+        }
+        // Also preserve observations made through literal handles, including
+        // literals which happened to alias an expression's captured handle.
+        for (&handle, &kind) in &observed.texture_types {
+            if self.read_texture_type(handle)? != kind {
+                return Ok(false);
+            }
+        }
+        for (&handle, &format) in &observed.texture_pixel_formats {
+            if self.read_texture_pixel_format(handle)? != format {
+                return Ok(false);
+            }
+        }
+        for (&handle, &integer) in &observed.texture_integer_formats {
+            if self.is_texture_pixel_format_integer(handle)? != integer {
+                return Ok(false);
+            }
+        }
+        if let Some(value) = observed.viewport_transform_state
+            && self.read_viewport_transform_state()? != value
+        {
+            return Ok(false);
+        }
+        for (key, &replacement) in &observed.replacements {
+            if self.get_replace_const_buffer(key.index, key.offset)? != replacement {
+                return Ok(false);
+            }
+        }
+        self.consolidate_code();
+        Ok(true)
+    }
+
     fn consolidate_code(&mut self) {
         let Some(begin) = self.code_dependencies.iter().map(|read| read.address).min() else {
             return;
@@ -410,7 +502,7 @@ mod tests {
         assert_eq!(captured.code_dependencies.len(), 1);
         assert_eq!(captured.code_dependencies[0].bytes.len(), 24);
         crate::test_memory::write(&allocation, 0x800, &[1]).unwrap();
-        assert!(!captured.is_current(space.memory()));
+        assert!(captured.is_current(space.memory()));
         crate::test_memory::write(&allocation, 16, &(mov | 2).to_le_bytes()).unwrap();
         assert!(!captured.is_current(space.memory()));
     }
@@ -447,6 +539,121 @@ mod tests {
             machine.tracking_statistics().protection_calls,
             before.protection_calls
         );
+    }
+
+    #[test]
+    fn restored_environment_rechecks_mutable_compilation_observations() {
+        use nixe_shader_recompiler::environment::HandleKey;
+        let (allocation, space, base) = mapped_memory();
+        crate::test_memory::write(&allocation, 8, &0xe300_0000_0007_000fu64.to_le_bytes()).unwrap();
+        crate::test_memory::write(&allocation, 0x100, &7u32.to_le_bytes()).unwrap();
+        let format = 8 | [7, 10, 13, 16]
+            .into_iter()
+            .map(|shift| 2 << shift)
+            .sum::<u32>();
+        crate::test_memory::write(&allocation, 0x200, &format.to_le_bytes()).unwrap();
+        crate::test_memory::write(&allocation, 0x210, &(1u32 << 23).to_le_bytes()).unwrap();
+        crate::test_memory::write(&allocation, 0x214, &(1u32 << 31).to_le_bytes()).unwrap();
+        let metadata = EnvironmentMetadata {
+            stage: Stage::Compute,
+            ..Default::default()
+        };
+        let mut bindings = CaptureBindings {
+            texture_pool: Some(TexturePool {
+                address: base + 0x200,
+                maximum_index: 1,
+                via_header_index: false,
+            }),
+            ..Default::default()
+        };
+        bindings.constant_buffers[0] = Some(BufferBinding {
+            address: base + 0x100,
+            size: 8,
+        });
+        let mut memory = MemoryCache::default();
+        let mut access = crate::test_memory::access(space.memory().machine());
+        let snapshot = {
+            let mut source = CaptureEnvironment {
+                memory: MaxwellShaderMemoryView::new(space.memory(), &mut memory, &mut access),
+                address: base,
+                metadata: metadata.clone(),
+                bindings: bindings.clone(),
+                code_dependencies: Vec::new(),
+                textures: BTreeMap::new(),
+            };
+            let mut recorder = RecordingEnvironment::new(&mut source);
+            recorder.read_instruction(ProgramOffset(8)).unwrap();
+            assert_eq!(
+                recorder
+                    .read_cbuf_value(CbufIndex(0), ByteOffset(0))
+                    .unwrap(),
+                7
+            );
+            let handle = recorder
+                .read_texture_handle(HandleKey {
+                    offset: ByteOffset(4),
+                    count: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(handle, TextureHandle(0));
+            assert_eq!(
+                recorder.read_texture_type(handle).unwrap(),
+                TextureType::Color2D
+            );
+            assert_eq!(
+                recorder.read_texture_pixel_format(handle).unwrap(),
+                TexturePixelFormat::A8B8G8R8_UNORM
+            );
+            assert!(!recorder.is_texture_pixel_format_integer(handle).unwrap());
+            recorder.read_viewport_transform_state().unwrap();
+            recorder
+                .get_replace_const_buffer(CbufIndex(0), ByteOffset(0))
+                .unwrap();
+            recorder.into_snapshot()
+        };
+        let mut matches = || {
+            CaptureEnvironment {
+                memory: MaxwellShaderMemoryView::new(space.memory(), &mut memory, &mut access),
+                address: base,
+                metadata: metadata.clone(),
+                bindings: bindings.clone(),
+                code_dependencies: Vec::new(),
+                textures: BTreeMap::new(),
+            }
+            .matches_snapshot(&snapshot)
+            .unwrap()
+        };
+        assert!(matches());
+        // A different handle with the same observed properties retains shader
+        // specialization. A dimension change requires a different capture.
+        crate::test_memory::write(&allocation, 0x220, &format.to_le_bytes()).unwrap();
+        crate::test_memory::write(&allocation, 0x230, &(1u32 << 23).to_le_bytes()).unwrap();
+        crate::test_memory::write(&allocation, 0x234, &(1u32 << 31).to_le_bytes()).unwrap();
+        crate::test_memory::write(&allocation, 0x104, &1u32.to_le_bytes()).unwrap();
+        assert!(matches());
+        crate::test_memory::write(&allocation, 0x230, &(5u32 << 23).to_le_bytes()).unwrap();
+        assert!(!matches());
+        crate::test_memory::write(&allocation, 0x104, &0u32.to_le_bytes()).unwrap();
+        assert!(matches());
+        for (offset, changed, original) in [
+            (0x100, 8, 7),
+            (0x104, 1, 0),
+            (0x210, 5 << 23, 1 << 23),
+            (
+                0x200,
+                8 | [7, 10, 13, 16]
+                    .into_iter()
+                    .map(|shift| 4 << shift)
+                    .sum::<u32>(),
+                format,
+            ),
+        ] {
+            crate::test_memory::write(&allocation, offset, &changed.to_le_bytes()).unwrap();
+            assert!(!matches(), "changed input at {offset:#x}");
+            crate::test_memory::write(&allocation, offset, &original.to_le_bytes()).unwrap();
+            assert!(matches());
+        }
     }
 
     #[test]

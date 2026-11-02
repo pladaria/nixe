@@ -603,7 +603,13 @@ fn native_copy_preserves_other_mips_layers_and_pitch_padding() {
         },
     };
     cache
-        .copy_image_region(source, 1, rect, destination, 1, vk::Offset2D { x: 0, y: 1 })
+        .copy_image_regions(
+            source,
+            destination,
+            &[(1, 1)],
+            rect,
+            vk::Offset2D { x: 0, y: 1 },
+        )
         .unwrap();
     cache.flush().unwrap();
     let result = cpu_read(&mut cache, &b);
@@ -694,7 +700,7 @@ fn same_image_copy_snapshots_overlapping_source_pixels() {
         },
     };
     cache
-        .copy_image_region(image, 0, src, image, 0, vk::Offset2D { x: 2, y: 0 })
+        .copy_image_regions(image, image, &[(0, 0)], src, vk::Offset2D { x: 2, y: 0 })
         .unwrap();
     cache.flush().unwrap();
     let data = cpu_read(&mut cache, &bytes);
@@ -1122,4 +1128,217 @@ fn interleaved_scanout_rows_batch_and_scatter_multiple_versioned_windows() {
     }
     drop(cache);
     validation.check().unwrap();
+}
+
+#[test]
+fn grouped_depth_stencil_transfers_preserve_aspects_padding_and_self_copy_sources() {
+    for unified in [false, true] {
+        let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
+            return;
+        };
+        if unified && !cache.unified_layouts {
+            continue;
+        }
+        cache.unified_layouts = unified;
+        let validation = cache.device.validation_monitor();
+        for format in [
+            vk::Format::D24_UNORM_S8_UINT,
+            vk::Format::D32_SFLOAT_S8_UINT,
+        ] {
+            let make = |cache: &mut VulkanResidency, byte| {
+                let (allocation, bytes) = backing_allocation(cache, 4096, 4096, byte);
+                let extent = vk::Extent3D {
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                };
+                let description = NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                    flags: vk::ImageCreateFlags::empty(),
+                };
+                let depth = ImagePlane {
+                    depth_slice: 0,
+                    offset: 0,
+                    row_pitch: 16,
+                    mip_level: 0,
+                    array_layer: 0,
+                    aspect: vk::ImageAspectFlags::DEPTH,
+                    extent,
+                    block_extent: vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                    bytes_per_block: 4,
+                };
+                let stencil = ImagePlane {
+                    offset: 128,
+                    row_pitch: 4,
+                    aspect: vk::ImageAspectFlags::STENCIL,
+                    bytes_per_block: 1,
+                    ..depth
+                };
+                let id = cache
+                    .image_for(
+                        crate::residency::tests::image_geometry(
+                            bytes.clone(),
+                            description,
+                            &[depth, stencil],
+                        ),
+                        description,
+                        vec![depth, stencil],
+                    )
+                    .unwrap();
+                (allocation, bytes, id)
+            };
+            let (_source_allocation, source_bytes, source) = make(&mut cache, 0x31);
+            let (_destination_allocation, destination_bytes, destination) = make(&mut cache, 0x73);
+            cache.clear_depth_stencil(source, 0, 0.25, 0).unwrap();
+            cache.clear_depth_stencil(source, 1, f32::NAN, 37).unwrap();
+            cache.clear_depth_stencil(destination, 0, 0.75, 0).unwrap();
+            cache
+                .clear_depth_stencil(destination, 1, f32::NAN, 99)
+                .unwrap();
+            // A new sampled interpretation of the same physical depth/stencil
+            // bytes must gather both aspects in one native alias copy.
+            let entry = cache.image(source).unwrap();
+            let mut description = entry.description;
+            description.usage |= vk::ImageUsageFlags::SAMPLED;
+            let geometry = entry.contents.geometry.clone();
+            let planes = entry.planes.to_vec();
+            let source = cache.image_for(geometry, description, planes).unwrap();
+            let copies = cache.statistics().alias_copy_commands;
+            cache.ensure_image(source).unwrap();
+            assert_eq!(cache.statistics().alias_copy_commands, copies + 1);
+            let original = cpu_read(&mut cache, &source_bytes);
+            let preserved = cpu_read(&mut cache, &destination_bytes);
+            let depth_bytes = if format == vk::Format::D24_UNORM_S8_UINT {
+                3
+            } else {
+                4
+            };
+            let rect = vk::Rect2D {
+                offset: vk::Offset2D { x: 1, y: 1 },
+                extent: vk::Extent2D {
+                    width: 2,
+                    height: 2,
+                },
+            };
+            cache
+                .copy_image_regions(
+                    source,
+                    destination,
+                    &[(0, 0), (1, 1)],
+                    rect,
+                    Default::default(),
+                )
+                .unwrap();
+            let copied = cpu_read(&mut cache, &destination_bytes);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let index = y * 4 + x;
+                    let expected = if x < 2 && y < 2 {
+                        &original
+                    } else {
+                        &preserved
+                    };
+                    assert_eq!(
+                        &copied[index * 4..index * 4 + depth_bytes],
+                        &expected[..depth_bytes]
+                    );
+                    assert_eq!(copied[128 + index], if x < 2 && y < 2 { 37 } else { 99 });
+                    if depth_bytes == 3 {
+                        assert_eq!(copied[index * 4 + 3], 0x73);
+                    }
+                }
+            }
+            let full = vk::Rect2D {
+                offset: Default::default(),
+                extent: vk::Extent2D {
+                    width: 4,
+                    height: 4,
+                },
+            };
+            let target = vk::Rect2D {
+                offset: Default::default(),
+                extent: vk::Extent2D {
+                    width: 2,
+                    height: 2,
+                },
+            };
+            cache.clear_depth_stencil(destination, 0, 0.5, 0).unwrap();
+            cache
+                .clear_depth_stencil(destination, 1, f32::NAN, 100)
+                .unwrap();
+            let before_blit = cpu_read(&mut cache, &destination_bytes);
+            cache
+                .blit_image(
+                    source,
+                    destination,
+                    &[(0, 0), (1, 1)],
+                    full,
+                    target,
+                    vk::Filter::NEAREST,
+                )
+                .unwrap();
+            let blitted = cpu_read(&mut cache, &destination_bytes);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let index = y * 4 + x;
+                    let expected = if x < 2 && y < 2 {
+                        &original
+                    } else {
+                        &before_blit
+                    };
+                    assert_eq!(
+                        &blitted[index * 4..index * 4 + depth_bytes],
+                        &expected[..depth_bytes]
+                    );
+                    assert_eq!(blitted[128 + index], if x < 2 && y < 2 { 37 } else { 100 });
+                }
+            }
+            let overlap = vk::Rect2D {
+                offset: Default::default(),
+                extent: vk::Extent2D {
+                    width: 3,
+                    height: 3,
+                },
+            };
+            // Stencil comes first and requires padding before the depth snapshot.
+            cache
+                .copy_image_regions(
+                    destination,
+                    destination,
+                    &[(1, 1), (0, 0)],
+                    overlap,
+                    vk::Offset2D { x: 1, y: 1 },
+                )
+                .unwrap();
+            let overlapped = cpu_read(&mut cache, &destination_bytes);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let index = y * 4 + x;
+                    let source_index = if x > 0 && y > 0 {
+                        (y - 1) * 4 + x - 1
+                    } else {
+                        index
+                    };
+                    assert_eq!(
+                        &overlapped[index * 4..index * 4 + depth_bytes],
+                        &blitted[source_index * 4..source_index * 4 + depth_bytes]
+                    );
+                    assert_eq!(overlapped[128 + index], blitted[128 + source_index]);
+                }
+            }
+            assert_eq!(&overlapped[64..128], &[0x73; 64]);
+            assert_eq!(&overlapped[144..], &[0x73; 4096 - 144]);
+        }
+        drop(cache);
+        validation.check().unwrap();
+    }
 }

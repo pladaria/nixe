@@ -172,7 +172,7 @@ impl VulkanDevice {
             })
             .layer_count(1);
         unsafe {
-            self.dispatch.begin_rendering(&info);
+            self.dispatch.begin_rendering(&info, Default::default());
             self.dispatch.end_rendering();
         }
         self.flush()?;

@@ -13,22 +13,36 @@ impl UsageTracker {
             pages: vec![0; size.div_ceil(4096) as usize],
         }
     }
-    fn masks(offset: u64, size: u64) -> impl Iterator<Item = (usize, u64)> {
+    fn bounds(offset: u64, size: u64) -> (usize, usize, u64, u64) {
         let first = offset / 64;
         let last = (offset + size - 1) / 64;
-        (first / 64..=last / 64).map(move |page| {
-            let lo = first.saturating_sub(page * 64);
-            let hi = (last - page * 64).min(63);
-            (page as usize, (u64::MAX << lo) & (u64::MAX >> (63 - hi)))
-        })
+        (
+            (first / 64) as usize,
+            (last / 64) as usize,
+            u64::MAX << (first % 64),
+            u64::MAX >> (63 - last % 64),
+        )
     }
     pub fn used(&self, offset: u64, size: u64) -> bool {
-        Self::masks(offset, size).any(|(page, mask)| self.pages[page] & mask != 0)
+        let (first, last, first_mask, last_mask) = Self::bounds(offset, size);
+        if first == last {
+            return self.pages[first] & first_mask & last_mask != 0;
+        }
+        self.pages[first] & first_mask != 0
+            || self.pages[last] & last_mask != 0
+            || self.pages[first + 1..last].iter().any(|&page| page != 0)
     }
     pub fn mark(&mut self, offset: u64, size: u64) {
-        for (page, mask) in Self::masks(offset, size) {
-            self.pages[page] |= mask;
+        let (first, last, first_mask, last_mask) = Self::bounds(offset, size);
+        if first == last {
+            self.pages[first] |= first_mask & last_mask;
+            return;
         }
+        self.pages[first] |= first_mask;
+        self.pages[last] |= last_mask;
+        // Only the edge words need masks. Large vertex windows mark whole
+        // interior pages in bulk, as Eden's UsageTracker::Track does.
+        self.pages[first + 1..last].fill(u64::MAX);
     }
     pub fn reset(&mut self) {
         self.pages.fill(0);
@@ -101,10 +115,10 @@ impl AccessState {
             };
             // WAR needs execution ordering, not visibility of previous reads.
             source.stages |= self.readers.stages;
-            *self = Self {
-                writer: next,
-                ..Self::default()
-            };
+            self.writer = next;
+            self.readers = AccessScope::default();
+            self.visible.clear();
+            self.uploaded = false;
             (!source.stages.is_empty()).then_some(Dependency {
                 source,
                 destination: next,
@@ -130,11 +144,10 @@ impl AccessState {
         let source = self.preceding();
         // The upload buffer's final barrier makes this writer visible to all
         // main-buffer work. Overlapping uploads still need their own ordering.
-        *self = Self {
-            writer: next,
-            uploaded: true,
-            ..Self::default()
-        };
+        self.writer = next;
+        self.readers = AccessScope::default();
+        self.visible.clear();
+        self.uploaded = true;
         (!source.stages.is_empty()).then_some(Dependency {
             source,
             destination: next,
@@ -467,10 +480,7 @@ impl VulkanResidency {
                 "image access exceeds subresources",
             ));
         }
-        let layout = if self.unified_layouts
-            && conventional != vk::ImageLayout::PRESENT_SRC_KHR
-            && conventional != vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
-        {
+        let layout = if self.unified_layouts && conventional != vk::ImageLayout::PRESENT_SRC_KHR {
             vk::ImageLayout::GENERAL
         } else {
             conventional
@@ -537,6 +547,35 @@ impl VulkanResidency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn usage_covers_partial_blocks_and_page_edges_without_marking_neighbors() {
+        const SIZE: u64 = 32771;
+        let mut tracker = UsageTracker::new(SIZE);
+        for offset in [0, 1, 63, 64, 65, 4095, 4096, 4097, SIZE - 1] {
+            for size in [1, 2, 63, 64, 65, 4095, 4096, 8193] {
+                let size = size.min(SIZE - offset);
+                tracker.reset();
+                tracker.mark(offset, size);
+                let first_block = offset / 64;
+                let last_block = (offset + size - 1) / 64;
+                for query in 0..SIZE {
+                    assert_eq!(
+                        tracker.used(query, 1),
+                        (first_block..=last_block).contains(&(query / 64)),
+                        "offset={offset} size={size} query={query}"
+                    );
+                }
+                assert!(tracker.used(offset, size));
+                assert!(tracker.used(0, SIZE));
+            }
+        }
+        tracker.reset();
+        assert!(!tracker.used(0, SIZE));
+        tracker.mark(0, 1);
+        tracker.mark(SIZE - 1, 1);
+        assert!(!tracker.used(64, SIZE / 64 * 64 - 64));
+        assert!(tracker.used(64, SIZE - 64));
+    }
     fn scope(stage: vk::PipelineStageFlags2, access: vk::AccessFlags2) -> AccessScope {
         AccessScope::new(stage, access)
     }

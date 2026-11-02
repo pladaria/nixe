@@ -2,6 +2,34 @@
 use super::recording::scratch_read_barrier;
 use super::*;
 mod aliases;
+
+type AliasCopies = rustc_hash::FxHashMap<ImageId, smallvec::SmallVec<[PlaneCopies; 2]>>;
+struct PlaneCopies {
+    source: ImagePlane,
+    destination: ImagePlane,
+    copies: Vec<vk::ImageCopy>,
+}
+fn push_alias_copy(
+    batches: &mut AliasCopies,
+    source: ImageId,
+    from: ImagePlane,
+    destination: ImagePlane,
+    copy: vk::ImageCopy,
+) {
+    let groups = batches.entry(source).or_default();
+    if let Some(group) = groups
+        .iter_mut()
+        .find(|group| group.source == from && group.destination == destination)
+    {
+        group.copies.push(copy);
+    } else {
+        groups.push(PlaneCopies {
+            source: from,
+            destination,
+            copies: vec![copy],
+        });
+    }
+}
 impl VulkanResidency {
     // Image interpretations belong to their resident entry and retire with it.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
@@ -441,10 +469,7 @@ impl VulkanResidency {
         };
         let canonical_import = target.canonical_import;
         let grid = target.sample_grid;
-        let mut copies = rustc_hash::FxHashMap::<
-            (ImageId, u64, u64),
-            (ImagePlane, ImagePlane, Vec<vk::ImageCopy>),
-        >::default();
+        let mut copies = AliasCopies::default();
         let mut undefined = Vec::new();
         for (&destination, footprint) in planes.iter().zip(&geometry) {
             let Some(changes) =
@@ -520,11 +545,7 @@ impl VulkanResidency {
                         height: to_rect.extent.height,
                         depth: 1,
                     });
-                copies
-                    .entry((source, from.offset, destination.offset))
-                    .or_insert_with(|| (from, destination, Vec::new()))
-                    .2
-                    .push(region);
+                push_alias_copy(&mut copies, source, from, destination, region);
             }
         }
         let copied = !copies.is_empty();
@@ -535,10 +556,10 @@ impl VulkanResidency {
         let retained = self.constructing.len();
         self.constructing.push(Resource::Image(id));
         self.constructing
-            .extend(copies.keys().map(|&(source, ..)| Resource::Image(source)));
+            .extend(copies.keys().map(|&source| Resource::Image(source)));
         let result: Result<(), VulkanError> = (|| {
-            for ((source, ..), (from, destination, regions)) in copies {
-                self.copy_alias_regions(source, from, id, destination, &regions)?;
+            for (source, planes) in copies {
+                self.copy_alias_regions(source, id, planes)?;
             }
             for (plane, rect) in undefined {
                 self.mark_image_discarded(id, plane, rect);
@@ -638,38 +659,7 @@ impl VulkanResidency {
                 footprint.mapping().observed_pages(footprint, &mut inputs)?;
             }
             let inputs = nixe_gpu::physical::pin_selected_pages(inputs)?;
-            let mut copies = Vec::new();
-            if cpu_only {
-                for footprint in &geometry {
-                    for (index, span) in footprint.mapping().spans().iter().enumerate() {
-                        footprint.visit(index, span.start, span.bytes, |part| {
-                            copies.push(nixe_memory::PhysicalCapture {
-                                source: nixe_memory::Extent {
-                                    start: part.start,
-                                    bytes: part.bytes,
-                                },
-                                destination: part.native as usize,
-                            });
-                            true
-                        })?;
-                    }
-                }
-            } else {
-                copies.extend(parts.iter().map(|p| nixe_memory::PhysicalCapture {
-                    source: nixe_memory::Extent {
-                        start: p.start,
-                        bytes: p.bytes,
-                    },
-                    destination: p.logical as usize,
-                }));
-            }
-            let mut captured = vec![0; bytes as usize];
-            self.memory
-                .capture_resource_scattered(&inputs, &copies, &mut captured)?;
-            for plane in planes.iter() {
-                let end = plane.end().expect("validated plane") as usize;
-                self.upload_cpu_image_rows(id, *plane, 0, &captured[plane.offset as usize..end])?;
-            }
+            self.upload_cpu_image(id, &geometry, &planes, &inputs)?;
         } else {
             self.refresh_image_intersections(id, &parts, bytes)?;
         }
@@ -752,24 +742,82 @@ impl VulkanResidency {
         }
         Ok(())
     }
-    fn upload_cpu_image_rows(
+    /// Deswizzle directly into one aligned mapped reservation, as Eden's
+    /// UploadImageContents/UnswizzleImage. Physical inputs remain admitted for
+    /// the complete capture; recording receives only native staging references.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
+    fn upload_cpu_image(
+        &mut self,
+        id: ImageId,
+        geometry: &[Arc<Footprint>],
+        planes: &[ImagePlane],
+        inputs: &[nixe_memory::AllocationRange],
+    ) -> Result<(), VulkanError> {
+        let mut regions = smallvec::SmallVec::<[(u64, u64); 16]>::new();
+        let mut packed = 0u64;
+        let alignment = planes
+            .iter()
+            .map(|plane| u64::from(plane.bytes_per_block).max(4))
+            .max()
+            .unwrap();
+        for plane in planes {
+            let align = u64::from(plane.bytes_per_block).max(4);
+            packed = packed.next_multiple_of(align);
+            let bytes = plane.end().expect("validated image plane") - plane.offset;
+            regions.push((packed, bytes));
+            packed = packed
+                .checked_add(bytes)
+                .ok_or(VulkanError::InvalidResource("image upload size overflows"))?;
+        }
+        let slice = self.device.submission.reserve_slice(
+            &mut self.device.dispatch,
+            packed,
+            true,
+            alignment,
+        )?;
+        // SAFETY: one fresh reservation owns every written byte and its atom
+        // padding. Capture and flush finish before any native copy is recorded.
+        unsafe {
+            self.device.submission.staging_buffer(&slice).write_with(
+                slice.offset,
+                slice.size,
+                |destination| {
+                    destination.fill(0);
+                    self.memory
+                        .capture_resource(inputs, |reader| {
+                            for ((footprint, plane), &(offset, bytes)) in
+                                geometry.iter().zip(planes).zip(&regions)
+                            {
+                                footprint.capture_resource(
+                                    reader,
+                                    plane.offset,
+                                    &mut destination[offset as usize..(offset + bytes) as usize],
+                                )?;
+                            }
+                            Ok(())
+                        })
+                        .map_err(memory_error)
+                },
+            )?;
+        }
+        for (&plane, &(offset, bytes)) in planes.iter().zip(&regions) {
+            self.record_cpu_image_plane(id, plane, &slice, offset..offset + bytes)?;
+        }
+        Ok(())
+    }
+    fn record_cpu_image_plane(
         &mut self,
         id: ImageId,
         plane: ImagePlane,
-        offset: u64,
-        bytes: &[u8],
+        slice: &crate::queue::Slice,
+        source: std::ops::Range<u64>,
     ) -> Result<(), VulkanError> {
-        debug_assert!(offset.is_multiple_of(plane.row_pitch));
-        debug_assert!((bytes.len() as u64).is_multiple_of(plane.row_pitch));
-        let row = offset / plane.row_pitch;
-        let y = row as u32 * plane.block_extent.height;
-        let height = (bytes.len() as u64 / plane.row_pitch) as u32 * plane.block_extent.height;
-        let height = height.min(plane.extent.height - y);
-        let slice = self.device.submission.reserve_upload_aligned(
-            &mut self.device.dispatch,
+        let bytes = source.end - source.start;
+        debug_assert_eq!(
             bytes,
-            u64::from(plane.bytes_per_block).max(4),
-        )?;
+            plane.end().expect("validated image plane") - plane.offset
+        );
+        let height = plane.extent.height;
         let (image, layout) = self.image_access_subresources(
             id,
             commands::plane_range(plane),
@@ -780,7 +828,7 @@ impl VulkanResidency {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         )?;
         let region = vk::BufferImageCopy::default()
-            .buffer_offset(slice.offset)
+            .buffer_offset(slice.offset + source.start)
             .image_subresource(
                 vk::ImageSubresourceLayers::default()
                     .aspect_mask(plane.aspect)
@@ -790,7 +838,7 @@ impl VulkanResidency {
             )
             .image_offset(vk::Offset3D {
                 x: 0,
-                y: y as i32,
+                y: 0,
                 z: plane.depth_slice as i32,
             })
             .image_extent(vk::Extent3D {
@@ -801,7 +849,7 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         unsafe {
             self.device.dispatch.cmd_copy_buffer_to_image(
-                self.device.submission.staging_buffer(&slice).handle,
+                self.device.submission.staging_buffer(slice).handle,
                 image,
                 layout,
                 &[region],
@@ -811,14 +859,14 @@ impl VulkanResidency {
             id,
             plane,
             vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: y as i32 },
+                offset: vk::Offset2D { x: 0, y: 0 },
                 extent: vk::Extent2D {
                     width: plane.extent.width,
                     height,
                 },
             },
         );
-        self.statistics.cpu_uploaded_bytes += bytes.len() as u64;
+        self.statistics.cpu_uploaded_bytes += bytes;
         Ok(())
     }
     pub(super) fn copy_rows_to_image(
@@ -1235,22 +1283,19 @@ impl VulkanResidency {
         pieces: &[ImagePiece],
         access: vk::AccessFlags2,
     ) -> Result<(vk::Image, vk::ImageLayout), VulkanError> {
-        let mut result = (vk::Image::null(), vk::ImageLayout::UNDEFINED);
         let conventional = if access == vk::AccessFlags2::TRANSFER_READ {
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         } else {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL
         };
-        for piece in pieces {
-            result = self.image_access_subresources(
-                id,
-                super::commands::plane_range(piece.plane),
-                AccessScope::new(vk::PipelineStageFlags2::COPY, access),
-                conventional,
-            )?;
-        }
-        Ok(result)
+        self.image_planes_access(
+            id,
+            pieces.iter().map(|piece| piece.plane),
+            AccessScope::new(vk::PipelineStageFlags2::COPY, access),
+            conventional,
+        )
     }
+
     /// Download whole transfer blocks once, then scatter only authoritative
     /// bytes on the CPU. D24 padding and independent stencil/alias producers
     /// must never become canonical merely because a native transfer reads them.
@@ -1331,19 +1376,8 @@ impl VulkanResidency {
         let mut references = references.to_vec();
         references.push(Resource::Image(id));
         let scratch = self.temporary_buffer(size, &references)?;
-        let mut source = vk::Image::null();
-        let mut layout = vk::ImageLayout::UNDEFINED;
-        for piece in pieces {
-            (source, layout) = self.image_access_subresources(
-                id,
-                super::commands::plane_range(piece.plane),
-                AccessScope::new(
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_READ,
-                ),
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            )?;
-        }
+        let (source, layout) =
+            self.image_regions_access(id, pieces, vk::AccessFlags2::TRANSFER_READ)?;
         self.device.begin_recording()?;
 
         let regions: Vec<_> = pieces

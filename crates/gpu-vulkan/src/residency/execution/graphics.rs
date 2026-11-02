@@ -90,9 +90,8 @@ struct Attachment {
     format: vk::Format,
     samples: vk::SampleCountFlags,
 }
-#[derive(Clone)]
 pub struct PreparedTargets {
-    binding_revision: u64,
+    binding_revision: AtomicU64,
     area: vk::Rect2D,
     colors: Box<[Option<Attachment>]>,
     depth: Option<Attachment>,
@@ -100,6 +99,20 @@ pub struct PreparedTargets {
     native_colors: Box<[vk::RenderingAttachmentInfo<'static>]>,
     native_depth: Option<vk::RenderingAttachmentInfo<'static>>,
     native_stencil: Option<vk::RenderingAttachmentInfo<'static>>,
+}
+impl Clone for PreparedTargets {
+    fn clone(&self) -> Self {
+        Self {
+            binding_revision: self.binding_revision.load(Ordering::Relaxed).into(),
+            area: self.area,
+            colors: self.colors.clone(),
+            depth: self.depth.clone(),
+            stencil: self.stencil.clone(),
+            native_colors: self.native_colors.clone(),
+            native_depth: self.native_depth,
+            native_stencil: self.native_stencil,
+        }
+    }
 }
 impl PreparedTargets {
     fn compatible(&self, other: &Self) -> bool {
@@ -154,7 +167,7 @@ fn read_only_attachment(a: &Attachment, state: &GraphicsState) -> bool {
 }
 
 pub struct PreparedDraw {
-    binding_revision: u64,
+    binding_revision: AtomicU64,
     native_vertices: Arc<[(u32, vk::Buffer, u64)]>,
     native_index: Option<(vk::Buffer, u64, vk::IndexType)>,
     batchable: bool,
@@ -164,38 +177,77 @@ pub struct PreparedDraw {
     index: Option<IndexBuffer>,
     inline_index: Option<Arc<[u8]>>,
     feedback_aspects: vk::ImageAspectFlags,
+    rendering_feedback: crate::dispatch::RenderingFeedback,
 }
 impl PreparedDraw {
     pub(crate) fn can_group(&self) -> bool {
-        self.batchable && !self.shader_writes()
-    }
-
-    pub(crate) fn shader_writes(&self) -> bool {
-        self.graphics.program.uses.iter().any(|u| match u {
-            Use::Buffer { scope, .. } | Use::Image { scope, .. } => scope.writes(),
-        })
+        self.batchable
     }
 }
 impl VulkanResidency {
     pub(crate) fn draw_current(&self, draw: &PreparedDraw) -> bool {
-        draw.binding_revision == self.binding_revision
+        if draw.binding_revision.load(Ordering::Relaxed) == self.binding_revision {
+            return true;
+        }
+        // A cache deletion is an invalidation hint. Preserve every current
+        // selection whose own resource IDs and generations remain valid.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+        if !self.program_current(&draw.graphics.program)
+            || !self.targets_current(&draw.targets)
+            || draw
+                .vertices
+                .iter()
+                .any(|vertex| !self.buffer_binding_current(vertex.buffer))
+            || draw
+                .index
+                .is_some_and(|index| !self.buffer_binding_current(index.buffer))
+        {
+            return false;
+        }
+        draw.binding_revision
+            .store(self.binding_revision, Ordering::Relaxed);
+        true
     }
 
     pub(crate) fn targets_current(&self, targets: &PreparedTargets) -> bool {
-        targets.binding_revision == self.binding_revision
+        if targets.binding_revision.load(Ordering::Relaxed) == self.binding_revision {
+            return true;
+        }
+        if targets
+            .attachments()
+            .any(|attachment| match attachment.description.source {
+                AttachmentSource::Canonical { image, .. } => !self.image_binding_current(image),
+                AttachmentSource::ResidentOnly(id) => self.attachment(id).is_err(),
+            })
+        {
+            return false;
+        }
+        targets
+            .binding_revision
+            .store(self.binding_revision, Ordering::Relaxed);
+        true
     }
-    fn rendering_matches(&self, targets: &Arc<PreparedTargets>) -> bool {
-        self.device
-            .submission
-            .recording
-            .and_then(|index| self.device.submission.slots[index].active_targets.as_ref())
-            .is_some_and(|active| Arc::ptr_eq(active, targets) || active.compatible(targets))
+    fn rendering_matches(&self, draw: &PreparedDraw) -> bool {
+        self.device.submission.recording.is_some_and(|index| {
+            let slot = &self.device.submission.slots[index];
+            slot.rendering_feedback == draw.rendering_feedback
+                && slot.active_targets.as_ref().is_some_and(|active| {
+                    Arc::ptr_eq(active, &draw.targets) || active.compatible(&draw.targets)
+                })
+        })
     }
 
     pub fn prepare_targets(
         &mut self,
         targets: RenderingTargets,
     ) -> Result<Arc<PreparedTargets>, VulkanError> {
+        if targets.colors.len() > 8
+            || targets.colors.len() > self.device.profile().limits.max_color_attachments as usize
+        {
+            return Err(VulkanError::InvalidResource(
+                "rendering targets exceed supported color attachment slots",
+            ));
+        }
         let area = targets.area;
         let colors = targets
             .colors
@@ -238,7 +290,7 @@ impl VulkanResidency {
         let native_depth = depth.as_ref().map(native);
         let native_stencil = stencil.as_ref().map(native);
         Ok(Arc::new(PreparedTargets {
-            binding_revision: self.binding_revision,
+            binding_revision: self.binding_revision.into(),
             area,
             colors,
             depth,
@@ -371,7 +423,7 @@ impl VulkanResidency {
             plane: p,
             physical,
             view,
-            layout: shader_attachment_layout(description.usage),
+            layout: shader_attachment_layout(description.usage, self.unified_layouts),
             format: description.format,
             samples: description.samples,
         })
@@ -464,15 +516,18 @@ impl VulkanResidency {
             }
         }
         let mut feedback_aspects = vk::ImageAspectFlags::empty();
+        let mut rendering_feedback = crate::dispatch::RenderingFeedback::default();
         for resource in &graphics.program.uses {
             if let Use::Image { id, range, scope } = resource {
-                for a in targets.attachments().filter(|a| {
+                let overlaps = |a: &Attachment| {
                     matches!(a.description.source,AttachmentSource::Canonical {image,..} if image==*id)
                         && (range.base_mip_level..range.base_mip_level + range.level_count)
                             .contains(&a.plane.mip_level)
                         && (range.base_array_layer..range.base_array_layer + range.layer_count)
                             .contains(&a.plane.array_layer)
-                }) {
+                };
+                let mut feedback = false;
+                for a in targets.attachments().filter(|a| overlaps(a)) {
                     // Load/store operations can touch adjacent depth/stencil
                     // aspects too. Both must be read-only before sharing reads.
                     if scope.writes() {
@@ -482,16 +537,32 @@ impl VulkanResidency {
                     }
                     if !read_only_attachment(a, state) {
                         if !self.device.profile().attachment_feedback_loop
-                            || !self.image(*id)?.description.usage.contains(
-                                vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT,
-                            )
+                            || !self
+                                .image(*id)?
+                                .description
+                                .usage
+                                .contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT)
                         {
                             return Err(VulkanError::InvalidResource(
                                 "attachment feedback requires Vulkan feedback-loop support",
                             ));
                         }
                         feedback_aspects |= range.aspect_mask;
+                        feedback = true;
                     }
+                }
+                if feedback && self.unified_layouts {
+                    // GENERAL needs explicit feedback semantics only for a
+                    // view actually read while used as a writable attachment.
+                    // Include adjacent depth/stencil attachments sharing it.
+                    // https://docs.vulkan.org/spec/latest/chapters/renderpass.html#renderpass-feedbackloop
+                    for (index, attachment) in targets.colors.iter().enumerate() {
+                        if attachment.as_ref().is_some_and(overlaps) {
+                            rendering_feedback.colors |= 1 << index;
+                        }
+                    }
+                    rendering_feedback.depth |= targets.depth.as_ref().is_some_and(overlaps);
+                    rendering_feedback.stencil |= targets.stencil.as_ref().is_some_and(overlaps);
                 }
             }
         }
@@ -564,7 +635,9 @@ impl VulkanResidency {
             )?;
             Ok(candidates.any(|(_, target)| target.intersects(&footprint)))
         };
-        let mut batchable = targets.attachments().all(|a| {
+        let mut batchable = !graphics.program.uses.iter().any(|usage| match usage {
+            Use::Buffer { scope, .. } | Use::Image { scope, .. } => scope.writes(),
+        }) && targets.attachments().all(|a| {
             a.description.load == vk::AttachmentLoadOp::LOAD
                 && a.description.store == vk::AttachmentStoreOp::STORE
         });
@@ -621,7 +694,7 @@ impl VulkanResidency {
             })
             .transpose()?;
         Ok(PreparedDraw {
-            binding_revision: self.binding_revision,
+            binding_revision: self.binding_revision.into(),
             native_vertices,
             native_index,
             batchable,
@@ -631,6 +704,7 @@ impl VulkanResidency {
             index,
             inline_index: None,
             feedback_aspects,
+            rendering_feedback,
         })
     }
     /// Consume immediately, synchronizing contents independently of cached bindings.
@@ -680,7 +754,7 @@ impl VulkanResidency {
         if !self.deferred_clears.is_empty() && !self.clear_matches_targets(&prepared.targets) {
             self.realize_deferred_clears()?;
         }
-        if !prepared.can_group() || !self.rendering_matches(&prepared.targets) {
+        if !prepared.can_group() || !self.rendering_matches(prepared) {
             self.device.end_rendering();
         }
         let graphics = &prepared.graphics;
@@ -849,19 +923,22 @@ impl VulkanResidency {
                             entry.planes[index] == a.plane
                                 && transfers::intersects(rect, prepared.targets.area)
                         });
-                    let regions = if incomplete {
-                        preserved_draw_rects(
+                    if incomplete {
+                        for rect in preserved_draw_rects(
                             prepared.targets.area,
                             entry.discarded.iter().filter_map(|&(index, rect)| {
                                 (entry.planes[index] == a.plane).then_some(rect)
                             }),
                             &graphics.parameters.scissors,
-                        )
+                        ) {
+                            writers.push(self.prepare_image_rect(image, a.plane, rect)?);
+                        }
                     } else {
-                        vec![prepared.targets.area]
-                    };
-                    for rect in regions {
-                        writers.push(self.prepare_image_rect(image, a.plane, rect)?);
+                        writers.push(self.prepare_image_rect(
+                            image,
+                            a.plane,
+                            prepared.targets.area,
+                        )?);
                     }
                 }
             }
@@ -878,7 +955,7 @@ impl VulkanResidency {
         if !self.barriers.is_empty() {
             self.device.end_rendering();
         }
-        let continuing = self.rendering_matches(&prepared.targets);
+        let continuing = self.rendering_matches(prepared);
         if !continuing {
             for a in prepared.targets.attachments() {
                 let (stages, access) = if a.plane.aspect == vk::ImageAspectFlags::COLOR {
@@ -1034,8 +1111,9 @@ impl VulkanResidency {
                     // No render-pass object, framebuffer cache, HAL encoder or backend segment.
                     // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdBeginRendering.html
                     device.submission.statistics.rendering_scopes += 1;
-                    raw.begin_rendering(&info);
+                    raw.begin_rendering(&info, prepared.rendering_feedback);
                     slot.active_targets = Some(Arc::clone(&prepared.targets));
+                    slot.rendering_feedback = prepared.rendering_feedback;
                 }
                 if !empty {
                     device.submission.statistics.draw_calls += 1;

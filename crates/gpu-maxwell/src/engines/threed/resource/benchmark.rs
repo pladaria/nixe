@@ -8,6 +8,162 @@ use crate::{
 
 #[test]
 #[cfg(target_os = "linux")]
+#[ignore = "opt-in resource reads across physical admission regions"]
+fn scattered_texture_binding_throughput() {
+    use crate::engines::tests::{program_three_d, three_d_channel};
+    const REGION: u64 = 2 * 1024 * 1024;
+    const TEXTURES: u8 = 8;
+    let iterations: usize = std::env::var("NIXE_TEXTURE_BENCH_ITERS")
+        .ok()
+        .map(|value| value.parse().unwrap())
+        .unwrap_or(200_000);
+    assert!(iterations > 0);
+    for layout in ["local", "three_regions", "many_regions"] {
+        let machine = crate::test_memory::machine();
+        let allocation = crate::test_memory::allocate(&machine, 12 * REGION);
+        let mut space = MaxwellGpuAddressSpace::new(
+            machine.clone(),
+            MaxwellAddressSpaceId::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let mapping = space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(1),
+                backing: crate::test_memory::ranges(&allocation),
+                backing_offset: 0,
+                size: 12 * REGION,
+                allocation_alignment: 4096,
+                page_size: 0,
+                kind: 0,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        let base = mapping.offset().get();
+        let (tic, tsc) = if layout == "local" {
+            (0x1000, 0x2000)
+        } else {
+            (REGION, 2 * REGION)
+        };
+        let mut channel = three_d_channel();
+        let mut roles = Vec::new();
+        for index in 0..TEXTURES {
+            let handle_offset = if layout == "many_regions" {
+                (3 + u64::from(index)) * REGION
+            } else {
+                u64::from(index) * 4
+            };
+            let handle = u32::from(index) | (u32::from(index) << 20);
+            crate::test_memory::write(&allocation, handle_offset, &handle.to_le_bytes()).unwrap();
+            let image = base + 11 * REGION + u64::from(index) * 256;
+            let header = [
+                0x74e2_4915u32,
+                image as u32,
+                (image >> 32) as u32 | (2 << 21),
+                1,
+                3 | (1 << 23),
+                3 | (1 << 31),
+                0,
+                0,
+            ];
+            let sampler = [
+                0u32,
+                2 | (2 << 4) | (3 << 6),
+                (15 * 256) << 12,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ];
+            for (offset, words) in [(tic, header), (tsc, sampler)] {
+                crate::test_memory::write(
+                    &allocation,
+                    offset + u64::from(index) * 32,
+                    &words
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            }
+            let slot = if layout == "many_regions" { index } else { 0 };
+            if layout == "many_regions" || index == 0 {
+                let address = if layout == "many_regions" {
+                    base + handle_offset
+                } else {
+                    base
+                };
+                for (method, value) in [
+                    (0x2380, 128),
+                    (0x2384, (address >> 32) as u32),
+                    (0x2388, address as u32),
+                    (0x2410, 1 | (u32::from(slot) << 4)),
+                ] {
+                    program_three_d(&mut channel, method, value);
+                }
+            }
+            roles.push(MaxwellThreeDResourceRole::SampledImage {
+                texture: MaxwellThreeDTextureReference::new(
+                    0,
+                    slot,
+                    if layout == "many_regions" {
+                        0
+                    } else {
+                        u32::from(index) * 4
+                    },
+                ),
+                dimension: MaxwellThreeDTextureDimension::Two,
+                with_sampler: true,
+            });
+        }
+        for (method, value) in [
+            (0x1234, 0),
+            (0x1574, ((base + tic) >> 32) as u32),
+            (0x1578, (base + tic) as u32),
+            (0x157c, u32::from(TEXTURES) - 1),
+            (0x155c, ((base + tsc) >> 32) as u32),
+            (0x1560, (base + tsc) as u32),
+            (0x1564, u32::from(TEXTURES) - 1),
+        ] {
+            program_three_d(&mut channel, method, value);
+        }
+        let selection = MaxwellThreeDResourceSelection::new(&roles, &[]);
+        let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
+        let mut access = crate::test_memory::access(space.memory().machine());
+        for _ in 0..1000 {
+            cache
+                .select(&selection, Default::default())
+                .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+                .unwrap();
+        }
+        let expected = cache.selected.clone();
+        ALLOCATIONS.with(|counter| counter.set(Some(0)));
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(
+                cache
+                    .select(&selection, Default::default())
+                    .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+                    .unwrap(),
+            );
+        }
+        let wall_ns = started.elapsed().as_nanos();
+        let allocations = ALLOCATIONS.with(|counter| counter.replace(None).unwrap());
+        assert_eq!(cache.selected, expected);
+        assert_eq!(allocations, 0);
+        println!(
+            "SCATTERED_TEXTURE_BENCH {{\"layout\":\"{layout}\",\"iterations\":{iterations},\"textures\":{TEXTURES},\"wall_ns\":{wall_ns},\"allocations\":{allocations}}}"
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 #[ignore = "opt-in matched descriptor CPU/allocation measurement"]
 fn descriptor_lookup_throughput() {
     let machine = crate::test_memory::machine();
@@ -99,12 +255,13 @@ fn retained_bindings_throughput() {
         program_three_d(&mut channel, method, value);
     }
     let roles = [MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 }];
+    let selection = MaxwellThreeDResourceSelection::new(&roles, &[]);
     let mut access = crate::test_memory::access(space.memory().machine());
     for cold in [true, false] {
         let iterations = if cold { 1000 } else { 100000 };
         let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
         let first = cache
-            .select(&roles, &[])
+            .select(&selection, Default::default())
             .resolve(channel.three_d(), space.memory(), 4096, &mut access)
             .unwrap()
             .clone();
@@ -115,7 +272,7 @@ fn retained_bindings_throughput() {
                 cache = MaxwellThreeDResolvedResourceCache::new(1);
             }
             let bindings = cache
-                .select(&roles, &[])
+                .select(&selection, Default::default())
                 .resolve(channel.three_d(), space.memory(), 4096, &mut access)
                 .unwrap();
             if !cold {
@@ -148,16 +305,17 @@ fn unused_slots_and_inactive_groups_do_not_allocate_or_rebuild() {
         program_three_d(&mut channel, method, value);
     }
     let roles = [MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 }];
+    let selection = MaxwellThreeDResourceSelection::new(&roles, &[]);
     let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
     let mut access = crate::test_memory::access(space.memory().machine());
     let first = cache
-        .select(&roles, &[])
+        .select(&selection, Default::default())
         .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap()
         .clone();
     ALLOCATIONS.with(|n| n.set(Some(0)));
     let repeated = cache
-        .select(&roles, &[])
+        .select(&selection, Default::default())
         .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap();
     let warm = ALLOCATIONS.with(|n| n.replace(None).unwrap());
@@ -166,7 +324,7 @@ fn unused_slots_and_inactive_groups_do_not_allocate_or_rebuild() {
     program_three_d(&mut channel, 0x2410, 17);
     ALLOCATIONS.with(|n| n.set(Some(0)));
     let unused = cache
-        .select(&roles, &[])
+        .select(&selection, Default::default())
         .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap();
     let unused_count = ALLOCATIONS.with(|n| n.replace(None).unwrap());
@@ -176,13 +334,16 @@ fn unused_slots_and_inactive_groups_do_not_allocate_or_rebuild() {
         unused.resource(roles[0]).unwrap().source()
     );
     cache
-        .select(&[], &[])
+        .select(
+            &MaxwellThreeDResourceSelection::new(&[], &[]),
+            Default::default(),
+        )
         .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap();
     program_three_d(&mut channel, 0x2410, 16);
     ALLOCATIONS.with(|n| n.set(Some(0)));
     let after = cache
-        .select(&roles, &[])
+        .select(&selection, Default::default())
         .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap();
     let after_count = ALLOCATIONS.with(|n| n.replace(None).unwrap());
@@ -195,6 +356,306 @@ fn unused_slots_and_inactive_groups_do_not_allocate_or_rebuild() {
         (first == unused),
         (unused == after)
     );
+}
+
+#[test]
+fn enabling_an_empty_binding_keeps_later_program_slots_and_physical_views() {
+    use crate::engines::tests::{program_three_d, three_d_channel};
+    let (_allocation, space, address) = crate::shader::test_support::mapped_memory();
+    let mut channel = three_d_channel();
+    for (method, value) in [
+        (0x2380, 64),
+        (0x2384, (address >> 32) as u32),
+        (0x2388, address as u32 + 64),
+        (0x2410, 17),
+    ] {
+        program_three_d(&mut channel, method, value);
+    }
+    let roles = [0, 1].map(|slot| MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot });
+    let locations = [0, 1].map(|index| MaxwellThreeDBindingLocation {
+        group: 1,
+        index,
+        sampler: false,
+    });
+    let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
+    let mut access = crate::test_memory::access(space.memory().machine());
+    let selected = cache
+        .select(
+            &MaxwellThreeDResourceSelection::new(&roles, &[]),
+            Default::default(),
+        )
+        .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+        .unwrap();
+    assert!(selected.binding_at(locations[0]).is_none());
+    let Some(MaxwellThreeDResolvedBinding::Resource(MaxwellThreeDResolvedResource::Buffer {
+        view: following,
+        ..
+    })) = selected.binding_at(locations[1])
+    else {
+        panic!("second slot must remain addressable after an empty first slot")
+    };
+    let following = Arc::clone(following);
+    for enabled in [true, false, true] {
+        program_three_d(&mut channel, 0x2388, address as u32);
+        program_three_d(&mut channel, 0x2410, u32::from(enabled));
+        let selected = cache
+            .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+            .unwrap();
+        assert_eq!(selected.binding_at(locations[0]).is_some(), enabled);
+        assert_eq!(selected.resource(roles[0]).is_some(), enabled);
+        let Some(MaxwellThreeDResolvedBinding::Resource(MaxwellThreeDResolvedResource::Buffer {
+            view,
+            ..
+        })) = selected.binding_at(locations[1])
+        else {
+            panic!("changing the first slot must not shift the second")
+        };
+        assert!(Arc::ptr_eq(view, &following));
+        assert_eq!(view.source().offset().get(), address + 64);
+    }
+}
+
+#[test]
+#[ignore = "opt-in program selection CPU measurement"]
+fn program_selection_throughput() {
+    use crate::engines::tests::{program_three_d, three_d_channel};
+    let (_allocation, space, address) = crate::shader::test_support::mapped_memory();
+    let mut channel = three_d_channel();
+    for group in 0..8 {
+        for slot in 0..32 {
+            for (method, value) in [
+                (0x2380, 64),
+                (0x2384, (address >> 32) as u32),
+                (0x2388, (address + ((group * 32 + slot) % 64) * 64) as u32),
+                (0x2410 + group as u32 * 0x20, 1 | (slot as u32) << 4),
+            ] {
+                program_three_d(&mut channel, method, value);
+            }
+        }
+    }
+    let programs: Vec<Vec<_>> = (0..16)
+        .map(|program| {
+            (0..8)
+                .flat_map(|group| {
+                    (0..4).map(move |i| MaxwellThreeDResourceRole::ConstantBuffer {
+                        group,
+                        slot: (program + i * 8) % 32,
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
+    let mut access = crate::test_memory::access(space.memory().machine());
+    // Keep every view in the ordinary semantic cache; measure the channel's
+    // real program changes rather than cache misses or guest memory uploads.
+    for roles in &programs {
+        let mut roles = roles.clone();
+        roles.sort_unstable();
+        cache
+            .select(
+                &MaxwellThreeDResourceSelection::new(&roles, &[]),
+                Default::default(),
+            )
+            .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+            .unwrap();
+    }
+    let programs: Vec<_> = programs
+        .into_iter()
+        .map(|mut roles| {
+            roles.sort_unstable();
+            MaxwellThreeDResourceSelection::new(&roles, &[])
+        })
+        .collect();
+    let cpu_ns = || -> u64 {
+        std::fs::read_to_string("/proc/thread-self/schedstat")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let iterations = 100_000;
+    let before = cpu_ns();
+    let start = std::time::Instant::now();
+    for index in 0..iterations {
+        std::hint::black_box(
+            cache
+                .select(&programs[index % programs.len()], Default::default())
+                .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+                .unwrap(),
+        );
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let cpu_ns = cpu_ns() - before;
+    println!("{{\"iterations\":{iterations},\"seconds\":{elapsed},\"cpu_ns\":{cpu_ns}}}");
+}
+
+#[test]
+fn distant_constant_buffer_groups_keep_distinct_channel_selections() {
+    use crate::engines::tests::{program_three_d, three_d_channel};
+    let (_allocation, space, address) = crate::shader::test_support::mapped_memory();
+    let mut channel = three_d_channel();
+    let coordinates = [(0, 0), (0, 31), (7, 0), (7, 31)];
+    for (index, &(group, slot)) in coordinates.iter().enumerate() {
+        for (method, value) in [
+            (0x2380, 64),
+            (0x2384, (address >> 32) as u32),
+            (0x2388, (address + index as u64 * 64) as u32),
+            (0x2410 + group * 0x20, 1 | slot << 4),
+        ] {
+            program_three_d(&mut channel, method, value);
+        }
+    }
+    let roles = coordinates.map(|(group, slot)| MaxwellThreeDResourceRole::ConstantBuffer {
+        group: group as u8,
+        slot: slot as u8,
+    });
+    let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
+    let mut access = crate::test_memory::access(space.memory().machine());
+    for selected in [&roles[..], &roles[2..], &roles[..1], &roles[..]] {
+        let bindings = cache
+            .select(
+                &MaxwellThreeDResourceSelection::new(selected, &[]),
+                Default::default(),
+            )
+            .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+            .unwrap();
+        for (index, &role) in roles.iter().enumerate() {
+            assert_eq!(
+                bindings.resource(role).map(|r| r.source().offset().get()),
+                selected
+                    .contains(&role)
+                    .then_some(address + index as u64 * 64),
+            );
+        }
+    }
+}
+
+#[test]
+fn program_switches_retain_channel_slots_and_consume_inactive_binding_changes() {
+    use crate::engines::tests::{program_three_d, three_d_channel};
+    let (_allocation, space, address) = crate::shader::test_support::mapped_memory();
+    let mut channel = three_d_channel();
+    for (method, value) in [
+        (0x2380, 64),
+        (0x2384, (address >> 32) as u32),
+        (0x2388, address as u32),
+        (0x2410, 1),
+        (0x2388, address as u32 + 64),
+        (0x2410, 17),
+    ] {
+        program_three_d(&mut channel, method, value);
+    }
+    let roles = [0, 1].map(|slot| MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot });
+    let selections = roles.map(|role| MaxwellThreeDResourceSelection::new(&[role], &[]));
+    let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
+    let mut access = crate::test_memory::access(space.memory().machine());
+    for role in roles {
+        cache
+            .select(
+                &MaxwellThreeDResourceSelection::new(&[role], &[]),
+                Default::default(),
+            )
+            .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+            .unwrap();
+    }
+    ALLOCATIONS.with(|n| n.set(Some(0)));
+    for index in 0..100 {
+        let selected = cache
+            .select(&selections[index % 2], Default::default())
+            .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+            .unwrap();
+        assert_eq!(
+            selected
+                .resource(roles[index % 2])
+                .unwrap()
+                .source()
+                .offset()
+                .get(),
+            address + (index % 2) as u64 * 64
+        );
+        assert!(selected.resource(roles[(index + 1) % 2]).is_none());
+    }
+    assert_eq!(ALLOCATIONS.with(|n| n.replace(None).unwrap()), 0);
+    // Slot zero is inactive. Its next consumption must use the changed address.
+    program_three_d(&mut channel, 0x2388, address as u32 + 128);
+    program_three_d(&mut channel, 0x2410, 1);
+    let selected = cache
+        .select(&selections[0], Default::default())
+        .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+        .unwrap();
+    assert_eq!(
+        selected.resource(roles[0]).unwrap().source().offset().get(),
+        address + 128
+    );
+}
+
+#[test]
+fn interleaved_program_slots_keep_their_ranges_and_consumed_sizes() {
+    use crate::engines::tests::{program_three_d, three_d_channel};
+    let (_allocation, space, address) = crate::shader::test_support::mapped_memory();
+    let mut channel = three_d_channel();
+    program_three_d(&mut channel, 0x2380, 64);
+    program_three_d(&mut channel, 0x2384, (address >> 32) as u32);
+    for slot in 0..5 {
+        program_three_d(&mut channel, 0x2388, (address + slot * 64) as u32);
+        program_three_d(&mut channel, 0x2410, 1 | (slot as u32) << 4);
+    }
+    let roles =
+        [0, 2, 3, 4].map(|slot| MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot });
+    let sizes = [
+        (roles[0], MaxwellShaderBufferSize::Proven(16)),
+        (roles[2], MaxwellShaderBufferSize::Proven(32)),
+    ];
+    let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
+    let mut access = crate::test_memory::access(space.memory().machine());
+    cache
+        .select(
+            &MaxwellThreeDResourceSelection::new(&[roles[1], roles[3]], &sizes),
+            Default::default(),
+        )
+        .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+        .unwrap();
+    let changed_sizes = [
+        (roles[0], MaxwellShaderBufferSize::Proven(48)),
+        (roles[2], MaxwellShaderBufferSize::Proven(8)),
+    ];
+    for (selected, sizes) in [
+        (&roles[..], &sizes[..]),
+        (&roles[1..], &sizes[..]),
+        (&roles[..], &sizes[..]),
+        (&roles[..], &changed_sizes[..]),
+        (&roles[..], &[]),
+        (&roles[..], &sizes[..]),
+    ] {
+        let resources = cache
+            .select(
+                &MaxwellThreeDResourceSelection::new(selected, sizes),
+                Default::default(),
+            )
+            .resolve(channel.three_d(), space.memory(), 4096, &mut access)
+            .unwrap();
+        for &role in selected {
+            let MaxwellThreeDResourceRole::ConstantBuffer { slot, .. } = role else {
+                unreachable!()
+            };
+            let source = resources.resource(role).unwrap().source();
+            assert_eq!(source.offset().get(), address + u64::from(slot) * 64);
+            assert_eq!(
+                source.size(),
+                match sizes
+                    .iter()
+                    .find_map(|&(r, size)| (r == role).then_some(size))
+                {
+                    Some(MaxwellShaderBufferSize::Proven(end)) => end,
+                    _ => 64,
+                }
+            );
+        }
+        assert_eq!(resources.resources().count(), selected.len());
+    }
 }
 
 #[test]
@@ -218,14 +679,20 @@ fn changed_binding_preserves_other_slots_and_cache_pressure_preserves_selected_w
     let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
     let mut access = crate::test_memory::access(space.memory().machine());
     let first = cache
-        .select(&roles, &[])
+        .select(
+            &MaxwellThreeDResourceSelection::new(&roles, &[]),
+            Default::default(),
+        )
         .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap()
         .clone();
     program_three_d(&mut channel, 0x2388, address as u32 + 64);
     program_three_d(&mut channel, 0x2410, 17);
     let changed = cache
-        .select(&roles, &[])
+        .select(
+            &MaxwellThreeDResourceSelection::new(&roles, &[]),
+            Default::default(),
+        )
         .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap()
         .clone();
@@ -257,12 +724,12 @@ fn paired_texture_identity_tracks_only_both_consumed_constant_slots() {
     let original = channel.three_d().resource_state_identity(role);
     program_three_d(&mut channel, 0x2388, address as u32 + 64);
     program_three_d(&mut channel, 0x2410, 33);
-    assert!(original.matches(channel.three_d()));
+    assert!(original.matches(channel.three_d(), role));
     program_three_d(&mut channel, 0x2410, 49);
-    assert!(!original.matches(channel.three_d()));
+    assert!(!original.matches(channel.three_d(), role));
     let changed = channel.three_d().resource_state_identity(role);
     program_three_d(&mut channel, 0x2410, 17);
-    assert!(!changed.matches(channel.three_d()));
+    assert!(!changed.matches(channel.three_d(), role));
 }
 
 #[test]
@@ -284,6 +751,7 @@ fn storage_descriptor_rebinding_reads_once_without_allocations() {
         byte_offset: 0x110,
     };
     let sizes = [(role, MaxwellShaderBufferSize::Declared)];
+    let selection = MaxwellThreeDResourceSelection::new(&[role], &sizes);
     let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
     let mut access = crate::test_memory::access(space.memory().machine());
     let descriptor = |offset: u64| {
@@ -295,7 +763,7 @@ fn storage_descriptor_rebinding_reads_once_without_allocations() {
     for offset in [0x400, 0x500] {
         crate::test_memory::write(&allocation, 0x110, &descriptor(offset)).unwrap();
         cache
-            .select(&[role], &sizes)
+            .select(&selection, Default::default())
             .resolve(channel.three_d(), space.memory(), 4096, &mut access)
             .unwrap();
     }
@@ -312,7 +780,7 @@ fn storage_descriptor_rebinding_reads_once_without_allocations() {
             .captured_bytes;
         ALLOCATIONS.with(|n| n.set(Some(0)));
         cache
-            .select(&[role], &sizes)
+            .select(&selection, Default::default())
             .resolve(channel.three_d(), space.memory(), 4096, &mut access)
             .unwrap();
         let allocations = ALLOCATIONS.with(|n| n.replace(None).unwrap());
@@ -469,17 +937,32 @@ fn combined_texture_and_sampler_read_one_handle_per_draw() {
     }];
     let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
     let mut access = crate::test_memory::access(space.memory().machine());
-    cache
-        .select(&roles, &[])
+    let selected = cache
+        .select(
+            &MaxwellThreeDResourceSelection::new(&roles, &[]),
+            Default::default(),
+        )
         .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap();
+    let location = MaxwellThreeDBindingLocation {
+        group: 2,
+        index: 0,
+        sampler: true,
+    };
+    let Some(MaxwellThreeDResolvedBinding::Sampler(sampler)) = selected.binding_at(location) else {
+        panic!("combined image slot must expose its current sampler")
+    };
+    assert_eq!(sampler.role(), MaxwellThreeDResourceRole::Sampler(texture));
     let before = space
         .memory()
         .machine()
         .tracking_statistics()
         .captured_bytes;
     cache
-        .select(&roles, &[])
+        .select(
+            &MaxwellThreeDResourceSelection::new(&roles, &[]),
+            Default::default(),
+        )
         .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap();
     let read = space
@@ -493,22 +976,41 @@ fn combined_texture_and_sampler_read_one_handle_per_draw() {
     );
     #[cfg(feature = "performance-counters")]
     assert_eq!(read, 68);
-    let first = *cache
-        .selected
-        .sampler(MaxwellThreeDResourceRole::Sampler(texture))
+    let current_sampler = |selected: &MaxwellThreeDResolvedResources| {
+        let Some(MaxwellThreeDResolvedBinding::Sampler(sampler)) = selected.binding_at(location)
+        else {
+            panic!("current sampler must occupy the program's selected slot")
+        };
+        *sampler
+    };
+    let first = current_sampler(&cache.selected);
+    // A program can use a different handle expression at the same binding
+    // position. Returning to this program must consume the now mutable TSC.
+    let alternate = MaxwellThreeDResourceRole::SampledImage {
+        texture: MaxwellThreeDTextureReference::new(0, 0, 4),
+        dimension: MaxwellThreeDTextureDimension::Two,
+        with_sampler: true,
+    };
+    crate::test_memory::write(&allocation, 4, &0u32.to_le_bytes()).unwrap();
+    let selected = cache
+        .select(
+            &MaxwellThreeDResourceSelection::new(&[alternate], &[]),
+            Default::default(),
+        )
+        .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap();
+    assert!(selected.resource(alternate).is_some());
+    assert!(selected.resource(roles[0]).is_none());
     // A mutable TSC descriptor must be consumed again even with the same handle.
     crate::test_memory::write(&allocation, 0x144, &((tsc[1] & !0xf) | 1).to_le_bytes()).unwrap();
     let selected = cache
-        .select(&roles, &[])
+        .select(
+            &MaxwellThreeDResourceSelection::new(&roles, &[]),
+            Default::default(),
+        )
         .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap();
-    assert_ne!(
-        *selected
-            .sampler(MaxwellThreeDResourceRole::Sampler(texture))
-            .unwrap(),
-        first
-    );
+    assert_ne!(current_sampler(selected), first);
     // Then switch the handle to another TSC entry without touching the registers.
     crate::test_memory::write(
         &allocation,
@@ -521,15 +1023,13 @@ fn combined_texture_and_sampler_read_one_handle_per_draw() {
     program_three_d(&mut channel, 0x1564, 1);
     crate::test_memory::write(&allocation, 0, &(1u32 << 20).to_le_bytes()).unwrap();
     let selected = cache
-        .select(&roles, &[])
+        .select(
+            &MaxwellThreeDResourceSelection::new(&roles, &[]),
+            Default::default(),
+        )
         .resolve(channel.three_d(), space.memory(), 4096, &mut access)
         .unwrap();
-    assert_eq!(
-        *selected
-            .sampler(MaxwellThreeDResourceRole::Sampler(texture))
-            .unwrap(),
-        first
-    );
+    assert_eq!(current_sampler(selected), first);
     // Handle and descriptor inputs are consumed bytes, not retained resources.
     assert_eq!(cache.retained_backings.entries.usage().0, 1);
     let original = match cache.selected.resource(roles[0]).unwrap() {
@@ -556,7 +1056,10 @@ fn combined_texture_and_sampler_read_one_handle_per_draw() {
         )
         .unwrap();
         let selected = cache
-            .select(&roles, &[])
+            .select(
+                &MaxwellThreeDResourceSelection::new(&roles, &[]),
+                Default::default(),
+            )
             .resolve(channel.three_d(), space.memory(), 4096, &mut access)
             .unwrap();
         let MaxwellThreeDResolvedResource::Image { view, .. } =
@@ -571,8 +1074,11 @@ fn combined_texture_and_sampler_read_one_handle_per_draw() {
     cache.retained_backings.set_view_limit(1);
     cache
         .select(
-            &[MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 }],
-            &[],
+            &MaxwellThreeDResourceSelection::new(
+                &[MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 }],
+                &[],
+            ),
+            Default::default(),
         )
         .resolve(channel.three_d(), space.memory(), 1, &mut access)
         .unwrap();
@@ -581,7 +1087,10 @@ fn combined_texture_and_sampler_read_one_handle_per_draw() {
         "descriptor indices must not pin evicted views"
     );
     let selected = cache
-        .select(&roles, &[])
+        .select(
+            &MaxwellThreeDResourceSelection::new(&roles, &[]),
+            Default::default(),
+        )
         .resolve(channel.three_d(), space.memory(), 1, &mut access)
         .unwrap();
     let MaxwellThreeDResolvedResource::Image { view, .. } = selected.resource(roles[0]).unwrap()
@@ -674,6 +1183,7 @@ fn texture_binding_throughput() {
         dimension: MaxwellThreeDTextureDimension::Two,
         with_sampler: false,
     }];
+    let selection = MaxwellThreeDResourceSelection::new(&roles, &[]);
     let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
     let mut access = crate::test_memory::access(space.memory().machine());
     let iterations = std::env::var("NIXE_TEXTURE_BENCH_ITERS")
@@ -685,7 +1195,7 @@ fn texture_binding_throughput() {
             for handle in 0u32..2 {
                 crate::test_memory::write(&allocation, 0, &handle.to_le_bytes()).unwrap();
                 cache
-                    .select(&roles, &[])
+                    .select(&selection, Default::default())
                     .resolve(channel.three_d(), space.memory(), 4096, &mut access)
                     .unwrap();
             }
@@ -709,7 +1219,7 @@ fn texture_binding_throughput() {
             }
             std::hint::black_box(
                 cache
-                    .select(&roles, &[])
+                    .select(&selection, Default::default())
                     .resolve(channel.three_d(), space.memory(), 4096, &mut access)
                     .unwrap(),
             );

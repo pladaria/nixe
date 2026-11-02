@@ -347,10 +347,9 @@ impl MaxwellGpuMemory {
         let source = if let Some(bytes) = source.gathered_bytes() {
             nixe_memory::WriteSource::Bytes(&bytes[..byte_count])
         } else {
-            let (address, offset) = source.ram_bytes().expect("command source");
             nixe_memory::WriteSource::Ram {
-                address,
-                offset,
+                address: source.ram_address().expect("command source"),
+                offset: 0,
                 bytes: byte_count,
             }
         };
@@ -489,7 +488,7 @@ impl MaxwellGpuMemory {
     pub(crate) fn command_ram(
         &self,
         resolved: &MaxwellResolvedRange,
-    ) -> Result<Option<(nixe_memory::HostAddress, AllocationRange)>, MaxwellGpuAccessError> {
+    ) -> Result<Option<nixe_memory::RamSource>, MaxwellGpuAccessError> {
         let _change = self
             .inner
             .mappings
@@ -506,14 +505,8 @@ impl MaxwellGpuMemory {
         &self,
         address: GpuVirtualAddress,
         size: u64,
-    ) -> Result<
-        Option<(
-            MaxwellResolvedMapping,
-            nixe_memory::HostAddress,
-            AllocationRange,
-        )>,
-        MaxwellGpuAccessError,
-    > {
+    ) -> Result<Option<(MaxwellResolvedMapping, nixe_memory::RamSource)>, MaxwellGpuAccessError>
+    {
         self.validate_resolution_request(address, MemoryPermissions::READ)?;
         if size == 0 {
             return Err(MaxwellGpuAccessError::EmptyRange);
@@ -533,12 +526,12 @@ impl MaxwellGpuMemory {
         segment.size = size;
         Ok(self
             .command_ram_segment(&segment)?
-            .map(|(pointer, pin)| (segment, pointer, pin)))
+            .map(|source| (segment, source)))
     }
     fn command_ram_segment(
         &self,
         segment: &MaxwellResolvedMapping,
-    ) -> Result<Option<(nixe_memory::HostAddress, AllocationRange)>, MaxwellGpuAccessError> {
+    ) -> Result<Option<nixe_memory::RamSource>, MaxwellGpuAccessError> {
         let mapping = segment.mapping().physical();
         let begin = segment.backing_offset();
         let spans = mapping.spans();
@@ -550,15 +543,9 @@ impl MaxwellGpuMemory {
         };
         let start = ArenaOffset::new(span.start.get() + begin - span.logical);
         let backing = |error| MaxwellGpuAccessError::Backing(Arc::new(error));
-        let range = mapping
-            .pin_span(index, start, segment.size())
-            .map_err(backing)?
-            .ok_or_else(|| backing(MemoryError::Invalid("command RAM has retired")))?;
-        Ok(self
-            .machine()
-            .try_ram_pointer(&range)
-            .map_err(backing)?
-            .map(|pointer| (pointer, range)))
+        mapping
+            .try_ram_span(index, start, segment.size())
+            .map_err(backing)
     }
     /// Read accepted spans. Device-dependent results own their bytes; a pending
     /// access never retains this output buffer or a borrowed frontend stack.

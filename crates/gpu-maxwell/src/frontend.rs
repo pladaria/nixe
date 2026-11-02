@@ -15,7 +15,9 @@ use crate::{
 #[derive(Clone, Debug)]
 pub enum MaxwellFrontendDispatchError {
     EmptySubmission,
-    PacketDecode(MaxwellPushbufferDecodeError),
+    // Effects and MME sends carry this error type through their synchronous
+    // results. Keep packet provenance behind the failure-only allocation too.
+    PacketDecode(Box<MaxwellPushbufferDecodeError>),
     EngineDispatch(Box<MaxwellEngineDispatchError>),
     Execution(Box<MaxwellSubmissionExecutionError>),
 }
@@ -75,7 +77,9 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
             if stream.needs_entry()
                 && !stream
                     .load_entry(submission, address_space, sources, effects.host)
-                    .map_err(|error| MaxwellFrontendDispatchError::PacketDecode(error.into()))?
+                    .map_err(|error| {
+                        MaxwellFrontendDispatchError::PacketDecode(Box::new(error.into()))
+                    })?
             {
                 break;
             }
@@ -106,7 +110,7 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
         }
         stream
             .finish(sources)
-            .map_err(MaxwellFrontendDispatchError::PacketDecode)?;
+            .map_err(|error| MaxwellFrontendDispatchError::PacketDecode(Box::new(error)))?;
         crate::engines::finish_maxwell_engine_stream(channel, &mut async |event| {
             effects.push_event(event).await?;
             effects.control()

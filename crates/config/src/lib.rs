@@ -24,6 +24,8 @@ pub const CONFIG_VERSION: u32 = 2;
 /// Bounds for derived native GPU caches; these are not hardware limits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuConfig {
+    /// Bounded derived shader and driver data, resolved from the configuration file.
+    pub cache_directory: PathBuf,
     pub shader_entries: usize,
     pub pipeline_entries: usize,
     pub persistent_bytes: u64,
@@ -31,6 +33,7 @@ pub struct GpuConfig {
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
+            cache_directory: PathBuf::from("./storage/cache/gpu"),
             shader_entries: 2048,
             pipeline_entries: 8192,
             persistent_bytes: 128 * 1024 * 1024,
@@ -89,7 +92,8 @@ impl NixeConfig {
         let base_directory = source_path
             .parent()
             .expect("an absolute file path must have a parent");
-        let gpu = gpu_cache_configuration(path, raw.gpu)?;
+        let mut gpu = gpu_cache_configuration(path, raw.gpu)?;
+        gpu.cache_directory = resolve_path(base_directory, gpu.cache_directory);
 
         Ok(Self {
             version: raw.version,
@@ -445,6 +449,8 @@ struct RawConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawGpuConfig {
+    #[serde(default = "default_gpu_cache_directory")]
+    cache_directory: PathBuf,
     #[serde(default = "default_shader_cache_entries")]
     shader_cache_entries: usize,
     #[serde(default = "default_pipeline_cache_entries")]
@@ -456,6 +462,7 @@ struct RawGpuConfig {
 impl Default for RawGpuConfig {
     fn default() -> Self {
         Self {
+            cache_directory: default_gpu_cache_directory(),
             shader_cache_entries: default_shader_cache_entries(),
             pipeline_cache_entries: default_pipeline_cache_entries(),
             persistent_pipeline_cache_mib: default_persistent_pipeline_cache_mib(),
@@ -581,6 +588,9 @@ fn default_pipeline_cache_entries() -> usize {
 fn default_persistent_pipeline_cache_mib() -> u64 {
     GpuConfig::default().persistent_bytes / (1024 * 1024)
 }
+fn default_gpu_cache_directory() -> PathBuf {
+    GpuConfig::default().cache_directory
+}
 
 fn gpu_cache_configuration(path: &Path, raw: RawGpuConfig) -> Result<GpuConfig, ConfigError> {
     let persistent_bytes = raw
@@ -603,6 +613,7 @@ fn gpu_cache_configuration(path: &Path, raw: RawGpuConfig) -> Result<GpuConfig, 
         }
     }
     Ok(GpuConfig {
+        cache_directory: raw.cache_directory,
         shader_entries: raw.shader_cache_entries,
         pipeline_entries: raw.pipeline_cache_entries,
         persistent_bytes,
@@ -857,7 +868,13 @@ mod tests {
         assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Info);
         assert_eq!(config.diagnostics.guest_logs_level, GuestLogsLevel::Inherit);
         assert!(!config.diagnostics.file_system_access_log);
-        assert_eq!(config.gpu, GpuConfig::default());
+        assert_eq!(
+            config.gpu,
+            GpuConfig {
+                cache_directory: file.path.parent().unwrap().join("./storage/cache/gpu"),
+                ..GpuConfig::default()
+            }
+        );
         assert!(config.input.profiles.is_empty());
     }
 
@@ -1010,12 +1027,27 @@ mod tests {
                 shader_cache_entries = 512
                 pipeline_cache_entries = 2048
                 persistent_pipeline_cache_mib = 96
+                cache_directory = "derived/gpu"
             "#,
         );
         let config = NixeConfig::load(&explicit.path).unwrap();
         assert_eq!(config.gpu.shader_entries, 512);
         assert_eq!(config.gpu.pipeline_entries, 2_048);
         assert_eq!(config.gpu.persistent_bytes, 96 * 1024 * 1024);
+        assert_eq!(
+            config.gpu.cache_directory,
+            explicit.path.parent().unwrap().join("derived/gpu")
+        );
+        let default = TemporaryConfig::new(
+            &fs::read_to_string(&explicit.path)
+                .unwrap()
+                .replace("cache_directory = \"derived/gpu\"", ""),
+        );
+        let default_config = NixeConfig::load(&default.path).unwrap();
+        assert_eq!(
+            default_config.gpu.cache_directory,
+            default.path.parent().unwrap().join("./storage/cache/gpu")
+        );
 
         for setting in [
             "shader_cache_entries = 0",

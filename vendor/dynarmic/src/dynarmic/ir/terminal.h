@@ -5,7 +5,9 @@
 
 #pragma once
 
-#include <boost/variant.hpp>
+#include <type_traits>
+#include <variant>
+
 #include <mcl/stdint.hpp>
 
 #include "dynarmic/ir/cond.h"
@@ -77,29 +79,32 @@ struct FastDispatchHint {};
 struct If;
 struct CheckBit;
 struct CheckHalt;
-/// A Terminal is the terminal instruction in a MicroBlock.
-using Terminal = boost::variant<
-    Invalid,
+
+// Both frontends generate one conditional decision followed by leaf exits,
+// never nested decision trees. Represent that grammar directly, as in Eden,
+// so constructing, copying and visiting terminals requires no heap ownership.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/ir/terminal.h
+using LeafTerminal = std::variant<
     Interpret,
     ReturnToDispatch,
     LinkBlock,
     LinkBlockFast,
     PopRSBHint,
-    FastDispatchHint,
-    boost::recursive_wrapper<If>,
-    boost::recursive_wrapper<CheckBit>,
-    boost::recursive_wrapper<CheckHalt>>;
+    FastDispatchHint>;
+
+/// A Terminal is the terminal instruction in a MicroBlock.
+using Terminal = std::variant<Invalid, LeafTerminal, If, CheckBit, CheckHalt>;
 
 /**
  * This terminal instruction conditionally executes one terminal or another depending
  * on the run-time state of the ARM flags.
  */
 struct If {
-    If(Cond if_, Terminal then_, Terminal else_)
+    If(Cond if_, LeafTerminal then_, LeafTerminal else_)
             : if_(if_), then_(std::move(then_)), else_(std::move(else_)) {}
     Cond if_;
-    Terminal then_;
-    Terminal else_;
+    LeafTerminal then_;
+    LeafTerminal else_;
 };
 
 /**
@@ -108,10 +113,10 @@ struct If {
  * then_ is executed if the check bit is non-zero, otherwise else_ is executed.
  */
 struct CheckBit {
-    CheckBit(Terminal then_, Terminal else_)
+    CheckBit(LeafTerminal then_, LeafTerminal else_)
             : then_(std::move(then_)), else_(std::move(else_)) {}
-    Terminal then_;
-    Terminal else_;
+    LeafTerminal then_;
+    LeafTerminal else_;
 };
 
 /**
@@ -119,10 +124,13 @@ struct CheckBit {
  * executed.
  */
 struct CheckHalt {
-    explicit CheckHalt(Terminal else_)
+    explicit CheckHalt(LeafTerminal else_)
             : else_(std::move(else_)) {}
-    Terminal else_;
+    LeafTerminal else_;
 };
+
+static_assert(std::is_trivially_copyable_v<LeafTerminal>);
+static_assert(std::is_trivially_copyable_v<Terminal>);
 
 }  // namespace Term
 

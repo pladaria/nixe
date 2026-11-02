@@ -3,6 +3,55 @@ use std::sync::Arc;
 use super::*;
 
 #[test]
+fn prepared_parameters_reject_invalid_changes_and_reuse_restored_registers() {
+    use crate::execution::MaxwellFrontend;
+    use nixe_gpu::native::NativeCommand;
+    let NativeDrawFixture {
+        space, mut channel, ..
+    } = native_draw_fixture();
+    let mut frontend = crate::MaxwellNativeFrontend::new(Default::default());
+    let original_cull = channel
+        .three_d_mut()
+        .raw_register_value(GpuMethodId(0x1918))
+        .unwrap();
+    let original_face = channel
+        .three_d_mut()
+        .raw_register_value(GpuMethodId(0x1920))
+        .unwrap();
+    let mut original = None;
+    for invalid in [false, true, false] {
+        program_three_d(&mut channel, 0x1918, u32::from(invalid) | original_cull);
+        program_three_d(
+            &mut channel,
+            0x1920,
+            if invalid { u32::MAX } else { original_face },
+        );
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let draw = &dispatch.operations()[0];
+        let result = frontend.lower_three_d(
+            draw.state(),
+            draw.trigger(),
+            space.memory(),
+            FrontendSubmissionId::new(1),
+            None,
+            &mut crate::test_memory::access(space.memory().machine()),
+        );
+        if invalid {
+            assert!(result.is_err());
+        } else {
+            let NativeCommand::Draw { state, .. } = result.unwrap().command else {
+                panic!("draw")
+            };
+            if let Some(original) = &original {
+                assert!(Arc::ptr_eq(original, &state.parameters));
+            } else {
+                original = Some(Arc::clone(&state.parameters));
+            }
+        }
+    }
+}
+
+#[test]
 fn initialized_class_banks_have_identical_raw_defaults_and_stop_at_macro_methods() {
     let mut channel = three_d_channel();
     for index in 0..0xe00 {
@@ -274,7 +323,7 @@ fn clear_and_fixed_function_state_preserve_typed_values_and_sources() {
 }
 
 #[test]
-fn mme_ram_loads_capture_typed_programs_with_sources_and_auto_advance() {
+fn mme_ram_uploads_preserve_raw_words_and_auto_advance() {
     let mut channel = three_d_channel();
 
     let start_dispatch = dispatch_incrementing(&mut channel, 0x011c / 4, &[5, 7]).unwrap();
@@ -309,11 +358,8 @@ fn mme_ram_loads_capture_typed_programs_with_sources_and_auto_advance() {
         let address = MaxwellThreeDMmeRamAddress::new(7 + word as u32);
         let register = mme.instruction(address).unwrap();
 
-        assert_eq!(register.raw(), Some(expected));
-        assert_eq!(
-            register.value(),
-            Some(&MaxwellThreeDMmeInstruction::new(expected))
-        );
+        assert_eq!(register.raw(), expected);
+        assert_eq!(register, MaxwellThreeDMmeInstruction::new(expected));
     }
     assert_eq!(mme.start_address_pointer().raw(), Some(5));
     assert_eq!(
@@ -600,7 +646,7 @@ fn mme_execution_crosses_instruction_windows_and_preserves_sparse_addresses() {
                 .instruction(MaxwellThreeDMmeRamAddress::new(start))
                 .unwrap()
                 .raw(),
-            Some(set_method)
+            set_method
         );
         assert_eq!(channel.three_d_mut().mme().instruction_count(), 3);
         // Replacing an uploaded instruction must replace its executable form
@@ -620,7 +666,7 @@ fn mme_execution_crosses_instruction_windows_and_preserves_sparse_addresses() {
                 .instruction(MaxwellThreeDMmeRamAddress::new(start + 1))
                 .unwrap()
                 .raw(),
-            Some(send_parameter_and_exit)
+            send_parameter_and_exit
         );
     }
 }
@@ -1437,7 +1483,7 @@ fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
     assert_eq!(primitive.end().raw(), Some(0));
     assert_eq!(primitive.end().value(), Some(&false));
 
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
     let three_d_before = channel.three_d().clone();
     let decoded = incrementing_packet(0x1610 / 4, &[0, 2]);
@@ -1449,7 +1495,7 @@ fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
             ..
         }) if source.method() == GpuMethodId(0x1614) && source.argument() == 2
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert_eq!(channel.three_d(), &three_d_before);
 
@@ -1570,15 +1616,21 @@ fn shader_bindings_snapshot_selectors_and_preserve_stage_visibility() {
 
     let bindings = channel.three_d().shader_bindings();
     let constant = bindings.groups()[2].constant_buffers()[3].unwrap();
-    assert!(constant.enabled());
-    assert_eq!(constant.address().unwrap().get(), 0x4000);
-    assert_eq!(constant.size(), Some(0x100));
+    assert_eq!(constant.address().get(), 0x4000);
+    assert_eq!(constant.size(), 0x100);
     assert!(bindings.stage_visibility(2)[MaxwellShaderStage::Vertex as usize]);
     assert_eq!(bindings.texture_headers().address().unwrap().get(), 0x8000);
     assert_eq!(bindings.samplers().maximum_index().value(), Some(&7));
     assert_eq!(
         bindings.sampler_binding().value(),
         Some(&MaxwellThreeDSamplerBindingMode::ViaTextureHeader)
+    );
+    dispatch_method(&mut channel, 0x2450 / 4, 0x30).unwrap();
+    assert!(channel.three_d().shader_bindings().groups()[2].constant_buffers()[3].is_none());
+    dispatch_method(&mut channel, 0x2450 / 4, 0x31).unwrap();
+    assert_eq!(
+        channel.three_d().shader_bindings().groups()[2].constant_buffers()[3],
+        Some(constant)
     );
 }
 
@@ -1791,6 +1843,24 @@ struct NativeDrawFixture {
     fragment_header: [u32; 20],
 }
 
+const NATIVE_VERTEX_SHADER: [u64; 4] = [
+    // Load Generic0.x into R0 and retain the load by storing Position.x.
+    nixe_shader_recompiler::maxwell::decode::Opcode::ALD
+        .encoding()
+        .value
+        | (7 << 16)
+        | (255 << 8)
+        | (128 << 20),
+    nixe_shader_recompiler::maxwell::decode::Opcode::AST
+        .encoding()
+        .value
+        | (7 << 16)
+        | (255 << 8)
+        | (112 << 20),
+    0,
+    0xe300_0000_0007_000f,
+];
+
 fn native_draw_fixture() -> NativeDrawFixture {
     let mut space = resource_address_space();
     let vertices = crate::test_memory::allocate(space.memory().machine(), 0x1000);
@@ -1813,7 +1883,7 @@ fn native_draw_fixture() -> NativeDrawFixture {
         &header
             .into_iter()
             .flat_map(u32::to_le_bytes)
-            .chain([exit, 0, 0, 0].into_iter().flat_map(u64::to_le_bytes))
+            .chain(NATIVE_VERTEX_SHADER.into_iter().flat_map(u64::to_le_bytes))
             .collect::<Vec<_>>(),
     )
     .unwrap();
@@ -1858,6 +1928,169 @@ fn native_draw_fixture() -> NativeDrawFixture {
         vertex,
         fragment_header: header,
     }
+}
+
+#[test]
+fn native_draw_resolves_only_vertex_inputs_loaded_by_the_current_shader() {
+    use crate::execution::MaxwellFrontend;
+    use nixe_gpu::native::NativeCommand;
+    let NativeDrawFixture {
+        space,
+        mut channel,
+        shaders,
+        ..
+    } = native_draw_fixture();
+    // A stale attribute refers to a contradictory, unmapped stream. Neither
+    // its descriptor nor its storage is consumed by this vertex shader.
+    for (method, argument) in [
+        (0x11dc, 0x3820_001f),
+        (0x1df0, 0x1018),
+        (0x1df4, 1),
+        (0x1df8, 0x2000),
+        (0x1ff8, 1),
+        (0x1ffc, 0x1000),
+    ] {
+        program_three_d(&mut channel, method, argument);
+    }
+    let mut frontend = crate::MaxwellNativeFrontend::new(Default::default());
+    for consumes_input in [true, false, true] {
+        let instruction = if consumes_input {
+            NATIVE_VERTEX_SHADER[0]
+        } else {
+            0xe300_0000_0007_000f
+        };
+        crate::test_memory::write(&shaders, 0x50, &instruction.to_le_bytes()).unwrap();
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let draw = &dispatch.operations()[0];
+        let work = frontend
+            .lower_three_d(
+                draw.state(),
+                draw.trigger(),
+                space.memory(),
+                FrontendSubmissionId::new(1),
+                None,
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
+        let NativeCommand::Draw { state, .. } = work.command else {
+            panic!("expected native draw")
+        };
+        assert_eq!(state.vertices.len(), usize::from(consumes_input));
+        assert_eq!(state.parameters.vertices.len(), usize::from(consumes_input));
+        if consumes_input {
+            assert_eq!(state.parameters.vertices[0].attributes.len(), 1);
+            assert_eq!(
+                state.parameters.vertices[0].attributes[0].shader_location,
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn native_frontend_restores_shader_capture_and_rejects_changed_code_and_corrupt_records() {
+    use crate::execution::MaxwellFrontend;
+    use nixe_gpu::{native::NativeCommand, shader_identity::ContentId};
+    let NativeDrawFixture {
+        space,
+        mut channel,
+        shaders,
+        ..
+    } = native_draw_fixture();
+    let directory = std::env::temp_dir().join(format!(
+        "nixe-frontend-capture-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let namespace = ContentId::of(b"capture-test", &[]);
+    let make_frontend = || {
+        let mut frontend = crate::MaxwellNativeFrontend::new(Default::default());
+        frontend.set_capture_cache(&directory, namespace, 1 << 20);
+        frontend
+    };
+    let mut draw = |frontend: &mut crate::MaxwellNativeFrontend| {
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let operation = &dispatch.operations()[0];
+        let work = frontend
+            .lower_three_d(
+                operation.state(),
+                operation.trigger(),
+                space.memory(),
+                FrontendSubmissionId::new(1),
+                None,
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
+        let NativeCommand::Draw { state, .. } = work.command else {
+            panic!("expected draw")
+        };
+        state
+    };
+    let mut first = make_frontend();
+    let original = draw(&mut first);
+    assert_eq!(first.statistics.shader_captures, 1);
+    // A transient code version must survive even when the address-indexed
+    // proof has returned to its previous contents before shutdown.
+    crate::test_memory::write(&shaders, 0x50, &0xe300_0000_0007_000fu64.to_le_bytes()).unwrap();
+    let transient = draw(&mut first);
+    assert!(transient.vertices.is_empty());
+    assert_eq!(first.statistics.shader_captures, 2);
+    crate::test_memory::write(&shaders, 0x50, &NATIVE_VERTEX_SHADER[0].to_le_bytes()).unwrap();
+    assert_eq!(
+        draw(&mut first).program.shader.identity,
+        original.program.shader.identity
+    );
+    drop(first);
+    let mut second = make_frontend();
+    crate::test_memory::write(&shaders, 0x50, &0xe300_0000_0007_000fu64.to_le_bytes()).unwrap();
+    assert_eq!(
+        draw(&mut second).program.shader.identity,
+        transient.program.shader.identity
+    );
+    assert_eq!(second.statistics.shader_captures, 0);
+    crate::test_memory::write(&shaders, 0x50, &NATIVE_VERTEX_SHADER[0].to_le_bytes()).unwrap();
+    let restored = draw(&mut second);
+    assert_eq!(second.statistics.shader_captures, 0);
+    assert_eq!(second.statistics.restored_captures, 2);
+    assert_eq!(
+        original.program.shader.identity,
+        restored.program.shader.identity
+    );
+    assert_eq!(
+        restored.parameters.vertices[0].attributes[0].shader_location,
+        0
+    );
+    drop(second);
+    // A fresh owner validates current bytes before accepting stored metadata.
+    // The prefix still matches, but Position.y replaces Position.x.
+    crate::test_memory::write(
+        &shaders,
+        0x58,
+        &(NATIVE_VERTEX_SHADER[1] | (4 << 20)).to_le_bytes(),
+    )
+    .unwrap();
+    let mut changed = make_frontend();
+    let updated = draw(&mut changed);
+    assert_eq!(updated.vertices.len(), 1);
+    assert_ne!(
+        original.program.shader.identity,
+        updated.program.shader.identity
+    );
+    assert_eq!(changed.statistics.restored_captures, 0);
+    assert_eq!(changed.statistics.shader_captures, 1);
+    drop(changed);
+    for entry in std::fs::read_dir(directory.join("captures-v1").join(namespace.hex())).unwrap() {
+        std::fs::write(entry.unwrap().path(), b"truncated").unwrap();
+    }
+    let mut corrupt = make_frontend();
+    assert_eq!(draw(&mut corrupt).vertices.len(), 1);
+    assert_eq!(corrupt.statistics.restored_captures, 0);
+    assert_eq!(corrupt.statistics.shader_captures, 1);
+    drop(corrupt);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -2171,6 +2404,8 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
     program_three_d(&mut channel, 0x1160, 0x3820_0000);
     let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
     let draw = &dispatch.operations()[0];
+    let allocations = &super::register_benchmark::ALLOCATIONS;
+    allocations.with(|count| count.set(Some(0)));
     let work = frontend
         .lower_three_d(
             draw.state(),
@@ -2181,6 +2416,7 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
             &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap();
+    assert_eq!(allocations.with(|count| count.replace(None).unwrap()), 0);
     let NativeCommand::Draw { state, .. } = work.command else {
         panic!("expected draw")
     };
@@ -2188,11 +2424,14 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
     assert_eq!(frontend.statistics.prepared_parameters, 1);
     for phase in 0..2 {
         // Stream offsets affect vertex binding, but not shader input types.
+        let code_identity = channel.three_d().shader_state_identity();
         program_three_d(&mut channel, 0x1160, 0x3820_0000 | (((phase + 1) * 8) << 7));
+        assert!(code_identity.matches_code(channel.three_d()));
         if phase == 1 {
             // An identical CPU write refreshes the memory proof while keeping
             // the immutable capture and compiled code reusable.
-            crate::test_memory::write(&shaders, 0x50, &exit.to_le_bytes()).unwrap();
+            crate::test_memory::write(&shaders, 0x50, &NATIVE_VERTEX_SHADER[0].to_le_bytes())
+                .unwrap();
         }
         let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
         let draw = &dispatch.operations()[0];

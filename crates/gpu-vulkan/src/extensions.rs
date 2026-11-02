@@ -34,3 +34,21 @@ macro_rules! feature_struct {
 }
 feature_struct!(UnifiedLayouts, 1_000_527_000, layouts, video);
 feature_struct!(ShaderFma, 1_000_579_000, float16, float32, float64);
+
+// GENERAL carries feedback-loop semantics through this attachment flag.
+// https://docs.vulkan.org/refpages/latest/refpages/source/VkAttachmentFeedbackLoopInfoEXT.html
+#[repr(C)]
+pub(crate) struct AttachmentFeedbackLoop {
+    s_type: vk::StructureType,
+    p_next: *const c_void,
+    feedback_loop_enable: vk::Bool32,
+}
+impl AttachmentFeedbackLoop {
+    pub(crate) fn enabled() -> Self {
+        Self {
+            s_type: vk::StructureType::from_raw(1_000_527_001),
+            p_next: std::ptr::null(),
+            feedback_loop_enable: vk::TRUE,
+        }
+    }
+}

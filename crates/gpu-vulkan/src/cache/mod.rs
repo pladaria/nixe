@@ -6,8 +6,8 @@ impl From<crate::VulkanError> for CompileError {
     }
 }
 mod monitor;
-mod persistent;
 pub use monitor::CacheMonitor;
+pub(crate) use nixe_gpu::persistent_cache as persistent;
 mod shader;
 pub use shader::{CompilationTimings, CompiledStage, ShaderArtifact, ShaderCompiler};
 mod layout;
@@ -37,6 +37,9 @@ pub struct CacheConfiguration {
     pub sampler_entries: usize,
     pub persistent_bytes: u64,
     pub directory: Option<std::path::PathBuf>,
+    /// Application identity for startup reconstruction; driver/shader data can
+    /// still share their content-addressed caches across applications.
+    pub pipeline_namespace: Option<nixe_gpu::shader_identity::ContentId>,
 }
 impl Default for CacheConfiguration {
     fn default() -> Self {
@@ -50,6 +53,7 @@ impl Default for CacheConfiguration {
             sampler_entries: 512,
             persistent_bytes: 128 * 1024 * 1024,
             directory: None,
+            pipeline_namespace: None,
         }
     }
 }

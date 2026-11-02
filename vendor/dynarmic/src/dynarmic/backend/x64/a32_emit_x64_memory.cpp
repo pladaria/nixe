@@ -11,7 +11,6 @@
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include <mcl/type_traits/integer_of_size.hpp>
-#include <xbyak/xbyak.h>
 
 #include "dynarmic/backend/x64/a32_emit_x64.h"
 #include "dynarmic/backend/x64/abi.h"
@@ -19,6 +18,7 @@
 #include "dynarmic/backend/x64/emit_x64_memory.h"
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/backend/x64/perf_map.h"
+#include "dynarmic/backend/x64/xbyak.h"
 #include "dynarmic/common/x64_disassemble.h"
 #include "dynarmic/interface/exclusive_monitor.h"
 
@@ -52,7 +52,7 @@ void A32EmitX64::GenFastmemFallbacks() {
             for (int value_idx : idxes) {
                 for (const auto& [bitsize, callback] : read_callbacks) {
                     code.align();
-                    read_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)] = code.getCurr<void (*)()>();
+                    read_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx] = code.getCurr<void (*)()>();
                     ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, HostLocRegIdx(value_idx));
                     if (vaddr_idx != code.ABI_PARAM2.getIdx()) {
                         code.mov(code.ABI_PARAM2, Xbyak::Reg64{vaddr_idx});
@@ -67,12 +67,12 @@ void A32EmitX64::GenFastmemFallbacks() {
                     ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLocRegIdx(value_idx));
                     code.ZeroExtendFrom(bitsize, Xbyak::Reg64{value_idx});
                     code.ret();
-                    PerfMapRegister(read_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)], code.getCurr(), fmt::format("a32_read_fallback_{}", bitsize));
+                    PerfMapRegister(read_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a32_read_fallback_{}", bitsize));
                 }
 
                 for (const auto& [bitsize, callback] : write_callbacks) {
                     code.align();
-                    write_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)] = code.getCurr<void (*)()>();
+                    write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx] = code.getCurr<void (*)()>();
                     ABI_PushCallerSaveRegistersAndAdjustStack(code);
                     if (vaddr_idx == code.ABI_PARAM3.getIdx() && value_idx == code.ABI_PARAM2.getIdx()) {
                         code.xchg(code.ABI_PARAM2, code.ABI_PARAM3);
@@ -96,12 +96,12 @@ void A32EmitX64::GenFastmemFallbacks() {
                     }
                     ABI_PopCallerSaveRegistersAndAdjustStack(code);
                     code.ret();
-                    PerfMapRegister(write_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)], code.getCurr(), fmt::format("a32_write_fallback_{}", bitsize));
+                    PerfMapRegister(write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a32_write_fallback_{}", bitsize));
                 }
 
                 for (const auto& [bitsize, callback] : exclusive_write_callbacks) {
                     code.align();
-                    exclusive_write_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)] = code.getCurr<void (*)()>();
+                    exclusive_write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx] = code.getCurr<void (*)()>();
                     ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, HostLoc::RAX);
                     if (vaddr_idx == code.ABI_PARAM3.getIdx() && value_idx == code.ABI_PARAM2.getIdx()) {
                         code.xchg(code.ABI_PARAM2, code.ABI_PARAM3);
@@ -124,7 +124,7 @@ void A32EmitX64::GenFastmemFallbacks() {
                     callback.EmitCall(code);
                     ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLoc::RAX);
                     code.ret();
-                    PerfMapRegister(exclusive_write_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)], code.getCurr(), fmt::format("a32_exclusive_write_fallback_{}", bitsize));
+                    PerfMapRegister(exclusive_write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a32_exclusive_write_fallback_{}", bitsize));
                 }
             }
         }
@@ -136,35 +136,35 @@ void A32EmitX64::GenFastmemFallbacks() {
 #undef Axx
 
 void A32EmitX64::EmitA32ReadMemory8(A32EmitContext& ctx, IR::Inst* inst) {
-    EmitMemoryRead<8, &A32::UserCallbacks::MemoryRead8>(ctx, inst);
+    EmitMemoryRead<8, &A32::UserCallbacks::MemoryRead8>(ctx, inst, ShouldFastmem(ctx, inst));
 }
 
 void A32EmitX64::EmitA32ReadMemory16(A32EmitContext& ctx, IR::Inst* inst) {
-    EmitMemoryRead<16, &A32::UserCallbacks::MemoryRead16>(ctx, inst);
+    EmitMemoryRead<16, &A32::UserCallbacks::MemoryRead16>(ctx, inst, ShouldFastmem(ctx, inst));
 }
 
 void A32EmitX64::EmitA32ReadMemory32(A32EmitContext& ctx, IR::Inst* inst) {
-    EmitMemoryRead<32, &A32::UserCallbacks::MemoryRead32>(ctx, inst);
+    EmitMemoryRead<32, &A32::UserCallbacks::MemoryRead32>(ctx, inst, ShouldFastmem(ctx, inst));
 }
 
 void A32EmitX64::EmitA32ReadMemory64(A32EmitContext& ctx, IR::Inst* inst) {
-    EmitMemoryRead<64, &A32::UserCallbacks::MemoryRead64>(ctx, inst);
+    EmitMemoryRead<64, &A32::UserCallbacks::MemoryRead64>(ctx, inst, ShouldFastmem(ctx, inst));
 }
 
 void A32EmitX64::EmitA32WriteMemory8(A32EmitContext& ctx, IR::Inst* inst) {
-    EmitMemoryWrite<8, &A32::UserCallbacks::MemoryWrite8>(ctx, inst);
+    EmitMemoryWrite<8, &A32::UserCallbacks::MemoryWrite8>(ctx, inst, ShouldFastmem(ctx, inst));
 }
 
 void A32EmitX64::EmitA32WriteMemory16(A32EmitContext& ctx, IR::Inst* inst) {
-    EmitMemoryWrite<16, &A32::UserCallbacks::MemoryWrite16>(ctx, inst);
+    EmitMemoryWrite<16, &A32::UserCallbacks::MemoryWrite16>(ctx, inst, ShouldFastmem(ctx, inst));
 }
 
 void A32EmitX64::EmitA32WriteMemory32(A32EmitContext& ctx, IR::Inst* inst) {
-    EmitMemoryWrite<32, &A32::UserCallbacks::MemoryWrite32>(ctx, inst);
+    EmitMemoryWrite<32, &A32::UserCallbacks::MemoryWrite32>(ctx, inst, ShouldFastmem(ctx, inst));
 }
 
 void A32EmitX64::EmitA32WriteMemory64(A32EmitContext& ctx, IR::Inst* inst) {
-    EmitMemoryWrite<64, &A32::UserCallbacks::MemoryWrite64>(ctx, inst);
+    EmitMemoryWrite<64, &A32::UserCallbacks::MemoryWrite64>(ctx, inst, ShouldFastmem(ctx, inst));
 }
 
 void A32EmitX64::EmitA32ClearExclusive(A32EmitContext&, IR::Inst*) {

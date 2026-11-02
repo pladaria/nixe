@@ -452,38 +452,102 @@ impl MaxwellThreeDResolvedResource {
 /// revision counters suffice to recognize an unchanged selection.
 #[derive(Clone, Debug, Default)]
 pub struct MaxwellThreeDResolvedResources {
-    resources: [Vec<MaxwellThreeDResolvedResource>; 4],
-    samplers: Vec<MaxwellThreeDResolvedSampler>,
+    resources: [Vec<Option<MaxwellThreeDResolvedResource>>; 4],
+    samplers: Vec<Option<MaxwellThreeDResolvedSampler>>,
+    // Program buffer/image slots. Vertex and attachment selections already
+    // have their own preparation domains and need no program-binding metadata.
+    binding_revisions: [Vec<u64>; 2],
+    sampler_revisions: Vec<u64>,
+    binding_revision: u64,
     revisions: [u64; 4],
+}
+#[derive(Clone, Debug)]
+struct ResolvedSlot {
+    role: MaxwellThreeDResourceRole,
+    resource: Option<MaxwellThreeDResolvedResource>,
+    sampler: Option<MaxwellThreeDResolvedSampler>,
+}
+/// A program selects these positions once. Empty bindings keep their positions
+/// so enabling one resource never shifts any following program selection.
+#[derive(Clone, Copy)]
+pub(crate) struct MaxwellThreeDBindingLocation {
+    pub group: usize,
+    pub index: usize,
+    pub sampler: bool,
+}
+pub(crate) enum MaxwellThreeDResolvedBinding<'a> {
+    Resource(&'a MaxwellThreeDResolvedResource),
+    Sampler(&'a MaxwellThreeDResolvedSampler),
 }
 impl PartialEq for MaxwellThreeDResolvedResources {
     fn eq(&self, other: &Self) -> bool {
-        self.resources == other.resources && self.samplers == other.samplers
+        self.resources().eq(other.resources()) && self.samplers().eq(other.samplers())
     }
 }
 impl Eq for MaxwellThreeDResolvedResources {}
 impl MaxwellThreeDResolvedResources {
     pub fn resources(&self) -> impl Iterator<Item = &MaxwellThreeDResolvedResource> {
-        self.resources.iter().flat_map(|g| g.iter())
+        self.resources
+            .iter()
+            .flat_map(|group| group.iter().flatten())
+    }
+    fn samplers(&self) -> impl Iterator<Item = &MaxwellThreeDResolvedSampler> {
+        self.samplers.iter().flatten()
+    }
+    pub(crate) fn binding_at(
+        &self,
+        location: MaxwellThreeDBindingLocation,
+    ) -> Option<MaxwellThreeDResolvedBinding<'_>> {
+        if location.sampler {
+            debug_assert_eq!(location.group, 2);
+            self.samplers
+                .get(location.index)?
+                .as_ref()
+                .map(MaxwellThreeDResolvedBinding::Sampler)
+        } else {
+            self.resources[location.group]
+                .get(location.index)?
+                .as_ref()
+                .map(MaxwellThreeDResolvedBinding::Resource)
+        }
+    }
+    pub(crate) fn binding_revision(&self, location: MaxwellThreeDBindingLocation) -> Option<u64> {
+        let revisions = if location.sampler {
+            &self.sampler_revisions
+        } else {
+            self.binding_revisions.get(location.group.checked_sub(1)?)?
+        };
+        revisions.get(location.index).copied()
+    }
+    pub(crate) fn binding_location(
+        &self,
+        role: MaxwellThreeDResourceRole,
+    ) -> Option<MaxwellThreeDBindingLocation> {
+        let group = role.binding_group();
+        let sampler = matches!(role, MaxwellThreeDResourceRole::Sampler(_));
+        let index = if sampler {
+            self.samplers
+                .iter()
+                .position(|slot| slot.as_ref().is_some_and(|s| s.role() == role))
+        } else {
+            self.resources[group]
+                .iter()
+                .position(|slot| slot.as_ref().is_some_and(|r| r.role() == role))
+        }?;
+        Some(MaxwellThreeDBindingLocation {
+            group,
+            index,
+            sampler,
+        })
     }
     pub fn resource(
         &self,
         role: MaxwellThreeDResourceRole,
     ) -> Option<&MaxwellThreeDResolvedResource> {
-        let group = &self.resources[role.binding_group()];
-        group
-            .binary_search_by_key(&role, |r| r.role())
-            .ok()
-            .map(|i| &group[i])
-    }
-    pub fn sampler(
-        &self,
-        role: MaxwellThreeDResourceRole,
-    ) -> Option<&MaxwellThreeDResolvedSampler> {
-        self.samplers
-            .binary_search_by_key(&role, |s| s.role())
-            .ok()
-            .map(|i| &self.samplers[i])
+        self.resources[role.binding_group()]
+            .iter()
+            .flatten()
+            .find(|r| r.role() == role)
     }
     pub(crate) fn revisions(&self) -> [u64; 4] {
         self.revisions
@@ -533,8 +597,7 @@ fn resolve_binding(
     let bindings = state.shader_bindings();
     let texture_cbuf = |texture: MaxwellThreeDTextureReference, slot: u8| {
         bindings.groups()[usize::from(texture.group)].constant_buffers()[usize::from(slot)]
-            .filter(|b| b.enabled())
-            .and_then(|b| Some((b.address()?.get(), u64::from(b.size()?))))
+            .map(|binding| (binding.address().get(), u64::from(binding.size())))
     };
     match role {
         R::VertexStream(slot) => {
@@ -856,6 +919,11 @@ impl DescriptorTable {
         if index > self.limit {
             return Err(MaxwellThreeDResourceError::DescriptorIndexOutOfRange { role, index });
         }
+        if let Some(Some(entry)) = self.entries.get(index as usize)
+            && entry.read_epoch == self.epoch
+        {
+            return Ok((entry.bytes, entry.version));
+        }
         let base = self
             .base
             .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
@@ -870,9 +938,6 @@ impl DescriptorTable {
             self.entries.resize_with(index + 1, || None);
         }
         let entry = &mut self.entries[index];
-        if entry
-            .as_ref()
-            .is_none_or(|entry| entry.read_epoch != self.epoch)
         {
             let mut bytes = [0; 32];
             batch
@@ -966,16 +1031,136 @@ struct RetainedBinding {
 }
 
 #[derive(Debug)]
+enum InactiveResource {
+    Buffer(Weak<MaxwellThreeDResolvedBuffer>),
+    Image(Weak<MaxwellThreeDResolvedImage>),
+}
+impl InactiveResource {
+    fn from_resource(resource: MaxwellThreeDResolvedResource) -> Self {
+        match resource {
+            MaxwellThreeDResolvedResource::Buffer { view, .. } => {
+                Self::Buffer(Arc::downgrade(&view))
+            }
+            MaxwellThreeDResolvedResource::Image { view, .. } => Self::Image(Arc::downgrade(&view)),
+        }
+    }
+    fn upgrade(self, role: MaxwellThreeDResourceRole) -> Option<MaxwellThreeDResolvedResource> {
+        Some(match self {
+            Self::Buffer(view) => MaxwellThreeDResolvedResource::Buffer {
+                role,
+                view: view.upgrade()?,
+            },
+            Self::Image(view) => MaxwellThreeDResolvedResource::Image {
+                role,
+                view: view.upgrade()?,
+            },
+        })
+    }
+}
+
+#[derive(Debug)]
 struct BindingSlot {
     role: MaxwellThreeDResourceRole,
     size: Option<MaxwellShaderBufferSize>,
     binding: Option<RetainedBinding>,
-    resource_index: Option<usize>,
-    sampler_index: Option<usize>,
+    // Inactive slots retain freshness metadata without extending physical RAM
+    // ownership after the resolved-view cache and concrete consumers release it.
+    inactive_resource: Option<InactiveResource>,
 }
+impl BindingSlot {
+    fn new(role: MaxwellThreeDResourceRole) -> Self {
+        Self {
+            role,
+            size: None,
+            binding: None,
+            inactive_resource: None,
+        }
+    }
+}
+
+const CHANNEL_SLOT_COUNTS: [usize; 4] = [
+    33,
+    MAXWELL_BIND_GROUP_COUNT * MAXWELL_CONSTANT_BUFFER_SLOT_COUNT,
+    0,
+    9,
+];
+
+#[derive(Debug)]
+struct ResourceSelectionSlot {
+    role: MaxwellThreeDResourceRole,
+    index: usize,
+    size: Option<MaxwellShaderBufferSize>,
+}
+
+#[derive(Debug, Default)]
+struct ResourceGroupSelection {
+    enabled: [u64; 4],
+    fixed: usize,
+    slots: Vec<ResourceSelectionSlot>,
+}
+
+/// The immutable binding coordinates of a compiled program. Interpret mutable
+/// handles and descriptors when these slots are consumed, not when prepared.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+#[derive(Debug, Default)]
+pub(crate) struct MaxwellThreeDResourceSelection {
+    groups: [ResourceGroupSelection; 4],
+}
+
+impl MaxwellThreeDResourceSelection {
+    pub(crate) fn new(
+        roles: &[MaxwellThreeDResourceRole],
+        sizes: &[(MaxwellThreeDResourceRole, MaxwellShaderBufferSize)],
+    ) -> Self {
+        debug_assert!(roles.is_sorted());
+        debug_assert!(roles.windows(2).all(|pair| pair[0] != pair[1]));
+        debug_assert!(sizes.is_sorted_by_key(|(role, _)| *role));
+        let mut selection = Self::default();
+        for &role in roles {
+            let group = role.binding_group();
+            let selected = &mut selection.groups[group];
+            let index = if let Some(index) = role.channel_slot() {
+                debug_assert_eq!(selected.fixed, selected.slots.len());
+                debug_assert!(index < CHANNEL_SLOT_COUNTS[group]);
+                selected.enabled[index / 64] |= 1 << (index % 64);
+                selected.fixed += 1;
+                index
+            } else {
+                CHANNEL_SLOT_COUNTS[group] + selected.slots.len() - selected.fixed
+            };
+            let size = sizes
+                .binary_search_by_key(&role, |(role, _)| *role)
+                .ok()
+                .map(|index| sizes[index].1);
+            selected
+                .slots
+                .push(ResourceSelectionSlot { role, index, size });
+        }
+        selection
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.groups
+            .iter()
+            .map(|group| group.slots.capacity() * std::mem::size_of::<ResourceSelectionSlot>())
+            .sum()
+    }
+}
+
+/// Fetch and attachment slots selected by the current execution trigger.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MaxwellThreeDDrawResourceSlots {
+    pub geometry: u64,
+    pub attachments: u64,
+}
+
 #[derive(Debug, Default)]
 struct RetainedBindingGroup {
+    // Fixed hardware slots form the prefix; only this program's variable
+    // storage/texture bindings follow it. No historical role table is retained.
     bindings: Vec<BindingSlot>,
+    enabled: [u64; 4],
+    active: Vec<usize>,
     state: Option<MaxwellThreeDResourceGroupIdentity>,
     address_space: Option<crate::MaxwellAddressSpaceId>,
     mapping_generation: u64,
@@ -984,7 +1169,34 @@ struct RetainedBindingGroup {
 }
 
 impl MaxwellThreeDResourceRole {
-    const fn binding_group(self) -> usize {
+    const fn channel_slot(self) -> Option<usize> {
+        match self {
+            Self::VertexStream(slot) => Some(slot as usize),
+            Self::IndexBuffer => Some(32),
+            Self::ConstantBuffer { group, slot } => {
+                Some(group as usize * MAXWELL_CONSTANT_BUFFER_SLOT_COUNT + slot as usize)
+            }
+            Self::ColorTarget(slot) => Some(slot as usize),
+            Self::DepthStencilTarget => Some(8),
+            _ => None,
+        }
+    }
+
+    fn channel_role(group: usize, index: usize) -> Self {
+        match group {
+            0 if index < 32 => Self::VertexStream(index as u8),
+            0 => Self::IndexBuffer,
+            1 => Self::ConstantBuffer {
+                group: (index / MAXWELL_CONSTANT_BUFFER_SLOT_COUNT) as u8,
+                slot: (index % MAXWELL_CONSTANT_BUFFER_SLOT_COUNT) as u8,
+            },
+            3 if index < 8 => Self::ColorTarget(index as u8),
+            3 => Self::DepthStencilTarget,
+            _ => unreachable!("group has no hardware binding slots"),
+        }
+    }
+
+    pub(crate) const fn binding_group(self) -> usize {
         match self {
             Self::VertexStream(_) | Self::IndexBuffer => 0,
             Self::ConstantBuffer { .. } | Self::StorageBuffer { .. } => 1,
@@ -1343,52 +1555,113 @@ impl MaxwellThreeDResolvedResourceCache {
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
     pub(crate) fn select(
         &mut self,
-        roles: &[MaxwellThreeDResourceRole],
-        sizes: &[(MaxwellThreeDResourceRole, MaxwellShaderBufferSize)],
+        selection: &MaxwellThreeDResourceSelection,
+        draw: MaxwellThreeDDrawResourceSlots,
     ) -> &mut Self {
-        debug_assert!(roles.is_sorted());
-        debug_assert!(sizes.is_sorted_by_key(|(role, _)| *role));
-        let mut remaining = roles;
-        for group in 0..4 {
-            let end = remaining.partition_point(|role| role.binding_group() == group);
-            let (roles, rest) = remaining.split_at(end);
-            remaining = rest;
-            let slots = &mut self.groups[group];
-            let size = |role| {
-                sizes
-                    .binary_search_by_key(&role, |(role, _)| *role)
-                    .ok()
-                    .map(|index| sizes[index].1)
+        for (group, &fixed_count) in CHANNEL_SLOT_COUNTS.iter().enumerate() {
+            let selected = &selection.groups[group];
+            let variable_slots = &selected.slots[selected.fixed..];
+            let mut enabled = selected.enabled;
+            enabled[0] |= match group {
+                0 => draw.geometry,
+                3 => draw.attachments,
+                _ => 0,
             };
-            if slots.bindings.len() == roles.len()
-                && slots
-                    .bindings
+            let count = enabled
+                .iter()
+                .map(|word| word.count_ones() as usize)
+                .sum::<usize>()
+                + variable_slots.len();
+            let slots = &mut self.groups[group];
+            let variables = slots.bindings.get(fixed_count..).unwrap_or_default();
+            let same_selection = slots.active.len() == count
+                && enabled == slots.enabled
+                && variables.len() == variable_slots.len()
+                && variables
                     .iter()
-                    .zip(roles)
-                    .all(|(slot, &role)| slot.role == role && slot.size == size(role))
-            {
+                    .zip(variable_slots)
+                    .all(|(slot, selected)| slot.role == selected.role);
+            if same_selection {
+                let mut changed = false;
+                for selected in &selected.slots {
+                    let slot = &mut slots.bindings[selected.index];
+                    changed |= slot.size != selected.size;
+                    slot.size = selected.size;
+                }
+                if changed {
+                    slots.state = None;
+                }
                 continue;
             }
-            let mut old = std::mem::take(&mut slots.bindings).into_iter().peekable();
-            slots.bindings = Vec::with_capacity(roles.len());
-            for &role in roles {
-                while old.peek().is_some_and(|slot| slot.role < role) {
-                    old.next();
-                }
-                let mut slot = if old.peek().is_some_and(|slot| slot.role == role) {
-                    old.next().unwrap()
-                } else {
-                    BindingSlot {
-                        role,
-                        size: None,
-                        binding: None,
-                        resource_index: None,
-                        sampler_index: None,
-                    }
-                };
-                slot.size = size(role);
-                slots.bindings.push(slot);
+            // Hardware binding coordinates are the channel's canonical slots,
+            // as in Eden. Allocate the fixed bank only when this group is used.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache_base.h
+            if slots.bindings.is_empty() {
+                slots.bindings.extend((0..fixed_count).map(|index| {
+                    BindingSlot::new(MaxwellThreeDResourceRole::channel_role(group, index))
+                }));
             }
+            for (word, (&previous, &next)) in slots.enabled.iter().zip(&enabled).enumerate() {
+                let mut removed = previous & !next;
+                while removed != 0 {
+                    let index = word * 64 + removed.trailing_zeros() as usize;
+                    removed &= removed - 1;
+                    let slot = &mut slots.bindings[index];
+                    if let Some(resource) = slot
+                        .binding
+                        .as_mut()
+                        .and_then(|binding| binding.resource.take())
+                    {
+                        slot.inactive_resource = Some(InactiveResource::from_resource(resource));
+                    }
+                }
+                let mut added = next & !previous;
+                while added != 0 {
+                    let index = word * 64 + added.trailing_zeros() as usize;
+                    added &= added - 1;
+                    let slot = &mut slots.bindings[index];
+                    if let Some(resource) = slot.inactive_resource.take() {
+                        if let Some(resource) = resource.upgrade(slot.role) {
+                            slot.binding
+                                .as_mut()
+                                .expect("retained binding proof")
+                                .resource = Some(resource);
+                        } else {
+                            slot.binding = None;
+                        }
+                    }
+                }
+            }
+            // Variable slots belong to the current program. Keep matching
+            // positions, replace changed ones, and release the removed suffix.
+            slots.bindings.truncate(fixed_count + variable_slots.len());
+            for selected in variable_slots {
+                let (index, role) = (selected.index, selected.role);
+                if let Some(slot) = slots.bindings.get_mut(index) {
+                    if slot.role != role {
+                        *slot = BindingSlot::new(role);
+                    }
+                } else {
+                    slots.bindings.push(BindingSlot::new(role));
+                }
+            }
+            slots.active.clear();
+            for (word, &mask) in enabled.iter().enumerate() {
+                let mut mask = mask;
+                while mask != 0 {
+                    let index = word * 64 + mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    slots.bindings[index].size = None;
+                    slots.active.push(index);
+                }
+            }
+            slots
+                .active
+                .extend(variable_slots.iter().map(|slot| slot.index));
+            for selected in &selected.slots {
+                slots.bindings[selected.index].size = selected.size;
+            }
+            slots.enabled = enabled;
             slots.selection_dirty = true;
         }
         self
@@ -1419,9 +1692,28 @@ impl MaxwellThreeDResolvedResourceCache {
                 continue;
             }
             let mut changed = slots.selection_dirty;
-            let mut rebuild = slots.selection_dirty;
             let mut has_descriptor_reads = false;
-            for slot in &mut slots.bindings {
+            let shader_group = group.checked_sub(1).filter(|&index| index < 2);
+            let revision = self
+                .selected
+                .binding_revision
+                .checked_add(1)
+                .expect("binding revision exhausted");
+            if slots.selection_dirty {
+                let selected = &mut self.selected.resources[group];
+                selected.resize_with(slots.active.len(), || None);
+                if let Some(shader_group) = shader_group {
+                    self.selected.binding_revisions[shader_group].resize(slots.active.len(), 0);
+                }
+                if group == 2 {
+                    self.selected.samplers.resize(slots.active.len(), None);
+                    self.selected
+                        .sampler_revisions
+                        .resize(slots.active.len(), 0);
+                }
+            }
+            for (position, &index) in slots.active.iter().enumerate() {
+                let slot = &mut slots.bindings[index];
                 if !slots.selection_dirty
                     && same_state
                     && slot.binding.as_ref().is_some_and(|entry| {
@@ -1447,17 +1739,26 @@ impl MaxwellThreeDResolvedResourceCache {
                 let entry = slot.binding.as_ref().expect("selected slot is resolved");
                 has_descriptor_reads |= !entry.descriptor_reads.is_empty();
                 changed |= different;
-                if different {
-                    rebuild |= slot.resource_index.is_some() != entry.resource.is_some()
-                        || slot.sampler_index.is_some() != entry.sampler.is_some();
-                    if !rebuild {
-                        if let Some(index) = slot.resource_index {
-                            self.selected.resources[group][index] =
-                                entry.resource.as_ref().unwrap().clone();
+                if different || slots.selection_dirty {
+                    let selected = &mut self.selected.resources[group][position];
+                    let same_resource = match (&*selected, &entry.resource) {
+                        (Some(old), Some(new)) => old.same_view(new),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if slots.selection_dirty || !same_resource {
+                        selected.clone_from(&entry.resource);
+                        if let Some(shader_group) = shader_group {
+                            self.selected.binding_revisions[shader_group][position] = revision;
                         }
-                        if let Some(index) = slot.sampler_index {
-                            self.selected.samplers[index] = entry.sampler.unwrap();
+                    }
+                    if group == 2 {
+                        if slots.selection_dirty
+                            || self.selected.samplers[position] != entry.sampler
+                        {
+                            self.selected.sampler_revisions[position] = revision;
                         }
+                        self.selected.samplers[position] = entry.sampler;
                     }
                 }
             }
@@ -1465,31 +1766,14 @@ impl MaxwellThreeDResolvedResourceCache {
             slots.address_space = Some(address_space.id());
             slots.mapping_generation = generation;
             slots.has_descriptor_reads = has_descriptor_reads;
-            if rebuild {
-                let selected = &mut self.selected.resources[group];
-                selected.clear();
-                if group == 2 {
-                    self.selected.samplers.clear();
-                }
-                for slot in &mut slots.bindings {
-                    let entry = slot.binding.as_ref().expect("selected slot is resolved");
-                    slot.resource_index = entry.resource.as_ref().map(|resource| {
-                        let index = selected.len();
-                        selected.push(resource.clone());
-                        index
-                    });
-                    slot.sampler_index = entry.sampler.map(|sampler| {
-                        let index = self.selected.samplers.len();
-                        self.selected.samplers.push(sampler);
-                        index
-                    });
-                }
-            }
             slots.selection_dirty = false;
             if changed {
+                if shader_group.is_some() {
+                    self.selected.binding_revision = revision;
+                }
                 self.selected.revisions[group] = self.selected.revisions[group]
                     .checked_add(1)
-                    .expect("binding revision exhausted");
+                    .expect("resource group revision exhausted");
             }
         }
         Ok(&self.selected)
@@ -1512,7 +1796,7 @@ impl MaxwellThreeDResolvedResourceCache {
         if let Some(entry) = &mut previous
             && entry.address_space == address_space.id()
             && entry.size == size
-            && entry.state.matches(state)
+            && entry.state.matches(state, role)
         {
             if Self::binding_memory_is_current(
                 entry,
@@ -2103,15 +2387,9 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
             .and_then(|group| group.constant_buffers().get(usize::from(slot)))
             .copied()
             .flatten()
-            .filter(|binding| binding.enabled())
             .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-        let address = binding
-            .address()
-            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?
-            .get();
-        let cb_size = binding
-            .size()
-            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
+        let address = binding.address().get();
+        let cb_size = binding.size();
         let descriptor_size = if size == MaxwellShaderBufferSize::Declared {
             16
         } else {
@@ -2177,18 +2455,11 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
     ) -> Result<(), MaxwellThreeDResourceError> {
         let role = MaxwellThreeDResourceRole::ConstantBuffer { group, slot };
         let Some(binding) = bindings.groups()[group as usize].constant_buffers()[slot as usize]
-            .filter(|b| b.enabled())
         else {
             return Ok(());
         };
-        let address = binding
-            .address()
-            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-        let size = u64::from(
-            binding
-                .size()
-                .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?,
-        );
+        let address = binding.address();
+        let size = u64::from(binding.size());
         self.buffer(role, address, end.map_or(size, |end| size.min(end)))
     }
     fn sampler_pool(
@@ -3342,7 +3613,7 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
     }
 
     fn finish(
-        mut self,
+        self,
     ) -> Result<
         (
             MaxwellThreeDResolvedResources,
@@ -3350,19 +3621,32 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         ),
         MaxwellThreeDResourceError,
     > {
-        let mut groups: [Vec<MaxwellThreeDResolvedResource>; 4] = Default::default();
+        let mut groups: [Vec<ResolvedSlot>; 4] = Default::default();
         for resource in self.resources {
-            groups[resource.role().binding_group()].push(resource);
+            let role = resource.role();
+            groups[role.binding_group()].push(ResolvedSlot {
+                role,
+                resource: Some(resource),
+                sampler: None,
+            });
         }
-        self.samplers.sort_unstable_by_key(|sampler| sampler.role());
-        let result = MaxwellThreeDResolvedResources {
-            resources: groups.map(|mut group| {
-                group.sort_unstable_by_key(|r| r.role());
-                group
-            }),
-            samplers: self.samplers.into_vec(),
-            revisions: [0; 4],
-        };
+        for sampler in self.samplers {
+            groups[2].push(ResolvedSlot {
+                role: sampler.role(),
+                resource: None,
+                sampler: Some(sampler),
+            });
+        }
+        let mut result = MaxwellThreeDResolvedResources::default();
+        for (index, mut group) in groups.into_iter().enumerate() {
+            group.sort_unstable_by_key(|r| r.role);
+            for slot in group {
+                result.resources[index].push(slot.resource);
+                if index == 2 {
+                    result.samplers.push(slot.sampler);
+                }
+            }
+        }
         result.validate_mappings(self.address_space)?;
         Ok((result, self.descriptor_reads.into_vec().into_boxed_slice()))
     }

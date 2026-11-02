@@ -18,6 +18,71 @@ fn increment() -> Shader {
 }
 
 #[test]
+fn retained_program_selections_keep_independent_dynamic_buffer_offsets() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let compilers = Compilers::new(&cache);
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Compute(
+            compilers.shader(&cache, [increment()]),
+        ))
+        .unwrap();
+    let (_allocation, backing) = backing_allocation(&cache, 4096, 4096, 0);
+    let buffer = cache
+        .buffer_for(backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
+        .unwrap()
+        .buffer;
+    let programs = [0, 256].map(|offset| {
+        cache
+            .prepare_program(
+                Arc::clone(&pipeline),
+                &[Binding::Buffer {
+                    buffer,
+                    offset,
+                    size: 16,
+                }],
+            )
+            .unwrap()
+    });
+    let (_other, unrelated) = backing_allocation(&cache, 4096, 4096, 0);
+    let discarded = cache
+        .buffer_for_deferred_import(unrelated, vk::BufferUsageFlags::STORAGE_BUFFER)
+        .unwrap();
+    cache
+        .retire_entry(Resource::Buffer(discarded.buffer))
+        .unwrap();
+    assert!(
+        programs
+            .iter()
+            .all(|program| cache.program_current(program))
+    );
+    for index in [0, 1, 0, 1, 0] {
+        cache
+            .dispatch(&programs[index], Dispatch::Direct([1; 3]), &[])
+            .unwrap();
+        cache.flush().unwrap();
+    }
+    let bytes = cpu_read(&mut cache, &backing);
+    assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(bytes[256..260].try_into().unwrap()), 2);
+    assert!(bytes[4..256].iter().all(|&byte| byte == 0));
+    cache.retire_entry(Resource::Buffer(buffer)).unwrap();
+    assert!(
+        programs
+            .iter()
+            .all(|program| !cache.program_current(program))
+    );
+    drop(programs);
+    drop(pipeline);
+    drop(compilers);
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
 fn native_image_range_coalescing_preserves_mixed_scopes_and_subresource_holes() {
     use std::collections::BTreeMap;
     let id = ImageId {
@@ -2752,12 +2817,11 @@ fn incompatible_image_layouts_keep_native_lifetimes_and_latest_cpu_visibility() 
     let destination = make(&mut cache, result.clone(), 64, 64);
     let source_plane = cache.image(source).unwrap().planes[0];
     cache
-        .copy_image_region(
+        .copy_image_regions(
             source,
-            0,
-            transfers::full_rect(source_plane),
             destination,
-            0,
+            &[(0, 0)],
+            transfers::full_rect(source_plane),
             Default::default(),
         )
         .unwrap();
@@ -2931,7 +2995,7 @@ fn deferred_canonical_import_skips_overwritten_bytes_and_preserves_partial_loads
             4,
         );
         cache
-            .copy_image_region(target, 0, area(), result, 0, Default::default())
+            .copy_image_regions(target, result, &[(0, 0)], area(), Default::default())
             .unwrap();
         cache.flush().unwrap();
         let actual = cpu_read(&mut cache, &download);
@@ -3334,7 +3398,14 @@ fn unaligned_fill_and_native_565_to_bgra_blit_preserve_unselected_bytes() {
         },
     };
     cache
-        .blit_image(source, 0, area(), destination, 0, rect, vk::Filter::NEAREST)
+        .blit_image(
+            source,
+            destination,
+            &[(0, 0)],
+            area(),
+            rect,
+            vk::Filter::NEAREST,
+        )
         .unwrap();
     cache.flush().unwrap();
     let data = cpu_read(&mut cache, &target);
@@ -3875,7 +3946,10 @@ fn first_read_layout_transition_is_visible_to_later_attachment_loads() {
     );
     // Establish a read-only first use. The transition itself writes the image,
     // even though there is no data writer in its access history.
-    let layout = shader_attachment_layout(cache.image(depth).unwrap().description.usage);
+    let layout = shader_attachment_layout(
+        cache.image(depth).unwrap().description.usage,
+        cache.unified_layouts,
+    );
     cache
         .image_access_subresources(
             depth,
@@ -4110,6 +4184,10 @@ fn exercise_read_only_depth(api: ApiPreference) {
         )
         .unwrap();
     assert_eq!(cache.image(depth).unwrap().version, depth_version);
+    let recording = cache.device.submission.recording.unwrap();
+    let feedback = cache.device.submission.slots[recording].rendering_feedback;
+    assert_eq!(feedback.colors, 0);
+    assert!(!feedback.depth && !feedback.stencil);
     cache.flush().unwrap();
     let output = cpu_read(&mut cache, &bytes);
     assert!((127..=128).contains(&output[32]));
@@ -4124,13 +4202,26 @@ fn exercise_read_only_depth(api: ApiPreference) {
 }
 
 #[test]
-fn sampled_color_attachment_uses_native_feedback_layout() {
+fn sampled_color_attachment_feedback_uses_general_on_unified_layouts() {
+    sampled_color_attachment_feedback(true);
+}
+
+#[test]
+fn sampled_color_attachment_feedback_uses_explicit_layout_without_unified_layouts() {
+    sampled_color_attachment_feedback(false);
+}
+
+fn sampled_color_attachment_feedback(unified: bool) {
     let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
         return;
     };
     if !cache.device.profile().attachment_feedback_loop {
         return;
     }
+    if unified && !cache.unified_layouts {
+        return;
+    }
+    cache.unified_layouts = unified;
     let validation = cache.device.validation_monitor();
     let (original, bytes, _allocation) = image(
         &mut cache,
@@ -4159,6 +4250,20 @@ fn sampled_color_attachment_uses_native_feedback_layout() {
             .usage
             .contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT)
     );
+    let (other, other_bytes, _other_allocation) = image(
+        &mut cache,
+        description.format,
+        vk::ImageAspectFlags::COLOR,
+        4,
+    );
+    let other_planes = cache.image(other).unwrap().planes.to_vec();
+    let other = cache
+        .image_for_device_write(
+            crate::residency::tests::image_geometry(other_bytes, description, &other_planes),
+            description,
+            other_planes,
+        )
+        .unwrap();
     let pixel = vk::Rect2D {
         offset: Default::default(),
         extent: vk::Extent2D {
@@ -4178,6 +4283,9 @@ fn sampled_color_attachment_uses_native_feedback_layout() {
             },
         )
         .unwrap();
+    cache
+        .clear_image_rect(other, 0, pixel, vk::ClearValue::default())
+        .unwrap();
     let view = cache
         .image_view(
             target,
@@ -4196,7 +4304,12 @@ fn sampled_color_attachment_uses_native_feedback_layout() {
     let mut samplers = SamplerCache::new(cache.device(), 4);
     let sampler = samplers.get(&vk::SamplerCreateInfo::default()).unwrap();
     let compiler = compiler(&cache);
-    let state = GraphicsState::color(description.format);
+    let mut state = GraphicsState::color(description.format);
+    let mut colors = state.colors.to_vec();
+    let mut unused = colors[0];
+    unused.1.write_mask = vk::ColorComponentFlags::empty();
+    colors.push(unused);
+    state.colors = colors.into();
     let pipeline = compiler
         .request(PipelineRecipe::Graphics {
             shader: sampled_shader(&cache, [0.0625, 0.0625]),
@@ -4213,40 +4326,112 @@ fn sampled_color_attachment_uses_native_feedback_layout() {
         )
         .unwrap();
     let graphics = cache
-        .prepare_graphics(program, GraphicsParameters::new(state, pixel.extent))
+        .prepare_graphics(
+            program,
+            GraphicsParameters::new(state.clone(), pixel.extent),
+        )
         .unwrap();
     let targets = cache
         .prepare_targets(RenderingTargets {
             area: pixel,
-            colors: Box::new([Some(RenderAttachment::color(
-                target,
-                0,
-                AttachmentLoad::Load,
-                AttachmentStore::Store,
-            ))]),
+            colors: Box::new([
+                Some(RenderAttachment::color(
+                    target,
+                    0,
+                    AttachmentLoad::Load,
+                    AttachmentStore::Store,
+                )),
+                Some(RenderAttachment::color(
+                    other,
+                    0,
+                    AttachmentLoad::Load,
+                    AttachmentStore::Store,
+                )),
+            ]),
             depth: None,
             stencil: None,
         })
         .unwrap();
+    let expected_layout = if unified {
+        vk::ImageLayout::GENERAL
+    } else {
+        vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+    };
+    let mut plain_state = state;
+    Arc::make_mut(&mut plain_state.colors)[0].1.write_mask = vk::ColorComponentFlags::empty();
+    let plain_pipeline = compiler
+        .request(PipelineRecipe::Graphics {
+            shader: solid_artifact(),
+            state: plain_state.clone(),
+        })
+        .unwrap();
+    let plain_program = cache.prepare_program(plain_pipeline, &[]).unwrap();
+    let plain_graphics = cache
+        .prepare_graphics(
+            plain_program,
+            GraphicsParameters::new(plain_state, pixel.extent),
+        )
+        .unwrap();
+    let plain = cache
+        .prepare_draw(plain_graphics, Arc::clone(&targets), Box::new([]), None)
+        .unwrap();
     let draw = cache
         .prepare_draw(graphics, targets, Box::new([]), None)
         .unwrap();
-    cache
-        .draw(
-            &draw,
-            Draw::Direct {
-                vertices: 3,
-                instances: 1,
-                first_vertex: 0,
-                first_instance: 0,
-            },
-            &[],
-        )
-        .unwrap();
-    cache.flush().unwrap();
-    let result = cpu_read(&mut cache, &bytes);
-    assert_eq!(&result[32..36], &[255, 0, 0, 255]);
+    for (color, expected) in [
+        ([1., 0., 0., 1.], [255, 0, 0, 255]),
+        ([0., 1., 0., 1.], [0, 255, 0, 255]),
+        ([0., 0., 1., 1.], [0, 0, 255, 255]),
+    ] {
+        cache
+            .clear_image_rect(
+                target,
+                0,
+                pixel,
+                vk::ClearValue {
+                    color: vk::ClearColorValue { float32: color },
+                },
+            )
+            .unwrap();
+        let triangle = Draw::Direct {
+            vertices: 3,
+            instances: 1,
+            first_vertex: 0,
+            first_instance: 0,
+        };
+        let feedback_mask = |cache: &VulkanResidency| {
+            let slot = cache.device.submission.recording.unwrap();
+            cache.device.submission.slots[slot].rendering_feedback
+        };
+        cache.draw(&plain, triangle, &[0; 16]).unwrap();
+        assert_eq!(feedback_mask(&cache).colors, 0);
+        cache.draw(&draw, triangle, &[]).unwrap();
+        assert_eq!(feedback_mask(&cache).colors, u8::from(unified));
+        let scopes = cache.device.recording_statistics().rendering_scopes;
+        // The targets stay the same. The new non-feedback scope must preserve
+        // the sampled result even though this pipeline has no color writes.
+        cache.draw(&plain, triangle, &[0; 16]).unwrap();
+        assert_eq!(feedback_mask(&cache).colors, 0);
+        if unified {
+            assert_eq!(
+                cache.device.recording_statistics().rendering_scopes,
+                scopes + 1
+            );
+        }
+        assert!(
+            cache
+                .image(target)
+                .unwrap()
+                .access
+                .iter()
+                .all(|cell| cell.layout == expected_layout)
+        );
+        cache.flush().unwrap();
+        let result = cpu_read(&mut cache, &bytes);
+        assert_eq!(&result[32..36], &expected);
+    }
     drop(draw);
+    drop(plain);
     drop(compiler);
     drop(samplers);
     drop(cache);
@@ -4522,17 +4707,16 @@ fn transfer_writes_skip_old_destination_import_and_preserve_exterior_producers()
                 cache
                     .blit_image(
                         source,
-                        0,
-                        source_rect,
                         destination,
-                        0,
+                        &[(0, 0)],
+                        source_rect,
                         rect,
                         vk::Filter::NEAREST,
                     )
                     .unwrap();
             } else {
                 cache
-                    .copy_image_region(source, 0, source_rect, destination, 0, rect.offset)
+                    .copy_image_regions(source, destination, &[(0, 0)], source_rect, rect.offset)
                     .unwrap();
             }
             assert_eq!(
@@ -4723,7 +4907,7 @@ fn streamed_uniform_bindings_preserve_merged_aliases_and_independent_sources() {
         .min_uniform_buffer_offset_alignment
         .max(16);
     let (a, a_mapping) = backing_allocation(&cache, 4096, 4096, 0x11);
-    let (_b, b_mapping) = backing_allocation(&cache, 4096, 4096, 0x22);
+    let (b, b_mapping) = backing_allocation(&cache, 4096, 4096, 0x22);
     let (_output, output_mapping) = backing_allocation(&cache, 4096, 4096, 0);
     let a_id = super::super::tests::buffer(&mut cache, a_mapping);
     let b_id = super::super::tests::buffer(&mut cache, b_mapping);
@@ -4800,6 +4984,215 @@ fn streamed_uniform_bindings_preserve_merged_aliases_and_independent_sources() {
         &[0x11111111u32, 0x55555555, 0x22222222]
             .map(u32::to_le_bytes)
             .concat()
+    );
+    // Alternate programs with different storage outputs but the same dynamic
+    // uniform stream. Each program must retain its descriptor selection while
+    // every dispatch captures the new CPU bytes at its own dynamic offset.
+    let (_other_output, other_mapping) = backing_allocation(&cache, 4096, 4096, 0);
+    let other_id = super::super::tests::buffer(&mut cache, other_mapping.clone());
+    let mut bindings = program.bindings.to_vec();
+    bindings[3] = Binding::Buffer {
+        buffer: other_id,
+        offset: 0,
+        size: 12,
+    };
+    let other = cache
+        .prepare_program(Arc::clone(&program.pipeline), &bindings)
+        .unwrap();
+    for selected in [&program, &other] {
+        cache
+            .dispatch(selected, Dispatch::Direct([1, 1, 1]), &[])
+            .unwrap();
+    }
+    let captures = cache
+        .device
+        .recording_statistics()
+        .descriptor_payload_captures;
+    for index in 0..100u32 {
+        super::super::tests::cpu_write(&mut cache, &b, 0, &(0x60000000 + index).to_le_bytes())
+            .unwrap();
+        cache
+            .dispatch(
+                if index % 2 == 0 { &program } else { &other },
+                Dispatch::Direct([1, 1, 1]),
+                &[],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        cache
+            .device
+            .recording_statistics()
+            .descriptor_payload_captures,
+        captures
+    );
+    for (mapping, last) in [(&output_mapping, 98), (&other_mapping, 99)] {
+        assert_eq!(
+            &cpu_read(&mut cache, mapping)[..12],
+            &[0x11111111u32, 0x55555555, 0x60000000 + last]
+                .map(u32::to_le_bytes)
+                .concat()
+        );
+    }
+    // Changing the uniform slot count must discard the previous draw's stream
+    // selections, including a layout with no uniform descriptors at all.
+    let mut shader = Shader::new(Stage::Compute);
+    shader.storage();
+    shader.program.info.used_constant_buffer_types = Type::U32;
+    shader
+        .program
+        .info
+        .constant_buffer_descriptors
+        .push(ConstantBufferDescriptor {
+            index: CbufIndex(0),
+            count: 1,
+        })
+        .unwrap();
+    let value = shader.op(O::GetCbufU32, &[V::U32(0), V::U32(0)]);
+    shader.op(O::WriteStorage32, &[V::U32(0), V::U32(0), value]);
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Compute(compilers.shader(&cache, [shader])))
+        .unwrap();
+    let short = cache
+        .prepare_program(
+            pipeline,
+            &[
+                Binding::Buffer {
+                    buffer: b_id,
+                    offset: 0,
+                    size: 4,
+                },
+                Binding::Buffer {
+                    buffer: other_id,
+                    offset: 0,
+                    size: 4,
+                },
+            ],
+        )
+        .unwrap();
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Compute(
+            compilers.shader(&cache, [increment()]),
+        ))
+        .unwrap();
+    let storage_only = cache
+        .prepare_program(
+            pipeline,
+            &[Binding::Buffer {
+                buffer: other_id,
+                offset: 0,
+                size: 4,
+            }],
+        )
+        .unwrap();
+    for _ in 0..3 {
+        for selected in [&program, &short, &storage_only] {
+            cache
+                .dispatch(selected, Dispatch::Direct([1; 3]), &[])
+                .unwrap();
+        }
+        assert_eq!(
+            &cpu_read(&mut cache, &output_mapping)[..12],
+            &[0x11111111u32, 0x55555555, 0x60000063]
+                .map(u32::to_le_bytes)
+                .concat(),
+        );
+        assert_eq!(
+            &cpu_read(&mut cache, &other_mapping)[..4],
+            &0x60000064u32.to_le_bytes()
+        );
+    }
+    drop(storage_only);
+    drop(short);
+    drop(other);
+    drop(program);
+    drop(compilers);
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "controlled physical Vulkan uniform streaming throughput"]
+fn uniform_streaming_throughput() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
+        panic!("physical Vulkan is required for the controlled benchmark");
+    };
+    let validation = cache.device.validation_monitor();
+    let compilers = Compilers::new(&cache);
+    let slots = 12u32;
+    let mut shader = Shader::new(Stage::Compute);
+    shader.storage();
+    shader.program.info.used_constant_buffer_types = Type::U32;
+    let mut bindings = Vec::new();
+    let mut allocations = Vec::new();
+    let mut expected = Vec::new();
+    for index in 0..slots {
+        let byte = index as u8 + 1;
+        let (allocation, mapping) = backing_allocation(&cache, 4096, 4096, byte);
+        allocations.push(allocation);
+        let buffer = super::super::tests::buffer(&mut cache, mapping);
+        bindings.push(Binding::Buffer {
+            buffer,
+            offset: 0,
+            size: 16,
+        });
+        expected.extend_from_slice(&[byte; 4]);
+        shader
+            .program
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor {
+                index: CbufIndex(index),
+                count: 1,
+            })
+            .unwrap();
+        let value = shader.op(O::GetCbufU32, &[V::U32(index), V::U32(0)]);
+        shader.op(O::WriteStorage32, &[V::U32(0), V::U32(index * 4), value]);
+    }
+    let (_allocation, output) = backing_allocation(&cache, 4096, 4096, 0);
+    let buffer = super::super::tests::buffer(&mut cache, output.clone());
+    bindings.push(Binding::Buffer {
+        buffer,
+        offset: 0,
+        size: u64::from(slots * 4),
+    });
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Compute(compilers.shader(&cache, [shader])))
+        .unwrap();
+    let program = cache.prepare_program(pipeline, &bindings).unwrap();
+    cache
+        .dispatch(&program, Dispatch::Direct([1; 3]), &[])
+        .unwrap();
+    assert_eq!(&cpu_read(&mut cache, &output)[..expected.len()], expected);
+    let rounds = std::env::var("NIXE_UNIFORM_BENCH_ROUNDS")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(16_384);
+    let cpu_ns = || {
+        std::fs::read_to_string("/proc/thread-self/schedstat")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let before = cpu_ns();
+    let started = std::time::Instant::now();
+    for _ in 0..rounds {
+        cache
+            .dispatch(&program, Dispatch::Direct([1; 3]), &[])
+            .unwrap();
+    }
+    let wall_ns = started.elapsed().as_nanos();
+    let elapsed = cpu_ns() - before;
+    assert_eq!(&cpu_read(&mut cache, &output)[..expected.len()], expected);
+    println!(
+        "UNIFORM_BENCH {{\"rounds\":{rounds},\"slots\":{slots},\"cpu_ns\":{elapsed},\"wall_ns\":{wall_ns}}}"
     );
     drop(program);
     drop(compilers);

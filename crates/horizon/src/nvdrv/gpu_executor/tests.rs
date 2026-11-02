@@ -218,7 +218,7 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
             &nixe_runtime::VirtualClock::default(),
         )
         .unwrap();
-    let presented = executor.request_presentable_image(image, 1).unwrap();
+    let presented = executor.request_presentable_image(image, 1, None).unwrap();
     // Empty work fails at the frontend boundary. Its queued presentation
     // must never reach the backend or create a false resident producer.
     assert!(

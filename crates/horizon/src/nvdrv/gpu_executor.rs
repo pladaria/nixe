@@ -101,6 +101,20 @@ struct GpuQueuedSubmission {
     submission: GpuSubmission,
     clock: nixe_runtime::VirtualClock,
 }
+struct PresentReply {
+    result: mpsc::SyncSender<Result<ResidentImage, Box<str>>>,
+    events: Option<nixe_runtime::ExternalEventSender>,
+}
+impl PresentReply {
+    fn complete(self, result: Result<ResidentImage, Box<str>>) {
+        // Publish before waking the display consumer, including failure replies.
+        if self.result.send(result).is_ok()
+            && let Some(events) = self.events
+        {
+            events.notify_host_service(nixe_runtime::ExternalEventSource::Worker);
+        }
+    }
+}
 #[allow(
     clippy::large_enum_variant,
     reason = "retained deliveries are bounded by shared permits"
@@ -118,7 +132,7 @@ enum GpuMessage {
     PresentImage {
         request: PresentationImageRequest,
         swap_interval: u32,
-        reply: mpsc::SyncSender<Result<ResidentImage, Box<str>>>,
+        reply: PresentReply,
     },
     Wake,
     MemoryAccess(DeviceAccessRequest),
@@ -586,6 +600,7 @@ impl NvDrvGpuExecutor {
         &self,
         request: PresentationImageRequest,
         swap_interval: u32,
+        events: Option<nixe_runtime::ExternalEventSender>,
     ) -> Result<mpsc::Receiver<Result<ResidentImage, Box<str>>>, GpuExecutorFailure> {
         self.require_healthy()?;
         let sender = self
@@ -604,7 +619,10 @@ impl NvDrvGpuExecutor {
             .send(GpuMessage::PresentImage {
                 request,
                 swap_interval,
-                reply,
+                reply: PresentReply {
+                    result: reply,
+                    events,
+                },
             })
             .map_err(|_| {
                 self.failure().unwrap_or(GpuExecutorFailure {

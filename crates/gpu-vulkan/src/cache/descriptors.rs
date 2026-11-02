@@ -251,6 +251,16 @@ pub struct BindingRecord {
     counters: nixe_gpu::cache_counters::CacheCounters,
     sets_per_pool: usize,
 }
+impl BindingRecord {
+    /// Reserve the payload retained by a prepared program's current selection,
+    /// including before its first descriptor capture is materialized.
+    pub(crate) fn capture_bytes(resources: usize) -> usize {
+        std::mem::size_of::<Self>()
+            + resources
+                * (std::mem::size_of::<DescriptorResource>()
+                    + std::mem::size_of::<DescriptorEntry>())
+    }
+}
 #[derive(Default)]
 struct NativeMetrics {
     allocated: AtomicU64,

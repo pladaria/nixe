@@ -34,8 +34,56 @@ namespace Dynarmic::Backend::X64 {
 
 using namespace Xbyak::util;
 
-A64EmitContext::A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block)
-        : EmitContext(reg_alloc, block), conf(conf) {}
+A64EmitContext::A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits)
+        : EmitContext(reg_alloc, block, labels, deferred_emits), conf(conf) {}
+
+// Eden Auto omits the fastmem width check globally. Retain that direct operand
+// only when the block's SSA expression proves the complete starting address.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+bool A64EmitContext::CanOmitFastmemBoundsCheck(IR::Value address) const {
+    if (address.IsEmpty()) {
+        return false;
+    }
+    const u64 limit = u64{1} << conf.fastmem_address_space_bits;
+    u64 offset = 0;
+    IR::Inst* root = nullptr;
+    for (unsigned depth = 0; depth < 16; ++depth) {
+        if (address.IsImmediate()) {
+            return address.GetImmediateAsU64() + offset < limit;
+        }
+        root = address.GetInstRecursive();
+        if (root->GetOpcode() != IR::Opcode::Add64 || !root->GetArg(2).IsZero()) {
+            break;
+        }
+        if (root->GetArg(1).IsImmediate()) {
+            offset += root->GetArg(1).GetImmediateAsU64();
+            address = root->GetArg(0);
+        } else if (root->GetArg(0).IsImmediate()) {
+            offset += root->GetArg(0).GetImmediateAsU64();
+            address = root->GetArg(1);
+        } else {
+            break;
+        }
+        root = nullptr;
+    }
+    if (!root) {
+        return false;
+    }
+    std::optional<u64> maximum;
+    if (root->GetOpcode() == IR::Opcode::ZeroExtendWordToLong) {
+        maximum = 0xffff'ffff;
+    } else if (root->GetOpcode() == IR::Opcode::And64) {
+        for (size_t index : {0, 1}) {
+            if (root->GetArg(index).IsImmediate()) {
+                maximum = root->GetArg(index).GetImmediateAsU64();
+            }
+        }
+    }
+    if (maximum && *maximum < limit && offset < limit - *maximum) {
+        return true;
+    }
+    return false;
+}
 
 A64::LocationDescriptor A64EmitContext::Location() const {
     return A64::LocationDescriptor{block.Location()};
@@ -50,7 +98,18 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
 }
 
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
-        : EmitX64(code), conf(conf), jit_interface{jit_interface} {
+        : EmitX64(code, [&conf] {
+            HostLocSet gprs{any_gpr};
+            if (conf.page_table || conf.canonical_page_table) {
+                gprs.reset(static_cast<size_t>(HostLoc::R14));
+            }
+            if (conf.fastmem_pointer) {
+                gprs.reset(static_cast<size_t>(HostLoc::R13));
+            }
+            return gprs;
+        }())
+        , conf(conf)
+        , jit_interface{jit_interface} {
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();
@@ -71,22 +130,11 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
 
     code.EnableWriting();
     SCOPE_EXIT {
+        labels.clear();
         code.DisableWriting();
     };
 
-    const std::vector<HostLoc> gpr_order = [this] {
-        std::vector<HostLoc> gprs{any_gpr};
-        if (conf.page_table || conf.canonical_page_table) {
-            gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R14));
-        }
-        if (conf.fastmem_pointer) {
-            gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R13));
-        }
-        return gprs;
-    }();
-
-    RegAlloc reg_alloc{code, gpr_order, any_xmm};
-    A64EmitContext ctx{conf, reg_alloc, block};
+    A64EmitContext ctx{conf, reg_alloc, block, labels, deferred_emits};
 
     // Start emitting.
     code.align();
@@ -125,8 +173,6 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
         }
     }
 
-    reg_alloc.AssertNoMoreUses();
-
     if (conf.enable_cycle_counting) {
         EmitAddCycles(block.CycleCount());
     }
@@ -136,6 +182,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     for (auto& deferred_emit : ctx.deferred_emits) {
         deferred_emit();
     }
+    reg_alloc.AssertNoMoreUses();
     code.int3();
 
     const size_t size = static_cast<size_t>(code.getCurr() - entrypoint);

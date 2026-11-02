@@ -1,12 +1,16 @@
 //! Code inputs captured before leaving native translation admission.
 use nixe_memory::{
     Access, AccessResult, AddressSpace, AddressSpaceId, AllocationRange, CodeFetch,
-    GuestVirtualAddress, MappingObservation, MemoryError, NativeAdmission, Observation,
+    GuestVirtualAddress, MappingObservation, MemoryError, NativeAdmission, NativeCodePage,
+    Observation,
 };
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Default)]
-pub(crate) struct CodeCache(HashMap<u64, CodeWord>);
+pub(crate) struct CodeCache {
+    page: Option<NativeCodePage>,
+    device_words: HashMap<u64, CodeWord>,
+}
 pub(crate) enum Lookup {
     Ready(u32),
     Capture(CodeCapture),
@@ -55,18 +59,28 @@ impl CodeCache {
         native: &NativeAdmission<'_>,
         address: GuestVirtualAddress,
     ) -> Result<Lookup, MemoryError> {
+        if let Some(word) = self
+            .page
+            .as_ref()
+            .and_then(|page| page.read(native, address))
+        {
+            return Ok(Lookup::Ready(word));
+        }
         match space.fetch_code_native(native, address)? {
-            CodeFetch::Ready { word, .. } => Ok(Lookup::Ready(word)),
+            CodeFetch::Ready { word, page } => {
+                self.page = Some(page);
+                Ok(Lookup::Ready(word))
+            }
             CodeFetch::Capture {
                 ranges,
                 device_owned,
             } => {
-                if let Some(word) = self.0.get(&address.get())
+                if let Some(word) = self.device_words.get(&address.get())
                     && !word.observation.is_invalid()
                 {
                     return Ok(Lookup::Ready(word.word));
                 }
-                self.0.remove(&address.get());
+                self.device_words.remove(&address.get());
                 Ok(Lookup::Capture(CodeCapture {
                     space: space.identity(),
                     address,
@@ -89,7 +103,7 @@ impl CodeCache {
         // Ordinary RAM now has a physical code watch and remains a direct
         // indexed read. Only device-owned code needs an owned-word cache.
         if code.device_owned && !code.word.observation.is_invalid() {
-            self.0.insert(code.word.address.get(), code.word);
+            self.device_words.insert(code.word.address.get(), code.word);
         }
         Ok(())
     }
@@ -163,5 +177,85 @@ impl CodeRead {
                 },
             })
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixe_memory::{AddressWidth, Machine, MemoryPermissions, PAGE_SIZE};
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "controlled native code-reader measurement"]
+    fn native_code_reader_throughput() {
+        let pages = 16;
+        let bytes = pages * PAGE_SIZE;
+        let machine = Machine::new(bytes).unwrap();
+        let allocation = machine.account(bytes).unwrap().allocate(bytes).unwrap();
+        let words: Vec<_> = (0..bytes / 4).map(|index| index as u32).collect();
+        machine
+            .write_resolved(
+                &[AllocationRange::new(allocation.pin(), 0, bytes).unwrap()],
+                &words
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
+        let base = GuestVirtualAddress::new(PAGE_SIZE);
+        space
+            .map(base, allocation, 0, bytes, MemoryPermissions::EXECUTE)
+            .unwrap();
+        let captured = space
+            .capture(base, bytes, MemoryPermissions::EXECUTE)
+            .unwrap();
+        let (access, _observation) = machine.access_code_captured(captured).unwrap();
+        access.into_ready().unwrap();
+        let context = space.register_core(Arc::new(|| {
+            panic!("unexpected transition during benchmark")
+        }));
+        let native = context.enter_native().unwrap();
+        let mut cache = CodeCache::default();
+        let iterations = std::env::var("NIXE_CODE_READER_ITERS")
+            .ok()
+            .map(|value| value.parse::<u64>().unwrap())
+            .unwrap_or(1000);
+        let cpu_ns = || {
+            std::fs::read_to_string("/proc/thread-self/schedstat")
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        let begin_cpu = cpu_ns();
+        let begin = std::time::Instant::now();
+        let mut checksum = 0u64;
+        for _ in 0..iterations {
+            for (index, expected) in words.iter().enumerate() {
+                let address = GuestVirtualAddress::new(PAGE_SIZE + index as u64 * 4);
+                let Lookup::Ready(word) = cache
+                    .fetch(&space, &native, std::hint::black_box(address))
+                    .unwrap()
+                else {
+                    panic!("tracked code unexpectedly requires capture");
+                };
+                assert_eq!(word, *expected);
+                checksum += u64::from(word);
+            }
+        }
+        let wall_ns = begin.elapsed().as_nanos();
+        let elapsed_cpu = cpu_ns() - begin_cpu;
+        let count = iterations * words.len() as u64;
+        assert_eq!(
+            checksum,
+            iterations * (words.len() as u64 - 1) * words.len() as u64 / 2
+        );
+        println!(
+            "CODE_READER_BENCH {{\"words\":{count},\"cpu_ns\":{elapsed_cpu},\"wall_ns\":{wall_ns},\"checksum\":{checksum}}}"
+        );
     }
 }

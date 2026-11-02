@@ -2,6 +2,58 @@
 use super::commands::plane_range;
 use super::*;
 impl VulkanResidency {
+    pub(super) fn transfer_planes(
+        &self,
+        source: ImageId,
+        destination: ImageId,
+        planes: &[(usize, usize)],
+        source_rect: vk::Rect2D,
+        destination_rect: vk::Rect2D,
+    ) -> Result<smallvec::SmallVec<[(ImagePlane, ImagePlane); 2]>, VulkanError> {
+        if planes.is_empty() {
+            return Err(VulkanError::InvalidResource("image transfer has no planes"));
+        }
+        let mut selected = smallvec::SmallVec::new();
+        for &(source_plane, destination_plane) in planes {
+            let src = self.checked_image_rect(source, source_plane, source_rect)?;
+            let dst = self.checked_image_rect(destination, destination_plane, destination_rect)?;
+            if src.aspect != dst.aspect
+                || selected
+                    .iter()
+                    .any(|(_, prior): &(ImagePlane, ImagePlane)| same_subresource(*prior, dst))
+            {
+                return Err(VulkanError::InvalidResource(
+                    "image transfer requires matching aspects and distinct destination subresources",
+                ));
+            }
+            selected.push((src, dst));
+        }
+        Ok(selected)
+    }
+    pub(super) fn image_planes_access(
+        &mut self,
+        id: ImageId,
+        planes: impl IntoIterator<Item = ImagePlane>,
+        scope: AccessScope,
+        conventional: vk::ImageLayout,
+    ) -> Result<(vk::Image, vk::ImageLayout), VulkanError> {
+        let mut ranges = smallvec::SmallVec::<[vk::ImageSubresourceRange; 2]>::new();
+        for plane in planes {
+            if let Some(range) = ranges.iter_mut().find(|range| {
+                range.base_mip_level == plane.mip_level
+                    && range.base_array_layer == plane.array_layer
+            }) {
+                range.aspect_mask |= plane.aspect;
+            } else {
+                ranges.push(plane_range(plane));
+            }
+        }
+        let mut native = None;
+        for range in ranges {
+            native = Some(self.image_access_subresources(id, range, scope, conventional)?);
+        }
+        native.ok_or(VulkanError::InvalidResource("image access has no planes"))
+    }
     /// Exact byte-range fill. Native aligned words cover the interior; at most
     /// six staging bytes preserve boundary bytes without a read-modify-write
     /// shader, CPU readback, or an oversized zero upload.
@@ -452,171 +504,196 @@ impl VulkanResidency {
         self.finish_image_rect(destination, dst, rect)?;
         self.device.work_ticket()
     }
-    pub fn copy_image_region(
+    /// Copy all selected aspects in one native command. Overlapping self-copies
+    /// capture every source plane before publishing any destination plane.
+    /// https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyImage.html
+    pub fn copy_image_regions(
         &mut self,
         source: ImageId,
-        source_plane: usize,
-        source_rect: vk::Rect2D,
         destination: ImageId,
-        destination_plane: usize,
+        planes: &[(usize, usize)],
+        source_rect: vk::Rect2D,
         destination_offset: vk::Offset2D,
     ) -> Result<WorkTicket, VulkanError> {
         self.ensure_image(source)?;
-        let src = self.checked_image_rect(source, source_plane, source_rect)?;
         let rect = vk::Rect2D {
             offset: destination_offset,
             extent: source_rect.extent,
         };
-        let dst = self.checked_image_rect(destination, destination_plane, rect)?;
-        self.ensure_image_initialized(source, src, source_rect)?;
-        if self.image(source)?.description.samples != self.image(destination)?.description.samples
-            || !format::copy_compatible(
-                self.image(source)?.description.format,
-                self.image(destination)?.description.format,
-                src.aspect,
-            )
-            || src.aspect != dst.aspect
-            || src.block_extent != dst.block_extent
-            || src.bytes_per_block != dst.bytes_per_block
-        {
-            return Err(VulkanError::InvalidResource(
-                "image copy requires compatible native aspect/block representations",
-            ));
-        }
-        if source == destination
-            && src.mip_level == dst.mip_level
-            && src.array_layer == dst.array_layer
-            && src.depth_slice == dst.depth_slice
-        {
-            if self.image(source)?.description.samples != vk::SampleCountFlags::TYPE_1 {
+        let selected = self.transfer_planes(source, destination, planes, source_rect, rect)?;
+        let source_description = self.image(source)?.description;
+        let destination_description = self.image(destination)?.description;
+        for &(src, dst) in &selected {
+            self.ensure_image_initialized(source, src, source_rect)?;
+            if source_description.samples != destination_description.samples
+                || !format::copy_compatible(
+                    source_description.format,
+                    destination_description.format,
+                    src.aspect,
+                )
+                || src.block_extent != dst.block_extent
+                || src.bytes_per_block != dst.bytes_per_block
+            {
                 return Err(VulkanError::InvalidResource(
-                    "overlapping multisample image copy requires a sample-preserving snapshot",
+                    "image copy requires compatible native aspect/block representations",
                 ));
             }
-            let writer = self.prepare_image_rect(destination, dst, rect)?;
-            let row_bytes = u64::from(source_rect.extent.width.div_ceil(src.block_extent.width))
-                * u64::from(src.bytes_per_block);
-            let size =
-                row_bytes * u64::from(source_rect.extent.height.div_ceil(src.block_extent.height));
+        }
+        let snapshot = source == destination
+            && selected
+                .iter()
+                .any(|(src, _)| selected.iter().any(|(_, dst)| same_subresource(*src, *dst)));
+        if snapshot && source_description.samples != vk::SampleCountFlags::TYPE_1 {
+            return Err(VulkanError::InvalidResource(
+                "overlapping multisample image copy requires a sample-preserving snapshot",
+            ));
+        }
+        let mut writers = smallvec::SmallVec::<[WriterId; 2]>::new();
+        for &(_, dst) in &selected {
+            writers.push(self.prepare_image_rect(destination, dst, rect)?);
+        }
+        let read_scope = AccessScope::new(
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_READ,
+        );
+        let write_scope = AccessScope::new(
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        let extent = vk::Extent3D {
+            width: rect.extent.width,
+            height: rect.extent.height,
+            depth: 1,
+        };
+        if snapshot {
+            let mut size = 0;
+            let mut reads = smallvec::SmallVec::<[vk::BufferImageCopy; 2]>::new();
+            let mut writes = smallvec::SmallVec::<[vk::BufferImageCopy; 2]>::new();
+            for &(src, dst) in &selected {
+                let offset = crate::queue::align_up(size, 4).ok_or(
+                    VulkanError::InvalidResource("image snapshot alignment overflow"),
+                )?;
+                let row_bytes =
+                    u64::from(source_rect.extent.width.div_ceil(src.block_extent.width))
+                        * u64::from(src.bytes_per_block);
+                let bytes = row_bytes
+                    * u64::from(source_rect.extent.height.div_ceil(src.block_extent.height));
+                size = offset
+                    .checked_add(bytes)
+                    .ok_or(VulkanError::InvalidResource("image snapshot size overflow"))?;
+                reads.push(
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
+                        .image_subresource(src.layers())
+                        .image_offset(vk::Offset3D {
+                            x: source_rect.offset.x,
+                            y: source_rect.offset.y,
+                            z: src.depth_slice as i32,
+                        })
+                        .image_extent(extent),
+                );
+                writes.push(
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
+                        .image_subresource(dst.layers())
+                        .image_offset(vk::Offset3D {
+                            x: rect.offset.x,
+                            y: rect.offset.y,
+                            z: dst.depth_slice as i32,
+                        })
+                        .image_extent(extent),
+                );
+            }
             let scratch = Arc::new(self.temporary_buffer(size, &[Resource::Image(source)])?);
-            let (handle, read_layout) = self.image_access_subresources(
+            let (handle, read_layout) = self.image_planes_access(
                 source,
-                plane_range(src),
-                AccessScope::new(
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_READ,
-                ),
+                selected.iter().map(|(src, _)| *src),
+                read_scope,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             )?;
             self.barriers.emit(&mut self.device);
-            self.device.begin_recording()?;
-
             let work = self.device.work_ticket()?;
             self.device.retire_buffer(Arc::clone(&scratch), work)?;
-            let extent = vk::Extent3D {
-                width: rect.extent.width,
-                height: rect.extent.height,
-                depth: 1,
-            };
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(src.layers())
-                .image_offset(vk::Offset3D {
-                    x: source_rect.offset.x,
-                    y: source_rect.offset.y,
-                    z: src.depth_slice as i32,
-                })
-                .image_extent(extent);
             unsafe {
                 self.device.dispatch.cmd_copy_image_to_buffer(
                     handle,
                     read_layout,
                     scratch.handle,
-                    &[region],
+                    &reads,
                 );
             }
             super::recording::scratch_read_barrier(&mut self.device, scratch.handle, size);
-            let (_, write_layout) = self.image_access_subresources(
+            let (_, write_layout) = self.image_planes_access(
                 destination,
-                plane_range(dst),
-                AccessScope::new(
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                ),
+                selected.iter().map(|(_, dst)| *dst),
+                write_scope,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             )?;
             self.barriers.emit(&mut self.device);
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(dst.layers())
-                .image_offset(vk::Offset3D {
-                    x: rect.offset.x,
-                    y: rect.offset.y,
-                    z: dst.depth_slice as i32,
-                })
-                .image_extent(extent);
-            self.publish_effect(&[writer], |device| unsafe {
+            self.publish_effect(&writers, |device| unsafe {
                 device.dispatch.cmd_copy_buffer_to_image(
                     scratch.handle,
                     handle,
                     write_layout,
-                    &[region],
+                    &writes,
                 );
             })?;
             let work = self.device.work_ticket()?;
             self.device.retire_buffer(scratch, work)?;
-            self.finish_image_rect(destination, dst, rect)?;
-            return Ok(work);
+        } else {
+            let (source_handle, source_layout) = self.image_planes_access(
+                source,
+                selected.iter().map(|(src, _)| *src),
+                read_scope,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            )?;
+            let (destination_handle, destination_layout) = self.image_planes_access(
+                destination,
+                selected.iter().map(|(_, dst)| *dst),
+                write_scope,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            )?;
+            let regions: smallvec::SmallVec<[_; 2]> = selected
+                .iter()
+                .map(|&(src, dst)| {
+                    vk::ImageCopy::default()
+                        .src_subresource(src.layers())
+                        .dst_subresource(dst.layers())
+                        .src_offset(vk::Offset3D {
+                            x: source_rect.offset.x,
+                            y: source_rect.offset.y,
+                            z: src.depth_slice as i32,
+                        })
+                        .dst_offset(vk::Offset3D {
+                            x: rect.offset.x,
+                            y: rect.offset.y,
+                            z: dst.depth_slice as i32,
+                        })
+                        .extent(extent)
+                })
+                .collect();
+            self.barriers.emit(&mut self.device);
+            self.publish_effect(&writers, |device| unsafe {
+                device.dispatch.cmd_copy_image(
+                    source_handle,
+                    source_layout,
+                    destination_handle,
+                    destination_layout,
+                    &regions,
+                );
+            })?;
         }
-        let writer = self.prepare_image_rect(destination, dst, rect)?;
-        let (source_handle, source_layout) = self.image_access_subresources(
-            source,
-            plane_range(src),
-            AccessScope::new(
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_READ,
-            ),
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        )?;
-        let (destination_handle, destination_layout) = self.image_access_subresources(
-            destination,
-            plane_range(dst),
-            AccessScope::new(
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        )?;
-        let region = vk::ImageCopy::default()
-            .src_subresource(src.layers())
-            .dst_subresource(dst.layers())
-            .src_offset(vk::Offset3D {
-                x: source_rect.offset.x,
-                y: source_rect.offset.y,
-                z: src.depth_slice as i32,
-            })
-            .dst_offset(vk::Offset3D {
-                x: rect.offset.x,
-                y: rect.offset.y,
-                z: dst.depth_slice as i32,
-            })
-            .extent(vk::Extent3D {
-                width: rect.extent.width,
-                height: rect.extent.height,
-                depth: 1,
-            });
-        self.barriers.emit(&mut self.device);
-        self.device.begin_recording()?;
-        self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.cmd_copy_image(
-                source_handle,
-                source_layout,
-                destination_handle,
-                destination_layout,
-                &[region],
-            );
-        })?;
-        self.finish_image_rect(destination, dst, rect)?;
+        for &(_, dst) in &selected {
+            self.finish_image_rect(destination, dst, rect)?;
+        }
         self.device.work_ticket()
     }
+}
+pub(super) fn same_subresource(a: ImagePlane, b: ImagePlane) -> bool {
+    a.aspect.intersects(b.aspect)
+        && a.mip_level == b.mip_level
+        && a.array_layer == b.array_layer
+        && a.depth_slice == b.depth_slice
 }
 pub(super) fn full_rect(p: ImagePlane) -> vk::Rect2D {
     vk::Rect2D {

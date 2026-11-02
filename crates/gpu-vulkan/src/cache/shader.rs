@@ -169,7 +169,7 @@ impl CompiledStage {
         }
         bytes
     }
-    fn to_guest(&self) -> nixe_shader_recompiler::StageArtifact {
+    pub(super) fn to_guest(&self) -> nixe_shader_recompiler::StageArtifact {
         use nixe_shader_recompiler::Stage;
         let metadata = self.guest.as_ref().expect("guest stage metadata");
         nixe_shader_recompiler::StageArtifact {

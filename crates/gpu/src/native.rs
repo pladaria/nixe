@@ -99,17 +99,56 @@ pub struct GuestDrawState {
     pub depth_stencil: Option<GuestImage>,
     pub parameters: Arc<GuestDrawParameters>,
 }
+/// Borrowed semantic state for lookup before allocating an owned draw snapshot.
+/// Prepared identities and physical bindings share the owned state's exact key.
+#[derive(Clone, Copy)]
+pub struct GuestDrawStateKey<'a> {
+    pub program: PreparedStateId,
+    pub parameters: PreparedStateId,
+    pub vertices: &'a [GuestVertexBuffer],
+    pub index: Option<&'a GuestIndexBuffer>,
+    pub colors: &'a [GuestImage],
+    pub depth_stencil: Option<&'a GuestImage>,
+}
+impl GuestDrawState {
+    pub fn key(&self) -> GuestDrawStateKey<'_> {
+        GuestDrawStateKey {
+            program: self.program.identity,
+            parameters: self.parameters.identity,
+            vertices: &self.vertices,
+            index: self.index.as_ref(),
+            colors: &self.colors,
+            depth_stencil: self.depth_stencil.as_ref(),
+        }
+    }
+}
 impl PartialEq for GuestDrawState {
     fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+impl Eq for GuestDrawState {}
+impl Hash for GuestDrawState {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
+}
+impl crate::Equivalent<Arc<GuestDrawState>> for GuestDrawStateKey<'_> {
+    fn equivalent(&self, other: &Arc<GuestDrawState>) -> bool {
+        *self == other.key()
+    }
+}
+impl PartialEq for GuestDrawStateKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
         let (a, b) = (self, other);
-        a.parameters.identity == b.parameters.identity
-            && a.program.identity == b.program.identity
+        a.parameters == b.parameters
+            && a.program == b.program
             && a.vertices.len() == b.vertices.len()
             && a.vertices
                 .iter()
                 .zip(b.vertices.iter())
                 .all(|(a, b)| a.binding == b.binding && a.backing == b.backing)
-            && match (&a.index, &b.index) {
+            && match (a.index, b.index) {
                 (None, None) => true,
                 (
                     Some(GuestIndexBuffer::Canonical(a, at)),
@@ -125,25 +164,25 @@ impl PartialEq for GuestDrawState {
                 .iter()
                 .zip(b.colors.iter())
                 .all(|(a, b)| a.same_prepared_view(b))
-            && match (&a.depth_stencil, &b.depth_stencil) {
+            && match (a.depth_stencil, b.depth_stencil) {
                 (None, None) => true,
                 (Some(a), Some(b)) => a.same_prepared_view(b),
                 _ => false,
             }
     }
 }
-impl Eq for GuestDrawState {}
-impl Hash for GuestDrawState {
+impl Eq for GuestDrawStateKey<'_> {}
+impl Hash for GuestDrawStateKey<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let a = self;
-        a.parameters.identity.hash(state);
-        a.program.identity.hash(state);
+        a.parameters.hash(state);
+        a.program.hash(state);
         a.vertices.len().hash(state);
         for vertex in a.vertices.iter() {
             vertex.binding.hash(state);
             vertex.backing.hash(state);
         }
-        match &a.index {
+        match a.index {
             None => 0_u8.hash(state),
             Some(GuestIndexBuffer::Canonical(backing, kind)) => {
                 1_u8.hash(state);
@@ -156,7 +195,7 @@ impl Hash for GuestDrawState {
             }
         }
         a.colors.len().hash(state);
-        for image in a.colors.iter().chain(&a.depth_stencil) {
+        for image in a.colors.iter().chain(a.depth_stencil) {
             image.view_identity.is_some().hash(state);
             if let Some(identity) = image.view_identity {
                 identity.hash(state);
@@ -211,67 +250,6 @@ pub struct GuestDrawParameters {
     pub tessellation: Option<TessellationState>,
     pub sample_mask: u64,
     pub alpha_to_coverage: bool,
-}
-impl GuestDrawParameters {
-    /// Hash the consumed state, excluding its interned identity.
-    pub fn hash_state<H: Hasher>(&self, state: &mut H) {
-        self.shader_state.hash(state);
-        self.vertices.hash(state);
-        self.color_formats.hash(state);
-        self.depth_stencil_format.hash(state);
-        self.samples.hash(state);
-        self.extent.hash(state);
-        self.render_area.hash(state);
-        self.topology.hash(state);
-        self.restart.hash(state);
-        self.provoking_first.hash(state);
-        self.raster.hash(state);
-        self.line.hash(state);
-        self.front_face.hash(state);
-        self.cull.hash(state);
-        self.depth_bias.hash(state);
-        self.viewport.hash(state);
-        self.position_transform.hash(state);
-        self.scissor.hash(state);
-        self.depth.hash(state);
-        self.stencil.hash(state);
-        self.color_outputs.hash(state);
-        self.alpha_test.hash(state);
-        self.tessellation.hash(state);
-        self.sample_mask.hash(state);
-        self.alpha_to_coverage.hash(state);
-        self.blend_constants.map(f32::to_bits).hash(state);
-    }
-    /// Compare consumed semantics when register revisions changed and then
-    /// restored a prior value. Identity/provenance is not pipeline state.
-    pub fn same_state(&self, other: &Self) -> bool {
-        self.shader_state == other.shader_state
-            && self.vertices == other.vertices
-            && self.color_formats == other.color_formats
-            && self.depth_stencil_format == other.depth_stencil_format
-            && self.samples == other.samples
-            && self.extent == other.extent
-            && self.render_area == other.render_area
-            && self.topology == other.topology
-            && self.restart == other.restart
-            && self.provoking_first == other.provoking_first
-            && self.raster == other.raster
-            && self.line == other.line
-            && self.front_face == other.front_face
-            && self.cull == other.cull
-            && self.depth_bias == other.depth_bias
-            && self.viewport == other.viewport
-            && self.position_transform == other.position_transform
-            && self.scissor == other.scissor
-            && self.depth == other.depth
-            && self.stencil == other.stencil
-            && self.color_outputs == other.color_outputs
-            && self.blend_constants.map(f32::to_bits) == other.blend_constants.map(f32::to_bits)
-            && self.alpha_test == other.alpha_test
-            && self.tessellation == other.tessellation
-            && self.sample_mask == other.sample_mask
-            && self.alpha_to_coverage == other.alpha_to_coverage
-    }
 }
 #[derive(Clone, Copy, Debug)]
 pub struct BufferCopyRegion {

@@ -5,6 +5,7 @@ use nixe_memory::{
     MachineId, MemoryError,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::{SmallVec, smallvec};
 use std::{
     collections::BTreeMap,
     hash::Hash,
@@ -69,6 +70,7 @@ fn prune_on_insert<T>(entries: &mut Vec<T>, next: &mut usize, keep: impl FnMut(&
 struct Resource<R> {
     aliases: Vec<R>,
     overlaps: FxHashSet<R>,
+    buffer_aliases: usize,
     modification: u64,
     buffer_invalidations: Option<BTreeMap<u64, u64>>,
     footprints: Vec<Arc<Footprint>>,
@@ -276,6 +278,10 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             Resource {
                 aliases: aliases.clone(),
                 overlaps: overlaps.clone(),
+                buffer_aliases: overlaps
+                    .iter()
+                    .filter(|alias| self.resources[alias].buffer_invalidations.is_some())
+                    .count(),
                 modification: 0,
                 buffer_invalidations: None,
                 footprints,
@@ -403,10 +409,20 @@ impl<R: Copy + Eq + Hash> Authority<R> {
     /// Native buffers retain dirty intervals, independently of their consumers.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/memory_tracker_base.h
     pub fn track_buffer_changes(&mut self, resource: R) {
-        self.resources
+        let entry = self
+            .resources
             .get_mut(&resource)
-            .expect("registered buffer")
-            .buffer_invalidations = Some(BTreeMap::new());
+            .expect("registered buffer");
+        if entry
+            .buffer_invalidations
+            .replace(BTreeMap::new())
+            .is_none()
+        {
+            let overlaps: Vec<_> = entry.overlaps.iter().copied().collect();
+            for overlap in overlaps {
+                self.resources.get_mut(&overlap).unwrap().buffer_aliases += 1;
+            }
+        }
     }
     pub fn drain_buffer_changes(&mut self, resource: R, invalid: &mut Vec<(u64, u64)>) {
         let changes = self
@@ -420,6 +436,16 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         changes.clear();
     }
     fn invalidate_native_buffers(&mut self, resource: R, footprint: &Footprint) {
+        // Registration already records physical overlap relationships. Image
+        // writes with no buffer alias cannot invalidate a native buffer; avoid
+        // searching an index containing every image and pending CPU request.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/image_base.h
+        let entry = &self.resources[&resource];
+        if entry.buffer_aliases == 0
+            && (entry.buffer_invalidations.is_none() || footprint.mapping().is_injective())
+        {
+            return;
+        }
         let bounds = footprint.bounds();
         let index = &self.index;
         let resources = &mut self.resources;
@@ -1165,7 +1191,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         }
         let mut result = Vec::new();
         for (index, span) in footprint.mapping().spans().iter().enumerate() {
-            let mut demand: Vec<ByteIntersection> = Vec::new();
+            let mut demand = SmallVec::<[ByteIntersection; 4]>::new();
             footprint.visit(index, span.start, span.bytes, |part| {
                 if let Some(last) = demand.last_mut()
                     && last.start.get() + last.bytes == part.start.get()
@@ -1182,6 +1208,60 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         result.sort_unstable_by_key(|part| part.logical);
         Ok(result)
     }
+    /// Resolve only the ordered invalid windows of a linear buffer. Valid
+    /// native bytes need neither another producer selection nor a copy.
+    /// Mapping spans retain their exact logical projection, including aliases.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+    pub fn resolve_buffer_ranges(
+        &self,
+        mapping: &PhysicalMapping,
+        ranges: &[(u64, u64)],
+        output: &mut Vec<ResolvedBytes<R>>,
+    ) -> Result<(), MemoryError> {
+        if mapping.machine() != self.machine {
+            return Err(MemoryError::Invalid(
+                "authority buffer names another machine",
+            ));
+        }
+        let mut end = 0;
+        for &(start, bytes) in ranges {
+            end = start
+                .checked_add(bytes)
+                .filter(|&stop| bytes != 0 && start >= end && stop <= mapping.bytes())
+                .ok_or(MemoryError::Invalid(
+                    "buffer authority windows are not ordered within the mapping",
+                ))?;
+        }
+        output.clear();
+        let Some(&(start, _)) = ranges.first() else {
+            return Ok(());
+        };
+        let first = mapping
+            .spans()
+            .partition_point(|span| span.logical + span.bytes <= start);
+        for span in &mapping.spans()[first..] {
+            if span.logical >= end {
+                break;
+            }
+            let first = ranges.partition_point(|&(start, bytes)| start + bytes <= span.logical);
+            let mut demand = SmallVec::<[ByteIntersection; 4]>::new();
+            for &(start, bytes) in &ranges[first..] {
+                if start >= span.logical + span.bytes {
+                    break;
+                }
+                let begin = start.max(span.logical);
+                let stop = (start + bytes).min(span.logical + span.bytes);
+                demand.push(ByteIntersection {
+                    start: ArenaOffset::new(span.start.get() + begin - span.logical),
+                    bytes: stop - begin,
+                    native: begin,
+                });
+            }
+            self.resolve_ordered(span.allocation, demand, None, output, false)?;
+        }
+        output.sort_unstable_by_key(|part| part.logical);
+        Ok(())
+    }
     fn resolve_span(
         &self,
         allocation: AllocationId,
@@ -1196,7 +1276,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             .ok_or(MemoryError::Invalid("physical authority demand overflows"))?;
         self.resolve_ordered(
             allocation,
-            vec![ByteIntersection {
+            smallvec![ByteIntersection {
                 start,
                 bytes,
                 native: logical,
@@ -1213,7 +1293,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
     fn resolve_ordered(
         &self,
         allocation: AllocationId,
-        mut remaining: Vec<ByteIntersection>,
+        remaining: SmallVec<[ByteIntersection; 4]>,
         footprint: Option<&Footprint>,
         output: &mut Vec<ResolvedBytes<R>>,
         stop_on_device: bool,
@@ -1224,10 +1304,31 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         let start = first.start;
         let last = remaining.last().unwrap();
         let end = last.start.get() + last.bytes;
-        let bytes = end - start.get();
-        let mut candidates = FxHashSet::default();
-        self.index.overlapping(start.get(), end, |candidate| {
+        let mut candidates = SmallVec::<[(WriterId, usize); 8]>::new();
+        self.select_producers(allocation, start.get(), end, footprint, &mut candidates);
+        self.resolve_selected(allocation, remaining, &candidates, output, stop_on_device)
+    }
+
+    /// The same index query supplies byte resolution and page retirement. A
+    /// pending access keeps protection even if all producers are already in RAM.
+    fn select_producers(
+        &self,
+        allocation: AllocationId,
+        start: u64,
+        end: u64,
+        footprint: Option<&Footprint>,
+        candidates: &mut SmallVec<[(WriterId, usize); 8]>,
+    ) -> bool {
+        candidates.clear();
+        let mut pending = false;
+        self.index.overlapping(start, end, |candidate| {
             let Indexed::Resource(candidate) = candidate else {
+                if let Indexed::Access {
+                    allocation: owner, ..
+                } = candidate
+                {
+                    pending |= *owner == allocation;
+                }
                 return;
             };
             let resource = &self.resources[&candidate.resource];
@@ -1241,11 +1342,10 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                     && Arc::ptr_eq(writer.footprint.mapping(), mapping)
                     && footprint.is_none_or(|demand| writer.footprint.intersects(demand))
                 {
-                    candidates.insert((id, candidate.span));
+                    candidates.push((id, candidate.span));
                 }
             }
         });
-        let mut candidates: Vec<_> = candidates.into_iter().collect();
         candidates.sort_unstable_by_key(|&(id, span)| {
             let writer = &self.writers[&id];
             (
@@ -1253,8 +1353,27 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                 std::cmp::Reverse(writer.footprint.mapping().spans()[span].logical),
             )
         });
-        let mut unclaimed = Vec::new();
-        for (id, span) in candidates {
+        candidates.dedup();
+        pending
+    }
+
+    fn resolve_selected(
+        &self,
+        allocation: AllocationId,
+        mut remaining: SmallVec<[ByteIntersection; 4]>,
+        candidates: &[(WriterId, usize)],
+        output: &mut Vec<ResolvedBytes<R>>,
+        stop_on_device: bool,
+    ) -> Result<bool, MemoryError> {
+        let Some(first) = remaining.first() else {
+            return Ok(false);
+        };
+        let start = first.start;
+        let last = remaining.last().unwrap();
+        let end = last.start.get() + last.bytes;
+        let bytes = end - start.get();
+        let mut unclaimed = SmallVec::<[ByteIntersection; 4]>::new();
+        for &(id, span) in candidates {
             let writer = &self.writers[&id];
             if writer
                 .holes
@@ -1501,11 +1620,11 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         }
         let entry = self.resources.remove(&resource).unwrap();
         for overlap in entry.overlaps {
-            self.resources
-                .get_mut(&overlap)
-                .unwrap()
-                .overlaps
-                .remove(&resource);
+            let other = self.resources.get_mut(&overlap).unwrap();
+            other.overlaps.remove(&resource);
+            if entry.buffer_invalidations.is_some() {
+                other.buffer_aliases -= 1;
+            }
         }
         for alias in entry.aliases {
             self.resources
@@ -1706,7 +1825,7 @@ fn intersects_range(
 fn consume_ordered(
     remaining: &mut [ByteIntersection],
     next: &mut usize,
-    unclaimed: &mut Vec<ByteIntersection>,
+    unclaimed: &mut SmallVec<[ByteIntersection; 4]>,
     covered: Range<u64>,
     mut visit: impl FnMut(ByteIntersection, u64, u64),
 ) {

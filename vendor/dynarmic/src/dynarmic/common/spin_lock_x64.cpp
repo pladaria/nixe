@@ -5,10 +5,9 @@
 
 #include <mutex>
 
-#include <xbyak/xbyak.h>
-
 #include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/hostloc.h"
+#include "dynarmic/backend/x64/xbyak.h"
 #include "dynarmic/common/spin_lock.h"
 
 namespace Dynarmic {

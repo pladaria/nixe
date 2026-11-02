@@ -9,7 +9,8 @@
 #include <vector>
 
 #include <mcl/stdint.hpp>
-#include <xbyak/xbyak.h>
+
+#include "dynarmic/backend/x64/xbyak.h"
 
 namespace Dynarmic::Backend::X64 {
 

@@ -10,13 +10,20 @@ use nixe_gpu::{
     shader_identity::{ContentId, ShaderNamespace},
 };
 use rustc_hash::FxHashMap as HashMap;
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 mod completion;
 mod images;
 mod key;
 mod state;
 use crate::residency::affine_pipeline;
 use key::GraphicsKey;
+const IDLE_BATCH_OPERATIONS: u32 = 32;
+const PREPARED_STATE_ENTRIES: usize = 8192;
+const PREPARED_COLLECTION_BUDGET: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeExecutionStatistics {
@@ -33,7 +40,7 @@ pub struct NativeExecutionStatistics {
     pub dispatches: u64,
 }
 struct Drawing {
-    source: Arc<GuestDrawState>,
+    source: Weak<GuestDrawState>,
     draw: PreparedDraw,
     push: Arc<[u8]>,
     recorded: bool,
@@ -63,7 +70,7 @@ enum Computing {
         source: Arc<GuestProgram>,
     },
     Ready {
-        source: Arc<GuestProgram>,
+        source: Weak<GuestProgram>,
         program: PreparedProgram,
         push: Box<[u8]>,
     },
@@ -84,7 +91,7 @@ pub struct NativeGpuExecution {
     pipelines: Arc<PipelineCompiler>,
     descriptors: DescriptorCache,
     samplers: SamplerCache,
-    drawings: HashMap<PreparedStateId, Drawing>,
+    drawings: nixe_gpu::WorkingSet<PreparedStateId, Drawing>,
     graphics: HashMap<GraphicsKey, Graphics>,
     // Stable owner indices provide direct current-pipeline access while each
     // entry retains its converted dynamic state across pipeline switches.
@@ -98,14 +105,14 @@ pub struct NativeGpuExecution {
         IndexBuffer,
     )>,
     programs: nixe_gpu::WorkingSet<(PreparedStateId, usize), Arc<PreparedProgram>>,
-    next_collection: usize,
-    computing: HashMap<PreparedStateId, Computing>,
+    computing: nixe_gpu::WorkingSet<PreparedStateId, Computing>,
     affine_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
     video_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
     video_inputs: Option<crate::residency::Nv12Inputs>,
     completions: VecDeque<Completion>,
     next: u64,
     draw_counter: u32,
+    batch_tick: u64,
     pub statistics: NativeExecutionStatistics,
 }
 fn runtime(error: VulkanError) -> BackendRuntimeError {
@@ -182,6 +189,10 @@ impl NativeGpuExecution {
         );
         let shaders = ShaderCompiler::new(namespace, Arc::clone(&translation_pool), &configuration);
         let pipelines = Arc::new(PipelineCompiler::new(&device, driver_pool, &configuration)?);
+        let loaded = pipelines.load_disk();
+        if loaded != 0 {
+            log::info!("preloaded {loaded} native pipelines before guest execution");
+        }
         let descriptors = DescriptorCache::new(&device);
         let samplers = SamplerCache::new(&device, configuration.sampler_entries);
         let mut residency = VulkanResidency::new(memory, device, resident_bytes)?;
@@ -199,7 +210,7 @@ impl NativeGpuExecution {
             pipelines,
             descriptors,
             samplers,
-            drawings: HashMap::default(),
+            drawings: nixe_gpu::WorkingSet::new(PREPARED_STATE_ENTRIES, usize::MAX),
             graphics: HashMap::default(),
             graphics_pipelines: Vec::new(),
             current_graphics: None,
@@ -207,14 +218,14 @@ impl NativeGpuExecution {
             vertex_buffers: Vec::new(),
             index_buffer: None,
             programs: nixe_gpu::WorkingSet::new(8192, 32 * 1024 * 1024),
-            next_collection: 0,
-            computing: HashMap::default(),
+            computing: nixe_gpu::WorkingSet::new(PREPARED_STATE_ENTRIES, usize::MAX),
             affine_pipelines: HashMap::default(),
             video_pipelines: HashMap::default(),
             video_inputs: None,
             completions: VecDeque::new(),
             next: 1,
             draw_counter: 0,
+            batch_tick: 0,
             statistics: Default::default(),
         })
     }
@@ -439,7 +450,7 @@ impl NativeGpuExecution {
     fn prepare_drawing(&mut self, source: &Arc<GuestDrawState>) -> Result<bool, VulkanError> {
         let id = source.identity;
         if let Some(draw) = self.drawings.get(&id) {
-            if !Arc::ptr_eq(&draw.source, source) {
+            if !std::ptr::eq(draw.source.as_ptr(), Arc::as_ptr(source)) {
                 return Err(VulkanError::InvalidResource(
                     "prepared draw identity was reused",
                 ));
@@ -612,14 +623,23 @@ impl NativeGpuExecution {
             };
             self.statistics.prepared_draws += 1;
             self.statistics.reused_graphics += u64::from(already_prepared);
+            // Reclaim a bounded prefix of stable slots on a cold insertion,
+            // like Eden's budgeted LRU cleanup. Warm effects do no collection.
+            // The weak source does not extend frontend capture ownership;
+            // recorded native references keep their existing submission leases.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
+            self.drawings.prune(PREPARED_COLLECTION_BUDGET, |drawing| {
+                drawing.source.strong_count() != 0
+            });
             self.drawings.insert(
                 id,
                 Drawing {
-                    source: Arc::clone(source),
+                    source: Arc::downgrade(source),
                     draw,
                     push,
                     recorded: false,
                 },
+                0,
             );
             return Ok(true);
         }
@@ -632,15 +652,21 @@ impl NativeGpuExecution {
                 Err(CompileError::Backpressure | CompileError::Budget) => return Ok(false),
                 Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
             };
+            self.computing
+                .prune(PREPARED_COLLECTION_BUDGET, |computing| match computing {
+                    Computing::Ready { source, .. } => source.strong_count() != 0,
+                    Computing::Shader { .. } => true,
+                });
             self.computing.insert(
                 id,
                 Computing::Shader {
                     pending,
                     source: Arc::clone(source),
                 },
+                0,
             );
         }
-        if let Computing::Ready { program, .. } = &self.computing[&id] {
+        if let Computing::Ready { program, .. } = self.computing.get(&id).unwrap() {
             if self.residency.program_current(program) {
                 return Ok(true);
             }
@@ -655,7 +681,7 @@ impl NativeGpuExecution {
             *old = program;
             return Ok(true);
         }
-        let ready = match &self.computing[&id] {
+        let ready = match self.computing.get(&id).unwrap() {
             Computing::Ready { .. } => return Ok(true),
             Computing::Shader { pending, .. } => pending.poll(),
         };
@@ -667,7 +693,7 @@ impl NativeGpuExecution {
                     Ok(p) => p,
                     Err(CompileError::Backpressure | CompileError::Budget) => {
                         self.computing
-                            .insert(id, Computing::Shader { pending, source });
+                            .insert(id, Computing::Shader { pending, source }, 0);
                         return Ok(false);
                     }
                     Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
@@ -680,10 +706,11 @@ impl NativeGpuExecution {
                 self.computing.insert(
                     id,
                     Computing::Ready {
-                        source,
+                        source: Arc::downgrade(&source),
                         program,
                         push,
                     },
+                    0,
                 );
                 Ok(true)
             }
@@ -799,7 +826,6 @@ impl NativeGpuExecution {
                 if !self.drawing(state)? {
                     return Ok(false);
                 }
-                self.flush_work()?;
                 let Drawing {
                     source,
                     draw,
@@ -809,7 +835,7 @@ impl NativeGpuExecution {
                     .drawings
                     .get_mut(&state.identity)
                     .ok_or(VulkanError::InvalidResource("draw was not prepared"))?;
-                if !Arc::ptr_eq(source, state) {
+                if !std::ptr::eq(source.as_ptr(), Arc::as_ptr(state)) {
                     return Err(VulkanError::InvalidResource(
                         "prepared draw identity was reused",
                     ));
@@ -824,8 +850,8 @@ impl NativeGpuExecution {
                 if !self.computing(program)? {
                     return Ok(false);
                 }
-                self.flush_work()?;
-                let Computing::Ready { program, push, .. } = &self.computing[&program.identity]
+                let Computing::Ready { program, push, .. } =
+                    self.computing.get(&program.identity).unwrap()
                 else {
                     return Err(VulkanError::InvalidResource(
                         "dispatch compilation is pending",
@@ -840,7 +866,6 @@ impl NativeGpuExecution {
                 rectangle,
                 value,
             } => {
-                self.flush_work()?;
                 self.clear(image, *rectangle, *value)?;
             }
             NativeCommand::Blit {
@@ -852,9 +877,6 @@ impl NativeGpuExecution {
                 resolve,
                 sampling,
             } => {
-                if sampling.is_some() {
-                    self.flush_work()?;
-                }
                 self.blit(
                     source,
                     destination,
@@ -907,17 +929,55 @@ impl NativeGpuExecution {
                 self.residency.convert_nv12(&conversion)?;
             }
         }
+        if matches!(
+            command,
+            NativeCommand::Draw { .. }
+                | NativeCommand::Dispatch { .. }
+                | NativeCommand::Clear { .. }
+                | NativeCommand::Blit {
+                    sampling: Some(_),
+                    ..
+                }
+        ) {
+            self.flush_work()?;
+        }
         Ok(true)
     }
     fn flush_work(&mut self) -> Result<(), VulkanError> {
-        // Match FlushWork: dispatch each eight operations, and submit long
-        // streams at 4096 operations without a wall-clock deadline.
+        // Keep Eden's recording chunks and maximum batch size. Submit a useful
+        // prefix sooner when the GPU has no preceding work, so a slower frontend
+        // can overlap preparation with execution rather than leave the GPU idle.
+        // Count after recording: a batch boundary must include this operation.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+        let device = self.residency.device();
+        let scheduled = device.scheduled_tick();
+        if self.batch_tick != scheduled {
+            self.batch_tick = scheduled;
+            self.draw_counter = 0;
+        }
         self.draw_counter += 1;
-        if self.draw_counter & 7 == 7 {
-            if self.draw_counter >= 4096 {
-                self.residency.flush()?;
+        if self.draw_counter & 7 == 0 {
+            // Presentation or coherence may have sealed the preceding batch
+            // without a logical fence demand. Observe that real completion too;
+            // otherwise the cached idle status can remain stale for a whole frame.
+            if self.draw_counter == IDLE_BATCH_OPERATIONS
+                && device.submission.progress.completed() < scheduled
+                && let Some(wakeup) = &self.completion_wakeup
+            {
+                wakeup.arm(scheduled)?;
+            }
+            if self.draw_counter >= 4096
+                || (self.draw_counter >= IDLE_BATCH_OPERATIONS
+                    && device.submission.progress.completed() >= scheduled)
+            {
+                let work = self.residency.flush()?;
                 self.draw_counter = 0;
+                self.batch_tick = self.residency.device().scheduled_tick();
+                if let Some(work) = work
+                    && let Some(wakeup) = &self.completion_wakeup
+                {
+                    wakeup.arm(work.tick())?;
+                }
             } else {
                 self.residency.device_mut().dispatch.dispatch_work()?;
             }
@@ -1097,17 +1157,6 @@ impl GpuExecution for NativeGpuExecution {
         Ok(())
     }
     fn consume(&mut self, batch: &Self::Commands) -> Result<bool, BackendRuntimeError> {
-        // Retire released frontend states only after the prepared set grows. Warm
-        // effects neither age pipelines nor repeatedly scan unchanged caches.
-        if self.drawings.len() + self.computing.len() >= self.next_collection {
-            self.drawings
-                .retain(|_, drawing| Arc::strong_count(&drawing.source) > 1);
-            self.computing.retain(|_, computing| match computing {
-                Computing::Ready { source, .. } => Arc::strong_count(source) > 1,
-                _ => true,
-            });
-            self.next_collection = self.drawings.len() + self.computing.len() + 256;
-        }
         self.record_work(batch)
     }
     fn submit(

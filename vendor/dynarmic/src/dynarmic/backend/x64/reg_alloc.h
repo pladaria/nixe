@@ -5,18 +5,20 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <functional>
 #include <optional>
 #include <utility>
-#include <vector>
 
+#include <boost/container/small_vector.hpp>
 #include <mcl/stdint.hpp>
-#include <xbyak/xbyak.h>
 
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/hostloc.h"
 #include "dynarmic/backend/x64/oparg.h"
+#include "dynarmic/backend/x64/stack_layout.h"
+#include "dynarmic/backend/x64/xbyak.h"
 #include "dynarmic/ir/cond.h"
 #include "dynarmic/ir/microinstruction.h"
 #include "dynarmic/ir/value.h"
@@ -31,9 +33,21 @@ class RegAlloc;
 
 struct HostLocInfo {
 public:
-    bool IsLocked() const;
-    bool IsEmpty() const;
-    bool IsLastUse() const;
+    HostLocInfo() = default;
+    HostLocInfo(const HostLocInfo&) = delete;
+    HostLocInfo& operator=(const HostLocInfo&) = delete;
+    HostLocInfo(HostLocInfo&&) = delete;
+    HostLocInfo& operator=(HostLocInfo&&) = delete;
+
+    bool IsLocked() const {
+        return is_being_used_count > 0;
+    }
+    bool IsEmpty() const {
+        return is_being_used_count == 0 && values.empty();
+    }
+    bool IsLastUse() const {
+        return is_being_used_count == 0 && current_references == 1 && accumulated_uses + 1 == total_uses;
+    }
 
     void SetLastUse();
 
@@ -43,14 +57,20 @@ public:
     void ReleaseOne();
     void ReleaseAll();
 
-    bool ContainsValue(const IR::Inst* inst) const;
-    size_t GetMaxBitWidth() const;
+    size_t GetMaxBitWidth() const {
+        return max_bit_width;
+    }
 
-    void AddValue(IR::Inst* inst);
+    void AddValue(HostLoc loc, IR::Inst* inst);
+    void SetLocation(HostLoc loc);
+    void MoveFrom(HostLocInfo& from);
+    void ExchangeWith(HostLocInfo& other);
 
     void EmitVerboseDebuggingOutput(BlockOfCode& code, size_t host_loc_index) const;
 
 private:
+    void ClearValues();
+
     // Current instruction state
     size_t is_being_used_count = 0;
     bool is_scratch = false;
@@ -62,7 +82,7 @@ private:
     size_t total_uses = 0;
 
     // Value state
-    std::vector<IR::Inst*> values;
+    boost::container::small_vector<IR::Inst*, 3> values;
     size_t max_bit_width = 0;
 };
 
@@ -70,9 +90,15 @@ struct Argument {
 public:
     using copyable_reference = std::reference_wrapper<Argument>;
 
-    IR::Type GetType() const;
-    bool IsImmediate() const;
-    bool IsVoid() const;
+    IR::Type GetType() const {
+        return value.GetType();
+    }
+    bool IsImmediate() const {
+        return value.IsImmediate();
+    }
+    bool IsVoid() const {
+        return GetType() == IR::Type::Void;
+    }
 
     bool FitsInImmediateU32() const;
     bool FitsInImmediateS32() const;
@@ -107,7 +133,7 @@ class RegAlloc final {
 public:
     using ArgumentInfo = std::array<Argument, IR::max_arg_count>;
 
-    explicit RegAlloc(BlockOfCode& code, std::vector<HostLoc> gpr_order, std::vector<HostLoc> xmm_order);
+    explicit RegAlloc(BlockOfCode& code, HostLocSet gpr_candidates, HostLocSet xmm_candidates);
 
     ArgumentInfo GetArgumentInfo(IR::Inst* inst);
     void RegisterPseudoOperation(IR::Inst* inst);
@@ -145,22 +171,35 @@ public:
 
     void EndOfAllocScope();
 
-    void AssertNoMoreUses();
+    void AssertNoMoreUses() const {
+#ifndef NDEBUG
+        ASSERT(std::all_of(hostloc_info.begin(), hostloc_info.end(), [](const auto& i) { return i.IsEmpty(); }));
+        ASSERT(std::all_of(scope_locations.begin(), scope_locations.end(), [](u64 word) { return word == 0; }));
+        ASSERT(reserved_stack_space == 0);
+#endif
+    }
 
     void EmitVerboseDebuggingOutput();
 
 private:
     friend struct Argument;
 
-    std::vector<HostLoc> gpr_order;
-    std::vector<HostLoc> xmm_order;
+    HostLocSet gpr_candidates;
+    HostLocSet xmm_candidates;
 
-    HostLoc SelectARegister(const std::vector<HostLoc>& desired_locations) const;
-    std::optional<HostLoc> ValueLocation(const IR::Inst* value) const;
+    HostLoc SelectARegister(HostLocSet desired_locations) const;
+    std::optional<HostLoc> ValueLocation(const IR::Inst* value) const {
+        const auto location = value->GetAllocationLocation();
+        if (location == IR::Inst::InvalidAllocationLocation) {
+            return std::nullopt;
+        }
+        DEBUG_ASSERT(location < hostloc_info.size());
+        return static_cast<HostLoc>(location);
+    }
 
-    HostLoc UseImpl(IR::Value use_value, const std::vector<HostLoc>& desired_locations);
-    HostLoc UseScratchImpl(IR::Value use_value, const std::vector<HostLoc>& desired_locations);
-    HostLoc ScratchImpl(const std::vector<HostLoc>& desired_locations);
+    HostLoc UseImpl(IR::Value use_value, HostLocSet desired_locations);
+    HostLoc UseScratchImpl(IR::Value use_value, HostLocSet desired_locations);
+    HostLoc ScratchImpl(HostLocSet desired_locations);
     void DefineValueImpl(IR::Inst* def_inst, HostLoc host_loc);
     void DefineValueImpl(IR::Inst* def_inst, const IR::Value& use_inst);
 
@@ -173,9 +212,18 @@ private:
     void SpillRegister(HostLoc loc);
     HostLoc FindFreeSpill() const;
 
-    std::vector<HostLocInfo> hostloc_info;
-    HostLocInfo& LocInfo(HostLoc loc);
-    const HostLocInfo& LocInfo(HostLoc loc) const;
+    std::array<HostLocInfo, NonSpillHostLocCount + SpillCount> hostloc_info;
+    std::array<u64, (NonSpillHostLocCount + SpillCount + 63) / 64> scope_locations{};
+    HostLocInfo& LocInfo(HostLoc loc) {
+        DEBUG_ASSERT(loc != HostLoc::RSP && loc != HostLoc::R15);
+        const auto index = static_cast<size_t>(loc);
+        scope_locations[index / 64] |= u64{1} << (index % 64);
+        return hostloc_info[index];
+    }
+    const HostLocInfo& LocInfo(HostLoc loc) const {
+        DEBUG_ASSERT(loc != HostLoc::RSP && loc != HostLoc::R15);
+        return hostloc_info[static_cast<size_t>(loc)];
+    }
 
     BlockOfCode& code;
     size_t reserved_stack_space = 0;

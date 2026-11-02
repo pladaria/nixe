@@ -47,10 +47,7 @@ const char* GetNameOfA32Instruction(u32 instruction) {
 }
 
 const char* GetNameOfA64Instruction(u32 instruction) {
-    if (auto decoder = A64::Decode<A64::TranslatorVisitor>(instruction)) {
-        return decoder->get().GetName();
-    }
-    return "<null>";
+    return A64::GetName<A64::TranslatorVisitor>(instruction);
 }
 
 void PrintA32Instruction(u32 instruction) {

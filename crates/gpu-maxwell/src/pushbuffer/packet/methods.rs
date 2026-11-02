@@ -7,35 +7,35 @@ enum SpanData<'a> {
     Live {
         address: nixe_memory::HostAddress,
         stream: &'a sources::CommandStream,
-        offset: usize,
+        offset: u32,
         first: u32,
     },
     #[cfg(test)]
-    Fixture(&'a MaxwellDecodedMethodPacket),
+    Fixture {
+        packet: &'a MaxwellDecodedMethodPacket,
+        offset: usize,
+    },
 }
 #[derive(Clone, Copy)]
 pub struct MaxwellMethodSpan<'a> {
     data: SpanData<'a>,
     mode: MaxwellMethodPacketMode,
-    begin: usize,
-    end: usize,
+    count: u32,
 }
 impl<'a> MaxwellMethodSpan<'a> {
     #[cfg(test)]
     pub(super) fn new(packet: &'a MaxwellDecodedMethodPacket) -> Self {
-        let end = packet.methods.len();
         Self {
-            data: SpanData::Fixture(packet),
+            data: SpanData::Fixture { packet, offset: 0 },
             mode: packet.mode,
-            begin: 0,
-            end,
+            count: u32::try_from(packet.methods.len()).expect("hardware packet method bound"),
         }
     }
     pub fn len(self) -> usize {
-        self.end - self.begin
+        self.count as usize
     }
     pub fn is_empty(self) -> bool {
-        self.begin == self.end
+        self.count == 0
     }
     pub fn first(self) -> Option<MaxwellDecodedMethod> {
         self.get(0)
@@ -46,31 +46,25 @@ impl<'a> MaxwellMethodSpan<'a> {
     #[inline]
     pub(crate) fn method_at(self, index: usize) -> GpuMethodId {
         debug_assert!(index < self.len());
-        let index = self.begin + index;
         match self.data {
             SpanData::Live { first, .. } => method_id(method_dword(self.mode, first, index as u16)),
             #[cfg(test)]
-            SpanData::Fixture(packet) => packet.methods[index].method,
+            SpanData::Fixture { packet, offset } => packet.methods[offset + index].method,
         }
     }
     #[inline]
     pub(crate) fn argument_at(self, index: usize) -> u32 {
         debug_assert!(index < self.len());
-        let index = self.begin + index;
         match self.data {
             // SAFETY: the span is bounded when the entry is parsed; its borrow
             // retains both the physical pin and any owned gathered storage.
             SpanData::Live { address, .. } => unsafe { address.read_u32(index * 4) },
             #[cfg(test)]
-            SpanData::Fixture(packet) => packet.methods[index].argument,
+            SpanData::Fixture { packet, offset } => packet.methods[offset + index].argument,
         }
     }
     pub(crate) fn mode(self) -> MaxwellMethodPacketMode {
-        if self.mode == MaxwellMethodPacketMode::IncrementOnce && self.begin > 0 {
-            MaxwellMethodPacketMode::NonIncrementing
-        } else {
-            self.mode
-        }
+        self.mode
     }
     pub fn get(self, index: usize) -> Option<MaxwellDecodedMethod> {
         if index >= self.len() {
@@ -78,10 +72,10 @@ impl<'a> MaxwellMethodSpan<'a> {
         }
         let source = match self.data {
             SpanData::Live { stream, offset, .. } => {
-                stream.location_at(offset + (self.begin + index) * 4)
+                stream.location_at(offset as usize + index * 4)
             }
             #[cfg(test)]
-            SpanData::Fixture(packet) => packet.methods[self.begin + index].argument_source,
+            SpanData::Fixture { packet, offset } => packet.methods[offset + index].argument_source,
         };
         Some(MaxwellDecodedMethod {
             method: self.method_at(index),
@@ -97,32 +91,33 @@ impl<'a> MaxwellMethodSpan<'a> {
         first: u32,
         mode: MaxwellMethodPacketMode,
     ) -> Self {
+        // Entry sizes and packet counts come from bounded hardware fields.
+        debug_assert!(offset <= u32::MAX as usize && count <= u16::MAX as usize);
         Self {
             data: SpanData::Live {
                 address,
                 stream,
-                offset,
+                offset: offset as u32,
                 first,
             },
             mode,
-            begin: 0,
-            end: count,
+            count: count as u32,
         }
     }
-    pub(crate) fn ram_bytes(self) -> Option<(nixe_memory::HostAddress, usize)> {
+    pub(crate) fn ram_address(self) -> Option<nixe_memory::HostAddress> {
         match self.data {
-            SpanData::Live { address, .. } => Some((address, self.begin * 4)),
+            SpanData::Live { address, .. } => Some(address),
             #[cfg(test)]
-            SpanData::Fixture(_) => None,
+            SpanData::Fixture { .. } => None,
         }
     }
     pub(crate) fn gathered_bytes(self) -> Option<&'a [u8]> {
         match self.data {
             SpanData::Live { stream, offset, .. } => {
-                stream.gathered_bytes(offset + self.begin * 4, offset + self.end * 4)
+                stream.gathered_bytes(offset as usize, offset as usize + self.len() * 4)
             }
             #[cfg(test)]
-            SpanData::Fixture(_) => None,
+            SpanData::Fixture { .. } => None,
         }
     }
     pub(crate) fn arguments(self) -> impl ExactSizeIterator<Item = u32> + 'a {
@@ -140,22 +135,22 @@ impl<'a> MaxwellMethodSpan<'a> {
                 // SAFETY: entry admission bounds the complete span, its borrow
                 // retains storage, and reserve established the disjoint output.
                 unsafe {
-                    address.copy_words_to(self.begin * 4, output.as_mut_ptr().add(start), count);
+                    address.copy_words_to(0, output.as_mut_ptr().add(start), count);
                     output.set_len(start + count);
                 }
             }
             #[cfg(test)]
-            SpanData::Fixture(_) => output.extend(self.arguments()),
+            SpanData::Fixture { .. } => output.extend(self.arguments()),
         }
         Ok(())
     }
     pub(crate) fn last_writes(mut self) -> impl Iterator<Item = MaxwellDecodedMethod> + 'a {
         std::iter::from_fn(move || {
             let method = self.last()?;
-            self.end = match self.mode {
-                MaxwellMethodPacketMode::Incrementing => self.end - 1,
-                MaxwellMethodPacketMode::IncrementOnce if self.begin == 0 && self.end > 1 => 1,
-                _ => self.begin,
+            self.count = match self.mode {
+                MaxwellMethodPacketMode::Incrementing => self.count - 1,
+                MaxwellMethodPacketMode::IncrementOnce if self.count > 1 => 1,
+                _ => 0,
             };
             Some(method)
         })
@@ -175,10 +170,39 @@ impl<'a> MaxwellMethodSpan<'a> {
             begin <= end && end <= self.len(),
             "method span outside packet"
         );
+        // Normalize the cursor once when slicing, as DmaPusher advances its
+        // method and data pointer. Argument access then needs no base-index
+        // addition or repeated increment-once classification.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp
+        let data = match self.data {
+            SpanData::Live {
+                address,
+                stream,
+                offset,
+                first,
+            } => SpanData::Live {
+                // SAFETY: slicing was bounded above, including the empty tail.
+                address: nixe_memory::HostAddress::from_pointer(unsafe {
+                    address.as_ptr().add(begin * 4)
+                }),
+                stream,
+                offset: offset + begin as u32 * 4,
+                first: method_dword(self.mode, first, begin as u16),
+            },
+            #[cfg(test)]
+            SpanData::Fixture { packet, offset } => SpanData::Fixture {
+                packet,
+                offset: offset + begin,
+            },
+        };
         Self {
-            begin: self.begin + begin,
-            end: self.begin + end,
-            ..self
+            data,
+            count: (end - begin) as u32,
+            mode: if self.mode == MaxwellMethodPacketMode::IncrementOnce && begin != 0 {
+                MaxwellMethodPacketMode::NonIncrementing
+            } else {
+                self.mode
+            },
         }
     }
     pub fn iter(self) -> MaxwellMethodIterator<'a> {
@@ -211,7 +235,7 @@ impl DoubleEndedIterator for MaxwellMethodIterator<'_> {
             return None;
         }
         let method = self.span.last();
-        self.span.end -= 1;
+        self.span.count -= 1;
         method
     }
 }

@@ -171,7 +171,7 @@ fn queued_audio_open_retains_the_copied_process_after_its_client_handle_closes()
     write_guest_bytes(&process, caller.tls_base, &open);
     caller.registers().write_w(x(0), manager);
     let events = process.driver_mut().event_sender();
-    let dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let dispatcher = support::dispatcher(&process).with_host_events(events);
     let machine = process.memory().account().machine().clone();
     let ranges = process
         .memory()
@@ -309,7 +309,7 @@ fn nested_pcm_uses_its_own_capture_after_the_descriptor_mapping_changes() {
         let backend = Arc::new(Backend::default());
         let dispatcher = support::dispatcher(&process)
             .with_audio_backend(backend.clone())
-            .with_input_completions(events);
+            .with_host_events(events);
         let session = crate::AudioOutSession::open(
             process.scheduler(),
             backend.as_ref(),

@@ -48,6 +48,10 @@ pub struct MaxwellMethodSource {
 }
 
 impl MaxwellMethodSource {
+    pub(crate) const fn set_argument(&mut self, argument: u32) {
+        self.argument = argument;
+    }
+
     pub(crate) const fn decoded(
         method: MaxwellDecodedMethod,
         subchannel: MaxwellPushbufferSubchannel,
@@ -171,7 +175,7 @@ impl MaxwellMethodDispatch {
     }
 
     pub(crate) const fn set_effective_argument(&mut self, argument: u32) {
-        self.source.argument = argument;
+        self.source.set_argument(argument);
     }
 
     #[must_use]
@@ -726,7 +730,7 @@ mod tests {
     fn ordinary_method_on_unbound_subchannel_is_rejected_without_state_change() {
         let decoded = decode(&[word(header(1, 0x100, 2, 1), 0), word(9, 1)]);
         let mut channel = channel();
-        let before = channel.frontend();
+        let before = *channel.frontend();
         assert!(matches!(
             dispatch_maxwell_packet(
                 &mut channel,
@@ -738,7 +742,7 @@ mod tests {
                     && source.subchannel().get() == 2
                     && source.method() == GpuMethodId(0x400)
         ));
-        assert_eq!(channel.frontend(), before);
+        assert_eq!(channel.frontend(), &before);
     }
 
     #[test]
@@ -750,7 +754,7 @@ mod tests {
             word(class.0 | 0x0020_0000, 2),
         ]);
         let mut channel = channel();
-        let before = channel.frontend();
+        let before = *channel.frontend();
         assert!(matches!(
             dispatch_maxwell_packet(
                 &mut channel,
@@ -760,7 +764,7 @@ mod tests {
             Err(MaxwellMethodDispatchError::InvalidSetObjectValue { source })
                 if source.location() == location(2)
         ));
-        assert_ne!(channel.frontend(), before);
+        assert_ne!(channel.frontend(), &before);
     }
 
     #[test]
@@ -803,7 +807,7 @@ mod tests {
             ),
             Err(MaxwellMethodDispatchError::UnsupportedSetObjectEngine { engine: 1, .. })
         ));
-        assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
+        assert_eq!(channel.frontend(), &MaxwellChannelFrontendState::default());
     }
 
     #[test]
@@ -982,7 +986,7 @@ mod tests {
                     packet.methods()[0].kind(),
                     MaxwellMethodDispatchKind::HostMethod(MaxwellHostMethod::Nop)
                 );
-                assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
+                assert_eq!(channel.frontend(), &MaxwellChannelFrontendState::default());
             }
         }
     }
@@ -1024,6 +1028,6 @@ mod tests {
                 .unwrap();
         assert_eq!(dispatched.len(), 3);
         assert!(dispatched.iter().all(|packet| packet.methods().is_empty()));
-        assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
+        assert_eq!(channel.frontend(), &MaxwellChannelFrontendState::default());
     }
 }

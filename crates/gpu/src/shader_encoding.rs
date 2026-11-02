@@ -270,6 +270,55 @@ impl Encode for SnapshotEnvironment {
         self.observations().encode(out);
     }
 }
+impl Decode for SnapshotEnvironment {
+    fn decode(input: &mut Reader<'_>) -> Option<Self> {
+        Some(Self::new(Decode::decode(input)?, Decode::decode(input)?))
+    }
+}
+
+/// Owned frontend observations and resource metadata, without compiler IR.
+pub fn encode_inputs(inputs: &crate::shader_compilation::ShaderInputs) -> Vec<u8> {
+    let mut out = b"NXCAPT01".to_vec();
+    SCHEMA.encode(&mut out);
+    ARTIFACT_ABI_VERSION.encode(&mut out);
+    out.extend_from_slice(&inputs.identity.0);
+    (inputs.stages.len() as u32).encode(&mut out);
+    for stage in &inputs.stages {
+        stage.environment.encode(&mut out);
+        stage.info.encode(&mut out);
+        stage.binding_group.encode(&mut out);
+    }
+    out
+}
+
+pub fn decode_inputs(
+    bytes: &[u8],
+    configuration: &crate::shader_compilation::Configuration,
+) -> Option<crate::shader_compilation::ShaderInputs> {
+    let mut input = Reader { remaining: bytes };
+    if &input.take::<8>()? != b"NXCAPT01"
+        || u32::decode(&mut input)? != SCHEMA
+        || u32::decode(&mut input)? != ARTIFACT_ABI_VERSION
+    {
+        return None;
+    }
+    let identity = crate::shader_identity::ContentId(input.take()?);
+    let count = input.count()?;
+    if !(1..=6).contains(&count) {
+        return None;
+    }
+    let stages = (0..count)
+        .map(|_| {
+            Some(crate::shader_compilation::StageSource {
+                environment: std::sync::Arc::new(Decode::decode(&mut input)?),
+                info: std::sync::Arc::new(Decode::decode(&mut input)?),
+                binding_group: Decode::decode(&mut input)?,
+            })
+        })
+        .collect::<Option<Box<[_]>>>()?;
+    let inputs = crate::shader_compilation::ShaderInputs::new(stages, configuration);
+    (input.remaining.is_empty() && inputs.identity == identity).then_some(inputs)
+}
 
 /// Encode properties that affect compilation, retaining resource expressions
 /// without specializing on the texture or sampler selected at runtime.

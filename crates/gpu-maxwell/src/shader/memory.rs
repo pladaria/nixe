@@ -143,8 +143,12 @@ impl<'a, 'm> MaxwellShaderMemoryView<'a, 'm> {
             .pin(0, size as u64)
             .map_err(|e| fail(MaxwellGpuAccessError::Backing(Arc::new(e))))?;
         let observation = Observation::default();
+        // Maxwell instructions are data for the ARM CPU. Observe their bytes
+        // without installing executable-ARM tracking or interrupting all cores.
+        // Existing ARM code aliases still retain their own stronger semantics.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/shader_cache.h
         let AccessResult::Read(bytes) =
-            (self.access)(inputs, AccessOperation::ReadCode(observation.clone()))
+            (self.access)(inputs, AccessOperation::ReadObserved(observation.clone()))
                 .map_err(|e| fail(MaxwellGpuAccessError::Backing(e)))?
         else {
             unreachable!("read returns bytes")
@@ -232,6 +236,41 @@ mod tests {
     use crate::{shader::test_support::mapped_memory, test_memory};
 
     #[test]
+    fn shader_capture_and_rewrite_keep_arm_native_execution_admitted() {
+        use nixe_memory::{AddressSpace, AddressWidth, GuestVirtualAddress};
+        let (allocation, space, base) = mapped_memory();
+        let machine = space.memory().machine();
+        let cpu = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
+        cpu.map(
+            GuestVirtualAddress::new(0x10000),
+            allocation.clone(),
+            0,
+            4096,
+            MemoryPermissions::READ_WRITE,
+        )
+        .unwrap();
+        let core = cpu.register_core(Arc::new(|| {
+            panic!("GPU shader observation interrupted ARM execution")
+        }));
+        let native = core.enter_native().unwrap();
+        let code_generation = machine.code_generation();
+        let mut cache = MaxwellShaderMemoryCache::default();
+        let captured = MaxwellShaderMemoryView::new(
+            space.memory(),
+            &mut cache,
+            &mut test_memory::access(machine),
+        )
+        .read(MaxwellShaderStage::Compute, base + 8, 4)
+        .unwrap();
+        test_memory::write(&allocation, 8, &[1, 2, 3, 4]).unwrap();
+        assert!(!captured.is_current(space.memory()));
+        assert_eq!(machine.code_generation(), code_generation);
+        native
+            .synchronize_code(|_| panic!("GPU shader bytes invalidated ARM translations"))
+            .unwrap();
+    }
+
+    #[test]
     fn unchanged_shader_reads_share_owned_bytes_without_allocating_or_backend_calls() {
         use crate::engines::tests::register_benchmark::ALLOCATIONS;
         let (allocation, space, base) = mapped_memory();
@@ -252,7 +291,7 @@ mod tests {
         assert_eq!(ALLOCATIONS.with(|n| n.replace(None).unwrap()), 0);
         let code_generation = space.memory().machine().code_generation();
         test_memory::write(&allocation, 8, &[9]).unwrap();
-        assert!(space.memory().machine().code_generation() > code_generation);
+        assert_eq!(space.memory().machine().code_generation(), code_generation);
         let changed = MaxwellShaderMemoryView::new(space.memory(), &mut cache, &mut access)
             .read(MaxwellShaderStage::Compute, base + 8, 4)
             .unwrap();
@@ -280,7 +319,7 @@ mod tests {
         memory
             .publish_device_write(&test_memory::ranges(&allocation), || Ok(()))
             .unwrap();
-        assert!(memory.code_generation() > code_generation);
+        assert_eq!(memory.code_generation(), code_generation);
         assert!(!first.is_current(space.memory()));
         let mut readbacks = 0;
         let mut owner = |ranges: Vec<nixe_memory::AllocationRange>, mut operation| {

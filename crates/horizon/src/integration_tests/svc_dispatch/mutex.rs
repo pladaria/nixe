@@ -468,7 +468,7 @@ fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
         svc(0x0a),
     ]);
     let ingress = process.driver_mut().event_sender();
-    let dispatcher = support::dispatcher(&process).with_input_completions(ingress);
+    let dispatcher = support::dispatcher(&process).with_host_events(ingress);
     let mutex = process.main_thread().stack_bottom;
     let key = mutex.checked_add(12).unwrap();
     let owner_object = process.main_thread().clone();

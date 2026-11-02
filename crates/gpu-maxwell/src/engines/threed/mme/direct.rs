@@ -30,19 +30,19 @@ impl DirectProgram {
         // Eden also caches direct macros by uploaded program contents:
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/macro.cpp
         for _ in 0..256 {
-            let instruction = ram.page(pc)?.decoded[pc as usize % MME_INSTRUCTION_PAGE_WORDS]?;
+            let instruction = ram.get(pc)?;
             pc = pc.checked_add(1)?;
-            let a = registers[instruction.src_a as usize];
-            let b = registers[instruction.src_b as usize];
-            let value = match instruction.operation {
+            let a = registers[instruction.src_a() as usize];
+            let b = registers[instruction.src_b() as usize];
+            let value = match instruction.operation() {
                 1 => match a {
                     Value::Constant(value) => {
-                        Value::Constant(value.wrapping_add_signed(instruction.immediate))
+                        Value::Constant(value.wrapping_add_signed(instruction.immediate()))
                     }
-                    _ if instruction.immediate == 0 => a,
+                    _ if instruction.immediate() == 0 => a,
                     _ => return None,
                 },
-                0 => match (instruction.alu, a, b) {
+                0 => match (instruction.alu(), a, b) {
                     (0 | 8 | 9, Value::Constant(0), value) => value,
                     (0 | 2 | 8 | 9, value, Value::Constant(0)) => value,
                     (10, value, Value::Constant(u32::MAX)) => value,
@@ -61,8 +61,8 @@ impl DirectProgram {
                 },
                 _ => return None,
             };
-            let destination = instruction.destination as usize;
-            let result = instruction.result;
+            let destination = instruction.destination() as usize;
+            let result = instruction.result();
             let fetched = if matches!(result, 0 | 3 | 5 | 6) {
                 operations.push(Operation::Parameter(parameters));
                 let value = Value::Parameter(parameters);
@@ -102,7 +102,7 @@ impl DirectProgram {
                     parameters,
                 });
             }
-            delay = instruction.exit;
+            delay = instruction.exit();
         }
         None
     }
@@ -127,10 +127,10 @@ impl DirectProgram {
                         Value::Parameter(index) => parameters[index],
                     };
                     if !host
-                        .emit_register(method, value)
+                        .try_emit_method(method, value)
                         .map_err(MaxwellThreeDMmeRunError::Host)?
                     {
-                        host.emit_method(method, value)
+                        host.finish_method(method, value)
                             .await
                             .map_err(MaxwellThreeDMmeRunError::Host)?;
                     }
@@ -162,10 +162,10 @@ mod tests {
         fn read_register(&self, _: u16) -> Result<u32, usize> {
             panic!("direct programs contain no register reads")
         }
-        fn emit_register(&mut self, _: u16, _: u32) -> Result<bool, usize> {
+        fn try_emit_method(&mut self, _: u16, _: u32) -> Result<bool, usize> {
             Ok(false)
         }
-        async fn emit_method(&mut self, method: u16, value: u32) -> Result<(), usize> {
+        async fn finish_method(&mut self, method: u16, value: u32) -> Result<(), usize> {
             if self.fail_at == Some(self.sent.len()) {
                 return Err(23);
             }
@@ -176,15 +176,7 @@ mod tests {
     fn ram(words: &[u32]) -> MmeInstructionRam {
         let mut ram = MmeInstructionRam::default();
         for (pc, &word) in words.iter().enumerate() {
-            let page = ram
-                .pages
-                .entry(pc as u32 / MME_INSTRUCTION_PAGE_WORDS as u32)
-                .or_insert_with(|| MmeInstructionPage {
-                    registers: vec![None; MME_INSTRUCTION_PAGE_WORDS].into(),
-                    decoded: vec![None; MME_INSTRUCTION_PAGE_WORDS].into(),
-                });
-            page.decoded[pc % MME_INSTRUCTION_PAGE_WORDS] = Some(MmeInstruction::decode(word));
-            ram.count += 1;
+            ram.insert(pc as u32, MaxwellThreeDMmeInstruction::new(word));
         }
         ram
     }
@@ -196,7 +188,7 @@ mod tests {
         let mut interpreter = MaxwellThreeDMmeInterpreter {
             program,
             instruction_page: None,
-            instruction_page_index: 0,
+            instruction_page_index: u32::MAX,
             host,
             parameters,
             registers: [0; MME_REGISTER_COUNT],
@@ -214,7 +206,7 @@ mod tests {
         };
         interpreter.registers[1] = parameters[0];
         while let Some((method, value)) = interpreter.run_until_effect()? {
-            crate::test_memory::ready(interpreter.host.emit_method(method, value))
+            crate::test_memory::ready(interpreter.host.finish_method(method, value))
                 .map_err(MaxwellThreeDMmeRunError::Host)?;
         }
         if interpreter.next_parameter != parameters.len() {

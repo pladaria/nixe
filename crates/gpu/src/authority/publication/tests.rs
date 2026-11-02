@@ -668,6 +668,113 @@ fn cancelling_the_last_exact_dependency_reopens_a_ram_only_page() {
 }
 
 #[test]
+fn retirement_unions_alias_pages_and_reopens_only_fully_current_coverage() {
+    let machine = Machine::new(6 * PAGE_SIZE).unwrap();
+    let account = machine.account(6 * PAGE_SIZE).unwrap();
+    let first = account.allocate(4 * PAGE_SIZE).unwrap();
+    let second = account.allocate(2 * PAGE_SIZE).unwrap();
+    let first = AllocationRange::new(first.pin(), 0, 4 * PAGE_SIZE).unwrap();
+    let second = AllocationRange::new(second.pin(), 0, 2 * PAGE_SIZE).unwrap();
+    let mapping = PhysicalMapping::new(&[
+        first.slice(2 * PAGE_SIZE, PAGE_SIZE).unwrap(),
+        first.slice(0, PAGE_SIZE).unwrap(),
+        first.slice(2 * PAGE_SIZE, PAGE_SIZE).unwrap(),
+        second.slice(PAGE_SIZE, PAGE_SIZE).unwrap(),
+    ])
+    .unwrap();
+    let old_domain = Footprint::new(
+        mapping,
+        WriteDomain::Buffer {
+            start: 0,
+            bytes: 4 * PAGE_SIZE,
+        },
+    )
+    .unwrap();
+    let new_domain = Footprint::new(
+        PhysicalMapping::new(&[first.slice(17, 4).unwrap()]).unwrap(),
+        WriteDomain::Buffer { start: 0, bytes: 4 },
+    )
+    .unwrap();
+    let mut authority = Authority::new(machine.identity());
+    authority.register(1u32, vec![old_domain.clone()]).unwrap();
+    authority.register(2, vec![new_domain.clone()]).unwrap();
+    let old = authority.create_writer(1, old_domain).unwrap();
+    let new = authority.create_writer(2, new_domain).unwrap();
+    authority
+        .publish_write(&machine, old, || Ok(((), NativeTick(1))))
+        .unwrap();
+    authority
+        .publish_write(&machine, new, || Ok(((), NativeTick(2))))
+        .unwrap();
+    authority
+        .cpu_write(&[
+            first.slice(2 * PAGE_SIZE, PAGE_SIZE).unwrap(),
+            second.slice(PAGE_SIZE, PAGE_SIZE).unwrap(),
+        ])
+        .unwrap();
+    // Overlapping inputs include unmodified RAM pages and repeated physical
+    // aliases. A surviving four-byte producer must keep its whole page closed.
+    let inputs = [
+        first.clone(),
+        second.clone(),
+        first.slice(PAGE_SIZE, 3 * PAGE_SIZE).unwrap(),
+    ];
+    authority
+        .retire_unused_device_pages(&machine, &inputs)
+        .unwrap();
+    let page_is_device = |range: &AllocationRange, page| {
+        machine.has_device_pages(
+            range
+                .slice(page * PAGE_SIZE, PAGE_SIZE)
+                .unwrap()
+                .physical_extents()
+                .next()
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        std::array::from_fn::<_, 4, _>(|page| page_is_device(&first, page as u64)),
+        [true, false, false, false]
+    );
+    assert!(!page_is_device(&second, 0));
+    assert!(!page_is_device(&second, 1));
+    assert!(
+        authority
+            .resolve(&[first.slice(2 * PAGE_SIZE, PAGE_SIZE).unwrap()])
+            .unwrap()
+            .iter()
+            .all(|part| part.producer.is_none())
+    );
+    assert_eq!(
+        authority.resolve(&[first.slice(17, 4).unwrap()]).unwrap()[0]
+            .producer
+            .unwrap()
+            .writer,
+        new
+    );
+    // Replaying the retained full writer re-establishes protection on every
+    // written page, including the aliases reopened by the previous retirement.
+    authority
+        .publish_write(&machine, old, || Ok(((), NativeTick(3))))
+        .unwrap();
+    assert_eq!(
+        std::array::from_fn::<_, 4, _>(|page| page_is_device(&first, page as u64)),
+        [true, false, true, false]
+    );
+    assert!(!page_is_device(&second, 0));
+    assert!(page_is_device(&second, 1));
+    assert_eq!(
+        authority
+            .resolve(&[first.slice(2 * PAGE_SIZE, 1).unwrap()])
+            .unwrap()[0]
+            .producer
+            .unwrap()
+            .native,
+        2 * PAGE_SIZE
+    );
+}
+
+#[test]
 fn one_effect_publishes_all_writers_once_and_rejects_a_conflicting_cpu_access_before_append() {
     let machine = Machine::new(PAGE_SIZE * 2).unwrap();
     let allocation = machine

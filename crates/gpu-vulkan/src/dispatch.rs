@@ -28,6 +28,14 @@ pub(crate) struct Dispatch {
     pub state: Option<StateDispatch>,
     pub release_swapchain_images: Option<vk::PFN_vkReleaseSwapchainImagesEXT>,
 }
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RenderingFeedback {
+    pub colors: u8,
+    pub depth: bool,
+    pub stencil: bool,
+}
+
 impl Dispatch {
     pub(crate) fn begin_command_buffer(
         &mut self,
@@ -310,7 +318,11 @@ impl Dispatch {
             )
         };
     }
-    pub unsafe fn begin_rendering(&mut self, info: &vk::RenderingInfo<'_>) {
+    pub unsafe fn begin_rendering(
+        &mut self,
+        info: &vk::RenderingInfo<'_>,
+        feedback: RenderingFeedback,
+    ) {
         debug_assert!(info.p_next.is_null());
         let own = |v: &vk::RenderingAttachmentInfo<'_>| {
             debug_assert!(v.p_next.is_null());
@@ -344,12 +356,40 @@ impl Dispatch {
         unsafe {
             self.recorder.record_array(colors, move |ctx, colors| {
                 ctx.flush_draw();
+                // Only the typed flags cross the recording boundary. Construct
+                // pNext chains here, where their storage outlives the Vulkan call.
+                let extension = crate::extensions::AttachmentFeedbackLoop::enabled();
+                let extension_ptr = std::ptr::from_ref(&extension).cast();
+                let mut feedback_colors = smallvec::SmallVec::<[_; 8]>::new();
+                if feedback.colors != 0 {
+                    feedback_colors.extend_from_slice(colors);
+                    for (index, attachment) in feedback_colors.iter_mut().enumerate() {
+                        if u32::from(feedback.colors) & (1 << index) != 0 {
+                            attachment.p_next = extension_ptr;
+                        }
+                    }
+                }
+                let mut depth = depth;
+                let mut stencil = stencil;
+                if feedback.depth {
+                    depth.as_mut().expect("feedback depth attachment").p_next = extension_ptr;
+                }
+                if feedback.stencil {
+                    stencil
+                        .as_mut()
+                        .expect("feedback stencil attachment")
+                        .p_next = extension_ptr;
+                }
                 let mut info = vk::RenderingInfo::default()
                     .flags(flags)
                     .render_area(area)
                     .layer_count(layers)
                     .view_mask(mask)
-                    .color_attachments(colors);
+                    .color_attachments(if feedback.colors == 0 {
+                        colors
+                    } else {
+                        &feedback_colors
+                    });
                 if let Some(depth) = &depth {
                     info = info.depth_attachment(depth);
                 }

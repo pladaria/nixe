@@ -13,6 +13,7 @@ use nixe_shader_recompiler::{
     environment::SnapshotEnvironment,
     passes::GraphicsRuntimeState,
 };
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Configuration {
@@ -31,8 +32,8 @@ impl Configuration {
 
 #[derive(Clone, Debug)]
 pub struct StageSource {
-    pub environment: SnapshotEnvironment,
-    pub info: ShaderInfo,
+    pub environment: Arc<SnapshotEnvironment>,
+    pub info: Arc<ShaderInfo>,
     pub binding_group: Option<u8>,
 }
 
@@ -75,7 +76,6 @@ impl ShaderInputs {
         configuration: &Configuration,
         graphics: Option<&GraphicsRuntimeState>,
     ) -> Result<Vec<StageArtifact>> {
-        crate::trace::event("shader_compile", self.stages.len() as u64, 0, 0);
         let stages = self.prepare(compiler, configuration, graphics)?;
         let mut bindings = Bindings::default();
         stages
@@ -97,11 +97,12 @@ impl ShaderInputs {
         configuration: &Configuration,
         graphics: Option<&GraphicsRuntimeState>,
     ) -> Result<Vec<PreparedStage>> {
+        crate::trace::event("shader_compile", self.stages.len() as u64, 0, 0);
         compiler.reset()?;
         let mut ids = Vec::with_capacity(self.stages.len());
         let mut vertex_a = None;
         for source in &self.stages {
-            let mut environment = source.environment.clone();
+            let mut environment = (*source.environment).clone();
             let mut id = compiler.translate(
                 &mut environment,
                 &configuration.host,

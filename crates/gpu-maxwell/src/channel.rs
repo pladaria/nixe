@@ -209,7 +209,7 @@ pub struct MaxwellChannelFrontendState {
 impl MaxwellChannelFrontendState {
     /// Returns the last source-preserving legacy `MEM_OP_A` operand.
     #[must_use]
-    pub const fn legacy_mem_op_a(self) -> Option<u32> {
+    pub const fn legacy_mem_op_a(&self) -> Option<u32> {
         self.legacy_mem_op_a
     }
 
@@ -217,7 +217,7 @@ impl MaxwellChannelFrontendState {
     /// subchannel. The binding contains no engine state or backend object.
     #[must_use]
     pub const fn subchannel_binding(
-        self,
+        &self,
         subchannel: MaxwellPushbufferSubchannel,
     ) -> Option<GpuClassId> {
         self.subchannel_bindings[subchannel.get() as usize]
@@ -239,7 +239,7 @@ impl MaxwellChannelFrontendState {
         self.host_semaphore[index] = value;
     }
 
-    pub(crate) const fn host_semaphore(self) -> [u32; 3] {
+    pub(crate) const fn host_semaphore(&self) -> [u32; 3] {
         self.host_semaphore
     }
 
@@ -357,8 +357,8 @@ impl MaxwellGpuChannel {
         );
         self.configuration = configuration;
     }
-    pub const fn frontend(&self) -> MaxwellChannelFrontendState {
-        self.frontend
+    pub const fn frontend(&self) -> &MaxwellChannelFrontendState {
+        &self.frontend
     }
     pub(crate) const fn frontend_mut(&mut self) -> &mut MaxwellChannelFrontendState {
         &mut self.frontend
@@ -769,7 +769,7 @@ mod tests {
         );
         assert_eq!(channel.owner().process_id(), 9);
         assert_eq!(channel.profile_id(), SWITCH_1_GM20B_PROFILE.id());
-        assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
+        assert_eq!(channel.frontend(), &MaxwellChannelFrontendState::default());
     }
 
     #[test]

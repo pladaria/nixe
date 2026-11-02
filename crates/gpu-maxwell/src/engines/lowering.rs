@@ -70,58 +70,54 @@ impl MaxwellThreeDOperationTrigger {
         matches!(self, Self::DrawIndexBuffer { .. })
     }
 
-    /// Appends the resources consumed directly by this trigger.
-    ///
-    /// Shader translation contributes constant-buffer, texture, and sampler
-    /// roles separately. Keeping the trigger-specific selection exhaustive
-    /// ensures that indexed draws also resolve the index storage.
-    pub(crate) fn append_resource_roles(
+    /// Select hardware fetch and attachment coordinates without constructing a
+    /// role list. The compiled shader supplies its own immutable binding slots.
+    pub(crate) fn resource_slots(
         self,
         state: &MaxwellThreeDState,
-        roles: &mut impl Extend<MaxwellThreeDResourceRole>,
-    ) {
+        vertex_attributes: u32,
+    ) -> MaxwellThreeDDrawResourceSlots {
+        let mut slots = MaxwellThreeDDrawResourceSlots::default();
         match self {
             Self::ClearSurface { .. } => {
                 if let Some(surface) = state.render_targets().clear().last_surface().value() {
                     if surface.color_mask() != 0 {
-                        roles.extend([MaxwellThreeDResourceRole::ColorTarget(
-                            surface.color_target(),
-                        )]);
+                        slots.attachments |= 1 << surface.color_target();
                     }
                     if surface.depth() || surface.stencil() {
-                        roles.extend([MaxwellThreeDResourceRole::DepthStencilTarget]);
+                        slots.attachments |= 1 << 8;
                     }
                 }
             }
             Self::DrawVertexArray { .. } | Self::DrawIndexBuffer { .. } => {
                 if self.is_indexed() && state.inline_index().is_none() {
-                    roles.extend([MaxwellThreeDResourceRole::IndexBuffer]);
+                    slots.geometry |= 1 << 32;
                 }
-                roles.extend(
-                    consumed_vertex_streams(state).map(MaxwellThreeDResourceRole::VertexStream),
-                );
+                for stream in consumed_vertex_streams(state, vertex_attributes) {
+                    slots.geometry |= 1 << stream;
+                }
                 if let Some(selection) = state.render_targets().color_target_selection().value() {
-                    roles.extend(
-                        selection
-                            .active_targets()
-                            .iter()
-                            .copied()
-                            .map(MaxwellThreeDResourceRole::ColorTarget),
-                    );
+                    for &target in selection.active_targets() {
+                        slots.attachments |= 1 << target;
+                    }
                 }
                 if draw_depth_stencil_resource_required(state) {
-                    roles.extend([MaxwellThreeDResourceRole::DepthStencilTarget]);
+                    slots.attachments |= 1 << 8;
                 }
             }
         }
+        slots
     }
 }
 
-/// A stream's enable bit alone does not cause vertex fetches. Draws can leave
-/// old streams configured while disabling all their attributes (for example,
-/// when a subsequent shader generates geometry from the vertex ID).
-fn consumed_vertex_streams(state: &MaxwellThreeDState) -> impl Iterator<Item = u8> {
-    let mut mask = (0..32)
+/// Only shader inputs cause vertex fetches. Unused programmed attributes and
+/// streams can retain descriptors from an earlier draw.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+fn consumed_vertex_streams(
+    state: &MaxwellThreeDState,
+    vertex_attributes: u32,
+) -> impl Iterator<Item = u8> {
+    let mask = vertex_attribute_locations(vertex_attributes)
         .map(|i| (i, state.vertex_input().attributes(i)))
         .fold(0_u32, |mask, (index, attribute)| {
             match attribute.value().filter(|attribute| {
@@ -131,11 +127,15 @@ fn consumed_vertex_streams(state: &MaxwellThreeDState) -> impl Iterator<Item = u
                 None => mask,
             }
         });
+    vertex_attribute_locations(mask).map(|stream| stream as u8)
+}
+
+fn vertex_attribute_locations(mut mask: u32) -> impl Iterator<Item = usize> {
     std::iter::from_fn(move || {
         if mask == 0 {
             return None;
         }
-        let stream = mask.trailing_zeros() as u8;
+        let stream = mask.trailing_zeros() as usize;
         mask &= mask - 1;
         Some(stream)
     })

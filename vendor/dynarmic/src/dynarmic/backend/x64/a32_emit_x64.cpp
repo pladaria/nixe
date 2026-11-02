@@ -24,7 +24,6 @@
 #include "dynarmic/backend/x64/nzcv_util.h"
 #include "dynarmic/backend/x64/perf_map.h"
 #include "dynarmic/backend/x64/stack_layout.h"
-#include "dynarmic/common/variant_util.h"
 #include "dynarmic/frontend/A32/a32_location_descriptor.h"
 #include "dynarmic/frontend/A32/a32_types.h"
 #include "dynarmic/interface/A32/coprocessor.h"
@@ -59,8 +58,8 @@ static Xbyak::Address MJitStateExtReg(A32::ExtReg reg) {
     ASSERT_FALSE("Should never happen.");
 }
 
-A32EmitContext::A32EmitContext(const A32::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block)
-        : EmitContext(reg_alloc, block), conf(conf) {}
+A32EmitContext::A32EmitContext(const A32::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits)
+        : EmitContext(reg_alloc, block, labels, deferred_emits), conf(conf) {}
 
 A32::LocationDescriptor A32EmitContext::Location() const {
     return A32::LocationDescriptor{block.Location()};
@@ -80,7 +79,18 @@ FP::FPCR A32EmitContext::FPCR(bool fpcr_controlled) const {
 }
 
 A32EmitX64::A32EmitX64(BlockOfCode& code, A32::UserConfig conf, A32::Jit* jit_interface)
-        : EmitX64(code), conf(std::move(conf)), jit_interface(jit_interface) {
+        : EmitX64(code, [&conf] {
+            HostLocSet gprs{any_gpr};
+            if (conf.page_table) {
+                gprs.reset(static_cast<size_t>(HostLoc::R14));
+            }
+            if (conf.fastmem_pointer) {
+                gprs.reset(static_cast<size_t>(HostLoc::R13));
+            }
+            return gprs;
+        }())
+        , conf(std::move(conf))
+        , jit_interface(jit_interface) {
     GenFastmemFallbacks();
     GenTerminalHandlers();
     code.PreludeComplete();
@@ -100,22 +110,11 @@ A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
 
     code.EnableWriting();
     SCOPE_EXIT {
+        labels.clear();
         code.DisableWriting();
     };
 
-    const std::vector<HostLoc> gpr_order = [this] {
-        std::vector<HostLoc> gprs{any_gpr};
-        if (conf.page_table) {
-            gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R14));
-        }
-        if (conf.fastmem_pointer) {
-            gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R13));
-        }
-        return gprs;
-    }();
-
-    RegAlloc reg_alloc{code, gpr_order, any_xmm};
-    A32EmitContext ctx{conf, reg_alloc, block};
+    A32EmitContext ctx{conf, reg_alloc, block, labels, deferred_emits};
 
     // Start emitting.
     code.align();
@@ -154,8 +153,6 @@ A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
         }
     }
 
-    reg_alloc.AssertNoMoreUses();
-
     if (conf.enable_cycle_counting) {
         EmitAddCycles(block.CycleCount());
     }
@@ -165,6 +162,7 @@ A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
     for (auto& deferred_emit : ctx.deferred_emits) {
         deferred_emit();
     }
+    reg_alloc.AssertNoMoreUses();
     code.int3();
 
     const size_t size = static_cast<size_t>(code.getCurr() - entrypoint);
@@ -201,7 +199,7 @@ void A32EmitX64::EmitCondPrelude(const A32EmitContext& ctx) {
     if (conf.enable_cycle_counting) {
         EmitAddCycles(ctx.block.ConditionFailedCycleCount());
     }
-    EmitTerminal(IR::Term::LinkBlock{ctx.block.ConditionFailedLocation()}, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+    EmitTerminalImpl(IR::Term::LinkBlock{ctx.block.ConditionFailedLocation()}, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
     code.L(pass);
 }
 

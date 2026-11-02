@@ -4,11 +4,11 @@
  */
 
 #include <mcl/bit_cast.hpp>
-#include <xbyak/xbyak.h>
 
 #include "dynarmic/backend/x64/a32_emit_x64.h"
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
+#include "dynarmic/backend/x64/xbyak.h"
 #include "dynarmic/common/spin_lock_x64.h"
 #include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/ir/acc_type.h"
@@ -53,7 +53,7 @@ void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsi
 
     const u32 page_align_mask = static_cast<u32>(page_size - 1) & ~align_mask;
 
-    SharedLabel detect_boundary = GenSharedLabel(), resume = GenSharedLabel();
+    const auto detect_boundary = ctx.GenLabel(), resume = ctx.GenLabel();
 
     code.jnz(*detect_boundary, code.T_NEAR);
     code.L(*resume);
@@ -152,18 +152,18 @@ template<>
 }
 
 template<typename EmitContext>
-Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt);
+Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt, IR::Value address = {});
 
 template<>
-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>) {
+[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>, IR::Value) {
     return r13 + vaddr;
 }
 
 template<>
-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp) {
+[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp, IR::Value address) {
     const size_t unused_top_bits = 64 - ctx.conf.fastmem_address_space_bits;
 
-    if (unused_top_bits == 0) {
+    if (unused_top_bits == 0 || (!ctx.conf.silently_mirror_fastmem && ctx.CanOmitFastmemBoundsCheck(address))) {
         return r13 + vaddr;
     } else if (ctx.conf.silently_mirror_fastmem) {
         if (!tmp) {

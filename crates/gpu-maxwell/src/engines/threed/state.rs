@@ -19,10 +19,9 @@ use super::{
     MAXWELL_COLOR_TARGET_COUNT, MAXWELL_PIPELINE_SHADER_COUNT, MaxwellThreeDColorReductionState,
     MaxwellThreeDCoverageState, MaxwellThreeDFixedFunctionState, MaxwellThreeDInlineToMemoryState,
     MaxwellThreeDInlineToMemoryStateWrite, MaxwellThreeDLineState, MaxwellThreeDMmeState,
-    MaxwellThreeDMmeStateWrite, MaxwellThreeDRenderEnableState, MaxwellThreeDRenderTargetState,
+    MaxwellThreeDRenderEnableState, MaxwellThreeDRenderTargetState,
     MaxwellThreeDReportSemaphoreState, MaxwellThreeDResourceRole, MaxwellThreeDShaderBindingState,
     MaxwellThreeDShaderExecutionState, MaxwellThreeDVertexInputState,
-    MaxwellThreeDVertexInputWrite,
     render_targets::{
         MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD, MAXWELL_THREE_D_COLOR_COMPRESSION_RESET,
         MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE, MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD,
@@ -274,12 +273,22 @@ const CLASS_REGISTER_WORDS: usize = 0xe00;
 /// The fixed class register file keeps consumed raw words dense.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct MaxwellThreeDRawRegisterFile {
-    values: Box<[u32]>,
+    // The physical aperture is fixed, as in Eden's Maxwell3D::Regs. Keep its
+    // size in the type so constant register reads need no dynamic length check.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.h
+    values: Box<[u32; CLASS_REGISTER_WORDS]>,
+    // A packed rendering key, updated with the canonical bank. Exact pipeline
+    // reuse compares it once instead of gathering fragmented register ranges.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+    parameters: Box<[u32; super::registers::PARAMETER_METHOD_COUNT]>,
 }
 
 impl Default for MaxwellThreeDRawRegisterFile {
     fn default() -> Self {
-        let mut values = vec![0; CLASS_REGISTER_WORDS].into_boxed_slice();
+        let mut values: Box<[u32; CLASS_REGISTER_WORDS]> = vec![0; CLASS_REGISTER_WORDS]
+            .into_boxed_slice()
+            .try_into()
+            .expect("fixed class register count");
         // Maxwell3D initializes both banks identically. Keep renderer-required
         // defaults in the bank itself, then apply the documented GM20B resets.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
@@ -328,7 +337,20 @@ impl Default for MaxwellThreeDRawRegisterFile {
                 *value = reset;
             }
         }
-        Self { values }
+        let mut parameters: Box<[u32; super::registers::PARAMETER_METHOD_COUNT]> =
+            vec![0; super::registers::PARAMETER_METHOD_COUNT]
+                .into_boxed_slice()
+                .try_into()
+                .expect("fixed renderer parameter count");
+        for (index, &value) in values.iter().enumerate() {
+            let method = GpuMethodId(index as u32 * 4);
+            let info = super::registers::info(method).expect("bounded register file");
+            if info.domains & super::registers::PARAMETERS != 0 {
+                parameters[usize::from(info.parameter_index)] =
+                    super::registers::parameter_word(method, value);
+            }
+        }
+        Self { values, parameters }
     }
 }
 
@@ -846,15 +868,14 @@ pub struct MaxwellThreeDState {
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/control/channel_state_cache.h
     draw_state_revision: u64,
     draw_parameters_revision: u64,
+    parameter_fingerprint: u64,
     resource_selection_revision: u64,
     color_target_revisions: [u64; 8],
     depth_target_revision: u64,
     vertex_slots: [u64; 32],
     index_revision: u64,
     constant_slots: [[u64; 32]; 8],
-    constant_buffer_revision: u64,
     resource_group_revisions: [u64; 4],
-    texture_revision: u64,
     texture_header_revision: u64,
     sampler_revision: u64,
     sample_mode_revision: u64,
@@ -868,12 +889,13 @@ pub struct MaxwellThreeDState {
 ///
 /// State domains unrelated to resource resolution deliberately do not advance
 /// the retained revisions or invalidate this identity.
+/// The channel slot supplies its role and dependent CB indices; the proof keeps
+/// only their revisions, without another copy of the selected resource layout.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MaxwellThreeDResourceStateIdentity {
-    role: MaxwellThreeDResourceRole,
     revision: u64,
-    constant_buffers: [Option<(u8, u8, u64)>; 2],
-    sample_mode: Option<u64>,
+    constant_buffers: [u64; 2],
+    sample_mode: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -922,18 +944,31 @@ impl MaxwellThreeDShaderStateIdentity {
 }
 
 impl MaxwellThreeDResourceStateIdentity {
-    pub(crate) fn matches(&self, state: &MaxwellThreeDState) -> bool {
-        self.revision == state.binding_revision(self.role)
-            && self
-                .constant_buffers
-                .iter()
-                .flatten()
-                .all(|&(group, slot, rev)| {
-                    state.constant_slots[group as usize][slot as usize] == rev
-                })
-            && self
-                .sample_mode
-                .is_none_or(|revision| revision == state.sample_mode_revision)
+    pub(crate) fn matches(
+        &self,
+        state: &MaxwellThreeDState,
+        role: MaxwellThreeDResourceRole,
+    ) -> bool {
+        if self.revision != state.binding_revision(role) {
+            return false;
+        }
+        if let MaxwellThreeDResourceRole::SampledImage { texture, .. }
+        | MaxwellThreeDResourceRole::Sampler(texture) = role
+        {
+            let slots = &state.constant_slots[texture.group as usize];
+            if slots[texture.constant_buffer_slot as usize] != self.constant_buffers[0]
+                || texture
+                    .secondary
+                    .is_some_and(|(slot, _, _)| slots[slot as usize] != self.constant_buffers[1])
+            {
+                return false;
+            }
+        }
+        !matches!(
+            role,
+            MaxwellThreeDResourceRole::ColorTarget(_)
+                | MaxwellThreeDResourceRole::DepthStencilTarget
+        ) || self.sample_mode == state.sample_mode_revision
     }
 }
 
@@ -941,7 +976,7 @@ impl MaxwellThreeDResourceStateIdentity {
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub(crate) struct MaxwellThreeDFrontendState {
     pub(super) instance_run: Option<super::draw::InstanceRun>,
-    deferred_draw_end: Option<MaxwellThreeDVertexInputWrite>,
+    deferred_draw_end: Option<u32>,
     inline_indices: Vec<u8>,
     inline_end: Option<MaxwellMethodSource>,
     pub(in crate::engines) pending_notification: Option<(u64, MaxwellMethodSource)>,
@@ -1052,12 +1087,7 @@ impl MaxwellThreeDFrontendState {
         if let Some(source) = self.inline_end.take() {
             self.operation.inline_index = None;
             self.inline_indices.clear();
-            self.apply(MaxwellThreeDStateWrite::VertexInput(
-                MaxwellThreeDVertexInputWrite::End {
-                    value: source.argument() != 0,
-                    source,
-                },
-            ));
+            self.end_primitive(source.argument());
         }
     }
     #[must_use]
@@ -1086,11 +1116,34 @@ impl MaxwellThreeDFrontendState {
     }
 
     pub(super) fn write_register(&mut self, method: GpuMethodId, argument: u32) {
-        if self.operation.registers.word(method) == argument {
+        let info = super::registers::info(method).expect("admitted register");
+        self.write_classified_register(method, argument, info);
+    }
+
+    #[inline(always)]
+    pub(super) fn write_classified_register(
+        &mut self,
+        method: GpuMethodId,
+        argument: u32,
+        info: &super::registers::MethodInfo,
+    ) {
+        let previous = self.operation.registers.word(method);
+        if previous == argument {
             return;
         }
         self.operation.registers.write(method, argument);
-        let domains = super::registers::domains(method);
+        let domains = info.domains;
+        if domains & super::registers::PARAMETERS != 0 {
+            let parameter =
+                &mut self.operation.registers.parameters[usize::from(info.parameter_index)];
+            let value = super::registers::parameter_word(method, argument);
+            if *parameter != value {
+                self.operation.parameter_fingerprint ^=
+                    super::registers::normalized_parameter_hash(method, *parameter)
+                        ^ super::registers::normalized_parameter_hash(method, value);
+                *parameter = value;
+            }
+        }
         self.operation.dirty_domains |= domains;
         if domains & super::registers::VERTEX != 0 {
             let index = if method.0 >= 0x1f00 {
@@ -1158,7 +1211,6 @@ impl MaxwellThreeDFrontendState {
             advance_revision(&mut state.sample_mode_revision);
         }
         if domains & (D::HEADERS | D::SAMPLERS) != 0 {
-            advance_revision(&mut state.texture_revision);
             advance_revision(&mut state.resource_group_revisions[2]);
         }
         if domains & D::HEADERS != 0 {
@@ -1171,6 +1223,18 @@ impl MaxwellThreeDFrontendState {
 }
 
 impl MaxwellThreeDState {
+    pub(crate) fn attachment_selection(&self) -> [u32; 4] {
+        [0x121c, 0x12cc, 0x1380, 0x1538].map(|method| self.registers.word(GpuMethodId(method)))
+    }
+    pub(crate) fn parameter_fingerprint(&self) -> u64 {
+        self.parameter_fingerprint
+    }
+    pub(crate) fn parameter_words(&self) -> Box<[u32]> {
+        self.registers.parameters.clone()
+    }
+    pub(crate) fn matches_parameter_words(&self, words: &[u32]) -> bool {
+        self.registers.parameters.as_ref() == words
+    }
     pub(crate) fn inline_index(&self) -> Option<&Arc<[u8]>> {
         self.inline_index.as_ref()
     }
@@ -1206,26 +1270,20 @@ impl MaxwellThreeDState {
         use MaxwellThreeDResourceRole as R;
         let constant_buffers = match role {
             R::SampledImage { texture, .. } | R::Sampler(texture) => {
-                let binding = |slot: u8| {
-                    (
-                        texture.group,
-                        slot,
-                        self.constant_slots[texture.group as usize][slot as usize],
-                    )
-                };
+                let slots = &self.constant_slots[texture.group as usize];
                 [
-                    Some(binding(texture.constant_buffer_slot)),
-                    texture.secondary.map(|(slot, _, _)| binding(slot)),
+                    slots[texture.constant_buffer_slot as usize],
+                    texture
+                        .secondary
+                        .map_or(0, |(slot, _, _)| slots[slot as usize]),
                 ]
             }
-            _ => [None; 2],
+            _ => [0; 2],
         };
         MaxwellThreeDResourceStateIdentity {
-            role,
             revision: self.binding_revision(role),
             constant_buffers,
-            sample_mode: matches!(role, R::ColorTarget(_) | R::DepthStencilTarget)
-                .then_some(self.sample_mode_revision),
+            sample_mode: self.sample_mode_revision,
         }
     }
 
@@ -1365,85 +1423,64 @@ impl MaxwellThreeDState {
 }
 
 impl MaxwellThreeDFrontendState {
-    fn apply_primitive(&mut self, write: MaxwellThreeDVertexInputWrite) {
-        match write {
-            MaxwellThreeDVertexInputWrite::Begin { value, source } => self
-                .operation
-                .primitive_sequence
-                .begin(source.argument(), value),
-            MaxwellThreeDVertexInputWrite::End { value, source } => self
-                .operation
-                .primitive_sequence
-                .end(source.argument(), value),
+    pub(super) fn begin_primitive(&mut self, raw: u32, value: super::MaxwellThreeDBegin) {
+        self.operation.primitive_sequence.begin(raw, value);
+    }
+    pub(super) fn end_primitive(&mut self, raw: u32) {
+        // A pending draw still consumes its validated BEGIN. End it only after
+        // that consumer, while the live and shadow register writes stay immediate.
+        if self.instance_run.is_some() {
+            self.deferred_draw_end = Some(raw);
+        } else {
+            self.operation.primitive_sequence.end(raw, raw != 0);
         }
     }
     pub(super) fn complete_draw_end(&mut self) {
-        if let Some(write) = self.deferred_draw_end.take() {
-            self.apply_primitive(write);
+        if let Some(raw) = self.deferred_draw_end.take() {
+            self.operation.primitive_sequence.end(raw, raw != 0);
         }
     }
-    pub(super) fn apply(&mut self, write: MaxwellThreeDStateWrite) {
-        // END terminates the pending draw, whose capture still consumes its
-        // validated BEGIN. Apply that termination after the draw consumer
-        // or before the next BEGIN; raw/shadow register writes remain immediate.
-        if self.instance_run.is_some()
-            && let MaxwellThreeDStateWrite::VertexInput(
-                end @ MaxwellThreeDVertexInputWrite::End { .. },
-            ) = write
-        {
-            self.deferred_draw_end = Some(end);
-            return;
+    pub(super) fn bind_constant_buffer(
+        &mut self,
+        group: u8,
+        slot: u8,
+        binding: Option<super::MaxwellThreeDConstantBufferBinding>,
+    ) {
+        let previous = self.operation.shader_bindings().groups()[group as usize].constant_buffers()
+            [slot as usize];
+        if previous != binding {
+            advance_revision(&mut self.operation.constant_slots[group as usize][slot as usize]);
+            advance_revision(&mut self.operation.resource_group_revisions[1]);
+            advance_revision(&mut self.operation.resource_group_revisions[2]);
         }
+        self.operation.shader_resources.groups[group as usize].constant_buffers[slot as usize] =
+            binding;
+    }
+    pub(super) fn apply_inline(&mut self, write: MaxwellThreeDInlineToMemoryStateWrite) {
         match write {
-            MaxwellThreeDStateWrite::InlineToMemory(write) => match write {
-                MaxwellThreeDInlineToMemoryStateWrite::Launch {
-                    address,
-                    byte_length,
-                    ..
-                } => {
-                    self.operation.inline_transfer =
-                        (byte_length != 0).then_some(super::inline_to_memory::PendingTransfer {
-                            address,
-                            byte_length,
-                            next_offset: 0,
-                        });
-                }
-                MaxwellThreeDInlineToMemoryStateWrite::Data { next_offset, .. } => {
-                    let pending = self
-                        .operation
-                        .inline_transfer
-                        .as_mut()
-                        .expect("validated inline transfer");
-                    pending.next_offset = next_offset;
-                    if next_offset >= pending.byte_length {
-                        self.operation.inline_transfer = None;
-                    }
-                }
-            },
-            MaxwellThreeDStateWrite::VertexInput(write) => self.apply_primitive(write),
-            MaxwellThreeDStateWrite::BindConstantBuffer {
-                group,
-                slot,
-                binding,
+            MaxwellThreeDInlineToMemoryStateWrite::Launch {
+                address,
+                byte_length,
+                ..
             } => {
-                let previous = self.operation.shader_bindings().groups()[group as usize]
-                    .constant_buffers()[slot as usize];
-                if previous.is_none_or(|p| {
-                    p.enabled() != binding.enabled()
-                        || p.address() != binding.address()
-                        || p.size() != binding.size()
-                }) {
-                    advance_revision(
-                        &mut self.operation.constant_slots[group as usize][slot as usize],
-                    );
-                    advance_revision(&mut self.operation.constant_buffer_revision);
-                    advance_revision(&mut self.operation.resource_group_revisions[1]);
-                    advance_revision(&mut self.operation.resource_group_revisions[2]);
-                }
-                self.operation.shader_resources.groups[group as usize].constant_buffers
-                    [slot as usize] = Some(binding);
+                self.operation.inline_transfer =
+                    (byte_length != 0).then_some(super::inline_to_memory::PendingTransfer {
+                        address,
+                        byte_length,
+                        next_offset: 0,
+                    });
             }
-            MaxwellThreeDStateWrite::Mme(write) => self.mme.apply(write),
+            MaxwellThreeDInlineToMemoryStateWrite::Data { next_offset, .. } => {
+                let pending = self
+                    .operation
+                    .inline_transfer
+                    .as_mut()
+                    .expect("validated inline transfer");
+                pending.next_offset = next_offset;
+                if next_offset >= pending.byte_length {
+                    self.operation.inline_transfer = None;
+                }
+            }
         }
     }
 }
@@ -1452,19 +1489,6 @@ fn advance_revision(revision: &mut u64) {
     *revision = revision
         .checked_add(1)
         .expect("Maxwell semantic revision exhausted");
-}
-
-/// One checked `MAXWELL_B` register transition ready for direct application.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDStateWrite {
-    InlineToMemory(MaxwellThreeDInlineToMemoryStateWrite),
-    VertexInput(MaxwellThreeDVertexInputWrite),
-    BindConstantBuffer {
-        group: u8,
-        slot: u8,
-        binding: super::MaxwellThreeDConstantBufferBinding,
-    },
-    Mme(MaxwellThreeDMmeStateWrite),
 }
 
 #[cfg(test)]

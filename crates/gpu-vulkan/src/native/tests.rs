@@ -243,8 +243,8 @@ fn captured_graphics(
             )
             .unwrap();
         stages.push(StageSource {
-            environment,
-            info: compiler.program(id).unwrap().info.clone(),
+            environment: Arc::new(environment),
+            info: Arc::new(compiler.program(id).unwrap().info.clone()),
             binding_group: Some(0),
         });
     }
@@ -947,7 +947,27 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         command: NativeCommand::Sequence(vec![draw; 16].into_boxed_slice()),
     };
 
+    let (_unrelated_allocation, unrelated) =
+        backing_allocation(&execution.residency, 128 * 1024, 4096, 0);
+    let old = execution
+        .residency
+        .buffer_for_deferred_import(
+            unrelated.slice(0, 4096).unwrap(),
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )
+        .unwrap();
     for frontend in 1..=2 {
+        if frontend == 2 {
+            let merged = execution
+                .residency
+                .buffer_for_deferred_import(
+                    Arc::clone(&unrelated),
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                )
+                .unwrap();
+            assert_ne!(merged.buffer, old.buffer);
+            assert!(!execution.residency.buffer_binding_current(old.buffer));
+        }
         let submission = NativeWork {
             frontend: FrontendSubmissionId::new(frontend),
             command: submission.command.clone(),
@@ -1092,6 +1112,13 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         submitted,
         "acceptance alone need not submit the native command buffer"
     );
+    // Cache eviction cannot release references still needed by the recording
+    // worker/GPU. The next use reconstructs the selection with the same source.
+    let retained_sources = Arc::strong_count(&state);
+    let prepared = execution.drawings.remove(&state.identity).unwrap();
+    assert_eq!(prepared.source.as_ptr(), Arc::as_ptr(&state));
+    drop(prepared);
+    assert_eq!(Arc::strong_count(&state), retained_sources);
 
     crate::residency::tests::cpu_write(
         &mut execution.residency,
@@ -1123,6 +1150,9 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     );
     // Different bindings and scissors across frontend deliveries share native
     // rendering, but preserve draw order and their own prepared semantics.
+    // Force eviction while every frontend source is still alive and earlier
+    // draws remain in the same unsubmitted rendering scope.
+    execution.drawings = nixe_gpu::WorkingSet::new(2, usize::MAX);
     let (other_vertices, other_backing) = backing_allocation(&execution.residency, 256, 256, 0);
     crate::residency::tests::cpu_write(
         &mut execution.residency,
@@ -1170,6 +1200,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                 .and_then(|()| execution.signal_fence(submission.frontend))
                 .unwrap(),
         );
+        assert!(execution.drawings.usage().0 <= 2);
         let push = &execution.graphics_pipelines[execution.current_graphics.unwrap().0]
             .parameters
             .as_ref()
@@ -1463,10 +1494,63 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         &state,
         &backing,
     );
+    idle_queue_executes_prefixes_before_the_command_list_ends(&mut execution, &state, &backing);
     drop(pixels);
     execution.teardown().unwrap();
     drop(execution);
     monitor.check().unwrap();
+}
+
+fn idle_queue_executes_prefixes_before_the_command_list_ends(
+    execution: &mut NativeGpuExecution,
+    state: &Arc<GuestDrawState>,
+    backing: &PhysicalMapping,
+) {
+    execution.bind_host_wakeup(Arc::new(|| {})).unwrap();
+    let draw = NativeCommand::Draw {
+        state: Arc::clone(state),
+        arguments: DrawArguments::NonIndexed {
+            first_vertex: 0,
+            vertex_count: 3,
+            first_instance: 0,
+            instance_count: 1,
+        },
+    };
+    consume(
+        execution,
+        &NativeWork {
+            frontend: FrontendSubmissionId::new(10000),
+            command: draw.clone(),
+        },
+    )
+    .unwrap();
+    execution.end_command_list().unwrap();
+    let expected = cpu_read(&mut execution.residency, backing);
+    let before = execution.residency.device().scheduled_tick();
+    let completions = execution.completions.len();
+    let draws = execution.statistics.draws;
+    // Include a clear at a batch boundary and a draw beyond the last boundary.
+    // Prefix submission must neither invent a fence nor omit the trailing work.
+    let mut commands = vec![draw.clone(); 63];
+    commands.push(NativeCommand::Clear {
+        image: state.colors[0].clone(),
+        rectangle: state.parameters.render_area,
+        value: ClearValue::Color([1., 0., 0., 1.]),
+    });
+    commands.extend(std::iter::repeat_n(draw, 193));
+    consume(
+        execution,
+        &NativeWork {
+            frontend: FrontendSubmissionId::new(10001),
+            command: NativeCommand::Sequence(commands.into_boxed_slice()),
+        },
+    )
+    .unwrap();
+    assert!(execution.residency.device().scheduled_tick() > before);
+    assert_eq!(execution.statistics.draws - draws, 256);
+    assert_eq!(execution.completions.len(), completions);
+    execution.end_command_list().unwrap();
+    assert_eq!(cpu_read(&mut execution.residency, backing), expected);
 }
 
 fn attachment_clears_fold_into_loads_and_preserve_active_rendering(
@@ -1764,7 +1848,7 @@ fn overlapping_graphics_buffers_preserve_shader_bindings(
     template: &Arc<GuestDrawState>,
     output: &Arc<PhysicalMapping>,
 ) {
-    use nixe_memory::PAGE_SIZE;
+    let cache_page = 64 * 1024;
     // Resolve a small uniform first, then grow its physical buffer through a
     // vertex or index range crossing the page boundary. The shader must bind
     // the surviving buffer, including the uniform value written by the GPU.
@@ -1773,12 +1857,13 @@ fn overlapping_graphics_buffers_preserve_shader_bindings(
         let indexed = case == 1;
         let (allocation, mapping) = backing_allocation(
             &execution.residency,
-            2 * PAGE_SIZE as usize,
-            PAGE_SIZE as usize,
+            2 * cache_page as usize,
+            cache_page as usize,
             0,
         );
+        let uniform_offset = if case == 2 { cache_page - 16 } else { 0 };
         let uniform = mapping
-            .slice(0, if case == 2 { 2 * PAGE_SIZE } else { 16 })
+            .slice(uniform_offset, if case == 2 { 32 } else { 16 })
             .unwrap();
         let mut draw = (**template).clone();
         draw.identity = PreparedStateId::new(10000 + case, 1);
@@ -1789,7 +1874,7 @@ fn overlapping_graphics_buffers_preserve_shader_bindings(
             GuestBinding::Buffer(Arc::clone(&uniform)),
         )]);
         let arguments = if indexed {
-            let offset = PAGE_SIZE - 2;
+            let offset = cache_page - 2;
             crate::residency::tests::cpu_write(
                 &mut execution.residency,
                 &allocation,
@@ -1809,7 +1894,7 @@ fn overlapping_graphics_buffers_preserve_shader_bindings(
                 instance_count: 1,
             }
         } else {
-            let offset = if case == 2 { 64 } else { PAGE_SIZE - 24 };
+            let offset = if case == 2 { 64 } else { cache_page - 24 };
             let vertices: [f32; 18] = [
                 -1., -1., 0., 0., 1., 0., 3., -1., 0., 0., 1., 0., -1., 3., 0., 0., 1., 0.,
             ];
@@ -1848,7 +1933,7 @@ fn overlapping_graphics_buffers_preserve_shader_bindings(
             .collect::<Vec<_>>();
         execution
             .residency
-            .write_buffer(initial.buffer, initial.offset, &color)
+            .write_buffer(initial.buffer, initial.offset + uniform_offset, &color)
             .unwrap();
 
         let merges = execution.residency.statistics().buffer_merges;
@@ -2366,7 +2451,7 @@ fn captured_compute_dispatch_reuses_prepared_pipeline_without_old_ir() {
     let monitor = device.validation_monitor();
     let inputs = Arc::new(ShaderInputs::new(
         vec![StageSource {
-            environment: SnapshotEnvironment::new(
+            environment: Arc::new(SnapshotEnvironment::new(
                 EnvironmentMetadata {
                     stage: Stage::Compute,
                     workgroup_size: [4, 1, 1],
@@ -2376,8 +2461,8 @@ fn captured_compute_dispatch_reuses_prepared_pipeline_without_old_ir() {
                     instructions: [(ProgramOffset(8), 0xe300_0000_0007_000f)].into(),
                     ..Default::default()
                 },
-            ),
-            info: ShaderInfo::default(),
+            )),
+            info: Arc::new(ShaderInfo::default()),
             binding_group: None,
         }]
         .into(),
@@ -2444,7 +2529,15 @@ fn captured_compute_dispatch_reuses_prepared_pipeline_without_old_ir() {
         );
     }
     assert_eq!(execution.statistics.dispatches, 2);
-    assert_eq!(execution.computing.len(), 1);
+    assert_eq!(execution.computing.usage().0, 1);
+    let source = Arc::downgrade(&program);
+    drop(program);
+    assert!(source.upgrade().is_none(), "ready compute state is weak");
+    execution.computing.prune(16, |computing| match computing {
+        Computing::Ready { source, .. } => source.strong_count() != 0,
+        Computing::Shader { .. } => true,
+    });
+    assert_eq!(execution.computing.usage().0, 0);
     drop(execution);
     monitor.check().unwrap();
 }

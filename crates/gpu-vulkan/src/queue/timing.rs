@@ -196,7 +196,7 @@ impl Queries {
             (elapsed as f64 * self.period) as u64,
         );
         record(Counter::HostQueueTimedSubmissions, 1);
-        if nixe_gpu::trace::active()
+        if nixe_gpu::trace::detailed_active()
             && let Some(calibration) = calibration
         {
             // Correlate completed device queries with CLOCK_MONOTONIC, retaining

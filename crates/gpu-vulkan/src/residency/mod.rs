@@ -42,8 +42,8 @@ use nixe_memory::Machine;
 use std::sync::Arc;
 pub use sync::{AccessScope, BarrierStatistics};
 
-fn shader_attachment_layout(usage: vk::ImageUsageFlags) -> vk::ImageLayout {
-    if usage.contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT) {
+fn shader_attachment_layout(usage: vk::ImageUsageFlags, unified: bool) -> vk::ImageLayout {
+    if !unified && usage.contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT) {
         vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
     } else {
         vk::ImageLayout::GENERAL
@@ -115,12 +115,44 @@ struct BufferEntry {
 }
 impl BufferEntry {
     fn validate_interval(&mut self, start: u64, size: u64) {
-        self.validate_intervals(&[(start, size)]);
+        if size == 0 {
+            return;
+        }
+        let end = start + size;
+        let first = self
+            .invalid
+            .partition_point(|&(offset, bytes)| offset + bytes <= start);
+        let last = first + self.invalid[first..].partition_point(|&(offset, _)| offset < end);
+        if first == last {
+            return;
+        }
+        let (low, _) = self.invalid[first];
+        let (high, bytes) = self.invalid[last - 1];
+        let left = (low < start).then_some((low, start.saturating_sub(low)));
+        let right = (high + bytes > end).then_some((end, (high + bytes).saturating_sub(end)));
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                self.invalid[first] = left;
+                self.invalid.drain(first + 1..last);
+                self.invalid.insert(first + 1, right);
+            }
+            (Some(remaining), None) | (None, Some(remaining)) => {
+                self.invalid[first] = remaining;
+                self.invalid.drain(first + 1..last);
+            }
+            (None, None) => {
+                self.invalid.drain(first..last);
+            }
+        }
     }
     /// Subtract ordered, non-overlapping written intervals in one sweep.
     /// Packed depth footprints can have one three-byte interval per texel.
     fn validate_intervals(&mut self, written: &[(u64, u64)]) {
-        if self.invalid.is_empty() {
+        if self.invalid.is_empty() || written.is_empty() {
+            return;
+        }
+        if let [(start, bytes)] = written {
+            self.validate_interval(*start, *bytes);
             return;
         }
         let mut invalid = Vec::new();
@@ -286,6 +318,7 @@ pub struct VulkanResidency {
     instance: BackendInstanceId,
     buffers: Vec<Slot<BufferEntry>>,
     free_buffers: Vec<usize>,
+    buffer_index: buffer::BufferIndex,
     binding_revision: u64,
     epoch: u64,
     lru_head: Option<Resource>,
@@ -300,6 +333,7 @@ pub struct VulkanResidency {
     free_attachments: Vec<usize>,
     memory: Machine,
     authority: Authority<Resource>,
+    buffer_resolution: Vec<nixe_gpu::authority::ResolvedBytes<Resource>>,
     budget: AllocationBudget,
     statistics: ResidencyStatistics,
     image_readbacks: readback::ImageReadbacks,
@@ -319,8 +353,8 @@ pub struct VulkanResidency {
     descriptors: crate::cache::DescriptorCache,
     descriptor_resources: Vec<crate::cache::DescriptorResource>,
     descriptor_offsets: Vec<u32>,
+    uniform_updates: Vec<Option<execution::UniformUpdate>>,
     streamed_uses: Vec<usize>,
-    stream_inputs: Vec<nixe_memory::AllocationRange>,
     uniform_cache_hits: [u64; 18],
     uniform_cache_shots: [u64; 18],
     uniform_stream_limit: u64,
@@ -455,6 +489,7 @@ impl VulkanResidency {
             instance,
             buffers: Vec::new(),
             free_buffers: Vec::new(),
+            buffer_index: buffer::BufferIndex::new(memory.arena().capacity()),
             binding_revision: 1,
             epoch: 0,
             lru_head: None,
@@ -468,6 +503,7 @@ impl VulkanResidency {
             attachments: Vec::new(),
             free_attachments: Vec::new(),
             authority: Authority::new(memory.identity()),
+            buffer_resolution: Vec::new(),
             memory,
             budget: AllocationBudget::new(bytes),
             statistics: ResidencyStatistics::default(),
@@ -486,8 +522,8 @@ impl VulkanResidency {
             constructing: Vec::new(),
             descriptor_resources: Vec::new(),
             descriptor_offsets: Vec::new(),
+            uniform_updates: Vec::new(),
             streamed_uses: Vec::new(),
-            stream_inputs: Vec::new(),
             uniform_cache_hits: [0; 18],
             uniform_cache_shots: [0; 18],
             uniform_stream_limit: 4096,
@@ -617,6 +653,8 @@ impl VulkanResidency {
             Resource::Buffer(id) => {
                 self.buffer_writes.remove(&id);
                 let entry = self.buffers[id.slot].entry.take().expect("candidate");
+                self.buffer_index
+                    .remove(id.slot, entry.contents.geometry[0].mapping());
                 if self.buffers[id.slot].generation < u32::MAX {
                     self.free_buffers.push(id.slot);
                 }
@@ -664,6 +702,8 @@ impl VulkanResidency {
                 match resource {
                     Resource::Buffer(id) => {
                         let entry = self.buffers[id.slot].entry.as_mut().unwrap();
+                        self.buffer_index
+                            .remove(id.slot, entry.contents.geometry[0].mapping());
                         entry.binding_valid = false;
                         entry.invalid = vec![(0, entry.native.size())];
                     }

@@ -104,6 +104,15 @@ impl References {
         }
         Ok(())
     }
+    pub fn check_live(&self, offset: u64, bytes: u64) -> Result<(), MemoryError> {
+        if self.pages[self.pages(offset, bytes)?]
+            .iter()
+            .any(|page| page.pins == FREED || (page.guest == 0 && page.pins == 0))
+        {
+            return Err(MemoryError::Invalid("physical range has retired"));
+        }
+        Ok(())
+    }
     pub fn can_release_guest_without_accounting(&self, offset: u64, bytes: u64) -> bool {
         self.pages[self.pages(offset, bytes).expect("live guest lease")]
             .iter()
@@ -211,15 +220,22 @@ impl AllocationRecord {
             })
     }
     pub fn pin(self: &Arc<Self>, offset: u64, bytes: u64) -> Result<AllocationPin, MemoryError> {
+        Ok(AllocationPin(Arc::new(self.pin_unshared(offset, bytes)?)))
+    }
+    pub fn pin_unshared(
+        self: &Arc<Self>,
+        offset: u64,
+        bytes: u64,
+    ) -> Result<PhysicalPin, MemoryError> {
         self.references
             .lock()
             .unwrap()
             .retain(offset, bytes, Reference::Pin)?;
-        Ok(AllocationPin(Arc::new(PhysicalPin {
+        Ok(PhysicalPin {
             record: Arc::clone(self),
             offset,
             bytes,
-        })))
+        })
     }
     pub fn physical_ranges(&self, ranges: &[Range<u64>]) -> Vec<Extent> {
         let mut physical: Vec<Extent> = Vec::new();
@@ -420,6 +436,10 @@ mod tests {
         let allocation = account.allocate(4 * PAGE_SIZE).unwrap();
         let weak = allocation.pin().downgrade();
         let input = allocation.pin_range(2 * PAGE_SIZE + 3, 7).unwrap();
+        let mut snapshot = [0xff; 7];
+        weak.capture_stream(2 * PAGE_SIZE + 3, &mut snapshot)
+            .unwrap();
+        assert_eq!(snapshot, [0; 7]);
         drop(allocation);
         assert_eq!(account.used_bytes(), 0);
         assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
@@ -429,6 +449,23 @@ mod tests {
         assert!(weak.upgrade().is_none());
         assert!(weak.upgrade_range(0, PAGE_SIZE).is_none());
         assert!(weak.upgrade_range(2 * PAGE_SIZE, PAGE_SIZE).is_some());
+        weak.capture_stream(2 * PAGE_SIZE + 3, &mut snapshot)
+            .unwrap();
+        assert!(weak.capture_stream(0, &mut snapshot).is_err());
+        let mut rejected = [0x6a; 8];
+        assert!(
+            weak.capture_stream(2 * PAGE_SIZE - 4, &mut rejected)
+                .is_err()
+        );
+        assert_eq!(rejected, [0x6a; 8], "retired prefix must not be copied");
+        assert!(
+            weak.capture_stream(3 * PAGE_SIZE - 4, &mut rejected)
+                .is_err()
+        );
+        assert_eq!(
+            rejected, [0x6a; 8],
+            "retired suffix must reject the whole input"
+        );
         assert!(input.pin_range(2 * PAGE_SIZE + 4, 2).is_ok());
         assert!(input.pin_range(2 * PAGE_SIZE, PAGE_SIZE).is_err());
         drop(input);
@@ -436,6 +473,65 @@ mod tests {
         assert_eq!(machine.statistics().allocated_bytes, 3 * PAGE_SIZE);
         drop(replacement);
         assert_eq!(machine.statistics().allocated_bytes, 0);
+    }
+
+    #[test]
+    fn blocked_stream_releases_reference_lock_and_retains_its_input_without_guest_charge() {
+        use std::time::{Duration, Instant};
+
+        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
+        let account = machine.account(2 * PAGE_SIZE).unwrap();
+        let allocation = account.allocate(PAGE_SIZE).unwrap();
+        allocation
+            .write(0, &[0x41; 32])
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        let weak = allocation.pin().downgrade();
+        let record = Arc::clone(&allocation.ownership.record);
+        let extent = record.physical_extents(0, PAGE_SIZE).next().unwrap();
+        // This test is the sole physical-protection writer. Keeping the guest
+        // alive until the reader promotes prevents an overlapping retirement.
+        let closed = machine.physical_access().close(&[extent]);
+        closed.wait();
+        let worker = std::thread::spawn(move || {
+            let mut bytes = [0; 32];
+            weak.capture_stream(0, &mut bytes).unwrap();
+            bytes
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let promoted = loop {
+            if let Ok(references) = record.references.try_lock()
+                && references.pages[0].pins == 1
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        if !promoted {
+            // A regressed reader must still be allowed to exit before failing.
+            drop(closed);
+            worker.join().unwrap();
+            panic!("blocked stream held reference counts or failed to retain its input");
+        }
+        drop(allocation);
+        assert_eq!(account.used_bytes(), 0);
+        assert_eq!(machine.statistics().retained_bytes, PAGE_SIZE);
+        let replacement = account.allocate(PAGE_SIZE).unwrap();
+        let replacement_extent = replacement
+            .physical_extents(0, PAGE_SIZE)
+            .unwrap()
+            .next()
+            .unwrap();
+        assert_ne!(replacement_extent.start, extent.start);
+        drop(closed);
+        assert_eq!(worker.join().unwrap(), [0x41; 32]);
+        assert_eq!(machine.statistics().retained_bytes, 0);
+        assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
+        assert!(record.pin(0, PAGE_SIZE).is_err());
     }
 
     #[test]

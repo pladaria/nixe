@@ -1,5 +1,9 @@
 use super::*;
 use crate::engines::MaxwellShaderBufferSize;
+use crate::engines::threed::{
+    MaxwellThreeDDrawResourceSlots, MaxwellThreeDResolvedResourceCache,
+    MaxwellThreeDResourceSelection,
+};
 
 #[test]
 fn three_d_embedded_inline_upload_covers_captured_block_linear_gob_row() {
@@ -203,36 +207,36 @@ fn operation_resource_scope_ignores_an_unreferenced_contradictory_vertex_stream(
 
     let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
     let operation = &dispatch.operations()[0];
-    let mut roles = Vec::new();
-    operation
-        .trigger()
-        .append_resource_roles(operation.state(), &mut roles);
-    assert!(roles.is_empty());
-    let resources = fixture_roles(
-        operation.state(),
-        address_space.memory(),
-        &roles,
-        &mut crate::test_memory::access(address_space.memory().machine()),
-    )
-    .unwrap();
+    let slots = operation.trigger().resource_slots(operation.state(), 1);
+    assert_eq!(slots, MaxwellThreeDDrawResourceSlots::default());
+    let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
+    let resources = cache
+        .select(&MaxwellThreeDResourceSelection::default(), slots)
+        .resolve(
+            operation.state(),
+            address_space.memory(),
+            4096,
+            &mut crate::test_memory::access(address_space.memory().machine()),
+        )
+        .unwrap();
     assert!(resources.resources().next().is_none());
 
     let mut consumed = channel;
     program_three_d(&mut consumed, 0x1160, 0x3840_0000);
     let dispatch = dispatch_method(&mut consumed, 0x0d78 / 4, 3).unwrap();
     let operation = &dispatch.operations()[0];
-    let mut roles = Vec::new();
-    operation
-        .trigger()
-        .append_resource_roles(operation.state(), &mut roles);
-    assert_eq!(roles, [MaxwellThreeDResourceRole::VertexStream(0)]);
+    let slots = operation.trigger().resource_slots(operation.state(), 1);
+    assert_eq!(slots.geometry, 1);
+    assert_eq!(slots.attachments, 0);
     assert!(matches!(
-        fixture_roles(
-            operation.state(),
-            address_space.memory(),
-            &roles,
-            &mut crate::test_memory::access(address_space.memory().machine())
-        ),
+        cache
+            .select(&MaxwellThreeDResourceSelection::default(), slots)
+            .resolve(
+                operation.state(),
+                address_space.memory(),
+                4096,
+                &mut crate::test_memory::access(address_space.memory().machine())
+            ),
         Err(MaxwellThreeDResourceError::ContradictoryState {
             role: MaxwellThreeDResourceRole::VertexStream(0),
         })
@@ -1174,7 +1178,7 @@ fn compute_shader_memory_state_is_typed_source_preserving_and_atomic() {
         (0x02f0, 0x100, 0xff),
         (0x02f8, 0x200, 0x1ff),
     ] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let compute_before = channel.compute().clone();
         let decoded = packet_on_subchannel(1, method / 4, argument);
         assert!(matches!(
@@ -1185,11 +1189,11 @@ fn compute_shader_memory_state_is_typed_source_preserving_and_atomic() {
                 ..
             }) if source.argument() == argument && defined_mask == mask
         ));
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.compute(), &compute_before);
     }
 
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let compute_before = channel.compute().clone();
     let decoded = incrementing_packet_on_subchannel(1, 0x02e4 / 4, &[1, 2, 0x200]);
     assert!(matches!(
@@ -1197,7 +1201,7 @@ fn compute_shader_memory_state_is_typed_source_preserving_and_atomic() {
         Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
             if source.method() == GpuMethodId(0x02ec)
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_ne!(channel.compute(), &compute_before);
 }
 
@@ -1310,7 +1314,7 @@ fn compute_program_state_is_typed_source_preserving_and_atomic() {
         assert_eq!(channel.compute(), &compute_before);
     }
 
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let compute_before = channel.compute().clone();
     let decoded = non_incrementing_packet_on_subchannel(1, 0x0310 / 4, &[0x0501, 0x1_0000]);
     assert!(matches!(
@@ -1319,7 +1323,7 @@ fn compute_program_state_is_typed_source_preserving_and_atomic() {
             if source.method() == GpuMethodId(0x0310)
                 && source.argument() == 0x1_0000
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_ne!(channel.compute(), &compute_before);
 }
 
@@ -1380,7 +1384,7 @@ fn compute_descriptor_pools_are_typed_source_preserving_and_atomic() {
         assert_eq!(channel.compute(), &compute_before);
     }
 
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let compute_before = channel.compute().clone();
     let invalid_header =
         incrementing_packet_on_subchannel(1, 0x1574 / 4, &[5, 0x1234_0000, 0x0040_0000]);
@@ -1389,7 +1393,7 @@ fn compute_descriptor_pools_are_typed_source_preserving_and_atomic() {
         Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
             if source.method() == GpuMethodId(0x157c)
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_ne!(channel.compute(), &compute_before);
 }
 
@@ -1426,14 +1430,14 @@ fn compute_bindless_texture_slot_is_typed_source_preserving_and_atomic() {
     ));
     assert_eq!(channel.compute(), &compute_before);
 
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let invalid_packet = non_incrementing_packet_on_subchannel(1, 0x2608 / 4, &[6, 8]);
     assert!(matches!(
         dispatch_first(&mut channel, &invalid_packet),
         Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
             if source.argument() == 8
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_ne!(channel.compute(), &compute_before);
 }
 
@@ -1553,7 +1557,7 @@ fn compute_inline_to_memory_pitch_upload_is_typed_ordered_and_atomic() {
 
     let short = packet_on_subchannel(1, 0x0180 / 4, 4);
     dispatch_first(&mut channel, &short).unwrap();
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let compute_before = channel.compute().clone();
     let excessive =
         increment_once_packet_on_subchannel(1, 0x01b0 / 4, &[0x41, 0x1122_3344, 0x5566_7788]);
@@ -1565,7 +1569,7 @@ fn compute_inline_to_memory_pitch_upload_is_typed_ordered_and_atomic() {
             ..
         }) if source.argument() == 0x5566_7788
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_ne!(channel.compute(), &compute_before);
 
     let after_prefix = channel.compute().clone();
@@ -1623,7 +1627,7 @@ fn compute_shader_cache_invalidation_is_typed_ordered_and_atomic() {
     assert!(captured.constant());
     assert_eq!(channel.compute(), &compute_before);
 
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let invalid = non_incrementing_packet_on_subchannel(1, 0x1698 / 4, &[0x1000, 0x1002]);
     assert!(matches!(
         dispatch_first(&mut channel, &invalid),
@@ -1633,7 +1637,7 @@ fn compute_shader_cache_invalidation_is_typed_ordered_and_atomic() {
             ..
         }) if source.argument() == 0x1002
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.compute(), &compute_before);
 }
 
@@ -1736,7 +1740,7 @@ fn compute_cwd_reference_counter_bank_is_typed_source_preserving_and_atomic() {
         assert_eq!(channel.compute(), &compute_before);
     }
 
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let compute_before = channel.compute().clone();
     let invalid_packet = non_incrementing_packet_on_subchannel(1, 0x0248 / 4, &[0x0012_343f, 0x40]);
     assert!(matches!(
@@ -1744,14 +1748,14 @@ fn compute_cwd_reference_counter_bank_is_typed_source_preserving_and_atomic() {
         Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
             if source.argument() == 0x40
     ));
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_ne!(channel.compute(), &compute_before);
 }
 
 #[test]
 fn compute_wait_for_idle_is_an_ordered_neutral_operation() {
     let mut channel = compute_channel();
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let compute_before = channel.compute().clone();
     let three_d_before = channel.three_d().clone();
     let two_d_before = channel.two_d().clone();
@@ -1784,7 +1788,7 @@ fn compute_wait_for_idle_is_an_ordered_neutral_operation() {
             }
         );
     }
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.compute(), &compute_before);
     assert!(
         three_d_before
@@ -1831,7 +1835,10 @@ fn render_target_discard_is_a_validated_non_destructive_hint() {
             );
             assert!(draw.matches(channel.three_d()));
             assert!(shaders.matches_code(channel.three_d()));
-            assert!(resources.matches(channel.three_d()));
+            assert!(resources.matches(
+                channel.three_d(),
+                MaxwellThreeDResourceRole::DepthStencilTarget
+            ));
         }
     }
     for raw in [2, 4, 8, 0x80, 0x100, u32::MAX] {
@@ -1945,7 +1952,7 @@ fn pixel_shader_barriers_preserve_source_and_do_not_mutate_draw_state() {
 fn three_d_wait_for_idle_is_an_ordered_neutral_operation() {
     let mut channel = three_d_channel();
     use_mme_shadow_passthrough(&mut channel);
-    let frontend_before = channel.frontend();
+    let frontend_before = *channel.frontend();
     let compute_before = channel.compute().clone();
     let three_d_before = channel.three_d().clone();
     let two_d_before = channel.two_d().clone();
@@ -1987,7 +1994,7 @@ fn three_d_wait_for_idle_is_an_ordered_neutral_operation() {
             })
         );
     }
-    assert_eq!(channel.frontend(), frontend_before);
+    assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.compute(), &compute_before);
     assert!(
         three_d_before
@@ -2659,7 +2666,7 @@ fn three_d_completion_reserved_bits_fail_without_register_state_writes() {
         (0x1144, 0, 2, 0x0000_0001),
         (0x02c8, 0x0011_0001, 0x0011_1001, 0x0011_0fff),
     ] {
-        let frontend_before = channel.frontend();
+        let frontend_before = *channel.frontend();
         let three_d_before = channel.three_d().clone();
         let packet = non_incrementing_packet_on_subchannel(0, method / 4, &[valid, invalid]);
         assert!(matches!(
@@ -2670,7 +2677,7 @@ fn three_d_completion_reserved_bits_fail_without_register_state_writes() {
                 ..
             }) if source.argument() == invalid && defined_mask == mask
         ));
-        assert_eq!(channel.frontend(), frontend_before);
+        assert_eq!(channel.frontend(), &frontend_before);
         assert!(
             three_d_before
                 .draw_state_identity()
@@ -2881,7 +2888,13 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
     let role = MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 };
     let mut cache = super::super::threed::MaxwellThreeDResolvedResourceCache::default();
     let first = cache
-        .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(0x40))])
+        .select(
+            &MaxwellThreeDResourceSelection::new(
+                &[role],
+                &[(role, MaxwellShaderBufferSize::Proven(0x40))],
+            ),
+            Default::default(),
+        )
         .resolve(
             channel.three_d(),
             space.memory(),
@@ -2892,7 +2905,13 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
         .clone();
     for (iteration, end) in [0x40_u64, 0x80, 0x40].into_iter().enumerate() {
         let resolved = cache
-            .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(end))])
+            .select(
+                &MaxwellThreeDResourceSelection::new(
+                    &[role],
+                    &[(role, MaxwellShaderBufferSize::Proven(end))],
+                ),
+                Default::default(),
+            )
             .resolve(
                 channel.three_d(),
                 space.memory(),
@@ -2914,7 +2933,13 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
     }
     assert!(
         cache
-            .select(&[role], &[(role, MaxwellShaderBufferSize::Declared)])
+            .select(
+                &MaxwellThreeDResourceSelection::new(
+                    &[role],
+                    &[(role, MaxwellShaderBufferSize::Declared)]
+                ),
+                Default::default()
+            )
             .resolve(
                 channel.three_d(),
                 space.memory(),
@@ -2926,7 +2951,13 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
     );
     assert!(
         cache
-            .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(0x1004))])
+            .select(
+                &MaxwellThreeDResourceSelection::new(
+                    &[role],
+                    &[(role, MaxwellShaderBufferSize::Proven(0x1004))]
+                ),
+                Default::default()
+            )
             .resolve(
                 channel.three_d(),
                 space.memory(),
@@ -2938,7 +2969,10 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
     );
     assert!(
         cache
-            .select(&[role], &[])
+            .select(
+                &MaxwellThreeDResourceSelection::new(&[role], &[]),
+                Default::default()
+            )
             .resolve(
                 channel.three_d(),
                 space.memory(),
@@ -2983,7 +3017,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
     let sizes = [(role, MaxwellShaderBufferSize::Declared)];
     let mut cache = super::super::threed::MaxwellThreeDResolvedResourceCache::default();
     let first = cache
-        .select(&[role], &sizes)
+        .select(
+            &MaxwellThreeDResourceSelection::new(&[role], &sizes),
+            Default::default(),
+        )
         .resolve(
             channel.three_d(),
             space.memory(),
@@ -2993,7 +3030,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
         .unwrap()
         .clone();
     let repeated = cache
-        .select(&[role], &sizes)
+        .select(
+            &MaxwellThreeDResourceSelection::new(&[role], &sizes),
+            Default::default(),
+        )
         .resolve(
             channel.three_d(),
             space.memory(),
@@ -3017,7 +3057,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
     // so the already prepared bindings remain reusable.
     crate::test_memory::write(&cb, 0x800, &[7]).unwrap();
     let refreshed = cache
-        .select(&[role], &sizes)
+        .select(
+            &MaxwellThreeDResourceSelection::new(&[role], &sizes),
+            Default::default(),
+        )
         .resolve(
             channel.three_d(),
             space.memory(),
@@ -3028,7 +3071,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
         .clone();
     assert!((first == refreshed));
     let clean = cache
-        .select(&[role], &sizes)
+        .select(
+            &MaxwellThreeDResourceSelection::new(&[role], &sizes),
+            Default::default(),
+        )
         .resolve(
             channel.three_d(),
             space.memory(),
@@ -3045,7 +3091,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
     )
     .unwrap();
     let changed = cache
-        .select(&[role], &sizes)
+        .select(
+            &MaxwellThreeDResourceSelection::new(&[role], &sizes),
+            Default::default(),
+        )
         .resolve(
             channel.three_d(),
             space.memory(),
@@ -3058,7 +3107,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
     assert_eq!(buffer(&first), (data_mapping.offset().get(), 128));
     crate::test_memory::write(&cb, 0x110, &descriptor(data_mapping.offset().get(), 128)).unwrap();
     let restored = cache
-        .select(&[role], &sizes)
+        .select(
+            &MaxwellThreeDResourceSelection::new(&[role], &sizes),
+            Default::default(),
+        )
         .resolve(
             channel.three_d(),
             space.memory(),
@@ -3069,7 +3121,13 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
         .clone();
     assert_eq!(buffer(&restored), (data_mapping.offset().get(), 128));
     let bounded = cache
-        .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(4))])
+        .select(
+            &MaxwellThreeDResourceSelection::new(
+                &[role],
+                &[(role, MaxwellShaderBufferSize::Proven(4))],
+            ),
+            Default::default(),
+        )
         .resolve(
             channel.three_d(),
             space.memory(),
@@ -3082,7 +3140,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
     crate::test_memory::write(&cb, 0x118, &0_u32.to_le_bytes()).unwrap();
     assert!(
         cache
-            .select(&[role], &sizes)
+            .select(
+                &MaxwellThreeDResourceSelection::new(&[role], &sizes),
+                Default::default()
+            )
             .resolve(
                 channel.three_d(),
                 space.memory(),
@@ -3092,7 +3153,13 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             .is_err()
     );
     let before_remap = cache
-        .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(4))])
+        .select(
+            &MaxwellThreeDResourceSelection::new(
+                &[role],
+                &[(role, MaxwellShaderBufferSize::Proven(4))],
+            ),
+            Default::default(),
+        )
         .resolve(
             channel.three_d(),
             space.memory(),
@@ -3129,7 +3196,13 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
         })
         .unwrap();
     let remapped_bounded = cache
-        .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(4))])
+        .select(
+            &MaxwellThreeDResourceSelection::new(
+                &[role],
+                &[(role, MaxwellShaderBufferSize::Proven(4))],
+            ),
+            Default::default(),
+        )
         .resolve(
             channel.three_d(),
             space.memory(),
@@ -3144,7 +3217,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
         (data_mapping.offset().get() + 128, 4)
     );
     let remapped = cache
-        .select(&[role], &sizes)
+        .select(
+            &MaxwellThreeDResourceSelection::new(&[role], &sizes),
+            Default::default(),
+        )
         .resolve(
             channel.three_d(),
             space.memory(),

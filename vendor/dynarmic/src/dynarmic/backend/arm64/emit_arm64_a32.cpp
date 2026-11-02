@@ -31,7 +31,12 @@ oaknut::Label EmitA32Cond(oaknut::CodeGenerator& code, EmitContext&, IR::Cond co
     return pass;
 }
 
-void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Terminal terminal, IR::LocationDescriptor initial_location, bool is_single_step);
+void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, const IR::Term::Terminal& terminal, IR::LocationDescriptor initial_location, bool is_single_step);
+void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, const IR::Term::LeafTerminal& terminal, IR::LocationDescriptor initial_location, bool is_single_step);
+
+void EmitA32Terminal(oaknut::CodeGenerator&, EmitContext&, IR::Term::Invalid, IR::LocationDescriptor, bool) {
+    ASSERT_FALSE("Invalid terminal");
+}
 
 void EmitA32Terminal(oaknut::CodeGenerator&, EmitContext&, IR::Term::Interpret, IR::LocationDescriptor, bool) {
     ASSERT_FALSE("Interpret should never be emitted.");
@@ -149,8 +154,12 @@ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Ch
     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
 }
 
-void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Terminal terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
-    boost::apply_visitor([&](const auto& t) { EmitA32Terminal(code, ctx, t, initial_location, is_single_step); }, terminal);
+void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, const IR::Term::LeafTerminal& terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    std::visit([&](const auto& t) { EmitA32Terminal(code, ctx, t, initial_location, is_single_step); }, terminal);
+}
+
+void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, const IR::Term::Terminal& terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    std::visit([&](const auto& t) { EmitA32Terminal(code, ctx, t, initial_location, is_single_step); }, terminal);
 }
 
 void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx) {

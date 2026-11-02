@@ -18,7 +18,6 @@
 #include "dynarmic/backend/x64/perf_map.h"
 #include "dynarmic/backend/x64/stack_layout.h"
 #include "dynarmic/backend/x64/verbose_debugging_output.h"
-#include "dynarmic/common/variant_util.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/microinstruction.h"
 #include "dynarmic/ir/opcodes.h"
@@ -30,18 +29,22 @@ namespace Dynarmic::Backend::X64 {
 
 using namespace Xbyak::util;
 
-EmitContext::EmitContext(RegAlloc& reg_alloc, IR::Block& block)
-        : reg_alloc(reg_alloc), block(block) {}
+EmitContext::EmitContext(RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits)
+        : reg_alloc(reg_alloc), block(block), deferred_emits(deferred_emits), labels(labels) {
+    DEBUG_ASSERT(deferred_emits.empty());
+}
 
-EmitContext::~EmitContext() = default;
+EmitContext::~EmitContext() {
+    deferred_emits.clear();
+}
 
 void EmitContext::EraseInstruction(IR::Inst* inst) {
     block.Instructions().erase(inst);
     inst->ClearArgs();
 }
 
-EmitX64::EmitX64(BlockOfCode& code)
-        : code(code) {
+EmitX64::EmitX64(BlockOfCode& code, HostLocSet gpr_candidates)
+        : code(code), reg_alloc(code, gpr_candidates, any_xmm) {
     exception_handler.Register(code);
 }
 
@@ -343,15 +346,25 @@ EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& de
     return block_desc;
 }
 
-void EmitX64::EmitTerminal(IR::Terminal terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
-    Common::VisitVariant<void>(terminal, [this, initial_location, is_single_step](auto x) {
+void EmitX64::EmitTerminal(const IR::Terminal& terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    std::visit([this, initial_location, is_single_step](const auto& x) {
         using T = std::decay_t<decltype(x)>;
-        if constexpr (!std::is_same_v<T, IR::Term::Invalid>) {
+        if constexpr (std::is_same_v<T, IR::Term::LeafTerminal>) {
+            EmitTerminal(x, initial_location, is_single_step);
+        } else if constexpr (!std::is_same_v<T, IR::Term::Invalid>) {
             this->EmitTerminalImpl(x, initial_location, is_single_step);
         } else {
             ASSERT_MSG(false, "Invalid terminal");
         }
-    });
+    },
+               terminal);
+}
+
+void EmitX64::EmitTerminal(const IR::Term::LeafTerminal& terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    std::visit([this, initial_location, is_single_step](const auto& x) {
+        EmitTerminalImpl(x, initial_location, is_single_step);
+    },
+               terminal);
 }
 
 void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {

@@ -4,8 +4,6 @@
 //! commit `9fdf5c4062007929d9f4e6cbad9c9771fe61b880`:
 //! https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
 
-use crate::MaxwellMethodSource;
-
 use super::state::MaxwellThreeDRegister;
 
 pub const MAXWELL_VERTEX_STREAM_COUNT: usize = 32;
@@ -853,16 +851,4 @@ impl<'a> MaxwellThreeDVertexInputState<'a> {
             sequence: self.sequence,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDVertexInputWrite {
-    Begin {
-        value: MaxwellThreeDBegin,
-        source: MaxwellMethodSource,
-    },
-    End {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
 }

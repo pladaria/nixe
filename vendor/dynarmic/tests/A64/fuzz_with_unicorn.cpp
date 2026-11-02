@@ -39,7 +39,8 @@ static bool ShouldTestInst(u32 instruction, u64 pc, bool is_last_inst) {
     bool should_continue = A64::TranslateSingleInstruction(block, location, instruction);
     if (!should_continue && !is_last_inst)
         return false;
-    if (auto terminal = block.GetTerminal(); boost::get<IR::Term::Interpret>(&terminal))
+    const auto* leaf = std::get_if<IR::Term::LeafTerminal>(&block.GetTerminal());
+    if (leaf && std::holds_alternative<IR::Term::Interpret>(*leaf))
         return false;
     for (const auto& ir_inst : block) {
         switch (ir_inst.GetOpcode()) {

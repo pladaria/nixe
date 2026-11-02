@@ -687,8 +687,8 @@ mod native_tests {
     #[test]
     fn compute_texture_arrays_consume_qmd_handles_and_refresh_changed_descriptors() {
         use crate::engines::threed::{
-            MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResourceCache,
-            MaxwellThreeDResourceRole,
+            MaxwellThreeDResolvedBinding, MaxwellThreeDResolvedResource,
+            MaxwellThreeDResolvedResourceCache,
         };
         use nixe_shader_recompiler::{
             artifact::{ShaderInfo, TextureDescriptor},
@@ -790,17 +790,15 @@ mod native_tests {
             let images = textures
                 .bindings
                 .iter()
-                .filter_map(|(_, role)| {
-                    let MaxwellThreeDResourceRole::SampledImage { .. } = role else {
-                        return None;
-                    };
-                    let Some(MaxwellThreeDResolvedResource::Image { view: image, .. }) =
-                        textures.resources.resource(*role)
-                    else {
-                        panic!("sampled image expected")
-                    };
-                    Some(image.source().offset().get())
-                })
+                .filter_map(
+                    |(_, location)| match textures.resources.binding_at(*location) {
+                        Some(MaxwellThreeDResolvedBinding::Resource(
+                            MaxwellThreeDResolvedResource::Image { view: image, .. },
+                        )) => Some(image.source().offset().get()),
+                        Some(MaxwellThreeDResolvedBinding::Sampler(_)) => None,
+                        _ => panic!("resolved compute texture binding expected"),
+                    },
+                )
                 .collect::<Vec<_>>();
             assert_eq!(images, [base + 0x600, base + 0x400]);
             let refresh = |resources: &mut ComputeResources,

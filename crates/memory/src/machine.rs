@@ -182,6 +182,21 @@ pub struct Allocation {
 #[derive(Clone)]
 pub struct AllocationPin(Arc<PhysicalPin>);
 
+/// One owner's live, contiguous RAM input. The physical lease moves with the
+/// command cursor across suspension; it needs no separately allocated Arc pin.
+pub struct RamSource {
+    address: crate::HostAddress,
+    _pin: PhysicalPin,
+}
+impl RamSource {
+    /// Raw owner reads must remain within this retained source. Effects can
+    /// change coherence later, exactly as for a native command stream; this is
+    /// neither a byte snapshot nor a CPU visibility grant.
+    pub fn address(&self) -> crate::HostAddress {
+        self.address
+    }
+}
+
 /// Cached metadata does not keep physical RAM alive after guest ownership and
 /// actual captured requests have gone. Native device/upload handles retain
 /// their own storage instead of retaining these emulated RAM bytes.
@@ -613,6 +628,97 @@ impl Allocation {
 impl WeakAllocation {
     pub fn upgrade_range(&self, offset: u64, bytes: u64) -> Option<AllocationPin> {
         self.record.upgrade()?.pin(offset, bytes).ok()
+    }
+    /// Select RAM-current command bytes without shared pin allocation. The
+    /// graphics owner keeps the returned source until its final raw read.
+    /// Eden's DMA pusher likewise owns the accepted input through consumption.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp
+    pub fn try_ram_source(
+        &self,
+        offset: u64,
+        bytes: u64,
+    ) -> Result<Option<RamSource>, MemoryError> {
+        let record = self
+            .record
+            .upgrade()
+            .ok_or(MemoryError::Invalid("RAM source allocation has retired"))?;
+        let pin = record.pin_unshared(offset, bytes)?;
+        let address = {
+            let mut extents = record.physical_extents(offset, bytes);
+            let Some(extent) = extents.next() else {
+                return Ok(None);
+            };
+            if extents.next().is_some() {
+                return Ok(None);
+            }
+            let _access = record.machine.physical_access().enter(extent);
+            if record.machine.has_device_pages(extent) {
+                return Ok(None);
+            }
+            record
+                .machine
+                .arena()
+                .host_address(extent.start, extent.bytes)
+        };
+        Ok(address.map(|address| RamSource { address, _pin: pin }))
+    }
+    /// Borrow live RAM only through this synchronous streaming copy. Actual
+    /// escaping inputs still retain their own physical leases. Eden likewise
+    /// copies fast uniforms directly into their mapped upload destination.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+    pub fn capture_stream(&self, offset: u64, destination: &mut [u8]) -> Result<(), MemoryError> {
+        if destination.is_empty() {
+            return Ok(());
+        }
+        let record = self
+            .record
+            .upgrade()
+            .ok_or(MemoryError::Invalid("streaming allocation has retired"))?;
+        let bytes = destination.len() as u64;
+        if offset
+            .checked_add(bytes)
+            .is_none_or(|end| end > record.bytes)
+        {
+            return Err(MemoryError::Invalid(
+                "reference exceeds its physical allocation",
+            ));
+        }
+        let mut references = record.references.lock().unwrap();
+        references.check_live(offset, bytes)?;
+        // Keeping this guard through the copy prevents the last guest or pin
+        // reference from reaching zero. No transient page counts are needed.
+        let mut copied = 0;
+        for extent in record.physical_extents(offset, bytes) {
+            let Some(_access) = record.machine.physical_access().try_enter(extent) else {
+                // Waiting must release the reference lock. Promote the live
+                // input to an owned lease before letting a final guest/pin
+                // release retire it, then use ordinary retained admission.
+                references.retain(offset, bytes, Reference::Pin)?;
+                let _pin = PhysicalPin {
+                    record: Arc::clone(&record),
+                    offset,
+                    bytes,
+                };
+                drop(references);
+                // SAFETY: the promoted lease retains the entire input. This
+                // path can wait without holding its reference-count lock.
+                return unsafe {
+                    record
+                        .machine
+                        .capture_stream_extents(record.physical_extents(offset, bytes), destination)
+                };
+            };
+            let count = extent.bytes as usize;
+            // SAFETY: admission covers this extent and the live reference
+            // counts remain locked until all synchronous reads finish.
+            unsafe {
+                record
+                    .machine
+                    .capture_stream_admitted(extent, &mut destination[copied..copied + count]);
+            }
+            copied += count;
+        }
+        Ok(())
     }
 }
 impl AllocationPin {

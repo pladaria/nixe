@@ -502,12 +502,11 @@ fn tiled_alias_batches_a_partial_rectangle() {
         )
         .unwrap();
     cache
-        .copy_image_region(
+        .copy_image_regions(
             b,
-            0,
-            transfers::full_rect(plane),
             destination,
-            0,
+            &[(0, 0)],
+            transfers::full_rect(plane),
             Default::default(),
         )
         .unwrap();
@@ -590,12 +589,11 @@ fn decoded_image_uploads_one_rectangle_per_plane() {
         )
         .unwrap();
     cache
-        .copy_image_region(
+        .copy_image_regions(
             image,
-            0,
-            transfers::full_rect(native_plane),
             destination,
-            0,
+            &[(0, 0)],
+            transfers::full_rect(native_plane),
             Default::default(),
         )
         .unwrap();
@@ -716,9 +714,10 @@ mod visibility {
             .image_for_device_write(geometry, description, planes)
             .unwrap();
         residency
-            .copy_image_region(
+            .copy_image_regions(
                 target,
-                0,
+                destination,
+                &[(0, 0)],
                 vk::Rect2D {
                     offset: vk::Offset2D::default(),
                     extent: vk::Extent2D {
@@ -726,8 +725,6 @@ mod visibility {
                         height: 9,
                     },
                 },
-                destination,
-                0,
                 vk::Offset2D::default(),
             )
             .unwrap();

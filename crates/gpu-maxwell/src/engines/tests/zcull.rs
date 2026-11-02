@@ -31,7 +31,10 @@ fn zcull_maintenance_never_clears_the_attachment_or_invalidates_prepared_draws()
             assert!(
                 before
                     .resource_state_identity(MaxwellThreeDResourceRole::DepthStencilTarget)
-                    .matches(channel.three_d())
+                    .matches(
+                        channel.three_d(),
+                        MaxwellThreeDResourceRole::DepthStencilTarget
+                    )
             );
             assert!(draw.matches(channel.three_d()));
         }
@@ -63,7 +66,10 @@ fn mme_can_clear_zcull_conservatively_without_emitting_an_attachment_clear() {
     assert!(
         before
             .resource_state_identity(MaxwellThreeDResourceRole::DepthStencilTarget)
-            .matches(channel.three_d())
+            .matches(
+                channel.three_d(),
+                MaxwellThreeDResourceRole::DepthStencilTarget
+            )
     );
     assert!(draw.matches(channel.three_d()));
 }
@@ -77,7 +83,10 @@ fn clearing_zcull_statistics_does_not_clear_depth_or_other_counters() {
     assert!(
         before
             .resource_state_identity(MaxwellThreeDResourceRole::DepthStencilTarget)
-            .matches(channel.three_d())
+            .matches(
+                channel.three_d(),
+                MaxwellThreeDResourceRole::DepthStencilTarget
+            )
     );
     assert!(dispatch_method(&mut channel, 0x1530 / 4, 1).is_err());
 }

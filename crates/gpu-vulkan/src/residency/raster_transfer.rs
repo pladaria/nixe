@@ -110,7 +110,7 @@ impl VulkanResidency {
             .color_attachment(0)
             .clear_value(value);
         self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.begin_rendering(&info);
+            device.dispatch.begin_rendering(&info, Default::default());
             device.dispatch.cmd_clear_attachments(
                 &[clear],
                 &[vk::ClearRect::default()
@@ -130,77 +130,80 @@ impl VulkanResidency {
     pub fn blit_image(
         &mut self,
         source: ImageId,
-        source_plane: usize,
-        source_rect: vk::Rect2D,
         destination: ImageId,
-        destination_plane: usize,
+        planes: &[(usize, usize)],
+        source_rect: vk::Rect2D,
         destination_rect: vk::Rect2D,
         filter: vk::Filter,
     ) -> Result<WorkTicket, VulkanError> {
-        let src = self.checked_image_rect(source, source_plane, source_rect)?;
-        let dst = self.checked_image_rect(destination, destination_plane, destination_rect)?;
-        // Equal-format, unscaled nearest transfers preserve encoded bits directly.
+        let descriptions = [
+            self.image(source)?.description,
+            self.image(destination)?.description,
+        ];
+        // Preserve encoded bits for equal-format, unscaled nearest transfers.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
         if source_rect.extent == destination_rect.extent
             && filter == vk::Filter::NEAREST
-            && self.image(source)?.description.format == self.image(destination)?.description.format
-            && self.image(source)?.description.samples == vk::SampleCountFlags::TYPE_1
-            && self.image(destination)?.description.samples == vk::SampleCountFlags::TYPE_1
+            && descriptions[0].format == descriptions[1].format
+            && descriptions
+                .iter()
+                .all(|d| d.samples == vk::SampleCountFlags::TYPE_1)
         {
-            return self.copy_image_region(
+            return self.copy_image_regions(
                 source,
-                source_plane,
-                source_rect,
                 destination,
-                destination_plane,
+                planes,
+                source_rect,
                 destination_rect.offset,
             );
         }
-        if source == destination
-            && src.mip_level == dst.mip_level
-            && src.array_layer == dst.array_layer
-            && src.depth_slice == dst.depth_slice
+        let selected =
+            self.transfer_planes(source, destination, planes, source_rect, destination_rect)?;
+        if descriptions
+            .iter()
+            .any(|d| d.samples != vk::SampleCountFlags::TYPE_1)
         {
             return Err(VulkanError::InvalidResource(
-                "same-subresource blit requires an explicit source snapshot",
+                "native blit requires single-sample images; multisample transfers require resolve or sample conversion",
             ));
         }
-        if src.aspect != dst.aspect
-            || src.block_extent
+        for &(src, dst) in &selected {
+            if source == destination
+                && selected
+                    .iter()
+                    .any(|(_, dst)| transfers::same_subresource(src, *dst))
+            {
+                return Err(VulkanError::InvalidResource(
+                    "same-subresource blit requires an explicit source snapshot",
+                ));
+            }
+            if src.block_extent
                 != (vk::Extent2D {
                     width: 1,
                     height: 1,
                 })
-            || dst.block_extent
-                != (vk::Extent2D {
-                    width: 1,
-                    height: 1,
-                })
-            || !matches!(filter, vk::Filter::NEAREST | vk::Filter::LINEAR)
-        {
-            return Err(VulkanError::InvalidResource(
-                "blit requires matching uncompressed aspects and nearest/linear filtering",
-            ));
+                || dst.block_extent
+                    != (vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    })
+                || !matches!(filter, vk::Filter::NEAREST | vk::Filter::LINEAR)
+            {
+                return Err(VulkanError::InvalidResource(
+                    "blit requires matching uncompressed aspects and nearest/linear filtering",
+                ));
+            }
+            if src.aspect != vk::ImageAspectFlags::COLOR
+                && (descriptions[0].format != descriptions[1].format
+                    || filter != vk::Filter::NEAREST)
+            {
+                return Err(VulkanError::InvalidResource(
+                    "depth/stencil blit requires equal native formats and nearest filtering",
+                ));
+            }
         }
-        let formats = [
-            self.image(source)?.description.format,
-            self.image(destination)?.description.format,
-        ];
-        if src.aspect != vk::ImageAspectFlags::COLOR
-            && (formats[0] != formats[1] || filter != vk::Filter::NEAREST)
-        {
-            return Err(VulkanError::InvalidResource(
-                "depth/stencil blit requires equal native formats and nearest filtering",
-            ));
-        }
-        for (index, format) in formats.into_iter().enumerate() {
-            let properties = unsafe {
-                self.device
-                    .owner
-                    .instance
-                    .instance
-                    .get_physical_device_format_properties(self.device.owner.physical, format)
-            };
+        for (index, description) in descriptions.into_iter().enumerate() {
+            let properties = self.device.format_properties(description.format);
             let needed = if index == 0 {
                 vk::FormatFeatureFlags::BLIT_SRC
                     | if filter == vk::Filter::LINEAR {
@@ -217,20 +220,25 @@ impl VulkanResidency {
                 ));
             }
         }
-        self.ensure_image_initialized(source, src, source_rect)?;
-        let writer = self.prepare_image_rect(destination, dst, destination_rect)?;
-        let (source, src_layout) = self.image_access_subresources(
+        for &(src, _) in &selected {
+            self.ensure_image_initialized(source, src, source_rect)?;
+        }
+        let mut writers = smallvec::SmallVec::<[WriterId; 2]>::new();
+        for &(_, dst) in &selected {
+            writers.push(self.prepare_image_rect(destination, dst, destination_rect)?);
+        }
+        let (source_handle, src_layout) = self.image_planes_access(
             source,
-            commands::plane_range(src),
+            selected.iter().map(|(src, _)| *src),
             AccessScope::new(
                 vk::PipelineStageFlags2::BLIT,
                 vk::AccessFlags2::TRANSFER_READ,
             ),
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         )?;
-        let (target, dst_layout) = self.image_access_subresources(
+        let (target, dst_layout) = self.image_planes_access(
             destination,
-            commands::plane_range(dst),
+            selected.iter().map(|(_, dst)| *dst),
             AccessScope::new(
                 vk::PipelineStageFlags2::BLIT,
                 vk::AccessFlags2::TRANSFER_WRITE,
@@ -251,24 +259,52 @@ impl VulkanResidency {
                 },
             ]
         };
-        let region = vk::ImageBlit::default()
-            .src_subresource(src.layers())
-            .dst_subresource(dst.layers())
-            .src_offsets(corners(source_rect, src.depth_slice))
-            .dst_offsets(corners(destination_rect, dst.depth_slice));
+        let mut regions = smallvec::SmallVec::<[vk::ImageBlit; 2]>::new();
+        for &(src, dst) in &selected {
+            let next = vk::ImageBlit::default()
+                .src_subresource(src.layers())
+                .dst_subresource(dst.layers())
+                .src_offsets(corners(source_rect, src.depth_slice))
+                .dst_offsets(corners(destination_rect, dst.depth_slice));
+            // A packed depth/stencil transfer shares the hardware operation,
+            // as TextureCacheRuntime::BlitImage does in the reference renderer.
+            // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdBlitImage.html
+            if let Some(previous) = regions.last_mut().filter(|previous| {
+                let aspects = vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL;
+                previous.src_subresource.aspect_mask | next.src_subresource.aspect_mask == aspects
+                    && previous.dst_subresource.aspect_mask | next.dst_subresource.aspect_mask
+                        == aspects
+                    && previous.src_subresource.mip_level == next.src_subresource.mip_level
+                    && previous.src_subresource.base_array_layer
+                        == next.src_subresource.base_array_layer
+                    && previous.src_subresource.layer_count == next.src_subresource.layer_count
+                    && previous.dst_subresource.mip_level == next.dst_subresource.mip_level
+                    && previous.dst_subresource.base_array_layer
+                        == next.dst_subresource.base_array_layer
+                    && previous.dst_subresource.layer_count == next.dst_subresource.layer_count
+                    && previous.src_offsets == next.src_offsets
+                    && previous.dst_offsets == next.dst_offsets
+            }) {
+                previous.src_subresource.aspect_mask |= next.src_subresource.aspect_mask;
+                previous.dst_subresource.aspect_mask |= next.dst_subresource.aspect_mask;
+            } else {
+                regions.push(next);
+            }
+        }
         self.barriers.emit(&mut self.device);
-        self.device.begin_recording()?;
-        self.publish_effect(&[writer], |device| unsafe {
+        self.publish_effect(&writers, |device| unsafe {
             device.dispatch.cmd_blit_image(
-                source,
+                source_handle,
                 src_layout,
                 target,
                 dst_layout,
-                &[region],
+                &regions,
                 filter,
             );
         })?;
-        self.finish_image_rect(destination, dst, destination_rect)?;
+        for &(_, dst) in &selected {
+            self.finish_image_rect(destination, dst, destination_rect)?;
+        }
         self.device.work_ticket()
     }
 }

@@ -52,10 +52,9 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
 }
 
 template<std::size_t bitsize, auto callback>
-void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst, const std::optional<DoNotFastmemMarker>& fastmem_marker) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const bool ordered = IsOrdered(args[2].GetImmediateAccType());
-    const auto fastmem_marker = ShouldFastmem(ctx, inst);
     const bool non_writing_ordered_read = ordered && bitsize != 128 && UseNonWritingOrderedReads(conf);
 
     if (!conf.page_table && !fastmem_marker) {
@@ -90,14 +89,14 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[1]);
     const int value_idx = bitsize == 128 ? ctx.reg_alloc.ScratchXmm().getIdx() : ctx.reg_alloc.ScratchGpr().getIdx();
 
-    const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
+    const auto wrapped_fn = read_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr.getIdx()][value_idx];
 
-    SharedLabel abort = GenSharedLabel(), end = GenSharedLabel();
+    const auto abort = ctx.GenLabel(), end = ctx.GenLabel();
 
     if (fastmem_marker) {
         // Use fastmem
         bool require_abort_handling;
-        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, inst->GetArg(1));
 
         if (non_writing_ordered_read) code.mfence();
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && !non_writing_ordered_read);
@@ -115,7 +114,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
                     conf.recompile_on_fastmem_failure,
                 });
 
-            EmitCheckMemoryAbort(ctx, inst, end.get());
+            EmitCheckMemoryAbort(ctx, inst, end);
             code.jmp(*end, code.T_NEAR);
         });
     } else {
@@ -128,7 +127,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
             code.call(wrapped_fn);
-            EmitCheckMemoryAbort(ctx, inst, end.get());
+            EmitCheckMemoryAbort(ctx, inst, end);
             code.jmp(*end, code.T_NEAR);
         });
     }
@@ -142,10 +141,9 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
 }
 
 template<std::size_t bitsize, auto callback>
-void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst, const std::optional<DoNotFastmemMarker>& fastmem_marker) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const bool ordered = IsOrdered(args[3].GetImmediateAccType());
-    const auto fastmem_marker = ShouldFastmem(ctx, inst);
 
     if (!conf.page_table && !fastmem_marker) {
         // Neither fastmem nor page table: Use callbacks
@@ -179,14 +177,14 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
                             ? ctx.reg_alloc.UseXmm(args[2]).getIdx()
                             : (ordered ? ctx.reg_alloc.UseScratchGpr(args[2]).getIdx() : ctx.reg_alloc.UseGpr(args[2]).getIdx());
 
-    const auto wrapped_fn = write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
+    const auto wrapped_fn = write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr.getIdx()][value_idx];
 
-    SharedLabel abort = GenSharedLabel(), end = GenSharedLabel();
+    const auto abort = ctx.GenLabel(), end = ctx.GenLabel();
 
     if (fastmem_marker) {
         // Use fastmem
         bool require_abort_handling;
-        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, inst->GetArg(1));
 
         const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
 
@@ -203,7 +201,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
                     conf.recompile_on_fastmem_failure,
                 });
 
-            EmitCheckMemoryAbort(ctx, inst, end.get());
+            EmitCheckMemoryAbort(ctx, inst, end);
             code.jmp(*end, code.T_NEAR);
         });
     } else {
@@ -215,7 +213,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
             code.call(wrapped_fn);
-            EmitCheckMemoryAbort(ctx, inst, end.get());
+            EmitCheckMemoryAbort(ctx, inst, end);
             code.jmp(*end, code.T_NEAR);
         });
     }
@@ -357,7 +355,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr();
     const Xbyak::Reg64 tmp2 = ctx.reg_alloc.ScratchGpr();
 
-    const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
+    const auto wrapped_fn = read_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr.getIdx()][value_idx];
 
     EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
 
@@ -367,7 +365,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
     const auto fastmem_marker = ShouldFastmem(ctx, inst);
     if (fastmem_marker) {
-        SharedLabel abort = GenSharedLabel(), end = GenSharedLabel();
+        const auto abort = ctx.GenLabel(), end = ctx.GenLabel();
         bool require_abort_handling = false;
 
         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
@@ -437,11 +435,11 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     const Xbyak::Reg32 status = ctx.reg_alloc.ScratchGpr().cvt32();
     const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr();
 
-    const auto wrapped_fn = exclusive_write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value.getIdx())];
+    const auto wrapped_fn = exclusive_write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr.getIdx()][value.getIdx()];
 
     EmitExclusiveLock(code, conf, tmp, eax);
 
-    SharedLabel end = GenSharedLabel();
+    const auto end = ctx.GenLabel();
 
     code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
     code.mov(status, u32(1));
@@ -473,7 +471,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
 
     const auto fastmem_marker = ShouldFastmem(ctx, inst);
     if (fastmem_marker) {
-        SharedLabel abort = GenSharedLabel();
+        const auto abort = ctx.GenLabel();
         bool require_abort_handling = false;
 
         const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, tmp);

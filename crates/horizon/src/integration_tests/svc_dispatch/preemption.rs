@@ -231,7 +231,7 @@ fn deferred_flag_clear_retains_the_pin_until_completion_and_preserves_void_regis
     for succeeds in [true, false] {
         let (_directory, mut process) = fixture_process(&[svc(0x36)]);
         let ingress = process.driver_mut().event_sender();
-        let dispatcher = support::dispatcher(&process).with_input_completions(ingress.clone());
+        let dispatcher = support::dispatcher(&process).with_host_events(ingress.clone());
         let main = process.main_thread_id();
         let process_id = process.scheduler_process_id();
         let flag = process.main_thread().tls_base.checked_add(0x102).unwrap();
@@ -356,8 +356,8 @@ fn thread_activity_and_affinity_wait_for_the_targets_real_unpin() {
             svc(0x36),
             svc(0x0a),
         ]);
-        let dispatcher = fixed_time_dispatcher(&process)
-            .with_input_completions(process.driver_mut().event_sender());
+        let dispatcher =
+            fixed_time_dispatcher(&process).with_host_events(process.driver_mut().event_sender());
         let main = process.main_thread_id();
         let entry = instruction_address(&process);
         let gate = process.main_thread().stack_bottom;
@@ -544,7 +544,7 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
                 .pin_thread(VirtualCpuId::new(0), target)
                 .unwrap();
             let dispatcher = fixed_time_dispatcher(&process)
-                .with_input_completions(process.driver_mut().event_sender());
+                .with_host_events(process.driver_mut().event_sender());
             let (caller, handling) = next_call(&mut process, &dispatcher);
             assert_eq!(caller, main);
             assert!(matches!(handling, ExceptionHandlingResult::Suspended));

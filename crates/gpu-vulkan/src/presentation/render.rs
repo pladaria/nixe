@@ -469,7 +469,7 @@ impl ScreenRenderer {
             .layer_count(1)
             .color_attachments(&attachments);
         unsafe {
-            device.dispatch.begin_rendering(&info);
+            device.dispatch.begin_rendering(&info, Default::default());
             device.dispatch.cmd_draw(3, 1, 0, 0);
             device.dispatch.end_rendering();
         }
@@ -581,7 +581,10 @@ impl ScreenRenderer {
             .layer_count(1)
             .color_attachments(&attachments);
         unsafe {
-            cache.device_mut().dispatch.begin_rendering(&info);
+            cache
+                .device_mut()
+                .dispatch
+                .begin_rendering(&info, Default::default());
         }
         let draw_result = (|| -> Result<(), VulkanError> {
             for (texture, clip, first, count, base) in ranges {

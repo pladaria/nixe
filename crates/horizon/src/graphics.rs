@@ -255,6 +255,7 @@ struct VideoState {
     vsync_events: BTreeMap<usize, WritableEventObject>,
     display_clock: DisplayClock,
     presenter: Option<FrameMailbox>,
+    host_events: Option<nixe_runtime::ExternalEventSender>,
     nvdrv: NvDrvSession,
     next_frame_sequence: u64,
     pending_frames: VecDeque<PendingFrame>,
@@ -278,14 +279,23 @@ struct ReleasedSlot {
 struct ResidentSlotLease {
     released_slots: Arc<Mutex<Vec<ReleasedSlot>>>,
     released: ReleasedSlot,
+    events: Option<nixe_runtime::ExternalEventSender>,
 }
 
 impl Drop for ResidentSlotLease {
     fn drop(&mut self) {
-        self.released_slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(self.released);
+        let first = {
+            let mut released = self
+                .released_slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let first = released.is_empty();
+            released.push(self.released);
+            first
+        };
+        if first && let Some(events) = &self.events {
+            events.notify_host_service(nixe_runtime::ExternalEventSource::Worker);
+        }
     }
 }
 
@@ -346,12 +356,23 @@ impl VideoSystem {
                 display_clock: DisplayClock::new(60)
                     .expect("the fixed Switch display refresh is non-zero"),
                 presenter,
+                host_events: None,
                 nvdrv,
                 next_frame_sequence: 1,
                 pending_frames: VecDeque::new(),
             })),
             released_slots: Arc::default(),
         }
+    }
+
+    // Display work must make progress independently of input sampling, as in
+    // Eden's display consumer. This process uses its existing host supervisor.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/vi/conductor.cpp
+    pub(crate) fn set_host_events(&self, events: nixe_runtime::ExternalEventSender) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .host_events = Some(events);
     }
 
     fn drain_released_slots(&self, state: &mut VideoState) {
@@ -630,12 +651,13 @@ impl VideoSystem {
                 .validate_image_view(&request.buffer.nvmap_view_metadata())
                 .map_err(FramebufferError::NvMap)?;
 
-            let presenting = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .presenter
-                .is_some();
+            let (presenting, events) = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (state.presenter.is_some(), state.host_events.clone())
+            };
             let mut presentation_source = request.presentation_source;
             let presentation = if presenting {
                 let source = match &presentation_source {
@@ -648,7 +670,7 @@ impl VideoSystem {
                 // the backend has established the ordered image dependency.
                 // https://source.android.com/docs/core/graphics/arch-bq-gralloc
                 let image = nvdrv
-                    .request_presentable_image(source.clone(), request.input.swap_interval)
+                    .request_presentable_image(source.clone(), request.input.swap_interval, events)
                     .map_err(FramebufferError::Backend)?;
                 presentation_source = Some(source);
                 Some(PendingPresentation {
@@ -683,6 +705,13 @@ impl VideoSystem {
                 acquired: false,
                 presentation,
             });
+            let events = state.host_events.clone();
+            drop(state);
+            // A ready image can beat QueueBuffer's commit. Wake again after
+            // installing the pending slot so that publication cannot lose it.
+            if let Some(events) = events {
+                events.notify_host_service(nixe_runtime::ExternalEventSource::Worker);
+            }
             Ok(())
         })();
 
@@ -836,6 +865,7 @@ impl VideoSystem {
                             binder_id: pending.binder_id,
                             slot: pending.slot,
                         },
+                        events: state.host_events.clone(),
                     }),
                 ));
                 state
@@ -2965,6 +2995,8 @@ mod tests {
             nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),
         );
         let (video, binder_id, buffer) = configure_rgba_nvmap(video, machine);
+        let mut runtime = nixe_runtime::Runtime::try_new(Arc::clone(&video.kernel)).unwrap();
+        video.set_host_events(runtime.event_sender());
         let syncpoint = GuestSyncpointId::new(11);
         video.nvdrv().install_test_timeline(syncpoint);
         {
@@ -3021,6 +3053,7 @@ mod tests {
         }
         queued.unwrap().unwrap();
         worker.join().unwrap();
+        runtime.drain_external_events().unwrap();
         assert_eq!(video.advance(Duration::from_millis(17)).unwrap(), 1);
         assert!(mailbox.take_latest().is_none());
         assert_eq!(
@@ -3028,15 +3061,18 @@ mod tests {
             SlotOwnership::Queued
         );
         release_tx.send(()).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let frame = loop {
-            assert_eq!(video.advance(Duration::from_millis(18)).unwrap(), 0);
-            if let Some(frame) = mailbox.take_latest() {
-                break frame;
-            }
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::yield_now();
-        };
+        // No input samples, guest waits or new refresh can wake this host.
+        // The asynchronous image reply must wake the actual supervisor inbox.
+        let waiting = std::time::Instant::now();
+        runtime.wait_events(Duration::from_secs(5)).unwrap();
+        assert!(
+            waiting.elapsed() < Duration::from_secs(2),
+            "image readiness did not wake VI"
+        );
+        assert_eq!(video.advance(Duration::from_millis(18)).unwrap(), 0);
+        let frame = mailbox
+            .take_latest()
+            .expect("ready image published before the next refresh");
         assert_eq!((frame.width(), frame.height()), (4, 4));
         {
             let state = video.state.lock().unwrap();
@@ -3045,7 +3081,14 @@ mod tests {
             assert!(slot.presentation_source.is_some());
         }
 
+        runtime.drain_external_events().unwrap();
         drop(frame);
+        let waiting = std::time::Instant::now();
+        runtime.wait_events(Duration::from_secs(5)).unwrap();
+        assert!(
+            waiting.elapsed() < Duration::from_secs(2),
+            "released slot did not wake VI"
+        );
         video.advance(Duration::ZERO).unwrap();
         assert_eq!(
             video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,

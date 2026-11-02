@@ -6,7 +6,7 @@
 //! the captured B197 meaning.
 //! <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L109-L186>
 
-use super::{MaxwellThreeDRegister, MaxwellThreeDStateWrite};
+use super::MaxwellThreeDRegister;
 use crate::MaxwellMethodSource;
 use crate::engines::{
     MaxwellEngineDispatchError, MaxwellInlineToMemoryAddress, MaxwellInlineToMemoryUpload,
@@ -178,7 +178,10 @@ const LAUNCH_DMA: u32 = 0x01b0;
 const LOAD_INLINE_DATA: u32 = 0x01b4;
 
 type PreflightResult = Result<
-    Option<(MaxwellThreeDStateWrite, Option<MaxwellInlineToMemoryUpload>)>,
+    Option<(
+        MaxwellThreeDInlineToMemoryStateWrite,
+        Option<MaxwellInlineToMemoryUpload>,
+    )>,
     MaxwellEngineDispatchError,
 >;
 
@@ -273,7 +276,7 @@ fn preflight_launch(
         byte_length,
         source,
     };
-    Ok(Some((MaxwellThreeDStateWrite::InlineToMemory(write), None)))
+    Ok(Some((write, None)))
 }
 
 fn preflight_data(
@@ -300,10 +303,7 @@ fn preflight_data(
         source.argument(),
         source,
     );
-    Ok(Some((
-        MaxwellThreeDStateWrite::InlineToMemory(write),
-        Some(upload),
-    )))
+    Ok(Some((write, Some(upload))))
 }
 
 fn invalid(

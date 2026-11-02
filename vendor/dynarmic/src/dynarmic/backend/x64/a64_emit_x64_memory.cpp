@@ -11,7 +11,6 @@
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include <mcl/type_traits/integer_of_size.hpp>
-#include <xbyak/xbyak.h>
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include "dynarmic/backend/x64/abi.h"
@@ -19,6 +18,7 @@
 #include "dynarmic/backend/x64/emit_x64_memory.h"
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/backend/x64/perf_map.h"
+#include "dynarmic/backend/x64/xbyak.h"
 #include "dynarmic/common/spin_lock_x64.h"
 #include "dynarmic/common/x64_disassemble.h"
 #include "dynarmic/interface/exclusive_monitor.h"
@@ -139,7 +139,7 @@ void A64EmitX64::GenFastmemFallbacks() {
 
             for (int value_idx : idxes) {
                 code.align();
-                read_fallbacks[std::make_tuple(ordered, 128, vaddr_idx, value_idx)] = code.getCurr<void (*)()>();
+                read_fallbacks[ordered][MemoryFallbackSizeIndex(128)][vaddr_idx][value_idx] = code.getCurr<void (*)()>();
                 ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, HostLocXmmIdx(value_idx));
                 if (vaddr_idx != code.ABI_PARAM2.getIdx()) {
                     code.mov(code.ABI_PARAM2, Xbyak::Reg64{vaddr_idx});
@@ -153,10 +153,10 @@ void A64EmitX64::GenFastmemFallbacks() {
                 }
                 ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLocXmmIdx(value_idx));
                 code.ret();
-                PerfMapRegister(read_fallbacks[std::make_tuple(ordered, 128, vaddr_idx, value_idx)], code.getCurr(), "a64_read_fallback_128");
+                PerfMapRegister(read_fallbacks[ordered][MemoryFallbackSizeIndex(128)][vaddr_idx][value_idx], code.getCurr(), "a64_read_fallback_128");
 
                 code.align();
-                write_fallbacks[std::make_tuple(ordered, 128, vaddr_idx, value_idx)] = code.getCurr<void (*)()>();
+                write_fallbacks[ordered][MemoryFallbackSizeIndex(128)][vaddr_idx][value_idx] = code.getCurr<void (*)()>();
                 ABI_PushCallerSaveRegistersAndAdjustStack(code);
                 if (vaddr_idx != code.ABI_PARAM2.getIdx()) {
                     code.mov(code.ABI_PARAM2, Xbyak::Reg64{vaddr_idx});
@@ -170,10 +170,10 @@ void A64EmitX64::GenFastmemFallbacks() {
                 }
                 ABI_PopCallerSaveRegistersAndAdjustStack(code);
                 code.ret();
-                PerfMapRegister(write_fallbacks[std::make_tuple(ordered, 128, vaddr_idx, value_idx)], code.getCurr(), "a64_write_fallback_128");
+                PerfMapRegister(write_fallbacks[ordered][MemoryFallbackSizeIndex(128)][vaddr_idx][value_idx], code.getCurr(), "a64_write_fallback_128");
 
                 code.align();
-                exclusive_write_fallbacks[std::make_tuple(ordered, 128, vaddr_idx, value_idx)] = code.getCurr<void (*)()>();
+                exclusive_write_fallbacks[ordered][MemoryFallbackSizeIndex(128)][vaddr_idx][value_idx] = code.getCurr<void (*)()>();
                 ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, HostLoc::RAX);
                 if (value_idx != 1) {
                     code.movaps(xmm1, Xbyak::Xmm{value_idx});
@@ -192,7 +192,7 @@ void A64EmitX64::GenFastmemFallbacks() {
                 code.call(memory_exclusive_write_128);
                 ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLoc::RAX);
                 code.ret();
-                PerfMapRegister(exclusive_write_fallbacks[std::make_tuple(ordered, 128, vaddr_idx, value_idx)], code.getCurr(), "a64_exclusive_write_fallback_128");
+                PerfMapRegister(exclusive_write_fallbacks[ordered][MemoryFallbackSizeIndex(128)][vaddr_idx][value_idx], code.getCurr(), "a64_exclusive_write_fallback_128");
 
                 if (value_idx == 4 || value_idx == 15) {
                     continue;
@@ -200,7 +200,7 @@ void A64EmitX64::GenFastmemFallbacks() {
 
                 for (const auto& [bitsize, callback] : read_callbacks) {
                     code.align();
-                    read_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)] = code.getCurr<void (*)()>();
+                    read_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx] = code.getCurr<void (*)()>();
                     ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, HostLocRegIdx(value_idx));
                     if (vaddr_idx != code.ABI_PARAM2.getIdx()) {
                         code.mov(code.ABI_PARAM2, Xbyak::Reg64{vaddr_idx});
@@ -215,12 +215,12 @@ void A64EmitX64::GenFastmemFallbacks() {
                     ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLocRegIdx(value_idx));
                     code.ZeroExtendFrom(bitsize, Xbyak::Reg64{value_idx});
                     code.ret();
-                    PerfMapRegister(read_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)], code.getCurr(), fmt::format("a64_read_fallback_{}", bitsize));
+                    PerfMapRegister(read_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a64_read_fallback_{}", bitsize));
                 }
 
                 for (const auto& [bitsize, callback] : write_callbacks) {
                     code.align();
-                    write_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)] = code.getCurr<void (*)()>();
+                    write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx] = code.getCurr<void (*)()>();
                     ABI_PushCallerSaveRegistersAndAdjustStack(code);
                     if (vaddr_idx == code.ABI_PARAM3.getIdx() && value_idx == code.ABI_PARAM2.getIdx()) {
                         code.xchg(code.ABI_PARAM2, code.ABI_PARAM3);
@@ -244,12 +244,12 @@ void A64EmitX64::GenFastmemFallbacks() {
                     }
                     ABI_PopCallerSaveRegistersAndAdjustStack(code);
                     code.ret();
-                    PerfMapRegister(write_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)], code.getCurr(), fmt::format("a64_write_fallback_{}", bitsize));
+                    PerfMapRegister(write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a64_write_fallback_{}", bitsize));
                 }
 
                 for (const auto& [bitsize, callback] : exclusive_write_callbacks) {
                     code.align();
-                    exclusive_write_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)] = code.getCurr<void (*)()>();
+                    exclusive_write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx] = code.getCurr<void (*)()>();
                     ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, HostLoc::RAX);
                     if (vaddr_idx == code.ABI_PARAM3.getIdx() && value_idx == code.ABI_PARAM2.getIdx()) {
                         code.xchg(code.ABI_PARAM2, code.ABI_PARAM3);
@@ -272,7 +272,7 @@ void A64EmitX64::GenFastmemFallbacks() {
                     callback.EmitCall(code);
                     ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLoc::RAX);
                     code.ret();
-                    PerfMapRegister(exclusive_write_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)], code.getCurr(), fmt::format("a64_exclusive_write_fallback_{}", bitsize));
+                    PerfMapRegister(exclusive_write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a64_exclusive_write_fallback_{}", bitsize));
                 }
             }
         }
@@ -286,53 +286,93 @@ void A64EmitX64::GenFastmemFallbacks() {
 #include "dynarmic/backend/x64/canonical_memory.cpp.inc"
 
 void A64EmitX64::EmitA64ReadMemory8(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.canonical_page_table && !ShouldFastmem(ctx, inst)) { EmitCanonicalMemoryAccess<8, false>(ctx, inst); return; }
-    EmitMemoryRead<8, &A64::UserCallbacks::MemoryRead8>(ctx, inst);
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    if (conf.canonical_page_table && !fastmem_marker) {
+        EmitCanonicalMemoryAccess<8, false>(ctx, inst);
+        return;
+    }
+    EmitMemoryRead<8, &A64::UserCallbacks::MemoryRead8>(ctx, inst, fastmem_marker);
 }
 
 void A64EmitX64::EmitA64ReadMemory16(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.canonical_page_table && !ShouldFastmem(ctx, inst)) { EmitCanonicalMemoryAccess<16, false>(ctx, inst); return; }
-    EmitMemoryRead<16, &A64::UserCallbacks::MemoryRead16>(ctx, inst);
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    if (conf.canonical_page_table && !fastmem_marker) {
+        EmitCanonicalMemoryAccess<16, false>(ctx, inst);
+        return;
+    }
+    EmitMemoryRead<16, &A64::UserCallbacks::MemoryRead16>(ctx, inst, fastmem_marker);
 }
 
 void A64EmitX64::EmitA64ReadMemory32(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.canonical_page_table && !ShouldFastmem(ctx, inst)) { EmitCanonicalMemoryAccess<32, false>(ctx, inst); return; }
-    EmitMemoryRead<32, &A64::UserCallbacks::MemoryRead32>(ctx, inst);
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    if (conf.canonical_page_table && !fastmem_marker) {
+        EmitCanonicalMemoryAccess<32, false>(ctx, inst);
+        return;
+    }
+    EmitMemoryRead<32, &A64::UserCallbacks::MemoryRead32>(ctx, inst, fastmem_marker);
 }
 
 void A64EmitX64::EmitA64ReadMemory64(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.canonical_page_table && !ShouldFastmem(ctx, inst)) { EmitCanonicalMemoryAccess<64, false>(ctx, inst); return; }
-    EmitMemoryRead<64, &A64::UserCallbacks::MemoryRead64>(ctx, inst);
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    if (conf.canonical_page_table && !fastmem_marker) {
+        EmitCanonicalMemoryAccess<64, false>(ctx, inst);
+        return;
+    }
+    EmitMemoryRead<64, &A64::UserCallbacks::MemoryRead64>(ctx, inst, fastmem_marker);
 }
 
 void A64EmitX64::EmitA64ReadMemory128(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.canonical_page_table && !ShouldFastmem(ctx, inst)) { EmitCanonicalMemoryAccess<128, false>(ctx, inst); return; }
-    EmitMemoryRead<128, &A64::UserCallbacks::MemoryRead128>(ctx, inst);
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    if (conf.canonical_page_table && !fastmem_marker) {
+        EmitCanonicalMemoryAccess<128, false>(ctx, inst);
+        return;
+    }
+    EmitMemoryRead<128, &A64::UserCallbacks::MemoryRead128>(ctx, inst, fastmem_marker);
 }
 
 void A64EmitX64::EmitA64WriteMemory8(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.canonical_page_table && !ShouldFastmem(ctx, inst)) { EmitCanonicalMemoryAccess<8, true>(ctx, inst); return; }
-    EmitMemoryWrite<8, &A64::UserCallbacks::MemoryWrite8>(ctx, inst);
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    if (conf.canonical_page_table && !fastmem_marker) {
+        EmitCanonicalMemoryAccess<8, true>(ctx, inst);
+        return;
+    }
+    EmitMemoryWrite<8, &A64::UserCallbacks::MemoryWrite8>(ctx, inst, fastmem_marker);
 }
 
 void A64EmitX64::EmitA64WriteMemory16(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.canonical_page_table && !ShouldFastmem(ctx, inst)) { EmitCanonicalMemoryAccess<16, true>(ctx, inst); return; }
-    EmitMemoryWrite<16, &A64::UserCallbacks::MemoryWrite16>(ctx, inst);
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    if (conf.canonical_page_table && !fastmem_marker) {
+        EmitCanonicalMemoryAccess<16, true>(ctx, inst);
+        return;
+    }
+    EmitMemoryWrite<16, &A64::UserCallbacks::MemoryWrite16>(ctx, inst, fastmem_marker);
 }
 
 void A64EmitX64::EmitA64WriteMemory32(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.canonical_page_table && !ShouldFastmem(ctx, inst)) { EmitCanonicalMemoryAccess<32, true>(ctx, inst); return; }
-    EmitMemoryWrite<32, &A64::UserCallbacks::MemoryWrite32>(ctx, inst);
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    if (conf.canonical_page_table && !fastmem_marker) {
+        EmitCanonicalMemoryAccess<32, true>(ctx, inst);
+        return;
+    }
+    EmitMemoryWrite<32, &A64::UserCallbacks::MemoryWrite32>(ctx, inst, fastmem_marker);
 }
 
 void A64EmitX64::EmitA64WriteMemory64(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.canonical_page_table && !ShouldFastmem(ctx, inst)) { EmitCanonicalMemoryAccess<64, true>(ctx, inst); return; }
-    EmitMemoryWrite<64, &A64::UserCallbacks::MemoryWrite64>(ctx, inst);
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    if (conf.canonical_page_table && !fastmem_marker) {
+        EmitCanonicalMemoryAccess<64, true>(ctx, inst);
+        return;
+    }
+    EmitMemoryWrite<64, &A64::UserCallbacks::MemoryWrite64>(ctx, inst, fastmem_marker);
 }
 
 void A64EmitX64::EmitA64WriteMemory128(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.canonical_page_table && !ShouldFastmem(ctx, inst)) { EmitCanonicalMemoryAccess<128, true>(ctx, inst); return; }
-    EmitMemoryWrite<128, &A64::UserCallbacks::MemoryWrite64>(ctx, inst);
+    const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    if (conf.canonical_page_table && !fastmem_marker) {
+        EmitCanonicalMemoryAccess<128, true>(ctx, inst);
+        return;
+    }
+    EmitMemoryWrite<128, &A64::UserCallbacks::MemoryWrite64>(ctx, inst, fastmem_marker);
 }
 
 void A64EmitX64::EmitA64ClearExclusive(A64EmitContext&, IR::Inst*) {

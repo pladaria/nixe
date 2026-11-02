@@ -148,6 +148,46 @@ impl MaxwellThreeDMmeInstruction {
     pub const fn raw(self) -> u32 {
         self.0
     }
+
+    const fn operation(self) -> u8 {
+        (self.0 & 7) as u8
+    }
+    const fn result(self) -> u8 {
+        ((self.0 >> 4) & 7) as u8
+    }
+    const fn destination(self) -> u8 {
+        ((self.0 >> 8) & 7) as u8
+    }
+    const fn src_a(self) -> u8 {
+        ((self.0 >> 11) & 7) as u8
+    }
+    const fn src_b(self) -> u8 {
+        ((self.0 >> 14) & 7) as u8
+    }
+    const fn alu(self) -> u8 {
+        ((self.0 >> 17) & 31) as u8
+    }
+    const fn source_bit(self) -> u8 {
+        ((self.0 >> 17) & 31) as u8
+    }
+    const fn destination_bit(self) -> u8 {
+        ((self.0 >> 27) & 31) as u8
+    }
+    const fn immediate(self) -> i32 {
+        signed_immediate(self.0)
+    }
+    const fn mask(self) -> u32 {
+        bitfield_mask(self.0)
+    }
+    const fn exit(self) -> bool {
+        self.0 & (1 << 7) != 0
+    }
+    const fn branch_nonzero(self) -> bool {
+        self.0 & (1 << 4) != 0
+    }
+    const fn branch_annul(self) -> bool {
+        self.0 & (1 << 5) != 0
+    }
 }
 
 /// Which independently addressed MME RAM a load targets.
@@ -215,10 +255,11 @@ pub(super) trait MaxwellThreeDMmeHost {
     type Error;
 
     fn read_register(&self, method_dword: u16) -> Result<u32, Self::Error>;
-    /// Apply a register-only send synchronously. False leaves the method intact
-    /// for emit_method, which may flush or suspend an observable engine effect.
-    fn emit_register(&mut self, method_dword: u16, argument: u32) -> Result<bool, Self::Error>;
-    async fn emit_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error>;
+    /// Apply a send synchronously when it has no observable effect. A false
+    /// result requires finish_method to flush a draw boundary or consume the
+    /// effect admitted by this send before the interpreter continues.
+    fn try_emit_method(&mut self, method_dword: u16, argument: u32) -> Result<bool, Self::Error>;
+    async fn finish_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error>;
 }
 
 pub(super) enum MaxwellThreeDMmeRunError<E> {
@@ -231,47 +272,28 @@ pub(super) enum MaxwellThreeDMmeRunError<E> {
 // lets the interpreter reuse a direct window across sequential instructions
 // and branches within the page. The distinct-word coverage limit is unchanged.
 const MME_INSTRUCTION_PAGE_WORDS: usize = 64;
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MmeInstruction {
-    immediate: i32,
-    mask: u32,
-    operation: u8,
-    result: u8,
-    destination: u8,
-    src_a: u8,
-    src_b: u8,
-    alu: u8,
-    source_bit: u8,
-    destination_bit: u8,
-    exit: bool,
-    branch_nonzero: bool,
-    branch_annul: bool,
+// Keep one canonical hardware word per uploaded instruction, like Eden's
+// Macro::Opcode. Read only the fields used by the consuming operation.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/macro.h
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MmeInstructionPage {
+    words: Box<[MaxwellThreeDMmeInstruction; MME_INSTRUCTION_PAGE_WORDS]>,
+    // Zero is an executable opcode, so absence cannot use a word sentinel.
+    present: u64,
 }
-impl MmeInstruction {
-    fn decode(raw: u32) -> Self {
+impl Default for MmeInstructionPage {
+    fn default() -> Self {
         Self {
-            immediate: signed_immediate(raw),
-            mask: bitfield_mask(raw),
-            operation: (raw & 7) as u8,
-            result: ((raw >> 4) & 7) as u8,
-            destination: ((raw >> 8) & 7) as u8,
-            src_a: ((raw >> 11) & 7) as u8,
-            src_b: ((raw >> 14) & 7) as u8,
-            alu: ((raw >> 17) & 31) as u8,
-            source_bit: ((raw >> 17) & 31) as u8,
-            destination_bit: ((raw >> 27) & 31) as u8,
-            exit: raw & (1 << 7) != 0,
-            branch_nonzero: raw & (1 << 4) != 0,
-            branch_annul: raw & (1 << 5) != 0,
+            words: Box::new([MaxwellThreeDMmeInstruction::new(0); MME_INSTRUCTION_PAGE_WORDS]),
+            present: 0,
         }
     }
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct MmeInstructionPage {
-    registers: Box<[Option<MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>>]>,
-    // Dense executable words stay separate from cold source provenance. Raw
-    // uploads replace both arrays; active programs retain their Arc snapshot.
-    decoded: Box<[Option<MmeInstruction>]>,
+impl MmeInstructionPage {
+    fn instruction(&self, address: u32) -> Option<MaxwellThreeDMmeInstruction> {
+        let index = address as usize % MME_INSTRUCTION_PAGE_WORDS;
+        (self.present & (1_u64 << index) != 0).then(|| self.words[index])
+    }
 }
 
 #[derive(Debug)]
@@ -343,15 +365,11 @@ impl MmeInstructionRam {
             .get(&(address / MME_INSTRUCTION_PAGE_WORDS as u32))
     }
 
-    fn get(&self, address: &u32) -> Option<&MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>> {
-        self.page(*address)?.registers[*address as usize % MME_INSTRUCTION_PAGE_WORDS].as_ref()
+    fn get(&self, address: u32) -> Option<MaxwellThreeDMmeInstruction> {
+        self.page(address)?.instruction(address)
     }
 
-    fn insert(
-        &mut self,
-        address: u32,
-        register: MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>,
-    ) {
+    fn insert(&mut self, address: u32, instruction: MaxwellThreeDMmeInstruction) {
         if let Some(users) = self
             .program_pages
             .get(&(address / MME_INSTRUCTION_PAGE_WORDS as u32))
@@ -368,19 +386,14 @@ impl MmeInstructionRam {
         let page = self
             .pages
             .entry(address / MME_INSTRUCTION_PAGE_WORDS as u32)
-            .or_insert_with(|| MmeInstructionPage {
-                registers: vec![None; MME_INSTRUCTION_PAGE_WORDS].into_boxed_slice(),
-                decoded: vec![None; MME_INSTRUCTION_PAGE_WORDS].into_boxed_slice(),
-            });
+            .or_default();
         let index = address as usize % MME_INSTRUCTION_PAGE_WORDS;
-        let slot = &mut page.registers[index];
-        if slot.is_none() {
+        let bit = 1_u64 << index;
+        if page.present & bit == 0 {
             self.count += 1;
         }
-        *slot = Some(register);
-        page.decoded[index] = register
-            .value()
-            .map(|word| MmeInstruction::decode(word.raw()));
+        page.words[index] = instruction;
+        page.present |= bit;
     }
 
     const fn len(&self) -> usize {
@@ -400,16 +413,16 @@ mod instruction_cache_tests {
         ram.programs[1].set(None).unwrap();
         ram.programs[2].set(None).unwrap();
 
-        ram.insert(3, MaxwellThreeDRegister::default());
+        ram.insert(3, MaxwellThreeDMmeInstruction::new(0));
         assert!(ram.programs[1].get().is_none());
         assert!(ram.programs[2].get().is_some());
 
         ram.programs[1].set(None).unwrap();
         ram.bind_program(1, Some(0), 1280);
         ram.programs[1].set(None).unwrap();
-        ram.insert(3, MaxwellThreeDRegister::default());
+        ram.insert(3, MaxwellThreeDMmeInstruction::new(0));
         assert!(ram.programs[1].get().is_some());
-        ram.insert(1280, MaxwellThreeDRegister::default());
+        ram.insert(1280, MaxwellThreeDMmeInstruction::new(0));
         assert!(ram.programs[1].get().is_none());
         assert!(ram.programs[2].get().is_some());
 
@@ -421,7 +434,8 @@ mod instruction_cache_tests {
 
 struct MaxwellThreeDMmeInterpreter<'a, H> {
     program: &'a MaxwellThreeDMmeProgram,
-    instruction_page: Option<&'a [Option<MmeInstruction>]>,
+    instruction_page: Option<&'a MmeInstructionPage>,
+    // No 32-bit word address can have this initial page index.
     instruction_page_index: u32,
     host: &'a mut H,
     parameters: &'a [u32],
@@ -493,7 +507,7 @@ impl MaxwellThreeDMmeProgram {
         let mut interpreter = MaxwellThreeDMmeInterpreter {
             program: self,
             instruction_page: None,
-            instruction_page_index: 0,
+            instruction_page_index: u32::MAX,
             host,
             parameters,
             registers: [0; MME_REGISTER_COUNT],
@@ -513,7 +527,7 @@ impl MaxwellThreeDMmeProgram {
         while let Some((method, value)) = interpreter.run_until_effect()? {
             interpreter
                 .host
-                .emit_method(method, value)
+                .finish_method(method, value)
                 .await
                 .map_err(MaxwellThreeDMmeRunError::Host)?;
         }
@@ -549,17 +563,14 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
             }
             let address = MaxwellThreeDMmeRamAddress::new(self.pc);
             let page_index = self.pc / MME_INSTRUCTION_PAGE_WORDS as u32;
-            if self.instruction_page.is_none() || self.instruction_page_index != page_index {
+            if self.instruction_page_index != page_index {
                 let program = self.program;
-                self.instruction_page = program
-                    .instructions
-                    .page(self.pc)
-                    .map(|page| page.decoded.as_ref());
+                self.instruction_page = program.instructions.page(self.pc);
                 self.instruction_page_index = page_index;
             }
             let instruction = self
                 .instruction_page
-                .and_then(|page| page[self.pc as usize % MME_INSTRUCTION_PAGE_WORDS])
+                .and_then(|page| page.instruction(self.pc))
                 .ok_or_else(|| {
                     Self::execution_error(MaxwellThreeDMmeExecutionError::MissingInstruction {
                         address,
@@ -578,26 +589,26 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
 
             let is_delay_slot = std::mem::take(&mut self.delay_slot);
             let mut sent = None;
-            let operation = instruction.operation;
+            let operation = instruction.operation();
             if operation == 7 {
                 if is_delay_slot {
                     return Err(Self::execution_error(
                         MaxwellThreeDMmeExecutionError::BranchInDelaySlot { address },
                     ));
                 }
-                let value = self.register(instruction.src_a);
-                let taken = if !instruction.branch_nonzero {
+                let value = self.register(instruction.src_a());
+                let taken = if !instruction.branch_nonzero() {
                     value == 0
                 } else {
                     value != 0
                 };
                 if taken {
-                    let target = add_signed_18(base, instruction.immediate).ok_or_else(|| {
+                    let target = add_signed_18(base, instruction.immediate()).ok_or_else(|| {
                         Self::execution_error(
                             MaxwellThreeDMmeExecutionError::ProgramCounterOverflow { address },
                         )
                     })?;
-                    if instruction.branch_annul {
+                    if instruction.branch_annul() {
                         self.pc = target;
                         continue;
                     }
@@ -606,24 +617,26 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
                     continue;
                 }
             } else {
-                let src_a = self.register(instruction.src_a);
-                let src_b = self.register(instruction.src_b);
+                let src_a = self.register(instruction.src_a());
+                let src_b = self.register(instruction.src_b());
                 let result = match operation {
-                    0 => self.alu(address, instruction.alu, src_a, src_b)?,
-                    1 => src_a.wrapping_add_signed(instruction.immediate),
+                    0 => self.alu(address, instruction.alu(), src_a, src_b)?,
+                    1 => src_a.wrapping_add_signed(instruction.immediate()),
                     2 => {
-                        let mask = instruction.mask;
-                        let source = (src_b >> instruction.source_bit) & mask;
-                        (src_a & !(mask << instruction.destination_bit))
-                            | (source << instruction.destination_bit)
+                        let mask = instruction.mask();
+                        let source = (src_b >> instruction.source_bit()) & mask;
+                        (src_a & !(mask << instruction.destination_bit()))
+                            | (source << instruction.destination_bit())
                     }
                     3 => {
-                        ((src_b >> (src_a & 0x1f)) & instruction.mask)
-                            << instruction.destination_bit
+                        ((src_b >> (src_a & 0x1f)) & instruction.mask())
+                            << instruction.destination_bit()
                     }
-                    4 => ((src_b >> instruction.source_bit) & instruction.mask) << (src_a & 0x1f),
+                    4 => {
+                        ((src_b >> instruction.source_bit()) & instruction.mask()) << (src_a & 0x1f)
+                    }
                     5 => {
-                        let method = src_a.wrapping_add_signed(instruction.immediate);
+                        let method = src_a.wrapping_add_signed(instruction.immediate());
                         if method > MME_METHOD_DWORD_MASK {
                             return Err(Self::execution_error(
                                 MaxwellThreeDMmeExecutionError::RegisterReadUnavailable {
@@ -642,13 +655,13 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
                     }
                 };
                 sent = self.process_result(
-                    instruction.result,
-                    usize::from(instruction.destination),
+                    instruction.result(),
+                    usize::from(instruction.destination()),
                     result,
                 )?;
             }
 
-            if instruction.exit && !is_delay_slot {
+            if instruction.exit() && !is_delay_slot {
                 self.delay_slot = true;
                 self.exit_after_delay = true;
             } else if is_delay_slot && self.exit_after_delay {
@@ -669,7 +682,7 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
                     & MME_METHOD_DWORD_MASK) as u16;
                 if !self
                     .host
-                    .emit_register(method, value)
+                    .try_emit_method(method, value)
                     .map_err(MaxwellThreeDMmeRunError::Host)?
                 {
                     return Ok(Some((method, value)));
@@ -876,12 +889,13 @@ impl MaxwellThreeDMmeState {
         self.next_instruction_address
     }
 
+    /// Returns the canonical word only when this address has been uploaded.
     #[must_use]
     pub fn instruction(
         &self,
         address: MaxwellThreeDMmeRamAddress,
-    ) -> Option<&MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>> {
-        self.instructions.get(&address.raw())
+    ) -> Option<MaxwellThreeDMmeInstruction> {
+        self.instructions.get(address.raw())
     }
 
     #[must_use]
@@ -996,10 +1010,7 @@ impl MaxwellThreeDMmeState {
                     u64::from(value.raw()),
                     0,
                 );
-                Arc::make_mut(&mut self.instructions).insert(
-                    address.raw(),
-                    MaxwellThreeDRegister::decoded(value.raw(), value),
-                );
+                Arc::make_mut(&mut self.instructions).insert(address.raw(), value);
                 self.next_instruction_address = Some(MaxwellThreeDMmeRamAddress::new(
                     address
                         .raw()
@@ -1084,4 +1095,174 @@ pub enum MaxwellThreeDMmeStateWrite {
         value: MaxwellThreeDMutableMethodControl,
         source: MaxwellMethodSource,
     },
+}
+
+#[cfg(test)]
+mod execution_benchmark {
+    use super::*;
+
+    #[derive(Default)]
+    struct Host {
+        value: u32,
+        sends: u64,
+        sum: u64,
+    }
+    impl MaxwellThreeDMmeHost for Host {
+        type Error = &'static str;
+        fn read_register(&self, method: u16) -> Result<u32, Self::Error> {
+            if method != 0x3400 / 4 {
+                return Err("unexpected benchmark register");
+            }
+            Ok(self.value)
+        }
+        fn try_emit_method(&mut self, method: u16, value: u32) -> Result<bool, Self::Error> {
+            if method != 0x3400 / 4 {
+                return Err("unexpected benchmark send");
+            }
+            self.sends += 1;
+            self.sum = self.sum.wrapping_add(u64::from(value));
+            Ok(true)
+        }
+        async fn finish_method(&mut self, method: u16, value: u32) -> Result<(), Self::Error> {
+            self.try_emit_method(method, value).map(|_| ())
+        }
+    }
+    fn run(program: &MaxwellThreeDMmeProgram, parameters: &[u32], host: &mut Host) {
+        match crate::test_memory::ready(program.execute(0, parameters, host)) {
+            Ok(()) => {}
+            Err(MaxwellThreeDMmeRunError::Execution(error)) => {
+                panic!("benchmark MME ISA error: {error:?}")
+            }
+            Err(MaxwellThreeDMmeRunError::Host(error)) => {
+                panic!("benchmark MME host error: {error}")
+            }
+        }
+    }
+    fn program(start: u32, words: &[u32]) -> MaxwellThreeDMmeProgram {
+        let mut instructions = MmeInstructionRam::default();
+        for (offset, &raw) in words.iter().enumerate() {
+            instructions.insert(
+                start.checked_add(offset as u32).unwrap(),
+                MaxwellThreeDMmeInstruction::new(raw),
+            );
+        }
+        instructions.bind_program(0, None, start);
+        MaxwellThreeDMmeProgram {
+            instructions: Arc::new(instructions),
+            start_addresses: Arc::new(BTreeMap::from([(
+                0,
+                MaxwellThreeDRegister::decoded(start, MaxwellThreeDMmeRamAddress::new(start)),
+            )])),
+        }
+    }
+
+    #[test]
+    fn a_zero_opcode_is_executable_and_unwritten_words_remain_missing() {
+        let mut host = Host::default();
+        let zero = program(7, &[0]);
+        let result = crate::test_memory::ready(zero.execute(0, &[0, 1], &mut host));
+        assert!(matches!(result,
+            Err(MaxwellThreeDMmeRunError::Execution(
+                MaxwellThreeDMmeExecutionError::MissingInstruction { address }
+            )) if address.raw() == 8));
+        let mut hole = program(0, &[]);
+        Arc::get_mut(&mut hole.instructions)
+            .unwrap()
+            .insert(32, MaxwellThreeDMmeInstruction::new(0x11));
+        let result = crate::test_memory::ready(hole.execute(0, &[0], &mut host));
+        assert!(matches!(result,
+            Err(MaxwellThreeDMmeRunError::Execution(
+                MaxwellThreeDMmeExecutionError::MissingInstruction { address }
+            )) if address.raw() == 0));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "controlled MME interpreter CPU/allocation measurement"]
+    fn interpreter_throughput() {
+        use crate::engines::tests::register_benchmark::ALLOCATIONS;
+        use std::hint::black_box;
+        use std::time::Instant;
+        let iterations: usize = std::env::var("NIXE_MME_BENCH_ITERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(5000);
+        let cpu_ns = || {
+            std::fs::read_to_string("/proc/thread-self/schedstat")
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        // The bounded counter and branch loops also occur in the existing
+        // architectural tests. A register read forces ISA execution in the
+        // send case; none of these programs can use the direct-program path.
+        let decrement = 1 | (1 << 4) | (1 << 8) | (1 << 11) | ((-1_i32 as u32) << 14);
+        let branch = |offset: i32| 7 | (1 << 4) | (1 << 5) | (1 << 11) | ((offset as u32) << 14);
+        let exit = 1 | (1 << 4) | (1 << 7);
+        let delay = 1 | (1 << 4);
+        let method = 0x3400 / 4;
+        let set_method = 1 | (2 << 4) | (method << 14);
+        let read_send = 5 | (4 << 4) | (method << 14);
+        for (name, start, count, words, per_call, sends) in [
+            (
+                "alu_branch",
+                0,
+                20_000,
+                vec![decrement, branch(-1), exit, delay],
+                40_002,
+                0,
+            ),
+            (
+                "page_branch",
+                63,
+                20_000,
+                vec![decrement, branch(-1), exit, delay],
+                40_002,
+                0,
+            ),
+            (
+                "read_send",
+                0,
+                5_000,
+                vec![set_method, read_send, decrement, branch(-2), exit, delay],
+                15_003,
+                5_000,
+            ),
+        ] {
+            let program = program(start, &words);
+            let parameters = [count];
+            let mut host = Host {
+                value: black_box(0x1234_abcd),
+                ..Host::default()
+            };
+            for _ in 0..4 {
+                run(&program, &parameters, &mut host);
+            }
+            assert!(program.instructions.programs[0].get().unwrap().is_none());
+            host.sends = 0;
+            host.sum = 0;
+            let before = cpu_ns();
+            let started = Instant::now();
+            ALLOCATIONS.with(|n| n.set(Some(0)));
+            for _ in 0..iterations {
+                run(&program, black_box(&parameters), &mut host);
+            }
+            let allocations = ALLOCATIONS.with(|n| n.replace(None).unwrap());
+            let wall_ns = started.elapsed().as_nanos();
+            let elapsed_cpu_ns = cpu_ns() - before;
+            let emitted = sends * iterations as u64;
+            assert_eq!(host.sends, emitted);
+            assert_eq!(host.sum, u64::from(host.value) * emitted);
+            assert_eq!(allocations, 0);
+            let instructions = per_call * iterations as u64;
+            let word_bytes = std::mem::size_of::<MaxwellThreeDMmeInstruction>();
+            println!(
+                "MME_WORD_BENCH {{\"scenario\":\"{name}\",\"iterations\":{iterations},\"instructions\":{instructions},\"cpu_ns\":{elapsed_cpu_ns},\"wall_ns\":{wall_ns},\"allocations\":{allocations},\"instruction_bytes\":{word_bytes}}}"
+            );
+        }
+    }
 }

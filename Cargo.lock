@@ -1370,10 +1370,12 @@ dependencies = [
  "bcdec_rs",
  "ctt-astcenc",
  "half",
+ "hashbrown",
  "nixe-memory",
  "nixe-shader-recompiler",
  "rustc-hash",
  "sha2",
+ "smallvec",
  "spirv",
 ]
 

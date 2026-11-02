@@ -111,11 +111,14 @@ impl VulkanResidency {
                 info = info.stencil_attachment(attachment);
             }
             unsafe {
-                self.device.dispatch.begin_rendering(&info);
+                self.device
+                    .dispatch
+                    .begin_rendering(&info, Default::default());
             }
             self.device.submission.statistics.rendering_scopes += 1;
             let slot = &mut self.device.submission.slots[slot];
             slot.active_targets = Some(Arc::clone(&targets));
+            slot.rendering_feedback = Default::default();
             slot.target_handles.insert(Arc::as_ptr(&targets) as usize);
             slot.native_targets.push(targets);
             first = last;

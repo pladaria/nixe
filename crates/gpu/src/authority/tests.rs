@@ -3,6 +3,189 @@ use crate::physical::WriteDomain;
 use nixe_memory::{Machine, PAGE_SIZE};
 
 #[test]
+fn invalid_buffer_windows_keep_fragmented_aliases_and_latest_byte_producers() {
+    let machine = Machine::new(3 * PAGE_SIZE).unwrap();
+    let allocation = machine
+        .account(3 * PAGE_SIZE)
+        .unwrap()
+        .allocate(3 * PAGE_SIZE)
+        .unwrap();
+    let range = AllocationRange::new(allocation.pin(), 0, 3 * PAGE_SIZE).unwrap();
+    let mapping = PhysicalMapping::new(
+        &[2, 0, 2, 1].map(|page| range.slice(page * PAGE_SIZE, PAGE_SIZE).unwrap()),
+    )
+    .unwrap();
+    let full = Footprint::new(
+        mapping.clone(),
+        WriteDomain::Buffer {
+            start: 0,
+            bytes: 4 * PAGE_SIZE,
+        },
+    )
+    .unwrap();
+    let partial = Footprint::new(
+        mapping.clone(),
+        WriteDomain::Buffer {
+            start: PAGE_SIZE + 17,
+            bytes: 7,
+        },
+    )
+    .unwrap();
+    let mut authority = Authority::new(machine.identity());
+    authority.register(1u32, vec![full.clone()]).unwrap();
+    authority.register(2, vec![partial.clone()]).unwrap();
+    let old = authority.create_writer(1, full).unwrap();
+    let new = authority.create_writer(2, partial).unwrap();
+    authority
+        .publish_write(&machine, old, || Ok(((), NativeTick(1))))
+        .unwrap();
+    authority
+        .publish_write(&machine, new, || Ok(((), NativeTick(2))))
+        .unwrap();
+    authority
+        .cpu_write(&[range.slice(2 * PAGE_SIZE + 24, 5).unwrap()])
+        .unwrap();
+    let windows = [
+        (PAGE_SIZE - 4, 12),
+        (PAGE_SIZE + 15, 15),
+        (2 * PAGE_SIZE + 21, 15),
+        (3 * PAGE_SIZE + 9, 10),
+    ];
+    let mut output = Vec::new();
+    authority
+        .resolve_buffer_ranges(&mapping, &windows, &mut output)
+        .unwrap();
+    let actual: Vec<_> = output
+        .iter()
+        .flat_map(|part| {
+            (0..part.bytes).map(move |byte| {
+                (
+                    part.logical + byte,
+                    part.start.get() + byte,
+                    part.producer
+                        .map(|p| (p.resource, p.native + byte, p.tick.0)),
+                )
+            })
+        })
+        .collect();
+    let physical_base = range.physical_extents().next().unwrap().start.get();
+    // Independent byte model: the later logical alias wins the first writer's
+    // repeated physical page, then the second writer and CPU holes override it.
+    let expected: Vec<_> = windows
+        .iter()
+        .flat_map(|&(start, bytes)| start..start + bytes)
+        .map(|logical| {
+            let offset = logical % PAGE_SIZE;
+            let physical_page = [2, 0, 2, 1][(logical / PAGE_SIZE) as usize];
+            let producer = if physical_page == 2 && (24..29).contains(&offset) {
+                None
+            } else if physical_page == 0 && (17..24).contains(&offset) {
+                Some((2, PAGE_SIZE + offset, 2))
+            } else {
+                let source_page = [1, 3, 2][physical_page as usize];
+                Some((1, source_page * PAGE_SIZE + offset, 1))
+            };
+            (
+                logical,
+                physical_base + physical_page * PAGE_SIZE + offset,
+                producer,
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+    for invalid in [vec![(1, 0)], vec![(8, 8), (7, 1)], vec![(u64::MAX, 2)]] {
+        assert!(
+            authority
+                .resolve_buffer_ranges(&mapping, &invalid, &mut output)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn buffer_invalidations_follow_late_alias_registration_and_retirement() {
+    for late in [false, true] {
+        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(2 * PAGE_SIZE)
+            .unwrap()
+            .allocate(2 * PAGE_SIZE)
+            .unwrap();
+        let range = AllocationRange::new(allocation.pin(), 0, 2 * PAGE_SIZE).unwrap();
+        let footprint = |offset, bytes| {
+            Footprint::new(
+                PhysicalMapping::new(&[range.slice(offset, bytes).unwrap()]).unwrap(),
+                WriteDomain::Buffer { start: 0, bytes },
+            )
+            .unwrap()
+        };
+        let mut authority = Authority::new(machine.identity());
+        if !late {
+            authority.register(2u32, vec![footprint(64, 64)]).unwrap();
+            authority.track_buffer_changes(2);
+        }
+        let source = footprint(0, PAGE_SIZE);
+        authority.register(1u32, vec![source.clone()]).unwrap();
+        let writer = authority.create_writer(1, source).unwrap();
+        authority
+            .publish_write(&machine, writer, || Ok(((), NativeTick(1))))
+            .unwrap();
+        if late {
+            authority.register(2, vec![footprint(64, 64)]).unwrap();
+            authority.track_buffer_changes(2);
+            authority
+                .publish_write(&machine, writer, || Ok(((), NativeTick(2))))
+                .unwrap();
+        }
+        let mut invalid = Vec::new();
+        authority.drain_buffer_changes(2, &mut invalid);
+        assert_eq!(invalid, [(0, 64)]);
+        authority.unregister(2).unwrap();
+        authority
+            .register(2, vec![footprint(PAGE_SIZE, 64)])
+            .unwrap();
+        authority.track_buffer_changes(2);
+        authority
+            .publish_write(&machine, writer, || Ok(((), NativeTick(3))))
+            .unwrap();
+        invalid.clear();
+        authority.drain_buffer_changes(2, &mut invalid);
+        assert!(invalid.is_empty());
+    }
+}
+
+#[test]
+fn buffer_self_aliases_preserve_native_invalidations() {
+    let machine = Machine::new(PAGE_SIZE).unwrap();
+    let allocation = machine
+        .account(PAGE_SIZE)
+        .unwrap()
+        .allocate(PAGE_SIZE)
+        .unwrap();
+    let range = AllocationRange::new(allocation.pin(), 0, PAGE_SIZE).unwrap();
+    let mapping = PhysicalMapping::new(&[range.clone(), range]).unwrap();
+    let full = Footprint::new(
+        mapping.clone(),
+        WriteDomain::Buffer {
+            start: 0,
+            bytes: 2 * PAGE_SIZE,
+        },
+    )
+    .unwrap();
+    let mut authority = Authority::new(machine.identity());
+    authority.register(1u32, vec![full]).unwrap();
+    authority.track_buffer_changes(1);
+    let write = Footprint::new(mapping, WriteDomain::Buffer { start: 0, bytes: 4 }).unwrap();
+    let writer = authority.create_writer(1, write).unwrap();
+    authority
+        .publish_write(&machine, writer, || Ok(((), NativeTick(1))))
+        .unwrap();
+    let mut invalid = Vec::new();
+    authority.drain_buffer_changes(1, &mut invalid);
+    assert_eq!(invalid, [(0, 4), (PAGE_SIZE, 4)]);
+}
+
+#[test]
 fn physical_overlap_relations_follow_registration_retirement_and_replacement() {
     let machine = Machine::new(4 * PAGE_SIZE).unwrap();
     let allocation = machine

@@ -42,41 +42,66 @@ impl Hash for ImageKey {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct ParameterKey(pub Arc<GuestDrawParameters>);
-impl PartialEq for ParameterKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.same_state(&other.0)
-    }
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(super) struct ParameterKey {
+    pub shader: nixe_gpu::shader_identity::ContentId,
+    pub registers: u64,
+    pub indexed: bool,
+    pub extent: [u32; 2],
+    pub colors: [Option<nixe_gpu::ImageFormat>; 8],
+    pub depth_stencil: Option<nixe_gpu::ImageFormat>,
+    pub samples: nixe_gpu::SampleCount,
 }
-impl Eq for ParameterKey {}
-impl Hash for ParameterKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash_state(state);
-    }
+pub(super) struct ParameterSelection {
+    pub words: Box<[u32]>,
+    pub parameters: Arc<GuestDrawParameters>,
 }
 #[derive(Clone)]
 pub(super) struct ProgramKey(pub Arc<GuestProgram>);
-impl PartialEq for ProgramKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.shader.identity == other.0.shader.identity
-            && self.0.shared_memory_bytes == other.0.shared_memory_bytes
-            && self.0.bindings.len() == other.0.bindings.len()
+pub(super) struct ProgramLookup<'a> {
+    pub shader: nixe_gpu::shader_identity::ContentId,
+    pub shared_memory_bytes: u32,
+    pub bindings: &'a [(ResourceId, GuestBinding)],
+}
+impl<'a> From<&'a GuestProgram> for ProgramLookup<'a> {
+    fn from(program: &'a GuestProgram) -> Self {
+        Self {
+            shader: program.shader.identity,
+            shared_memory_bytes: program.shared_memory_bytes,
+            bindings: &program.bindings,
+        }
+    }
+}
+impl nixe_gpu::Equivalent<ProgramKey> for ProgramLookup<'_> {
+    fn equivalent(&self, key: &ProgramKey) -> bool {
+        let program = &key.0;
+        self.shader == program.shader.identity
+            && self.shared_memory_bytes == program.shared_memory_bytes
+            && self.bindings.len() == program.bindings.len()
             && self
-                .0
                 .bindings
                 .iter()
-                .zip(&other.0.bindings)
+                .zip(&program.bindings)
                 .all(|((a, av), (b, bv))| a == b && same_binding(av, bv))
+    }
+}
+impl PartialEq for ProgramKey {
+    fn eq(&self, other: &Self) -> bool {
+        nixe_gpu::Equivalent::equivalent(&ProgramLookup::from(self.0.as_ref()), other)
     }
 }
 impl Eq for ProgramKey {}
 impl Hash for ProgramKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.shader.identity.hash(state);
-        self.0.shared_memory_bytes.hash(state);
-        self.0.bindings.len().hash(state);
-        for (id, binding) in &self.0.bindings {
+        ProgramLookup::from(self.0.as_ref()).hash(state);
+    }
+}
+impl Hash for ProgramLookup<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.shader.hash(state);
+        self.shared_memory_bytes.hash(state);
+        self.bindings.len().hash(state);
+        for (id, binding) in self.bindings {
             id.hash(state);
             std::mem::discriminant(binding).hash(state);
             match binding {

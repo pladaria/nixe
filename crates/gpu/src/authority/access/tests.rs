@@ -503,7 +503,9 @@ fn an_owned_atomic_reads_its_current_producer_and_is_never_replayed() {
         .register(1u32, vec![Arc::clone(&footprint)])
         .unwrap();
     let writer = authority.create_writer(1, footprint).unwrap();
-    authority.record_write(writer, NativeTick(1)).unwrap();
+    authority
+        .publish_write(&machine, writer, || Ok(((), NativeTick(1))))
+        .unwrap();
     let atomic = AtomicAccess {
         bytes: 4,
         ordering: AccessOrdering::AcquireRelease,
@@ -537,7 +539,9 @@ fn an_owned_atomic_reads_its_current_producer_and_is_never_replayed() {
     machine.capture_stream(&[range()], &mut bytes).unwrap();
     assert_eq!(u32::from_le_bytes(bytes), 23);
     assert!(authority.resolve(&[range()]).unwrap()[0].producer.is_none());
-    authority.record_write(writer, NativeTick(2)).unwrap();
+    authority
+        .publish_write(&machine, writer, || Ok(((), NativeTick(2))))
+        .unwrap();
     let snapshot = authority.resolve(&[range()]).unwrap().remove(0);
     authority
         .publish_readback(&machine, snapshot, &100u32.to_le_bytes(), &mut Vec::new())

@@ -12,14 +12,13 @@
 
 #include <mcl/bit/bit_field.hpp>
 #include <mcl/stdint.hpp>
-#include <xbyak/xbyak.h>
-#include <xbyak/xbyak_util.h>
 
 #include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/callback.h"
 #include "dynarmic/backend/x64/constant_pool.h"
 #include "dynarmic/backend/x64/host_feature.h"
 #include "dynarmic/backend/x64/jitstate_info.h"
+#include "dynarmic/backend/x64/xbyak.h"
 #include "dynarmic/common/cast_util.h"
 #include "dynarmic/interface/halt_reason.h"
 #include "dynarmic/ir/cond.h"

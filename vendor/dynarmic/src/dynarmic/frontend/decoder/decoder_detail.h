@@ -116,9 +116,8 @@ struct detail {
     }
 
     /**
-     * This struct's Make member function generates a lambda which decodes an instruction based on
-     * the provided arg_masks and arg_shifts. The Visitor member function to call is provided as a
-     * template argument.
+     * Decode instruction fields and invoke a statically selected visitor member.
+     * The field masks and shifts are constants in the generated direct callback.
      */
     template<typename FnT>
     struct VisitorCaller;
@@ -129,35 +128,21 @@ struct detail {
 #endif
     template<typename Visitor, typename... Args, typename CallRetT>
     struct VisitorCaller<CallRetT (Visitor::*)(Args...)> {
-        template<size_t... iota>
-        static auto Make(std::integer_sequence<size_t, iota...>,
-                         CallRetT (Visitor::*const fn)(Args...),
-                         const std::array<opcode_type, sizeof...(iota)> arg_masks,
-                         const std::array<size_t, sizeof...(iota)> arg_shifts) {
+        template<auto fn, auto bitstring, size_t... iota>
+        static CallRetT Call(Visitor& v, opcode_type instruction, std::integer_sequence<size_t, iota...>) {
             static_assert(std::is_same_v<visitor_type, Visitor>, "Member function is not from Matcher's Visitor");
-            return [fn, arg_masks, arg_shifts](Visitor& v, opcode_type instruction) {
-                (void)instruction;
-                (void)arg_masks;
-                (void)arg_shifts;
-                return (v.*fn)(static_cast<Args>((instruction & arg_masks[iota]) >> arg_shifts[iota])...);
-            };
+            constexpr auto args = GetArgInfo<sizeof...(Args)>(bitstring);
+            return (v.*fn)(static_cast<Args>((instruction & std::get<0>(args)[iota]) >> std::get<1>(args)[iota])...);
         }
     };
 
     template<typename Visitor, typename... Args, typename CallRetT>
     struct VisitorCaller<CallRetT (Visitor::*)(Args...) const> {
-        template<size_t... iota>
-        static auto Make(std::integer_sequence<size_t, iota...>,
-                         CallRetT (Visitor::*const fn)(Args...) const,
-                         const std::array<opcode_type, sizeof...(iota)> arg_masks,
-                         const std::array<size_t, sizeof...(iota)> arg_shifts) {
+        template<auto fn, auto bitstring, size_t... iota>
+        static CallRetT Call(const Visitor& v, opcode_type instruction, std::integer_sequence<size_t, iota...>) {
             static_assert(std::is_same_v<visitor_type, const Visitor>, "Member function is not from Matcher's Visitor");
-            return [fn, arg_masks, arg_shifts](const Visitor& v, opcode_type instruction) {
-                (void)instruction;
-                (void)arg_masks;
-                (void)arg_shifts;
-                return (v.*fn)(static_cast<Args>((instruction & arg_masks[iota]) >> arg_shifts[iota])...);
-            };
+            constexpr auto args = GetArgInfo<sizeof...(Args)>(bitstring);
+            return (v.*fn)(static_cast<Args>((instruction & std::get<0>(args)[iota]) >> std::get<1>(args)[iota])...);
         }
     };
 #ifdef _MSC_VER
@@ -168,23 +153,25 @@ struct detail {
      * Creates a matcher that can match and parse instructions based on bitstring.
      * See also: GetMaskAndExpect and GetArgInfo for format of bitstring.
      */
-    template<auto bitstring, typename FnT>
-    static auto GetMatcher(FnT fn, const char* const name) {
+    template<auto bitstring, auto fn>
+    static auto GetMatcher(const char* const name) {
+        using FnT = decltype(fn);
         constexpr size_t args_count = mcl::parameter_count_v<FnT>;
 
         constexpr auto mask = std::get<0>(GetMaskAndExpect(bitstring));
         constexpr auto expect = std::get<1>(GetMaskAndExpect(bitstring));
-        constexpr auto arg_masks = std::get<0>(GetArgInfo<args_count>(bitstring));
-        constexpr auto arg_shifts = std::get<1>(GetArgInfo<args_count>(bitstring));
-
         using Iota = std::make_index_sequence<args_count>;
-
-        const auto proxy_fn = VisitorCaller<FnT>::Make(Iota(), fn, arg_masks, arg_shifts);
+        // Compile the member and argument masks into a direct callback, as Eden
+        // does, instead of retaining a type-erased closure and its captures.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/frontend/decoder/decoder_detail.h
+        const auto proxy_fn = +[](visitor_type& visitor, opcode_type instruction) {
+            return VisitorCaller<FnT>::template Call<fn, bitstring>(visitor, instruction, Iota{});
+        };
         return MatcherT(name, mask, expect, proxy_fn);
     }
 };
 
-#define DYNARMIC_DECODER_GET_MATCHER(MatcherT, fn, name, bitstring) Decoder::detail::detail<MatcherT<V>>::template GetMatcher<bitstring>(&V::fn, name)
+#define DYNARMIC_DECODER_GET_MATCHER(MatcherT, fn, name, bitstring) Decoder::detail::detail<MatcherT<V>>::template GetMatcher<bitstring, &V::fn>(name)
 
 }  // namespace detail
 }  // namespace Dynarmic::Decoder

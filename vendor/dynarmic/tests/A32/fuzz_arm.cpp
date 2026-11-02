@@ -24,7 +24,6 @@
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/common/fp/fpsr.h"
 #include "dynarmic/common/llvm_disassemble.h"
-#include "dynarmic/common/variant_util.h"
 #include "dynarmic/frontend/A32/ITState.h"
 #include "dynarmic/frontend/A32/a32_location_descriptor.h"
 #include "dynarmic/frontend/A32/a32_types.h"
@@ -41,11 +40,13 @@
 namespace {
 using namespace Dynarmic;
 
-template<typename Fn>
-bool AnyLocationDescriptorForTerminalHas(IR::Terminal terminal, Fn fn) {
-    return Common::VisitVariant<bool>(terminal, [&](auto t) -> bool {
+template<typename Terminal, typename Fn>
+bool AnyLocationDescriptorForTerminalHas(const Terminal& terminal, Fn fn) {
+    return std::visit([&](const auto& t) -> bool {
         using T = std::decay_t<decltype(t)>;
-        if constexpr (std::is_same_v<T, IR::Term::Invalid>) {
+        if constexpr (std::is_same_v<T, IR::Term::LeafTerminal>) {
+            return AnyLocationDescriptorForTerminalHas(t, fn);
+        } else if constexpr (std::is_same_v<T, IR::Term::Invalid>) {
             return false;
         } else if constexpr (std::is_same_v<T, IR::Term::ReturnToDispatch>) {
             return false;
@@ -69,7 +70,8 @@ bool AnyLocationDescriptorForTerminalHas(IR::Terminal terminal, Fn fn) {
             ASSERT_MSG(false, "Invalid terminal type");
             return false;
         }
-    });
+    },
+                      terminal);
 }
 
 bool ShouldTestInst(u32 instruction, u32 pc, bool is_thumb, bool is_last_inst, A32::ITState it_state = {}) {
@@ -81,7 +83,8 @@ bool ShouldTestInst(u32 instruction, u32 pc, bool is_thumb, bool is_last_inst, A
         return false;
     }
 
-    if (auto terminal = block.GetTerminal(); boost::get<IR::Term::Interpret>(&terminal)) {
+    const auto* leaf = std::get_if<IR::Term::LeafTerminal>(&block.GetTerminal());
+    if (leaf && std::holds_alternative<IR::Term::Interpret>(*leaf)) {
         return false;
     }
 

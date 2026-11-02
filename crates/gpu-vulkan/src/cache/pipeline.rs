@@ -17,6 +17,7 @@ use std::{
 mod state;
 pub use state::*;
 mod create;
+mod recipes;
 use create::GraphicsCompilation;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,6 +237,8 @@ pub struct PipelineCompiler {
     cache: Mutex<nixe_gpu::WorkingSet<PipelineKey, Arc<NativePipeline>>>,
     compiler: Arc<Compiler>,
     counters: nixe_gpu::cache_counters::CacheCounters,
+    recipes: Option<Arc<recipes::Recipes>>,
+    load_batch: usize,
 }
 impl PipelineCompiler {
     pub(crate) fn bind_wakeup(&self, wake: Arc<dyn Fn() + Send + Sync>) {
@@ -305,6 +308,8 @@ impl PipelineCompiler {
         }
         Ok(Self {
             pool,
+            recipes: recipes::Recipes::new(device, config),
+            load_batch: config.workers.min(config.pending_jobs).max(1),
             counters: nixe_gpu::cache_counters::CacheCounters::new(config.pipeline_entries, 0),
             cache: Mutex::new(nixe_gpu::WorkingSet::new(
                 config.pipeline_entries,
@@ -351,6 +356,47 @@ impl PipelineCompiler {
         self.compiler.strategy
     }
     pub fn request(&self, recipe: PipelineRecipe) -> Result<Arc<NativePipeline>, CompileError> {
+        self.request_pipeline(recipe, true)
+    }
+    /// Rebuild accepted disk recipes on the existing compiler workers before
+    /// the guest starts producing frames. Each batch respects pool admission.
+    pub fn load_disk(&self) -> usize {
+        let Some(recipes) = &self.recipes else {
+            return 0;
+        };
+        let mut pending = Vec::with_capacity(self.load_batch);
+        let mut loaded = 0;
+        let finish = |pending: &mut Vec<Arc<NativePipeline>>| {
+            pending
+                .drain(..)
+                .filter(|pipeline| match pipeline.handle() {
+                    Ok(_) => true,
+                    Err(error) => {
+                        log::debug!("cached pipeline reconstruction: {error}");
+                        false
+                    }
+                })
+                .count()
+        };
+        for key in recipes.keys() {
+            let Some(recipe) = recipes.read(key) else {
+                continue;
+            };
+            match self.request_pipeline(recipe, false) {
+                Ok(pipeline) => pending.push(pipeline),
+                Err(error) => log::debug!("cached pipeline admission: {error}"),
+            }
+            if pending.len() == self.load_batch {
+                loaded += finish(&mut pending);
+            }
+        }
+        loaded + finish(&mut pending)
+    }
+    fn request_pipeline(
+        &self,
+        recipe: PipelineRecipe,
+        persist: bool,
+    ) -> Result<Arc<NativePipeline>, CompileError> {
         let (shader, state) = match recipe {
             PipelineRecipe::Compute(shader) => (shader, None),
             PipelineRecipe::Graphics { shader, state } => (shader, Some(state)),
@@ -405,9 +451,11 @@ impl PipelineCompiler {
             graphics: state,
         });
         let compiler = Arc::clone(&self.compiler);
+        let recipes = self.recipes.clone().filter(|_| persist);
         let build_pipeline = Arc::clone(&pipeline);
         self.pool.submit(move |worker| {
-            let _trace = nixe_gpu::trace::span("pipeline_compile", worker as u64, 0, 0);
+            nixe_gpu::trace::event("pipeline_compile", worker as u64, 0, 0);
+            let _trace = nixe_gpu::trace::span("pipeline_build", worker as u64, 0, 0);
             #[cfg(feature = "performance-counters")]
             capture_key.event("begin", worker, 0);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -436,12 +484,19 @@ impl PipelineCompiler {
                     );
                 }
             }
-            let _lock = build_pipeline.build_lock.lock().unwrap();
-            assert!(
-                build_pipeline.build.set(result).is_ok(),
-                "pipeline completed twice"
-            );
-            build_pipeline.build_ready.notify_all();
+            let succeeded = result.is_ok();
+            {
+                let _lock = build_pipeline.build_lock.lock().unwrap();
+                assert!(
+                    build_pipeline.build.set(result).is_ok(),
+                    "pipeline completed twice"
+                );
+                build_pipeline.build_ready.notify_all();
+            }
+            // Disk I/O must not delay a pipeline that is already executable.
+            if succeeded && let Some(recipes) = recipes {
+                recipes.write(&shader, build_pipeline.graphics.as_ref());
+            }
         })?;
         let previous_entries = cache.usage().0;
         cache.insert(

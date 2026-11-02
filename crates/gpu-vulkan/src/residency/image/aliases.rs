@@ -223,10 +223,7 @@ impl VulkanResidency {
         parts: &[ResolvedBytes<Resource>],
     ) -> Result<bool, VulkanError> {
         let target = self.image(id)?;
-        let mut groups = rustc_hash::FxHashMap::<
-            (ImageId, u32, u32, u32, u32, u32, u32, u32),
-            (ImagePlane, ImagePlane, Vec<vk::ImageCopy>),
-        >::default();
+        let mut groups = AliasCopies::default();
         for part in parts {
             let Some(producer) = part.producer else {
                 if target.canonical_import && !target.synchronized {
@@ -324,28 +321,17 @@ impl VulkanResidency {
                         height,
                         depth: 1,
                     });
-                groups
-                    .entry((
-                        source,
-                        src.aspect.as_raw(),
-                        src.mip_level,
-                        src.array_layer,
-                        src.depth_slice,
-                        dst.mip_level,
-                        dst.array_layer,
-                        dst.depth_slice,
-                    ))
-                    .or_insert_with(|| (src, dst, Vec::new()))
-                    .2
-                    .push(copy);
+                push_alias_copy(&mut groups, source, src, dst, copy);
                 from += size;
                 to += size;
                 remaining -= size;
             }
         }
-        for ((source, ..), (src, dst, mut copies)) in groups {
-            coalesce_copies(&mut copies);
-            self.copy_alias_regions(source, src, id, dst, &copies)?;
+        for (source, mut planes) in groups {
+            for plane in &mut planes {
+                coalesce_copies(&mut plane.copies);
+            }
+            self.copy_alias_regions(source, id, planes)?;
         }
         Ok(true)
     }
@@ -353,23 +339,21 @@ impl VulkanResidency {
     pub(super) fn copy_alias_regions(
         &mut self,
         source: ImageId,
-        src: ImagePlane,
         id: ImageId,
-        dst: ImagePlane,
-        copies: &[vk::ImageCopy],
+        planes: smallvec::SmallVec<[PlaneCopies; 2]>,
     ) -> Result<(), VulkanError> {
-        let (native, layout) = self.image_access_subresources(
+        let (native, layout) = self.image_planes_access(
             source,
-            commands::plane_range(src),
+            planes.iter().map(|plane| plane.source),
             AccessScope::new(
                 vk::PipelineStageFlags2::COPY,
                 vk::AccessFlags2::TRANSFER_READ,
             ),
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         )?;
-        let (target, target_layout) = self.image_access_subresources(
+        let (target, target_layout) = self.image_planes_access(
             id,
-            commands::plane_range(dst),
+            planes.iter().map(|plane| plane.destination),
             AccessScope::new(
                 vk::PipelineStageFlags2::COPY,
                 vk::AccessFlags2::TRANSFER_WRITE,
@@ -378,32 +362,44 @@ impl VulkanResidency {
         )?;
         self.device.begin_recording()?;
         self.barriers.emit(&mut self.device);
+        let mut planes = planes.into_iter();
+        let first = planes.next().expect("alias copies have a source plane");
+        let mut ranges = smallvec::SmallVec::<[(ImagePlane, std::ops::Range<usize>); 2]>::new();
+        ranges.push((first.destination, 0..first.copies.len()));
+        let mut copies = first.copies;
+        for mut plane in planes {
+            let start = copies.len();
+            copies.append(&mut plane.copies);
+            ranges.push((plane.destination, start..copies.len()));
+        }
         unsafe {
             self.device
                 .dispatch
-                .cmd_copy_image(native, layout, target, target_layout, copies);
+                .cmd_copy_image(native, layout, target, target_layout, &copies);
         }
         self.statistics.alias_copy_commands += 1;
         self.statistics.alias_copy_regions += copies.len() as u64;
-        for copy in copies {
-            self.define_image_rect(
-                id,
-                dst,
-                vk::Rect2D {
-                    offset: vk::Offset2D {
-                        x: copy.dst_offset.x,
-                        y: copy.dst_offset.y,
+        for (dst, range) in ranges {
+            for copy in &copies[range] {
+                self.define_image_rect(
+                    id,
+                    dst,
+                    vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: copy.dst_offset.x,
+                            y: copy.dst_offset.y,
+                        },
+                        extent: vk::Extent2D {
+                            width: copy.extent.width,
+                            height: copy.extent.height,
+                        },
                     },
-                    extent: vk::Extent2D {
-                        width: copy.extent.width,
-                        height: copy.extent.height,
-                    },
-                },
-            );
-            self.statistics.gpu_copied_bytes +=
-                u64::from(copy.extent.width.div_ceil(dst.block_extent.width))
-                    * u64::from(copy.extent.height.div_ceil(dst.block_extent.height))
-                    * u64::from(dst.bytes_per_block);
+                );
+                self.statistics.gpu_copied_bytes +=
+                    u64::from(copy.extent.width.div_ceil(dst.block_extent.width))
+                        * u64::from(copy.extent.height.div_ceil(dst.block_extent.height))
+                        * u64::from(dst.bytes_per_block);
+            }
         }
         Ok(())
     }

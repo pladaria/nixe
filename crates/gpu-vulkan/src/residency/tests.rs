@@ -4,18 +4,132 @@ use nixe_memory::{Allocation, AllocationRange, Machine, PAGE_SIZE};
 use std::time::Duration;
 
 #[test]
+fn buffer_validity_subtraction_matches_byte_coverage() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let (_allocation, backing) = backing_allocation(&cache, 4096, 4096, 0);
+    let id = buffer(&mut cache, backing);
+    for seed in 0..4 {
+        let initial: [bool; 64] = std::array::from_fn(|index| (index * 7 + seed * 13) % 19 < 11);
+        let mut intervals = Vec::new();
+        for (index, &invalid) in initial.iter().enumerate() {
+            if !invalid {
+                continue;
+            }
+            if let Some((start, bytes)) = intervals.last_mut()
+                && *start + *bytes == index as u64
+            {
+                *bytes += 1;
+            } else {
+                intervals.push((index as u64, 1));
+            }
+        }
+        for start in 0..=64 {
+            for end in start..=64 {
+                let entry = cache.buffer_mut(id);
+                entry.invalid.clone_from(&intervals);
+                entry.validate_interval(start as u64, (end - start) as u64);
+                let mut expected = initial;
+                expected[start..end].fill(false);
+                let actual: [bool; 64] = std::array::from_fn(|byte| {
+                    entry.invalid.iter().any(|&(start, bytes)| {
+                        start <= byte as u64 && (byte as u64) < start + bytes
+                    })
+                });
+                assert_eq!(actual, expected, "seed={seed}, window={start}..{end}");
+            }
+        }
+        for written in [&[][..], &[(2, 3)][..], &[(2, 3), (13, 7), (63, 1)][..]] {
+            let entry = cache.buffer_mut(id);
+            entry.invalid.clone_from(&intervals);
+            entry.validate_intervals(written);
+            let mut expected = initial;
+            for &(start, bytes) in written {
+                expected[start as usize..(start + bytes) as usize].fill(false);
+            }
+            let actual: [bool; 64] = std::array::from_fn(|byte| {
+                entry
+                    .invalid
+                    .iter()
+                    .any(|&(start, bytes)| start <= byte as u64 && (byte as u64) < start + bytes)
+            });
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
+fn refreshing_buffer_window_keeps_valid_native_image_bytes_without_copying_them_again() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (_allocation, backing) = backing_allocation(&cache, 4096, 4096, 0x41);
+    let (mut description, planes) = rgba_image();
+    description.usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+    let image = cache
+        .image_for(
+            image_geometry(backing.clone(), description, &planes),
+            description,
+            planes,
+        )
+        .unwrap();
+    let (_source, source) = backing_allocation(&cache, 4096, 4096, 0x87);
+    copy_fixture_image(&mut cache, image, source);
+    let alias = buffer(&mut cache, backing.slice(0, 128).unwrap());
+    let mut expected = cache.read_buffer(alias, 0, 128).unwrap();
+    cache
+        .clear_image_rect(
+            image,
+            0,
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 1, y: 1 },
+                extent: vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                },
+            },
+            vk::ClearValue {
+                color: vk::ClearColorValue { float32: [1.; 4] },
+            },
+        )
+        .unwrap();
+    let before = cache.statistics();
+    cache.ensure_buffer_range(alias, 60, 4).unwrap();
+    assert_eq!(
+        cache.statistics().gpu_copied_bytes,
+        before.gpu_copied_bytes + 4
+    );
+    assert_eq!(
+        cache.statistics().cpu_uploaded_bytes,
+        before.cpu_uploaded_bytes
+    );
+    expected[60..64].fill(0xff);
+    assert_eq!(cache.read_buffer(alias, 0, 128).unwrap(), expected);
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
 fn batched_cpu_streams_preserve_versions_aliases_and_native_imports() {
     let Some(mut cache) = cache(ApiPreference::Auto, 32 * 1024 * 1024) else {
         return;
     };
     let validation = cache.device.validation_monitor();
     let (allocation, backing) = backing_allocation(&cache, 8192, 4096, 0x19);
-    let a = buffer(&mut cache, backing.slice(64, 32).unwrap());
-    let b = buffer(&mut cache, backing.slice(4096, 32).unwrap());
-    let requests = [(a, 64), (b, 0)].map(|(id, offset)| {
+    let [a, b] = [64, 4096].map(|offset| {
+        cache
+            .buffer_for(
+                backing.slice(offset, 32).unwrap(),
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+            )
+            .unwrap()
+    });
+    let requests = [a, b].map(|range| {
         Some(buffer::BufferStreamRequest {
-            id,
-            offset,
+            id: range.buffer,
+            offset: range.offset,
             size: 32,
             alignment: 16,
         })
@@ -43,9 +157,15 @@ fn batched_cpu_streams_preserve_versions_aliases_and_native_imports() {
             [0x19; 32]
         );
     }
-    assert_eq!(cache.read_buffer(a, 64, 32).unwrap(), [0x37; 32]);
-    assert_eq!(cache.read_buffer(b, 0, 32).unwrap(), [0x42; 32]);
-    write(&mut cache, a, 64, &[0x71; 32]);
+    assert_eq!(
+        cache.read_buffer(a.buffer, a.offset, 32).unwrap(),
+        [0x37; 32]
+    );
+    assert_eq!(
+        cache.read_buffer(b.buffer, b.offset, 32).unwrap(),
+        [0x42; 32]
+    );
+    write(&mut cache, a.buffer, a.offset, &[0x71; 32]);
     let streams = requests
         .iter()
         .map(|request| cache.stream_buffer(request.unwrap()).unwrap())
@@ -57,8 +177,8 @@ fn batched_cpu_streams_preserve_versions_aliases_and_native_imports() {
     assert!(streams[1].is_some());
     let (clean, offset) = cache
         .stream_buffer(buffer::BufferStreamRequest {
-            id: a,
-            offset: 128,
+            id: a.buffer,
+            offset: a.offset + 64,
             size: 32,
             alignment: 16,
         })
@@ -68,7 +188,10 @@ fn batched_cpu_streams_preserve_versions_aliases_and_native_imports() {
         unsafe { clean.completed_bytes(offset, 32) }.unwrap(),
         [0x19; 32]
     );
-    assert_eq!(cache.read_buffer(a, 64, 32).unwrap(), [0x71; 32]);
+    assert_eq!(
+        cache.read_buffer(a.buffer, a.offset, 32).unwrap(),
+        [0x71; 32]
+    );
     drop(cache);
     validation.check().unwrap();
 }
@@ -236,6 +359,113 @@ fn buffer_mapping_index_preserves_subranges_usage_and_eviction_generations() {
     let next = buffer(&mut cache, range);
     assert_ne!(next, ids[1]);
     assert_eq!(cache.read_buffer(next, 16, 16).unwrap(), [0x37; 16]);
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
+fn buffer_page_selection_distinguishes_fragment_order_and_repeated_physical_bytes() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (_a, a) = backing_allocation(&cache, 4096, 4096, 0x31);
+    let (_b, b) = backing_allocation(&cache, 4096, 4096, 0x42);
+    let (_c, c) = backing_allocation(&cache, 4096, 4096, 0x53);
+    assert_eq!(
+        a.spans()[0].start.get() / 65536,
+        c.spans()[0].start.get() / 65536
+    );
+    let left = PhysicalMapping::join(&[
+        a.slice(32, 16).unwrap(),
+        b.slice(64, 16).unwrap(),
+        a.slice(32, 16).unwrap(),
+        b.slice(128, 16).unwrap(),
+    ])
+    .unwrap();
+    let right =
+        PhysicalMapping::join(&[a.slice(32, 16).unwrap(), c.slice(64, 16).unwrap()]).unwrap();
+    let left_id = buffer(&mut cache, Arc::clone(&left));
+    let right_id = buffer(&mut cache, Arc::clone(&right));
+    assert_ne!(left_id, right_id);
+    for mapping in [&left, &right, &right, &left] {
+        let selected = cache
+            .buffer_for_deferred_import(Arc::clone(mapping), vk::BufferUsageFlags::VERTEX_BUFFER)
+            .unwrap();
+        assert_eq!(
+            selected.buffer,
+            if Arc::ptr_eq(mapping, &left) {
+                left_id
+            } else {
+                right_id
+            }
+        );
+        assert_eq!(selected.offset, 0);
+    }
+    cache.fill_buffer(left_id, 16, 16, 0x11223344).unwrap();
+    cache.fill_buffer(right_id, 16, 16, 0x55667788).unwrap();
+    assert_eq!(
+        cache.read_buffer(left_id, 16, 16).unwrap(),
+        0x11223344u32.to_ne_bytes().repeat(4)
+    );
+    assert_eq!(
+        cache.read_buffer(right_id, 16, 16).unwrap(),
+        0x55667788u32.to_ne_bytes().repeat(4)
+    );
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
+fn partially_retired_buffer_leaves_selection_but_preserves_live_native_producers() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (a_allocation, a) = backing_allocation(&cache, 4096, 4096, 0x31);
+    let (_b_allocation, b) = backing_allocation(&cache, 4096, 4096, 0x42);
+    let joined = PhysicalMapping::join(&[
+        a.slice(32, 16).unwrap(),
+        b.slice(64, 16).unwrap(),
+        a.slice(32, 16).unwrap(),
+    ])
+    .unwrap();
+    let old = buffer(&mut cache, joined);
+    cache.fill_buffer(old, 16, 16, 0x11223344).unwrap();
+    let work = cache.flush().unwrap().unwrap();
+    cache.device.wait_for_work(work, Duration::MAX).unwrap();
+    let retired = a_allocation.identity();
+    let extents = a
+        .spans()
+        .iter()
+        .map(|span| nixe_memory::Extent {
+            start: span.start,
+            bytes: span.bytes,
+        })
+        .collect::<Vec<_>>();
+    drop(a_allocation);
+    cache
+        .retire_physical_memory(cache.memory.identity(), retired, &extents)
+        .unwrap();
+    assert!(
+        cache.buffer(old).is_ok(),
+        "surviving bytes retain their producer"
+    );
+    assert!(!cache.buffer_binding_current(old));
+    let live = cache
+        .buffer_for(
+            b.slice(64, 16).unwrap(),
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )
+        .unwrap();
+    assert_ne!(live.buffer, old);
+    assert_eq!(
+        cache
+            .read_buffer(live.buffer, live.offset, live.size)
+            .unwrap(),
+        0x11223344u32.to_ne_bytes().repeat(4)
+    );
+    assert_eq!(cache.statistics().canonical_readback_bytes, 0);
     drop(cache);
     validation.check().unwrap();
 }
@@ -423,12 +653,11 @@ fn copy_fixture_image(
         .unwrap();
     for (index, plane) in planes.into_iter().enumerate() {
         cache
-            .copy_image_region(
+            .copy_image_regions(
                 source,
-                index,
-                transfers::full_rect(plane),
                 destination,
-                index,
+                &[(index, index)],
+                transfers::full_rect(plane),
                 vk::Offset2D::default(),
             )
             .unwrap();
@@ -459,6 +688,75 @@ pub(crate) fn cpu_write(
 fn write(cache: &mut VulkanResidency, id: BufferId, offset: u64, bytes: &[u8]) -> WorkTicket {
     cache.write_buffer(id, offset, bytes).unwrap()
 }
+#[test]
+fn cached_ram_native_stores_reach_gpu_and_survive_a_later_fence_publication() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let (allocation, whole) = backing_allocation(&cache, 8192, 4096, 0x19);
+    let id = buffer(&mut cache, whole);
+    let memory = cache.memory().clone();
+    let space =
+        nixe_memory::AddressSpace::new(memory.clone(), nixe_memory::AddressWidth::Bits32).unwrap();
+    for base in [4096, 16384] {
+        space
+            .map(
+                nixe_memory::GuestVirtualAddress::new(base),
+                allocation.clone(),
+                0,
+                8192,
+                nixe_memory::MemoryPermissions::READ_WRITE,
+            )
+            .unwrap();
+    }
+    memory.enable_cpu_write_collection().unwrap();
+    let core = space.register_core(Arc::new(|| {}));
+    let native = core.enter_native().unwrap();
+    let protections = memory.tracking_statistics().protection_calls;
+    assert!(
+        space
+            .write_native(
+                &native,
+                nixe_memory::GuestVirtualAddress::new(16384 + 4094),
+                &[1, 2, 3, 4, 5, 6],
+            )
+            .unwrap()
+    );
+    drop(native);
+    cache
+        .consume_cpu_writes(memory.collect_cpu_writes().unwrap())
+        .unwrap();
+    assert_eq!(
+        cache.read_buffer(id, 4093, 8).unwrap(),
+        [0x19, 1, 2, 3, 4, 5, 6, 0x19]
+    );
+    assert_eq!(memory.tracking_statistics().protection_calls, protections);
+
+    // A later GPU producer replaces the RAM version. Its already committed
+    // fence must preserve still later native stores into the same bytes.
+    write(&mut cache, id, 4094, &[11; 6]);
+    cache.commit_buffer_downloads().unwrap();
+    cache.flush().unwrap();
+    let native = core.enter_native().unwrap();
+    assert!(
+        space
+            .write_native(
+                &native,
+                nixe_memory::GuestVirtualAddress::new(4096 + 4095),
+                &[77, 78],
+            )
+            .unwrap()
+    );
+    drop(native);
+    cache.drain_buffer_downloads().unwrap();
+    assert_eq!(
+        cache.read_buffer(id, 4093, 8).unwrap(),
+        [0x19, 11, 77, 78, 11, 11, 11, 0x19]
+    );
+    assert!(memory.collect_cpu_writes().unwrap().is_empty());
+    memory.disable_cpu_write_collection();
+}
+
 #[test]
 fn a_batch_of_fragmented_cpu_overwrites_preserves_native_buffer_neighbors() {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
@@ -1704,12 +2002,59 @@ fn native_scalar_read_materializes_current_image_bytes_once_for_neighbouring_cpu
 }
 
 #[test]
+fn nearby_buffer_bindings_share_a_cache_page_without_importing_unused_pages() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (_allocation, whole) = backing_allocation(&cache, 128 * 1024, 64 * 1024, 0x39);
+    let before = cache.statistics();
+    let first = cache
+        .buffer_for(
+            whole.slice(32, 16).unwrap(),
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )
+        .unwrap();
+    assert_eq!(cache.buffer(first.buffer).unwrap().native.size(), 64 * 1024);
+    for page in 1..16 {
+        let offset = page * PAGE_SIZE + 32;
+        let selected = cache
+            .buffer_for_deferred_import(
+                whole.slice(offset, 16).unwrap(),
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+            )
+            .unwrap();
+        assert_eq!(selected.buffer, first.buffer);
+        assert_eq!(selected.offset, offset);
+    }
+    assert_eq!(
+        cache.statistics().buffer_allocations - before.buffer_allocations,
+        1
+    );
+    assert_eq!(cache.statistics().buffer_merges, before.buffer_merges);
+    assert_eq!(
+        cache.statistics().cpu_uploaded_bytes - before.cpu_uploaded_bytes,
+        PAGE_SIZE
+    );
+    assert_eq!(
+        cache
+            .read_buffer(first.buffer, 15 * PAGE_SIZE + 32, 16)
+            .unwrap(),
+        [0x39; 16]
+    );
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
 fn overlapping_buffer_growth_reuses_ranges_and_preserves_queued_native_versions() {
     let Some(mut cache) = cache(ApiPreference::Auto, 32 * 1024 * 1024) else {
         return;
     };
+    let cache_page = 64 * 1024;
     let validation = cache.device.validation_monitor();
-    let (_allocation, whole) = backing_allocation(&cache, 4 * PAGE_SIZE as usize, 4096, 0x19);
+    let (_allocation, whole) =
+        backing_allocation(&cache, 4 * cache_page as usize, cache_page as usize, 0x19);
     let first = cache
         .buffer_for(
             whole.slice(64, 128).unwrap(),
@@ -1731,14 +2076,14 @@ fn overlapping_buffer_growth_reuses_ranges_and_preserves_queued_native_versions(
         .unwrap();
     let last = cache
         .buffer_for(
-            whole.slice(2 * PAGE_SIZE, PAGE_SIZE).unwrap(),
+            whole.slice(2 * cache_page, cache_page).unwrap(),
             vk::BufferUsageFlags::INDEX_BUFFER,
         )
         .unwrap();
     write(&mut cache, last.buffer, last.offset + 32, &[0x42; 32]);
     let merged = cache
         .buffer_for(
-            whole.slice(PAGE_SIZE / 2, 2 * PAGE_SIZE).unwrap(),
+            whole.slice(cache_page / 2, 2 * cache_page).unwrap(),
             vk::BufferUsageFlags::INDIRECT_BUFFER,
         )
         .unwrap();
@@ -1762,12 +2107,12 @@ fn overlapping_buffer_growth_reuses_ranges_and_preserves_queued_native_versions(
     );
     assert_eq!(
         cache
-            .read_buffer(merged.buffer, 2 * PAGE_SIZE + 32, 32)
+            .read_buffer(merged.buffer, 2 * cache_page + 32, 32)
             .unwrap(),
         [0x42; 32]
     );
     assert_eq!(
-        cache.read_buffer(merged.buffer, PAGE_SIZE, 32).unwrap(),
+        cache.read_buffer(merged.buffer, cache_page, 32).unwrap(),
         [0x19; 32]
     );
     let before = cache.statistics();
@@ -1850,10 +2195,10 @@ fn four_consecutive_overlaps_expand_to_live_megabyte_coverage_and_idle_resets_gr
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_allocation, mapping) = backing_allocation(&cache, 2 * 1024 * 1024, 4096, 0x19);
+    let (_allocation, mapping) = backing_allocation(&cache, 2 * 1024 * 1024, 1024 * 1024, 0x19);
     let mut range = cache
         .buffer_for_deferred_import(
-            mapping.slice(0, 4096).unwrap(),
+            mapping.slice(0, 65536).unwrap(),
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )
         .unwrap();
@@ -1861,7 +2206,7 @@ fn four_consecutive_overlaps_expand_to_live_megabyte_coverage_and_idle_resets_gr
         let old = range.buffer;
         range = cache
             .buffer_for_deferred_import(
-                mapping.slice(0, (page + 1) * 4096).unwrap(),
+                mapping.slice(0, (page + 1) * 65536).unwrap(),
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             )
             .unwrap();
@@ -1869,7 +2214,7 @@ fn four_consecutive_overlaps_expand_to_live_megabyte_coverage_and_idle_resets_gr
         if page < 4 {
             assert_eq!(
                 cache.buffer(range.buffer).unwrap().native.size(),
-                (page + 1) * 4096
+                (page + 1) * 65536
             );
         }
     }
@@ -1878,10 +2223,10 @@ fn four_consecutive_overlaps_expand_to_live_megabyte_coverage_and_idle_resets_gr
     let coverage = native.contents.geometry[0].mapping();
     assert_eq!(coverage.spans()[0].start.get() % (1024 * 1024), 0);
     assert_eq!(coverage.bytes(), 1024 * 1024);
-    let (_allocation2, second) = backing_allocation(&cache, 32 * 4096, 4096, 0x19);
+    let (_allocation2, second) = backing_allocation(&cache, 32 * 65536, 65536, 0x19);
     let mut previous = cache
         .buffer_for_deferred_import(
-            second.slice(0, 4096).unwrap(),
+            second.slice(0, 65536).unwrap(),
             vk::BufferUsageFlags::VERTEX_BUFFER,
         )
         .unwrap();
@@ -1889,7 +2234,7 @@ fn four_consecutive_overlaps_expand_to_live_megabyte_coverage_and_idle_resets_gr
         cache.epoch += 2;
         previous = cache
             .buffer_for_deferred_import(
-                second.slice(0, (page + 1) * 4096).unwrap(),
+                second.slice(0, (page + 1) * 65536).unwrap(),
                 vk::BufferUsageFlags::VERTEX_BUFFER,
             )
             .unwrap();
@@ -1897,7 +2242,7 @@ fn four_consecutive_overlaps_expand_to_live_megabyte_coverage_and_idle_resets_gr
     }
     assert_eq!(
         cache.buffer(previous.buffer).unwrap().native.size(),
-        6 * 4096
+        6 * 65536
     );
     drop(cache);
     validation.check().unwrap();
@@ -2311,7 +2656,11 @@ fn owner_inline_overwrites_keep_gpu_neighbors_without_payload_retention_or_readb
     );
     unsafe { cache.owner_memory_written(&extents) }.unwrap();
     assert!(
-        memory.try_ram_pointer(&full).unwrap().is_some(),
+        full.allocation()
+            .downgrade()
+            .try_ram_source(full.offset(), full.bytes())
+            .unwrap()
+            .is_some(),
         "full overwrite retires obsolete device protection"
     );
     assert_eq!(cache.read_buffer(id, 0, 64).unwrap(), [0x54; 64]);

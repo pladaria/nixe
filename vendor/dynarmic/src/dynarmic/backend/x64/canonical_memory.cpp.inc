@@ -30,10 +30,10 @@ void A64EmitX64::EmitCanonicalMemoryAccess(A64EmitContext& ctx, IR::Inst* inst) 
         }
     }();
     const auto tmp = ctx.reg_alloc.ScratchGpr();
-    const auto abort = GenSharedLabel(), end = GenSharedLabel();
+    const auto abort = ctx.GenLabel(), end = ctx.GenLabel();
     const auto fallback = [&] {
-        if constexpr (write) return write_fallbacks.at({ordered, bitsize, vaddr.getIdx(), value});
-        else return read_fallbacks.at({ordered, bitsize, vaddr.getIdx(), value});
+        if constexpr (write) return write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr.getIdx()][value];
+        else return read_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr.getIdx()][value];
     }();
     bool handling;
     const auto address = EmitFastmemVAddr(code, ctx, *abort, vaddr, handling, tmp);
@@ -79,7 +79,7 @@ void A64EmitX64::EmitCanonicalMemoryAccess(A64EmitContext& ctx, IR::Inst* inst) 
         // this site already uses the PTE and needs no further recompilation.
         fastmem_patch_info.emplace(mcl::bit_cast<u64>(location),
             FastmemPatchInfo{mcl::bit_cast<u64>(code.getCurr()), mcl::bit_cast<u64>(fallback), marker, false});
-        EmitCheckMemoryAbort(ctx, inst, end.get());
+        EmitCheckMemoryAbort(ctx, inst, end);
         code.jmp(*end, code.T_NEAR);
     });
 }
