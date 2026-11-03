@@ -260,6 +260,7 @@ fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
     });
     finish(
         &owner,
+        None,
         CommandHost {
             owner: Rc::clone(&owner),
             clock: Default::default(),
@@ -280,6 +281,7 @@ fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
     warm_sender.send(GpuMessage::MemoryAccess(request)).unwrap();
     finish(
         &owner,
+        None,
         CommandHost {
             owner: Rc::clone(&owner),
             clock: Default::default(),
@@ -548,7 +550,12 @@ fn command_entry_after_dma(overwrite: bool, sync_wait: bool) {
         &budget,
         nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),
     )));
-    finish(&owner, Owner::submission(Rc::clone(&owner), queued)).unwrap();
+    finish(
+        &owner,
+        Some(nixe_gpu_maxwell::MaxwellChannelId::new(1)),
+        Owner::submission(Rc::clone(&owner), queued),
+    )
+    .unwrap();
     assert_eq!(budget.state.lock().unwrap().active, 0);
     let mut actual = [0; 4];
     memory
@@ -571,10 +578,14 @@ fn finish<
     F: Future,
 >(
     owner: &Rc<RefCell<Owner<'_, L, E>>>,
+    channel: Option<nixe_gpu_maxwell::MaxwellChannelId>,
     future: F,
 ) -> F::Output {
     let mut future = std::pin::pin!(future);
     loop {
+        if let Some(channel) = channel {
+            owner.borrow().frontend.borrow_mut().bind_channel(channel);
+        }
         match future
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
@@ -715,7 +726,7 @@ impl GpuExecution for ControlledPreparation {
 }
 
 #[test]
-fn ready_channel_resumes_while_another_remains_blocked_and_preserves_fifo() {
+fn ready_channel_resumes_with_its_render_state_while_preserving_channel_fifo() {
     let memory = Machine::new(0x10000).unwrap();
     let outer_ready = Arc::new(AtomicBool::new(false));
     let inner_ready = Arc::new(AtomicBool::new(false));
@@ -730,10 +741,31 @@ fn ready_channel_resumes_while_another_remains_blocked_and_preserves_fifo() {
         inner_started: Some(inner_started),
         recorded,
     })));
-    let commands = |_, _: &AllocationRange| vec![vec![(4 << 29) | (0x50 / 4)]];
-    let (_first_space, first) = queued_commands(&budget, &memory, 1, 1, false, commands);
-    let (_second_space, second) = queued_commands(&budget, &memory, 2, 2, false, commands);
-    let (_third_space, third) = queued_commands(&budget, &memory, 1, 3, false, commands);
+    let commands = |enabled: u32, draw: bool| {
+        move |_, _: &AllocationRange| {
+            let mut words = vec![
+                (1 << 29) | (1 << 16),
+                nixe_gpu_maxwell::SWITCH_1_GM20B_PROFILE
+                    .classes()
+                    .three_d()
+                    .0,
+                (4 << 29) | (0x1944 / 4),
+                (4 << 29) | (enabled << 16) | (0x1558 / 4),
+                (4 << 29) | (0x50 / 4),
+            ];
+            if draw {
+                // After the peer enabled rendering, this channel must recover
+                // its disabled condition. Preparing this draw would require
+                // shaders and attachments which are deliberately absent.
+                words.push((4 << 29) | (3 << 16) | (0x0d78 / 4));
+            }
+            vec![words]
+        }
+    };
+    let (_first_space, first) = queued_commands(&budget, &memory, 1, 1, false, commands(0, true));
+    let (_second_space, second) =
+        queued_commands(&budget, &memory, 2, 2, false, commands(1, false));
+    let (_third_space, third) = queued_commands(&budget, &memory, 1, 3, false, commands(0, false));
     for queued in [first, third, second] {
         sender.send(GpuMessage::Submission(queued)).unwrap();
     }

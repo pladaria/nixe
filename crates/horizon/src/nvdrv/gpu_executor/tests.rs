@@ -142,16 +142,41 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
         SWITCH_1_GM20B_PROFILE,
     );
     channel.bind_address_space(address_space.id()).unwrap();
+    let allocation = machine.account(4096).unwrap().allocate(4096).unwrap();
+    let input = AllocationRange::new(allocation.pin(), 0, 4096).unwrap();
+    machine
+        .write_resolved(
+            &[input.slice(0, 4).unwrap()],
+            &0x1234_5678_u32.to_le_bytes(),
+        )
+        .unwrap();
+    let mapping = address_space
+        .map(nixe_gpu_maxwell::MaxwellMapRequest {
+            allocation: nixe_gpu_maxwell::MaxwellAllocationId::new(1),
+            backing: vec![input.clone()],
+            backing_offset: 0,
+            size: 4096,
+            allocation_alignment: 4096,
+            page_size: 0,
+            kind: 0,
+            cacheable: false,
+            permissions: nixe_memory::MemoryPermissions::READ_WRITE,
+            fixed_offset: None,
+        })
+        .unwrap();
+    let address = mapping.offset().get();
+    let mut entry = (address as u32).to_le_bytes().to_vec();
+    entry.extend_from_slice(&(((address >> 32) as u32) | (1 << 10)).to_le_bytes());
     let decoded = decode_gpfifo_submission(
         SWITCH_1_GM20B_PROFILE,
         8,
         MaxwellGpfifoSubmitRequest {
-            entry_count: 0,
+            entry_count: 1,
             flags: 4,
             fence_id: 0,
             fence_value: 0,
         },
-        &[],
+        &entry,
     )
     .unwrap();
     let retained = validate_gpfifo_submission(
@@ -169,8 +194,6 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
         .dispatch_next(true, address_space.memory())
         .unwrap()
         .unwrap();
-    let allocation = machine.account(4096).unwrap().allocate(4096).unwrap();
-    let input = AllocationRange::new(allocation.pin(), 0, 4096).unwrap();
     let backing = PhysicalMapping::new(std::slice::from_ref(&input)).unwrap();
     let image = PresentationImageRequest {
         allow_canonical_import: false,
@@ -192,7 +215,7 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
         inputs: vec![input],
     };
     let executor = NvDrvGpuExecutor::new(machine, &crate::test_memory::kernel());
-    let GpuSubmissionAdmission::Ready(permit) = executor.reserve_submission(0).unwrap() else {
+    let GpuSubmissionAdmission::Ready(permit) = executor.reserve_submission(8).unwrap() else {
         panic!()
     };
     let descriptor = NvDrvDeviceDescriptor::open(
@@ -218,16 +241,28 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
             &nixe_runtime::VirtualClock::default(),
         )
         .unwrap();
-    let presented = executor.request_presentable_image(image, 1, None).unwrap();
-    // Empty work fails at the frontend boundary. Its queued presentation
-    // must never reach the backend or create a false resident producer.
-    assert!(
-        presented
+    let error = match executor.request_presentable_image(image, 1, None) {
+        Ok(presented) => presented
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap()
-            .is_err()
+            .unwrap_err()
+            .to_string(),
+        Err(error) => error.to_string(),
+    };
+    // A queued presentation is cancelled; one requested after the failure
+    // observes it directly. Neither may reach the native presentation backend.
+    assert!(
+        error == "GPU owner is shutting down" || error.contains("0x12345678"),
+        "{error}"
     );
-    assert!(executor.teardown().unwrap_err().boundary.is_some());
+    let failure = executor.teardown().unwrap_err();
+    let (_, _, boundary) = failure.boundary.expect("the original frontend failure");
+    assert!(
+        boundary
+            .frontend_failure()
+            .to_string()
+            .contains("0x12345678")
+    );
 }
 
 #[test]

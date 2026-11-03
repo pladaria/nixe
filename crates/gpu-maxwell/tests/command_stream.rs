@@ -3,9 +3,7 @@ mod command;
 #[path = "support/stream.rs"]
 mod stream;
 use nixe_gpu::{CacheMaintenanceOperation, native::NativeCommand};
-use nixe_gpu_maxwell::{
-    MaxwellFrontendDispatchError, MaxwellPushbufferDecodeError, SWITCH_1_GM20B_PROFILE,
-};
+use nixe_gpu_maxwell::{MaxwellFrontend, SWITCH_1_GM20B_PROFILE};
 use stream::{Fixture, header, packet};
 
 #[test]
@@ -235,21 +233,99 @@ fn embedded_inline_zero_and_partial_lengths_preserve_neighboring_bytes() {
 }
 
 #[test]
-fn malformed_tail_reports_source_after_consuming_the_valid_prefix() {
+fn a_partial_packet_resumes_in_the_next_submission_without_repeating_its_prefix() {
     let mut fixture = Fixture::new(|_| vec![vec![header(3, 0x78, 3), 0, 0]]);
     let mut waits = 0;
-    let error = fixture
+    fixture
         .run(&mut |work| {
             assert!(matches!(work.command, NativeCommand::WaitForIdle));
             waits += 1;
         })
-        .unwrap_err();
+        .unwrap();
     assert_eq!(waits, 2);
-    let MaxwellFrontendDispatchError::PacketDecode(error) = error else {
-        panic!("expected a packet decode failure")
-    };
+    fixture.submit(&[]);
     assert!(
-        matches!(*error,MaxwellPushbufferDecodeError::TruncatedPacket {source,expected_arguments:3,available_arguments:2} if source.entry_index==0 && source.word_offset==0)
+        fixture
+            .run(&mut |_| panic!("an empty submit has no new effect"))
+            .unwrap()
+            > 0
+    );
+    // The first word is still data for the preceding packet. It must not be
+    // decoded as another header, nor replay either completed method.
+    fixture.submit(&[0, header(3, 0x78, 1), 0]);
+    fixture
+        .run(&mut |work| {
+            assert!(matches!(work.command, NativeCommand::WaitForIdle));
+            waits += 1;
+        })
+        .unwrap();
+    assert_eq!(waits, 4);
+}
+
+#[test]
+fn pending_macro_arguments_survive_submissions_and_another_channel() {
+    use nixe_gpu::GuestSyncpointId;
+    use nixe_gpu_maxwell::{
+        MaxwellChannelId, MaxwellChannelOwner, MaxwellGpuChannel, MaxwellMemoryManagerId,
+    };
+    let mut fixture = Fixture::new(|_| {
+        let mut words = Vec::new();
+        packet(
+            &mut words,
+            0,
+            &[SWITCH_1_GM20B_PROFILE.classes().three_d().0],
+        );
+        packet(&mut words, 0x011c, &[2, 0x120]);
+        words.push(header(5, 0x0114, 5));
+        words.extend([
+            0x120,
+            1 | (2 << 8),
+            1 | (2 << 4) | ((0x0110 / 4) << 14),
+            (4 << 4) | (1 << 7) | (2 << 11),
+            0x11,
+        ]);
+        words.extend([header(1, 0x3810, 2), 0xdead_beef]);
+        vec![words]
+    });
+    fixture
+        .run(&mut |_| panic!("an incomplete macro call must not execute"))
+        .unwrap();
+    let mut other = MaxwellGpuChannel::new(
+        MaxwellChannelId::new(2),
+        MaxwellChannelOwner::new(1),
+        SWITCH_1_GM20B_PROFILE,
+    );
+    other
+        .bind_address_space(fixture.space.memory().id())
+        .unwrap();
+    other
+        .bind_memory_manager(MaxwellMemoryManagerId::new(1))
+        .unwrap();
+    other
+        .allocate_gpfifo(128, false, GuestSyncpointId::new(2))
+        .unwrap();
+    let pending = std::mem::replace(&mut fixture.channel, other);
+    fixture.submit(&[header(3, 0x78, 1), 0]);
+    let mut other_waits = 0;
+    fixture
+        .run(&mut |work| {
+            assert!(matches!(work.command, NativeCommand::WaitForIdle));
+            other_waits += 1;
+        })
+        .unwrap();
+    assert_eq!(other_waits, 1);
+    fixture.channel = pending;
+    fixture.submit(&[0, header(3, 0x78, 1), 0]);
+    let mut resumed_waits = 0;
+    fixture
+        .run(&mut |work| {
+            assert!(matches!(work.command, NativeCommand::WaitForIdle));
+            resumed_waits += 1;
+        })
+        .unwrap();
+    assert_eq!(
+        resumed_waits, 2,
+        "one macro send and one following host method"
     );
 }
 
@@ -518,6 +594,10 @@ fn command_control_latency() {
     };
     for _ in 0..1000 {
         host.previous = std::time::Instant::now();
+        fixture
+            .frontend
+            .borrow_mut()
+            .bind_channel(fixture.channel.id());
         command::ready(stream_maxwell_frontend(
             &fixture.dispatch,
             &mut fixture.channel,
@@ -812,6 +892,10 @@ fn syncpoint_callbacks_keep_their_position_before_later_methods_and_driver_suffi
     }
     let events = RefCell::new(Vec::new());
     let mut host = OrderedHost { events: &events };
+    fixture
+        .frontend
+        .borrow_mut()
+        .bind_channel(fixture.channel.id());
     command::ready(stream_maxwell_frontend(
         &fixture.dispatch,
         &mut fixture.channel,
@@ -832,6 +916,52 @@ fn syncpoint_callbacks_keep_their_position_before_later_methods_and_driver_suffi
             "syncpoint"
         ]
     );
+}
+
+#[test]
+#[ignore = "opt-in production command-stream CPU measurement"]
+#[cfg(target_os = "linux")]
+fn command_effect_throughput() {
+    let iterations = std::env::var("NIXE_COMMAND_BENCH_ITERS")
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(100_000);
+    for effects in [1_u32, 16, 256] {
+        let mut fixture = Fixture::new(|_| {
+            let mut words = Vec::new();
+            packet(
+                &mut words,
+                0,
+                &[SWITCH_1_GM20B_PROFILE.classes().three_d().0],
+            );
+            words.push(header(3, 0x0110, effects));
+            words.extend(std::iter::repeat_n(0, effects as usize));
+            vec![words]
+        });
+        let mut emitted = 0;
+        let mut consume = |work: nixe_gpu::native::NativeWork| {
+            assert!(matches!(work.command, NativeCommand::WaitForIdle));
+            emitted += 1;
+        };
+        for _ in 0..100 {
+            fixture.run(&mut consume).unwrap();
+        }
+        allocation_counter::COUNT.with(|counter| counter.set(Some(0)));
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            fixture.run(&mut consume).unwrap();
+        }
+        let wall_ns = start.elapsed().as_nanos();
+        let allocations = allocation_counter::COUNT.with(|counter| counter.replace(None).unwrap());
+        assert_eq!(
+            allocations, 0,
+            "warmed command admission and effect execution"
+        );
+        assert_eq!(emitted, (iterations + 100) * effects as usize);
+        println!(
+            "COMMAND_EFFECT_BENCH {{\"effects\":{effects},\"iterations\":{iterations},\"wall_ns\":{wall_ns},\"allocations\":{allocations}}}"
+        );
+    }
 }
 
 #[test]

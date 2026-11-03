@@ -307,6 +307,7 @@ where
         // thread per channel is needed. Ingress permits bound the live lists.
         type Task<'a> = Pin<Box<dyn Future<Output = Result<(), GpuExecutorFailure>> + 'a>>;
         let mut running: Vec<(Option<nixe_gpu_maxwell::MaxwellChannelId>, Task<'_>)> = Vec::new();
+        let frontend = Rc::clone(&owner.borrow().frontend);
         let mut context = Context::from_waker(Waker::noop());
         loop {
             if owner.borrow().budget.is_stopped() {
@@ -316,6 +317,12 @@ where
             owner.borrow_mut().poll()?;
             let mut index = 0;
             while index < running.len() {
+                // Select persistent renderer state at the execution boundary.
+                // A suspended channel can resume after a peer changed it.
+                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/gpu.cpp#L74-L82
+                if let Some(channel) = running[index].0 {
+                    frontend.borrow_mut().bind_channel(channel);
+                }
                 match running[index].1.as_mut().poll(&mut context) {
                     Poll::Pending => index += 1,
                     Poll::Ready(result) => {

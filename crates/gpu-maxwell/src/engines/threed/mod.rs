@@ -1069,18 +1069,18 @@ pub(super) const fn is_mme_aperture(method: GpuMethodId) -> bool {
     method.0 >= 0x3800 && method.0 <= 0x3ffc && method.0 & 3 == 0
 }
 
-pub(super) enum MaxwellThreeDMmePreflightError<E> {
+pub(super) enum MaxwellThreeDMmeDispatchError<E> {
     Dispatch(Box<MaxwellEngineDispatchError>),
     Consumer(E),
 }
 
-impl<E> MaxwellThreeDMmePreflightError<E> {
+impl<E> MaxwellThreeDMmeDispatchError<E> {
     fn dispatch(error: MaxwellEngineDispatchError) -> Self {
         Self::Dispatch(Box::new(error))
     }
 }
 
-pub(super) async fn preflight_mme_call<E>(
+pub(super) async fn execute_mme_call<E>(
     profile: &MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
     parameters: &[u32],
@@ -1090,7 +1090,7 @@ pub(super) async fn preflight_mme_call<E>(
         &MaxwellThreeDState,
         Option<(u32, u32)>,
     ) -> Result<(), E>,
-) -> Result<(), MaxwellThreeDMmePreflightError<E>> {
+) -> Result<(), MaxwellThreeDMmeDispatchError<E>> {
     let macro_index = ((source.method().0 - 0x3800) / 8) as u8;
     let program = candidate.mme().program();
 
@@ -1106,7 +1106,7 @@ pub(super) async fn preflight_mme_call<E>(
         match program.execute(macro_index, parameters, &mut host).await {
             Ok(()) => {}
             Err(MaxwellThreeDMmeRunError::Execution(error)) => {
-                return Err(MaxwellThreeDMmePreflightError::dispatch(
+                return Err(MaxwellThreeDMmeDispatchError::dispatch(
                     MaxwellEngineDispatchError::MmeExecution { source, error },
                 ));
             }
@@ -1117,7 +1117,7 @@ pub(super) async fn preflight_mme_call<E>(
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
     draw::flush(candidate, consume)
         .await
-        .map_err(MaxwellThreeDMmePreflightError::Consumer)
+        .map_err(MaxwellThreeDMmeDispatchError::Consumer)
 }
 
 struct MmeDispatchHost<'a, E, F> {
@@ -1138,9 +1138,9 @@ impl<E, F> MmeDispatchHost<'_, E, F> {
         &mut self,
         method: GpuMethodId,
         argument: u32,
-    ) -> Result<bool, MaxwellThreeDMmePreflightError<E>> {
+    ) -> Result<bool, MaxwellThreeDMmeDispatchError<E>> {
         if is_mme_aperture(method) {
-            return Err(MaxwellThreeDMmePreflightError::dispatch(
+            return Err(MaxwellThreeDMmeDispatchError::dispatch(
                 MaxwellEngineDispatchError::MmeExecution {
                     source: self.source,
                     error: MaxwellThreeDMmeExecutionError::RecursiveMacroCall {
@@ -1151,7 +1151,7 @@ impl<E, F> MmeDispatchHost<'_, E, F> {
         }
         let mut source = self.source.emitted_by_mme(method, argument);
         let prepared = admit_effect(self.profile, &mut source, self.candidate)
-            .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
+            .map_err(MaxwellThreeDMmeDispatchError::dispatch)?;
         if let Some(operation) = prepared {
             if !draw::defer(self.candidate, &operation) {
                 self.pending = Some(operation);
@@ -1167,12 +1167,12 @@ impl<E, F> MaxwellThreeDMmeHost for MmeDispatchHost<'_, E, F>
 where
     F: AsyncFnMut(PendingEngineOperation, &MaxwellThreeDState, Option<(u32, u32)>) -> Result<(), E>,
 {
-    type Error = MaxwellThreeDMmePreflightError<E>;
+    type Error = MaxwellThreeDMmeDispatchError<E>;
 
     fn read_register(&self, method_dword: u16) -> Result<u32, Self::Error> {
         let method = GpuMethodId(u32::from(method_dword) * 4);
         self.candidate.raw_register_value(method).ok_or_else(|| {
-            MaxwellThreeDMmePreflightError::dispatch(MaxwellEngineDispatchError::MmeExecution {
+            MaxwellThreeDMmeDispatchError::dispatch(MaxwellEngineDispatchError::MmeExecution {
                 source: self.source,
                 error: MaxwellThreeDMmeExecutionError::RegisterReadUnavailable { method_dword },
             })
@@ -1186,12 +1186,12 @@ where
         if !draw::admit_method(self.candidate, method, argument) {
             return Ok(false);
         }
-        if let Some(info) = registers::info(method).filter(|info| info.passive) {
+        if let Some(info) = registers::info(method).filter(|info| info.passive()) {
             let origin = &self.source;
             write_plain_register(method, argument, info, self.candidate, || {
                 origin.emitted_by_mme(method, argument)
             })
-            .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
+            .map_err(MaxwellThreeDMmeDispatchError::dispatch)?;
             return Ok(true);
         }
         // The engine and method class are already known for a macro send.
@@ -1205,7 +1205,7 @@ where
         if self.pending.is_none() {
             draw::flush(self.candidate, self.consume)
                 .await
-                .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
+                .map_err(MaxwellThreeDMmeDispatchError::Consumer)?;
             if self.try_emit_method(method_dword, argument)? {
                 return Ok(());
             }
@@ -1213,14 +1213,14 @@ where
         let operation = self.pending.take().expect("admitted MME effect");
         draw::operation(self.candidate, operation, self.consume)
             .await
-            .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
+            .map_err(MaxwellThreeDMmeDispatchError::Consumer)?;
         self.candidate.complete_inline_draw();
         Ok(())
     }
 }
 
 #[inline]
-pub(super) fn preflight(
+pub(super) fn call_method(
     profile: &MaxwellGpuProfile,
     method: &mut MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDFrontendState,
@@ -1247,6 +1247,14 @@ fn admit_effect(
             error: MaxwellThreeDMmeExecutionError::DataWithoutCall,
         });
     }
+    if source.method().0 >= 0x3800 || source.method().0 & 3 != 0 {
+        return Err(MaxwellEngineDispatchError::UnknownMethod {
+            source: *source,
+            class_name: CLASS_NAME,
+        });
+    }
+    let info = registers::info(source.method()).expect("class register");
+    let submitted_source = *source;
     let shadow_control = candidate.mme().shadow_ram_control().value().copied();
     let effective_argument = candidate
         .mme()
@@ -1254,20 +1262,33 @@ fn admit_effect(
 
     source.set_argument(effective_argument);
     let effective_source = *source;
-    let prepared = preflight_register(profile, effective_source, candidate)?;
-    // Every executed method updates its live register, including triggers. MME
-    // reads this same bank; effects are not a second register-storage policy.
-    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
-    candidate.record_raw_register(effective_source);
+    // Control execution uses the submitted argument, while the live register
+    // receives the replayed value. The mode itself aliases the shadow bank.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp#L388-L405
+    let execution_source = if effective_source.method().0 == 0x0124 {
+        submitted_source
+    } else {
+        effective_source
+    };
+    // Publish the shadow/live registers before interpreting an executable
+    // method, as Maxwell3D::CallMethod does. A semantic failure stops execution;
+    // it does not roll back the hardware register write.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp#L388-L405
     candidate.mme_mut().track_shadow_register(
         shadow_control,
         effective_source.method(),
         effective_source.argument(),
     );
-    if matches!(prepared, Some(PendingEngineOperation::ThreeD(_))) {
+    candidate.write_classified_register(
+        effective_source.method(),
+        effective_source.argument(),
+        info,
+    );
+    let operation = execute_register(profile, execution_source, candidate, info.family())?;
+    if matches!(operation, Some(PendingEngineOperation::ThreeD(_))) {
         candidate.flush_dirty();
     }
-    Ok(prepared)
+    Ok(operation)
 }
 
 /// Plain state admission builds no typed write, metadata or operation adapter.
@@ -1278,7 +1299,7 @@ pub(super) fn write_plain_method(
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<bool, MaxwellEngineDispatchError> {
     let source = method.source();
-    let Some(info) = registers::info(source.method()).filter(|info| info.passive) else {
+    let Some(info) = registers::info(source.method()).filter(|info| info.passive()) else {
         return Ok(false);
     };
     let argument =
@@ -1297,7 +1318,7 @@ fn write_plain_register(
     candidate: &mut MaxwellThreeDFrontendState,
     source: impl FnOnce() -> crate::MaxwellMethodSource,
 ) -> Result<u32, MaxwellEngineDispatchError> {
-    debug_assert!(info.passive);
+    debug_assert!(info.passive());
     let control = candidate.mme().shadow_ram_control().value().copied();
     let argument = candidate
         .mme()
@@ -1417,7 +1438,7 @@ fn write_plain_words<const REPLAY: bool, const TRACK: bool, const INCREMENT: boo
     let mut method = words.method_at(0);
     let mut consumed = 0;
     for index in 0..words.len() {
-        let Some(info) = registers::info(method).filter(|info| info.passive) else {
+        let Some(info) = registers::info(method).filter(|info| info.passive()) else {
             break;
         };
         let argument = if REPLAY {
@@ -1539,15 +1560,11 @@ const fn classify_family(method: u32) -> RegisterFamily {
     }
 }
 
-#[inline]
-fn register_family(method: u32) -> RegisterFamily {
-    registers::info(GpuMethodId(method)).map_or(RegisterFamily::Other, |info| info.family)
-}
-
-fn preflight_register(
+fn execute_register(
     profile: &MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
     candidate: &mut MaxwellThreeDFrontendState,
+    family: RegisterFamily,
 ) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
     // NVIDIA's packed inline ports append low lanes first. END consumes the
     // complete stream, as in the independently reviewed public draw managers:
@@ -1580,7 +1597,6 @@ fn preflight_register(
             },
         )));
     }
-    let family = register_family(source.method().0);
     if family == RegisterFamily::InlineToMemory
         && let Some((write, upload)) =
             inline_to_memory::preflight(source, &candidate.operation_state().inline_to_memory())?

@@ -130,9 +130,11 @@ fn one_entry_consumes_many_packets_and_large_payloads_before_the_ordered_effect(
     .unwrap_or_else(|_| panic!("command entry"));
     assert_eq!(draws.len(), 1);
     assert!(stream.needs_entry());
-    stream
-        .finish(&mut crate::MaxwellCommandSourceScratch::default())
-        .unwrap();
+    assert!(
+        stream
+            .finish(&mut crate::MaxwellCommandSourceScratch::default())
+            .is_none()
+    );
 }
 
 #[test]

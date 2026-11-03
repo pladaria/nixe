@@ -80,10 +80,9 @@ fn mutable_method_control_is_typed_and_source_preserving() {
 }
 
 #[test]
-fn mutable_method_control_rejects_reserved_bits_atomically() {
+fn mutable_method_control_rejects_reserved_bits_after_publishing_the_register() {
     let mut channel = three_d_channel();
     program_three_d(&mut channel, 0x1134, 1);
-    let before = channel.clone();
 
     let decoded = packet(0x1134 / 4, 2);
     assert!(matches!(
@@ -91,7 +90,16 @@ fn mutable_method_control_rejects_reserved_bits_atomically() {
         Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
             if source.method() == GpuMethodId(0x1134)
     ));
-    assert_eq!(channel, before);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x1134)),
+        Some(2)
+    );
+    assert_eq!(
+        channel.three_d_mut().mme().mutable_method_control().raw(),
+        Some(1)
+    );
 }
 
 #[test]
@@ -181,7 +189,6 @@ fn three_d_report_semaphore_trigger_is_an_explicit_observable_boundary() {
         }) if control.raw() == 0
     ));
 
-    let before = channel.clone();
     let unallocated = packet(0x1b0c / 4, 3 << 12);
     assert!(matches!(
         dispatch_first(&mut channel, &unallocated),
@@ -190,7 +197,12 @@ fn three_d_report_semaphore_trigger_is_an_explicit_observable_boundary() {
             ..
         })
     ));
-    assert_eq!(channel, before);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x1b0c)),
+        Some(3 << 12)
+    );
 
     let invalid = packet(0x1b0c / 4, 1 << 30);
     assert!(matches!(
@@ -201,7 +213,12 @@ fn three_d_report_semaphore_trigger_is_an_explicit_observable_boundary() {
             ..
         }) if source.argument() == 1 << 30
     ));
-    assert_eq!(channel, before);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x1b0c)),
+        Some(1 << 30)
+    );
 }
 
 #[test]
@@ -1149,13 +1166,12 @@ fn three_d_render_enable_modes_are_typed_and_engine_owned() {
 }
 
 #[test]
-fn invalid_three_d_render_enable_modes_are_rejected_atomically() {
+fn invalid_three_d_render_enable_modes_are_rejected_after_publishing_the_register() {
     let mut channel = three_d_channel();
 
     for argument in [5, 6, 7, 8, u32::MAX] {
         let frontend_before = *channel.frontend();
         let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
         let decoded = packet(0x1558 / 4, argument);
 
         assert!(matches!(
@@ -1168,7 +1184,12 @@ fn invalid_three_d_render_enable_modes_are_rejected_atomically() {
         ));
         assert_eq!(channel.frontend(), &frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .raw_register_value(GpuMethodId(0x1558)),
+            Some(argument)
+        );
     }
 }
 

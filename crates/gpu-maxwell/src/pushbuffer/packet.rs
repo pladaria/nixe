@@ -11,8 +11,8 @@
 mod methods;
 pub use methods::{MaxwellMethodIterator, MaxwellMethodSpan};
 mod sources;
-pub(crate) use sources::CommandStream;
 pub use sources::MaxwellCommandSourceScratch;
+pub(crate) use sources::{CommandState, CommandStream};
 
 use std::fmt::{Display, Formatter};
 
@@ -288,11 +288,6 @@ pub enum MaxwellPushbufferDecodeError {
         first_method: GpuMethodId,
         count: u16,
     },
-    TruncatedPacket {
-        source: MaxwellGpfifoSourceLocation,
-        expected_arguments: u16,
-        available_arguments: u16,
-    },
     ResourceExhausted,
 }
 
@@ -325,14 +320,6 @@ impl Display for MaxwellPushbufferDecodeError {
                 formatter,
                 "Maxwell method sequence exceeds the method range: {source} mode={mode} {first_method} count={count}"
             ),
-            Self::TruncatedPacket {
-                source,
-                expected_arguments,
-                available_arguments,
-            } => write!(
-                formatter,
-                "truncated Maxwell method packet: {source} expected-arguments={expected_arguments} available-arguments={available_arguments}"
-            ),
             Self::ResourceExhausted => {
                 formatter.write_str("Maxwell packet decoding exhausted host resources")
             }
@@ -363,7 +350,7 @@ where
     sources::fixture_packets(words.into_iter().collect::<Result<Vec<_>, _>>()?)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MethodHeader {
     offset: usize,
     mode: MaxwellMethodPacketMode,
@@ -730,19 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncation_and_incrementing_method_overflow_at_the_header() {
-        let truncated = sourced(method_header(3, 0x100, 0, 3), 0, 4);
-        let Err(MaxwellPushbufferDecodeError::TruncatedPacket {
-            source,
-            expected_arguments,
-            available_arguments,
-        }) = decode(&[truncated, sourced(1, 0, 5)])
-        else {
-            panic!("expected truncated packet")
-        };
-        assert_eq!(source, location(0, 4));
-        assert_eq!((expected_arguments, available_arguments), (3, 1));
-
+    fn rejects_incrementing_method_overflow_at_the_header() {
         assert!(matches!(
             decode(&[
                 sourced(method_header(1, 0xfff, 0, 2), 0, 8),

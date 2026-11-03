@@ -251,13 +251,6 @@ impl<T> Default for MaxwellThreeDRegister<T> {
 }
 
 impl<T> MaxwellThreeDRegister<T> {
-    pub(super) const fn verified_reset(raw: u32, value: Option<T>) -> Self {
-        Self {
-            raw: Some(raw),
-            value,
-        }
-    }
-
     pub(super) const fn decoded(raw: u32, value: T) -> Self {
         Self {
             raw: Some(raw),
@@ -277,10 +270,6 @@ pub(super) struct MaxwellThreeDRawRegisterFile {
     // size in the type so constant register reads need no dynamic length check.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.h
     values: Box<[u32; CLASS_REGISTER_WORDS]>,
-    // A packed rendering key, updated with the canonical bank. Exact pipeline
-    // reuse compares it once instead of gathering fragmented register ranges.
-    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
-    parameters: Box<[u32; super::registers::PARAMETER_METHOD_COUNT]>,
 }
 
 impl Default for MaxwellThreeDRawRegisterFile {
@@ -337,20 +326,7 @@ impl Default for MaxwellThreeDRawRegisterFile {
                 *value = reset;
             }
         }
-        let mut parameters: Box<[u32; super::registers::PARAMETER_METHOD_COUNT]> =
-            vec![0; super::registers::PARAMETER_METHOD_COUNT]
-                .into_boxed_slice()
-                .try_into()
-                .expect("fixed renderer parameter count");
-        for (index, &value) in values.iter().enumerate() {
-            let method = GpuMethodId(index as u32 * 4);
-            let info = super::registers::info(method).expect("bounded register file");
-            if info.domains & super::registers::PARAMETERS != 0 {
-                parameters[usize::from(info.parameter_index)] =
-                    super::registers::parameter_word(method, value);
-            }
-        }
-        Self { values, parameters }
+        Self { values }
     }
 }
 
@@ -857,18 +833,17 @@ impl MaxwellThreeDViewportState<'_> {
 
 /// Authoritative class registers, renderer dirty domains and operational state.
 /// Consumers interpret only the fields required by the operation they execute.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDState {
     registers: MaxwellThreeDRawRegisterFile,
-    dirty_domains: u16,
-    dirty_vertices: u32,
-    dirty_colors: u8,
+    parameters: Box<[u32; super::registers::PARAMETER_METHOD_COUNT]>,
+    parameter_fingerprint: u64,
+    dirty: u64,
     inline_index: Option<Arc<[u8]>>,
     // Renderer preparation and revisions belong to the same channel lifetime.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/control/channel_state_cache.h
     draw_state_revision: u64,
     draw_parameters_revision: u64,
-    parameter_fingerprint: u64,
     resource_selection_revision: u64,
     color_target_revisions: [u64; 8],
     depth_target_revision: u64,
@@ -885,6 +860,41 @@ pub struct MaxwellThreeDState {
     inline_transfer: Option<super::inline_to_memory::PendingTransfer>,
 }
 
+impl Default for MaxwellThreeDState {
+    fn default() -> Self {
+        let registers = MaxwellThreeDRawRegisterFile::default();
+        // The incremental rendering key belongs only to live state. The shadow
+        // bank retains raw hardware words and has no unused parameter mirror.
+        let parameters = Box::new(
+            super::registers::PARAMETER_METHODS
+                .map(|method| super::registers::parameter_word(method, registers.word(method))),
+        );
+        Self {
+            registers,
+            parameters,
+            parameter_fingerprint: 0,
+            dirty: Default::default(),
+            inline_index: Default::default(),
+            draw_state_revision: Default::default(),
+            draw_parameters_revision: Default::default(),
+            resource_selection_revision: Default::default(),
+            color_target_revisions: Default::default(),
+            depth_target_revision: Default::default(),
+            vertex_slots: Default::default(),
+            index_revision: Default::default(),
+            constant_slots: Default::default(),
+            resource_group_revisions: Default::default(),
+            texture_header_revision: Default::default(),
+            sampler_revision: Default::default(),
+            sample_mode_revision: Default::default(),
+            shader_revision: Default::default(),
+            primitive_sequence: Default::default(),
+            shader_resources: Default::default(),
+            inline_transfer: Default::default(),
+        }
+    }
+}
+
 /// Retained identity of the state domains which determine resource bindings.
 ///
 /// State domains unrelated to resource resolution deliberately do not advance
@@ -894,6 +904,10 @@ pub struct MaxwellThreeDState {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MaxwellThreeDResourceStateIdentity {
     revision: u64,
+    // Combined descriptors depend on TIC and TSC state independently. The
+    // handle's own CB slots below determine buffer selection changes.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+    sampler: u64,
     constant_buffers: [u64; 2],
     sample_mode: u64,
 }
@@ -949,7 +963,15 @@ impl MaxwellThreeDResourceStateIdentity {
         state: &MaxwellThreeDState,
         role: MaxwellThreeDResourceRole,
     ) -> bool {
-        if self.revision != state.binding_revision(role) {
+        if self.revision != state.binding_revision(role)
+            || (matches!(
+                role,
+                MaxwellThreeDResourceRole::SampledImage {
+                    with_sampler: true,
+                    ..
+                }
+            ) && self.sampler != state.sampler_revision)
+        {
             return false;
         }
         if let MaxwellThreeDResourceRole::SampledImage { texture, .. }
@@ -1109,7 +1131,7 @@ impl MaxwellThreeDFrontendState {
         &mut self.mme
     }
 
-    /// Returns the last validated raw value for one byte-addressed class method.
+    /// Returns the last raw write to one byte-addressed class method.
     #[must_use]
     pub(in crate::engines) fn raw_register_value(&self, method: GpuMethodId) -> Option<u32> {
         self.operation.registers.raw(method)
@@ -1132,10 +1154,9 @@ impl MaxwellThreeDFrontendState {
             return;
         }
         self.operation.registers.write(method, argument);
-        let domains = info.domains;
-        if domains & super::registers::PARAMETERS != 0 {
-            let parameter =
-                &mut self.operation.registers.parameters[usize::from(info.parameter_index)];
+        if info.domains() & super::registers::PARAMETERS != 0 {
+            let ordinal = super::registers::PARAMETER_ORDINALS[(method.0 / 4) as usize] as usize;
+            let parameter = &mut self.operation.parameters[ordinal];
             let value = super::registers::parameter_word(method, argument);
             if *parameter != value {
                 self.operation.parameter_fingerprint ^=
@@ -1144,24 +1165,7 @@ impl MaxwellThreeDFrontendState {
                 *parameter = value;
             }
         }
-        self.operation.dirty_domains |= domains;
-        if domains & super::registers::VERTEX != 0 {
-            let index = if method.0 >= 0x1f00 {
-                (method.0 - 0x1f00) / 8
-            } else {
-                (method.0 - 0x1c00) / 16
-            };
-            self.operation.dirty_vertices |= 1 << index;
-        }
-        if domains & super::registers::COLOR != 0 {
-            self.operation.dirty_colors |= if method.0 == 0x15b8 {
-                0xff
-            } else if method.0 >= 0x19e0 {
-                1 << ((method.0 - 0x19e0) / 4)
-            } else {
-                1 << ((method.0 - 0x0800) / 0x40)
-            };
-        }
+        self.operation.dirty |= info.dirty();
     }
     pub(super) fn record_raw_register(&mut self, source: MaxwellMethodSource) {
         self.write_register(source.method(), source.argument());
@@ -1170,7 +1174,8 @@ impl MaxwellThreeDFrontendState {
     pub(super) fn flush_dirty(&mut self) {
         use super::registers as D;
         let state = &mut self.operation;
-        let domains = std::mem::take(&mut state.dirty_domains);
+        let dirty = std::mem::take(&mut state.dirty);
+        let domains = dirty as u16;
         if domains & D::DRAW != 0 {
             advance_revision(&mut state.draw_state_revision);
         }
@@ -1186,7 +1191,7 @@ impl MaxwellThreeDFrontendState {
         if domains & (D::VERTEX | D::INDEX) != 0 {
             advance_revision(&mut state.resource_group_revisions[0]);
         }
-        let mut vertices = std::mem::take(&mut state.dirty_vertices);
+        let mut vertices = (dirty >> D::VERTEX_SHIFT) as u32;
         while vertices != 0 {
             let index = vertices.trailing_zeros() as usize;
             vertices &= vertices - 1;
@@ -1198,7 +1203,7 @@ impl MaxwellThreeDFrontendState {
         if domains & (D::COLOR | D::DEPTH | D::SAMPLE_MODE) != 0 {
             advance_revision(&mut state.resource_group_revisions[3]);
         }
-        let mut colors = std::mem::take(&mut state.dirty_colors);
+        let mut colors = (dirty >> D::COLOR_SHIFT) as u8;
         while colors != 0 {
             let index = colors.trailing_zeros() as usize;
             colors &= colors - 1;
@@ -1229,11 +1234,8 @@ impl MaxwellThreeDState {
     pub(crate) fn parameter_fingerprint(&self) -> u64 {
         self.parameter_fingerprint
     }
-    pub(crate) fn parameter_words(&self) -> Box<[u32]> {
-        self.registers.parameters.clone()
-    }
-    pub(crate) fn matches_parameter_words(&self, words: &[u32]) -> bool {
-        self.registers.parameters.as_ref() == words
+    pub(crate) fn parameter_registers(&self) -> &[u32; super::registers::PARAMETER_METHOD_COUNT] {
+        &self.parameters
     }
     pub(crate) fn inline_index(&self) -> Option<&Arc<[u8]>> {
         self.inline_index.as_ref()
@@ -1255,9 +1257,6 @@ impl MaxwellThreeDState {
             }
             R::ColorTarget(slot) => self.color_target_revisions[slot as usize],
             R::DepthStencilTarget => self.depth_target_revision,
-            R::SampledImage {
-                with_sampler: true, ..
-            } => self.resource_group_revisions[2],
             R::SampledImage { .. } | R::TextureHeaders => self.texture_header_revision,
             R::Sampler(_) | R::Samplers => self.sampler_revision,
             R::BlitSource | R::BlitDestination => 0,
@@ -1282,6 +1281,7 @@ impl MaxwellThreeDState {
         };
         MaxwellThreeDResourceStateIdentity {
             revision: self.binding_revision(role),
+            sampler: self.sampler_revision,
             constant_buffers,
             sample_mode: self.sample_mode_revision,
         }
@@ -1494,6 +1494,114 @@ fn advance_revision(revision: &mut u64) {
 #[cfg(test)]
 mod tests {
     use super::MaxwellThreeDFrontendState;
+
+    #[test]
+    fn sampled_image_identity_tracks_its_handles_and_both_descriptor_tables() {
+        use crate::engines::threed::{
+            MaxwellThreeDConstantBufferBinding, MaxwellThreeDResourceRole,
+            MaxwellThreeDTextureDimension, MaxwellThreeDTextureReference,
+            MaxwellThreeDUnresolvedAddress,
+        };
+        let mut frontend = MaxwellThreeDFrontendState::default();
+        let texture =
+            MaxwellThreeDTextureReference::expression(4, (1, 0, 0), Some((2, 4, 0))).unwrap();
+        let combined = MaxwellThreeDResourceRole::SampledImage {
+            texture,
+            dimension: MaxwellThreeDTextureDimension::Two,
+            with_sampler: true,
+        };
+        let image = MaxwellThreeDResourceRole::SampledImage {
+            texture,
+            dimension: MaxwellThreeDTextureDimension::Two,
+            with_sampler: false,
+        };
+        let binding = Some(MaxwellThreeDConstantBufferBinding {
+            address: MaxwellThreeDUnresolvedAddress::new(0, 0x1000),
+            size: std::num::NonZeroU32::new(256).unwrap(),
+        });
+        let identity = frontend.operation.resource_state_identity(combined);
+        frontend.bind_constant_buffer(4, 3, binding);
+        frontend.bind_constant_buffer(3, 1, binding);
+        assert!(identity.matches(&frontend.operation, combined));
+        for slot in [1, 2] {
+            let identity = frontend.operation.resource_state_identity(combined);
+            frontend.bind_constant_buffer(4, slot, binding);
+            assert!(!identity.matches(&frontend.operation, combined));
+        }
+        let combined_identity = frontend.operation.resource_state_identity(combined);
+        let image_identity = frontend.operation.resource_state_identity(image);
+        frontend.operation.sampler_revision += 1;
+        assert!(!combined_identity.matches(&frontend.operation, combined));
+        assert!(image_identity.matches(&frontend.operation, image));
+        let identity = frontend.operation.resource_state_identity(combined);
+        frontend.operation.texture_header_revision += 1;
+        assert!(!identity.matches(&frontend.operation, combined));
+        assert!(!image_identity.matches(&frontend.operation, image));
+    }
+
+    #[test]
+    fn register_dirty_routing_preserves_independent_vertex_and_attachment_slots() {
+        use nixe_gpu::GpuMethodId;
+        let mut frontend = MaxwellThreeDFrontendState::default();
+        for slot in 0..32 {
+            for method in [
+                0x1c00 + slot * 16,
+                0x1c04 + slot * 16,
+                0x1c08 + slot * 16,
+                0x1f00 + slot * 8,
+                0x1f04 + slot * 8,
+            ] {
+                let vertices = frontend.operation.vertex_slots;
+                let colors = frontend.operation.color_target_revisions;
+                let method = GpuMethodId(method);
+                let value = frontend.raw_register_value(method).unwrap() ^ 1;
+                frontend.write_register(method, value);
+                frontend.flush_dirty();
+                for (index, revision) in vertices.into_iter().enumerate() {
+                    assert_eq!(
+                        frontend.operation.vertex_slots[index],
+                        revision + u64::from(index == slot as usize),
+                        "{method:?}, vertex {index}"
+                    );
+                }
+                assert_eq!(frontend.operation.color_target_revisions, colors);
+                let consumed = frontend.operation.vertex_slots;
+                frontend.write_register(method, value);
+                frontend.flush_dirty();
+                assert_eq!(frontend.operation.vertex_slots, consumed);
+            }
+        }
+        for slot in 0..8 {
+            for method in (0..=8)
+                .map(|word| 0x0800 + slot * 0x40 + word * 4)
+                .chain([0x19e0 + slot * 4])
+            {
+                let vertices = frontend.operation.vertex_slots;
+                let colors = frontend.operation.color_target_revisions;
+                let method = GpuMethodId(method);
+                let value = frontend.raw_register_value(method).unwrap() ^ 1;
+                frontend.write_register(method, value);
+                frontend.flush_dirty();
+                assert_eq!(frontend.operation.vertex_slots, vertices);
+                for (index, revision) in colors.into_iter().enumerate() {
+                    assert_eq!(
+                        frontend.operation.color_target_revisions[index],
+                        revision + u64::from(index == slot as usize),
+                        "{method:?}, attachment {index}"
+                    );
+                }
+            }
+        }
+        let colors = frontend.operation.color_target_revisions;
+        let method = GpuMethodId(0x15b8);
+        let value = frontend.raw_register_value(method).unwrap() ^ 1;
+        frontend.write_register(method, value);
+        frontend.flush_dirty();
+        assert_eq!(
+            frontend.operation.color_target_revisions,
+            colors.map(|revision| revision + 1)
+        );
+    }
 
     #[test]
     fn viewport_depth_reset_is_shared_by_typed_live_state_and_mme_shadow_reads() {

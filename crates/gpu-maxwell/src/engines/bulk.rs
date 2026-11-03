@@ -74,7 +74,7 @@ pub(super) async fn stream_packet<E>(
         }
         if cb {
             if first.method().0 == 0x238c {
-                threed::preflight(
+                threed::call_method(
                     profile,
                     &mut MaxwellMethodDispatch::class_method(
                         MaxwellMethodSource::decoded(first, subchannel),
@@ -96,7 +96,7 @@ pub(super) async fn stream_packet<E>(
             .await
             .map_err(MaxwellEngineStreamError::Consumer)?;
             if count < data.len() {
-                threed::preflight(
+                threed::call_method(
                     profile,
                     &mut MaxwellMethodDispatch::class_method(
                         MaxwellMethodSource::decoded(data.get(count).unwrap(), subchannel),

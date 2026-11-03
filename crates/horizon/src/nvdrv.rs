@@ -3144,7 +3144,7 @@ mod tests {
     }
 
     #[test]
-    fn asynchronous_frontend_failures_retain_sources_and_never_publish_completion() {
+    fn asynchronous_frontend_accepts_empty_submissions_and_retains_real_failures() {
         for (legacy, empty, zero_increment) in [
             (false, false, false),
             (true, false, false),
@@ -3213,7 +3213,7 @@ mod tests {
             header[8..12].copy_from_slice(&u32::from(!empty).to_le_bytes());
             header[12..16]
                 .copy_from_slice(&(4_u32 | (u32::from(zero_increment) << 8)).to_le_bytes());
-            let (accepted, request) = if legacy {
+            let (accepted, mut request) = if legacy {
                 let mut input = header.to_vec();
                 if !empty {
                     input.extend_from_slice(&entry);
@@ -3259,6 +3259,24 @@ mod tests {
                     state.devices[&control_fd],
                 )
             };
+            if empty {
+                // A following malformed stream proves the empty submission was
+                // consumed without stopping the owner. Its diagnostic must name
+                // the second frontend and the ABI that actually submitted it.
+                let mut nonempty = header;
+                nonempty[8..12].copy_from_slice(&1_u32.to_le_bytes());
+                let accepted = if legacy {
+                    request = 0xc020_4808;
+                    let mut input = nonempty.to_vec();
+                    input.extend_from_slice(&entry);
+                    session.ioctl(channel_fd, request, &input).unwrap()
+                } else {
+                    session
+                        .ioctl2(channel_fd, request, &nonempty, &entry)
+                        .unwrap()
+                };
+                assert_eq!(accepted.1, NV_SUCCESS);
+            }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             let failure = loop {
                 if let Err(failure) = backend.require_healthy() {
@@ -3284,7 +3302,7 @@ mod tests {
             );
             assert_eq!(
                 boundary.dispatch().scheduled().frontend(),
-                nixe_gpu::FrontendSubmissionId::new(1)
+                nixe_gpu::FrontendSubmissionId::new(1 + u64::from(empty))
             );
             assert_eq!(
                 session.guest_timeline_point_reached(GuestTimelinePoint::new(
@@ -3300,37 +3318,30 @@ mod tests {
                 )),
                 Some(false)
             );
-            if empty {
-                assert!(matches!(
-                    boundary.frontend_failure(),
-                    nixe_gpu_maxwell::MaxwellFrontendDispatchError::EmptySubmission
-                ));
-            } else {
-                assert!(matches!(
-                    boundary.frontend_failure(),
-                    nixe_gpu_maxwell::MaxwellFrontendDispatchError::PacketDecode(_)
-                ));
-                let submission = boundary.dispatch().scheduled().submission();
-                assert_eq!(
-                    submission.decoded().entries()[0].address(),
-                    mapping.offset()
-                );
-                let error = boundary.frontend_failure().to_string();
-                assert!(error.contains("0x12345678"));
-                drop(allocation);
-                {
-                    let state = session.state.lock().unwrap();
-                    state
-                        .gpu_address_spaces
-                        .lock()
-                        .unwrap()
-                        .get_mut(&as_fd)
-                        .unwrap()
-                        .unmap(mapping.offset())
-                        .unwrap();
-                }
-                assert_eq!(boundary.frontend_failure().to_string(), error);
+            assert!(matches!(
+                boundary.frontend_failure(),
+                nixe_gpu_maxwell::MaxwellFrontendDispatchError::PacketDecode(_)
+            ));
+            let submission = boundary.dispatch().scheduled().submission();
+            assert_eq!(
+                submission.decoded().entries()[0].address(),
+                mapping.offset()
+            );
+            let error = boundary.frontend_failure().to_string();
+            assert!(error.contains("0x12345678"));
+            drop(allocation);
+            {
+                let state = session.state.lock().unwrap();
+                state
+                    .gpu_address_spaces
+                    .lock()
+                    .unwrap()
+                    .get_mut(&as_fd)
+                    .unwrap()
+                    .unmap(mapping.offset())
+                    .unwrap();
             }
+            assert_eq!(boundary.frontend_failure().to_string(), error);
         }
     }
 

@@ -248,8 +248,8 @@ mod tests {
             }
             match crate::test_memory::ready(host.finish_method(method, value)) {
                 Ok(()) => {}
-                Err(MaxwellThreeDMmePreflightError::Dispatch(error)) => panic!("{error}"),
-                Err(MaxwellThreeDMmePreflightError::Consumer(never)) => match never {},
+                Err(MaxwellThreeDMmeDispatchError::Dispatch(error)) => panic!("{error}"),
+                Err(MaxwellThreeDMmeDispatchError::Consumer(never)) => match never {},
             }
         }
         crate::test_memory::ready(flush(host.candidate, host.consume)).unwrap();

@@ -1,7 +1,7 @@
 //! Switch 1 Maxwell GPU channel identity and configuration semantics.
 //!
 //! This module deliberately contains no Horizon descriptors, runtime events,
-//! host-backend handles, or GPFIFO command storage. The Horizon adapter owns
+//! host-backend handles, or GPFIFO descriptor storage. The Horizon adapter owns
 //! wire decoding while this frontend owns the durable channel associations
 //! which later submission batches consume.
 
@@ -315,6 +315,7 @@ pub struct MaxwellGpuChannel {
     inline_to_memory: MaxwellInlineToMemoryState,
     two_d: MaxwellTwoDState,
     three_d: MaxwellThreeDFrontendState,
+    pub(crate) commands: crate::pushbuffer::packet::CommandState,
 }
 impl std::ops::Deref for MaxwellGpuChannel {
     type Target = MaxwellChannelConfiguration;
@@ -345,6 +346,7 @@ impl MaxwellGpuChannel {
             inline_to_memory: MaxwellInlineToMemoryState::new(),
             two_d: MaxwellTwoDState::new(),
             three_d: MaxwellThreeDFrontendState::new(),
+            commands: Default::default(),
         }
     }
     pub const fn configuration(&self) -> MaxwellChannelConfiguration {

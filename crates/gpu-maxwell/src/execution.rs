@@ -249,7 +249,6 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
             PendingEngineOperation::ThreeDRenderCondition(source) => *source,
             PendingEngineOperation::ThreeDSynchronization(request) => request.source(),
         };
-        self.cache.borrow_mut().bind_channel(source.channel());
         let result = self.consume_event(operation).await;
         result.map_err(|cause| MaxwellSubmissionExecutionError::AtMethod {
             source,
@@ -802,16 +801,8 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
         })
         .await
     }
-    pub(crate) fn take_mme_scratch(&mut self) -> Vec<u32> {
-        self.cache.borrow_mut().take_mme_scratch()
-    }
-
     pub(crate) fn set_driver_completion_increments(&mut self, increments: u32) {
         self.driver_completion_increments = increments;
-    }
-
-    pub(crate) fn recycle_mme_scratch(&mut self, parameters: Vec<u32>) {
-        self.cache.borrow_mut().recycle_mme_scratch(parameters);
     }
 
     pub(crate) async fn finish(

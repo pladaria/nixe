@@ -1,10 +1,10 @@
 use nixe_gpu::{FrontendSubmissionId, GuestSyncpointId, native::NativeCommand};
 use nixe_gpu_maxwell::{
     MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
-    MaxwellChannelId, MaxwellChannelOwner, MaxwellCommandSourceScratch, MaxwellGpfifoSubmitRequest,
-    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellMapRequest, MaxwellMemoryManagerId,
-    MaxwellNativeFrontend, MaxwellScheduler, SWITCH_1_GM20B_PROFILE, decode_gpfifo_submission,
-    stream_maxwell_frontend, validate_gpfifo_submission,
+    MaxwellChannelId, MaxwellChannelOwner, MaxwellCommandSourceScratch, MaxwellFrontend,
+    MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellMapRequest,
+    MaxwellMemoryManagerId, MaxwellNativeFrontend, MaxwellScheduler, SWITCH_1_GM20B_PROFILE,
+    decode_gpfifo_submission, stream_maxwell_frontend, validate_gpfifo_submission,
 };
 use nixe_memory::{AllocationRange, Machine, MemoryPermissions, PAGE_SIZE};
 #[path = "support/command.rs"]
@@ -104,11 +104,13 @@ fn inline_uploads_are_consumed_between_native_inputs_without_native_delivery() {
         .unwrap()
         .unwrap();
     let mut observed = Vec::new();
+    let renderer = std::cell::RefCell::new(MaxwellNativeFrontend::new(Default::default()));
+    renderer.borrow_mut().bind_channel(channel.id());
     command::ready(stream_maxwell_frontend(
         &dispatch,
         &mut channel,
         space.memory(),
-        &std::cell::RefCell::new(MaxwellNativeFrontend::new(Default::default())),
+        &renderer,
         &mut MaxwellCommandSourceScratch::default(),
         &mut command::Observer {
             memory: &machine,

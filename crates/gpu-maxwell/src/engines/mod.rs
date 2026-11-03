@@ -991,7 +991,7 @@ async fn flush_mme_methods<E>(
         return Ok(());
     };
     let (profile, state) = channel.three_d_with_profile_mut();
-    threed::preflight_mme_call(
+    threed::execute_mme_call(
         profile,
         first.source(),
         parameters,
@@ -1009,10 +1009,10 @@ async fn flush_mme_methods<E>(
     )
     .await
     .map_err(|error| match error {
-        threed::MaxwellThreeDMmePreflightError::Dispatch(error) => {
+        threed::MaxwellThreeDMmeDispatchError::Dispatch(error) => {
             MaxwellEngineStreamError::Dispatch(error)
         }
-        threed::MaxwellThreeDMmePreflightError::Consumer(error) => {
+        threed::MaxwellThreeDMmeDispatchError::Consumer(error) => {
             MaxwellEngineStreamError::Consumer(error)
         }
     })?;
@@ -1036,7 +1036,7 @@ fn dispatch_class_method(
     }
     if class == threed::CLASS {
         let (profile, state) = channel.three_d_with_profile_mut();
-        return threed::preflight(profile, method, state);
+        return threed::call_method(profile, method, state);
     }
     if class == twod::CLASS {
         return twod::preflight(*method, channel.two_d_mut());

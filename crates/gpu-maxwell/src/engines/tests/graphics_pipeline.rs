@@ -824,7 +824,97 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
 }
 
 #[test]
-fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
+fn shadow_control_aliases_the_shadow_bank_while_live_reads_keep_replayed_bits() {
+    for from_mme in [false, true] {
+        let mut channel = three_d_channel();
+        if from_mme {
+            load_mme_program(
+                &mut channel,
+                5,
+                &[
+                    1 | (2 << 4) | ((0x0124 / 4) << 14),
+                    (4 << 4) | (1 << 7) | (1 << 11),
+                    0x11,
+                ],
+            );
+        }
+        // Leaving replay changes the mode using the submitted argument; the
+        // live register receives the prior shadow control. Both PFIFO and MME
+        // follow Eden's ProcessShadowRam / dirty write / method-call sequence.
+        for (submitted, live) in [(2, 2), (3, 3), (1, 3), (3, 3), (2, 3), (0, 0)] {
+            if from_mme {
+                dispatch_method(&mut channel, (0x3800 + 5 * 8) / 4, submitted).unwrap();
+            } else {
+                program_three_d(&mut channel, 0x0124, submitted);
+            }
+            assert_eq!(
+                channel
+                    .three_d_mut()
+                    .raw_register_value(GpuMethodId(0x0124)),
+                Some(live)
+            );
+            assert_eq!(
+                channel
+                    .three_d_mut()
+                    .mme()
+                    .shadow_value(GpuMethodId(0x0124)),
+                Some(submitted)
+            );
+            assert_eq!(
+                channel.three_d_mut().mme().shadow_ram_control().value(),
+                MaxwellThreeDMmeShadowRamControl::parse(submitted).as_ref()
+            );
+        }
+    }
+}
+
+#[test]
+fn pfifo_and_mme_publish_effect_registers_before_semantic_failure() {
+    for from_mme in [false, true] {
+        for mode in [0, 2] {
+            let mut channel = three_d_channel();
+            program_three_d(&mut channel, 0x0124, mode);
+            program_three_d(&mut channel, 0x1134, 1);
+            let shadow = channel
+                .three_d_mut()
+                .mme()
+                .shadow_value(GpuMethodId(0x1134));
+            let method = if from_mme {
+                let set_method = 1 | (2 << 4) | ((0x1134 / 4) << 14);
+                let send_parameter = (4 << 4) | (1 << 7) | (1 << 11);
+                load_mme_program(&mut channel, 0, &[set_method, send_parameter, 0x11]);
+                0x3800
+            } else {
+                0x1134
+            };
+            assert!(matches!(
+                dispatch_method(&mut channel, method / 4, 2),
+                Err(MaxwellEngineDispatchError::InvalidMethodValue { source, .. })
+                    if source.method() == GpuMethodId(0x1134) && source.argument() == 2
+            ));
+            assert_eq!(
+                channel
+                    .three_d_mut()
+                    .raw_register_value(GpuMethodId(0x1134)),
+                Some(2)
+            );
+            assert_eq!(
+                channel
+                    .three_d_mut()
+                    .mme()
+                    .shadow_value(GpuMethodId(0x1134)),
+                if mode == 0 { Some(2) } else { shadow }
+            );
+            assert_eq!(
+                channel.three_d_mut().mme().mutable_method_control().raw(),
+                Some(1)
+            );
+        }
+    }
+}
+
+#[test]
+fn mme_shadow_ram_control_tracks_bypasses_replays_and_publishes_before_validation() {
     let mut channel = three_d_channel();
 
     assert_eq!(
@@ -888,7 +978,6 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
         Some(0x1b00)
     );
 
-    let before_invalid = channel.clone();
     let invalid = packet(0x0124 / 4, 4);
     assert!(matches!(
         dispatch_first(&mut channel, &invalid),
@@ -897,7 +986,23 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
             ..
         })
     ));
-    assert_eq!(channel, before_invalid);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x0124)),
+        Some(4)
+    );
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .mme()
+            .shadow_value(GpuMethodId(0x0124)),
+        Some(4)
+    );
+    assert_eq!(
+        channel.three_d_mut().mme().shadow_ram_control().value(),
+        None
+    );
 }
 
 #[test]
@@ -1463,7 +1568,7 @@ fn vertex_stream_attributes_and_begin_state_remain_unresolved_and_typed() {
 }
 
 #[test]
-fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
+fn end_closes_the_active_begin_and_preserves_sequence_provenance() {
     let mut channel = three_d_channel();
 
     program_three_d(&mut channel, 0x1618, 4);
@@ -1485,7 +1590,6 @@ fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
 
     let frontend_before = *channel.frontend();
     let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
     let decoded = incrementing_packet(0x1610 / 4, &[0, 2]);
     assert!(matches!(
         dispatch_first(&mut channel, &decoded),
@@ -1497,7 +1601,13 @@ fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
     ));
     assert_eq!(channel.frontend(), &frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x1614)),
+        Some(2)
+    );
+    assert!(!channel.three_d().vertex_input().primitive().is_open());
 
     dispatch_incrementing(&mut channel, 0x1614 / 4, &[1, 5]).unwrap();
     let primitive = channel.three_d().vertex_input().primitive();
@@ -2558,4 +2668,123 @@ fn direct_mme_program_cache_follows_instruction_uploads_and_start_address_change
     .unwrap();
     dispatch_method(&mut channel, call, 3.5_f32.to_bits()).unwrap();
     assert_eq!(channel.three_d().raster().point_size().raw(), Some(8));
+}
+
+#[test]
+#[ignore = "controlled register admission plus native draw preparation measurement"]
+fn parameter_preparation_throughput() {
+    use super::register_benchmark::ALLOCATIONS;
+    use crate::execution::MaxwellFrontend;
+    use nixe_gpu::native::NativeCommand;
+    use std::{hint::black_box, time::Instant};
+    fn draw(
+        channel: &mut MaxwellGpuChannel,
+        stream: &mut crate::pushbuffer::packet::CommandStream,
+        frontend: &mut crate::MaxwellNativeFrontend,
+        memory: &crate::MaxwellGpuMemory,
+        expected: [f32; 4],
+    ) {
+        stream.rewind();
+        let mut pending = None;
+        let mut parameters = Vec::new();
+        let mut calls = 0;
+        let mut consume = async |event: MaxwellEngineEvent<'_>| {
+            let PendingEngineOperation::ThreeD(trigger) = event.operation else {
+                panic!("expected a draw trigger")
+            };
+            let work = frontend
+                .lower_three_d(
+                    event.three_d,
+                    trigger,
+                    memory,
+                    nixe_gpu::FrontendSubmissionId::new(1),
+                    event.instances,
+                    &mut crate::test_memory::access(memory.machine()),
+                )
+                .unwrap();
+            let NativeCommand::Draw { state, .. } = work.command else {
+                panic!("expected a native draw")
+            };
+            assert_eq!(state.parameters.blend_constants, expected);
+            black_box(&state);
+            calls += 1;
+            Ok::<_, std::convert::Infallible>(())
+        };
+        crate::test_memory::ready(async {
+            stream_maxwell_engine_entry(
+                channel,
+                stream,
+                None,
+                &mut pending,
+                &mut parameters,
+                &mut consume,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("register/draw admission"));
+            finish_maxwell_engine_stream(channel, &mut consume)
+                .await
+                .unwrap();
+        });
+        assert_eq!(calls, 1);
+    }
+    let iterations: usize = std::env::var("NIXE_PARAMETER_BENCH_ITERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000);
+    for writes in [1_usize, 2, 4, 16, 64] {
+        let NativeDrawFixture {
+            space, mut channel, ..
+        } = native_draw_fixture();
+        let mut frontend = crate::MaxwellNativeFrontend::new(Default::default());
+        frontend.bind_channel(channel.id());
+        let origin = word(0, 0).unwrap().location();
+        let mut cases = [0.25_f32, 0.75].map(|seed| {
+            let mut words = Vec::new();
+            let mut expected = [0.; 4];
+            for index in 0..writes {
+                let lane = index % 4;
+                let value = seed + lane as f32 / 8. + (index / 4) as f32 / 16.;
+                words.extend([
+                    (1 << 29) | (1 << 16) | ((0x131c + lane as u32 * 4) / 4),
+                    value.to_bits(),
+                ]);
+                expected[lane] = value;
+            }
+            words.push((4 << 29) | (3 << 16) | (0x0d78 / 4));
+            (
+                crate::pushbuffer::packet::CommandStream::fixture_words(origin, &words),
+                expected,
+            )
+        });
+        for index in 0..1000 {
+            let (stream, expected) = &mut cases[index % 2];
+            draw(
+                &mut channel,
+                stream,
+                &mut frontend,
+                space.memory(),
+                *expected,
+            );
+        }
+        let prepared = frontend.statistics.prepared_parameters;
+        ALLOCATIONS.with(|counter| counter.set(Some(0)));
+        let start = Instant::now();
+        for index in 0..iterations {
+            let (stream, expected) = &mut cases[index % 2];
+            draw(
+                &mut channel,
+                stream,
+                &mut frontend,
+                space.memory(),
+                *expected,
+            );
+        }
+        let wall_ns = start.elapsed().as_nanos();
+        let allocations = ALLOCATIONS.with(|counter| counter.replace(None).unwrap());
+        assert_eq!(allocations, 0, "warmed admission and draw preparation");
+        assert_eq!(frontend.statistics.prepared_parameters, prepared);
+        println!(
+            "PARAMETER_PREPARATION_BENCH {{\"writes\":{writes},\"iterations\":{iterations},\"wall_ns\":{wall_ns},\"allocations\":{allocations}}}"
+        );
+    }
 }

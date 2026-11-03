@@ -88,7 +88,6 @@ pub struct MaxwellNativeFrontend {
     draw_vertices: Vec<GuestVertexBuffer>,
     draws: nixe_gpu::WorkingSet<Arc<GuestDrawState>, Arc<GuestDrawState>>,
     next: u64,
-    parameters: Vec<u32>,
     pub statistics: NativeFrontendStatistics,
     image_views: nixe_gpu::WorkingSet<ImageKey, GuestImage>,
     capture_compiler: Option<nixe_shader_recompiler::Compiler>,
@@ -137,7 +136,6 @@ impl MaxwellNativeFrontend {
             draw_vertices: Vec::new(),
             draws: nixe_gpu::WorkingSet::new(8192, 64 * 1024 * 1024),
             next: 1,
-            parameters: Vec::new(),
             statistics: Default::default(),
             image_views: nixe_gpu::WorkingSet::new(4096, IMAGE_VIEW_BYTES),
             capture_compiler: None,
@@ -550,6 +548,7 @@ impl MaxwellNativeFrontend {
             for (slot, image) in formats.iter_mut().zip(colors.iter()) {
                 *slot = Some(image.description.format());
             }
+            let words = state.parameter_registers();
             let key = ParameterKey {
                 shader: shader.identity,
                 registers: state.parameter_fingerprint(),
@@ -571,7 +570,7 @@ impl MaxwellNativeFrontend {
             // every relevant register must match before validation is reused.
             // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
             if let Some(selected) = self.parameter_states.get(&key)
-                && state.matches_parameter_words(&selected.words)
+                && selected.words.as_ref() == words.as_slice()
             {
                 self.statistics.reused_parameters += 1;
                 Arc::clone(&selected.parameters)
@@ -737,14 +736,12 @@ impl MaxwellNativeFrontend {
                     alpha_to_coverage: false,
                 };
                 let parameters = Arc::new(parameters);
-                let words = state.parameter_words();
-                let bytes =
-                    identity::parameter_bytes(&parameters) + std::mem::size_of_val(words.as_ref());
+                let bytes = identity::parameter_bytes(&parameters) + std::mem::size_of_val(words);
                 self.statistics.prepared_parameters += 1;
                 self.parameter_states.insert(
                     key,
                     ParameterSelection {
-                        words,
+                        words: Box::new(*words),
                         parameters: Arc::clone(&parameters),
                     },
                     bytes,
@@ -1575,12 +1572,6 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             }
         };
         Ok(())
-    }
-    fn take_mme_scratch(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.parameters)
-    }
-    fn recycle_mme_scratch(&mut self, parameters: Vec<u32>) {
-        self.parameters = parameters;
     }
     fn lower_nv12_conversion(
         &mut self,

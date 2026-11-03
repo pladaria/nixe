@@ -14,7 +14,6 @@ use crate::{
 /// First semantic failure while consuming a command stream.
 #[derive(Clone, Debug)]
 pub enum MaxwellFrontendDispatchError {
-    EmptySubmission,
     // Effects and MME sends carry this error type through their synchronous
     // results. Keep packet provenance behind the failure-only allocation too.
     PacketDecode(Box<MaxwellPushbufferDecodeError>),
@@ -25,7 +24,6 @@ pub enum MaxwellFrontendDispatchError {
 impl Display for MaxwellFrontendDispatchError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptySubmission => formatter.write_str("empty Maxwell submission"),
             Self::PacketDecode(error) => write!(formatter, "packet decode failed: {error}"),
             Self::EngineDispatch(error) => write!(formatter, "engine dispatch failed: {error}"),
             Self::Execution(error) => write!(formatter, "frontend lowering failed: {error}"),
@@ -37,6 +35,7 @@ impl std::error::Error for MaxwellFrontendDispatchError {}
 
 /// Fetch each entry and consume engine effects in order. Packet continuation
 /// survives entry fetches; control work runs at effects and entry boundaries.
+/// The executor selects the frontend channel before each poll of this future.
 pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellCommandHost>(
     dispatch: &MaxwellFrontendDispatch,
     channel: &mut MaxwellGpuChannel,
@@ -59,10 +58,8 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
     if submission.decoded().mode().fence_get() {
         effects.set_driver_completion_increments(2);
     }
-    let mut mme_methods = None;
-    let mut mme_parameters = effects.take_mme_scratch();
-    let mut stream = CommandStream::default();
-    let mut any = false;
+    let mut commands = std::mem::take(&mut channel.commands);
+    let mut stream = CommandStream::resume(commands.packet.take());
     let execution_error = |error| MaxwellFrontendDispatchError::Execution(Box::new(error));
     let result = async {
         loop {
@@ -83,14 +80,13 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
             {
                 break;
             }
-            any = true;
             stream_maxwell_engine_entry(
                 channel,
                 &mut stream,
                 #[cfg(test)]
                 None,
-                &mut mme_methods,
-                &mut mme_parameters,
+                &mut commands.mme_method,
+                &mut commands.mme_parameters,
                 &mut async |event| {
                     effects.push_event(event).await.map_err(execution_error)?;
                     effects.control().map_err(execution_error)
@@ -108,9 +104,7 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
             })?;
             effects.control().map_err(execution_error)?;
         }
-        stream
-            .finish(sources)
-            .map_err(|error| MaxwellFrontendDispatchError::PacketDecode(Box::new(error)))?;
+        commands.packet = stream.finish(sources);
         crate::engines::finish_maxwell_engine_stream(channel, &mut async |event| {
             effects.push_event(event).await?;
             effects.control()
@@ -120,11 +114,8 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
         Ok(())
     }
     .await;
-    effects.recycle_mme_scratch(mme_parameters);
+    channel.commands = commands;
     result?;
-    if !any {
-        return Err(MaxwellFrontendDispatchError::EmptySubmission);
-    }
     #[cfg(feature = "performance-counters")]
     {
         nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::FrontendSubmissions, 1);

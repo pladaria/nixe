@@ -201,6 +201,31 @@ impl AudioBackend for HostAudioBackend {
 }
 
 impl HostAudioBackend {
+    /// Set host output volume in percent for current and future streams.
+    pub fn set_volume(&self, volume: u8) -> Result<(), AudioError> {
+        if volume > 100 {
+            return Err(AudioError(
+                "host audio volume must be between 0 and 100".into(),
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.active {
+            return Err(AudioError("SDL audio subsystem has been shut down".into()));
+        }
+        let gain = f32::from(volume) / 100.0;
+        if state.gain == gain {
+            return Ok(());
+        }
+        for stream in state.streams.values() {
+            stream.feed.lock().host_gain = gain;
+        }
+        state.gain = gain;
+        Ok(())
+    }
+
     /// Freezes playback without consuming or discarding queued guest PCM.
     pub fn set_paused(&self, paused: bool) -> Result<(), AudioError> {
         let mut state = self
@@ -291,6 +316,7 @@ mod tests {
         let sdl = sdl3::init().unwrap();
         let gamepads = sdl.gamepad().unwrap();
         verify_host_volume(&sdl);
+        verify_live_host_volume(&sdl);
         let runtime = HostAudioRuntime::new(&sdl, ChannelLayout::Stereo, 1.0).unwrap();
         verify_callback_pitch_and_channels();
         let backend = runtime.backend();
@@ -405,6 +431,45 @@ mod tests {
                 assert_eq!(output.played_frames().unwrap(), 1);
                 assert_eq!(output.released(1).unwrap(), [tag]);
             }
+        }
+    }
+
+    fn verify_live_host_volume(sdl: &sdl3::Sdl) {
+        let runtime = HostAudioRuntime::new(sdl, ChannelLayout::Stereo, 0.25).unwrap();
+        let backend = runtime.backend();
+        backend.set_paused(true).unwrap();
+        let outputs: Vec<_> = (0..2)
+            .map(|tag| {
+                let output =
+                    AudioOutput::open(backend.as_ref(), PcmFormat::STEREO_48KHZ, Arc::new(|_| {}))
+                        .unwrap();
+                output.set_volume(0.5).unwrap();
+                output.append(tag, [10_000, -10_000].repeat(4)).unwrap();
+                output.start().unwrap();
+                output
+            })
+            .collect();
+        for (volume, amplitude) in [(35, 1750), (100, 5000), (0, 0), (10, 500)] {
+            backend.set_volume(volume).unwrap();
+            for output in &outputs {
+                let mut samples = [1; 2];
+                output.feed.render(&mut samples);
+                assert_eq!(samples, [amplitude, -amplitude]);
+                assert_eq!(output.volume().unwrap(), 0.5);
+            }
+            let output =
+                AudioOutput::open(backend.as_ref(), PcmFormat::STEREO_48KHZ, Arc::new(|_| {}))
+                    .unwrap();
+            output.set_volume(0.5).unwrap();
+            output.append(0, vec![10_000, -10_000]).unwrap();
+            output.start().unwrap();
+            let mut samples = [1; 2];
+            output.feed.render(&mut samples);
+            assert_eq!(samples, [amplitude, -amplitude]);
+        }
+        for (tag, output) in outputs.iter().enumerate() {
+            assert_eq!(output.played_frames().unwrap(), 4);
+            assert_eq!(output.released(1).unwrap(), [tag as u64]);
         }
     }
 

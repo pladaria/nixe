@@ -234,7 +234,7 @@ fn mme_register_admission_throughput() {
         "MME_ADMISSION_LAYOUT frontend_error={} mme_error={}",
         std::mem::size_of::<crate::MaxwellFrontendDispatchError>(),
         std::mem::size_of::<
-            super::super::threed::MaxwellThreeDMmePreflightError<
+            super::super::threed::MaxwellThreeDMmeDispatchError<
                 crate::MaxwellFrontendDispatchError,
             >,
         >()

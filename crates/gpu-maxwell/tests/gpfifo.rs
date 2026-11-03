@@ -330,6 +330,7 @@ fn exercise_command_source(split: bool, wait: bool, unmap_during_entry: bool) {
         controls: 0,
     };
     let frontend = RefCell::new(MaxwellNativeFrontend::new(Default::default()));
+    frontend.borrow_mut().bind_channel(channel.id());
     let mut scratch = MaxwellCommandSourceScratch::default();
     command::ready(stream_maxwell_frontend(
         &dispatch,
@@ -449,11 +450,13 @@ fn later_entry_fetch_uses_the_mapping_current_after_prior_work() {
         consume: &mut consume,
         controls: 0,
     };
+    let frontend = RefCell::new(MaxwellNativeFrontend::new(Default::default()));
+    frontend.borrow_mut().bind_channel(channel.id());
     command::ready(stream_maxwell_frontend(
         &dispatch,
         &mut channel,
         &reader,
-        &RefCell::new(MaxwellNativeFrontend::new(Default::default())),
+        &frontend,
         &mut MaxwellCommandSourceScratch::default(),
         &mut host,
     ))

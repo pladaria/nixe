@@ -38,8 +38,9 @@ enum FrontendEvent {
 }
 
 type PauseHandler = Box<dyn Fn(bool) -> Result<(), String> + Send + Sync>;
+type VolumeHandler = Box<dyn FnMut(i8) -> Result<(), String> + Send>;
 
-fn pause_key_pressed(down: &mut bool, state: ElementState, repeat: bool, synthetic: bool) -> bool {
+fn hotkey_pressed(down: &mut bool, state: ElementState, repeat: bool, synthetic: bool) -> bool {
     if synthetic {
         return false;
     }
@@ -136,6 +137,8 @@ impl WindowFrontend {
                 frame_wakeup_pending,
                 pause_handler: None,
                 pause_key_down: false,
+                volume_handler: None,
+                volume_keys_down: [false; 2],
                 presenter: None,
                 failure: None,
                 initial_window_state: None,
@@ -180,6 +183,16 @@ impl WindowFrontend {
         handler: impl Fn(bool) -> Result<(), String> + Send + Sync + 'static,
     ) -> Self {
         self.application.pause_handler = Some(Box::new(handler));
+        self
+    }
+
+    /// Routes numpad volume hotkeys as changes in percentage points.
+    #[must_use]
+    pub fn with_volume_handler(
+        mut self,
+        handler: impl FnMut(i8) -> Result<(), String> + Send + 'static,
+    ) -> Self {
+        self.application.volume_handler = Some(Box::new(handler));
         self
     }
 
@@ -432,6 +445,8 @@ struct PresenterApplication {
     frame_wakeup_pending: Arc<AtomicBool>,
     pause_handler: Option<PauseHandler>,
     pause_key_down: bool,
+    volume_handler: Option<VolumeHandler>,
+    volume_keys_down: [bool; 2],
     presenter: Option<Presenter>,
     failure: Option<WindowError>,
     initial_window_state: Option<WindowState>,
@@ -539,13 +554,39 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
         {
             return;
         }
+        if let WindowEvent::KeyboardInput {
+            event,
+            is_synthetic,
+            ..
+        } = &event
+            && let PhysicalKey::Code(key @ (KeyCode::NumpadAdd | KeyCode::NumpadSubtract)) =
+                event.physical_key
+            && let Some(handler) = &mut self.volume_handler
+        {
+            let increase = key == KeyCode::NumpadAdd;
+            if hotkey_pressed(
+                &mut self.volume_keys_down[usize::from(increase)],
+                event.state,
+                event.repeat,
+                *is_synthetic,
+            ) && self
+                .presenter
+                .as_ref()
+                .is_some_and(|p| p.window.has_focus())
+                && let Err(error) = handler(if increase { 10 } else { -10 })
+            {
+                self.failure = Some(WindowError::new("volume control", error));
+                self.stop_requested.store(true, Ordering::Release);
+            }
+            return;
+        }
         let event_window = self.presenter.as_ref().map(|p| Arc::clone(&p.window));
         let pause_pressed = match &event {
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic,
                 ..
-            } if event.physical_key == PhysicalKey::Code(KeyCode::KeyP) => pause_key_pressed(
+            } if event.physical_key == PhysicalKey::Code(KeyCode::KeyP) => hotkey_pressed(
                 &mut self.pause_key_down,
                 event.state,
                 event.repeat,
@@ -553,6 +594,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             ),
             WindowEvent::Focused(false) => {
                 self.pause_key_down = false;
+                self.volume_keys_down = [false; 2];
                 false
             }
             _ => false,
@@ -828,46 +870,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pause_hotkey_requires_a_real_press_edge_and_ignores_repeats_and_synthetic_events() {
+    fn hotkeys_require_a_real_press_edge_and_ignore_repeats_and_synthetic_events() {
         let mut down = false;
-        assert!(!pause_key_pressed(
+        assert!(!hotkey_pressed(
             &mut down,
             ElementState::Pressed,
             false,
             true
         ));
-        assert!(pause_key_pressed(
+        assert!(hotkey_pressed(
             &mut down,
             ElementState::Pressed,
             false,
             false
         ));
-        assert!(!pause_key_pressed(
+        assert!(!hotkey_pressed(
             &mut down,
             ElementState::Pressed,
             true,
             false
         ));
-        assert!(!pause_key_pressed(
+        assert!(!hotkey_pressed(
             &mut down,
             ElementState::Pressed,
             false,
             false
         ));
-        assert!(!pause_key_pressed(
+        assert!(!hotkey_pressed(
             &mut down,
             ElementState::Released,
             false,
             true
         ));
         assert!(down);
-        assert!(!pause_key_pressed(
+        assert!(!hotkey_pressed(
             &mut down,
             ElementState::Released,
             false,
             false
         ));
-        assert!(pause_key_pressed(
+        assert!(hotkey_pressed(
             &mut down,
             ElementState::Pressed,
             false,

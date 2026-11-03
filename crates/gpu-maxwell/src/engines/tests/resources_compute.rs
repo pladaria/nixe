@@ -97,7 +97,6 @@ fn three_d_embedded_inline_upload_still_rejects_active_unsupported_launch_modes(
     ] {
         let mut channel = three_d_channel();
         dispatch_incrementing(&mut channel, 0x0180 / 4, &[4, 1, 0, 0x0409_3000]).unwrap();
-        let before = channel.three_d().clone();
         assert!(matches!(
             dispatch_first(&mut channel, &packet(0x01b0 / 4, raw)),
             Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
@@ -105,7 +104,20 @@ fn three_d_embedded_inline_upload_still_rejects_active_unsupported_launch_modes(
                 ..
             })
         ));
-        assert_eq!(channel.three_d(), &before);
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .raw_register_value(GpuMethodId(0x01b0)),
+            Some(raw)
+        );
+        assert!(
+            channel
+                .three_d()
+                .inline_to_memory()
+                .launch()
+                .value()
+                .is_none()
+        );
     }
 }
 
@@ -798,7 +810,6 @@ fn constant_buffer_inline_load_tracks_typed_cursor_and_upload_effects() {
 fn constant_buffer_inline_load_validates_consumed_ranges_and_preserves_applied_prefix() {
     let mut channel = three_d_channel();
 
-    let before = channel.three_d().clone();
     let data_without_selector = packet(0x2390 / 4, 1);
     assert!(matches!(
         dispatch_first(&mut channel, &data_without_selector),
@@ -807,7 +818,16 @@ fn constant_buffer_inline_load_validates_consumed_ranges_and_preserves_applied_p
             ..
         })
     ));
-    assert_eq!(channel.three_d(), &before);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x2390)),
+        Some(1)
+    );
+    assert_eq!(
+        channel.three_d().shader_bindings().constant_buffer_offset(),
+        0
+    );
 
     // Ordinary selectors are raw state, validated when a transfer consumes
     // them. They do not maintain a second optional cursor.
@@ -831,6 +851,16 @@ fn constant_buffer_inline_load_validates_consumed_ranges_and_preserves_applied_p
         }) if source.argument() == 2
     ));
     assert_ne!(channel.three_d(), &before_packet);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x2390)),
+        Some(2)
+    );
+    assert_eq!(
+        channel.three_d().shader_bindings().constant_buffer_offset(),
+        4
+    );
 }
 
 #[test]
@@ -845,7 +875,6 @@ fn conditional_constant_buffer_inline_load_is_an_explicit_host_boundary() {
     ] {
         program_three_d(&mut channel, method, argument);
     }
-    let before = channel.three_d().clone();
     let data = packet(0x2390 / 4, 0xfeed_beef);
     assert!(matches!(
         dispatch_first(&mut channel, &data),
@@ -853,7 +882,16 @@ fn conditional_constant_buffer_inline_load_is_an_explicit_host_boundary() {
             source,
         }) if source.argument() == 0xfeed_beef
     ));
-    assert_eq!(channel.three_d(), &before);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x2390)),
+        Some(0xfeed_beef)
+    );
+    assert_eq!(
+        channel.three_d().shader_bindings().constant_buffer_offset(),
+        0
+    );
 
     program_three_d(&mut channel, 0x030c, 0);
     program_three_d(&mut channel, 0x2390, 0xfeed_beef);
@@ -866,13 +904,21 @@ fn conditional_constant_buffer_inline_load_is_an_explicit_host_boundary() {
 #[test]
 fn incomplete_constant_buffer_binding_is_rejected() {
     let mut channel = three_d_channel();
-    let before = channel.three_d().clone();
     let bind = packet(0x2410 / 4, 1);
     assert!(matches!(
         dispatch_first(&mut channel, &bind),
         Err(MaxwellEngineDispatchError::InvalidMethodEncoding { .. })
     ));
-    assert_eq!(channel.three_d(), &before);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x2410)),
+        Some(1)
+    );
+    assert_eq!(
+        channel.three_d().shader_bindings().groups()[0].constant_buffers()[0],
+        None
+    );
 }
 
 #[test]
@@ -1892,7 +1938,18 @@ fn tiled_cache_barrier_preserves_source_and_draw_state() {
                 ..
             })
         ));
-        assert_eq!(channel, before);
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .raw_register_value(GpuMethodId(0x0f7c)),
+            Some(raw)
+        );
+        assert!(
+            before
+                .three_d()
+                .draw_state_identity()
+                .matches(channel.three_d())
+        );
     }
 }
 
@@ -2077,11 +2134,10 @@ fn decompress_surface_is_ordered_for_reset_or_programmed_uncompressed_targets() 
 }
 
 #[test]
-fn decompress_surface_rejects_reserved_bits_atomically() {
+fn decompress_surface_rejects_reserved_bits_after_publishing_the_register() {
     let mut channel = three_d_channel();
 
     for raw in [8, 1 << 20, u32::MAX] {
-        let before = channel.clone();
         let decoded = packet(0x02e0 / 4, raw);
         assert!(matches!(
             dispatch_first(&mut channel, &decoded),
@@ -2091,7 +2147,12 @@ fn decompress_surface_rejects_reserved_bits_atomically() {
                 ..
             }) if source.argument() == raw
         ));
-        assert_eq!(channel, before);
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .raw_register_value(GpuMethodId(0x02e0)),
+            Some(raw)
+        );
     }
 }
 
@@ -2278,7 +2339,6 @@ fn tiled_cache_flush_decodes_allocated_modes_and_lowers_only_verified_flush() {
         }) if source.method() == GpuMethodId(0x0f80) && source.argument() == 1
     ));
 
-    let before_invalid = channel.clone();
     let invalid = packet(0x0f80 / 4, 2);
     assert!(matches!(
         dispatch_first(&mut channel, &invalid),
@@ -2288,7 +2348,12 @@ fn tiled_cache_flush_decodes_allocated_modes_and_lowers_only_verified_flush() {
             ..
         }) if source.method() == GpuMethodId(0x0f80) && source.argument() == 2
     ));
-    assert_eq!(channel, before_invalid);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x0f80)),
+        Some(2)
+    );
 }
 
 #[test]
@@ -2383,7 +2448,7 @@ fn three_d_texture_cache_invalidation_family_preserves_target_and_scope_without_
             channel
                 .three_d_mut()
                 .raw_register_value(GpuMethodId(method)),
-            Some(0)
+            Some(1 << 1)
         );
     }
     assert!(
@@ -2473,7 +2538,6 @@ fn three_d_waiting_texture_cache_invalidation_family_drains_prior_work() {
             );
         }
 
-        let before = channel.clone();
         let invalid = packet_on_subchannel(0, method / 4, 1 << 2);
         assert!(matches!(
             dispatch_first(&mut channel, &invalid),
@@ -2482,7 +2546,12 @@ fn three_d_waiting_texture_cache_invalidation_family_drains_prior_work() {
                 ..
             })
         ));
-        assert_eq!(channel, before);
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .raw_register_value(GpuMethodId(method)),
+            Some(1 << 2)
+        );
     }
     assert!(
         three_d_before
@@ -2497,7 +2566,7 @@ fn three_d_waiting_texture_cache_invalidation_family_drains_prior_work() {
 }
 
 #[test]
-fn three_d_shader_cache_invalidation_covers_every_selector_combination_atomically() {
+fn three_d_shader_cache_invalidation_covers_every_selector_combination() {
     let mut channel = three_d_channel();
     use_mme_shadow_passthrough(&mut channel);
     let three_d_before = channel.three_d().clone();
@@ -2547,7 +2616,6 @@ fn three_d_shader_cache_invalidation_covers_every_selector_combination_atomicall
             .matches_parameters(channel.three_d())
     );
 
-    let before = channel.clone();
     let invalid = non_incrementing_packet_on_subchannel(0, 0x0da4 / 4, &[0x1011, 1 << 1]);
     assert!(matches!(
         dispatch_first(&mut channel, &invalid),
@@ -2557,7 +2625,12 @@ fn three_d_shader_cache_invalidation_covers_every_selector_combination_atomicall
             ..
         }) if source.argument() == 1 << 1
     ));
-    assert_eq!(channel, before);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x0da4)),
+        Some(1 << 1)
+    );
 }
 
 #[test]
@@ -2614,7 +2687,7 @@ fn ordered_three_d_shader_cache_invalidation_preserves_controls_and_prior_work()
 }
 
 #[test]
-fn ordered_shader_cache_special_controls_fail_during_lowering_and_reserved_bits_are_atomic() {
+fn ordered_shader_cache_special_controls_fail_during_lowering_after_register_publication() {
     let mut channel = three_d_channel();
 
     for (argument, expected) in [
@@ -2643,7 +2716,6 @@ fn ordered_shader_cache_special_controls_fail_during_lowering_and_reserved_bits_
     }
 
     for argument in [1 << 3, 1 << 5, u32::MAX] {
-        let before = channel.clone();
         let decoded = packet(0x021c / 4, argument);
         assert!(matches!(
             dispatch_first(&mut channel, &decoded),
@@ -2653,12 +2725,17 @@ fn ordered_shader_cache_special_controls_fail_during_lowering_and_reserved_bits_
                 ..
             }) if source.argument() == argument
         ));
-        assert_eq!(channel, before);
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .raw_register_value(GpuMethodId(0x021c)),
+            Some(argument)
+        );
     }
 }
 
 #[test]
-fn three_d_completion_reserved_bits_fail_without_register_state_writes() {
+fn three_d_completion_reserved_bits_fail_after_register_publication_without_changing_draw_state() {
     let mut channel = three_d_channel();
     use_mme_shadow_passthrough(&mut channel);
 
@@ -2678,6 +2755,12 @@ fn three_d_completion_reserved_bits_fail_without_register_state_writes() {
             }) if source.argument() == invalid && defined_mask == mask
         ));
         assert_eq!(channel.frontend(), &frontend_before);
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .raw_register_value(GpuMethodId(method)),
+            Some(invalid)
+        );
         assert!(
             three_d_before
                 .draw_state_identity()

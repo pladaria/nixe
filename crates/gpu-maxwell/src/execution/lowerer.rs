@@ -40,7 +40,6 @@ pub trait MaxwellFrontend: Send + 'static {
         frontend: FrontendSubmissionId,
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<NativeWork, MaxwellSubmissionExecutionError>;
-    fn take_mme_scratch(&mut self) -> Vec<u32>;
     fn render_enabled(&self) -> bool;
     fn update_render_condition(
         &mut self,
@@ -48,7 +47,6 @@ pub trait MaxwellFrontend: Send + 'static {
         address_space: &MaxwellGpuMemory,
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<(), MaxwellSubmissionExecutionError>;
-    fn recycle_mme_scratch(&mut self, parameters: Vec<u32>);
     fn lower_nv12_conversion(
         &mut self,
         destination: nixe_gpu::ConversionImage,

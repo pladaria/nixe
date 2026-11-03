@@ -157,34 +157,47 @@ pub(super) const fn passive_action(action: MethodAction) -> bool {
 
 // Like Eden's execution mask and dirty tables, method routing is fixed at build time.
 // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
-pub(super) struct MethodInfo {
-    pub(super) passive: bool,
-    pub(super) family: RegisterFamily,
-    pub(super) domains: u16,
-    pub(super) parameter_index: u16,
+// One write ORs the precomputed dirty routing into the channel's flag word.
+// Low 16 bits select domains, then 32 vertex slots and 8 color targets. The
+// remaining byte classifies the method and is never copied into dirty state.
+pub(super) const VERTEX_SHIFT: u32 = 16;
+pub(super) const COLOR_SHIFT: u32 = 48;
+const FAMILY_SHIFT: u32 = 56;
+const PASSIVE: u64 = 1 << 63;
+const DIRTY_MASK: u64 = (1 << FAMILY_SHIFT) - 1;
+
+#[derive(Clone, Copy)]
+pub(super) struct MethodInfo(u64);
+impl MethodInfo {
+    pub(super) const fn passive(self) -> bool {
+        self.0 & PASSIVE != 0
+    }
+    pub(super) const fn family(self) -> RegisterFamily {
+        match (self.0 >> FAMILY_SHIFT) & 7 {
+            1 => RegisterFamily::InlineToMemory,
+            2 => RegisterFamily::Mme,
+            3 => RegisterFamily::ConstantBuffer,
+            4 => RegisterFamily::VertexAndBinding,
+            _ => RegisterFamily::Other,
+        }
+    }
+    pub(super) const fn domains(self) -> u16 {
+        self.0 as u16
+    }
+    pub(super) const fn dirty(self) -> u64 {
+        self.0 & DIRTY_MASK
+    }
 }
 static METHODS: [MethodInfo; 4096] = {
-    let mut table = [const {
-        MethodInfo {
-            passive: false,
-            family: RegisterFamily::Other,
-            domains: 0,
-            parameter_index: u16::MAX,
-        }
-    }; 4096];
+    let mut table = [MethodInfo(0); 4096];
     let mut index = 0;
-    let mut parameter_index = 0;
     while index < table.len() {
         let method = index as u32 * 4;
-        table[index].family = classify_family(method);
-        table[index].domains = dirty_domains(method);
-        if table[index].domains & PARAMETERS != 0 {
-            table[index].parameter_index = parameter_index;
-            parameter_index += 1;
-        }
-        table[index].passive = if output_state(method) {
+        let family = classify_family(method);
+        let domains = dirty_domains(method);
+        let passive = if output_state(method) {
             true
-        } else if matches!(table[index].family, RegisterFamily::VertexAndBinding) {
+        } else if matches!(family, RegisterFamily::VertexAndBinding) {
             !matches!(method, 0x1614 | 0x1618) && !(method >= 0x2400 && method < 0x2500)
         } else if (method >= 0x3400
             && method < 0x3400 + MAXWELL_THREE_D_MME_SHADOW_SCRATCH_COUNT as u32 * 4)
@@ -197,6 +210,34 @@ static METHODS: [MethodInfo; 4096] = {
         } else {
             false
         };
+        let vertices = if domains & VERTEX != 0 {
+            let slot = if method >= 0x1f00 {
+                (method - 0x1f00) / 8
+            } else {
+                (method - 0x1c00) / 16
+            };
+            1_u32 << slot
+        } else {
+            0
+        };
+        let colors = if domains & COLOR != 0 {
+            if method == 0x15b8 {
+                0xff
+            } else if method >= 0x19e0 {
+                1_u8 << ((method - 0x19e0) / 4)
+            } else {
+                1_u8 << ((method - 0x0800) / 0x40)
+            }
+        } else {
+            0
+        };
+        table[index] = MethodInfo(
+            domains as u64
+                | ((vertices as u64) << VERTEX_SHIFT)
+                | ((colors as u64) << COLOR_SHIFT)
+                | ((family as u64) << FAMILY_SHIFT)
+                | if passive { PASSIVE } else { 0 },
+        );
         index += 1;
     }
     table
@@ -208,7 +249,7 @@ pub(super) fn info(method: GpuMethodId) -> Option<&'static MethodInfo> {
         .flatten()
 }
 pub(super) fn passive(method: GpuMethodId) -> bool {
-    info(method).is_some_and(|info| info.passive)
+    info(method).is_some_and(|info| info.passive())
 }
 
 /// Complete the valid prefix of a contiguous CB data packet in one transition.
@@ -434,13 +475,41 @@ pub(super) const PARAMETER_METHOD_COUNT: usize = {
     let mut count = 0;
     let mut i = 0;
     while i < METHODS.len() {
-        count += (METHODS[i].domains & PARAMETERS != 0) as usize;
+        count += (METHODS[i].domains() & PARAMETERS != 0) as usize;
         i += 1;
     }
     count
 };
 
-/// Lookup hint only: reuse still compares every consumed register exactly.
+pub(super) const PARAMETER_METHODS: [GpuMethodId; PARAMETER_METHOD_COUNT] = {
+    let mut methods = [GpuMethodId(0); PARAMETER_METHOD_COUNT];
+    let mut index = 0;
+    let mut ordinal = 0;
+    while index < METHODS.len() {
+        if METHODS[index].domains() & PARAMETERS != 0 {
+            methods[ordinal] = GpuMethodId(index as u32 * 4);
+            ordinal += 1;
+        }
+        index += 1;
+    }
+    methods
+};
+
+pub(super) const PARAMETER_ORDINALS: [u16; 4096] = {
+    let mut ordinals = [u16::MAX; 4096];
+    let mut index = 0;
+    let mut ordinal = 0;
+    while index < METHODS.len() {
+        if METHODS[index].domains() & PARAMETERS != 0 {
+            ordinals[index] = ordinal;
+            ordinal += 1;
+        }
+        index += 1;
+    }
+    ordinals
+};
+
+/// Lookup hint only; parameter reuse also compares every consumed word exactly.
 pub(super) fn normalized_parameter_hash(method: GpuMethodId, value: u32) -> u64 {
     let mut word = (u64::from(method.0) << 32) | u64::from(value);
     word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -466,28 +535,21 @@ mod tests {
     #[test]
     fn parameter_snapshot_compares_every_consumed_word_exactly() {
         let mut channel = three_d_channel();
-        let words = channel.three_d().parameter_words();
-        let fingerprint = channel.three_d().parameter_fingerprint();
+        let words = *channel.three_d().parameter_registers();
         for (index, info) in METHODS.iter().enumerate() {
-            if info.domains & PARAMETERS != 0 {
+            if info.domains() & PARAMETERS != 0 {
                 let method = GpuMethodId(index as u32 * 4);
                 let state = channel.three_d_mut();
                 let original = state.raw_register_value(method).unwrap();
                 state.write_register(method, original ^ 0x8000_0000);
                 assert!(
-                    !state.operation_state().matches_parameter_words(&words),
+                    *state.operation_state().parameter_registers() != words,
                     "{method:?}"
                 );
                 state.write_register(method, original);
-                assert!(state.operation_state().matches_parameter_words(&words));
-                assert_eq!(state.operation_state().parameter_fingerprint(), fingerprint);
+                assert_eq!(*state.operation_state().parameter_registers(), words);
             }
         }
-        assert!(
-            !channel
-                .three_d()
-                .matches_parameter_words(&words[..words.len() - 1])
-        );
     }
 
     #[test]
@@ -495,7 +557,7 @@ mod tests {
         let mut channel = three_d_channel();
         program_three_d(&mut channel, 0x0d78, 3);
         let before = channel.three_d().draw_state_identity();
-        let words = channel.three_d().parameter_words();
+        let words = *channel.three_d().parameter_registers();
         for method in [0x0a20, 0x0c10, 0x0e10, 0x1700] {
             program_three_d(&mut channel, method, u32::MAX);
             assert_eq!(
@@ -507,7 +569,7 @@ mod tests {
         }
         program_three_d(&mut channel, 0x0d78, 3);
         assert!(before.matches_parameters(channel.three_d()));
-        assert!(channel.three_d().matches_parameter_words(&words));
+        assert_eq!(*channel.three_d().parameter_registers(), words);
     }
 
     #[test]

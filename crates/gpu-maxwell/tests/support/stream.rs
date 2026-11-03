@@ -13,6 +13,7 @@ pub struct Fixture {
     pub dispatch: MaxwellFrontendDispatch,
     pub frontend: std::cell::RefCell<MaxwellNativeFrontend>,
     pub scratch: MaxwellCommandSourceScratch,
+    command_address: u64,
 }
 impl Fixture {
     pub fn new(build: impl FnOnce(u64) -> Vec<Vec<u32>>) -> Self {
@@ -117,12 +118,65 @@ impl Fixture {
             dispatch,
             frontend: std::cell::RefCell::new(MaxwellNativeFrontend::new(Default::default())),
             scratch: Default::default(),
+            command_address: base + PAGE_SIZE,
         }
+    }
+    pub fn submit(&mut self, words: &[u32]) {
+        let previous = self.dispatch.scheduled().submission();
+        let address = self.command_address;
+        let frontend = FrontendSubmissionId::new(previous.frontend().get() + 1);
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        if !bytes.is_empty() {
+            self.memory
+                .write_resolved(
+                    &[
+                        AllocationRange::new(self.allocation.pin(), PAGE_SIZE, bytes.len() as u64)
+                            .unwrap(),
+                    ],
+                    &bytes,
+                )
+                .unwrap();
+        }
+        let mut descriptors = (address as u32).to_le_bytes().to_vec();
+        descriptors.extend_from_slice(
+            &(((address >> 32) as u32) | ((words.len() as u32) << 10)).to_le_bytes(),
+        );
+        if words.is_empty() {
+            descriptors.clear();
+        }
+        let decoded = decode_gpfifo_submission(
+            SWITCH_1_GM20B_PROFILE,
+            128,
+            MaxwellGpfifoSubmitRequest {
+                entry_count: u32::from(!words.is_empty()),
+                flags: 4,
+                fence_id: 0,
+                fence_value: 0,
+            },
+            &descriptors,
+        )
+        .unwrap();
+        let submission = validate_gpfifo_submission(
+            &self.channel.configuration(),
+            frontend,
+            decoded,
+            self.space.memory(),
+        )
+        .unwrap();
+        let mut scheduler = MaxwellScheduler::default();
+        scheduler
+            .enqueue(&self.channel.configuration(), submission, None, None)
+            .unwrap();
+        self.dispatch = scheduler
+            .dispatch_next(true, self.space.memory())
+            .unwrap()
+            .unwrap();
     }
     pub fn run(
         &mut self,
         consume: &mut dyn FnMut(NativeWork),
     ) -> Result<usize, MaxwellFrontendDispatchError> {
+        self.frontend.borrow_mut().bind_channel(self.channel.id());
         let mut host = Observer {
             memory: &self.memory,
             consume,

@@ -372,8 +372,18 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
             gpu_diagnostics,
         ));
     };
-    let frontend =
-        frontend.with_screenshots(title.name.clone(), config.filesystem.screenshots.clone());
+    let volume_backend = Arc::clone(&audio_backend);
+    let mut volume = config.audio.volume;
+    let frontend = frontend
+        .with_screenshots(title.name.clone(), config.filesystem.screenshots.clone())
+        .with_volume_handler(move |delta| {
+            volume = volume.saturating_add_signed(delta).min(100);
+            volume_backend
+                .set_volume(volume)
+                .map_err(|error| error.to_string())?;
+            log::info!("audio volume: {volume}%");
+            Ok(())
+        });
 
     let worker_control =
         frontend_control.expect("window frontend construction provides its control channel");

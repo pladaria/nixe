@@ -16,6 +16,21 @@ pub(crate) enum EntryWords {
     Ram(nixe_memory::RamSource),
     Gathered(Vec<u8>),
 }
+/// DMA and macro argument progress belong to the channel, not a driver submit.
+/// No entry storage or physical RAM admission survives in this continuation.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.h
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CommandState {
+    pub(crate) packet: Option<PacketContinuation>,
+    pub(crate) mme_method: Option<crate::MaxwellMethodDispatch>,
+    pub(crate) mme_parameters: Vec<u32>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PacketContinuation {
+    header: MethodHeader,
+    consumed: u16,
+    origin: MaxwellGpfifoSourceLocation,
+}
 #[derive(Default)]
 pub(crate) struct CommandStream {
     next_entry: usize,
@@ -36,6 +51,17 @@ pub(crate) struct CommandStream {
     locations: Vec<MaxwellGpfifoSourceLocation>,
 }
 impl CommandStream {
+    pub(crate) fn resume(continuation: Option<PacketContinuation>) -> Self {
+        match continuation {
+            Some(continuation) => Self {
+                packet: Some(continuation.header),
+                consumed: continuation.consumed,
+                header_origin: Some(continuation.origin),
+                ..Self::default()
+            },
+            None => Self::default(),
+        }
+    }
     fn set_words(&mut self, words: EntryWords) {
         self.address = Some(match &words {
             EntryWords::Ram(source) => source.address(),
@@ -352,18 +378,20 @@ impl CommandStream {
     pub(crate) fn finish(
         &mut self,
         scratch: &mut MaxwellCommandSourceScratch,
-    ) -> Result<(), MaxwellPushbufferDecodeError> {
-        if let Some(header) = self.packet {
-            return Err(MaxwellPushbufferDecodeError::TruncatedPacket {
-                source: self.header_location(),
-                expected_arguments: header.count,
-                available_arguments: self.consumed,
-            });
-        }
+    ) -> Option<PacketContinuation> {
+        self.retain_header_location();
+        let continuation = self.packet.take().map(|header| PacketContinuation {
+            header,
+            consumed: self.consumed,
+            origin: self.header_location(),
+        });
         if let Some(EntryWords::Gathered(bytes)) = self.words.take() {
             scratch.bytes = bytes;
         }
-        Ok(())
+        self.source = None;
+        self.address = None;
+        self.current = None;
+        continuation
     }
 }
 #[cfg(test)]
@@ -409,7 +437,12 @@ pub(super) fn fixture_packets(
             }
         }
     }
-    stream.finish(&mut MaxwellCommandSourceScratch::default())?;
+    assert!(
+        stream
+            .finish(&mut MaxwellCommandSourceScratch::default())
+            .is_none(),
+        "encoded-input fixtures must contain complete packets"
+    );
     Ok(MaxwellDecodedPushbuffer {
         packets: packets.into_boxed_slice(),
     })
@@ -417,6 +450,67 @@ pub(super) fn fixture_packets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_retains_packet_modes_and_origin_after_entry_storage_is_released() {
+        use nixe_gpu::{FrontendSubmissionId, GpuVirtualAddress, MappingGeneration};
+        let origin = MaxwellGpfifoSourceLocation {
+            channel: crate::MaxwellChannelId::new(1),
+            frontend: FrontendSubmissionId::new(1),
+            entry_index: 0,
+            pushbuffer: GpuVirtualAddress::try_new(0x1000, 40).unwrap(),
+            word_offset: 0,
+            mapping: crate::MaxwellMappingId::new(1),
+            generation: MappingGeneration::new(1),
+        };
+        for (mode, addresses) in [
+            (1, [0x3404, 0x3408]),
+            (3, [0x3400, 0x3400]),
+            (5, [0x3404, 0x3404]),
+        ] {
+            let mut stream = CommandStream::fixture_words(
+                origin,
+                &[(mode << 29) | (3 << 16) | (0x3400 / 4), 11],
+            );
+            stream.next().unwrap();
+            assert_eq!(stream.methods().first().unwrap().argument(), 11);
+            let mut scratch = MaxwellCommandSourceScratch::default();
+            let continuation = stream.finish(&mut scratch);
+            assert!(continuation.is_some());
+            drop(stream);
+            drop(scratch);
+            let mut stream = CommandStream::resume(continuation);
+            stream.origin = Some(MaxwellGpfifoSourceLocation {
+                frontend: FrontendSubmissionId::new(2),
+                ..origin
+            });
+            stream.set_words(EntryWords::Gathered(
+                [22_u32, 33]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect(),
+            ));
+            stream.end = 8;
+            stream.next().unwrap();
+            assert_eq!(stream.header_location(), origin);
+            for ((method, expected), argument) in
+                stream.methods().iter().zip(addresses).zip([22, 33])
+            {
+                assert_eq!(method.method(), GpuMethodId(expected));
+                assert_eq!(method.argument(), argument);
+                assert_eq!(
+                    method.argument_source().frontend,
+                    FrontendSubmissionId::new(2)
+                );
+            }
+            assert!(stream.last());
+            assert!(
+                stream
+                    .finish(&mut MaxwellCommandSourceScratch::default())
+                    .is_none()
+            );
+        }
+    }
 
     #[test]
     fn a_packet_crosses_mappings_without_fragmenting_or_losing_error_locations() {
@@ -491,9 +585,11 @@ mod tests {
         assert_eq!(tail.get(0).unwrap().argument_source().word_offset, 3);
         assert!(tail.slice(1..).is_empty());
         assert!(stream.needs_entry());
-        stream
-            .finish(&mut MaxwellCommandSourceScratch::default())
-            .unwrap();
+        assert!(
+            stream
+                .finish(&mut MaxwellCommandSourceScratch::default())
+                .is_none()
+        );
         let mut once = CommandStream::fixture_words(
             origin,
             &[(5 << 29) | (3 << 16) | (0x0a00 / 4), 11, 22, 33],

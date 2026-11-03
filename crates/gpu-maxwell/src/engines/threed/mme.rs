@@ -837,7 +837,6 @@ pub struct MaxwellThreeDMmeState {
     start_address_pointer: MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>,
     next_start_address_index: Option<MaxwellThreeDMmeRamAddress>,
     start_addresses: Arc<BTreeMap<u32, MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>>>,
-    shadow_ram_control: MaxwellThreeDRegister<MaxwellThreeDMmeShadowRamControl>,
     mutable_method_control: MaxwellThreeDRegister<MaxwellThreeDMutableMethodControl>,
     shadow_registers: ShadowRegisters,
 }
@@ -861,10 +860,6 @@ impl Default for MaxwellThreeDMmeState {
             start_address_pointer: MaxwellThreeDRegister::default(),
             next_start_address_index: None,
             start_addresses: Arc::new(BTreeMap::new()),
-            shadow_ram_control: MaxwellThreeDRegister::verified_reset(
-                MaxwellThreeDMmeShadowRamControl::MethodTrack.raw(),
-                Some(MaxwellThreeDMmeShadowRamControl::MethodTrack),
-            ),
             mutable_method_control: MaxwellThreeDRegister::default(),
             shadow_registers: ShadowRegisters::default(),
         }
@@ -929,10 +924,12 @@ impl MaxwellThreeDMmeState {
     }
 
     #[must_use]
-    pub const fn shadow_ram_control(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDMmeShadowRamControl> {
-        &self.shadow_ram_control
+    pub fn shadow_ram_control(&self) -> MaxwellThreeDRegister<MaxwellThreeDMmeShadowRamControl> {
+        // The mode is the shadow bank's control register, as in Eden's Regs
+        // union. Keep one authority even when the live control word is replayed.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
+        self.shadow_registers
+            .read(0x0124, MaxwellThreeDMmeShadowRamControl::parse)
     }
 
     #[must_use]
@@ -959,17 +956,13 @@ impl MaxwellThreeDMmeState {
         method: GpuMethodId,
         submitted_argument: u32,
     ) -> u32 {
-        // SET_MME_SHADOW_RAM_CONTROL consumes its non-shadowed argument so the
-        // command stream can always leave replay mode. This agrees with the
-        // source-preserving split used by yuzu's Maxwell frontend:
-        // https://ni.4a.si/anonymous/yuzu/tree/src/video_core/engines/maxwell_3d.cpp?id=9705094a576e6594e359cc0256b63385ac05de3f#n319
-        if method.0 == 0x0124
-            || self.shadow_ram_control.value()
-                != Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay)
+        if self.shadow_registers.word(GpuMethodId(0x0124))
+            == MaxwellThreeDMmeShadowRamControl::MethodReplay.raw()
         {
-            return submitted_argument;
+            self.shadow_registers.word(method)
+        } else {
+            submitted_argument
         }
-        self.shadow_registers.word(method)
     }
 
     pub(super) fn track_shadow_register(
@@ -1057,7 +1050,8 @@ impl MaxwellThreeDMmeState {
                 ));
             }
             MaxwellThreeDMmeStateWrite::ShadowRamControl { value, source: _ } => {
-                self.shadow_ram_control = MaxwellThreeDRegister::decoded(value.raw(), value);
+                self.shadow_registers
+                    .write(GpuMethodId(0x0124), value.raw());
             }
             MaxwellThreeDMmeStateWrite::MutableMethodControl { value, source: _ } => {
                 self.mutable_method_control = MaxwellThreeDRegister::decoded(value.raw(), value);
