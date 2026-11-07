@@ -100,7 +100,7 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
         : EmitX64(code, [&conf] {
             HostLocSet gprs{any_gpr};
-            if (conf.page_table || conf.canonical_page_table) {
+            if (conf.page_table) {
                 gprs.reset(static_cast<size_t>(HostLoc::R14));
             }
             if (conf.fastmem_pointer) {

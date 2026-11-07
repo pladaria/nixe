@@ -1,215 +1,15 @@
-//! Physical dirty summaries and independently invalidated clean observations.
-use crate::physical_access::PhysicalGuard;
+//! Physical device coverage and ordered CPU/device RAM access.
 use crate::{AddressSpace, AllocationRange, ArenaOffset, Extent, Machine, MemoryError, PAGE_SIZE};
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc, RwLock, Weak,
+    atomic::{AtomicU64, Ordering},
 };
 
-struct Bitmap(Box<[AtomicU64]>);
-impl Bitmap {
-    fn new(pages: u64, value: u64) -> Self {
-        Self(
-            (0..pages.div_ceil(64))
-                .map(|_| AtomicU64::new(value))
-                .collect(),
-        )
-    }
-    fn get(&self, page: u64) -> bool {
-        self.0[(page / 64) as usize].load(Ordering::Acquire) & (1 << (page % 64)) != 0
-    }
-    fn any(&self, extent: Extent) -> bool {
-        bitmap_words(extent).any(|(word, mask)| self.0[word].load(Ordering::Acquire) & mask != 0)
-    }
-    fn update_range(&self, extent: Extent, value: bool, mut cleared: impl FnMut(u64)) {
-        for (word, mask) in bitmap_words(extent) {
-            if value {
-                self.0[word].fetch_or(mask, Ordering::Release);
-            } else {
-                let mut previous = self.0[word].fetch_and(!mask, Ordering::AcqRel) & mask;
-                while previous != 0 {
-                    let bit = previous.trailing_zeros();
-                    cleared(word as u64 * 64 + u64::from(bit));
-                    previous &= previous - 1;
-                }
-            }
-        }
-    }
-}
 pub(crate) struct Tracking {
-    observed: Bitmap,
-    resource_observed: Bitmap,
-    device_observed: Bitmap,
-    dirty: Bitmap,
-    device: Bitmap,
-    code: Bitmap,
-    code_generation: AtomicU64,
-    observers: Mutex<Observers>,
-    cpu_dirty_pending: AtomicBool,
+    device_memory: RwLock<Option<Weak<crate::device_memory::Inner>>>,
     protection_calls: AtomicU64,
     #[cfg(any(test, feature = "performance-counters"))]
     captured_bytes: AtomicU64,
-}
-#[derive(Default)]
-struct Observers {
-    pages: HashMap<u64, PageObservers>,
-    dirty_words: Vec<usize>,
-}
-// Cached-page counts do not revisit existing consumers on every increment.
-// Weak flags also need reclamation; amortize it over insertions here.
-// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/device_memory_manager.inc
-#[derive(Default)]
-struct PageObservers {
-    entries: Vec<Observer>,
-    prune_at: usize,
-    #[cfg(test)]
-    registration_inspections: usize,
-}
-impl PageObservers {
-    fn retain(&mut self, keep: impl FnMut(&Observer) -> bool) {
-        self.entries.retain(keep);
-        // Charge the next sweep to at least as many insertions as survivors.
-        // Use an insertion budget, not Vec capacity: reclaiming just one dead
-        // entry from a full Vec must not cause another full scan on the next push.
-        self.prune_at = self.entries.len().saturating_mul(2).max(16);
-    }
-    fn push(&mut self, observer: Observer) {
-        if self.entries.len() >= self.prune_at {
-            #[cfg(test)]
-            {
-                self.registration_inspections += self.entries.len();
-            }
-            self.retain(|observer| {
-                observer
-                    .invalid
-                    .upgrade()
-                    .is_some_and(|invalid| !invalid.load(Ordering::Acquire))
-            });
-        }
-        self.entries.push(observer);
-    }
-}
-struct Observer {
-    invalid: Weak<AtomicBool>,
-    extent: Extent,
-    cpu_writes: bool,
-    device_writes: bool,
-    code: bool,
-}
-
-fn intersects(a: Extent, b: Extent) -> bool {
-    a.start.get() < b.start.get() + b.bytes && b.start.get() < a.start.get() + a.bytes
-}
-/// A cache checks this flag once per use, without walking its physical pages.
-/// The flag never becomes clean again; a new capture creates a new observation.
-#[derive(Clone, Debug)]
-pub struct Observation(Arc<AtomicBool>);
-/// Reuse physical admission while an owner consumes nearby RAM reads.
-/// The caller retains the allocation or the mapping for every read.
-pub struct MappedRamReader<'a> {
-    machine: &'a Machine,
-    current: Option<PhysicalGuard<'a>>,
-    retained: [Option<PhysicalGuard<'a>>; 3],
-    next: usize,
-}
-
-impl Machine {
-    pub fn mapped_ram_reader(&self) -> MappedRamReader<'_> {
-        MappedRamReader {
-            machine: self,
-            current: None,
-            retained: [const { None }; 3],
-            next: 0,
-        }
-    }
-}
-
-impl MappedRamReader<'_> {
-    pub fn release(&mut self) {
-        self.current = None;
-        self.retained = [const { None }; 3];
-    }
-
-    /// # Safety
-    /// The caller retains the physical bytes for the duration of this read.
-    /// The destination must be exclusive host memory disjoint from guest RAM.
-    pub unsafe fn try_read(
-        &mut self,
-        start: ArenaOffset,
-        destination: &mut [u8],
-    ) -> Result<bool, MemoryError> {
-        let extent = Extent {
-            start,
-            bytes: destination.len() as u64,
-        };
-        let source = self
-            .machine
-            .arena()
-            .host_address(start, extent.bytes)
-            .ok_or(MemoryError::Invalid("mapped read exceeds physical RAM"))?;
-        if destination.is_empty() {
-            return Ok(true);
-        }
-        if !self
-            .current
-            .as_ref()
-            .is_some_and(|guard| guard.covers(extent))
-        {
-            if let Some(index) = self
-                .retained
-                .iter()
-                .position(|guard| guard.as_ref().is_some_and(|guard| guard.covers(extent)))
-            {
-                std::mem::swap(&mut self.current, &mut self.retained[index]);
-            } else {
-                // Handles, image headers and samplers commonly alternate between
-                // a few regions in one draw. Retain their short admissions, not
-                // their bytes. Never wait with a partial set: a protection writer
-                // may have closed both an earlier region and this new one.
-                // This is the same admission rule as PhysicalAccess::enter_many.
-                if let Some(guard) = self.machine.physical_access().try_enter(extent) {
-                    self.retained[self.next] = self.current.take();
-                    self.current = Some(guard);
-                    self.next = (self.next + 1) % self.retained.len();
-                } else {
-                    self.release();
-                    self.current = Some(self.machine.physical_access().enter(extent));
-                }
-            }
-        }
-        if pages(extent).any(|page| self.machine.tracking().device.get(page)) {
-            return Ok(false);
-        }
-        unsafe {
-            crate::raw::capture(source.as_ptr(), destination);
-        }
-        #[cfg(any(test, feature = "performance-counters"))]
-        self.machine
-            .tracking()
-            .captured_bytes
-            .fetch_add(extent.bytes, Ordering::Relaxed);
-        Ok(true)
-    }
-}
-impl Default for Observation {
-    fn default() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
-    }
-}
-impl Observation {
-    pub fn is_invalid(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-    pub fn invalidate(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-    /// Host metadata only. Subscribers may set this flag, never clear it.
-    pub fn weak_invalidation_flag(&self) -> Weak<AtomicBool> {
-        Arc::downgrade(&self.0)
-    }
 }
 /// The two sources consumed synchronously by graphics-owner RAM writes.
 #[derive(Clone, Copy)]
@@ -221,11 +21,24 @@ pub enum WriteSource<'a> {
         bytes: usize,
     },
 }
-impl WriteSource<'_> {
+impl<'a> WriteSource<'a> {
     pub fn len(&self) -> usize {
         match self {
             Self::Bytes(bytes) => bytes.len(),
             Self::Ram { bytes, .. } => *bytes,
+        }
+    }
+    pub fn slice(self, range: std::ops::Range<usize>) -> WriteSource<'a> {
+        assert!(range.start <= range.end && range.end <= self.len());
+        match self {
+            Self::Bytes(bytes) => Self::Bytes(&bytes[range]),
+            Self::Ram {
+                address, offset, ..
+            } => Self::Ram {
+                address,
+                offset: offset.checked_add(range.start).expect("RAM source offset"),
+                bytes: range.len(),
+            },
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -241,6 +54,38 @@ pub struct ResourceReader<'a> {
     #[cfg(any(test, feature = "performance-counters"))]
     captured: std::cell::Cell<u64>,
 }
+/// Admitted GPU publication into retained RAM, without exposing Rust references
+/// to memory concurrently accessed by native guest instructions.
+pub struct ResourceWriter<'a> {
+    machine: &'a Machine,
+    retained: Vec<Extent>,
+}
+impl ResourceWriter<'_> {
+    pub fn write(&self, extent: Extent, source: &[u8]) -> Result<(), MemoryError> {
+        let index = self
+            .retained
+            .partition_point(|retained| retained.start <= extent.start);
+        if extent.bytes != source.len() as u64
+            || index == 0
+            || extent
+                .start
+                .get()
+                .checked_add(extent.bytes)
+                .is_none_or(|end| {
+                    end > self.retained[index - 1].start.get() + self.retained[index - 1].bytes
+                })
+        {
+            return Err(MemoryError::Invalid("GPU publication exceeds retained RAM"));
+        }
+        // SAFETY: write_resources retains these pages and excludes physical
+        // access for the entire callback; the source is owned host memory.
+        unsafe {
+            self.machine.write_admitted(extent, source);
+        }
+        Ok(())
+    }
+}
+
 /// A validated region within the current capture. It cannot outlive admission.
 pub struct ResourceRead<'a> {
     source: crate::HostAddress,
@@ -352,292 +197,27 @@ pub struct PhysicalCapture {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrackingStatistics {
-    pub bitmap_bytes: usize,
-    pub observer_pages: usize,
-    pub observer_registrations: usize,
-    pub dirty_queue_bytes: usize,
     pub protection_calls: u64,
     pub captured_bytes: u64,
 }
-struct AliasRange {
-    space: usize,
-    start: u64,
-    bytes: u64,
-}
-struct ProtectionBatch<'a> {
-    aliases: Vec<AliasRange>,
-    spaces: &'a [Arc<AddressSpace>],
-}
-impl ProtectionBatch<'_> {
-    fn invalidate(&self, machine: &Machine, extents: &[Extent]) {
-        self.invalidate_from(machine, extents, false);
-    }
-    fn invalidate_from(&self, machine: &Machine, extents: &[Extent], device: bool) {
-        if extents
-            .iter()
-            .any(|&extent| machine.tracking().code.any(extent))
-        {
-            machine
-                .tracking()
-                .code_generation
-                .fetch_add(1, Ordering::AcqRel);
-            for alias in &self.aliases {
-                // SAFETY: all affected spaces have drained native execution and
-                // host accesses. Queue invalidations before clearing code watches.
-                unsafe {
-                    self.spaces[alias.space].invalidate_code_writes(alias.start, alias.bytes);
-                }
-            }
-        }
-        if device {
-            machine.tracking().invalidate_device(extents);
-        } else {
-            machine.tracking().invalidate(extents);
-        }
-    }
-    fn refresh(&self) -> Result<(), MemoryError> {
-        for alias in &self.aliases {
-            // SAFETY: alias and space writers exclude mapping mutation. Host and
-            // checked physical accesses have drained; tracking fields are atomic.
-            unsafe {
-                self.spaces[alias.space].refresh_tracking(alias.start, alias.bytes)?;
-            }
-        }
-        Ok(())
-    }
-}
-fn pages(extent: Extent) -> std::ops::Range<u64> {
-    extent.start.get() / PAGE_SIZE..(extent.start.get() + extent.bytes).div_ceil(PAGE_SIZE)
-}
-fn bitmap_words(extent: Extent) -> impl Iterator<Item = (usize, u64)> {
-    let pages = pages(extent);
-    (pages.start / 64..pages.end.div_ceil(64)).map(move |word| {
-        let low = pages.start.saturating_sub(word * 64);
-        let high = (pages.end - word * 64).min(64);
-        (word as usize, (u64::MAX << low) & (u64::MAX >> (64 - high)))
-    })
-}
 impl Tracking {
-    pub fn new(bytes: u64) -> Self {
+    pub fn new(_bytes: u64) -> Self {
         Self {
-            observed: Bitmap::new(bytes / PAGE_SIZE, 0),
-            resource_observed: Bitmap::new(bytes / PAGE_SIZE, 0),
-            device_observed: Bitmap::new(bytes / PAGE_SIZE, 0),
-            dirty: Bitmap::new(bytes / PAGE_SIZE, 0),
-            device: Bitmap::new(bytes / PAGE_SIZE, 0),
-            code: Bitmap::new(bytes / PAGE_SIZE, 0),
-            code_generation: AtomicU64::new(1),
-            observers: Mutex::new(Observers::default()),
-            cpu_dirty_pending: AtomicBool::new(false),
+            device_memory: RwLock::new(None),
             protection_calls: AtomicU64::new(0),
             #[cfg(any(test, feature = "performance-counters"))]
             captured_bytes: AtomicU64::new(0),
         }
     }
-    pub fn observed(&self, page: u64) -> bool {
-        self.observed.get(page) || self.resource_observed.get(page)
-    }
-    /// Immutable observations require invalidation outside native execution.
-    /// Otherwise cache/device pages can journal stores under physical admission.
-    pub fn native_store_tracking(&self, page: u64) -> Option<bool> {
-        if self.observed.get(page) {
-            None
-        } else {
-            Some(self.resource_observed.get(page) || self.device.get(page))
-        }
-    }
-    fn all_observed(&self, extent: Extent) -> bool {
-        bitmap_words(extent).all(|(word, mask)| {
-            (self.observed.0[word].load(Ordering::Acquire)
-                | self.resource_observed.0[word].load(Ordering::Acquire))
-                & mask
-                == mask
-        })
-    }
-    fn any_observed(&self, extent: Extent) -> bool {
-        self.observed.any(extent) || self.resource_observed.any(extent)
-    }
-    pub fn code(&self, page: u64) -> bool {
-        self.code.get(page)
-    }
-    pub fn retire(&self, extents: &[Extent]) {
-        self.invalidate(extents);
-        self.invalidate_device(extents);
-        for &extent in extents {
-            self.device.update_range(extent, false, |_| {});
-        }
-    }
-    pub fn kind(&self, page: u64) -> u8 {
-        crate::address_space::MappedPage::RAM
-            // Device pages already journal exact CPU stores. Keep the retained
-            // resource watch for later materialization without forcing an extra
-            // observed-memory slow path while that journal owns the writes.
-            | if self.observed.get(page)
-                || (self.resource_observed.get(page) && !self.device.get(page))
-            {
-                crate::address_space::MappedPage::OBSERVED
-            } else {
-                0
-            }
-            | if self.device.get(page) {
-                crate::address_space::MappedPage::DEVICE
-            } else {
-                0
-            }
-    }
+
     pub fn record_protection(&self) {
         self.protection_calls.fetch_add(1, Ordering::Relaxed);
     }
     // Caller excludes physical writers, or owns the last allocation pin before
     // recycling. Invalidation precedes both the store and direct write access.
-    pub fn invalidate(&self, extents: &[Extent]) {
-        let mut observers = self.observers.lock().unwrap();
-        for &extent in extents {
-            self.code.update_range(extent, false, |_| {});
-            self.resource_observed.update_range(extent, false, |_| {});
-            self.observed.update_range(extent, false, |page| {
-                let page_extent = Extent {
-                    start: ArenaOffset::new(page * PAGE_SIZE),
-                    bytes: PAGE_SIZE,
-                };
-                let mut cpu_observed = false;
-                let mut device_observed = false;
-                let mut code_observed = false;
-                if let Some(registered) = observers.pages.get_mut(&page) {
-                    registered.retain(|observer| {
-                        let Some(invalid) = observer.invalid.upgrade() else {
-                            return false;
-                        };
-                        if observer.cpu_writes && intersects(observer.extent, extent) {
-                            invalid.store(true, Ordering::Release);
-                            false
-                        } else {
-                            let live = !invalid.load(Ordering::Acquire);
-                            cpu_observed |= live && observer.cpu_writes;
-                            device_observed |= live && observer.device_writes;
-                            code_observed |= live && observer.code;
-                            live
-                        }
-                    });
-                    if registered.entries.is_empty() {
-                        observers.pages.remove(&page);
-                    }
-                }
-                self.observed
-                    .update_range(page_extent, cpu_observed, |_| {});
-                self.device_observed
-                    .update_range(page_extent, device_observed, |_| {});
-                self.code.update_range(page_extent, code_observed, |_| {});
-            });
-            for (word, mask) in bitmap_words(extent) {
-                if self.dirty.0[word].fetch_or(mask, Ordering::Release) == 0 {
-                    observers.dirty_words.push(word);
-                }
-            }
-        }
-        if !extents.is_empty() {
-            self.cpu_dirty_pending.store(true, Ordering::Release);
-        }
-    }
-    fn invalidate_device(&self, extents: &[Extent]) {
-        let mut observers = self.observers.lock().unwrap();
-        for &extent in extents {
-            self.code.update_range(extent, false, |_| {});
-            self.device_observed.update_range(extent, false, |page| {
-                let page_extent = Extent {
-                    start: ArenaOffset::new(page * PAGE_SIZE),
-                    bytes: PAGE_SIZE,
-                };
-                let mut cpu_observed = false;
-                let mut device_observed = false;
-                let mut code_observed = false;
-                if let Some(registered) = observers.pages.get_mut(&page) {
-                    registered.retain(|observer| {
-                        let Some(invalid) = observer.invalid.upgrade() else {
-                            return false;
-                        };
-                        if observer.device_writes && intersects(observer.extent, extent) {
-                            invalid.store(true, Ordering::Release);
-                            false
-                        } else {
-                            let live = !invalid.load(Ordering::Acquire);
-                            cpu_observed |= live && observer.cpu_writes;
-                            device_observed |= live && observer.device_writes;
-                            code_observed |= live && observer.code;
-                            live
-                        }
-                    });
-                    if registered.entries.is_empty() {
-                        observers.pages.remove(&page);
-                    }
-                }
-                self.device_observed
-                    .update_range(page_extent, device_observed, |_| {});
-                self.code.update_range(page_extent, code_observed, |_| {});
-                self.observed
-                    .update_range(page_extent, cpu_observed, |_| {});
-            });
-        }
-    }
-    fn register(
-        &self,
-        extents: impl Iterator<Item = Extent>,
-        observation: &Observation,
-        cpu_writes: bool,
-        device_writes: bool,
-        code: bool,
-    ) {
-        let mut observers = self.observers.lock().unwrap();
-        for extent in extents {
-            // Live native read areas observe device writes only. They do not
-            // establish the CPU store protection required by immutable captures.
-            if cpu_writes {
-                self.observed.update_range(extent, true, |_| {});
-            }
-            for page in pages(extent) {
-                if device_writes {
-                    self.device_observed.update_range(
-                        Extent {
-                            start: ArenaOffset::new(page * PAGE_SIZE),
-                            bytes: PAGE_SIZE,
-                        },
-                        true,
-                        |_| {},
-                    );
-                }
-                let registered = observers.pages.entry(page).or_default();
-                registered.push(Observer {
-                    invalid: Arc::downgrade(&observation.0),
-                    extent: if code {
-                        Extent {
-                            start: ArenaOffset::new(page * PAGE_SIZE),
-                            bytes: PAGE_SIZE,
-                        }
-                    } else {
-                        Extent {
-                            start: ArenaOffset::new(extent.start.get().max(page * PAGE_SIZE)),
-                            bytes: (extent.start.get() + extent.bytes).min((page + 1) * PAGE_SIZE)
-                                - extent.start.get().max(page * PAGE_SIZE),
-                        }
-                    },
-                    cpu_writes,
-                    device_writes,
-                    code,
-                });
-            }
-        }
-    }
+
     fn statistics(&self) -> TrackingStatistics {
-        let observers = self.observers.lock().unwrap();
         TrackingStatistics {
-            bitmap_bytes: self.observed.0.len() * 56,
-            observer_pages: observers.pages.len(),
-            observer_registrations: observers
-                .pages
-                .values()
-                .map(|page| page.entries.len())
-                .sum(),
-            dirty_queue_bytes: observers.dirty_words.capacity() * std::mem::size_of::<usize>(),
             protection_calls: self.protection_calls.load(Ordering::Relaxed),
             #[cfg(any(test, feature = "performance-counters"))]
             captured_bytes: self.captured_bytes.load(Ordering::Relaxed),
@@ -646,56 +226,174 @@ impl Tracking {
         }
     }
 }
-impl Machine {
-    pub fn code_generation(&self) -> u64 {
-        self.tracking().code_generation.load(Ordering::Acquire)
-    }
-
-    /// The graphics owner consumes CPU modification pages once, then updates all
-    /// registered views before resource capture. These are cache invalidations;
-    /// exact CPU/device byte ownership remains with the operation authority.
-    pub fn take_cpu_modified_pages(&self) -> Vec<Extent> {
-        let tracking = self.tracking();
-        if !tracking.cpu_dirty_pending.load(Ordering::Acquire) {
-            return Vec::new();
+impl crate::NativeAdmission<'_> {
+    /// OnCPUWrite is called after suspending native admission. The operation
+    /// and its possible journal pages were captured before that suspension.
+    /// Buffer GPU-dirty stores are collected without waiting for a GPU fence.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/memory.cpp#L695-L735
+    pub fn access_captured(
+        &self,
+        ranges: &[AllocationRange],
+        cached: bool,
+        mut operation: crate::AccessOperation,
+    ) -> Result<crate::Access<crate::AccessResult>, MemoryError> {
+        assert!(
+            !self.is_active(),
+            "CPU cache notification requires suspended admission"
+        );
+        let machine = self.address_space().machine();
+        let notify = matches!(operation, crate::AccessOperation::Atomic(_))
+            || (matches!(operation, crate::AccessOperation::Write(_)) && cached);
+        let collect = notify
+            && machine.notify_cpu_write(ranges.iter().flat_map(AllocationRange::physical_extents));
+        if collect
+            && let crate::AccessOperation::Write(bytes) = &mut operation
+            && self.collect_cached_write(ranges, bytes)?
+        {
+            return Ok(crate::Access::Ready(crate::AccessResult::Written(
+                std::mem::take(bytes),
+            )));
         }
-        let mut observers = tracking.observers.lock().unwrap();
-        let mut result: Vec<Extent> = Vec::new();
-        for &word in &observers.dirty_words {
-            let mut bits = tracking.dirty.0[word].swap(0, Ordering::AcqRel);
-            while bits != 0 {
-                let low = bits.trailing_zeros();
-                let high = low + (bits >> low).trailing_ones();
-                let start = (word as u64 * 64 + u64::from(low)) * PAGE_SIZE;
-                let bytes = u64::from(high - low) * PAGE_SIZE;
-                if let Some(previous) = result
-                    .last_mut()
-                    .filter(|previous| previous.start.get() + previous.bytes == start)
-                {
-                    previous.bytes += bytes;
-                } else {
-                    result.push(Extent {
-                        start: ArenaOffset::new(start),
-                        bytes,
-                    });
+        machine.finish_captured_access(ranges, operation)
+    }
+    fn collect_cached_write(
+        &self,
+        ranges: &[AllocationRange],
+        source: &[u8],
+    ) -> Result<bool, MemoryError> {
+        let machine = self.address_space().machine();
+        if machine.validate_ranges(ranges)? != source.len() {
+            return Err(MemoryError::Invalid("cached CPU store size mismatch"));
+        }
+        if source.is_empty() || source.len() > 16 {
+            return Ok(false);
+        }
+        let extents: smallvec::SmallVec<[_; 2]> = ranges
+            .iter()
+            .flat_map(AllocationRange::physical_extents)
+            .collect();
+        let written = self.collect_write(&extents, || {
+            let mut offset = 0;
+            for &extent in &extents {
+                let end = offset + extent.bytes as usize;
+                unsafe {
+                    machine.write_admitted(extent, &source[offset..end]);
                 }
-                bits = if high == 64 {
-                    0
-                } else {
-                    bits & (u64::MAX << high)
-                };
+                offset = end;
+            }
+        })?;
+        if written
+            && extents.len() == 1
+            && extents[0].start.get() / PAGE_SIZE
+                == (extents[0].start.get() + extents[0].bytes - 1) / PAGE_SIZE
+        {
+            self.cpu_writes()
+                .last_gpu_page
+                .store(extents[0].start.get() / PAGE_SIZE, Ordering::Release);
+        }
+        Ok(written)
+    }
+}
+
+impl Machine {
+    pub(crate) fn bind_device_memory(
+        &self,
+        device: &crate::device_memory::DeviceMemory,
+    ) -> Result<(), MemoryError> {
+        let mut selected = self.tracking().device_memory.write().unwrap();
+        if let Some(previous) = selected.as_ref().and_then(Weak::upgrade)
+            && !Arc::ptr_eq(&previous, &device.0)
+        {
+            return Err(MemoryError::Invalid(
+                "RAM already has a live GPU device memory manager",
+            ));
+        }
+        *selected = Some(Arc::downgrade(&device.0));
+        Ok(())
+    }
+    pub(crate) fn gpu_device_memory(&self) -> Option<crate::device_memory::DeviceMemory> {
+        self.tracking()
+            .device_memory
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(crate::device_memory::DeviceMemory)
+    }
+    pub(crate) fn refresh_cached_cpu_region(
+        &self,
+        source: &AddressSpace,
+        start: crate::GuestVirtualAddress,
+        bytes: u64,
+        device: &crate::device_memory::DeviceMemory,
+    ) -> Result<(), MemoryError> {
+        let mut spaces = Vec::new();
+        let aliases = self.aliases();
+        let changed = source.cached_physical_regions(start, bytes)?;
+        for (physical, bytes) in changed.iter() {
+            let mut selected = Vec::new();
+            aliases
+                .index
+                .overlapping(physical, physical + bytes, |alias| {
+                    if let Some(space) = alias.space.upgrade() {
+                        let begin = physical.max(alias.physical);
+                        let end = (physical + bytes).min(alias.physical + alias.bytes);
+                        selected.push((
+                            space,
+                            alias.virtual_address + begin - alias.physical,
+                            end - begin,
+                        ));
+                    }
+                });
+            for (space, address, bytes) in selected {
+                space.publish_cached_region(
+                    crate::GuestVirtualAddress::new(address),
+                    bytes,
+                    device,
+                )?;
+                spaces.push(space);
             }
         }
-        observers.dirty_words.clear();
-        tracking.cpu_dirty_pending.store(false, Ordering::Release);
-        result
+        drop(aliases);
+        drop(spaces);
+        Ok(())
+    }
+    pub(crate) fn must_flush_physical(&self, extent: Extent) -> bool {
+        let Some(device) = self.gpu_device_memory() else {
+            return false;
+        };
+        let Some(interface) = device.interface() else {
+            return false;
+        };
+        let mut flush = false;
+        let scratch = std::cell::RefCell::new(Vec::new());
+        device.apply_on_physical(extent, &scratch, |address, bytes| {
+            flush |= interface.must_flush_region(address, bytes)
+        });
+        flush
+    }
+    pub(crate) fn notify_cpu_write(&self, extents: impl Iterator<Item = Extent>) -> bool {
+        let Some(device) = self.gpu_device_memory() else {
+            return false;
+        };
+        let Some(rasterizer) = device.interface() else {
+            return false;
+        };
+        let mut collect = false;
+        let scratch = std::cell::RefCell::new(Vec::new());
+        for extent in extents {
+            device.apply_on_physical(extent, &scratch, |address, bytes| {
+                collect |= rasterizer.on_cpu_write(address, bytes);
+            });
+        }
+        collect
     }
 }
 
 impl Machine {
     /// # Safety
     /// Caller retains/admitted this exact physical span and has resolved its
-    /// observed/device dependencies. Ordinary stores need no reservation lookup;
+    /// device/cache dependencies. Ordinary stores need no reservation lookup;
     /// exclusive/RMW commit uses host CAS against these same canonical bytes.
     pub(crate) unsafe fn write_admitted(&self, extent: Extent, source: &[u8]) {
         debug_assert_eq!(extent.bytes as usize, source.len());
@@ -706,102 +404,6 @@ impl Machine {
         unsafe {
             crate::raw::write(destination.as_ptr(), source);
         }
-    }
-    /// Retained producers already own device-affected pages. Invalidate only
-    /// newly observed input pages before appending their next native write;
-    /// device membership is managed by the producer.
-    pub fn invalidate_device_observations<T>(
-        &self,
-        ranges: &[AllocationRange],
-        publish: impl FnOnce() -> Result<T, MemoryError>,
-    ) -> Result<T, MemoryError> {
-        self.validate_ranges(ranges)?;
-        if ranges
-            .iter()
-            .flat_map(AllocationRange::physical_extents)
-            .all(|extent| !self.tracking().device_observed.any(extent))
-        {
-            return publish();
-        }
-        self.tracking_transition(ranges, |batch, extents| {
-            if extents
-                .iter()
-                .any(|&extent| pages(extent).any(|page| !self.tracking().device.get(page)))
-            {
-                return Err(MemoryError::Invalid(
-                    "observed producer must establish device coverage before reusing it",
-                ));
-            }
-            batch.invalidate_from(self, extents, true);
-            batch.refresh()?;
-            publish()
-        })
-    }
-    /// The owner calls this when exact device coverage first enters physical
-    /// pages. Append the producing command and publish its coverage inside the
-    /// callback, before CPU admission reopens. A retained coverage record may
-    /// skip page publication on repeated writes, but must still invalidate any
-    /// new CPU/code observations ordered through the owner since its last write.
-    pub fn publish_device_write<T>(
-        &self,
-        ranges: &[AllocationRange],
-        publish: impl FnOnce() -> Result<T, MemoryError>,
-    ) -> Result<T, MemoryError> {
-        self.validate_ranges(ranges)?;
-        if ranges
-            .iter()
-            .flat_map(AllocationRange::physical_extents)
-            .all(|extent| {
-                pages(extent).all(|page| {
-                    self.tracking().device.get(page) && !self.tracking().device_observed.get(page)
-                })
-            })
-        {
-            return publish();
-        }
-        self.tracking_transition(ranges, |batch, extents| {
-            batch.invalidate_from(self, extents, true);
-            for &extent in extents {
-                self.tracking().device.update_range(extent, true, |_| {});
-            }
-            batch.refresh()?;
-            publish()
-        })
-    }
-    /// The exact authority index calls this only after its final coverage has
-    /// left every supplied page. Other producers in a shared page must keep
-    /// that page protected; memory does not maintain another producer index.
-    pub fn retire_device_pages(&self, ranges: &[AllocationRange]) -> Result<(), MemoryError> {
-        self.validate_ranges(ranges)?;
-        let extents: smallvec::SmallVec<[_; 4]> = ranges
-            .iter()
-            .flat_map(|range| {
-                range
-                    .physical_extents()
-                    .map(|extent| (range.allocation().identity(), extent))
-            })
-            .collect();
-        unsafe { self.retire_device_extents(&extents) }
-    }
-    /// # Safety
-    /// All allocation pages remain retained; the owner has proved no producer
-    /// or pending access needs device protection on any of these pages.
-    pub unsafe fn retire_device_extents(
-        &self,
-        extents: &[(crate::AllocationId, Extent)],
-    ) -> Result<(), MemoryError> {
-        if extents
-            .iter()
-            .all(|&(_, extent)| !self.tracking().device.any(extent))
-        {
-            return Ok(());
-        }
-        self.tracking_transition_physical(extents.iter().copied(), false, |batch, extents| {
-            for &extent in extents {
-                self.tracking().device.update_range(extent, false, |_| {});
-            }
-            batch.refresh()
-        })
     }
     pub fn tracking_statistics(&self) -> TrackingStatistics {
         self.tracking().statistics()
@@ -820,7 +422,7 @@ impl Machine {
         }
         Ok(extent)
     }
-    fn validate_ranges(&self, ranges: &[AllocationRange]) -> Result<usize, MemoryError> {
+    pub(crate) fn validate_ranges(&self, ranges: &[AllocationRange]) -> Result<usize, MemoryError> {
         ranges.iter().try_fold(0usize, |size, range| {
             if range.allocation().machine().identity() != self.identity() {
                 return Err(MemoryError::Invalid(
@@ -854,11 +456,11 @@ impl Machine {
             ));
         }
         let extent = self.atomic_extent(range)?;
-        if route_device && self.tracking().device.get(extent.start.get() / PAGE_SIZE) {
+        if route_device && self.must_flush_physical(extent) {
             return Ok(None);
         }
         operation.before();
-        let apply = |batch: Option<&ProtectionBatch<'_>>| {
+        let apply = || {
             let address = self
                 .arena()
                 .host_address(extent.start, extent.bytes)
@@ -873,11 +475,7 @@ impl Machine {
                         written: false,
                     };
                 }
-                if self.tracking().observed(extent.start.get() / PAGE_SIZE) {
-                    batch
-                        .expect("observed atomic write requires alias quiescence")
-                        .invalidate(self, &[extent]);
-                }
+
                 let observed = unsafe {
                     crate::raw::compare_exchange(
                         address.as_ptr(),
@@ -895,162 +493,14 @@ impl Machine {
                 previous = observed;
             }
         };
-        let access = self.physical_access().enter(extent);
-        if route_device && self.tracking().device.get(extent.start.get() / PAGE_SIZE) {
-            return Ok(None);
-        }
-        let result = if self.tracking().observed(extent.start.get() / PAGE_SIZE) {
-            // A failed comparison writes nothing and leaves every clean
-            // observer armed, without requesting an unnecessary interruption.
-            if let crate::AtomicOperation::CompareExchange { .. } = operation.operation {
-                let address = self
-                    .arena()
-                    .host_address(extent.start, extent.bytes)
-                    .unwrap();
-                let previous =
-                    unsafe { crate::raw::read_value(address.as_ptr(), extent.bytes as usize) };
-                if !operation.update(previous).1 {
-                    operation.after();
-                    return Ok(Some(crate::AccessResult::Atomic {
-                        previous,
-                        written: false,
-                    }));
-                }
-            }
-            drop(access);
-            self.tracking_transition(std::slice::from_ref(range), |batch, _| {
-                if route_device && self.tracking().device.get(extent.start.get() / PAGE_SIZE) {
-                    return Ok(None);
-                }
-                let result = apply(Some(batch));
-                batch.refresh()?;
-                Ok(Some(result))
-            })?
-        } else {
-            Some(apply(None))
-        };
+        let result = Some(apply());
         operation.after();
         Ok(result)
     }
-    fn tracking_transition<T>(
-        &self,
-        ranges: &[AllocationRange],
-        operation: impl FnOnce(&ProtectionBatch<'_>, &[Extent]) -> Result<T, MemoryError>,
-    ) -> Result<T, MemoryError> {
-        self.tracking_transition_with_native(ranges, false, operation)
-    }
-    fn tracking_transition_with_native<T>(
-        &self,
-        ranges: &[AllocationRange],
-        force_native: bool,
-        operation: impl FnOnce(&ProtectionBatch<'_>, &[Extent]) -> Result<T, MemoryError>,
-    ) -> Result<T, MemoryError> {
-        self.validate_ranges(ranges)?;
-        self.tracking_transition_physical(
-            ranges.iter().flat_map(|range| {
-                range
-                    .physical_extents()
-                    .map(|extent| (range.allocation().identity(), extent))
-            }),
-            force_native,
-            operation,
-        )
-    }
+
     // Callers borrow a live allocation or validated pins through the transition.
     // Only an operation escaping to the device owner needs independent retention.
-    fn tracking_transition_physical<T>(
-        &self,
-        input: impl Iterator<Item = (crate::AllocationId, Extent)>,
-        force_native: bool,
-        operation: impl FnOnce(&ProtectionBatch<'_>, &[Extent]) -> Result<T, MemoryError>,
-    ) -> Result<T, MemoryError> {
-        // Spaces must outlive (and drop after) the index guard: their destructor
-        // removes reverse mappings from that same index.
-        let mut spaces = Vec::new();
-        let index = self.aliases();
-        let mut extents = smallvec::SmallVec::<[Extent; 4]>::new();
-        let mut selected = Vec::new();
-        for (allocation, extent) in input {
-            extents.push(extent);
-            let start = extent.start.get() & !(PAGE_SIZE - 1);
-            let end = (extent.start.get() + extent.bytes).next_multiple_of(PAGE_SIZE);
-            index.index.overlapping(start, end, |alias| {
-                if alias.allocation != allocation {
-                    return;
-                }
-                if let Some(space) = alias.space.upgrade() {
-                    let begin = start.max(alias.physical);
-                    let stop = end.min(alias.physical + alias.bytes);
-                    selected.push((
-                        space.identity(),
-                        alias.virtual_address + begin - alias.physical,
-                        stop - begin,
-                    ));
-                    spaces.push(space);
-                }
-            });
-        }
-        let interrupt_native = force_native
-            || extents
-                .iter()
-                .any(|&extent| self.tracking().code.any(extent));
-        spaces.sort_unstable_by_key(|space| space.identity());
-        spaces.dedup_by_key(|space| space.identity());
-        selected.sort_unstable();
-        let mut aliases: Vec<AliasRange> = Vec::new();
-        for (id, start, bytes) in selected {
-            let space = spaces
-                .binary_search_by_key(&id, |space| space.identity())
-                .unwrap();
-            if let Some(last) = aliases
-                .last_mut()
-                .filter(|last| last.space == space && start <= last.start + last.bytes)
-            {
-                last.bytes = (start + bytes).max(last.start + last.bytes) - last.start;
-            } else {
-                aliases.push(AliasRange {
-                    space,
-                    start,
-                    bytes,
-                });
-            }
-        }
-        let writers = spaces
-            .iter()
-            .map(|space| space.quiescence.writer())
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut transitions = Vec::with_capacity(spaces.len());
-        for (space, writer) in spaces.iter().zip(writers) {
-            transitions.push(space.quiescence.begin_tracking(writer, interrupt_native)?);
-        }
-        let closed = self.physical_access().close(&extents);
-        for transition in &transitions {
-            transition.wait_quiescent();
-        }
-        closed.wait();
-        let result = operation(
-            &ProtectionBatch {
-                spaces: &spaces,
-                aliases,
-            },
-            &extents,
-        );
-        match result {
-            Ok(value) => {
-                for transition in transitions {
-                    transition.publish();
-                }
-                Ok(value)
-            }
-            Err(error) => {
-                let error = Arc::new(error);
-                for transition in &transitions {
-                    transition.fail(MemoryError::TransitionFailed(Arc::clone(&error)));
-                }
-                Err(MemoryError::TransitionFailed(error))
-            }
-        }
-    }
+
     /// Apply the operation directly after the graphics owner has resolved its
     /// exact authority and retained its interval dependency. No endpoint reentry.
     pub fn apply_resolved_access(
@@ -1058,16 +508,11 @@ impl Machine {
         ranges: &[AllocationRange],
         operation: &mut crate::AccessOperation,
     ) -> Result<crate::AccessResult, MemoryError> {
-        let code = matches!(operation, crate::AccessOperation::ReadCode(_));
         match operation {
-            crate::AccessOperation::ReadNative => self.read_native_resolved(ranges, None),
-            crate::AccessOperation::ReadCode(observation)
-            | crate::AccessOperation::ReadObserved(observation) => {
-                let bytes = self
-                    .read_observed_impl(ranges, observation, false, code)?
-                    .expect("owner-resolved code capture cannot defer");
-                Ok(crate::AccessResult::Read(bytes.into_vec()))
-            }
+            crate::AccessOperation::Flush(_) => Err(MemoryError::Invalid(
+                "rasterizer flush requires the graphics owner",
+            )),
+
             crate::AccessOperation::Read(bytes) => {
                 let size = self.validate_ranges(ranges)?;
                 if bytes.len() != size {
@@ -1096,6 +541,19 @@ impl Machine {
     pub fn access_captured(
         &self,
         ranges: &[AllocationRange],
+        operation: crate::AccessOperation,
+    ) -> Result<crate::Access<crate::AccessResult>, MemoryError> {
+        if matches!(
+            operation,
+            crate::AccessOperation::Write(_) | crate::AccessOperation::Atomic(_)
+        ) {
+            self.notify_cpu_write(ranges.iter().flat_map(AllocationRange::physical_extents));
+        }
+        self.finish_captured_access(ranges, operation)
+    }
+    fn finish_captured_access(
+        &self,
+        ranges: &[AllocationRange],
         mut operation: crate::AccessOperation,
     ) -> Result<crate::Access<crate::AccessResult>, MemoryError> {
         if let Some(result) = self.try_access_captured(ranges, &mut operation)? {
@@ -1118,23 +576,9 @@ impl Machine {
                 "captured access requires physical spans",
             ));
         }
-        let code = matches!(operation, crate::AccessOperation::ReadCode(_));
         match operation {
-            crate::AccessOperation::ReadNative => {
-                let mut destination = vec![0; size];
-                if self.read_physical_into(ranges, &mut destination)? {
-                    return Ok(Some(crate::AccessResult::NativeRead {
-                        bytes: destination.into_boxed_slice(),
-                        area: None,
-                    }));
-                }
-            }
-            crate::AccessOperation::ReadCode(observation)
-            | crate::AccessOperation::ReadObserved(observation) => {
-                if let Some(bytes) = self.read_observed_impl(ranges, observation, true, code)? {
-                    return Ok(Some(crate::AccessResult::Read(bytes.into_vec())));
-                }
-            }
+            crate::AccessOperation::Flush(_) => return Ok(None),
+
             crate::AccessOperation::Write(bytes) => {
                 if self.write_physical_impl(ranges, bytes, true)? {
                     return Ok(Some(crate::AccessResult::Written(std::mem::take(bytes))));
@@ -1160,6 +604,17 @@ impl Machine {
             }
         }
         Ok(None)
+    }
+    /// CPU ReadBlock for instruction inputs. Cached device pages must pass
+    /// through the owning buffer/texture caches before filling the CPU page.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+    pub fn read_cached_captured(
+        &self,
+        ranges: &[AllocationRange],
+    ) -> Result<crate::Access<crate::AccessResult>, MemoryError> {
+        self.validate_ranges(ranges)?;
+        self.request_device_access(ranges.to_vec(), crate::AccessOperation::Read(Vec::new()))
+            .map(crate::Access::Pending)
     }
     /// Copy a previously accepted span into caller-owned host storage. Pending
     /// completion owns its byte result, never a pointer into this destination.
@@ -1244,142 +699,6 @@ impl Machine {
         }
         Ok(true)
     }
-    /// Inspect the page cache state when selecting a CPU or native device path.
-    /// This is metadata, not a RAM access grant: the chosen operation still
-    /// performs its normal ordered access and retains these allocations.
-    pub fn device_modified(&self, ranges: &[AllocationRange]) -> Result<bool, MemoryError> {
-        self.validate_ranges(ranges)?;
-        Ok(ranges
-            .iter()
-            .flat_map(AllocationRange::physical_extents)
-            .any(|extent| self.tracking().device.any(extent)))
-    }
-
-    /// Write on the graphics owner while the caller holds the original mappings.
-    /// Returns whether device coverage must be subtracted before another effect.
-    /// Cache invalidations accumulate in the existing dirty-page queue.
-    ///
-    /// # Safety
-    /// All destinations and any RAM source must remain retained until the owner
-    /// updates its exact device coverage. The source is RAM-current. No owner
-    /// effect or mapping mutation may run between this write and that update.
-    pub unsafe fn write_mapped_owner(
-        &self,
-        destinations: &[(crate::AllocationId, Extent)],
-        source: WriteSource<'_>,
-    ) -> Result<bool, MemoryError> {
-        let mut bytes = 0usize;
-        let mut extents = smallvec::SmallVec::<[Extent; 4]>::new();
-        for &(_, extent) in destinations {
-            if self
-                .arena()
-                .host_address(extent.start, extent.bytes)
-                .is_none()
-            {
-                return Err(MemoryError::Invalid("mapped write exceeds RAM"));
-            }
-            bytes = bytes
-                .checked_add(extent.bytes as usize)
-                .ok_or(MemoryError::Invalid("mapped write overflows"))?;
-            extents.push(extent);
-        }
-        if source.len() != bytes {
-            return Err(MemoryError::Invalid("mapped write payload length mismatch"));
-        }
-        let source = match source {
-            WriteSource::Ram {
-                address,
-                offset,
-                bytes,
-            } => WriteSource::Ram {
-                address: crate::HostAddress::from_pointer(
-                    (address.as_ptr() as usize)
-                        .checked_add(offset)
-                        .ok_or(MemoryError::Invalid("command address overflows"))?
-                        as *mut u8,
-                ),
-                offset: 0,
-                bytes,
-            },
-            other => other,
-        };
-        let mut overlap = None;
-        if let WriteSource::Ram { address, .. } = source {
-            let base = self
-                .arena()
-                .host_address(ArenaOffset::new(0), 0)
-                .unwrap()
-                .as_ptr() as usize;
-            let relative = (address.as_ptr() as usize)
-                .checked_sub(base)
-                .ok_or(MemoryError::Invalid("foreign command RAM"))?;
-            if self
-                .arena()
-                .host_address(ArenaOffset::new(relative as u64), bytes as u64)
-                .is_none()
-            {
-                return Err(MemoryError::Invalid("command copy exceeds RAM"));
-            }
-            if extents.iter().any(|extent| {
-                extent.start.get() < relative as u64 + bytes as u64
-                    && (relative as u64) < extent.start.get() + extent.bytes
-            }) {
-                let mut saved = vec![0; bytes];
-                unsafe {
-                    crate::raw::capture(address.as_ptr(), &mut saved);
-                }
-                overlap = Some(saved);
-            }
-        }
-        let source = overlap.as_deref().map_or(source, WriteSource::Bytes);
-        let copy = || {
-            let mut offset = 0;
-            for &extent in &extents {
-                let length = extent.bytes as usize;
-                unsafe {
-                    match source {
-                        WriteSource::Bytes(bytes) => {
-                            self.write_admitted(extent, &bytes[offset..offset + length])
-                        }
-                        WriteSource::Ram { address, .. } => crate::raw::copy(
-                            address.as_ptr().add(offset),
-                            self.arena()
-                                .host_address(extent.start, extent.bytes)
-                                .unwrap()
-                                .as_ptr(),
-                            length,
-                        ),
-                    }
-                }
-                offset += length;
-            }
-        };
-        {
-            let _access = self.physical_access().enter_many(&extents);
-            if extents
-                .iter()
-                .all(|&extent| !self.tracking().any_observed(extent))
-            {
-                let device = extents
-                    .iter()
-                    .any(|&extent| self.tracking().device.any(extent));
-                if device {
-                    self.tracking().invalidate(&extents);
-                }
-                copy();
-                return Ok(device);
-            }
-        }
-        self.tracking_transition_physical(destinations.iter().copied(), false, |batch, extents| {
-            let device = extents
-                .iter()
-                .any(|&extent| self.tracking().device.any(extent));
-            batch.invalidate(self, extents);
-            copy();
-            batch.refresh()?;
-            Ok(device)
-        })
-    }
     /// Copy mapped, RAM-current bytes directly to their consumer. Device-owned
     /// pages return false without reading or changing the destination. This
     /// never enqueues a request to the graphics owner's own endpoint.
@@ -1395,176 +714,28 @@ impl Machine {
         start: ArenaOffset,
         destination: &mut [u8],
     ) -> Result<bool, MemoryError> {
-        unsafe { self.mapped_ram_reader().try_read(start, destination) }
-    }
-    /// Recover a captured code fetch after the C++ compilation/execution frame
-    /// and native admission have ended. Registration precedes the byte copy.
-    pub fn access_code_captured(
-        &self,
-        ranges: Vec<AllocationRange>,
-    ) -> Result<(crate::Access<crate::AccessResult>, Observation), MemoryError> {
-        let observation = Observation(Arc::new(AtomicBool::new(false)));
-        let access = self.access_captured(
-            &ranges,
-            crate::AccessOperation::ReadCode(observation.clone()),
-        )?;
-        Ok((access, observation))
-    }
-    /// The graphics owner supplies only bytes already coherent in RAM. Its
-    /// authority determines the reusable interval; this method tracks that
-    /// interval while copying only the CPU instruction's requested bytes.
-    pub fn read_native_resolved(
-        &self,
-        ranges: &[AllocationRange],
-        reusable: Option<&AllocationRange>,
-    ) -> Result<crate::AccessResult, MemoryError> {
-        let size = self.validate_ranges(ranges)?;
-        let Some(reusable) = reusable else {
-            let mut bytes = vec![0; size];
-            self.capture_stream(ranges, &mut bytes)?;
-            return Ok(crate::AccessResult::NativeRead {
-                bytes: bytes.into_boxed_slice(),
-                area: None,
-            });
+        let extent = Extent {
+            start,
+            bytes: destination.len() as u64,
         };
-        self.validate_ranges(std::slice::from_ref(reusable))?;
-        let mut extents = reusable.physical_extents();
-        let extent = extents
-            .next()
-            .ok_or(MemoryError::Invalid("empty native read area"))?;
-        if extents.next().is_some()
-            || extent.start.get() / PAGE_SIZE != (extent.start.get() + extent.bytes - 1) / PAGE_SIZE
-            || ranges.iter().any(|range| {
-                range.allocation().identity() != reusable.allocation().identity()
-                    || range.physical_extents().any(|part| {
-                        part.start < extent.start
-                            || part.start.get() + part.bytes > extent.start.get() + extent.bytes
-                    })
-            })
-        {
-            return Err(MemoryError::Invalid(
-                "native read exceeds its coherent physical area",
-            ));
+        let source = self
+            .arena()
+            .host_address(start, extent.bytes)
+            .ok_or(MemoryError::Invalid("mapped read exceeds physical RAM"))?;
+        if self.must_flush_physical(extent) {
+            return Ok(false);
         }
-        // The proof concerns device coherence, not an immutable value. CPU
-        // stores remain legal and future native reads load their current bytes.
-        // Only a native overwrite or physical retirement invalidates this area.
-        let observation = Observation::default();
-        let _access = self.physical_access().enter(extent);
-        self.tracking()
-            .register(std::iter::once(extent), &observation, false, true, false);
-        let mut bytes = vec![0; size];
-        let mut offset = 0;
-        for range in ranges {
-            let length = range.bytes() as usize;
-            self.capture_unchecked(range, &mut bytes[offset..offset + length]);
-            offset += length;
+        // Coherence belongs to the real cache owners; retained inputs and the
+        // fixed RAM arena provide lifetime, without a generic observation lease.
+        unsafe {
+            self.copy_ram_to_host(source, destination);
         }
-        Ok(crate::AccessResult::NativeRead {
-            bytes: bytes.into_boxed_slice(),
-            area: Some(crate::NativeReadArea {
-                machine: self.identity(),
-                allocation: reusable.allocation().identity(),
-                start: extent.start,
-                bytes: extent.bytes,
-                observation,
-            }),
-        })
+        Ok(true)
     }
-    fn read_observed_impl(
-        &self,
-        ranges: &[AllocationRange],
-        observation: &Observation,
-        route_device: bool,
-        code: bool,
-    ) -> Result<Option<Box<[u8]>>, MemoryError> {
-        let size = self.validate_ranges(ranges)?;
-        if size == 0 {
-            return Err(MemoryError::Invalid("code capture requires physical input"));
-        }
-        let extents: smallvec::SmallVec<[_; 4]> = ranges
-            .iter()
-            .flat_map(AllocationRange::physical_extents)
-            .collect();
-        {
-            let _access = self.physical_access().enter_many(&extents);
-            if route_device
-                && extents
-                    .iter()
-                    .any(|&extent| self.tracking().device.any(extent))
-            {
-                return Ok(None);
-            }
-            if extents.iter().all(|&extent| {
-                pages(extent).all(|page| {
-                    self.tracking().kind(page) & crate::address_space::MappedPage::OBSERVED != 0
-                        && (!code || self.tracking().code(page))
-                })
-            }) {
-                // Existing protection excludes native stores; the admitted set
-                // keeps every fragment protected through registration and copy.
-                self.tracking()
-                    .register(extents.iter().copied(), observation, true, true, code);
-                let mut bytes = vec![0; size];
-                let mut offset = 0;
-                for range in ranges {
-                    let length = range.bytes() as usize;
-                    self.capture_unchecked(range, &mut bytes[offset..offset + length]);
-                    offset += length;
-                }
-                return Ok(Some(bytes.into_boxed_slice()));
-            }
-        }
-        self.tracking_transition_with_native(ranges, code, |batch, extents| {
-            if route_device
-                && extents
-                    .iter()
-                    .any(|&extent| self.tracking().device.any(extent))
-            {
-                return Ok(None);
-            }
-            for &extent in extents {
-                self.tracking().observed.update_range(extent, true, |_| {});
-                if code {
-                    self.tracking().code.update_range(extent, true, |_| {});
-                }
-            }
-            batch.refresh()?;
-            let mut bytes = vec![0; size];
-            let mut offset = 0;
-            for range in ranges {
-                self.tracking()
-                    .register(range.physical_extents(), observation, true, true, code);
-                let length = range.bytes() as usize;
-                self.capture_unchecked(range, &mut bytes[offset..offset + length]);
-                offset += length;
-            }
-            Ok(Some(bytes.into_boxed_slice()))
-        })
-    }
-    /// Coarse device coverage for retained physical bytes. A clear summary
-    /// proves RAM current; set bits still require exact owner resolution.
-    /// This does not grant admission to read or mutate the bytes.
+    /// Read selected retained RAM into its consumer. Cache tracking is owned by
+    /// the SMMU buffer/image counters, independently of this data copy.
     #[inline]
-    pub fn has_device_pages(&self, extent: Extent) -> bool {
-        self.tracking().device.any(extent)
-    }
-
-    /// Inspect weak cache metadata without acquiring a physical input lease.
-    /// Actual capture/publication still retains the allocation independently.
-    pub fn resource_pages_tracked(&self, extent: Extent) -> bool {
-        bitmap_words(extent).all(|(word, mask)| {
-            self.tracking()
-                .resource_observed
-                .0
-                .get(word)
-                .is_some_and(|bits| bits.load(Ordering::Acquire) & mask == mask)
-        })
-    }
-    /// Retained resources consume dirty-page notifications instead of rebuilding
-    /// per-resource observations. Device materialization preserves this CPU watch.
-    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/memory_tracker_base.h
-    pub fn capture_resource_scattered(
+    pub fn read_resources_scattered(
         &self,
         inputs: &[AllocationRange],
         copies: &[PhysicalCapture],
@@ -1581,7 +752,7 @@ impl Machine {
                 return Err(MemoryError::Invalid("physical capture exceeds destination"));
             }
         }
-        self.capture_resource_with(inputs, reader, |reader| {
+        self.read_resources_with(reader, |reader| {
             for copy in copies {
                 let end = copy.destination + copy.source.bytes as usize;
                 reader
@@ -1594,54 +765,41 @@ impl Machine {
     /// Capture layouts directly while their physical inputs remain admitted.
     /// The graphics owner resolves native producers before entering. The reader
     /// permits tiled imports without building a list of every 16-byte copy.
-    pub fn capture_resource<T>(
+    pub fn read_resources<T>(
         &self,
         inputs: &[AllocationRange],
         capture: impl FnOnce(&ResourceReader<'_>) -> Result<T, MemoryError>,
     ) -> Result<T, MemoryError> {
         let reader = ResourceReader::new(self, inputs)?;
-        self.capture_resource_with(inputs, reader, capture)
+        self.read_resources_with(reader, capture)
     }
-    fn capture_resource_with<T>(
+    fn read_resources_with<T>(
         &self,
-        inputs: &[AllocationRange],
         reader: ResourceReader<'_>,
         capture: impl FnOnce(&ResourceReader<'_>) -> Result<T, MemoryError>,
     ) -> Result<T, MemoryError> {
-        let observe = || {
-            for &extent in &reader.retained {
-                self.tracking()
-                    .resource_observed
-                    .update_range(extent, true, |_| {});
-            }
-        };
-        let read = || {
-            let result = capture(&reader);
-            #[cfg(any(test, feature = "performance-counters"))]
-            self.tracking()
-                .captured_bytes
-                .fetch_add(reader.captured.get(), Ordering::Relaxed);
-            result
-        };
-        {
-            let _access = self.physical_access().enter_many(&reader.retained);
-            if reader
-                .retained
-                .iter()
-                .all(|&extent| self.tracking().all_observed(extent))
-            {
-                observe();
-                return read();
-            }
-        }
-        self.tracking_transition(inputs, |batch, _| {
-            observe();
-            batch.refresh()?;
-            read()
+        let result = capture(&reader);
+        #[cfg(any(test, feature = "performance-counters"))]
+        self.tracking()
+            .captured_bytes
+            .fetch_add(reader.captured.get(), Ordering::Relaxed);
+        result
+    }
+    /// Publish into retained physical ranges after producer/version selection.
+    /// Cache ownership and guest fences order publication, as in Eden.
+    pub fn write_resources<T>(
+        &self,
+        inputs: &[AllocationRange],
+        publish: impl FnOnce(&ResourceWriter<'_>) -> Result<T, MemoryError>,
+    ) -> Result<T, MemoryError> {
+        let retained = ResourceReader::new(self, inputs)?.retained;
+        publish(&ResourceWriter {
+            machine: self,
+            retained,
         })
     }
-    /// Streaming captures keep dirty RAM dirty and do not install observers or
-    /// change native protection. Callers supply the owned upload destination.
+
+    /// Streaming captures keep dirty RAM dirty and preserve native protection. Callers supply the owned upload destination.
     pub fn capture_stream(
         &self,
         ranges: &[AllocationRange],
@@ -1670,7 +828,6 @@ impl Machine {
     ) -> Result<(), MemoryError> {
         let mut offset = 0;
         for extent in extents {
-            let _access = self.physical_access().enter(extent);
             let bytes = extent.bytes as usize;
             // SAFETY: the caller retains the extent and admission is held.
             unsafe {
@@ -1690,6 +847,21 @@ impl Machine {
             .host_address(extent.start, extent.bytes)
             .expect("retained physical extent");
         unsafe {
+            self.copy_ram_to_host(source, destination);
+        }
+    }
+    /// Copy raw RAM after the caller resolves coherence. The physical arena
+    /// remains mapped for the machine lifetime, independently of device maps.
+    ///
+    /// # Safety
+    /// Source is readable RAM in this machine; destination is disjoint host
+    /// storage. No retained Rust references may alias the guest bytes.
+    pub(crate) unsafe fn copy_ram_to_host(
+        &self,
+        source: crate::HostAddress,
+        destination: &mut [u8],
+    ) {
+        unsafe {
             crate::raw::capture(source.as_ptr(), destination);
         }
         #[cfg(any(test, feature = "performance-counters"))]
@@ -1697,29 +869,8 @@ impl Machine {
             .captured_bytes
             .fetch_add(destination.len() as u64, Ordering::Relaxed);
     }
-    // Caller either holds physical admission with established write protection,
-    // or has closed physical access and established protection on every alias.
-    fn capture_unchecked(&self, range: &AllocationRange, destination: &mut [u8]) {
-        let mut offset = 0;
-        for extent in range.physical_extents() {
-            let bytes = extent.bytes as usize;
-            let source = self
-                .arena()
-                .host_address(extent.start, extent.bytes)
-                .unwrap();
-            unsafe {
-                crate::raw::capture(source.as_ptr(), &mut destination[offset..offset + bytes]);
-            }
-            offset += bytes;
-        }
-        #[cfg(any(test, feature = "performance-counters"))]
-        self.tracking()
-            .captured_bytes
-            .fetch_add(destination.len() as u64, Ordering::Relaxed);
-    }
-    /// Revalidate a completed device download while its physical destination is
-    /// closed to native stores. Selection runs after draining existing accesses;
-    /// only selected byte intervals are copied. No collector lock spans it.
+    /// Select completed download intervals under the actual buffer-cache owner.
+    /// Physical pins retain the destination; only selected bytes are published.
     pub fn write_download(
         &self,
         range: &AllocationRange,
@@ -1731,7 +882,7 @@ impl Machine {
         }
         self.validate_ranges(std::slice::from_ref(range))?;
         let extents: Vec<_> = range.physical_extents().collect();
-        let apply = |batch: Option<&ProtectionBatch<'_>>| {
+        let apply = || {
             let selected = select()?;
             if selected
                 .iter()
@@ -1752,12 +903,7 @@ impl Machine {
                             start: ArenaOffset::new(extent.start.get() + (begin - base) as u64),
                             bytes: (stop - begin) as u64,
                         };
-                        if let Some(batch) = batch {
-                            // Materializing a native producer is a device write,
-                            // not a CPU mutation that requires another upload.
-                            batch.invalidate_from(self, &[target], true);
-                        }
-                        // The transition retains aliases and closes physical access.
+                        // The input retains this exact physical destination.
                         unsafe {
                             self.write_admitted(target, &source[begin..stop]);
                         }
@@ -1765,24 +911,9 @@ impl Machine {
                 }
                 base = end;
             }
-            batch.map_or(Ok(()), ProtectionBatch::refresh)
+            Ok(())
         };
-        // Existing device protection already routes native stores through
-        // physical admission. Reusing it needs neither alias quiescence nor
-        // mprotect; serialize only with mapping/protection changes here.
-        let index = self.aliases();
-        if extents.iter().all(|&extent| {
-            pages(extent).all(|page| self.tracking().device.get(page))
-                // Buffer watches survive materialization and need no observer
-                // invalidation or additional protection transition here.
-                && !self.tracking().observed.any(extent)
-        }) {
-            let closed = self.physical_access().close(&extents);
-            closed.wait();
-            return apply(None);
-        }
-        drop(index);
-        self.tracking_transition(std::slice::from_ref(range), |batch, _| apply(Some(batch)))
+        apply()
     }
     /// The graphics owner has already resolved exact authority/dependencies.
     /// Apply the owned write before releasing its interval dependency. This
@@ -1841,20 +972,11 @@ impl Machine {
         let extents: smallvec::SmallVec<[_; 4]> = ranges
             .physical_extents(offset, source.len() as u64)?
             .collect();
+        self.notify_cpu_write(extents.iter().copied());
         if source.is_empty() {
             return Ok(true);
         }
-        let written = self.try_write_extents(&extents, source, true);
-        if written == Some(true) {
-            return Ok(true);
-        }
-        if written.is_none() {
-            let selected = ranges.views(offset, source.len() as u64)?;
-            if self.write_physical_impl(&selected, source, true)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(self.try_write_extents(&extents, source, true))
     }
     fn write_physical_impl(
         &self,
@@ -1869,78 +991,30 @@ impl Machine {
             .iter()
             .flat_map(AllocationRange::physical_extents)
             .collect();
-        if let Some(written) = self.try_write_extents(&extents, source, route_device) {
-            return Ok(written);
-        }
-        self.write_tracked(
-            ranges.iter().flat_map(|range| {
-                range
-                    .physical_extents()
-                    .map(|extent| (range.allocation().identity(), extent))
-            }),
-            source,
-            route_device,
-        )
+        Ok(self.try_write_extents(&extents, source, route_device))
     }
-    fn write_tracked(
-        &self,
-        input: impl Iterator<Item = (crate::AllocationId, Extent)>,
-        source: &[u8],
-        route_device: bool,
-    ) -> Result<bool, MemoryError> {
-        self.tracking_transition_physical(input, false, |batch, extents| {
-            if route_device
-                && extents
-                    .iter()
-                    .any(|&extent| pages(extent).any(|page| self.tracking().device.get(page)))
-            {
-                return Ok(false);
-            }
-            batch.invalidate(self, extents);
-            let mut offset = 0;
-            for &extent in extents {
-                let bytes = extent.bytes as usize;
-                unsafe {
-                    self.write_admitted(extent, &source[offset..offset + bytes]);
-                }
-                offset += bytes;
-            }
-            batch.refresh()?;
-            Ok(true)
-        })
-    }
+
     /// Inputs and payload have already been validated and retained. None needs
     /// an observation transition; Some(false) needs device-owner resolution.
-    fn try_write_extents(
-        &self,
-        extents: &[Extent],
-        source: &[u8],
-        route_device: bool,
-    ) -> Option<bool> {
-        let _access = self.physical_access().enter_many(extents);
+    fn try_write_extents(&self, extents: &[Extent], source: &[u8], route_device: bool) -> bool {
         if route_device
             && extents
                 .iter()
-                .any(|&extent| self.tracking().device.any(extent))
+                .any(|&extent| self.must_flush_physical(extent))
         {
-            return Some(false);
+            return false;
         }
-        if extents
-            .iter()
-            .any(|&extent| self.tracking().any_observed(extent))
-        {
-            return None;
-        }
+
         let mut offset = 0;
         for &extent in extents {
             let end = offset + extent.bytes as usize;
-            // SAFETY: all destinations remain admitted until the final store.
+            // SAFETY: the caller retains every destination through the stores.
             unsafe {
                 self.write_admitted(extent, &source[offset..end]);
             }
             offset = end;
         }
-        Some(true)
+        true
     }
 }
 
@@ -1974,14 +1048,8 @@ impl crate::Allocation {
             .physical_extents(offset, source.len() as u64)?
             .collect();
         let machine = self.machine();
-        let written = match machine.try_write_extents(&extents, source, true) {
-            Some(written) => written,
-            None => machine.write_tracked(
-                extents.iter().map(|&extent| (self.identity(), extent)),
-                source,
-                true,
-            )?,
-        };
+        machine.notify_cpu_write(extents.iter().copied());
+        let written = machine.try_write_extents(&extents, source, true);
         if written {
             return Ok(crate::Access::Ready(()));
         }
@@ -1993,1512 +1061,5 @@ impl crate::Allocation {
         machine
             .request_device_access(vec![range], crate::AccessOperation::Write(source.into()))
             .map(crate::Access::Pending)
-    }
-}
-
-#[cfg(test)]
-mod observer_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{AddressWidth, GuestVirtualAddress, MemoryPermissions};
-    use std::{thread, time::Duration};
-
-    #[test]
-    fn shader_observation_survives_disjoint_writes_on_its_page() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let range = AllocationRange::new(allocation.pin(), 0, PAGE_SIZE).unwrap();
-        let space = mapping(&machine, allocation, PAGE_SIZE);
-        let shader = Observation::default();
-        machine
-            .access_captured(
-                &[range.slice(64, 16).unwrap()],
-                crate::AccessOperation::ReadObserved(shader.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let physical = range.physical_extents().next().unwrap().start.get();
-        let protections = machine.tracking_statistics().protection_calls;
-        space
-            .write_value(GuestVirtualAddress::new(PAGE_SIZE + 256), 4, 1)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(!shader.is_invalid());
-        assert_eq!(machine.tracking_statistics().protection_calls, protections);
-        machine.tracking().invalidate_device(&[Extent {
-            start: ArenaOffset::new(physical + 512),
-            bytes: 4,
-        }]);
-        assert!(!shader.is_invalid());
-        space
-            .write_value(GuestVirtualAddress::new(PAGE_SIZE + 68), 4, 2)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(shader.is_invalid());
-    }
-
-    #[test]
-    fn accepted_subrange_access_preserves_fragments_observations_and_remapped_bytes() {
-        let machine = Machine::new(8 * PAGE_SIZE).unwrap();
-        let account = machine.account(8 * PAGE_SIZE).unwrap();
-        let mut occupied: Vec<_> = (0..8)
-            .map(|_| Some(account.allocate(PAGE_SIZE).unwrap()))
-            .collect();
-        for index in [1, 3, 5] {
-            occupied[index] = None;
-        }
-        let allocation = account.allocate(3 * PAGE_SIZE).unwrap();
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(PAGE_SIZE);
-        space
-            .map(
-                base,
-                allocation,
-                0,
-                3 * PAGE_SIZE,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        let ranges = space
-            .capture(base, 3 * PAGE_SIZE, MemoryPermissions::READ_WRITE)
-            .unwrap();
-        assert_eq!(ranges[0].physical_extents().count(), 3);
-        let watch = crate::Observation::default();
-        machine
-            .access_captured(&ranges, crate::AccessOperation::ReadObserved(watch.clone()))
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let ranges = crate::CapturedMemory::new(ranges).unwrap();
-        space.unmap(base, 3 * PAGE_SIZE).unwrap();
-        let replacement = occupied[0].as_ref().unwrap().clone();
-        space
-            .map(
-                base,
-                replacement,
-                0,
-                PAGE_SIZE,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        let input = [17; 12];
-        assert!(matches!(
-            machine
-                .write_captured(&ranges, PAGE_SIZE - 4, &input)
-                .unwrap(),
-            crate::Access::Ready(())
-        ));
-        assert!(watch.is_invalid());
-        let mut output = [0; 16];
-        assert!(matches!(
-            machine
-                .read_captured_into(&ranges, PAGE_SIZE - 6, &mut output)
-                .unwrap(),
-            crate::Access::Ready(())
-        ));
-        assert_eq!(&output[..2], &[0; 2]);
-        assert_eq!(&output[2..14], &input);
-        assert_eq!(&output[14..], &[0; 2]);
-        assert!(
-            machine
-                .write_captured(&ranges, 3 * PAGE_SIZE - 1, &[99; 2])
-                .is_err()
-        );
-        assert!(matches!(
-            space.read_value(base, 8).unwrap(),
-            crate::Access::Ready(0)
-        ));
-    }
-
-    #[test]
-    fn native_ram_observations_survive_cpu_changes_but_not_device_writes_or_retirement() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let field = AllocationRange::new(allocation.pin(), 128, 4).unwrap();
-        let reusable = AllocationRange::new(allocation.pin(), 64, 448).unwrap();
-        let ordinary = crate::Observation::default();
-        machine
-            .access_captured(
-                std::slice::from_ref(&field),
-                crate::AccessOperation::ReadObserved(ordinary.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let crate::AccessResult::NativeRead {
-            area: Some(area), ..
-        } = machine
-            .read_native_resolved(std::slice::from_ref(&field), Some(&reusable))
-            .unwrap()
-        else {
-            panic!("expected native read area");
-        };
-        machine
-            .write_resolved(std::slice::from_ref(&field), &9u32.to_le_bytes())
-            .unwrap();
-        assert!(ordinary.is_invalid());
-        assert!(!area.observation().is_invalid());
-        machine
-            .publish_device_write(std::slice::from_ref(&field), || Ok(()))
-            .unwrap();
-        assert!(area.observation().is_invalid());
-        let crate::AccessResult::NativeRead {
-            area: Some(after_device),
-            ..
-        } = machine
-            .read_native_resolved(std::slice::from_ref(&field), Some(&reusable))
-            .unwrap()
-        else {
-            panic!("expected renewed native read area");
-        };
-        assert!(!after_device.observation().is_invalid());
-        drop(field);
-        drop(reusable);
-        drop(allocation);
-        assert_eq!(machine.statistics().allocated_bytes, 0);
-        assert!(after_device.observation().is_invalid());
-        assert_eq!(machine.tracking_statistics().observer_registrations, 0);
-    }
-
-    #[test]
-    fn native_read_area_cannot_authorize_another_machine_with_the_same_allocation_id() {
-        let mut machines = Vec::new();
-        for value in [17u32, 29] {
-            let machine = Machine::new(PAGE_SIZE).unwrap();
-            let allocation = machine
-                .account(PAGE_SIZE)
-                .unwrap()
-                .allocate(PAGE_SIZE)
-                .unwrap();
-            let field = AllocationRange::new(allocation.pin(), 128, 4).unwrap();
-            machine
-                .write_resolved(std::slice::from_ref(&field), &value.to_le_bytes())
-                .unwrap();
-            let space = mapping(&machine, allocation, PAGE_SIZE);
-            machine
-                .publish_device_write(std::slice::from_ref(&field), || Ok(()))
-                .unwrap();
-            let crate::AccessResult::NativeRead {
-                area: Some(area), ..
-            } = machine
-                .read_native_resolved(std::slice::from_ref(&field), Some(&field))
-                .unwrap()
-            else {
-                panic!("expected native read area");
-            };
-            machines.push((space, area));
-        }
-        let (space, area) = &machines[1];
-        assert_eq!(area.allocation, machines[0].1.allocation);
-        assert_eq!(area.start, machines[0].1.start);
-        assert!(!machines[0].1.observation().is_invalid());
-        let core = space.register_core(Arc::new(|| {}));
-        let native = core.enter_native().unwrap();
-        let address = GuestVirtualAddress::new(PAGE_SIZE + 128);
-        assert_eq!(
-            space
-                .read_native(&native, address, 4, Some(&machines[0].1))
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            space.read_native(&native, address, 4, Some(area)).unwrap(),
-            Some(29)
-        );
-    }
-
-    fn mapping(machine: &Machine, allocation: crate::Allocation, base: u64) -> Arc<AddressSpace> {
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let bytes = allocation.bytes();
-        space
-            .map(
-                GuestVirtualAddress::new(base),
-                allocation,
-                0,
-                bytes,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        space
-    }
-    fn host_store(space: &AddressSpace, address: u64) -> bool {
-        let pointer = space
-            .native_data_base()
-            .as_ptr()
-            .wrapping_add(address as usize);
-        let host = pointer as usize;
-        // Inspect the kernel's actual VM permissions. A denied write is never
-        // attempted in-process, so the test needs no signal handler or ptrace.
-        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-        for line in maps.lines() {
-            let mut fields = line.split_whitespace();
-            let (start, end) = fields.next().unwrap().split_once('-').unwrap();
-            let start = usize::from_str_radix(start, 16).unwrap();
-            let end = usize::from_str_radix(end, 16).unwrap();
-            if (start..end).contains(&host) {
-                if fields.next().unwrap().as_bytes()[1] != b'w' {
-                    return false;
-                }
-                // This test owns the space and is outside every transition.
-                unsafe {
-                    crate::raw::write_value(pointer, 1, 42);
-                }
-                return true;
-            }
-        }
-        panic!("live virtual arena absent from host mappings")
-    }
-
-    #[test]
-    fn first_data_capture_protects_aliases_without_interrupting_native_execution() {
-        use std::sync::mpsc;
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let range = AllocationRange::new(allocation.pin(), 0, PAGE_SIZE).unwrap();
-        let space = mapping(&machine, allocation, PAGE_SIZE);
-        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let interrupted = Arc::clone(&interrupts);
-        let running = Arc::clone(&space);
-        let (entered, active) = mpsc::channel();
-        let (release, released) = mpsc::channel();
-        let native = thread::spawn(move || {
-            let core = running.register_core(Arc::new(move || {
-                interrupted.fetch_add(1, Ordering::Relaxed);
-            }));
-            let _native = core.enter_native().unwrap();
-            entered.send(()).unwrap();
-            released.recv().unwrap();
-        });
-        active.recv().unwrap();
-        let read = machine.clone();
-        let (completed, result) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            let observation = Observation::default();
-            let captured = read
-                .access_captured(
-                    &[range],
-                    crate::AccessOperation::ReadObserved(observation.clone()),
-                )
-                .map(|access| {
-                    access.into_ready().unwrap();
-                    observation
-                });
-            completed.send(captured).unwrap();
-        });
-        let captured_while_running = result.recv_timeout(Duration::from_secs(1));
-        release.send(()).unwrap();
-        native.join().unwrap();
-        reader.join().unwrap();
-        let observation = captured_while_running
-            .expect("data tracking interrupted native execution")
-            .unwrap();
-        assert_eq!(interrupts.load(Ordering::Relaxed), 0);
-        assert!(!host_store(&space, PAGE_SIZE));
-        assert!(!observation.is_invalid());
-        space
-            .write_value(GuestVirtualAddress::new(PAGE_SIZE), 4, 7)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(observation.is_invalid());
-        assert!(host_store(&space, PAGE_SIZE));
-    }
-
-    #[test]
-    fn another_capture_of_protected_ram_neither_interrupts_a_running_core_nor_reprotects() {
-        use crate::{Access, AccessOperation, AccessResult};
-        use std::sync::mpsc;
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let range = AllocationRange::new(allocation.pin(), 0, PAGE_SIZE).unwrap();
-        let space = mapping(&machine, allocation, PAGE_SIZE);
-        let first = Observation::default();
-        assert!(matches!(
-            machine
-                .access_captured(
-                    &[range.slice(0, 4).unwrap()],
-                    AccessOperation::ReadObserved(first.clone())
-                )
-                .unwrap(),
-            Access::Ready(AccessResult::Read(_))
-        ));
-        let before = machine.tracking_statistics().protection_calls;
-        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let interrupted = Arc::clone(&interrupts);
-        let running = Arc::clone(&space);
-        let (entered, active) = mpsc::channel();
-        let (release, released) = mpsc::channel();
-        let native = thread::spawn(move || {
-            let core = running.register_core(Arc::new(move || {
-                interrupted.fetch_add(1, Ordering::Relaxed);
-            }));
-            let _native = core.enter_native().unwrap();
-            entered.send(()).unwrap();
-            released.recv().unwrap();
-        });
-        active.recv().unwrap();
-        let read = machine.clone();
-        let (completed, result) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            let observation = Observation::default();
-            let result = read
-                .access_captured(
-                    &[range.slice(4, 4).unwrap()],
-                    crate::AccessOperation::ReadObserved(observation.clone()),
-                )
-                .unwrap();
-            let mut bytes = [0xaa; 12];
-            read.capture_resource_scattered(
-                std::slice::from_ref(&range),
-                &[PhysicalCapture {
-                    source: Extent {
-                        start: range.physical_extents().next().unwrap().start,
-                        bytes: 8,
-                    },
-                    destination: 2,
-                }],
-                &mut bytes,
-            )
-            .unwrap();
-            completed.send((result, observation, bytes)).unwrap();
-        });
-        let captured_while_running = result.recv_timeout(Duration::from_secs(1));
-        release.send(()).unwrap();
-        native.join().unwrap();
-        reader.join().unwrap();
-        let (captured, second, bytes) =
-            captured_while_running.expect("protected RAM capture must not drain the running core");
-        assert!(matches!(captured, Access::Ready(AccessResult::Read(_))));
-        assert_eq!(bytes, [0xaa, 0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0xaa, 0xaa]);
-        assert_eq!(interrupts.load(Ordering::Relaxed), 0);
-        assert_eq!(machine.tracking_statistics().protection_calls, before);
-        assert!(matches!(
-            space
-                .write_value(GuestVirtualAddress::new(PAGE_SIZE + 4), 4, 7)
-                .unwrap(),
-            Access::Ready(())
-        ));
-        assert!(!first.is_invalid());
-        assert!(second.is_invalid());
-        space
-            .write_value(GuestVirtualAddress::new(PAGE_SIZE), 4, 9)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(first.is_invalid());
-    }
-    #[test]
-    fn owner_ram_copies_scatter_preserve_overlap_and_invalidate_observations() {
-        let machine = Machine::new(4 * PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(4 * PAGE_SIZE)
-            .unwrap()
-            .allocate(4 * PAGE_SIZE)
-            .unwrap();
-        let range = AllocationRange::new(allocation.pin(), 0, 4 * PAGE_SIZE).unwrap();
-        let source = range.slice(0, 1003).unwrap();
-        let payload: Vec<u8> = (0..1003).map(|i| (i % 251) as u8).collect();
-        machine
-            .write_resolved(std::slice::from_ref(&source), &payload)
-            .unwrap();
-        let source_extent = source.physical_extents().next().unwrap();
-        let address = machine
-            .arena()
-            .host_address(source_extent.start, source_extent.bytes)
-            .unwrap();
-        let first = range.slice(PAGE_SIZE + 3, 501).unwrap();
-        let second = range.slice(3 * PAGE_SIZE + 7, 502).unwrap();
-        let extents: Vec<_> = first
-            .physical_extents()
-            .chain(second.physical_extents())
-            .map(|extent| (allocation.identity(), extent))
-            .collect();
-        let input = WriteSource::Ram {
-            address,
-            offset: 0,
-            bytes: payload.len(),
-        };
-        assert!(!unsafe { machine.write_mapped_owner(&extents, input) }.unwrap());
-        let mut actual = vec![0; payload.len()];
-        machine
-            .capture_stream(&[first.clone(), second.clone()], &mut actual)
-            .unwrap();
-        assert_eq!(actual, payload);
-        let overlapping = range.slice(3, 1003).unwrap();
-        let overlap: Vec<_> = overlapping
-            .physical_extents()
-            .map(|extent| (allocation.identity(), extent))
-            .collect();
-        unsafe { machine.write_mapped_owner(&overlap, input) }.unwrap();
-        machine.capture_stream(&[overlapping], &mut actual).unwrap();
-        assert_eq!(actual, payload, "copy must snapshot an overlapping source");
-        machine
-            .write_resolved(std::slice::from_ref(&source), &payload)
-            .unwrap();
-        let observation = Observation::default();
-        machine
-            .access_captured(
-                std::slice::from_ref(&first),
-                crate::AccessOperation::ReadObserved(observation.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        unsafe { machine.write_mapped_owner(&extents, input) }.unwrap();
-        assert!(observation.is_invalid());
-        machine
-            .capture_stream(&[first, second], &mut actual)
-            .unwrap();
-        assert_eq!(actual, payload);
-    }
-
-    #[test]
-    fn fragmented_ram_writes_do_not_publish_dirty_pages_and_defer_device_writes_intact() {
-        let machine = Machine::new(6 * PAGE_SIZE).unwrap();
-        let account = machine.account(6 * PAGE_SIZE).unwrap();
-        let mut occupied: Vec<_> = (0..6)
-            .map(|_| Some(account.allocate(PAGE_SIZE).unwrap()))
-            .collect();
-        for index in [0, 2, 4] {
-            occupied[index] = None;
-        }
-        let allocation = account.allocate(3 * PAGE_SIZE).unwrap();
-        let full = AllocationRange::new(allocation.pin(), 0, 3 * PAGE_SIZE).unwrap();
-        assert_eq!(full.physical_extents().count(), 3);
-        let _space = mapping(&machine, allocation, PAGE_SIZE);
-        let split = [
-            full.slice(0, PAGE_SIZE).unwrap(),
-            full.slice(PAGE_SIZE, 2 * PAGE_SIZE).unwrap(),
-        ];
-        machine.take_cpu_modified_pages();
-        let protections = machine.tracking_statistics().protection_calls;
-        for ranges in [std::slice::from_ref(&full), split.as_slice()] {
-            machine
-                .write_resolved(ranges, &vec![3; 3 * PAGE_SIZE as usize])
-                .unwrap();
-            assert!(machine.take_cpu_modified_pages().is_empty());
-            let ranges = crate::CapturedMemory::new(ranges.iter().cloned()).unwrap();
-            machine
-                .write_captured(&ranges, PAGE_SIZE - 2, &[7; 8])
-                .unwrap()
-                .into_ready()
-                .unwrap();
-            assert!(machine.take_cpu_modified_pages().is_empty());
-            let mut bytes = [0; 12];
-            machine
-                .read_captured_into(&ranges, PAGE_SIZE - 4, &mut bytes)
-                .unwrap()
-                .into_ready()
-                .unwrap();
-            assert_eq!(bytes, [3, 3, 7, 7, 7, 7, 7, 7, 7, 7, 3, 3]);
-        }
-        assert_eq!(machine.tracking_statistics().protection_calls, protections);
-        machine
-            .publish_device_write(&[full.slice(PAGE_SIZE, PAGE_SIZE).unwrap()], || Ok(()))
-            .unwrap();
-        assert!(
-            machine
-                .try_access_captured(
-                    &split,
-                    &mut crate::AccessOperation::Write(vec![9; 3 * PAGE_SIZE as usize])
-                )
-                .unwrap()
-                .is_none()
-        );
-        let mut prefix = [0; 4];
-        machine
-            .capture_stream(&[full.slice(0, 4).unwrap()], &mut prefix)
-            .unwrap();
-        assert_eq!(prefix, [3; 4]);
-    }
-
-    #[test]
-    fn fragmented_observations_reuse_code_protection_without_stopping_native_execution() {
-        use crate::{AccessOperation, AccessResult};
-        use std::sync::{atomic::AtomicUsize, mpsc};
-        let machine = Machine::new(4 * PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(4 * PAGE_SIZE)
-            .unwrap()
-            .allocate(3 * PAGE_SIZE)
-            .unwrap();
-        let full = AllocationRange::new(allocation.pin(), 0, 3 * PAGE_SIZE).unwrap();
-        let space = mapping(&machine, allocation, PAGE_SIZE);
-        let ranges = [
-            full.slice(0, 8).unwrap(),
-            full.slice(2 * PAGE_SIZE, 8).unwrap(),
-        ];
-        let first = Observation::default();
-        machine
-            .access_captured(&ranges, AccessOperation::ReadCode(first.clone()))
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let protections = machine.tracking_statistics().protection_calls;
-        let interrupts = Arc::new(AtomicUsize::new(0));
-        let interrupted = interrupts.clone();
-        let running = space.clone();
-        let (entered, active) = mpsc::channel();
-        let (release, released) = mpsc::channel();
-        let native = thread::spawn(move || {
-            let core = running.register_core(Arc::new(move || {
-                interrupted.fetch_add(1, Ordering::Relaxed);
-            }));
-            let _native = core.enter_native().unwrap();
-            entered.send(()).unwrap();
-            released.recv().unwrap();
-        });
-        active.recv().unwrap();
-        let read = machine.clone();
-        let (completed, result) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            let mut observations = Vec::new();
-            for code in [false, true] {
-                let observation = Observation::default();
-                let operation = if code {
-                    AccessOperation::ReadCode(observation.clone())
-                } else {
-                    AccessOperation::ReadObserved(observation.clone())
-                };
-                let AccessResult::Read(bytes) = read
-                    .access_captured(&ranges, operation)
-                    .unwrap()
-                    .into_ready()
-                    .unwrap()
-                else {
-                    panic!("expected read");
-                };
-                assert_eq!(&*bytes, &[0; 16]);
-                observations.push(observation);
-            }
-            let copies: Vec<_> = ranges
-                .iter()
-                .enumerate()
-                .map(|(index, range)| PhysicalCapture {
-                    source: range.physical_extents().next().unwrap(),
-                    destination: index * 8,
-                })
-                .collect();
-            let mut bytes = [0xaa; 20];
-            read.capture_resource_scattered(&ranges, &copies, &mut bytes)
-                .unwrap();
-            assert_eq!(&bytes[..16], &[0; 16]);
-            assert_eq!(&bytes[16..], &[0xaa; 4]);
-            completed.send(observations).unwrap();
-        });
-        let captured = result.recv_timeout(Duration::from_secs(2));
-        release.send(()).unwrap();
-        native.join().unwrap();
-        reader.join().unwrap();
-        let observations =
-            captured.expect("existing fragmented protection must not drain native execution");
-        assert_eq!(interrupts.load(Ordering::Relaxed), 0);
-        assert_eq!(machine.tracking_statistics().protection_calls, protections);
-        assert!(observations.iter().all(|o| !o.is_invalid()));
-        space
-            .write_value(GuestVirtualAddress::new(3 * PAGE_SIZE), 4, 7)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(first.is_invalid());
-        assert!(observations.iter().all(Observation::is_invalid));
-    }
-
-    #[test]
-    fn fragmented_capture_establishes_missing_tracking_and_keeps_alias_invalidation() {
-        use crate::AccessOperation;
-        let machine = Machine::new(3 * PAGE_SIZE).unwrap();
-        let account = machine.account(3 * PAGE_SIZE).unwrap();
-        let allocation = account.allocate(3 * PAGE_SIZE).unwrap();
-        let full = AllocationRange::new(allocation.pin(), 0, 3 * PAGE_SIZE).unwrap();
-        let first_alias = mapping(&machine, allocation.clone(), PAGE_SIZE);
-        let other_alias = mapping(&machine, allocation, 8 * PAGE_SIZE);
-        let ranges = [
-            full.slice(0, 8).unwrap(),
-            full.slice(2 * PAGE_SIZE, 8).unwrap(),
-        ];
-        let first = Observation::default();
-        machine
-            .access_captured(&ranges[..1], AccessOperation::ReadObserved(first.clone()))
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let code = Observation::default();
-        machine
-            .access_captured(&ranges, AccessOperation::ReadCode(code.clone()))
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        for range in &ranges {
-            let page = range.physical_extents().next().unwrap().start.get() / PAGE_SIZE;
-            assert!(machine.tracking().observed(page));
-            assert!(machine.tracking().code(page));
-        }
-        machine
-            .capture_resource_scattered(
-                &ranges,
-                &[
-                    PhysicalCapture {
-                        source: ranges[0].physical_extents().next().unwrap(),
-                        destination: 0,
-                    },
-                    PhysicalCapture {
-                        source: ranges[1].physical_extents().next().unwrap(),
-                        destination: 8,
-                    },
-                ],
-                &mut [0; 16],
-            )
-            .unwrap();
-        other_alias
-            .write_value(GuestVirtualAddress::new(10 * PAGE_SIZE), 4, 91)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(code.is_invalid());
-        assert!(!first.is_invalid());
-        let mut value = [0; 4];
-        first_alias
-            .read_into(GuestVirtualAddress::new(3 * PAGE_SIZE), &mut value)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert_eq!(value, 91u32.to_le_bytes());
-        first_alias
-            .write_value(GuestVirtualAddress::new(PAGE_SIZE), 4, 12)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(first.is_invalid());
-    }
-
-    fn invalidations(context: &crate::CoreContext) -> Vec<crate::CodeInvalidation> {
-        let native = context.enter_native().unwrap();
-        let mut ranges = Vec::new();
-        native
-            .synchronize_code(|range| {
-                ranges.push(range);
-                Ok(())
-            })
-            .unwrap();
-        ranges
-    }
-    #[test]
-    fn code_write_quiesces_every_executable_alias_before_publishing_new_instructions() {
-        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(2 * PAGE_SIZE)
-            .unwrap()
-            .allocate(2 * PAGE_SIZE)
-            .unwrap();
-        let data = mapping(&machine, allocation.clone(), 0x20000);
-        let mut executable = Vec::new();
-        for base in [0x1000, 0x9000] {
-            let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-            space
-                .map(
-                    GuestVirtualAddress::new(base),
-                    allocation.clone(),
-                    0,
-                    2 * PAGE_SIZE,
-                    MemoryPermissions::READ_EXECUTE,
-                )
-                .unwrap();
-            executable.push((space, base));
-        }
-        let spans = data
-            .capture(
-                GuestVirtualAddress::new(0x20010),
-                4,
-                MemoryPermissions::READ,
-            )
-            .unwrap();
-        let code = crate::Observation::default();
-        let crate::AccessResult::Read(code_bytes) = machine
-            .access_captured(&spans, crate::AccessOperation::ReadCode(code.clone()))
-            .unwrap()
-            .into_ready()
-            .unwrap()
-        else {
-            panic!("expected captured bytes")
-        };
-        assert_eq!(&*code_bytes, &[0; 4]);
-        assert!(!host_store(&data, 0x20010));
-        let data_context = data.register_core(Arc::new(|| {}));
-        let (interrupt, interrupts) = std::sync::mpsc::channel();
-        let (ready, running) = std::sync::mpsc::channel();
-        let barrier = Arc::new(std::sync::Barrier::new(3));
-        let mut cores = Vec::new();
-        for (space, base) in executable {
-            let interrupt = interrupt.clone();
-            let context = space.register_core(Arc::new(move || {
-                interrupt.send(()).unwrap();
-            }));
-            let ready = ready.clone();
-            let barrier = Arc::clone(&barrier);
-            cores.push(thread::spawn(move || {
-                let native = context.enter_native().unwrap();
-                ready.send(()).unwrap();
-                barrier.wait();
-                native.suspend();
-                native.resume().unwrap();
-                let mut ranges = Vec::new();
-                native
-                    .synchronize_code(|range| {
-                        ranges.push(range);
-                        Ok(())
-                    })
-                    .unwrap();
-                assert_eq!(
-                    ranges,
-                    [crate::CodeInvalidation {
-                        start: GuestVirtualAddress::new(base),
-                        bytes: PAGE_SIZE,
-                    }]
-                );
-                let pointer = space
-                    .native_data_base()
-                    .as_ptr()
-                    .wrapping_add(base as usize + 16);
-                // The admitted core sees only the published instruction bytes.
-                assert_eq!(unsafe { crate::raw::read_value(pointer, 4) }, 0xd503201f);
-            }));
-        }
-        running.recv().unwrap();
-        running.recv().unwrap();
-        let writer_space = Arc::clone(&data);
-        let writer = thread::spawn(move || {
-            writer_space
-                .write_value(GuestVirtualAddress::new(0x20010), 4, 0xd503201f)
-                .unwrap()
-                .into_ready()
-                .unwrap();
-        });
-        interrupts.recv_timeout(Duration::from_secs(1)).unwrap();
-        interrupts.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(!code.is_invalid());
-        barrier.wait();
-        writer.join().unwrap();
-        for core in cores {
-            core.join().unwrap();
-        }
-        assert!(code.is_invalid());
-        assert!(invalidations(&data_context).is_empty());
-        assert!(host_store(&data, 0x20010));
-    }
-
-    #[test]
-    fn buffer_dirty_watch_survives_snapshot_invalidation_and_download() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let input = AllocationRange::new(allocation.pin(), 0, PAGE_SIZE).unwrap();
-        let physical = input.physical_extents().next().unwrap().start;
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(0x7000);
-        space
-            .map(
-                base,
-                allocation,
-                0,
-                PAGE_SIZE,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        machine
-            .capture_resource_scattered(std::slice::from_ref(&input), &[], &mut [])
-            .unwrap();
-        assert_eq!(machine.tracking_statistics().observer_registrations, 0);
-        let snapshot = Observation::default();
-        machine
-            .access_captured(
-                std::slice::from_ref(&input),
-                crate::AccessOperation::ReadObserved(snapshot.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        machine
-            .publish_device_write(std::slice::from_ref(&input), || Ok(()))
-            .unwrap();
-        assert!(snapshot.is_invalid());
-        machine
-            .write_download(&input, &vec![0x73; PAGE_SIZE as usize], || {
-                Ok(std::iter::once(0..PAGE_SIZE as usize).collect())
-            })
-            .unwrap();
-        machine
-            .retire_device_pages(std::slice::from_ref(&input))
-            .unwrap();
-        assert!(machine.take_cpu_modified_pages().is_empty());
-        assert!(!host_store(&space, base.get()));
-        space.write_value(base, 4, 7).unwrap().into_ready().unwrap();
-        assert_eq!(
-            machine.take_cpu_modified_pages(),
-            [Extent {
-                start: physical,
-                bytes: PAGE_SIZE
-            }]
-        );
-        assert!(host_store(&space, base.get()));
-        let copy = PhysicalCapture {
-            source: Extent {
-                start: physical,
-                bytes: 4,
-            },
-            destination: 0,
-        };
-        let mut captured = [0; 4];
-        machine
-            .capture_resource_scattered(&[input.slice(0, 4).unwrap()], &[copy], &mut captured)
-            .unwrap();
-        assert_eq!(captured, 42u32.to_le_bytes());
-        assert!(!host_store(&space, base.get()));
-        space.write_value(base, 4, 9).unwrap().into_ready().unwrap();
-        assert_eq!(
-            machine.take_cpu_modified_pages(),
-            [Extent {
-                start: physical,
-                bytes: PAGE_SIZE
-            }]
-        );
-    }
-    #[test]
-    fn repeated_device_publication_invalidates_new_code_without_reprotecting_pages() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(0x7000);
-        space
-            .map(
-                base,
-                allocation,
-                0,
-                PAGE_SIZE,
-                MemoryPermissions::READ_EXECUTE,
-            )
-            .unwrap();
-        let context = space.register_core(Arc::new(|| {}));
-        let ranges = space.capture(base, 4, MemoryPermissions::EXECUTE).unwrap();
-        machine.publish_device_write(&ranges, || Ok(())).unwrap();
-        let before = machine.tracking_statistics().protection_calls;
-        // The owner has resolved this exact demand; other bytes in the page
-        // can remain device-produced, so the device page stays inaccessible.
-        let code = crate::Observation::default();
-        machine
-            .apply_resolved_access(&ranges, &mut crate::AccessOperation::ReadCode(code.clone()))
-            .unwrap();
-        assert_eq!(machine.tracking_statistics().protection_calls, before);
-        assert!(invalidations(&context).is_empty());
-        machine
-            .publish_device_write(&ranges, || {
-                assert!(code.is_invalid());
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(
-            invalidations(&context),
-            [crate::CodeInvalidation {
-                start: base,
-                bytes: PAGE_SIZE
-            }]
-        );
-        assert_eq!(machine.tracking_statistics().protection_calls, before);
-    }
-    #[test]
-    fn captures_cannot_consume_other_views_pending_cpu_modification_pages() {
-        let machine = Machine::new(68 * PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(68 * PAGE_SIZE)
-            .unwrap()
-            .allocate(68 * PAGE_SIZE)
-            .unwrap();
-        let input = AllocationRange::new(allocation.pin(), 0, 68 * PAGE_SIZE).unwrap();
-        let first = crate::Observation::default();
-        machine
-            .access_captured(
-                std::slice::from_ref(&input),
-                crate::AccessOperation::ReadObserved(first.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        machine.take_cpu_modified_pages();
-        for offset in [65 * PAGE_SIZE + 7, PAGE_SIZE + 63] {
-            let write = AllocationRange::new(allocation.pin(), offset, 4).unwrap();
-            machine.write_resolved(&[write], &[7; 4]).unwrap();
-        }
-        let second = crate::Observation::default();
-        machine
-            .access_captured(
-                std::slice::from_ref(&input),
-                crate::AccessOperation::ReadObserved(second.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(first.is_invalid());
-        assert!(!second.is_invalid());
-        let mut pages = machine.take_cpu_modified_pages();
-        pages.sort_unstable_by_key(|extent| extent.start);
-        let start = input.physical_extents().next().unwrap().start.get();
-        assert_eq!(
-            pages,
-            [
-                Extent {
-                    start: ArenaOffset::new(start + PAGE_SIZE),
-                    bytes: PAGE_SIZE
-                },
-                Extent {
-                    start: ArenaOffset::new(start + 65 * PAGE_SIZE),
-                    bytes: PAGE_SIZE
-                }
-            ]
-        );
-        assert!(machine.take_cpu_modified_pages().is_empty());
-        let write = AllocationRange::new(allocation.pin(), PAGE_SIZE + 3, 1).unwrap();
-        machine.write_resolved(&[write], &[9]).unwrap();
-        assert_eq!(
-            machine.take_cpu_modified_pages(),
-            [Extent {
-                start: ArenaOffset::new(start + PAGE_SIZE),
-                bytes: PAGE_SIZE
-            }]
-        );
-    }
-
-    #[test]
-    fn first_write_invalidates_all_observers_and_restores_every_physical_alias() {
-        let machine = Machine::new(4 * PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(4 * PAGE_SIZE)
-            .unwrap()
-            .allocate(4 * PAGE_SIZE)
-            .unwrap();
-        let first = mapping(&machine, allocation.clone(), 0x4000);
-        let second = mapping(&machine, allocation, 0x9000);
-        assert_eq!(machine.tracking_statistics().protection_calls, 0);
-        assert!(host_store(&first, 0x4000));
-        let ranges = first
-            .capture(
-                GuestVirtualAddress::new(0x4000),
-                2 * PAGE_SIZE,
-                MemoryPermissions::READ,
-            )
-            .unwrap();
-        let a = crate::Observation::default();
-        machine
-            .access_captured(&ranges, crate::AccessOperation::ReadObserved(a.clone()))
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let b = crate::Observation::default();
-        machine
-            .access_captured(&ranges, crate::AccessOperation::ReadObserved(b.clone()))
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(!a.is_invalid());
-        assert!(!b.is_invalid());
-        assert!(!host_store(&first, 0x4000));
-        assert!(!host_store(&second, 0x9000));
-        let protected = machine.tracking_statistics().protection_calls;
-        assert_eq!(protected, 2);
-        second
-            .write_value(GuestVirtualAddress::new(0x9001), 4, 0x12345678)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(a.is_invalid());
-        assert!(b.is_invalid());
-        assert!(host_store(&first, 0x4000));
-        assert!(host_store(&second, 0x9000));
-        // The adjacent observed page remains protected until its own store.
-        assert!(!host_store(&second, 0xa000));
-        assert_eq!(
-            first
-                .read_value(GuestVirtualAddress::new(0x4001), 4)
-                .unwrap()
-                .into_ready()
-                .unwrap(),
-            0x12345678
-        );
-        second
-            .write(GuestVirtualAddress::new(0xafff), &[1, 2])
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(host_store(&second, 0xa000));
-        let before = machine.tracking_statistics();
-        for _ in 0..32 {
-            second
-                .write_value(GuestVirtualAddress::new(0x9001), 4, 19)
-                .unwrap()
-                .into_ready()
-                .unwrap();
-        }
-        assert_eq!(machine.tracking_statistics(), before);
-    }
-    #[test]
-    fn new_alias_and_guest_permission_replacement_preserve_existing_tracking() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let first = mapping(&machine, allocation.clone(), 0x1000);
-        let ranges = first
-            .capture(
-                GuestVirtualAddress::new(0x1000),
-                PAGE_SIZE,
-                MemoryPermissions::READ,
-            )
-            .unwrap();
-        let observed = crate::Observation::default();
-        machine
-            .access_captured(
-                &ranges,
-                crate::AccessOperation::ReadObserved(observed.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let second = mapping(&machine, allocation, 0x6000);
-        assert!(!host_store(&second, 0x6000));
-        second
-            .protect(
-                GuestVirtualAddress::new(0x6000),
-                PAGE_SIZE,
-                MemoryPermissions::READ,
-            )
-            .unwrap();
-        second
-            .protect(
-                GuestVirtualAddress::new(0x6000),
-                PAGE_SIZE,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        assert!(!host_store(&second, 0x6000));
-        second
-            .write(GuestVirtualAddress::new(0x6000), &[5])
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(observed.is_invalid());
-        assert_eq!(
-            first
-                .read_value(GuestVirtualAddress::new(0x1000), 1)
-                .unwrap()
-                .into_ready()
-                .unwrap(),
-            5
-        );
-    }
-    #[test]
-    fn partial_unmap_replaces_reverse_ranges_and_capture_does_not_pin_freed_ram() {
-        let machine = Machine::new(3 * PAGE_SIZE).unwrap();
-        let account = machine.account(3 * PAGE_SIZE).unwrap();
-        let allocation = account.allocate(3 * PAGE_SIZE).unwrap();
-        let pin = allocation.pin();
-        let cached_identity = pin.downgrade();
-        let space = mapping(&machine, allocation, 0x3000);
-        space
-            .unmap(GuestVirtualAddress::new(0x4000), PAGE_SIZE)
-            .unwrap();
-        assert_eq!(machine.aliases().index.len(), 2);
-        let ranges = vec![AllocationRange::new(pin, 0, 3 * PAGE_SIZE).unwrap()];
-        let observed = crate::Observation::default();
-        machine
-            .access_captured(
-                &ranges,
-                crate::AccessOperation::ReadObserved(observed.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(!host_store(&space, 0x3000));
-        assert!(!host_store(&space, 0x5000));
-        drop(space);
-        assert!(machine.aliases().index.is_empty());
-        assert!(!observed.is_invalid());
-        assert_eq!(account.used_bytes(), 0);
-        assert_eq!(machine.statistics().retained_bytes, 3 * PAGE_SIZE);
-        drop(ranges);
-        assert!(observed.is_invalid());
-        assert!(!cached_identity.is_live());
-        assert_eq!(machine.statistics().allocated_bytes, 0);
-        assert_eq!(machine.tracking_statistics().observer_pages, 0);
-        let recycled = account.allocate(3 * PAGE_SIZE).unwrap();
-        let fresh = mapping(&machine, recycled, 0x7000);
-        assert!(host_store(&fresh, 0x7000));
-    }
-    #[test]
-    fn code_capture_begins_all_core_interrupts_before_waiting_and_tracks_host_writes() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let first = mapping(&machine, allocation.clone(), 0x1000);
-        let second = mapping(&machine, allocation, 0x1000);
-        let ranges = first
-            .capture(
-                GuestVirtualAddress::new(0x1000),
-                PAGE_SIZE,
-                MemoryPermissions::READ,
-            )
-            .unwrap();
-        let (interrupt, interrupts) = std::sync::mpsc::channel();
-        let mut cores = Vec::new();
-        let (ready, running) = std::sync::mpsc::channel();
-        let barrier = Arc::new(std::sync::Barrier::new(3));
-        for space in [&first, &second] {
-            let interrupt = interrupt.clone();
-            let context = space.register_core(Arc::new(move || {
-                interrupt.send(()).unwrap();
-            }));
-            let barrier = Arc::clone(&barrier);
-            let ready = ready.clone();
-            cores.push(thread::spawn(move || {
-                let native = context.enter_native().unwrap();
-                ready.send(()).unwrap();
-                barrier.wait();
-                native.suspend();
-                native.resume().unwrap();
-            }));
-        }
-        running.recv().unwrap();
-        running.recv().unwrap();
-        let capture_machine = machine.clone();
-        let capture = thread::spawn(move || {
-            let observation = Observation::default();
-            capture_machine
-                .access_captured(
-                    &ranges,
-                    crate::AccessOperation::ReadCode(observation.clone()),
-                )
-                .unwrap()
-                .into_ready()
-                .unwrap();
-            observation
-        });
-        // Both requests must be issued even while the first core remains active.
-        interrupts.recv_timeout(Duration::from_secs(1)).unwrap();
-        interrupts.recv_timeout(Duration::from_secs(1)).unwrap();
-        barrier.wait();
-        let observation = capture.join().unwrap();
-        for core in cores {
-            core.join().unwrap();
-        }
-        first
-            .write(GuestVirtualAddress::new(0x1000), &[17])
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(observation.is_invalid());
-    }
-    #[test]
-    fn dirty_streaming_capture_does_not_install_tracking_or_clear_dirty_summaries() {
-        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(2 * PAGE_SIZE)
-            .unwrap()
-            .allocate(2 * PAGE_SIZE)
-            .unwrap();
-        let ranges = [AllocationRange::new(allocation.pin(), 0, 2 * PAGE_SIZE).unwrap()];
-        let weak = allocation.pin().downgrade();
-        let before = machine.tracking_statistics();
-        for byte in 0..8 {
-            let source = vec![byte; (2 * PAGE_SIZE) as usize];
-            machine.write_resolved(&ranges, &source).unwrap();
-            let mut destination = vec![0; source.len()];
-            machine.capture_stream(&ranges, &mut destination).unwrap();
-            assert_eq!(source, destination);
-            destination.fill(0xff);
-            weak.capture_stream(0, &mut destination).unwrap();
-            assert_eq!(source, destination);
-        }
-        assert_eq!(
-            machine.tracking_statistics().protection_calls,
-            before.protection_calls
-        );
-        assert_eq!(machine.tracking_statistics().observer_pages, 0);
-    }
-
-    #[test]
-    fn observations_follow_exact_physical_lifetime_after_cpu_guest_release() {
-        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
-        let account = machine.account(2 * PAGE_SIZE).unwrap();
-        let allocation = account.allocate(2 * PAGE_SIZE).unwrap();
-        let first = AllocationRange::new(allocation.pin_range(0, PAGE_SIZE).unwrap(), 0, PAGE_SIZE)
-            .unwrap();
-        let native = AllocationRange::new(
-            allocation.pin_range(PAGE_SIZE, PAGE_SIZE).unwrap(),
-            PAGE_SIZE,
-            PAGE_SIZE,
-        )
-        .unwrap();
-        let observations = [&first, &native].map(|range| {
-            let observation = Observation::default();
-            machine
-                .access_captured(
-                    std::slice::from_ref(range),
-                    crate::AccessOperation::ReadObserved(observation.clone()),
-                )
-                .unwrap()
-                .into_ready()
-                .unwrap();
-            observation
-        });
-        drop(first);
-        drop(allocation);
-        assert_eq!(account.used_bytes(), 0);
-        assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
-        assert!(observations[0].is_invalid());
-        assert!(!observations[1].is_invalid());
-        let captured_after_cpu_release = crate::Observation::default();
-        machine
-            .access_captured(
-                std::slice::from_ref(&native),
-                crate::AccessOperation::ReadObserved(captured_after_cpu_release.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(!captured_after_cpu_release.is_invalid());
-        machine
-            .write_resolved(std::slice::from_ref(&native), &vec![7; PAGE_SIZE as usize])
-            .unwrap();
-        assert!(observations[1].is_invalid());
-        assert!(captured_after_cpu_release.is_invalid());
-        let last = crate::Observation::default();
-        machine
-            .access_captured(
-                std::slice::from_ref(&native),
-                crate::AccessOperation::ReadObserved(last.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(!last.is_invalid());
-        drop(native);
-        assert!(last.is_invalid());
-        assert_eq!(machine.statistics().allocated_bytes, 0);
-        let recycled = account.allocate(PAGE_SIZE).unwrap();
-        assert!(last.is_invalid());
-        assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
-        drop(recycled);
-    }
-
-    #[test]
-    fn atomic_transforms_use_exact_width_and_compare_failures_preserve_observers() {
-        use crate::{
-            AccessOperation, AccessOrdering, AccessResult, AtomicAccess, AtomicOperation,
-            AtomicTransform,
-        };
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let range = AllocationRange::new(allocation.pin(), 0, 1).unwrap();
-        machine
-            .write_resolved(std::slice::from_ref(&range), &[0xff])
-            .unwrap();
-        let observed = crate::Observation::default();
-        machine
-            .access_captured(
-                std::slice::from_ref(&range),
-                crate::AccessOperation::ReadObserved(observed.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let access = AtomicAccess {
-            bytes: 1,
-            ordering: AccessOrdering::AcquireRelease,
-            operation: AtomicOperation::CompareExchange {
-                expected: 2,
-                replacement: 3,
-            },
-        };
-        assert_eq!(
-            machine.atomic_physical(&range, access).unwrap(),
-            AccessResult::Atomic {
-                previous: 0xff,
-                written: false
-            }
-        );
-        assert!(!observed.is_invalid());
-        for (transform, operand, expected) in [
-            (AtomicTransform::SignedMaximum, 127, 127),
-            (AtomicTransform::SignedMinimum, 255, 255),
-            (AtomicTransform::Add, 2, 1),
-            (AtomicTransform::UnsignedMaximum, 200, 200),
-            (AtomicTransform::UnsignedMinimum, 7, 7),
-            (AtomicTransform::Xor, 3, 4),
-            (AtomicTransform::Set, 2, 6),
-            (AtomicTransform::Clear, 4, 2),
-            (AtomicTransform::Swap, 0x1234, 0x34),
-        ] {
-            let access = AtomicAccess {
-                operation: AtomicOperation::ReadModifyWrite { transform, operand },
-                ..access
-            };
-            assert!(matches!(
-                machine.atomic_physical(&range, access).unwrap(),
-                AccessResult::Atomic { written: true, .. }
-            ));
-            let read = machine
-                .apply_resolved_access(
-                    std::slice::from_ref(&range),
-                    &mut AccessOperation::Read(Vec::new()),
-                )
-                .unwrap();
-            assert_eq!(read, AccessResult::Read(Vec::from([expected])));
-        }
-        assert!(observed.is_invalid());
-        for width in [2, 4, 8, 16] {
-            let range = AllocationRange::new(allocation.pin(), 0, width).unwrap();
-            machine
-                .write_resolved(std::slice::from_ref(&range), &vec![0xff; width as usize])
-                .unwrap();
-            let access = AtomicAccess {
-                bytes: width as u8,
-                operation: AtomicOperation::ReadModifyWrite {
-                    transform: AtomicTransform::Add,
-                    operand: 1,
-                },
-                ..access
-            };
-            let expected = u128::MAX >> (128 - width * 8);
-            assert_eq!(
-                machine.atomic_physical(&range, access).unwrap(),
-                AccessResult::Atomic {
-                    previous: expected,
-                    written: true
-                }
-            );
-            let mut bytes = vec![1; width as usize];
-            machine.capture_stream(&[range], &mut bytes).unwrap();
-            assert_eq!(bytes, vec![0; width as usize]);
-        }
-    }
-
-    #[test]
-    fn scattered_capture_observes_once_and_preserves_uncopied_destination_bytes() {
-        let machine = Machine::new(3 * PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(3 * PAGE_SIZE)
-            .unwrap()
-            .allocate(3 * PAGE_SIZE)
-            .unwrap();
-        let input = AllocationRange::new(allocation.pin(), 0, 2 * PAGE_SIZE).unwrap();
-        let physical = input.physical_extents().next().unwrap().start;
-        let first = AllocationRange::new(allocation.pin(), 7, 3).unwrap();
-        let second = AllocationRange::new(allocation.pin(), PAGE_SIZE + 5, 4).unwrap();
-        machine
-            .write_resolved(std::slice::from_ref(&first), &[1, 2, 3])
-            .unwrap();
-        machine
-            .write_resolved(std::slice::from_ref(&second), &[4, 5, 6, 7])
-            .unwrap();
-        let copies = [
-            PhysicalCapture {
-                source: Extent {
-                    start: ArenaOffset::new(physical.get() + 7),
-                    bytes: 3,
-                },
-                destination: 20,
-            },
-            PhysicalCapture {
-                source: Extent {
-                    start: ArenaOffset::new(physical.get() + PAGE_SIZE + 5),
-                    bytes: 4,
-                },
-                destination: 0,
-            },
-        ];
-        let mut bytes = [0xcc; 32];
-        machine
-            .capture_resource_scattered(&[input.clone(), input.clone()], &copies, &mut bytes)
-            .unwrap();
-        assert_eq!(&bytes[0..4], &[4, 5, 6, 7]);
-        assert_eq!(&bytes[20..23], &[1, 2, 3]);
-        assert!(
-            bytes[4..20]
-                .iter()
-                .chain(&bytes[23..])
-                .all(|byte| *byte == 0xcc)
-        );
-        assert_eq!(machine.tracking_statistics().observer_registrations, 0);
-        assert!(machine.resource_pages_tracked(input.physical_extents().next().unwrap()));
-        let before = machine.tracking_statistics();
-        let invalid = PhysicalCapture {
-            source: Extent {
-                start: ArenaOffset::new(physical.get() + 2 * PAGE_SIZE),
-                bytes: 1,
-            },
-            destination: 0,
-        };
-        assert!(
-            machine
-                .capture_resource_scattered(std::slice::from_ref(&input), &[invalid], &mut bytes)
-                .is_err()
-        );
-        assert!(
-            machine
-                .capture_resource_scattered(std::slice::from_ref(&input), &copies, &mut bytes[..2])
-                .is_err()
-        );
-        assert_eq!(machine.tracking_statistics(), before);
-        machine.write_resolved(&[first], &[8, 9, 10]).unwrap();
-        assert!(!machine.resource_pages_tracked(Extent {
-            start: physical,
-            bytes: 2 * PAGE_SIZE
-        }));
-        machine
-            .capture_resource_scattered(std::slice::from_ref(&input), &copies, &mut bytes)
-            .unwrap();
-        drop(second);
-        drop(input);
-        drop(allocation);
-        assert!(!machine.resource_pages_tracked(Extent {
-            start: physical,
-            bytes: 2 * PAGE_SIZE
-        }));
-        assert_eq!(machine.statistics().allocated_bytes, 0);
     }
 }

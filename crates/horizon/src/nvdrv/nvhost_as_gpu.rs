@@ -152,9 +152,19 @@ pub(super) fn ioctl_nvhost_as_gpu(
                 .allocation_metadata()
                 .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
             let backing = object
-                .ranges()
-                .map(<[nixe_memory::AllocationRange]>::to_vec)
-                .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
+                .pin_device(address_space.memory().device_memory())
+                .map_err(|fault| {
+                    NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::PhysicalMemory {
+                        context: NvDrvErrorContext::new(
+                            descriptor.kind(),
+                            request,
+                            descriptor.fd(),
+                            Some(handle),
+                            NvDrvValidationReason::PhysicalMemoryUnavailable,
+                        ),
+                        fault: std::sync::Arc::new(fault),
+                    })
+                })?;
             let mapping_size = if mapping_size == 0 {
                 u64::from(object.size())
             } else {
@@ -174,7 +184,7 @@ pub(super) fn ioctl_nvhost_as_gpu(
                     page_size: 0,
                     kind: decode_kind(kind, metadata.kind())?,
                     cacheable: flags & MAP_CACHEABLE != 0,
-                    permissions: metadata.gpu_mapping_permissions(),
+
                     fixed_offset: (flags & MAP_FIXED != 0).then_some(offset),
                 })
                 .map_err(driver_result)?;
@@ -259,13 +269,23 @@ fn remap(
             let object = nvmap
                 .object_snapshot_by_owned_handle(owner, handle)
                 .map_err(nvmap_driver_result)?;
-            let metadata = object
+            object
                 .allocation_metadata()
                 .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
             let backing = object
-                .ranges()
-                .map(<[nixe_memory::AllocationRange]>::to_vec)
-                .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
+                .pin_device(address_space.memory().device_memory())
+                .map_err(|fault| {
+                    NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::PhysicalMemory {
+                        context: NvDrvErrorContext::new(
+                            descriptor.kind(),
+                            request,
+                            descriptor.fd(),
+                            Some(handle),
+                            NvDrvValidationReason::PhysicalMemoryUnavailable,
+                        ),
+                        fault: std::sync::Arc::new(fault),
+                    })
+                })?;
             let backing_offset = u64::from(input_u32(entry, 8)?)
                 .checked_mul(big_page_size)
                 .ok_or_else(|| driver_result(MaxwellAddressSpaceError::ArithmeticOverflow))?;
@@ -275,7 +295,6 @@ fn remap(
                 backing_offset,
                 kind: decode_explicit_kind(u32::from(input_u16(entry, 2)?))?,
                 cacheable: flags & REMAP_CACHEABLE != 0,
-                permissions: metadata.gpu_mapping_permissions(),
             })
         };
         entries.push(MaxwellSparseRemapRequest {
@@ -363,7 +382,6 @@ fn address_space_driver_result(
         | MaxwellAddressSpaceError::UnknownMapping
         | MaxwellAddressSpaceError::PartialMapping
         | MaxwellAddressSpaceError::InvalidBackingRange
-        | MaxwellAddressSpaceError::InvalidMappingPermissions
         | MaxwellAddressSpaceError::InvalidKind { .. }
         | MaxwellAddressSpaceError::Address(_) => NV_BAD_VALUE,
         MaxwellAddressSpaceError::MappingIdentityExhausted

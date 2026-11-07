@@ -1,34 +1,6 @@
 //! Completion and visibility contracts for the concrete GPU owner.
-use crate::{BackendSubmissionToken, FrontendSubmissionId, ResourceDependency};
+use crate::ResourceDependency;
 use std::fmt::{Display, Formatter};
-
-/// Evidence that the native producer prefix finished.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BackendExecutionCompletion {
-    frontend: FrontendSubmissionId,
-    submission: BackendSubmissionToken,
-}
-
-impl BackendExecutionCompletion {
-    /// Construct only after the native producer prefix has completed.
-    #[must_use]
-    pub const fn new(frontend: FrontendSubmissionId, submission: BackendSubmissionToken) -> Self {
-        Self {
-            frontend,
-            submission,
-        }
-    }
-
-    #[must_use]
-    pub const fn frontend(self) -> FrontendSubmissionId {
-        self.frontend
-    }
-
-    #[must_use]
-    pub const fn submission(self) -> BackendSubmissionToken {
-        self.submission
-    }
-}
 
 /// Typed failure at the neutral runtime boundary.
 #[derive(Clone, Debug)]

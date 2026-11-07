@@ -291,49 +291,51 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
             "GPU backend initialized: api=Vulkan native adapter={}",
             device.profile().name
         );
-        let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
-            process.memory().space().machine().clone(),
-            device,
-            nixe_gpu_maxwell::MAXWELL_SHADER_NAMESPACE,
-            nixe_gpu_vulkan::cache::CacheConfiguration {
-                directory: Some(config.gpu.cache_directory.clone()),
-                pipeline_namespace: Some(nixe_gpu::shader_identity::ContentId::of(
-                    b"nixe-application-pipelines",
-                    &[title.identifier.to_string().as_bytes()],
-                )),
-                shader_entries: config.gpu.shader_entries,
-                pipeline_entries: config.gpu.pipeline_entries,
-                persistent_bytes: config.gpu.persistent_bytes,
-                ..Default::default()
-            },
-            u64::MAX, // Residency derives its headroom from the device heap budget.
-        )
-        .map_err(|e| e.to_string())?;
-        if let Some(client) = native_presentation {
-            renderer
-                .attach_presentation(client, config.video.vsync)
-                .map_err(|e| e.to_string())?;
-        }
-        let mut maxwell = nixe_gpu_maxwell::MaxwellNativeFrontend::new(
-            renderer.device_profile().shader_compiler.clone(),
+        let device_memory =
+            nixe_gpu_maxwell::MaxwellDeviceMemory::new(process.memory().space().machine().clone());
+        let cache_configuration = nixe_gpu_vulkan::cache::CacheConfiguration {
+            directory: Some(config.gpu.cache_directory.clone()),
+            shader_entries: config.gpu.shader_entries,
+            pipeline_entries: config.gpu.pipeline_entries,
+            persistent_bytes: config.gpu.persistent_bytes,
+            ..Default::default()
+        };
+        let capture_directory = config.gpu.cache_directory.clone();
+        let pipeline_namespace = nixe_gpu::shader_identity::ContentId::of(
+            b"nixe-application-pipelines",
+            &[title.identifier.to_string().as_bytes()],
         );
-        maxwell.set_capture_cache(
-            &config.gpu.cache_directory,
-            nixe_gpu::shader_identity::ContentId::of(
-                b"nixe-application-pipelines",
-                &[title.identifier.to_string().as_bytes()],
-            ),
-            config.gpu.persistent_bytes,
-        );
-        let gpu_diagnostics = (renderer.cache_monitor(), renderer.frame_metrics());
-        let video = VideoSystem::with_gpu_frontend(
-            process.memory().space().machine().clone(),
-            &kernel,
-            presenter,
-            renderer,
-            maxwell,
-        );
-        (video, gpu_diagnostics)
+        let persistent_bytes = config.gpu.persistent_bytes;
+        let maxwell = move |renderer: std::rc::Rc<
+            std::cell::RefCell<Option<nixe_gpu_vulkan::NativeGpuExecution>>,
+        >| {
+            let mut frontend = nixe_gpu_vulkan::MaxwellVulkanRasterizer::new(renderer);
+            frontend.set_capture_cache(&capture_directory, pipeline_namespace, persistent_bytes);
+            frontend
+        };
+        let native_memory = device_memory.device().clone();
+        let vsync = config.video.vsync;
+        let initialize = move || {
+            let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
+                native_memory,
+                device,
+                nixe_gpu_maxwell::MAXWELL_SHADER_NAMESPACE,
+                cache_configuration,
+                u64::MAX, // Residency derives headroom from the device heap budget.
+            )
+            .map_err(|error| nixe_gpu::BackendRuntimeError::Backend(error.to_string().into()))?;
+            if let Some(client) = native_presentation {
+                renderer
+                    .attach_presentation(client, vsync)
+                    .map_err(|error| {
+                        nixe_gpu::BackendRuntimeError::Backend(error.to_string().into())
+                    })?;
+            }
+            let diagnostics = (renderer.cache_monitor(), renderer.frame_metrics());
+            Ok((renderer, diagnostics))
+        };
+        VideoSystem::with_gpu_frontend(device_memory, &kernel, presenter, initialize, maxwell)
+            .map_err(|error| error.to_string())?
     };
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     // SDL initialization and final subsystem shutdown remain on the main thread.
@@ -750,6 +752,9 @@ fn execute(
     runtime
         .start(dispatcher.clone())
         .map_err(|error| error.to_string())?;
+    dispatcher
+        .start_video(runtime.event_sender())
+        .map_err(|error| error.to_string())?;
     let execution_started = runtime.emulation_elapsed();
     let execution_rate_enabled = log::log_enabled!(log::Level::Info);
     let mut last_rate_completions = 0_u64;
@@ -761,6 +766,9 @@ fn execute(
     loop {
         runtime
             .drain_external_events()
+            .map_err(|error| error.to_string())?;
+        dispatcher
+            .check_video()
             .map_err(|error| error.to_string())?;
         if runtime.host_stop_requested() {
             log::info!("host stop received; stopping the guest process cleanly");
@@ -793,9 +801,6 @@ fn execute(
             .saturating_sub(execution_started);
         dispatcher
             .poll_input_publication()
-            .map_err(|error| error.to_string())?;
-        dispatcher
-            .advance_video(elapsed)
             .map_err(|error| error.to_string())?;
         if let Some(sample) = host_input
             .controller
@@ -850,14 +855,8 @@ fn execute(
                 .map_err(|error| format!("cannot publish Horizon touch-screen state: {error}"))?;
             last_input_sample = Some(sample.captured_at);
         }
-        let host_wait = host_service_wait_duration(
-            runtime
-                .emulation_elapsed()
-                .saturating_sub(execution_started),
-            dispatcher.next_video_deadline(),
-        );
         runtime
-            .wait_events(host_wait)
+            .wait_events(Duration::MAX)
             .map_err(|error| error.to_string())?;
         if runtime
             .process(process_id)
@@ -955,10 +954,6 @@ fn report_input_change(
         None => log::warn!("no matching first-gamepad input profile; player one is disconnected"),
     }
     *active = next;
-}
-
-fn host_service_wait_duration(now: Duration, next_video_deadline: Duration) -> Duration {
-    next_video_deadline.saturating_sub(now)
 }
 
 fn button_transitions(
@@ -1155,22 +1150,6 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<RunnableProcess>();
-    }
-
-    #[test]
-    fn host_service_wait_is_bounded_by_the_next_video_deadline() {
-        assert_eq!(
-            host_service_wait_duration(Duration::from_millis(7), Duration::from_millis(12)),
-            Duration::from_millis(5)
-        );
-        assert_eq!(
-            host_service_wait_duration(Duration::from_millis(12), Duration::from_millis(12)),
-            Duration::ZERO
-        );
-        assert_eq!(
-            host_service_wait_duration(Duration::from_millis(13), Duration::from_millis(12)),
-            Duration::ZERO
-        );
     }
 
     #[test]

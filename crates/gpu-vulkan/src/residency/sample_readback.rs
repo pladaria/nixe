@@ -1,6 +1,6 @@
 //! CPU visibility reads individual samples, never an averaged color resolve.
 //! Host utilities use the renderer's shared pipeline compiler and normal recorder.
-use super::{image::ImagePiece, *};
+use super::*;
 use crate::{Draw, GraphicsParameters, RenderAttachment, RenderingTargets, cache::*};
 use nixe_gpu::{
     ShaderStage,
@@ -45,39 +45,40 @@ fn artifact(stencil: bool) -> Arc<ShaderArtifact> {
         ])))
     }))
 }
-impl VulkanResidency {
+impl Residency<'_> {
     pub fn enable_sample_conversion(&mut self, compiler: Arc<PipelineCompiler>) {
-        self.sample_conversion = Some(SampleConversion {
+        self.texture_cache.sample_conversion = Some(SampleConversion {
             compiler,
-            descriptors: DescriptorCache::new(&self.device),
+            descriptors: DescriptorCache::new(&self.runtime.device),
             pipelines: [None, None],
         });
     }
-    pub(super) fn sample_readback_window(
+    pub(super) fn sample_readback_plane(
         &mut self,
         id: ImageId,
-        piece: ImagePiece,
+        plane: ImagePlane,
     ) -> Result<AttachmentId, VulkanError> {
-        let mut conversion = self
-            .sample_conversion
-            .take()
-            .ok_or(VulkanError::InvalidResource(
-                "multisample CPU visibility needs the shared pipeline compiler",
-            ))?;
-        self.constructing.push(Resource::Image(id));
-        let result = self.record_sample_window(id, piece, &mut conversion);
+        let mut conversion =
+            self.texture_cache
+                .sample_conversion
+                .take()
+                .ok_or(VulkanError::InvalidResource(
+                    "multisample CPU visibility needs the shared pipeline compiler",
+                ))?;
+        self.runtime.constructing.push(Resource::Image(id));
+        let result = self.record_sample_plane(id, plane, &mut conversion);
         self.unpin(Resource::Image(id));
-        self.sample_conversion = Some(conversion);
+        self.texture_cache.sample_conversion = Some(conversion);
         result
     }
-    fn record_sample_window(
+    fn record_sample_plane(
         &mut self,
         id: ImageId,
-        piece: ImagePiece,
+        plane: ImagePlane,
         conversion: &mut SampleConversion,
     ) -> Result<AttachmentId, VulkanError> {
-        let entry = self.image(id)?;
-        let p = piece.plane;
+        let entry = self.texture_cache.get(id);
+        let p = plane;
         let grid = entry.sample_grid;
         let format = match entry.description.format {
             vk::Format::R8G8B8A8_SRGB => vk::Format::R8G8B8A8_UNORM,
@@ -125,6 +126,7 @@ impl VulkanResidency {
         let source = self.image_view(
             id,
             ImageViewDescription {
+                size: p.extent,
                 format,
                 view_type: vk::ImageViewType::TYPE_2D,
                 aspects: p.aspect,
@@ -135,28 +137,10 @@ impl VulkanResidency {
                 swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
             },
         )?;
-        // Authority reads the historical native producer. Other CPU-owned pages
-        // of this allocation may already have changed; refreshing the whole
-        // canonical representation here would overwrite the samples being read.
-        let native_plane = *self
-            .image(id)?
-            .planes
-            .iter()
-            .find(|plane| {
-                plane.aspect == p.aspect
-                    && plane.mip_level == p.mip_level
-                    && plane.array_layer == p.array_layer
-            })
-            .expect("sample readback plane");
-        let (_, layout) = self.image_access_subresources(
-            id,
-            commands::plane_range(native_plane),
-            AccessScope {
-                stages: vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                access: vk::AccessFlags2::SHADER_SAMPLED_READ,
-            },
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        )?;
+        // Download the native samples before refreshing CPU-modified contents,
+        // as TextureCache::DownloadMemory does in the reference implementation.
+        self.shader_image(id)?;
+        let layout = vk::ImageLayout::GENERAL;
         let record = conversion.descriptors.get(
             &pipeline.layout,
             &[DescriptorResource::Image {
@@ -165,8 +149,8 @@ impl VulkanResidency {
             }],
         )?;
         let extent = vk::Extent2D {
-            width: piece.blocks,
-            height: piece.rows,
+            width: p.extent.width.div_ceil(p.block_extent.width),
+            height: p.rows(),
         };
         let target = self.attachment_image(NativeImageDescription {
             image_type: vk::ImageType::TYPE_2D,
@@ -201,13 +185,13 @@ impl VulkanResidency {
             depth: None,
             stencil: None,
         })?;
-        let draw = self.prepare_draw(graphics, targets, Box::new([]), None)?;
-        let push: Vec<_> = [grid[0], grid[1], piece.row, kind]
+        let push: Vec<_> = [grid[0], grid[1], 0, kind]
             .into_iter()
             .flat_map(u32::to_le_bytes)
             .collect();
         self.draw(
-            &draw,
+            &graphics,
+            &targets,
             Draw::Direct {
                 vertices: 3,
                 instances: 1,

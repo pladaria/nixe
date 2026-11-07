@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <utility>
+
 #include <mcl/bit_cast.hpp>
 
 #include "dynarmic/backend/x64/a32_emit_x64.h"
@@ -74,7 +76,7 @@ Xbyak::RegExp EmitVAddrLookup(BlockOfCode& code, EmitContext& ctx, size_t bitsiz
 template<>
 [[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A32EmitContext>(BlockOfCode& code, A32EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr) {
     const Xbyak::Reg64 page = ctx.reg_alloc.ScratchGpr();
-    const Xbyak::Reg32 tmp = ctx.conf.absolute_offset_page_table ? page.cvt32() : ctx.reg_alloc.ScratchGpr().cvt32();
+    const Xbyak::Reg32 tmp = ctx.conf.absolute_offset_page_table && ctx.conf.page_table_pointer_mask == 0 ? page.cvt32() : ctx.reg_alloc.ScratchGpr().cvt32();
 
     EmitDetectMisalignedVAddr(code, ctx, bitsize, abort, vaddr, tmp.cvt64());
 
@@ -84,10 +86,19 @@ template<>
     code.shr(tmp, static_cast<int>(page_bits));
 
     code.mov(page, qword[r14 + tmp.cvt64() * sizeof(void*)]);
-    if (ctx.conf.page_table_pointer_mask_bits == 0) {
+    // Consume the marked atomic pointer exactly as Eden's page-table path.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+    if (ctx.conf.page_table_marked_bit) {
+        code.bt(page, *ctx.conf.page_table_marked_bit);
+        code.jc(abort, code.T_NEAR);
+    }
+    if (ctx.conf.page_table_pointer_mask == 0) {
         code.test(page, page);
+    } else if (std::in_range<s32>(ctx.conf.page_table_pointer_mask)) {
+        code.and_(page, static_cast<s32>(ctx.conf.page_table_pointer_mask));
     } else {
-        code.and_(page, ~u32(0) << ctx.conf.page_table_pointer_mask_bits);
+        code.mov(tmp.cvt64(), ctx.conf.page_table_pointer_mask);
+        code.and_(page, tmp.cvt64());
     }
     code.jz(abort, code.T_NEAR);
     if (ctx.conf.absolute_offset_page_table) {
@@ -104,7 +115,7 @@ template<>
     const size_t unused_top_bits = 64 - ctx.conf.page_table_address_space_bits;
 
     const Xbyak::Reg64 page = ctx.reg_alloc.ScratchGpr();
-    const Xbyak::Reg64 tmp = ctx.conf.absolute_offset_page_table ? page : ctx.reg_alloc.ScratchGpr();
+    const Xbyak::Reg64 tmp = ctx.conf.absolute_offset_page_table && ctx.conf.page_table_pointer_mask == 0 ? page : ctx.reg_alloc.ScratchGpr();
 
     EmitDetectMisalignedVAddr(code, ctx, bitsize, abort, vaddr, tmp);
 
@@ -137,10 +148,19 @@ template<>
         code.jnz(abort, code.T_NEAR);
     }
     code.mov(page, qword[r14 + tmp * sizeof(void*)]);
-    if (ctx.conf.page_table_pointer_mask_bits == 0) {
+    // Consume the marked atomic pointer exactly as Eden's page-table path.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+    if (ctx.conf.page_table_marked_bit) {
+        code.bt(page, *ctx.conf.page_table_marked_bit);
+        code.jc(abort, code.T_NEAR);
+    }
+    if (ctx.conf.page_table_pointer_mask == 0) {
         code.test(page, page);
+    } else if (std::in_range<s32>(ctx.conf.page_table_pointer_mask)) {
+        code.and_(page, static_cast<s32>(ctx.conf.page_table_pointer_mask));
     } else {
-        code.and_(page, ~u32(0) << ctx.conf.page_table_pointer_mask_bits);
+        code.mov(tmp, ctx.conf.page_table_pointer_mask);
+        code.and_(page, tmp);
     }
     code.jz(abort, code.T_NEAR);
     if (ctx.conf.absolute_offset_page_table) {
@@ -198,15 +218,6 @@ template<>
         return r13 + vaddr;
     }
 }
-
-// Our physical-memory profile permits genuine read-only guest aliases.
-// Retain the original locked read's full ordering without writing guest RAM.
-// Intel SDM, Vol. 3, memory ordering and MFENCE:
-// https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
-inline bool UseNonWritingOrderedReads(const A64::UserConfig& conf) {
-    return conf.canonical_page_table != 0;
-}
-inline bool UseNonWritingOrderedReads(const A32::UserConfig&) { return false; }
 
 template<std::size_t bitsize>
 const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {

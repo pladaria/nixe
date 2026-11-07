@@ -1,13 +1,10 @@
 //! One GPU command owner: translation and resource consumption share command order.
 use super::nvhost_ctrl::NvHostControl;
 use super::{NvDrvDeviceDescriptor, NvDrvValidationReason};
-use nixe_gpu::{
-    BackendSubmissionToken, FrontendSubmissionId, GpuExecution, PresentationImageRequest,
-    ReservedTimelinePoint, ResidentImage,
-};
+use nixe_gpu::{FrontendSubmissionId, GpuExecution, ReservedTimelinePoint};
 use nixe_gpu_maxwell::{
     MaxwellChannelConfiguration, MaxwellFrontend, MaxwellFrontendDispatch,
-    MaxwellFrontendDispatchBoundary, MaxwellGpuMemory, stream_maxwell_frontend,
+    MaxwellFrontendDispatchBoundary, MaxwellGpuMemoryHandle, stream_maxwell_frontend,
 };
 use nixe_memory::{
     AccessRequestId, AllocationId, DeviceAccessEndpoint, DeviceAccessRequest, Extent, Machine,
@@ -18,6 +15,7 @@ use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
+use nixe_gpu_maxwell::PresentationImageRequest;
 mod owner;
 
 // Bound owned ingress independently of native completion.
@@ -63,25 +61,19 @@ pub(super) struct GpuSubmission {
     request: u32,
     dispatch: MaxwellFrontendDispatch,
     channel: MaxwellChannelConfiguration,
-    address_space: MaxwellGpuMemory,
+    address_space: nixe_gpu_maxwell::MaxwellAddressSpaceId,
     reservation: Option<ReservedTimelinePoint>,
-    control: Arc<Mutex<NvHostControl>>,
     permit: GpuFrontendPermit,
 }
 
 impl GpuSubmission {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "retained frontend delivery and its guest ABI ownership"
-    )]
     pub(super) fn new(
         descriptor: NvDrvDeviceDescriptor,
         request: u32,
         dispatch: MaxwellFrontendDispatch,
         channel: MaxwellChannelConfiguration,
-        address_space: MaxwellGpuMemory,
+        address_space: nixe_gpu_maxwell::MaxwellAddressSpaceId,
         reservation: Option<ReservedTimelinePoint>,
-        control: Arc<Mutex<NvHostControl>>,
         permit: GpuFrontendPermit,
     ) -> Self {
         Self {
@@ -91,7 +83,6 @@ impl GpuSubmission {
             channel,
             address_space,
             reservation,
-            control,
             permit,
         }
     }
@@ -101,26 +92,65 @@ struct GpuQueuedSubmission {
     submission: GpuSubmission,
     clock: nixe_runtime::VirtualClock,
 }
-struct PresentReply {
-    result: mpsc::SyncSender<Result<ResidentImage, Box<str>>>,
-    events: Option<nixe_runtime::ExternalEventSender>,
+struct CompositeRegistration {
+    result: mpsc::SyncSender<Result<(), Box<str>>>,
+    notification: std::task::Waker,
 }
-impl PresentReply {
-    fn complete(self, result: Result<ResidentImage, Box<str>>) {
-        // Publish before waking the display consumer, including failure replies.
-        if self.result.send(result).is_ok()
-            && let Some(events) = self.events
-        {
-            events.notify_host_service(nixe_runtime::ExternalEventSource::Worker);
+impl CompositeRegistration {
+    fn complete(self, result: Result<(), Box<str>>) {
+        // WaitForComposite waits for registration, not for the rendered image.
+        if self.result.send(result).is_ok() {
+            self.notification.wake();
         }
     }
 }
+pub(crate) struct Composite {
+    pub(crate) request: PresentationImageRequest,
+    pub(crate) swap_interval: u32,
+    pub(crate) presenter: nixe_video::FrameMailbox,
+    pub(crate) sequence: u64,
+    pub(crate) source: u64,
+    pub(crate) display_sequence: u64,
+}
+/// GPU::RequestComposite counts guest fence actions before scheduling the
+/// actual composition in the thread which consumes the final guest fence.
+pub(super) struct PendingComposite {
+    state: Mutex<(usize, Option<Composite>)>,
+    sender: mpsc::Sender<GpuMessage>,
+}
+impl PendingComposite {
+    pub(super) fn signal(&self) -> Option<Composite> {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.1.as_ref()?;
+            state.0 -= 1;
+            if state.0 != 0 {
+                return None;
+            }
+            state.1.take()
+        }
+    }
+    pub(super) fn signal_from_cpu(&self) {
+        if let Some(work) = self.signal() {
+            // CPU-issued increments cannot record Vulkan commands. Their
+            // callback enters the existing GPU inbox, as GPUThread work does.
+            let _ = self.sender.send(GpuMessage::Composite(work));
+        }
+    }
+    fn cancel(&self) {
+        self.state.lock().unwrap().1.take();
+    }
+}
+
 #[allow(
     clippy::large_enum_variant,
     reason = "retained deliveries are bounded by shared permits"
 )]
 enum GpuMessage {
+    CreateAddressSpace(MaxwellGpuMemoryHandle),
+    CreateChannel(nixe_gpu_maxwell::MaxwellChannelConfiguration),
     CloseChannel(nixe_gpu_maxwell::MaxwellChannelId),
+    CloseAddressSpace(nixe_gpu_maxwell::MaxwellAddressSpaceId),
     ConvertNv12 {
         destination: Box<nixe_gpu::ConversionImage>,
         transform: nixe_gpu::Nv12ColorTransform,
@@ -129,11 +159,12 @@ enum GpuMessage {
     },
 
     Submission(GpuQueuedSubmission),
-    PresentImage {
-        request: PresentationImageRequest,
-        swap_interval: u32,
-        reply: PresentReply,
+    RequestComposite {
+        composite: Composite,
+        fences: Box<[nixe_gpu::GuestTimelinePoint]>,
+        registration: CompositeRegistration,
     },
+    Composite(Composite),
     Wake,
     MemoryAccess(DeviceAccessRequest),
     CancelMemory(AccessRequestId),
@@ -340,28 +371,38 @@ impl std::fmt::Debug for NvDrvGpuExecutor {
     }
 }
 impl NvDrvGpuExecutor {
-    pub(super) fn new(machine: Machine, kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
+    pub(super) fn new(
+        machine: Machine,
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
+        control: Arc<Mutex<NvHostControl>>,
+    ) -> Self {
         Self::with_frontend(
             machine,
             kernel,
-            None::<std::convert::Infallible>,
-            nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),
+            control,
+            || Ok((None::<nixe_gpu_maxwell::MissingGpuExecution>, ())),
+            |_| nixe_gpu_maxwell::MissingRenderer,
         )
+        .expect("missing-renderer GPU owner initialization")
+        .0
     }
-    pub(super) fn with_frontend<E, L>(
+    pub(super) fn with_frontend<E, L, R>(
         machine: Machine,
         kernel: &Arc<nixe_scheduler::SchedulerState>,
-        mut backend: Option<E>,
-        cache: L,
-    ) -> Self
+        control: Arc<Mutex<NvHostControl>>,
+        initialize: impl FnOnce() -> Result<(Option<E>, R), nixe_gpu::BackendRuntimeError>
+        + Send
+        + 'static,
+        create_frontend: impl FnOnce(std::rc::Rc<std::cell::RefCell<Option<E>>>) -> L + Send + 'static,
+    ) -> Result<(Self, R), nixe_gpu::BackendRuntimeError>
     where
         L: MaxwellFrontend,
+        R: Send + 'static,
         E: GpuExecution<
-                Commands = nixe_gpu::native::NativeWork,
-                ImageRequest = nixe_gpu::native::NativePresentationImage,
+                Conversion = nixe_gpu::native::NativeNv12Conversion,
+                ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
             >,
     {
-        let device_uuid = backend.as_ref().and_then(GpuExecution::device_uuid);
         let (sender, receiver) = mpsc::channel();
         let failure = Arc::new(Mutex::new(None));
         let budget = Arc::new(GpuWorkBudget::new(kernel));
@@ -371,50 +412,74 @@ impl NvDrvGpuExecutor {
         });
         let route: Arc<dyn DeviceAccessEndpoint> = endpoint.clone();
         machine.set_device_endpoint(&route);
-        let mut binding_failure = None;
-        if let Some(backend) = backend.as_mut() {
-            let wake = sender.clone();
-            if let Err(error) = backend.bind_host_wakeup(Arc::new(move || {
-                let _ = wake.send(GpuMessage::Wake);
-            })) {
-                let detail = error.to_string().into_boxed_str();
-                let cause = match error {
-                    nixe_gpu::BackendRuntimeError::Memory(cause) => cause,
-                    _ => Arc::new(MemoryError::Execution(detail.clone())),
-                };
-                endpoint.stop(Arc::clone(&cause));
-                // Binding failed before this executor was exposed. Drain the
-                // exact operations accepted by its already-published endpoint.
-                while let Ok(message) = receiver.try_recv() {
-                    if let GpuMessage::MemoryAccess(request) = message {
-                        request.finish(Err(Arc::clone(&cause)));
-                    }
-                }
-                binding_failure.get_or_insert((detail, cause));
-            }
-        }
+        let (startup, ready) = mpsc::sync_channel(1);
         let worker_failure = Arc::clone(&failure);
         let worker_budget = Arc::clone(&budget);
         let owner_endpoint = Arc::clone(&endpoint);
+        let sender_for_wake = sender.clone();
         let worker = thread::Builder::new()
             .name("nixe-gpu".into())
             .spawn(move || {
+                // Renderer/channel state is created and destroyed by this owner.
+                // Only the startup report, shared coherence contents and owned
+                // native commands cross thread boundaries.
+                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/gpu_thread.cpp
+                let mut backend = None;
+                let initialized = initialize().and_then(|(execution, report)| {
+                    backend = execution;
+                    if let Some(backend) = backend.as_mut() {
+                        let wake = sender_for_wake;
+                        backend.bind_host_wakeup(Arc::new(move || {
+                            let _ = wake.send(GpuMessage::Wake);
+                        }))?;
+                    }
+                    let device_uuid = backend.as_ref().and_then(GpuExecution::device_uuid);
+                    Ok((report, device_uuid))
+                });
+                let (report, device_uuid) = match initialized {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let detail = error.to_string().into_boxed_str();
+                        let cause = match &error {
+                            nixe_gpu::BackendRuntimeError::Memory(cause) => Arc::clone(cause),
+                            _ => Arc::new(MemoryError::Execution(detail.clone())),
+                        };
+                        owner_endpoint.stop(Arc::clone(&cause));
+                        worker_budget.stop();
+                        while let Ok(message) = receiver.try_recv() {
+                            if let GpuMessage::MemoryAccess(request) = message {
+                                request.finish(Err(Arc::clone(&cause)));
+                            }
+                        }
+                        *worker_failure.lock().unwrap() = Some(GpuExecutorFailure {
+                            memory_cause: Some(cause),
+                            boundary: None,
+                            frontend: FrontendSubmissionId::new(0),
+                            detail,
+                        });
+                        // Stop the endpoint before draining a renderer whose
+                        // wake binding failed. Preserve the original startup
+                        // error while releasing any work it already accepted.
+                        if let Some(backend) = backend.as_mut() {
+                            let _ = backend.teardown();
+                        }
+                        let _ = startup.send(Err(error));
+                        return;
+                    }
+                };
                 let backend = std::rc::Rc::new(std::cell::RefCell::new(backend));
-                let result = if let Some((detail, cause)) = binding_failure {
-                    Err(GpuExecutorFailure {
-                        memory_cause: Some(cause),
-                        boundary: None,
-                        frontend: FrontendSubmissionId::new(0),
-                        detail,
-                    })
-                } else {
+                let cache = create_frontend(std::rc::Rc::clone(&backend));
+                let result = if startup.send(Ok((device_uuid, report))).is_ok() {
                     owner::run(
                         receiver,
                         std::rc::Rc::clone(&backend),
                         cache,
                         &worker_budget,
                         &owner_endpoint,
+                        control,
                     )
+                } else {
+                    Ok(())
                 };
                 worker_budget.stop();
                 if let Err(error) = &result {
@@ -422,9 +487,6 @@ impl NvDrvGpuExecutor {
                         Arc::new(MemoryError::Execution(error.to_string().into()))
                     });
                     owner_endpoint.stop(Arc::clone(&cause));
-                    if let Some(backend) = backend.borrow_mut().as_mut() {
-                        backend.fail_device_accesses(cause);
-                    }
                 }
                 let teardown = backend
                     .borrow_mut()
@@ -446,14 +508,76 @@ impl NvDrvGpuExecutor {
                 }
             })
             .expect("failed to create the GPU command owner");
-        Self {
-            sender: Mutex::new(Some(sender)),
-            device_uuid,
-            failure,
-            worker: Mutex::new(Some(worker)),
-            budget,
-            _memory_endpoint: endpoint,
-        }
+        let initialized = ready.recv().unwrap_or_else(|error| {
+            Err(nixe_gpu::BackendRuntimeError::Backend(
+                format!("GPU owner stopped during initialization: {error}").into(),
+            ))
+        });
+        let (device_uuid, report) = match initialized {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = worker.join();
+                return Err(error);
+            }
+        };
+        Ok((
+            Self {
+                sender: Mutex::new(Some(sender)),
+                device_uuid,
+                failure,
+                worker: Mutex::new(Some(worker)),
+                budget,
+                _memory_endpoint: endpoint,
+            },
+            report,
+        ))
+    }
+
+    pub(super) fn create_address_space(
+        &self,
+        address_space: MaxwellGpuMemoryHandle,
+    ) -> Result<(), GpuExecutorFailure> {
+        self.require_healthy()?;
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failure = || {
+            self.failure().unwrap_or(GpuExecutorFailure {
+                memory_cause: None,
+                frontend: FrontendSubmissionId::new(0),
+                detail: "GPU owner stopped before address space creation".into(),
+                boundary: None,
+            })
+        };
+        sender
+            .as_ref()
+            .ok_or_else(failure)?
+            .send(GpuMessage::CreateAddressSpace(address_space))
+            .map_err(|_| failure())
+    }
+    pub(super) fn create_channel(
+        &self,
+        channel: nixe_gpu_maxwell::MaxwellChannelConfiguration,
+    ) -> Result<(), GpuExecutorFailure> {
+        self.require_healthy()?;
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failure = || {
+            self.failure().unwrap_or(GpuExecutorFailure {
+                memory_cause: None,
+                frontend: FrontendSubmissionId::new(0),
+                detail: "GPU owner stopped before channel creation".into(),
+                boundary: None,
+            })
+        };
+        sender
+            .as_ref()
+            .ok_or_else(failure)?
+            .send(GpuMessage::CreateChannel(channel))
+            .map_err(|_| failure())
     }
     pub(super) fn close_channel(&self, channel: nixe_gpu_maxwell::MaxwellChannelId) {
         if let Some(sender) = self
@@ -463,6 +587,19 @@ impl NvDrvGpuExecutor {
             .as_ref()
         {
             let _ = sender.send(GpuMessage::CloseChannel(channel));
+        }
+    }
+    pub(super) fn close_address_space(
+        &self,
+        address_space: nixe_gpu_maxwell::MaxwellAddressSpaceId,
+    ) {
+        if let Some(sender) = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = sender.send(GpuMessage::CloseAddressSpace(address_space));
         }
     }
     pub(super) fn enqueue(
@@ -596,12 +733,12 @@ impl NvDrvGpuExecutor {
         }
     }
 
-    pub(super) fn request_presentable_image(
+    pub(super) fn request_composite(
         &self,
-        request: PresentationImageRequest,
-        swap_interval: u32,
-        events: Option<nixe_runtime::ExternalEventSender>,
-    ) -> Result<mpsc::Receiver<Result<ResidentImage, Box<str>>>, GpuExecutorFailure> {
+        composite: Composite,
+        fences: Box<[nixe_gpu::GuestTimelinePoint]>,
+        notification: std::task::Waker,
+    ) -> Result<mpsc::Receiver<Result<(), Box<str>>>, GpuExecutorFailure> {
         self.require_healthy()?;
         let sender = self
             .sender
@@ -616,12 +753,12 @@ impl NvDrvGpuExecutor {
             })?;
         let (reply, result) = mpsc::sync_channel(1);
         sender
-            .send(GpuMessage::PresentImage {
-                request,
-                swap_interval,
-                reply: PresentReply {
+            .send(GpuMessage::RequestComposite {
+                composite,
+                fences,
+                registration: CompositeRegistration {
                     result: reply,
-                    events,
+                    notification,
                 },
             })
             .map_err(|_| {

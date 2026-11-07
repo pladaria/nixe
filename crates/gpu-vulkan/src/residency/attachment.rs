@@ -1,16 +1,15 @@
 //! Host conversion attachments have no guest physical identity.
 //! Native references retain their storage through the actual conversion commands.
 use super::*;
-cache_id!(AttachmentId);
+pub type AttachmentId = SlotId;
 pub(super) struct AttachmentEntry {
     pub view: Arc<crate::AllocatedImageView>,
     pub description: NativeImageDescription,
-    pub state: sync::AccessState,
-    pub layout: vk::ImageLayout,
+    pub initialized: bool,
     pub aspects: vk::ImageAspectFlags,
     pub last_use: Option<WorkTicket>,
 }
-impl VulkanResidency {
+impl Residency<'_> {
     pub fn attachment_image(
         &mut self,
         mut description: NativeImageDescription,
@@ -28,13 +27,13 @@ impl VulkanResidency {
             ));
         }
         description.usage |= vk::ImageUsageFlags::TRANSFER_SRC;
-        let owner = Arc::clone(&self.device.owner);
+        let owner = Arc::clone(&self.runtime.device.owner);
         let native = Arc::new(allocate_image_charged(
             &owner,
             description,
             AllocationMode::Managed,
             "resident-only attachment",
-            |bytes| self.reserve(bytes),
+            |bytes| self.charge(bytes),
         )?);
         let aspects = if description
             .usage
@@ -65,105 +64,59 @@ impl VulkanResidency {
             )
         }
         .map_err(|e| VulkanError::vk("resident-only attachment view", e))?;
-        let view = Arc::new(crate::AllocatedImageView::from_handle(native, handle));
-        let slot = self
-            .free_attachments
-            .pop()
-            .unwrap_or(self.attachments.len());
-        if slot == self.attachments.len() {
-            self.attachments.push(Slot {
-                generation: 0,
-                entry: None,
-            });
-        }
-        let generation = self.attachments[slot].generation + 1;
-        self.attachments[slot] = Slot {
-            generation,
-            entry: Some(AttachmentEntry {
-                view,
-                description,
-                aspects,
-                state: Default::default(),
-                layout: vk::ImageLayout::UNDEFINED,
-                last_use: None,
-            }),
-        };
-        Ok(AttachmentId {
-            instance: self.instance,
-            slot,
-            generation,
-        })
+        let view = Arc::new(crate::AllocatedImageView::from_handle(
+            native, handle, range,
+        ));
+        Ok(self.texture_cache.attachments.insert(AttachmentEntry {
+            view,
+            description,
+            aspects,
+            initialized: false,
+            last_use: None,
+        }))
     }
     /// Host conversion storage has no canonical reconstruction source. Release
     /// it after recording; native references retire on the actual use ticket.
     pub fn release_attachment(&mut self, id: AttachmentId) -> Result<(), VulkanError> {
         self.attachment(id)?;
         self.invalidate_bindings();
-        let entry = self.attachments[id.slot].entry.take().unwrap();
-        if self.attachments[id.slot].generation < u32::MAX {
-            self.free_attachments.push(id.slot);
-        }
+        let entry = self.texture_cache.attachments.erase(id);
         if let Some(work) = entry.last_use {
-            self.device.retire_image_views(vec![entry.view], work)?;
+            self.runtime
+                .device
+                .retire_image_views(vec![entry.view], work)?;
         }
         Ok(())
     }
     pub(super) fn attachment(&self, id: AttachmentId) -> Result<&AttachmentEntry, VulkanError> {
-        self.attachments
-            .get(id.slot)
-            .filter(|s| id.instance == self.instance && id.generation == s.generation)
-            .and_then(|s| s.entry.as_ref())
+        self.texture_cache
+            .attachments
+            .get(id)
             .ok_or(VulkanError::InvalidResource(
-                "stale or foreign resident-only attachment",
+                "retired resident-only attachment",
             ))
     }
-    pub(super) fn attachment_access(
-        &mut self,
-        id: AttachmentId,
-        scope: AccessScope,
-        layout: vk::ImageLayout,
-    ) -> Result<vk::Image, VulkanError> {
+    pub(super) fn use_attachment(&mut self, id: AttachmentId) -> Result<vk::Image, VulkanError> {
         self.attachment(id)?;
-        let work = self.device.work_ticket()?;
-        let entry = self.attachments[id.slot].entry.as_mut().unwrap();
-        let previous = entry.state.preceding();
-        let dependency = entry.state.access(scope);
-        if entry.layout != layout || dependency.is_some() {
-            let source = if entry.layout != layout {
-                previous
-            } else {
-                dependency.unwrap().source
-            };
-            let destination = if entry.layout != layout && !scope.writes() {
-                AccessScope::new(
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
-                )
-            } else {
-                scope
-            };
-            let aspect = entry.aspects;
-            self.barriers.queue_image(
-                vk::ImageMemoryBarrier2::default()
-                    .old_layout(entry.layout)
-                    .new_layout(layout)
-                    .src_stage_mask(source.stages)
-                    .src_access_mask(source.access)
-                    .dst_stage_mask(destination.stages)
-                    .dst_access_mask(destination.access)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(entry.view.image.handle)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(aspect)
-                            .level_count(1)
-                            .layer_count(1),
-                    ),
-            );
+        let work = self.runtime.device.current_work();
+        let entry = &mut self.texture_cache.attachments[id];
+        if !entry.initialized {
+            self.runtime.barriers.queue_image(sync::initialize_image(
+                entry.view.image.handle,
+                entry.aspects,
+                1,
+                1,
+            ));
+            entry.initialized = true;
         }
-        entry.layout = layout;
         entry.last_use = Some(work);
         Ok(entry.view.image.handle)
+    }
+    pub(super) fn transfer_attachment(
+        &mut self,
+        id: AttachmentId,
+    ) -> Result<(vk::Image, vk::ImageSubresourceRange), VulkanError> {
+        let range = self.attachment(id)?.view.range;
+        Ok((self.use_attachment(id)?, range))
     }
 }

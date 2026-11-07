@@ -26,13 +26,50 @@ pub(super) fn select_present_mode(
     }
 }
 
+fn surface_format(owner: &DeviceOwner) -> Result<vk::SurfaceFormatKHR, VulkanError> {
+    let surface = owner
+        .instance
+        .surface
+        .as_ref()
+        .ok_or(VulkanError::InvalidResource("presentation has no surface"))?;
+    let formats = unsafe {
+        surface
+            .loader
+            .get_physical_device_surface_formats(owner.physical, surface.handle)
+    }
+    .map_err(|e| VulkanError::vk("surface formats", e))?;
+    let format = formats
+        .iter()
+        .find(|f| {
+            f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+                && matches!(
+                    f.format,
+                    vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM
+                )
+        })
+        .or_else(|| {
+            formats.iter().find(|f| {
+                f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+                    && matches!(
+                        f.format,
+                        vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB
+                    )
+            })
+        })
+        .copied()
+        .ok_or(VulkanError::InvalidResource(
+            "surface requires nonlinear RGBA8/BGRA8 UNORM or sRGB",
+        ))?;
+
+    Ok(format)
+}
+
 /// Native scheduling synchronization crosses the owner boundary without guest reads.
 struct Context {
     progress: Arc<crate::queue::progress::SubmissionProgress>,
     owner: Arc<DeviceOwner>,
     queues: crate::device::QueueSelection,
     timeline: vk::Semaphore,
-    mutable_format: bool,
     vsync: bool,
 }
 impl Context {
@@ -66,9 +103,254 @@ impl Context {
         }
     }
 }
+pub(crate) struct CopyCommands {
+    owner: Arc<DeviceOwner>,
+    pool: vk::CommandPool,
+    command: vk::CommandBuffer,
+    fence: vk::Fence,
+}
+impl CopyCommands {
+    pub(super) fn new(device: &VulkanDevice) -> Result<Arc<Self>, VulkanError> {
+        let pool = unsafe {
+            device.owner.device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(device.queues().graphics_compute_family)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+        }
+        .map_err(|e| VulkanError::vk("presentation command pool", e))?;
+        let mut result = Self {
+            owner: Arc::clone(&device.owner),
+            pool,
+            command: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+        };
+        result.command = unsafe {
+            device.owner.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|e| VulkanError::vk("presentation command buffer", e))?[0];
+        result.fence = unsafe {
+            device.owner.device.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+        }
+        .map_err(|e| VulkanError::vk("presentation copy fence", e))?;
+        Ok(Arc::new(result))
+    }
+    fn ready(&self) -> Result<bool, VulkanError> {
+        unsafe { self.owner.device.get_fence_status(self.fence) }
+            .map_err(|e| VulkanError::vk("presentation copy completion", e))
+    }
+    fn wait(&self) -> Result<(), VulkanError> {
+        unsafe {
+            self.owner
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+        }
+        .or_else(|e| {
+            if e == vk::Result::ERROR_DEVICE_LOST {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .map_err(|e| VulkanError::vk("presentation copy retirement", e))
+    }
+    fn submit(
+        &self,
+        context: &Context,
+        frame: &PresentFrame,
+        target: &Acquired,
+    ) -> Result<(), VulkanError> {
+        // GetRenderFrame waits present_done before reusing this frame command buffer.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_present_manager.cpp#L172-L187
+        self.wait()?;
+        context.progress.wait_submitted(frame.work.tick(), None)?;
+        let d = &self.owner.device;
+        let source = frame.storage.view.image.handle;
+        let range = super::render::color_range();
+        let layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .layer_count(1);
+        let barrier = |image, old, new, src, dst| {
+            vk::ImageMemoryBarrier::default()
+                .image(image)
+                .subresource_range(range)
+                .old_layout(old)
+                .new_layout(new)
+                .src_access_mask(src)
+                .dst_access_mask(dst)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        };
+        let before = [
+            barrier(
+                source,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+            ),
+            barrier(
+                target.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            ),
+        ];
+        let after = [
+            barrier(
+                source,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::GENERAL,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+            ),
+            barrier(
+                target.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::MEMORY_READ,
+            ),
+        ];
+        unsafe {
+            d.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| VulkanError::vk("reset presentation command buffer", e))?;
+            d.begin_command_buffer(
+                self.command,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(|e| VulkanError::vk("begin presentation copy", e))?;
+            d.cmd_pipeline_barrier(
+                self.command,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &before,
+            );
+            if target.blit_supported {
+                let region = vk::ImageBlit::default()
+                    .src_subresource(layers)
+                    .dst_subresource(layers)
+                    .src_offsets([
+                        vk::Offset3D::default(),
+                        vk::Offset3D {
+                            x: frame.storage.extent[0] as i32,
+                            y: frame.storage.extent[1] as i32,
+                            z: 1,
+                        },
+                    ])
+                    .dst_offsets([
+                        vk::Offset3D::default(),
+                        vk::Offset3D {
+                            x: target.extent.width as i32,
+                            y: target.extent.height as i32,
+                            z: 1,
+                        },
+                    ]);
+                d.cmd_blit_image(
+                    self.command,
+                    source,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    target.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                    vk::Filter::LINEAR,
+                );
+            } else {
+                if frame.storage.format != target.format {
+                    return Err(VulkanError::InvalidResource(
+                        "presentation format conversion requires BLIT_DST support",
+                    ));
+                }
+                let region = vk::ImageCopy::default()
+                    .src_subresource(layers)
+                    .dst_subresource(layers)
+                    .extent(vk::Extent3D {
+                        width: frame.storage.extent[0].min(target.extent.width),
+                        height: frame.storage.extent[1].min(target.extent.height),
+                        depth: 1,
+                    });
+                d.cmd_copy_image(
+                    self.command,
+                    source,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    target.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+            }
+            d.cmd_pipeline_barrier(
+                self.command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &after,
+            );
+            d.end_command_buffer(self.command)
+                .map_err(|e| VulkanError::vk("end presentation copy", e))?;
+            d.reset_fences(&[self.fence])
+                .map_err(|e| VulkanError::vk("reset presentation copy fence", e))?;
+            let semaphores = [context.timeline, target.wait];
+            let values = [frame.work.tick(), 0];
+            let signals = [target.signal];
+            let signal_values = [0];
+            let stages = [vk::PipelineStageFlags::TRANSFER; 2];
+            let commands = [self.command];
+            let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
+                .wait_semaphore_values(&values)
+                .signal_semaphore_values(&signal_values);
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(&commands)
+                .wait_semaphores(&semaphores)
+                .wait_dst_stage_mask(&stages)
+                .signal_semaphores(&signals)
+                .push_next(&mut timeline);
+            let _queue = self
+                .owner
+                .queue_mutex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let queue = d.get_device_queue(context.queues.graphics_compute_family, 0);
+            d.queue_submit(queue, &[submit], self.fence)
+                .map_err(|e| VulkanError::vk("submit presentation copy", e))?;
+        }
+        nixe_gpu::trace::event(
+            "present_copy",
+            frame.work.tick(),
+            u64::from(target.extent.width),
+            u64::from(target.extent.height),
+        );
+        Ok(())
+    }
+}
+impl Drop for CopyCommands {
+    fn drop(&mut self) {
+        unsafe {
+            self.owner.device.destroy_fence(self.fence, None);
+            self.owner.device.destroy_command_pool(self.pool, None);
+        }
+    }
+}
 struct Image {
     handle: vk::Image,
-    view: vk::ImageView,
+    copy: Option<Arc<CopyCommands>>,
+    copy_submitted: bool,
+    source: Option<Arc<FrameStorage>>,
     finished: vk::Semaphore,
     present: vk::Fence,
     presented: bool,
@@ -79,6 +361,7 @@ struct Chain {
     handle: vk::SwapchainKHR,
     images: Vec<Image>,
     format: vk::Format,
+    blit_supported: bool,
     extent: vk::Extent2D,
     last_work: Option<WorkTicket>,
 }
@@ -88,6 +371,9 @@ impl Chain {
             return Ok(false);
         }
         for image in &self.images {
+            if image.copy_submitted && !image.copy.as_ref().unwrap().ready()? {
+                return Ok(false);
+            }
             if image.presented
                 && !unsafe { self.owner.device.get_fence_status(image.present) }
                     .map_err(|e| VulkanError::vk("presentation release status", e))?
@@ -101,8 +387,9 @@ impl Chain {
 impl Drop for Chain {
     fn drop(&mut self) {
         unsafe {
-            for image in &self.images {
-                self.owner.device.destroy_image_view(image.view, None);
+            for image in &mut self.images {
+                image.source.take();
+                image.copy.take();
                 self.owner.device.destroy_semaphore(image.finished, None);
                 self.owner.device.destroy_fence(image.present, None);
             }
@@ -113,14 +400,14 @@ impl Drop for Chain {
 struct Acquire {
     semaphore: vk::Semaphore,
     fence: vk::Fence,
-    work: Option<WorkTicket>,
+    copy: Option<Arc<CopyCommands>>,
     issued: bool,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Acquired {
     pub format: vk::Format,
+    blit_supported: bool,
     pub image: vk::Image,
-    pub view: vk::ImageView,
     pub extent: vk::Extent2D,
     pub wait: vk::Semaphore,
     pub signal: vk::Semaphore,
@@ -168,7 +455,7 @@ impl Swapchains {
             self.acquires.push(Acquire {
                 semaphore,
                 fence: vk::Fence::null(),
-                work: None,
+                copy: None,
                 issued: false,
             });
             let fence = unsafe {
@@ -189,6 +476,13 @@ impl Swapchains {
     }
     pub fn update(&mut self, device: &Context) -> Result<bool, VulkanError> {
         let completed = device.completed()?;
+        for chain in self.current.iter_mut().chain(&mut self.retired) {
+            for image in &mut chain.images {
+                if image.copy_submitted && image.copy.as_ref().unwrap().ready()? {
+                    image.source = None;
+                }
+            }
+        }
         let mut at = 0;
         while at < self.retired.len() {
             if self.retired[at].releasable(completed)? {
@@ -234,38 +528,13 @@ impl Swapchains {
         if extent.width == 0 || extent.height == 0 {
             return Ok(false);
         }
-        let formats = unsafe {
-            surface
-                .loader
-                .get_physical_device_surface_formats(device.owner.physical, surface.handle)
-        }
-        .map_err(|e| VulkanError::vk("surface formats", e))?;
-        let format = formats
-            .iter()
-            .find(|f| {
-                f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR && matches!(
-                    f.format,
-                    vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM
-                )
-            })
-            .or_else(|| {
-                formats.iter().find(|f| {
-                    device.mutable_format && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR && matches!(
-                        f.format,
-                        vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB
-                    )
-                })
-            })
-            .copied()
-            .ok_or(VulkanError::InvalidResource(
-                "surface requires nonlinear RGBA8/BGRA8 UNORM, or an sRGB surface with VK_KHR_swapchain_mutable_format",
-            ))?;
+        let format = surface_format(&device.owner)?;
         if !capabilities
             .supported_usage_flags
-            .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .contains(vk::ImageUsageFlags::TRANSFER_DST)
         {
             return Err(VulkanError::InvalidResource(
-                "surface cannot render color attachments",
+                "surface does not support presentation transfers",
             ));
         }
         let mut count = capabilities.min_image_count.saturating_add(1).max(3);
@@ -288,11 +557,6 @@ impl Swapchains {
                 "native presentation requires an identity surface transform",
             ));
         }
-        let view_format = match format.format {
-            vk::Format::R8G8B8A8_SRGB => vk::Format::R8G8B8A8_UNORM,
-            vk::Format::B8G8R8A8_SRGB => vk::Format::B8G8R8A8_UNORM,
-            format => format,
-        };
         let modes = unsafe {
             surface
                 .loader
@@ -304,8 +568,6 @@ impl Swapchains {
             "Vulkan presentation: vsync={} mode={present_mode:?}",
             self.vsync
         );
-        let view_formats = [format.format, view_format];
-        let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
         let graphics = device.queues.graphics_compute_family;
         let present = device.queues.present_family.unwrap();
         let families = [graphics, present];
@@ -316,7 +578,7 @@ impl Swapchains {
             .image_color_space(format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
             .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(present_mode)
@@ -326,14 +588,6 @@ impl Swapchains {
                     .as_ref()
                     .map_or(vk::SwapchainKHR::null(), |c| c.handle),
             );
-        // An UNORM attachment view preserves egui's nonlinear blending even
-        // when WSI advertises only sRGB images; no extra pass or gamma shader.
-        // https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_swapchain_mutable_format.html
-        if view_format != format.format {
-            info = info
-                .flags(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
-                .push_next(&mut format_list);
-        }
         // Separate present families share this WSI image explicitly; ordinary
         // guest resources remain exclusive to the graphics/compute owner.
         if graphics != present {
@@ -350,7 +604,16 @@ impl Swapchains {
             loader,
             handle,
             images: Vec::new(),
-            format: view_format,
+            format: format.format,
+            blit_supported: unsafe {
+                device
+                    .owner
+                    .instance
+                    .instance
+                    .get_physical_device_format_properties(device.owner.physical, format.format)
+            }
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::BLIT_DST),
             extent,
             last_work: None,
         };
@@ -359,23 +622,14 @@ impl Swapchains {
         {
             chain.images.push(Image {
                 handle: image,
-                view: vk::ImageView::null(),
+                copy: None,
+                copy_submitted: false,
+                source: None,
                 finished: vk::Semaphore::null(),
                 present: vk::Fence::null(),
                 presented: false,
             });
             let entry = chain.images.last_mut().unwrap();
-            entry.view = unsafe {
-                device.owner.device.create_image_view(
-                    &vk::ImageViewCreateInfo::default()
-                        .image(image)
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(view_format)
-                        .subresource_range(super::render::color_range()),
-                    None,
-                )
-            }
-            .map_err(|e| VulkanError::vk("swapchain view", e))?;
             entry.finished = unsafe {
                 device
                     .owner
@@ -399,7 +653,6 @@ impl Swapchains {
         Ok(true)
     }
     pub fn acquire(&mut self, device: &Context) -> Result<Option<Acquired>, VulkanError> {
-        let completed = device.completed()?;
         let Some(chain) = &self.current else {
             return Ok(None);
         };
@@ -408,7 +661,9 @@ impl Swapchains {
         } else {
             let mut available = None;
             for (index, acquire) in self.acquires.iter().enumerate() {
-                if acquire.work.is_some_and(|w| w.tick() > completed) {
+                if let Some(copy) = &acquire.copy
+                    && !copy.ready()?
+                {
                     continue;
                 }
                 if acquire.issued
@@ -459,6 +714,9 @@ impl Swapchains {
             return Ok(None);
         }
         let image = &chain.images[index as usize];
+        if image.copy_submitted && !image.copy.as_ref().unwrap().ready()? {
+            return Ok(None);
+        }
         if image.presented
             && !unsafe { device.owner.device.get_fence_status(image.present) }
                 .map_err(|e| VulkanError::vk("present release status", e))?
@@ -468,8 +726,8 @@ impl Swapchains {
         self.dirty |= suboptimal;
         Ok(Some(Acquired {
             format: chain.format,
+            blit_supported: chain.blit_supported,
             image: image.handle,
-            view: image.view,
             extent: chain.extent,
             wait: self.acquires[acquire].semaphore,
             signal: image.finished,
@@ -481,13 +739,17 @@ impl Swapchains {
         &mut self,
         device: &Context,
         frame: Acquired,
-        work: WorkTicket,
+        source: PresentFrame,
     ) -> Result<bool, VulkanError> {
-        // Binary WSI waits require an already submitted signal operation.
-        // Confirm it before resetting a fence that teardown may still need.
-        device.progress.wait_submitted(work.tick(), None)?;
+        let work = source.work;
         let chain = self.current.as_mut().unwrap();
         let image = &mut chain.images[frame.index as usize];
+        let copy = &source.storage.copy;
+        copy.submit(device, &source, &frame)?;
+        image.copy = Some(Arc::clone(copy));
+        image.copy_submitted = true;
+        self.acquires[frame.acquire].copy = Some(Arc::clone(copy));
+        image.source = Some(source.storage);
         unsafe { device.owner.device.reset_fences(&[image.present]) }
             .map_err(|e| VulkanError::vk("reset present release fence", e))?;
         let fences = [image.present];
@@ -501,7 +763,6 @@ impl Swapchains {
             .image_indices(&indices)
             .push_next(&mut release);
         chain.last_work = Some(work);
-        self.acquires[frame.acquire].work = Some(work);
         let result = {
             let _queue = device
                 .owner
@@ -560,6 +821,11 @@ impl Swapchains {
             // https://docs.vulkan.org/refpages/latest/refpages/source/vkDestroySwapchainKHR.html
         }
         for chain in self.current.iter().chain(&self.retired) {
+            for image in &chain.images {
+                if image.copy_submitted {
+                    image.copy.as_ref().unwrap().wait()?;
+                }
+            }
             if let Some(work) = chain.last_work {
                 device.drain(work)?;
             }
@@ -610,16 +876,13 @@ pub(crate) struct Presenter {
     receiver: mpsc::Receiver<Event>,
     worker: Option<std::thread::JoinHandle<Result<(), VulkanError>>>,
     busy: bool,
-    acquired: Option<Acquired>,
+    format: vk::Format,
 }
 enum Command {
-    Acquire([u32; 2]),
-    Submit(Acquired, WorkTicket, Option<u64>),
-    Graphics(WorkTicket),
+    Present(PresentFrame),
     Shutdown,
 }
 enum Event {
-    Acquired(Acquired),
     Idle,
     Failed(VulkanError),
 }
@@ -635,14 +898,17 @@ impl Presenter {
             ));
         }
         if device.profile().swapchain_maintenance == SwapchainMaintenance::Disabled {
-            let instance = &device.owner.instance;
-            let error = if !instance.surface_maintenance_khr && !instance.surface_maintenance_ext {
-                VulkanError::SurfaceMaintenanceUnavailable
-            } else {
-                VulkanError::SwapchainMaintenanceUnavailable
-            };
-            return Err(error);
+            return Err(
+                if !device.owner.instance.surface_maintenance_khr
+                    && !device.owner.instance.surface_maintenance_ext
+                {
+                    VulkanError::SurfaceMaintenanceUnavailable
+                } else {
+                    VulkanError::SwapchainMaintenanceUnavailable
+                },
+            );
         }
+        let format = surface_format(&device.owner)?.format;
         let context = Context {
             progress: Arc::clone(&device.submission.progress),
             owner: Arc::clone(&device.owner),
@@ -651,7 +917,6 @@ impl Presenter {
                 present_family: device.queues().present_family,
             },
             timeline: device.submission.timeline,
-            mutable_format: device.profile().swapchain_mutable_format,
             vsync,
         };
         let mut chains = Swapchains::new(&context)?;
@@ -660,69 +925,51 @@ impl Presenter {
         let worker = std::thread::Builder::new()
             .name("nixe-vulkan-present".into())
             .spawn(move || {
-                let mut requested = false;
-                let mut handed_off = false;
+                let mut pending: Option<PresentFrame> = None;
                 let mut last_sequence = None;
                 let result = (|| -> Result<(), VulkanError> {
                     loop {
-                        let command = if requested && !handed_off {
+                        let command = if pending.is_some() {
                             match commands.recv_timeout(std::time::Duration::from_millis(1)) {
-                                Ok(command) => Some(command),
+                                Ok(c) => Some(c),
                                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             }
                         } else {
                             match commands.recv() {
-                                Ok(command) => Some(command),
+                                Ok(c) => Some(c),
                                 Err(_) => break,
                             }
                         };
                         match command {
                             Some(Command::Shutdown) => break,
-                            Some(Command::Acquire(size)) => {
-                                chains.resize(size);
-                                requested = true;
-                            }
-                            Some(Command::Graphics(work)) => {
-                                chains.current.as_mut().unwrap().last_work = Some(work);
-                            }
-                            Some(Command::Submit(frame, work, sequence)) => {
-                                let accepted = chains.present(&context, frame, work)?;
-                                if accepted
-                                    && sequence != last_sequence
-                                    && let Some(fresh_sequence) = sequence
-                                {
-                                    nixe_gpu::trace::event(
-                                        "host_present",
-                                        fresh_sequence,
-                                        work.tick(),
-                                        0,
-                                    );
-                                    last_sequence = sequence;
-                                    client.record_presented();
-                                }
-                                requested = false;
-                                handed_off = false;
-                                events
-                                    .send(Event::Idle)
-                                    .map_err(|_| VulkanError::QueueStopped)?;
-                                client.wake_owner();
+                            Some(Command::Present(frame)) => {
+                                assert!(pending.is_none(), "one admitted composed frame");
+                                chains.resize(frame.storage.extent);
+                                pending = Some(frame);
                             }
                             None => {}
                         }
-                        if requested
-                            && !handed_off
+                        if pending.is_some()
                             && chains.update(&context)?
-                            && let Some(frame) = chains.acquire(&context)?
+                            && let Some(target) = chains.acquire(&context)?
                         {
+                            let frame = pending.take().unwrap();
+                            let sequence = frame.sequence;
+                            let work = frame.work;
+                            let accepted = chains.present(&context, target, frame)?;
+                            if accepted
+                                && sequence != last_sequence
+                                && let Some(sequence) = sequence
+                            {
+                                nixe_gpu::trace::event("host_present", sequence, work.tick(), 0);
+                                last_sequence = Some(sequence);
+                                client.record_presented();
+                            }
                             events
-                                .send(Event::Acquired(frame))
+                                .send(Event::Idle)
                                 .map_err(|_| VulkanError::QueueStopped)?;
-                            // Publish availability before waking the owner that
-                            // consumes it; no unrelated packet is needed to advance.
-                            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_present_manager.cpp
                             client.wake_owner();
-                            handed_off = true;
                         }
                     }
                     Ok(())
@@ -743,47 +990,30 @@ impl Presenter {
             receiver,
             worker: Some(worker),
             busy: false,
-            acquired: None,
+            format,
         })
+    }
+    pub fn format(&self) -> vk::Format {
+        self.format
     }
     pub fn poll(&mut self) -> Result<(), VulkanError> {
         while let Ok(event) = self.receiver.try_recv() {
             match event {
-                Event::Acquired(frame) => self.acquired = Some(frame),
                 Event::Idle => self.busy = false,
                 Event::Failed(error) => return Err(error),
             }
         }
         Ok(())
     }
-    pub fn acquire(&mut self, size: [u32; 2]) -> Result<Option<Acquired>, VulkanError> {
+    pub fn ready(&mut self) -> Result<bool, VulkanError> {
         self.poll()?;
-        if let Some(frame) = self.acquired {
-            return Ok(Some(frame));
-        }
-        if !self.busy && !size.contains(&0) {
-            self.sender
-                .send(Command::Acquire(size))
-                .map_err(|_| VulkanError::QueueStopped)?;
-            self.busy = true;
-        }
-        Ok(None)
+        Ok(!self.busy)
     }
-    pub fn graphics(&self, work: WorkTicket) -> Result<(), VulkanError> {
+    pub fn present(&mut self, frame: PresentFrame) -> Result<(), VulkanError> {
         self.sender
-            .send(Command::Graphics(work))
-            .map_err(|_| VulkanError::QueueStopped)
-    }
-    pub fn present(
-        &mut self,
-        frame: Acquired,
-        work: WorkTicket,
-        sequence: Option<u64>,
-    ) -> Result<(), VulkanError> {
-        self.sender
-            .send(Command::Submit(frame, work, sequence))
+            .send(Command::Present(frame))
             .map_err(|_| VulkanError::QueueStopped)?;
-        self.acquired = None;
+        self.busy = true;
         Ok(())
     }
     pub fn shutdown(&mut self) -> Result<(), VulkanError> {
@@ -791,9 +1021,7 @@ impl Presenter {
             return Ok(());
         };
         let _ = self.sender.send(Command::Shutdown);
-        worker
-            .join()
-            .map_err(|_| VulkanError::InvalidResource("presentation worker panicked"))?
+        worker.join().map_err(|_| VulkanError::QueueStopped)?
     }
 }
 impl Drop for Presenter {
@@ -804,6 +1032,3 @@ impl Drop for Presenter {
         }
     }
 }
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests;

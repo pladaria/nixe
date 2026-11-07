@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+test-support = []
 performance-counters = ["nixe-gpu/performance-counters", "nixe-memory/performance-counters"]
 
 [dependencies]

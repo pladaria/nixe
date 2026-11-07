@@ -21,7 +21,7 @@ pub struct CompiledStage {
     pub shared_memory_bytes: u32,
     pub output_control_points: Option<u32>,
     binding_end: Option<nixe_shader_recompiler::artifact::Bindings>,
-    pub guest: Option<Box<GuestStageMetadata>>,
+    pub guest: Option<Arc<GuestStageMetadata>>,
 }
 impl CompiledStage {
     pub fn new(
@@ -147,7 +147,7 @@ impl CompiledStage {
             output_control_points: (stage == Stage::TessellationControl)
                 .then_some(execution.output_vertices),
             binding_end: None,
-            guest: Some(Box::new(GuestStageMetadata {
+            guest: Some(Arc::new(GuestStageMetadata {
                 info,
                 bindings: origins,
                 host_uniforms,

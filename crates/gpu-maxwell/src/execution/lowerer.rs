@@ -1,45 +1,61 @@
 //! Startup-selected lowering. Static dispatch keeps host selection outside method/draw loops.
 use super::*;
 use crate::engines::{MaxwellResolvedComputeLaunch, MaxwellTwoDSolidOperation};
-use crate::{MaxwellThreeDOperationTrigger, MaxwellThreeDState, MaxwellTwoDBlitOperation};
+use crate::{MaxwellThreeDState, MaxwellTwoDBlitOperation};
 
-pub trait MaxwellFrontend: Send + 'static {
+pub trait MaxwellFrontend: 'static {
+    fn bind_gpu_memory(&mut self, memory: &crate::MaxwellGpuMemoryHandle);
+    fn create_channel(&mut self, channel: crate::MaxwellChannelId);
     fn bind_channel(&mut self, channel: crate::MaxwellChannelId);
     fn close_channel(&mut self, channel: crate::MaxwellChannelId);
-    fn lower_presentation(
+    fn bind_graphics_uniform(
         &mut self,
-        request: nixe_gpu::PresentationImageRequest,
-    ) -> Result<nixe_gpu::native::NativePresentationImage, MaxwellSubmissionExecutionError>;
-    fn lower_three_d(
+        group: u8,
+        slot: u8,
+        binding: Option<crate::MaxwellThreeDConstantBufferBinding>,
+        address_space: &MaxwellGpuMemory,
+    ) -> Result<(), MaxwellSubmissionExecutionError>;
+    fn try_draw(
         &mut self,
         state: &MaxwellThreeDState,
-        trigger: MaxwellThreeDOperationTrigger,
+        draw: &crate::MaxwellThreeDDrawState,
         address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
-        instances: Option<(u32, u32)>,
         access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<NativeWork, MaxwellSubmissionExecutionError>;
-    fn lower_launch(
+    ) -> Result<bool, MaxwellSubmissionExecutionError>;
+    fn clear(
+        &mut self,
+        state: &MaxwellThreeDState,
+        address_space: &MaxwellGpuMemory,
+        frontend: FrontendSubmissionId,
+    ) -> Result<(), MaxwellSubmissionExecutionError>;
+    fn try_launch(
         &mut self,
         launch: &MaxwellResolvedComputeLaunch,
         address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
         access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<NativeWork, MaxwellSubmissionExecutionError>;
-    fn lower_solid(
+    ) -> Result<bool, MaxwellSubmissionExecutionError>;
+    fn try_solid(
         &mut self,
         request: &MaxwellTwoDSolidOperation,
         address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
-        access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<NativeWork, MaxwellSubmissionExecutionError>;
-    fn lower_blit(
+    ) -> Result<bool, MaxwellSubmissionExecutionError>;
+    fn try_blit(
         &mut self,
         request: &MaxwellTwoDBlitOperation,
         address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
-        access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<NativeWork, MaxwellSubmissionExecutionError>;
+    ) -> Result<bool, MaxwellSubmissionExecutionError>;
+    /// True consumes the DMA through the actual buffer/texture owners. False
+    /// selects the engine's safe CPU copy; it is not an asynchronous retry.
+    fn accelerate_dma(
+        &mut self,
+        operation: &MaxwellMemoryCopyOperation,
+        address_space: &MaxwellGpuMemory,
+        frontend: FrontendSubmissionId,
+    ) -> Result<bool, MaxwellSubmissionExecutionError>;
     fn render_enabled(&self) -> bool;
     fn update_render_condition(
         &mut self,
@@ -52,5 +68,5 @@ pub trait MaxwellFrontend: Send + 'static {
         destination: nixe_gpu::ConversionImage,
         source: nixe_gpu::Nv12Planes,
         transform: nixe_gpu::Nv12ColorTransform,
-    ) -> Result<NativeWork, MaxwellLoweringError>;
+    ) -> Result<NativeNv12Conversion, MaxwellLoweringError>;
 }

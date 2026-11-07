@@ -7,9 +7,9 @@ dependency.
 
 ## Device and ownership
 
-Vulkan 1.3 uses core synchronization2 and dynamic rendering. Vulkan 1.2 requires
-the corresponding KHR extensions. Both require timeline semaphores and the actual
-feature bits. Device initialization freezes the enabled compiler profile, including
+Vulkan 1.3 uses core synchronization2. Vulkan 1.2 requires its KHR extension.
+Both use native render passes and framebuffers, timeline semaphores and the actual
+synchronization feature bits. Device initialization freezes the enabled compiler profile, including
 numerical, subgroup and descriptor capabilities.
 
 Window creation occurs in the event loop's resume callback, before surface-aware

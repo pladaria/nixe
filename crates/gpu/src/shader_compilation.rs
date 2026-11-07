@@ -1,6 +1,5 @@
 //! Immutable capture products and cold compilation, independent of a renderer.
 pub mod depth;
-pub mod resources;
 use crate::{
     shader_encoding::{self, Encode},
     shader_identity::ContentId,
@@ -60,10 +59,9 @@ impl ShaderInputs {
         (stages.len() as u32).encode(&mut bytes);
         for stage in &stages {
             shader_encoding::environment_specialization(&stage.environment, &mut bytes);
-            stage.binding_group.encode(&mut bytes);
         }
         let identity = ContentId::of(
-            b"nixe-recompiler-source-v2",
+            b"nixe-recompiler-source-v3",
             &[&configuration.identity().0, &bytes],
         );
         Self { identity, stages }
@@ -157,7 +155,6 @@ impl ShaderInputs {
                 || (source_stage == Stage::VertexA && stage.stage == Stage::VertexB)
             {
                 shader_encoding::environment_specialization(&source.environment, &mut bytes);
-                source.binding_group.encode(&mut bytes);
                 found = true;
             }
         }
@@ -167,7 +164,7 @@ impl ShaderInputs {
         stage.runtime.encode(&mut bytes);
         bindings.encode(&mut bytes);
         ContentId::of(
-            b"nixe-recompiler-stage-v2",
+            b"nixe-recompiler-stage-v3",
             &[&configuration.identity().0, &bytes],
         )
     }

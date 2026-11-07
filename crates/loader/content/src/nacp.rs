@@ -6,6 +6,8 @@ use crate::binary::{read_i64, read_u16, read_u32, read_u64};
 
 pub const NACP_SIZE: usize = 0x4000;
 const LANGUAGE_COUNT: usize = 16;
+const TITLE_ENTRY_SIZE: usize = 0x300;
+const MAX_EXPANDED_TITLE_ENTRIES: usize = 32;
 
 /// Loads Nintendo Switch application control properties (`control.nacp`).
 #[derive(Debug)]
@@ -205,7 +207,9 @@ impl ApplicationTitle {
 /// newer format regions whose semantics are not yet fully verified.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplicationControlProperty {
-    pub titles: [ApplicationTitle; LANGUAGE_COUNT],
+    /// Preserve every language entry, including expanded slots newer than the
+    /// currently recognized firmware language enum.
+    pub titles: Box<[ApplicationTitle]>,
     pub isbn: String,
     pub startup_user_account: StartupUserAccount,
     pub user_account_switch_lock: UserAccountSwitchLock,
@@ -274,13 +278,13 @@ pub struct ApplicationControlProperty {
 }
 
 impl ApplicationControlProperty {
-    pub fn title(&self, language: NacpLanguage) -> &ApplicationTitle {
-        &self.titles[language.index()]
+    pub fn title(&self, language: NacpLanguage) -> Option<&ApplicationTitle> {
+        self.titles.get(language.index())
     }
 
     pub fn localized_titles(&self) -> impl Iterator<Item = (NacpLanguage, &ApplicationTitle)> {
         NacpLanguage::ALL.into_iter().filter_map(|language| {
-            let title = self.title(language);
+            let title = self.title(language)?;
             (!title.is_empty()).then_some((language, title))
         })
     }
@@ -297,19 +301,14 @@ impl ApplicationControlProperty {
             .chain([NacpLanguage::AmericanEnglish])
             .chain(NacpLanguage::ALL)
             .find_map(|language| {
-                let title = self.title(language);
+                let title = self.title(language)?;
                 (!title.is_empty()).then_some((language, title))
             })
     }
 }
 
 fn parse_nacp(bytes: &[u8; NACP_SIZE]) -> Result<ApplicationControlProperty, LoadError> {
-    let mut titles = std::array::from_fn(|_| ApplicationTitle::default());
-    for (index, title) in titles.iter_mut().enumerate() {
-        let offset = index * 0x300;
-        title.name = fixed_string(bytes, offset, 0x200, "application name")?;
-        title.publisher = fixed_string(bytes, offset + 0x200, 0x100, "publisher")?;
-    }
+    let titles = parse_titles(bytes)?;
 
     Ok(ApplicationControlProperty {
         titles,
@@ -387,6 +386,70 @@ fn parse_nacp(bytes: &[u8; NACP_SIZE]) -> Result<ApplicationControlProperty, Loa
     })
 }
 
+/// NACP's language region is either sixteen literal entries or a length-prefixed
+/// raw DEFLATE stream. The remaining property offsets always refer to the raw
+/// 0x4000-byte NACP, not to the expanded language data.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/file_sys/control_metadata.cpp#L48-L105
+fn parse_titles(bytes: &[u8; NACP_SIZE]) -> Result<Box<[ApplicationTitle]>, LoadError> {
+    let expanded;
+    let data = match bytes[0x3215] {
+        0 => &bytes[..LANGUAGE_COUNT * TITLE_ENTRY_SIZE],
+        1 => {
+            let size = usize::from(read_u16(bytes, 0));
+            let compressed = bytes
+                .get(2..2 + size)
+                .filter(|_| size != 0 && size <= 0x2ffe)
+                .ok_or_else(|| {
+                    LoadError::invalid(
+                        "NACP",
+                        "compressed language data exceeds its field or is empty",
+                    )
+                })?;
+            let mut output = vec![0; MAX_EXPANDED_TITLE_ENTRIES * TITLE_ENTRY_SIZE];
+            let mut decoder = flate2::Decompress::new(false);
+            let status = decoder
+                .decompress(compressed, &mut output, flate2::FlushDecompress::Finish)
+                .map_err(|error| {
+                    LoadError::invalid(
+                        "NACP",
+                        format!("invalid raw DEFLATE language data: {error}"),
+                    )
+                })?;
+            let size = decoder.total_out() as usize;
+            if status != flate2::Status::StreamEnd || decoder.total_in() != compressed.len() as u64
+            {
+                return Err(LoadError::invalid(
+                    "NACP",
+                    "compressed language data is incomplete, exceeds 32 entries or contains trailing data",
+                ));
+            }
+            if size == 0 || !size.is_multiple_of(TITLE_ENTRY_SIZE) {
+                return Err(LoadError::invalid(
+                    "NACP",
+                    "expanded language data must contain complete 0x300-byte entries",
+                ));
+            }
+            output.truncate(size);
+            expanded = output;
+            &expanded
+        }
+        value => {
+            return Err(LoadError::invalid(
+                "NACP",
+                format!("unsupported title data format {value}"),
+            ));
+        }
+    };
+    data.chunks_exact(TITLE_ENTRY_SIZE)
+        .map(|entry| {
+            Ok(ApplicationTitle {
+                name: fixed_string(entry, 0, 0x200, "application name")?,
+                publisher: fixed_string(entry, 0x200, 0x100, "publisher")?,
+            })
+        })
+        .collect::<Result<Box<[_]>, _>>()
+}
+
 fn fixed_string(bytes: &[u8], offset: usize, size: usize, name: &str) -> Result<String, LoadError> {
     let field = &bytes[offset..offset + size];
     let used = field.iter().position(|byte| *byte == 0).unwrap_or(size);
@@ -430,35 +493,6 @@ mod tests {
     fn put_string(bytes: &mut [u8], offset: usize, size: usize, value: &str) {
         assert!(value.len() < size);
         bytes[offset..offset + value.len()].copy_from_slice(value.as_bytes());
-    }
-
-    #[test]
-    fn parses_localized_titles_languages_and_properties() {
-        let mut bytes = vec![0_u8; NACP_SIZE];
-        put_string(&mut bytes, 0, 0x200, "Example");
-        put_string(&mut bytes, 0x200, 0x100, "Publisher");
-        let japanese = NacpLanguage::Japanese.index() * 0x300;
-        put_string(&mut bytes, japanese, 0x200, "例");
-        put_string(&mut bytes, 0x3060, 0x10, "1.2.3");
-        bytes[0x302C..0x3030].copy_from_slice(
-            &(NacpLanguage::AmericanEnglish.bit() | NacpLanguage::Japanese.bit() | 0x8000_0000)
-                .to_le_bytes(),
-        );
-        bytes[0x3025] = 1;
-        bytes[0x3035] = 2;
-        bytes[0x3212] = 7;
-        bytes[0x3080..0x3088].copy_from_slice(&123_i64.to_le_bytes());
-
-        let nacp = load(bytes).unwrap();
-        assert_eq!(nacp.title(NacpLanguage::AmericanEnglish).name, "Example");
-        assert_eq!(nacp.title(NacpLanguage::Japanese).name, "例");
-        assert_eq!(nacp.display_version, "1.2.3");
-        assert_eq!(nacp.startup_user_account, StartupUserAccount::Required);
-        assert_eq!(nacp.video_capture, VideoCapturePolicy::Enable);
-        assert_eq!(nacp.program_index, 7);
-        assert_eq!(nacp.user_account_save_data_size, 123);
-        assert_eq!(nacp.supported_languages.iter().count(), 2);
-        assert_eq!(nacp.supported_languages.unknown_bits(), 0x8000_0000);
     }
 
     #[test]

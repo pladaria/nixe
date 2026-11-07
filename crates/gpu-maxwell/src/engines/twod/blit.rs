@@ -3,9 +3,9 @@ use super::{
     MaxwellTwoDClipEnable, MaxwellTwoDColorKeyEnable, MaxwellTwoDOperation, MaxwellTwoDRegister,
     MaxwellTwoDRenderEnableMode, MaxwellTwoDState,
 };
-use crate::engines::{MaxwellEngineDispatchError, PendingEngineOperation};
+use crate::MaxwellMethodSource;
+use crate::engines::MaxwellEngineDispatchError;
 use crate::engines::{MaxwellMemoryCopyLayout, MaxwellMemoryCopyOperation};
-use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellTwoDBlitState {
@@ -17,7 +17,7 @@ pub struct MaxwellTwoDBlitState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct BlitSurface {
+pub struct BlitSurface {
     pub address: u64,
     pub width: u32,
     pub height: u32,
@@ -26,13 +26,13 @@ pub(crate) struct BlitSurface {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum BlitSurfaceLayout {
+pub enum BlitSurfaceLayout {
     Pitch(u32),
     BlockLinear(u8),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BlitKind {
+pub enum BlitKind {
     Scale {
         filter: nixe_gpu::BlitFilter,
         first: [i64; 2],
@@ -57,10 +57,10 @@ pub(crate) enum BlitKind {
 /// The source PTE kind distinguishes multisample resolve from texel filtering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellTwoDBlitOperation {
-    pub(crate) source: MaxwellMethodSource,
-    pub(crate) images: [BlitSurface; 2],
-    pub(crate) destination_compression: bool,
-    pub(crate) kind: BlitKind,
+    pub source: MaxwellMethodSource,
+    pub images: [BlitSurface; 2],
+    pub destination_compression: bool,
+    pub kind: BlitKind,
 }
 
 impl MaxwellTwoDBlitOperation {
@@ -89,34 +89,39 @@ fn pixel_bytes(format: u8) -> Option<u32> {
 }
 
 impl MaxwellTwoDBlitState {
-    fn launch(
+    fn launch<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
         &self,
         state: &MaxwellTwoDState,
         source: MaxwellMethodSource,
-    ) -> Result<PendingEngineOperation, MaxwellEngineDispatchError> {
+        execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+    ) -> Result<bool, crate::engines::MaxwellEngineStreamError> {
         if state.operation().value() != Some(&MaxwellTwoDOperation::SourceCopy) {
-            return Err(error(
+            return Err((error(
                 source,
                 "2D pixels-from-memory requires SET_OPERATION=SRCCOPY",
-            ));
+            ))
+            .into());
         }
         if state.clip_enable().value() != Some(&MaxwellTwoDClipEnable::Disabled) {
-            return Err(error(
+            return Err((error(
                 source,
                 "2D pixels-from-memory requires SET_CLIP_ENABLE=FALSE",
-            ));
+            ))
+            .into());
         }
         if state.color_key_enable().value() != Some(&MaxwellTwoDColorKeyEnable::Disabled) {
-            return Err(error(
+            return Err((error(
                 source,
                 "2D pixels-from-memory requires SET_COLOR_KEY_ENABLE=FALSE",
-            ));
+            ))
+            .into());
         }
         if state.render_enable().mode().value() != Some(&MaxwellTwoDRenderEnableMode::Enabled) {
-            return Err(error(
+            return Err((error(
                 source,
                 "2D pixels-from-memory requires SET_RENDER_ENABLE_C=TRUE",
-            ));
+            ))
+            .into());
         }
         if self
             .sample_mode
@@ -180,9 +185,10 @@ impl MaxwellTwoDBlitState {
                     source,
                 )
                 .map_err(|_| error(source, "2D copy address range overflows"))?;
-                return Ok(PendingEngineOperation::MemoryCopy(copy));
+                execution.copy_memory(copy)?;
+                return Ok(true);
             }
-            return Ok(PendingEngineOperation::TwoDBlit(MaxwellTwoDBlitOperation {
+            return Ok(execution.blit(&MaxwellTwoDBlitOperation {
                 source,
                 images,
                 destination_compression: self.compression.value() == Some(&1),
@@ -191,7 +197,7 @@ impl MaxwellTwoDBlitState {
                 } else {
                     BlitKind::Copy { origins, extent }
                 },
-            }));
+            })?);
         }
         let get = |register: &MaxwellTwoDRegister<u32>| {
             register
@@ -227,14 +233,14 @@ impl MaxwellTwoDBlitState {
         let images = [surface(&self.src, false)?, surface(&self.dst, true)?];
         let [src, dst] = images;
         if src.width == 0 || src.height == 0 || dst.width == 0 || dst.height == 0 {
-            return Err(error(source, "2D sampling surfaces must be nonempty"));
+            return Err((error(source, "2D sampling surfaces must be nonempty")).into());
         }
         // deko3d averages each 2x2 sample block at its center. Other affine
         // transforms are blits, not hardware resolves, and must not be coerced.
         // https://github.com/devkitPro/deko3d/blob/master/source/dk_image.cpp#L666-L695
         let mode = get(&self.sample_mode)?;
         if mode & !0x11 != 0 {
-            return Err(error(source, "2D downsample sample mode has reserved bits"));
+            return Err((error(source, "2D downsample sample mode has reserved bits")).into());
         }
         let (fraction, integer) = if mode & 1 == 0 {
             (0x8000_0000, 0)
@@ -280,10 +286,11 @@ impl MaxwellTwoDBlitState {
                     .checked_add(extent.height)
                     .is_none_or(|end| end > dst.height)
             {
-                return Err(error(
+                return Err((error(
                     source,
                     "scaled 2D destination rectangle is empty or exceeds its surface",
-                ));
+                ))
+                .into());
             }
             let fixed = |slot: usize| -> Result<i64, MaxwellEngineDispatchError> {
                 Ok(((u64::from(get(&self.parameters[slot + 1])?) << 32)
@@ -296,7 +303,7 @@ impl MaxwellTwoDBlitState {
                 fixed(10)?.checked_add(adjustment),
             ];
             let [Some(first_x), Some(first_y)] = first else {
-                return Err(error(source, "scaled 2D source coordinate overflows"));
+                return Err((error(source, "scaled 2D source coordinate overflows")).into());
             };
             let first = [first_x, first_y];
             for axis in 0..2 {
@@ -309,7 +316,9 @@ impl MaxwellTwoDBlitState {
                     || last < 0
                     || last >= limit
                 {
-                    return Err(error(source, "scaled 2D samples exceed the source surface"));
+                    return Err(
+                        (error(source, "scaled 2D samples exceed the source surface")).into(),
+                    );
                 }
             }
             BlitKind::Scale {
@@ -320,12 +329,12 @@ impl MaxwellTwoDBlitState {
                 extent,
             }
         };
-        Ok(PendingEngineOperation::TwoDBlit(MaxwellTwoDBlitOperation {
+        Ok(execution.blit(&MaxwellTwoDBlitOperation {
             source,
             images,
             destination_compression: get(&self.compression)? != 0,
             kind,
-        }))
+        })?)
     }
     // Unit point sampling is an exact texel mapping for both origins. deko3d
     // places the corner sample at a half texel and the center sample at zero.
@@ -460,11 +469,11 @@ impl MaxwellTwoDBlitState {
 }
 
 /// O(1) decoding of the bounded public surface/launch register ranges.
-pub(super) fn apply(
-    method: MaxwellMethodDispatch,
+pub(super) fn apply<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    source: MaxwellMethodSource,
     state: &mut MaxwellTwoDState,
-) -> Option<Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError>> {
-    let source = method.source();
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Option<Result<bool, crate::engines::MaxwellEngineStreamError>> {
     let address = source.method().0;
     // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/twod/cl902d.h
     let (register, name, mask) = match address {
@@ -538,23 +547,23 @@ pub(super) fn apply(
         _ => return None,
     };
     if source.argument() & !mask != 0 {
-        return Some(Err(MaxwellEngineDispatchError::InvalidTwoDMethodEncoding {
-            source,
-            method_name: name,
-            reason: "reserved bits are set",
-        }));
+        return Some(Err(
+            (MaxwellEngineDispatchError::InvalidTwoDMethodEncoding {
+                source,
+                method_name: name,
+                reason: "reserved bits are set",
+            })
+            .into(),
+        ));
     }
     *register = MaxwellTwoDRegister::programmed(source.argument(), source.argument(), source);
-    let operation = if address == 0x08dc {
-        match state.blit.launch(state, source) {
-            Ok(operation) => Some(operation),
-            Err(error) => {
-                log::debug!("untranslated 2D blit state: {:?}", state.blit);
-                return Some(Err(error));
-            }
+    if address == 0x08dc {
+        let result = state.blit.launch(state, source, execution);
+        if result.is_err() {
+            log::debug!("untranslated 2D blit state: {:?}", state.blit);
         }
+        Some(result)
     } else {
-        None
-    };
-    Some(Ok(operation))
+        Some(Ok(true))
+    }
 }

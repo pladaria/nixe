@@ -4,8 +4,6 @@
 //! The live and shadow banks share initialized class state. Typed views decode
 //! those words when consumed, without tracking whether the guest wrote them.
 
-use std::sync::Arc;
-
 use nixe_gpu::GpuMethodId;
 
 use crate::MaxwellMethodSource;
@@ -20,7 +18,7 @@ use super::{
     MaxwellThreeDCoverageState, MaxwellThreeDFixedFunctionState, MaxwellThreeDInlineToMemoryState,
     MaxwellThreeDInlineToMemoryStateWrite, MaxwellThreeDLineState, MaxwellThreeDMmeState,
     MaxwellThreeDRenderEnableState, MaxwellThreeDRenderTargetState,
-    MaxwellThreeDReportSemaphoreState, MaxwellThreeDResourceRole, MaxwellThreeDShaderBindingState,
+    MaxwellThreeDReportSemaphoreState, MaxwellThreeDShaderBindingState,
     MaxwellThreeDShaderExecutionState, MaxwellThreeDVertexInputState,
     render_targets::{
         MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD, MAXWELL_THREE_D_COLOR_COMPRESSION_RESET,
@@ -833,28 +831,10 @@ impl MaxwellThreeDViewportState<'_> {
 
 /// Authoritative class registers, renderer dirty domains and operational state.
 /// Consumers interpret only the fields required by the operation they execute.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct MaxwellThreeDState {
-    registers: MaxwellThreeDRawRegisterFile,
-    parameters: Box<[u32; super::registers::PARAMETER_METHOD_COUNT]>,
-    parameter_fingerprint: u64,
-    dirty: u64,
-    inline_index: Option<Arc<[u8]>>,
-    // Renderer preparation and revisions belong to the same channel lifetime.
-    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/control/channel_state_cache.h
-    draw_state_revision: u64,
-    draw_parameters_revision: u64,
-    resource_selection_revision: u64,
-    color_target_revisions: [u64; 8],
-    depth_target_revision: u64,
-    vertex_slots: [u64; 32],
-    index_revision: u64,
-    constant_slots: [[u64; 32]; 8],
-    resource_group_revisions: [u64; 4],
-    texture_header_revision: u64,
-    sampler_revision: u64,
-    sample_mode_revision: u64,
-    shader_revision: u64,
+    pub(super) registers: MaxwellThreeDRawRegisterFile,
+    graphics_dirty: nixe_gpu::native::GraphicsDirty,
     primitive_sequence: super::vertex::MaxwellThreeDPrimitiveSequence,
     shader_resources: super::bindings::MaxwellThreeDShaderResources,
     inline_transfer: Option<super::inline_to_memory::PendingTransfer>,
@@ -863,31 +843,9 @@ pub struct MaxwellThreeDState {
 impl Default for MaxwellThreeDState {
     fn default() -> Self {
         let registers = MaxwellThreeDRawRegisterFile::default();
-        // The incremental rendering key belongs only to live state. The shadow
-        // bank retains raw hardware words and has no unused parameter mirror.
-        let parameters = Box::new(
-            super::registers::PARAMETER_METHODS
-                .map(|method| super::registers::parameter_word(method, registers.word(method))),
-        );
         Self {
             registers,
-            parameters,
-            parameter_fingerprint: 0,
-            dirty: Default::default(),
-            inline_index: Default::default(),
-            draw_state_revision: Default::default(),
-            draw_parameters_revision: Default::default(),
-            resource_selection_revision: Default::default(),
-            color_target_revisions: Default::default(),
-            depth_target_revision: Default::default(),
-            vertex_slots: Default::default(),
-            index_revision: Default::default(),
-            constant_slots: Default::default(),
-            resource_group_revisions: Default::default(),
-            texture_header_revision: Default::default(),
-            sampler_revision: Default::default(),
-            sample_mode_revision: Default::default(),
-            shader_revision: Default::default(),
+            graphics_dirty: Default::default(),
             primitive_sequence: Default::default(),
             shader_resources: Default::default(),
             inline_transfer: Default::default(),
@@ -895,112 +853,19 @@ impl Default for MaxwellThreeDState {
     }
 }
 
-/// Retained identity of the state domains which determine resource bindings.
-///
-/// State domains unrelated to resource resolution deliberately do not advance
-/// the retained revisions or invalidate this identity.
-/// The channel slot supplies its role and dependent CB indices; the proof keeps
-/// only their revisions, without another copy of the selected resource layout.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct MaxwellThreeDResourceStateIdentity {
-    revision: u64,
-    // Combined descriptors depend on TIC and TSC state independently. The
-    // handle's own CB slots below determine buffer selection changes.
-    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-    sampler: u64,
-    constant_buffers: [u64; 2],
-    sample_mode: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct MaxwellThreeDResourceGroupIdentity {
-    revision: u64,
-}
-
-impl MaxwellThreeDResourceGroupIdentity {
-    pub(crate) fn matches(&self, state: &MaxwellThreeDState, group: usize) -> bool {
-        self.revision == state.resource_group_revisions[group]
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct MaxwellThreeDShaderStateIdentity {
-    revision: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct MaxwellThreeDDrawStateIdentity {
-    revision: u64,
-    parameters_revision: u64,
-}
-
-impl MaxwellThreeDDrawStateIdentity {
-    pub(crate) fn matches_parameters(&self, state: &MaxwellThreeDState) -> bool {
-        self.parameters_revision == state.draw_parameters_revision
-    }
-    pub(crate) fn matches(&self, state: &MaxwellThreeDState) -> bool {
-        self.revision == state.draw_state_revision
-    }
-}
-
 /// Primitive class consumed by raster state, independent of assembly/winding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::engines) enum GeneratedPrimitive {
+pub enum GeneratedPrimitive {
     Points,
     Lines,
     Triangles,
 }
 
-impl MaxwellThreeDShaderStateIdentity {
-    pub(crate) fn matches_code(&self, state: &MaxwellThreeDState) -> bool {
-        self.revision == state.shader_revision
-    }
-}
-
-impl MaxwellThreeDResourceStateIdentity {
-    pub(crate) fn matches(
-        &self,
-        state: &MaxwellThreeDState,
-        role: MaxwellThreeDResourceRole,
-    ) -> bool {
-        if self.revision != state.binding_revision(role)
-            || (matches!(
-                role,
-                MaxwellThreeDResourceRole::SampledImage {
-                    with_sampler: true,
-                    ..
-                }
-            ) && self.sampler != state.sampler_revision)
-        {
-            return false;
-        }
-        if let MaxwellThreeDResourceRole::SampledImage { texture, .. }
-        | MaxwellThreeDResourceRole::Sampler(texture) = role
-        {
-            let slots = &state.constant_slots[texture.group as usize];
-            if slots[texture.constant_buffer_slot as usize] != self.constant_buffers[0]
-                || texture
-                    .secondary
-                    .is_some_and(|(slot, _, _)| slots[slot as usize] != self.constant_buffers[1])
-            {
-                return false;
-            }
-        }
-        !matches!(
-            role,
-            MaxwellThreeDResourceRole::ColorTarget(_)
-                | MaxwellThreeDResourceRole::DepthStencilTarget
-        ) || self.sample_mode == state.sample_mode_revision
-    }
-}
-
 /// Complete currently modeled live state of one channel's `MAXWELL_B` engine.
-#[derive(Clone, Debug, Eq, PartialEq, Default)]
-pub(crate) struct MaxwellThreeDFrontendState {
-    pub(super) instance_run: Option<super::draw::InstanceRun>,
-    deferred_draw_end: Option<u32>,
-    inline_indices: Vec<u8>,
-    inline_end: Option<MaxwellMethodSource>,
+#[derive(Clone, Debug, Default)]
+pub struct MaxwellThreeDFrontendState {
+    pub(super) method_sink: Vec<(GpuMethodId, u32)>,
+    pub(super) draw: super::draw::MaxwellThreeDDrawState,
     pub(in crate::engines) pending_notification: Option<(u64, MaxwellMethodSource)>,
     operation: MaxwellThreeDState,
     mme: MaxwellThreeDMmeState,
@@ -1008,7 +873,7 @@ pub(crate) struct MaxwellThreeDFrontendState {
 
 impl MaxwellThreeDFrontendState {
     pub(super) fn has_inline_indices(&self) -> bool {
-        !self.inline_indices.is_empty()
+        !self.draw.inline_indices.is_empty()
     }
 
     pub(super) fn append_inline_indices(
@@ -1036,6 +901,7 @@ impl MaxwellThreeDFrontendState {
                 "inline indices require an active BEGIN",
             ));
         }
+        super::draw::inline(self);
         let (lanes, bits) = match source.method().0 {
             0x1300 => (4, 8),
             0x15ec => (2, 16),
@@ -1047,11 +913,12 @@ impl MaxwellThreeDFrontendState {
             .checked_mul(lanes)
             .ok_or(super::MaxwellEngineDispatchError::ResourceExhausted)?;
         if additional > u32::MAX as usize
-            || self.inline_indices.len() / 4 > u32::MAX as usize - additional
+            || self.draw.inline_indices.len() / 4 > u32::MAX as usize - additional
         {
             return Err(super::MaxwellEngineDispatchError::ResourceExhausted);
         }
-        self.inline_indices
+        self.draw
+            .inline_indices
             .try_reserve(
                 additional
                     .checked_mul(4)
@@ -1062,16 +929,15 @@ impl MaxwellThreeDFrontendState {
         for word in words {
             for lane in 0..lanes {
                 let value = (word >> (lane * bits)) & mask;
-                self.inline_indices.extend_from_slice(&value.to_le_bytes());
+                self.draw
+                    .inline_indices
+                    .extend_from_slice(&value.to_le_bytes());
             }
         }
         Ok(())
     }
 
-    pub(super) fn publish_inline_indices(
-        &mut self,
-        source: MaxwellMethodSource,
-    ) -> Result<u32, super::MaxwellEngineDispatchError> {
+    pub(super) fn publish_inline_indices(&mut self) -> u32 {
         if self
             .operation
             .vertex_input()
@@ -1080,36 +946,27 @@ impl MaxwellThreeDFrontendState {
             .value()
             == Some(&true)
         {
-            let restart = self
-                .operation
-                .vertex_input()
-                .primitive()
-                .restart_index()
-                .raw()
-                .ok_or_else(|| {
-                    super::invalid_encoding(
-                        source,
-                        "INLINE_INDEX",
-                        "primitive restart requires a programmed restart index",
-                    )
-                })?;
-            for word in self.inline_indices.chunks_exact_mut(4) {
+            let restart = self.operation.register_words()[0x1648 / 4];
+            for word in self.draw.inline_indices.chunks_exact_mut(4) {
                 if u32::from_le_bytes(word.try_into().unwrap()) == restart {
                     word.copy_from_slice(&u32::MAX.to_le_bytes());
                 }
             }
         }
-        let count = (self.inline_indices.len() / 4) as u32;
-        self.operation.inline_index = Some(Arc::from(self.inline_indices.as_slice()));
-        self.inline_end = Some(source);
-        Ok(count)
+        let count = (self.draw.inline_indices.len() / 4) as u32;
+        self.operation
+            .graphics_dirty
+            .mark(nixe_gpu::native::GraphicsDirty::INDEX);
+        self.draw.inline_draw_pending = true;
+        count
     }
 
     pub(in crate::engines) fn complete_inline_draw(&mut self) {
-        if let Some(source) = self.inline_end.take() {
-            self.operation.inline_index = None;
-            self.inline_indices.clear();
-            self.end_primitive(source.argument());
+        if std::mem::take(&mut self.draw.inline_draw_pending) {
+            self.operation
+                .graphics_dirty
+                .mark(nixe_gpu::native::GraphicsDirty::INDEX);
+            self.draw.inline_indices.clear();
         }
     }
     #[must_use]
@@ -1131,179 +988,38 @@ impl MaxwellThreeDFrontendState {
         &mut self.mme
     }
 
+    #[inline(always)]
+    pub(super) fn write_register(&mut self, method: GpuMethodId, argument: u32) {
+        // ProcessDirtyRegisters stores repeated words and touches two byte-
+        // indexed flags. Execution effects are handled separately by admission.
+        self.operation.registers.write(method, argument);
+        for table in &super::registers::DIRTY_TABLES {
+            self.operation
+                .graphics_dirty
+                .mark_index(table[(method.0 / 4) as usize]);
+        }
+    }
+
     /// Returns the last raw write to one byte-addressed class method.
     #[must_use]
     pub(in crate::engines) fn raw_register_value(&self, method: GpuMethodId) -> Option<u32> {
         self.operation.registers.raw(method)
     }
 
-    pub(super) fn write_register(&mut self, method: GpuMethodId, argument: u32) {
-        let info = super::registers::info(method).expect("admitted register");
-        self.write_classified_register(method, argument, info);
-    }
-
-    #[inline(always)]
-    pub(super) fn write_classified_register(
-        &mut self,
-        method: GpuMethodId,
-        argument: u32,
-        info: &super::registers::MethodInfo,
-    ) {
-        let previous = self.operation.registers.word(method);
-        if previous == argument {
-            return;
-        }
-        self.operation.registers.write(method, argument);
-        if info.domains() & super::registers::PARAMETERS != 0 {
-            let ordinal = super::registers::PARAMETER_ORDINALS[(method.0 / 4) as usize] as usize;
-            let parameter = &mut self.operation.parameters[ordinal];
-            let value = super::registers::parameter_word(method, argument);
-            if *parameter != value {
-                self.operation.parameter_fingerprint ^=
-                    super::registers::normalized_parameter_hash(method, *parameter)
-                        ^ super::registers::normalized_parameter_hash(method, value);
-                *parameter = value;
-            }
-        }
-        self.operation.dirty |= info.dirty();
-    }
     pub(super) fn record_raw_register(&mut self, source: MaxwellMethodSource) {
         self.write_register(source.method(), source.argument());
-    }
-
-    pub(super) fn flush_dirty(&mut self) {
-        use super::registers as D;
-        let state = &mut self.operation;
-        let dirty = std::mem::take(&mut state.dirty);
-        let domains = dirty as u16;
-        if domains & D::DRAW != 0 {
-            advance_revision(&mut state.draw_state_revision);
-        }
-        if domains & D::PARAMETERS != 0 {
-            advance_revision(&mut state.draw_parameters_revision);
-        }
-        if domains & D::SELECTION != 0 {
-            advance_revision(&mut state.resource_selection_revision);
-        }
-        if domains & D::SHADERS != 0 {
-            advance_revision(&mut state.shader_revision);
-        }
-        if domains & (D::VERTEX | D::INDEX) != 0 {
-            advance_revision(&mut state.resource_group_revisions[0]);
-        }
-        let mut vertices = (dirty >> D::VERTEX_SHIFT) as u32;
-        while vertices != 0 {
-            let index = vertices.trailing_zeros() as usize;
-            vertices &= vertices - 1;
-            advance_revision(&mut state.vertex_slots[index]);
-        }
-        if domains & D::INDEX != 0 {
-            advance_revision(&mut state.index_revision);
-        }
-        if domains & (D::COLOR | D::DEPTH | D::SAMPLE_MODE) != 0 {
-            advance_revision(&mut state.resource_group_revisions[3]);
-        }
-        let mut colors = (dirty >> D::COLOR_SHIFT) as u8;
-        while colors != 0 {
-            let index = colors.trailing_zeros() as usize;
-            colors &= colors - 1;
-            advance_revision(&mut state.color_target_revisions[index]);
-        }
-        if domains & D::DEPTH != 0 {
-            advance_revision(&mut state.depth_target_revision);
-        }
-        if domains & D::SAMPLE_MODE != 0 {
-            advance_revision(&mut state.sample_mode_revision);
-        }
-        if domains & (D::HEADERS | D::SAMPLERS) != 0 {
-            advance_revision(&mut state.resource_group_revisions[2]);
-        }
-        if domains & D::HEADERS != 0 {
-            advance_revision(&mut state.texture_header_revision);
-        }
-        if domains & D::SAMPLERS != 0 {
-            advance_revision(&mut state.sampler_revision);
-        }
     }
 }
 
 impl MaxwellThreeDState {
-    pub(crate) fn attachment_selection(&self) -> [u32; 4] {
-        [0x121c, 0x12cc, 0x1380, 0x1538].map(|method| self.registers.word(GpuMethodId(method)))
+    /// Borrow the canonical class bank, as Maxwell3D::Regs::reg_array. Native
+    /// state consumers read these words directly without semantic snapshots.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.h
+    pub fn register_words(&self) -> &[u32; 0xe00] {
+        &self.registers.values
     }
-    pub(crate) fn parameter_fingerprint(&self) -> u64 {
-        self.parameter_fingerprint
-    }
-    pub(crate) fn parameter_registers(&self) -> &[u32; super::registers::PARAMETER_METHOD_COUNT] {
-        &self.parameters
-    }
-    pub(crate) fn inline_index(&self) -> Option<&Arc<[u8]>> {
-        self.inline_index.as_ref()
-    }
-    pub(crate) fn draw_state_identity(&self) -> MaxwellThreeDDrawStateIdentity {
-        MaxwellThreeDDrawStateIdentity {
-            revision: self.draw_state_revision,
-            parameters_revision: self.draw_parameters_revision,
-        }
-    }
-
-    fn binding_revision(&self, role: MaxwellThreeDResourceRole) -> u64 {
-        use MaxwellThreeDResourceRole as R;
-        match role {
-            R::VertexStream(slot) => self.vertex_slots[slot as usize],
-            R::IndexBuffer => self.index_revision,
-            R::ConstantBuffer { group, slot } | R::StorageBuffer { group, slot, .. } => {
-                self.constant_slots[group as usize][slot as usize]
-            }
-            R::ColorTarget(slot) => self.color_target_revisions[slot as usize],
-            R::DepthStencilTarget => self.depth_target_revision,
-            R::SampledImage { .. } | R::TextureHeaders => self.texture_header_revision,
-            R::Sampler(_) | R::Samplers => self.sampler_revision,
-            R::BlitSource | R::BlitDestination => 0,
-        }
-    }
-    pub(crate) fn resource_state_identity(
-        &self,
-        role: MaxwellThreeDResourceRole,
-    ) -> MaxwellThreeDResourceStateIdentity {
-        use MaxwellThreeDResourceRole as R;
-        let constant_buffers = match role {
-            R::SampledImage { texture, .. } | R::Sampler(texture) => {
-                let slots = &self.constant_slots[texture.group as usize];
-                [
-                    slots[texture.constant_buffer_slot as usize],
-                    texture
-                        .secondary
-                        .map_or(0, |(slot, _, _)| slots[slot as usize]),
-                ]
-            }
-            _ => [0; 2],
-        };
-        MaxwellThreeDResourceStateIdentity {
-            revision: self.binding_revision(role),
-            sampler: self.sampler_revision,
-            constant_buffers,
-            sample_mode: self.sample_mode_revision,
-        }
-    }
-
-    pub(crate) fn resource_selection_revision(&self) -> u64 {
-        self.resource_selection_revision
-    }
-
-    pub(crate) fn resource_group_identity(
-        &self,
-        group: usize,
-    ) -> MaxwellThreeDResourceGroupIdentity {
-        MaxwellThreeDResourceGroupIdentity {
-            revision: self.resource_group_revisions[group],
-        }
-    }
-
-    pub(crate) fn shader_state_identity(&self) -> MaxwellThreeDShaderStateIdentity {
-        MaxwellThreeDShaderStateIdentity {
-            revision: self.shader_revision,
-        }
+    pub fn graphics_dirty(&self) -> &nixe_gpu::native::GraphicsDirty {
+        &self.graphics_dirty
     }
 
     #[must_use]
@@ -1400,12 +1116,11 @@ impl MaxwellThreeDState {
     }
 
     /// Patches consume the tessellator's output primitive, not their input topology.
-    pub(in crate::engines) fn generated_primitive(&self) -> Option<GeneratedPrimitive> {
+    pub fn generated_primitive(&self, topology: u32) -> Option<GeneratedPrimitive> {
         use GeneratedPrimitive as Output;
-        match self.vertex_input().primitive().active_begin()?.topology() {
+        match topology {
             0 => Some(Output::Points),
-            1 | 3 => Some(Output::Lines),
-            4..=7 => Some(Output::Triangles),
+            1 | 2 | 3 | 10 | 11 => Some(Output::Lines),
             14 => self
                 .shader_bindings()
                 .tessellation_mode()
@@ -1417,7 +1132,7 @@ impl MaxwellThreeDState {
                     nixe_gpu::TessellationOutput::Lines => Output::Lines,
                     nixe_gpu::TessellationOutput::Triangles(_) => Output::Triangles,
                 }),
-            _ => None,
+            _ => Some(Output::Triangles),
         }
     }
 }
@@ -1427,18 +1142,7 @@ impl MaxwellThreeDFrontendState {
         self.operation.primitive_sequence.begin(raw, value);
     }
     pub(super) fn end_primitive(&mut self, raw: u32) {
-        // A pending draw still consumes its validated BEGIN. End it only after
-        // that consumer, while the live and shadow register writes stay immediate.
-        if self.instance_run.is_some() {
-            self.deferred_draw_end = Some(raw);
-        } else {
-            self.operation.primitive_sequence.end(raw, raw != 0);
-        }
-    }
-    pub(super) fn complete_draw_end(&mut self) {
-        if let Some(raw) = self.deferred_draw_end.take() {
-            self.operation.primitive_sequence.end(raw, raw != 0);
-        }
+        self.operation.primitive_sequence.end(raw, raw != 0);
     }
     pub(super) fn bind_constant_buffer(
         &mut self,
@@ -1446,13 +1150,6 @@ impl MaxwellThreeDFrontendState {
         slot: u8,
         binding: Option<super::MaxwellThreeDConstantBufferBinding>,
     ) {
-        let previous = self.operation.shader_bindings().groups()[group as usize].constant_buffers()
-            [slot as usize];
-        if previous != binding {
-            advance_revision(&mut self.operation.constant_slots[group as usize][slot as usize]);
-            advance_revision(&mut self.operation.resource_group_revisions[1]);
-            advance_revision(&mut self.operation.resource_group_revisions[2]);
-        }
         self.operation.shader_resources.groups[group as usize].constant_buffers[slot as usize] =
             binding;
     }
@@ -1485,123 +1182,9 @@ impl MaxwellThreeDFrontendState {
     }
 }
 
-fn advance_revision(revision: &mut u64) {
-    *revision = revision
-        .checked_add(1)
-        .expect("Maxwell semantic revision exhausted");
-}
-
 #[cfg(test)]
 mod tests {
     use super::MaxwellThreeDFrontendState;
-
-    #[test]
-    fn sampled_image_identity_tracks_its_handles_and_both_descriptor_tables() {
-        use crate::engines::threed::{
-            MaxwellThreeDConstantBufferBinding, MaxwellThreeDResourceRole,
-            MaxwellThreeDTextureDimension, MaxwellThreeDTextureReference,
-            MaxwellThreeDUnresolvedAddress,
-        };
-        let mut frontend = MaxwellThreeDFrontendState::default();
-        let texture =
-            MaxwellThreeDTextureReference::expression(4, (1, 0, 0), Some((2, 4, 0))).unwrap();
-        let combined = MaxwellThreeDResourceRole::SampledImage {
-            texture,
-            dimension: MaxwellThreeDTextureDimension::Two,
-            with_sampler: true,
-        };
-        let image = MaxwellThreeDResourceRole::SampledImage {
-            texture,
-            dimension: MaxwellThreeDTextureDimension::Two,
-            with_sampler: false,
-        };
-        let binding = Some(MaxwellThreeDConstantBufferBinding {
-            address: MaxwellThreeDUnresolvedAddress::new(0, 0x1000),
-            size: std::num::NonZeroU32::new(256).unwrap(),
-        });
-        let identity = frontend.operation.resource_state_identity(combined);
-        frontend.bind_constant_buffer(4, 3, binding);
-        frontend.bind_constant_buffer(3, 1, binding);
-        assert!(identity.matches(&frontend.operation, combined));
-        for slot in [1, 2] {
-            let identity = frontend.operation.resource_state_identity(combined);
-            frontend.bind_constant_buffer(4, slot, binding);
-            assert!(!identity.matches(&frontend.operation, combined));
-        }
-        let combined_identity = frontend.operation.resource_state_identity(combined);
-        let image_identity = frontend.operation.resource_state_identity(image);
-        frontend.operation.sampler_revision += 1;
-        assert!(!combined_identity.matches(&frontend.operation, combined));
-        assert!(image_identity.matches(&frontend.operation, image));
-        let identity = frontend.operation.resource_state_identity(combined);
-        frontend.operation.texture_header_revision += 1;
-        assert!(!identity.matches(&frontend.operation, combined));
-        assert!(!image_identity.matches(&frontend.operation, image));
-    }
-
-    #[test]
-    fn register_dirty_routing_preserves_independent_vertex_and_attachment_slots() {
-        use nixe_gpu::GpuMethodId;
-        let mut frontend = MaxwellThreeDFrontendState::default();
-        for slot in 0..32 {
-            for method in [
-                0x1c00 + slot * 16,
-                0x1c04 + slot * 16,
-                0x1c08 + slot * 16,
-                0x1f00 + slot * 8,
-                0x1f04 + slot * 8,
-            ] {
-                let vertices = frontend.operation.vertex_slots;
-                let colors = frontend.operation.color_target_revisions;
-                let method = GpuMethodId(method);
-                let value = frontend.raw_register_value(method).unwrap() ^ 1;
-                frontend.write_register(method, value);
-                frontend.flush_dirty();
-                for (index, revision) in vertices.into_iter().enumerate() {
-                    assert_eq!(
-                        frontend.operation.vertex_slots[index],
-                        revision + u64::from(index == slot as usize),
-                        "{method:?}, vertex {index}"
-                    );
-                }
-                assert_eq!(frontend.operation.color_target_revisions, colors);
-                let consumed = frontend.operation.vertex_slots;
-                frontend.write_register(method, value);
-                frontend.flush_dirty();
-                assert_eq!(frontend.operation.vertex_slots, consumed);
-            }
-        }
-        for slot in 0..8 {
-            for method in (0..=8)
-                .map(|word| 0x0800 + slot * 0x40 + word * 4)
-                .chain([0x19e0 + slot * 4])
-            {
-                let vertices = frontend.operation.vertex_slots;
-                let colors = frontend.operation.color_target_revisions;
-                let method = GpuMethodId(method);
-                let value = frontend.raw_register_value(method).unwrap() ^ 1;
-                frontend.write_register(method, value);
-                frontend.flush_dirty();
-                assert_eq!(frontend.operation.vertex_slots, vertices);
-                for (index, revision) in colors.into_iter().enumerate() {
-                    assert_eq!(
-                        frontend.operation.color_target_revisions[index],
-                        revision + u64::from(index == slot as usize),
-                        "{method:?}, attachment {index}"
-                    );
-                }
-            }
-        }
-        let colors = frontend.operation.color_target_revisions;
-        let method = GpuMethodId(0x15b8);
-        let value = frontend.raw_register_value(method).unwrap() ^ 1;
-        frontend.write_register(method, value);
-        frontend.flush_dirty();
-        assert_eq!(
-            frontend.operation.color_target_revisions,
-            colors.map(|revision| revision + 1)
-        );
-    }
 
     #[test]
     fn viewport_depth_reset_is_shared_by_typed_live_state_and_mme_shadow_reads() {

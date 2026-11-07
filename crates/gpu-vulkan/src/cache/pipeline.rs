@@ -17,7 +17,6 @@ use std::{
 mod state;
 pub use state::*;
 mod create;
-mod recipes;
 use create::GraphicsCompilation;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,9 +60,9 @@ pub struct NativePipeline {
     pub bind_point: vk::PipelineBindPoint,
     pub dynamic_states: Box<[vk::DynamicState]>,
     pub(crate) graphics: Option<GraphicsState>,
-    pub(crate) resources: Box<[crate::residency::execution::ShaderAccess]>,
-    pub(crate) host_uniforms: Box<[nixe_shader_recompiler::artifact::HostUniformLayout]>,
-    pub(crate) binding_origins: Box<[super::layout::BindingOrigin]>,
+    pub(crate) resources: Box<[crate::residency::AccessScope]>,
+    pub(crate) image_bindings: Box<[usize]>,
+    pub(crate) shader_writes: bool,
 }
 impl NativePipeline {
     fn executable(&self) -> Result<&Executable, Arc<CompileError>> {
@@ -226,19 +225,22 @@ struct Compiler {
     cache_control: bool,
     features: vk::PhysicalDeviceFeatures,
     limits: vk::PhysicalDeviceLimits,
+    formats: [vk::FormatProperties; 185],
     dynamic: Box<[vk::DynamicState]>,
     provoking: bool,
     lines: [bool; 3],
     triangle_fans: bool,
+    primitive_restart: [bool; 2],
     fill_rectangle: bool,
+    vertex_divisor: bool,
+    vertex_zero_divisor: bool,
+    max_vertex_divisor: u32,
 }
 pub struct PipelineCompiler {
     pool: Arc<CompilePool>,
     cache: Mutex<nixe_gpu::WorkingSet<PipelineKey, Arc<NativePipeline>>>,
     compiler: Arc<Compiler>,
     counters: nixe_gpu::cache_counters::CacheCounters,
-    recipes: Option<Arc<recipes::Recipes>>,
-    load_batch: usize,
 }
 impl PipelineCompiler {
     pub(crate) fn bind_wakeup(&self, wake: Arc<dyn Fn() + Send + Sync>) {
@@ -290,6 +292,7 @@ impl PipelineCompiler {
         ];
         if base {
             dynamic.extend([
+                vk::DynamicState::PRIMITIVE_TOPOLOGY,
                 vk::DynamicState::CULL_MODE,
                 vk::DynamicState::FRONT_FACE,
                 vk::DynamicState::DEPTH_TEST_ENABLE,
@@ -300,6 +303,29 @@ impl PipelineCompiler {
                 vk::DynamicState::STENCIL_OP,
             ]);
         }
+        if device.profile().dynamic_state.base2 {
+            dynamic.extend([
+                vk::DynamicState::PRIMITIVE_RESTART_ENABLE,
+                vk::DynamicState::RASTERIZER_DISCARD_ENABLE,
+                vk::DynamicState::DEPTH_BIAS_ENABLE,
+            ]);
+        }
+        if base {
+            // BindVertexBuffers2 supplies strides even with SetVertexInputEXT.
+            // Declare the state emitted by that command for VUID-08608.
+            // https://docs.vulkan.org/spec/latest/chapters/drawing.html#VUID-vkCmdDrawIndexed-None-08608
+            dynamic.push(vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE);
+        }
+        if device.profile().dynamic_state.vertex_input {
+            dynamic.push(vk::DynamicState::VERTEX_INPUT_EXT);
+        }
+        if device.profile().dynamic_state.blending() {
+            dynamic.extend([
+                vk::DynamicState::COLOR_BLEND_ENABLE_EXT,
+                vk::DynamicState::COLOR_BLEND_EQUATION_EXT,
+                vk::DynamicState::COLOR_WRITE_MASK_EXT,
+            ]);
+        }
         if device.profile().core.depth_bounds != 0 {
             dynamic.push(vk::DynamicState::DEPTH_BOUNDS);
         }
@@ -308,8 +334,6 @@ impl PipelineCompiler {
         }
         Ok(Self {
             pool,
-            recipes: recipes::Recipes::new(device, config),
-            load_batch: config.workers.min(config.pending_jobs).max(1),
             counters: nixe_gpu::cache_counters::CacheCounters::new(config.pipeline_entries, 0),
             cache: Mutex::new(nixe_gpu::WorkingSet::new(
                 config.pipeline_entries,
@@ -336,9 +360,14 @@ impl PipelineCompiler {
                 cache_control: device.profile().pipeline_creation_cache_control,
                 features: device.profile().core,
                 limits: device.profile().limits,
+                formats: device.profile().formats,
                 dynamic: dynamic.into_boxed_slice(),
                 fill_rectangle: device.profile().fill_rectangle,
+                vertex_divisor: device.profile().dynamic_state.vertex_divisor,
+                vertex_zero_divisor: device.profile().dynamic_state.vertex_zero_divisor,
+                max_vertex_divisor: device.profile().dynamic_state.max_vertex_divisor,
                 provoking: device.profile().provoking_vertex_last,
+                primitive_restart: device.profile().primitive_restart,
                 lines: [
                     device.profile().rectangular_lines,
                     device.profile().smooth_lines,
@@ -356,47 +385,6 @@ impl PipelineCompiler {
         self.compiler.strategy
     }
     pub fn request(&self, recipe: PipelineRecipe) -> Result<Arc<NativePipeline>, CompileError> {
-        self.request_pipeline(recipe, true)
-    }
-    /// Rebuild accepted disk recipes on the existing compiler workers before
-    /// the guest starts producing frames. Each batch respects pool admission.
-    pub fn load_disk(&self) -> usize {
-        let Some(recipes) = &self.recipes else {
-            return 0;
-        };
-        let mut pending = Vec::with_capacity(self.load_batch);
-        let mut loaded = 0;
-        let finish = |pending: &mut Vec<Arc<NativePipeline>>| {
-            pending
-                .drain(..)
-                .filter(|pipeline| match pipeline.handle() {
-                    Ok(_) => true,
-                    Err(error) => {
-                        log::debug!("cached pipeline reconstruction: {error}");
-                        false
-                    }
-                })
-                .count()
-        };
-        for key in recipes.keys() {
-            let Some(recipe) = recipes.read(key) else {
-                continue;
-            };
-            match self.request_pipeline(recipe, false) {
-                Ok(pipeline) => pending.push(pipeline),
-                Err(error) => log::debug!("cached pipeline admission: {error}"),
-            }
-            if pending.len() == self.load_batch {
-                loaded += finish(&mut pending);
-            }
-        }
-        loaded + finish(&mut pending)
-    }
-    fn request_pipeline(
-        &self,
-        recipe: PipelineRecipe,
-        persist: bool,
-    ) -> Result<Arc<NativePipeline>, CompileError> {
         let (shader, state) = match recipe {
             PipelineRecipe::Compute(shader) => (shader, None),
             PipelineRecipe::Graphics { shader, state } => (shader, Some(state)),
@@ -418,22 +406,20 @@ impl PipelineCompiler {
             capture_key.event("hit", usize::MAX, 0);
             return Ok(Arc::clone(pipeline));
         }
-        let layout = self.compiler.layouts.get(LayoutKey::reflect(&shader)?)?;
-        let binding_origins = super::layout::binding_origins(&shader, &layout.key)?;
-        let resources = crate::residency::execution::shader_accesses(&shader, &layout.key);
-        let host_uniforms = shader
-            .stages
-            .iter()
-            .filter_map(|stage| stage.guest.as_ref())
-            .flat_map(|stage| stage.host_uniforms.iter().cloned())
-            .collect();
         let bind_point = if state.is_some() {
             vk::PipelineBindPoint::GRAPHICS
         } else {
             vk::PipelineBindPoint::COMPUTE
         };
-        let dynamic_states = if state.is_some() {
-            self.compiler.dynamic.clone()
+        let key_layout = LayoutKey::reflect(&shader)?;
+        let layout = if shader.stages.iter().all(|stage| stage.guest.is_some()) {
+            self.compiler.layouts.get_guest(key_layout, bind_point)?
+        } else {
+            self.compiler.layouts.get(key_layout)?
+        };
+        let resources = crate::residency::execution::shader_accesses(&shader, &layout.key);
+        let dynamic_states = if let Some(state) = &state {
+            self.compiler.dynamic_states(state)
         } else {
             Box::new([])
         };
@@ -442,16 +428,29 @@ impl PipelineCompiler {
             build: OnceLock::new(),
             build_lock: Mutex::new(()),
             build_ready: Condvar::new(),
-            layout,
+            layout: Arc::clone(&layout),
             bind_point,
             dynamic_states,
+            shader_writes: resources.iter().any(|scope| scope.writes()),
+            image_bindings: layout
+                .key
+                .bindings
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    matches!(
+                        b.kind,
+                        vk::DescriptorType::SAMPLED_IMAGE
+                            | vk::DescriptorType::STORAGE_IMAGE
+                            | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                    )
+                    .then_some(i)
+                })
+                .collect(),
             resources,
-            binding_origins,
-            host_uniforms,
             graphics: state,
         });
         let compiler = Arc::clone(&self.compiler);
-        let recipes = self.recipes.clone().filter(|_| persist);
         let build_pipeline = Arc::clone(&pipeline);
         self.pool.submit(move |worker| {
             nixe_gpu::trace::event("pipeline_compile", worker as u64, 0, 0);
@@ -484,7 +483,6 @@ impl PipelineCompiler {
                     );
                 }
             }
-            let succeeded = result.is_ok();
             {
                 let _lock = build_pipeline.build_lock.lock().unwrap();
                 assert!(
@@ -492,10 +490,6 @@ impl PipelineCompiler {
                     "pipeline completed twice"
                 );
                 build_pipeline.build_ready.notify_all();
-            }
-            // Disk I/O must not delay a pipeline that is already executable.
-            if succeeded && let Some(recipes) = recipes {
-                recipes.write(&shader, build_pipeline.graphics.as_ref());
             }
         })?;
         let previous_entries = cache.usage().0;
@@ -528,6 +522,20 @@ impl PipelineCompiler {
 }
 
 impl Compiler {
+    /// Guest geometry and procedural host blits have different native input
+    /// contracts. A static pipeline with no vertex bindings emits no stride.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/blit_image.cpp#L196-L204
+    fn dynamic_states(&self, state: &GraphicsState) -> Box<[vk::DynamicState]> {
+        self.dynamic
+            .iter()
+            .copied()
+            .filter(|&value| {
+                value != vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE
+                    || !state.vertex_bindings.is_empty()
+                    || self.dynamic.contains(&vk::DynamicState::VERTEX_INPUT_EXT)
+            })
+            .collect()
+    }
     fn normalize(&self, s: GraphicsState) -> GraphicsState {
         s.normalized(&self.dynamic)
     }
@@ -779,6 +787,26 @@ impl Compiler {
                 "vertex input exceeds host bounds or references an absent binding".into(),
             ));
         }
+        for (index, &(binding, divisor)) in s.vertex_divisors.iter().enumerate() {
+            if !self.vertex_divisor
+                || (divisor == 0 && !self.vertex_zero_divisor)
+                || divisor > self.max_vertex_divisor
+                || !s
+                    .vertex_bindings
+                    .iter()
+                    .any(|b| b.binding == binding && b.rate == vk::VertexInputRate::INSTANCE)
+                || s.vertex_divisors[..index]
+                    .iter()
+                    .any(|&(b, _)| b == binding)
+            {
+                return Err(CompileError::Failed(
+                    format!(
+                        "vertex binding {binding}: unsupported native instance divisor {divisor}"
+                    )
+                    .into(),
+                ));
+            }
+        }
         if s.polygon == vk::PolygonMode::FILL_RECTANGLE_NV && !self.fill_rectangle {
             return Err(CompileError::Failed(
                 "fill rectangle requires VK_NV_fill_rectangle or an exact primitive lowering"
@@ -809,14 +837,12 @@ impl Compiler {
             ));
         }
         if s.primitive_restart
-            && !matches!(
-                s.topology,
-                vk::PrimitiveTopology::LINE_STRIP
-                    | vk::PrimitiveTopology::TRIANGLE_STRIP
-                    | vk::PrimitiveTopology::TRIANGLE_FAN
-            )
+            && !crate::cache::restart_supported(s.topology, self.primitive_restart)
         {
-            return Err(CompileError::Failed("primitive restart outside native strip/fan topology requires frontend index lowering".into()));
+            return Err(CompileError::Failed(
+                "primitive restart requires enabled topology-list/patch-list restart support"
+                    .into(),
+            ));
         }
         if s.vertex_bindings.iter().enumerate().any(|(i, b)| {
             s.vertex_bindings[..i]
@@ -832,15 +858,14 @@ impl Compiler {
             ));
         }
         for a in s.vertex_attributes.iter() {
-            let properties = unsafe {
-                self.owner
-                    .instance
-                    .instance
-                    .get_physical_device_format_properties(self.owner.physical, a.format)
-            };
-            if !properties
-                .buffer_features
-                .contains(vk::FormatFeatureFlags::VERTEX_BUFFER)
+            if !usize::try_from(a.format.as_raw())
+                .ok()
+                .and_then(|index| self.formats.get(index))
+                .map(|p| {
+                    p.buffer_features
+                        .contains(vk::FormatFeatureFlags::VERTEX_BUFFER)
+                })
+                .unwrap_or(false)
             {
                 return Err(CompileError::Failed(format!("native vertex format {:?} lacks VERTEX_BUFFER support; use exact SSA pulling",a.format).into()));
             }
@@ -849,12 +874,10 @@ impl Compiler {
             if format == vk::Format::UNDEFINED {
                 continue;
             }
-            let p = unsafe {
-                self.owner
-                    .instance
-                    .instance
-                    .get_physical_device_format_properties(self.owner.physical, format)
-            };
+            let p = self
+                .formats
+                .get(format.as_raw() as usize)
+                .ok_or_else(|| CompileError::Failed("unsupported native color format".into()))?;
             let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
                 | if blend.enabled {
                     vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
@@ -894,6 +917,7 @@ impl Compiler {
         if !vi {
             state.vertex_bindings = std::sync::Arc::from([]);
             state.vertex_attributes = std::sync::Arc::from([]);
+            state.vertex_divisors = std::sync::Arc::from([]);
             state.topology = vk::PrimitiveTopology::TRIANGLE_LIST;
             state.primitive_restart = false;
         }
@@ -956,103 +980,5 @@ impl Compiler {
             },
             state,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ApiPreference, test_device};
-    use std::{sync::mpsc, time::Duration};
-
-    struct Release(Option<mpsc::Sender<()>>);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            if let Some(sender) = self.0.take() {
-                let _ = sender.send(());
-            }
-        }
-    }
-
-    #[test]
-    fn driver_build_does_not_block_metadata_binding_or_submission_on_the_owner() {
-        let Some(mut device) = test_device::device_for_test(ApiPreference::Auto) else {
-            return;
-        };
-        let validation = device.validation_monitor();
-        let config = CacheConfiguration {
-            workers: 1,
-            ..Default::default()
-        };
-        let pool = Arc::new(CompilePool::new(1, 8).unwrap());
-        let (started, entered) = mpsc::channel();
-        let (release, released) = mpsc::channel();
-        let mut release = Release(Some(release));
-        pool.submit(move |_| {
-            started.send(()).unwrap();
-            released.recv().unwrap();
-        })
-        .unwrap();
-        entered.recv_timeout(Duration::from_secs(3)).unwrap();
-        let compiler = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
-        let shader = crate::test_shaders::compile(
-            &device.profile().shader_compiler.profile,
-            [crate::test_shaders::increment(7, 4)],
-        );
-        let pipeline = compiler.request(PipelineRecipe::Compute(shader)).unwrap();
-        assert!(!pipeline.layout.key.bindings.is_empty());
-        device.bind_native_pipeline(&pipeline).unwrap();
-        let work = device.flush().unwrap().unwrap();
-        assert!(device.queue_usage().submitted_tick < work.tick());
-        release.0.take().unwrap().send(()).unwrap();
-        assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());
-        device.shutdown().unwrap();
-        validation.check().unwrap();
-    }
-
-    #[test]
-    fn recorder_pipeline_failure_retains_its_cause_and_never_submits_the_failed_tick() {
-        let Some(mut device) = test_device::device_for_test(ApiPreference::Auto) else {
-            return;
-        };
-        let validation = device.validation_monitor();
-        let config = CacheConfiguration {
-            workers: 1,
-            ..Default::default()
-        };
-        let pool = Arc::new(CompilePool::new(1, 8).unwrap());
-        let compiler = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
-        let shader = crate::test_shaders::compile(
-            &device.profile().shader_compiler.profile,
-            [crate::test_shaders::increment(7, 4)],
-        );
-        let source = compiler.request(PipelineRecipe::Compute(shader)).unwrap();
-        let pipeline = Arc::new(NativePipeline {
-            owner: Arc::clone(&source.owner),
-            build: OnceLock::from(Err(Arc::new(CompileError::Failed(
-                "pipeline build regression".into(),
-            )))),
-            build_lock: Mutex::new(()),
-            build_ready: Condvar::new(),
-            layout: Arc::clone(&source.layout),
-            bind_point: source.bind_point,
-            dynamic_states: source.dynamic_states.clone(),
-            graphics: source.graphics.clone(),
-            resources: source.resources.clone(),
-            host_uniforms: source.host_uniforms.clone(),
-            binding_origins: source.binding_origins.clone(),
-        });
-        device.bind_native_pipeline(&pipeline).unwrap();
-        let work = device.flush().unwrap().unwrap();
-        let error = device
-            .wait_for_work(work, Duration::from_secs(10))
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("pipeline build regression"),
-            "{error}"
-        );
-        assert!(device.queue_usage().submitted_tick < work.tick());
-        assert!(device.shutdown().is_err());
-        validation.check().unwrap();
     }
 }

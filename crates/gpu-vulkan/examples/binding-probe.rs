@@ -15,11 +15,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         return Err("binding probe requires a hardware GPU".into());
     }
-    let mut cache = VulkanResidency::new(
-        nixe_memory::Machine::switch_ram()?,
+    let cache = VulkanResidency::new(
+        nixe_memory::device_memory::DeviceMemory::new(nixe_memory::Machine::switch_ram()?, 34),
         device,
         64 * 1024 * 1024,
     )?;
+    let mut cache_owner = cache;
+    let mut cache = cache_owner.access();
     println!(
         "adapter={}; driver={}; validation=disabled; words=1024; dispatches=256; trials=7",
         cache.device().profile().name,
@@ -31,6 +33,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             result.binding, result.cpu_ns_per_dispatch, result.gpu_ns_per_dispatch
         );
     }
-    println!("barriers={:?}", cache.barrier_statistics());
     Ok(())
 }

@@ -5,7 +5,7 @@
 //! `9fdf5c4062007929d9f4e6cbad9c9771fe61b880`:
 //! https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
 
-use crate::{MaxwellMethodSource, MaxwellSpaVersion};
+use crate::MaxwellSpaVersion;
 
 use super::{MaxwellThreeDRegister, MaxwellThreeDTessellationMode, MaxwellThreeDUnresolvedAddress};
 
@@ -74,10 +74,6 @@ impl MaxwellThreeDProgramRegionState<'_> {
             *self.address_upper().value()?,
             *self.address_lower().value()?,
         ))
-    }
-    pub(in crate::engines) fn is_partially_programmed(&self) -> bool {
-        self.address().is_none()
-            && (self.address_upper().raw().is_some() || self.address_lower().raw().is_some())
     }
 }
 
@@ -169,52 +165,6 @@ impl MaxwellThreeDConstantBufferSelectorState<'_> {
             *self.address_upper().value()?,
             *self.address_lower().value()?,
         ))
-    }
-}
-
-/// One validated inline word awaiting execution against the GPU address space.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDInlineConstantBufferUpload {
-    address: MaxwellThreeDUnresolvedAddress,
-    offset: u32,
-    value: u32,
-    source: MaxwellMethodSource,
-}
-
-impl MaxwellThreeDInlineConstantBufferUpload {
-    #[must_use]
-    pub const fn new(
-        address: MaxwellThreeDUnresolvedAddress,
-        offset: u32,
-        value: u32,
-        source: MaxwellMethodSource,
-    ) -> Self {
-        Self {
-            address,
-            offset,
-            value,
-            source,
-        }
-    }
-
-    #[must_use]
-    pub const fn address(self) -> MaxwellThreeDUnresolvedAddress {
-        self.address
-    }
-
-    #[must_use]
-    pub const fn offset(self) -> u32 {
-        self.offset
-    }
-
-    #[must_use]
-    pub const fn value(self) -> u32 {
-        self.value
-    }
-
-    #[must_use]
-    pub const fn source(self) -> MaxwellMethodSource {
-        self.source
     }
 }
 
@@ -382,10 +332,7 @@ impl<'a> MaxwellThreeDShaderBindingState<'a> {
         }
         Some(mask)
     }
-    pub(in crate::engines) fn has_enabled_pipeline(&self) -> bool {
-        (0..MAXWELL_PIPELINE_SHADER_COUNT)
-            .any(|i| self.pipeline(i).enabled().value() == Some(&true))
-    }
+
     #[must_use]
     pub fn constant_buffer_offset(&self) -> u32 {
         self.registers.word(nixe_gpu::GpuMethodId(0x238c))

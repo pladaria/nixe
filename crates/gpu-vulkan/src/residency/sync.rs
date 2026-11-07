@@ -1,4 +1,4 @@
-//! Ordered native hazards, independent of canonical guest-byte provenance.
+//! Native initialization and operation ordering, independent of guest-byte provenance.
 //! https://docs.vulkan.org/guide/latest/synchronization_examples.html
 use super::*;
 
@@ -83,321 +83,72 @@ impl AccessScope {
                 | vk::AccessFlags2::MEMORY_WRITE,
         )
     }
-    fn union(&mut self, scope: Self) {
-        self.stages |= scope.stages;
-        self.access |= scope.access;
-    }
-}
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct AccessState {
-    writer: AccessScope,
-    readers: AccessScope,
-    visible: Vec<AccessScope>,
-    uploaded: bool,
-}
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Dependency {
-    pub source: AccessScope,
-    pub destination: AccessScope,
-}
-impl AccessState {
-    pub(super) fn preceding(&self) -> AccessScope {
-        let mut scope = self.writer;
-        scope.stages |= self.readers.stages;
-        scope
-    }
-    pub fn access(&mut self, next: AccessScope) -> Option<Dependency> {
-        if next.writes() {
-            let mut source = if self.uploaded {
-                AccessScope::default()
-            } else {
-                self.writer
-            };
-            // WAR needs execution ordering, not visibility of previous reads.
-            source.stages |= self.readers.stages;
-            self.writer = next;
-            self.readers = AccessScope::default();
-            self.visible.clear();
-            self.uploaded = false;
-            (!source.stages.is_empty()).then_some(Dependency {
-                source,
-                destination: next,
-            })
-        } else {
-            self.readers.union(next);
-            if self.uploaded
-                || self.writer.stages.is_empty()
-                || self.visible.iter().any(|scope| {
-                    scope.stages.contains(next.stages) && scope.access.contains(next.access)
-                })
-            {
-                return None;
-            }
-            self.visible.push(next);
-            Some(Dependency {
-                source: self.writer,
-                destination: next,
-            })
-        }
-    }
-    fn upload(&mut self, next: AccessScope) -> Option<Dependency> {
-        let source = self.preceding();
-        // The upload buffer's final barrier makes this writer visible to all
-        // main-buffer work. Overlapping uploads still need their own ordering.
-        self.writer = next;
-        self.readers = AccessScope::default();
-        self.visible.clear();
-        self.uploaded = true;
-        (!source.stages.is_empty()).then_some(Dependency {
-            source,
-            destination: next,
-        })
-    }
-}
-#[derive(Clone, Debug)]
-struct BufferSpan {
-    start: u64,
-    end: u64,
-    state: AccessState,
-}
-pub(super) struct BufferAccess {
-    spans: Vec<BufferSpan>,
-}
-impl BufferAccess {
-    pub fn new(size: u64) -> Self {
-        Self {
-            spans: vec![BufferSpan {
-                start: 0,
-                end: size,
-                state: AccessState::default(),
-            }],
-        }
-    }
-    pub fn access(
-        &mut self,
-        offset: u64,
-        size: u64,
-        next: AccessScope,
-        emit: impl FnMut(u64, u64, Dependency),
-    ) {
-        let end = offset + size;
-        let first = self.spans.partition_point(|span| span.end <= offset);
-        let last = self.spans.partition_point(|span| span.start < end);
-        // Repeated reads do not change interval boundaries or visibility.
-        if !next.writes()
-            && self.spans[first..last].iter().all(|span| {
-                let state = &span.state;
-                state.readers.stages.contains(next.stages)
-                    && state.readers.access.contains(next.access)
-                    && (state.uploaded
-                        || state.writer.stages.is_empty()
-                        || state.visible.iter().any(|scope| {
-                            scope.stages.contains(next.stages) && scope.access.contains(next.access)
-                        }))
-            })
-        {
-            return;
-        }
-        self.transition(offset, size, |state| state.access(next), emit);
-    }
-    pub fn upload(
-        &mut self,
-        offset: u64,
-        size: u64,
-        scope: AccessScope,
-        emit: impl FnMut(u64, u64, Dependency),
-    ) {
-        self.transition(offset, size, |state| state.upload(scope), emit);
-    }
-    fn transition(
-        &mut self,
-        offset: u64,
-        size: u64,
-        mut transition: impl FnMut(&mut AccessState) -> Option<Dependency>,
-        mut emit: impl FnMut(u64, u64, Dependency),
-    ) {
-        let end = offset + size;
-        for boundary in [offset, end] {
-            let index = self.spans.partition_point(|span| span.end <= boundary);
-            if let Some(span) = self.spans.get_mut(index)
-                && span.start < boundary
-                && boundary < span.end
-            {
-                let right = BufferSpan {
-                    start: boundary,
-                    end: span.end,
-                    state: span.state.clone(),
-                };
-                span.end = boundary;
-                self.spans.insert(index + 1, right);
-            }
-        }
-        let first = self.spans.partition_point(|span| span.end <= offset);
-        let last = self.spans.partition_point(|span| span.start < end);
-        for span in &mut self.spans[first..last] {
-            if let Some(dependency) = transition(&mut span.state) {
-                emit(span.start, span.end - span.start, dependency);
-            }
-        }
-        // Only the affected intervals and their neighbors can now coalesce.
-        // Compact once; repeated Vec::remove would shift the tail quadratically.
-        let mut write = first.saturating_sub(1);
-        let stop = (last + 1).min(self.spans.len());
-        for read in write + 1..stop {
-            if self.spans[write].state == self.spans[read].state {
-                self.spans[write].end = self.spans[read].end;
-            } else {
-                write += 1;
-                if write != read {
-                    self.spans.swap(write, read);
-                }
-            }
-        }
-        self.spans.drain(write + 1..stop);
-    }
-}
-#[derive(Clone, Copy, Debug, Default)]
-pub struct BarrierStatistics {
-    pub calls: u64,
-    pub memory: u64,
-    pub images: u64,
-}
-#[derive(Clone, Debug)]
-pub(super) struct ImageAccess {
-    pub aspect: vk::ImageAspectFlags,
-    pub mip: u32,
-    pub layer: u32,
-    pub layout: vk::ImageLayout,
-    pub state: AccessState,
-}
-pub(super) fn image_states(
-    planes: &[ImagePlane],
-    format: vk::Format,
-    separate: bool,
-) -> Vec<ImageAccess> {
-    let combined = !separate
-        && super::format::copy_block(format, vk::ImageAspectFlags::STENCIL).is_some()
-        && super::format::copy_block(format, vk::ImageAspectFlags::DEPTH).is_some();
-    let mut states: Vec<ImageAccess> = Vec::new();
-    for plane in planes {
-        let aspect = if combined {
-            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
-        } else {
-            plane.aspect
-        };
-        if !states.iter().any(|cell| {
-            cell.aspect == aspect && cell.mip == plane.mip_level && cell.layer == plane.array_layer
-        }) {
-            states.push(ImageAccess {
-                aspect,
-                mip: plane.mip_level,
-                layer: plane.array_layer,
-                layout: vk::ImageLayout::UNDEFINED,
-                state: AccessState::default(),
-            });
-        }
-    }
-    states
 }
 #[derive(Default)]
 pub(super) struct Barriers {
-    memory: Vec<vk::MemoryBarrier2<'static>>,
     images: Vec<vk::ImageMemoryBarrier2<'static>>,
-    pub statistics: BarrierStatistics,
 }
 impl Barriers {
-    fn memory_dependency(&mut self, d: Dependency) {
-        if let Some(last) = self.memory.last_mut()
-            && last.src_stage_mask == d.source.stages
-            && last.dst_stage_mask == d.destination.stages
-        {
-            last.src_access_mask |= d.source.access;
-            last.dst_access_mask |= d.destination.access;
-        } else {
-            self.memory.push(
-                vk::MemoryBarrier2::default()
-                    .src_stage_mask(d.source.stages)
-                    .src_access_mask(d.source.access)
-                    .dst_stage_mask(d.destination.stages)
-                    .dst_access_mask(d.destination.access),
-            );
-        }
-    }
     pub fn queue_image(&mut self, barrier: vk::ImageMemoryBarrier2<'static>) {
         self.images.push(barrier);
     }
     pub(super) fn is_empty(&self) -> bool {
-        self.memory.is_empty() && self.images.is_empty()
+        self.images.is_empty()
     }
-    pub fn emit(&mut self, device: &mut VulkanDevice) {
-        // Transfers, compute, and barriers are recorded outside dynamic rendering.
+    pub fn emit(&mut self, device: &mut VulkanDevice) -> Result<(), VulkanError> {
+        // Transfers, compute, and barriers are recorded outside render passes.
         // Graphics alone may retain the scope when no dependency is pending.
-        device.end_rendering();
+        device.end_rendering()?;
         if self.is_empty() {
-            return;
+            return Ok(());
         }
         unsafe {
-            device.dispatch.barrier(
-                &vk::DependencyInfo::default()
-                    .memory_barriers(&self.memory)
-                    .image_memory_barriers(&self.images),
-            );
+            device
+                .dispatch
+                .barrier(&vk::DependencyInfo::default().image_memory_barriers(&self.images));
         }
-        self.statistics.calls += 1;
-        self.statistics.memory += self.memory.len() as u64;
-        self.statistics.images += self.images.len() as u64;
-        self.memory.clear();
         self.images.clear();
-    }
-}
-impl VulkanResidency {
-    /// WFI orders shader and transfer execution, excluding pixel operations.
-    /// The adjacent SetEvent/WaitEvents used by Eden has empty access scopes;
-    /// a single synchronization2 execution barrier expresses the same dependency.
-    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L853-L879
-    /// https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-execution-dependencies
-    pub(crate) fn order_device(&mut self) -> Result<(), VulkanError> {
-        self.realize_deferred_clears()?;
-        let mut stages = vk::PipelineStageFlags2::DRAW_INDIRECT
-            | vk::PipelineStageFlags2::VERTEX_INPUT
-            | vk::PipelineStageFlags2::PRE_RASTERIZATION_SHADERS
-            | vk::PipelineStageFlags2::FRAGMENT_SHADER
-            | vk::PipelineStageFlags2::COMPUTE_SHADER
-            | vk::PipelineStageFlags2::ALL_TRANSFER;
-        if self.device.profile().transform_feedback {
-            stages |= vk::PipelineStageFlags2::TRANSFORM_FEEDBACK_EXT;
-        }
-        self.barriers.memory_dependency(Dependency {
-            source: AccessScope::new(stages, vk::AccessFlags2::NONE),
-            destination: AccessScope::new(
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::NONE,
-            ),
-        });
-        if self.device.submission.recording.is_some() {
-            self.barriers.emit(&mut self.device);
-        }
         Ok(())
     }
-    pub fn barrier_statistics(&self) -> BarrierStatistics {
-        self.barriers.statistics
+}
+impl Residency<'_> {
+    /// WFI sets and waits for the rasterizer's event outside render passes.
+    /// Pixel output is excluded, while fragment storage writes remain ordered.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L955-L975
+    pub(crate) fn order_device(&mut self) -> Result<(), VulkanError> {
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        let mut stages = vk::PipelineStageFlags::DRAW_INDIRECT
+            | vk::PipelineStageFlags::VERTEX_INPUT
+            | vk::PipelineStageFlags::VERTEX_SHADER
+            | vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER
+            | vk::PipelineStageFlags::TESSELLATION_EVALUATION_SHADER
+            | vk::PipelineStageFlags::GEOMETRY_SHADER
+            | vk::PipelineStageFlags::FRAGMENT_SHADER
+            | vk::PipelineStageFlags::COMPUTE_SHADER
+            | vk::PipelineStageFlags::TRANSFER;
+        if self.runtime.device.profile().transform_feedback {
+            stages |= vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT;
+        }
+        unsafe {
+            self.runtime
+                .device
+                .dispatch
+                .wait_for_idle(self.runtime.device.submission.wait_for_idle_event, stages);
+        }
+        self.buffer_cache.accumulate_flushes();
+        Ok(())
     }
-    pub(super) fn buffer_access_range(
+    pub(super) fn materialize_buffer_literals(
         &mut self,
         id: BufferId,
         offset: u64,
         size: u64,
-        scope: AccessScope,
-    ) -> Result<vk::Buffer, VulkanError> {
-        self.check_buffer_range(id, offset, size)?;
+    ) -> Result<(), VulkanError> {
         // Logical completion effects retain an exact literal and producer
         // ticket. First physical use materializes the literal in queue order;
         // subsequent partial writers therefore preserve the remaining bytes.
-        // Clear the flag before upload_buffer re-enters buffer_access_range.
-        let pending: Vec<_> = self.buffers[id.slot]
-            .entry
-            .as_mut()
-            .expect("buffer")
+        // Clear the flag before upload_buffer re-enters use_buffer.
+        let pending: Vec<_> = self.buffer_cache.buffers[id]
             .known
             .iter_mut()
             .filter_map(|known| {
@@ -414,134 +165,130 @@ impl VulkanResidency {
         for (offset, bytes) in pending {
             self.upload_buffer(id, offset, &bytes)?;
         }
-        self.device.begin_recording()?;
-        let work = self.device.work_ticket()?;
-        let entry = self.buffers[id.slot]
-            .entry
-            .as_mut()
-            .expect("validated buffer");
+        Ok(())
+    }
+
+    pub(super) fn use_buffer(
+        &mut self,
+        id: BufferId,
+        offset: u64,
+        size: u64,
+    ) -> Result<vk::Buffer, VulkanError> {
+        self.check_buffer_range(id, offset, size)?;
+        self.materialize_buffer_literals(id, offset, size)?;
+        let work = self.runtime.device.current_work();
+        let entry = &mut self.buffer_cache.buffers[id];
         let handle = entry.native.handle;
         entry.used.mark(offset, size);
-        entry
-            .access
-            .access(offset, size, scope, |_, _, dependency| {
-                self.barriers.memory_dependency(dependency)
-            });
         entry.contents.last_use = Some(work);
         self.touch(Resource::Buffer(id));
         Ok(handle)
     }
-    pub(super) fn image_access_subresources(
+
+    /// Native image storage stays GENERAL between operations. Initialization
+    /// covers the complete native allocation once, independently of CPU/GPU
+    /// modification flags and the logical image-plane publication geometry.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L3154-L3181
+    pub(super) fn use_image(&mut self, id: ImageId) -> Result<vk::Image, VulkanError> {
+        let work = self.runtime.device.current_work();
+        let entry = &mut self.texture_cache.images[id];
+        if !entry.initialized {
+            self.runtime.barriers.queue_image(initialize_image(
+                entry.native.handle,
+                native_image_aspects(entry.description.format),
+                entry.description.mip_levels,
+                entry.description.array_layers,
+            ));
+            entry.initialized = true;
+        }
+        entry.contents.last_use = Some(work);
+        let handle = entry.native.handle;
+        self.touch(Resource::Image(id));
+        Ok(handle)
+    }
+    pub(super) fn shader_image(&mut self, id: ImageId) -> Result<vk::Image, VulkanError> {
+        if self
+            .runtime
+            .device
+            .submission
+            .deferred_clear
+            .as_ref()
+            .is_some_and(|clear| clear.overlaps(&self.texture_cache.get(id).maps))
+        {
+            self.runtime.barriers.emit(&mut self.runtime.device)?;
+        }
+        self.use_image(id)
+    }
+    pub(super) fn transfer_image(
         &mut self,
         id: ImageId,
-        range: vk::ImageSubresourceRange,
-        scope: AccessScope,
-        conventional: vk::ImageLayout,
-    ) -> Result<(vk::Image, vk::ImageLayout), VulkanError> {
-        if !scope.access.intersects(
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-        ) && self.deferred_clears.iter().any(|clear| {
-            clear.image == id
-                || self
-                    .authority
-                    .resources_may_overlap(Resource::Image(clear.image), Resource::Image(id))
-        }) {
-            self.realize_deferred_clears()?;
-        }
-        self.image(id)?;
-        if scope
-            .access
-            .intersects(vk::AccessFlags2::SHADER_SAMPLED_READ)
-            && scope.access.intersects(
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            )
-        {
-            return Err(VulkanError::InvalidResource(
-                "attachment feedback needs an explicit supported feedback-loop layout or an exact snapshot lowering",
-            ));
-        }
-        self.device.begin_recording()?;
-        let work = self.device.work_ticket()?;
-        let entry = self.images[id.slot].entry.as_mut().expect("image");
+        mut range: vk::ImageSubresourceRange,
+    ) -> Result<(vk::Image, vk::ImageSubresourceRange), VulkanError> {
+        let description = self.texture_cache.get(id).description;
         if range.level_count == 0
             || range.layer_count == 0
             || range
                 .base_mip_level
                 .checked_add(range.level_count)
-                .is_none_or(|end| end > entry.description.mip_levels)
+                .is_none_or(|end| end > description.mip_levels)
             || range
                 .base_array_layer
                 .checked_add(range.layer_count)
-                .is_none_or(|end| end > entry.description.array_layers)
+                .is_none_or(|end| end > description.array_layers)
         {
             return Err(VulkanError::InvalidResource(
-                "image access exceeds subresources",
+                "image transfer exceeds subresources",
             ));
         }
-        let layout = if self.unified_layouts && conventional != vk::ImageLayout::PRESENT_SRC_KHR {
-            vk::ImageLayout::GENERAL
-        } else {
-            conventional
-        };
-        for cell in &mut entry.access {
-            if !range.aspect_mask.intersects(cell.aspect)
-                || cell.mip < range.base_mip_level
-                || cell.mip >= range.base_mip_level + range.level_count
-                || cell.layer < range.base_array_layer
-                || cell.layer >= range.base_array_layer + range.layer_count
-            {
-                continue;
-            }
-            let preceding = cell.state.preceding();
-            let dependency = cell.state.access(scope);
-            if cell.layout == layout {
-                if let Some(dependency) = dependency {
-                    self.barriers.memory_dependency(dependency);
-                }
-            } else {
-                // The transition itself can write memory even when the first
-                // consumer only reads. Make it visible to later consumers too,
-                // as in the native texture cache's stable-layout initialization.
-                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L3154-L3181
-                // https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-image-layout-transitions
-                let destination = if scope.writes() {
-                    scope
-                } else {
-                    AccessScope::new(
-                        vk::PipelineStageFlags2::ALL_COMMANDS,
-                        vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
-                    )
-                };
-                self.barriers.images.push(
-                    vk::ImageMemoryBarrier2::default()
-                        .old_layout(cell.layout)
-                        .new_layout(layout)
-                        .src_stage_mask(preceding.stages)
-                        .src_access_mask(preceding.access)
-                        .dst_stage_mask(destination.stages)
-                        .dst_access_mask(destination.access)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(entry.native.handle)
-                        .subresource_range(
-                            vk::ImageSubresourceRange::default()
-                                .aspect_mask(cell.aspect)
-                                .base_mip_level(cell.mip)
-                                .level_count(1)
-                                .base_array_layer(cell.layer)
-                                .layer_count(1),
-                        ),
-                );
-            }
-            cell.layout = layout;
+        let aspects = native_image_aspects(description.format);
+        if !self.runtime.device.profile().separate_depth_stencil_layouts
+            && aspects.contains(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
+        {
+            range.aspect_mask = aspects;
         }
-        entry.contents.last_use = Some(work);
-        let handle = entry.native.handle;
-        self.touch(Resource::Image(id));
-        Ok((handle, layout))
+        Ok((self.use_image(id)?, range))
     }
+}
+
+pub(super) fn native_image_aspects(format: vk::Format) -> vk::ImageAspectFlags {
+    match format {
+        vk::Format::D16_UNORM | vk::Format::X8_D24_UNORM_PACK32 | vk::Format::D32_SFLOAT => {
+            vk::ImageAspectFlags::DEPTH
+        }
+        vk::Format::S8_UINT => vk::ImageAspectFlags::STENCIL,
+        vk::Format::D16_UNORM_S8_UINT
+        | vk::Format::D24_UNORM_S8_UINT
+        | vk::Format::D32_SFLOAT_S8_UINT => {
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        }
+        _ => vk::ImageAspectFlags::COLOR,
+    }
+}
+pub(super) fn initialize_image(
+    image: vk::Image,
+    aspects: vk::ImageAspectFlags,
+    mips: u32,
+    layers: u32,
+) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_stage_mask(
+            vk::PipelineStageFlags2::ALL_GRAPHICS | vk::PipelineStageFlags2::COMPUTE_SHADER,
+        )
+        .dst_stage_mask(
+            vk::PipelineStageFlags2::ALL_GRAPHICS | vk::PipelineStageFlags2::COMPUTE_SHADER,
+        )
+        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(aspects)
+                .level_count(mips)
+                .layer_count(layers),
+        )
 }
 
 #[cfg(test)]
@@ -575,210 +322,5 @@ mod tests {
         tracker.mark(SIZE - 1, 1);
         assert!(!tracker.used(64, SIZE / 64 * 64 - 64));
         assert!(tracker.used(64, SIZE - 64));
-    }
-    fn scope(stage: vk::PipelineStageFlags2, access: vk::AccessFlags2) -> AccessScope {
-        AccessScope::new(stage, access)
-    }
-    #[test]
-    fn split_and_coalesced_hazards_match_independent_byte_states() {
-        let scopes = [
-            scope(
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-            scope(
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_READ,
-            ),
-            scope(
-                vk::PipelineStageFlags2::VERTEX_SHADER,
-                vk::AccessFlags2::UNIFORM_READ,
-            ),
-            scope(
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_STORAGE_WRITE,
-            ),
-        ];
-        let mut state = BufferAccess::new(64);
-        let mut bytes = vec![AccessState::default(); 64];
-        let mut random = 0x42bc_a981u64;
-        for _ in 0..2000 {
-            random ^= random << 13;
-            random ^= random >> 7;
-            random ^= random << 17;
-            let start = (random as usize >> 8) % 64;
-            let end = (start + 1 + (random as usize >> 16) % 64).min(64);
-            let next = scopes[random as usize % scopes.len()];
-            let mut actual = vec![None; 64];
-            state.access(
-                start as u64,
-                (end - start) as u64,
-                next,
-                |offset, size, dependency| {
-                    actual[offset as usize..(offset + size) as usize]
-                        .fill(Some((dependency.source, dependency.destination)));
-                },
-            );
-            let mut expected = vec![None; 64];
-            for i in start..end {
-                expected[i] = bytes[i]
-                    .access(next)
-                    .map(|dependency| (dependency.source, dependency.destination));
-            }
-            assert_eq!(actual, expected);
-        }
-    }
-    #[test]
-    fn independent_ranges_skip_barriers_and_writer_visibility_survives_reads() {
-        let mut state = BufferAccess::new(1024);
-        let writer = scope(
-            vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::AccessFlags2::SHADER_STORAGE_WRITE,
-        );
-        state.access(0, 16, writer, |_, _, _| panic!("first producer"));
-        state.access(64, 16, writer, |_, _, _| panic!("disjoint producer"));
-        let copy = scope(
-            vk::PipelineStageFlags2::COPY,
-            vk::AccessFlags2::TRANSFER_READ,
-        );
-        let mut dependencies = Vec::new();
-        state.access(0, 16, copy, |start, size, d| {
-            dependencies.push((start, size, d))
-        });
-        assert_eq!(dependencies.len(), 1);
-        assert_eq!(dependencies[0].0, 0);
-        assert_eq!(dependencies[0].1, 16);
-        state.access(0, 16, copy, |_, _, _| panic!("RAR already visible"));
-        let fragment = scope(
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_STORAGE_READ,
-        );
-        state.access(0, 16, fragment, |_, _, d| assert_eq!(d.source, writer));
-        state.access(0, 16, copy, |_, _, _| {
-            panic!("earlier reader visibility remains valid")
-        });
-        state.access(64, 16, copy, |start, _, d| {
-            assert_eq!(start, 64);
-            assert_eq!(d.source, writer);
-        });
-    }
-    #[test]
-    fn war_orders_all_reader_stages_and_host_writes_require_visibility() {
-        let mut state = AccessState::default();
-        let copy = scope(
-            vk::PipelineStageFlags2::COPY,
-            vk::AccessFlags2::TRANSFER_READ,
-        );
-        let shader = scope(
-            vk::PipelineStageFlags2::VERTEX_SHADER,
-            vk::AccessFlags2::SHADER_STORAGE_READ,
-        );
-        assert!(state.access(copy).is_none());
-        assert!(state.access(shader).is_none());
-        let writer = scope(
-            vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::AccessFlags2::SHADER_STORAGE_WRITE,
-        );
-        let dependency = state.access(writer).unwrap();
-        assert_eq!(dependency.source.stages, copy.stages | shader.stages);
-        assert!(dependency.source.access.is_empty());
-        let host = scope(vk::PipelineStageFlags2::HOST, vk::AccessFlags2::HOST_WRITE);
-        let mut state = AccessState::default();
-        assert!(state.access(host).is_none());
-        assert_eq!(state.access(copy).unwrap().source, host);
-    }
-    #[test]
-    fn each_access_kind_retains_its_own_visibility_pair() {
-        let mut state = AccessState::default();
-        let writer = scope(
-            vk::PipelineStageFlags2::COPY,
-            vk::AccessFlags2::TRANSFER_WRITE,
-        );
-        let _ = state.access(writer);
-        let compute = scope(
-            vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::AccessFlags2::SHADER_STORAGE_READ,
-        );
-        let fragment = scope(
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::UNIFORM_READ,
-        );
-        assert!(state.access(compute).is_some());
-        assert!(state.access(fragment).is_some());
-        assert!(
-            state
-                .access(scope(
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::UNIFORM_READ
-                ))
-                .is_some(),
-            "union of unrelated stage/access pairs cannot fabricate visibility"
-        );
-    }
-}
-
-#[cfg(test)]
-mod upload_visibility_tests {
-    use super::*;
-    fn copy_write() -> AccessScope {
-        AccessScope::new(
-            vk::PipelineStageFlags2::COPY,
-            vk::AccessFlags2::TRANSFER_WRITE,
-        )
-    }
-    fn vertex_read() -> AccessScope {
-        AccessScope::new(
-            vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT,
-            vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
-        )
-    }
-    #[test]
-    fn upload_visibility_avoids_main_barriers_but_preserves_later_read_write_order() {
-        let mut access = BufferAccess::new(128);
-        access.upload(0, 128, copy_write(), |_, _, _| {
-            panic!("first upload has no preceding use")
-        });
-        access.access(0, 128, vertex_read(), |_, _, _| {
-            panic!("upload's global barrier covers this read")
-        });
-        access.access(0, 128, vertex_read(), |_, _, _| {
-            panic!("unchanged read needs no barrier")
-        });
-        let mut dependencies = Vec::new();
-        access.access(0, 128, copy_write(), |_, _, dependency| {
-            dependencies.push(dependency)
-        });
-        assert_eq!(dependencies.len(), 1);
-        assert_eq!(
-            dependencies[0].source.stages,
-            vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT
-        );
-        assert!(dependencies[0].source.access.is_empty());
-    }
-    #[test]
-    fn overlapping_uploads_keep_their_transfer_dependency() {
-        let mut access = BufferAccess::new(128);
-        access.upload(0, 64, copy_write(), |_, _, _| panic!("first upload"));
-        let mut dependencies = Vec::new();
-        access.upload(32, 64, copy_write(), |start, size, dependency| {
-            dependencies.push((start, size, dependency))
-        });
-        assert_eq!(dependencies.len(), 1);
-        assert_eq!((dependencies[0].0, dependencies[0].1), (32, 32));
-        assert_eq!(dependencies[0].2.source, copy_write());
-        access.access(0, 96, vertex_read(), |_, _, _| {
-            panic!("main read is globally synchronized")
-        });
-    }
-    #[test]
-    fn upload_visibility_does_not_cover_a_disjoint_main_writer() {
-        let mut access = BufferAccess::new(128);
-        access.access(0, 32, copy_write(), |_, _, _| {});
-        access.upload(64, 64, copy_write(), |_, _, _| panic!("disjoint upload"));
-        let mut dependencies = Vec::new();
-        access.access(0, 128, vertex_read(), |start, size, _| {
-            dependencies.push((start, size))
-        });
-        assert_eq!(dependencies, [(0, 32)]);
     }
 }

@@ -1,4 +1,4 @@
-use nixe_memory::{Allocation, AllocationRange, Machine, MemoryPermissions, PAGE_SIZE};
+use nixe_memory::{Allocation, AllocationRange, Machine, PAGE_SIZE};
 
 pub fn allocate(machine: &Machine, bytes: u64) -> Allocation {
     machine.account(bytes).unwrap().allocate(bytes).unwrap()
@@ -22,7 +22,7 @@ pub fn address_space(machine: &Machine, id: u64) -> nixe_gpu_maxwell::MaxwellGpu
         SWITCH_1_GM20B_PROFILE,
     };
     let mut space = MaxwellGpuAddressSpace::new(
-        machine.clone(),
+        nixe_gpu_maxwell::MaxwellDeviceMemory::new(machine.clone()),
         MaxwellAddressSpaceId::new(id),
         SWITCH_1_GM20B_PROFILE,
     );
@@ -40,14 +40,18 @@ pub fn map(
     space
         .map(MaxwellMapRequest {
             allocation: MaxwellAllocationId::new(id),
-            backing: ranges(allocation),
+            backing: space
+                .memory()
+                .device_memory()
+                .map((ranges(allocation)).into(), None)
+                .unwrap(),
             backing_offset: 0,
             size: allocation.pin().bytes(),
             allocation_alignment: PAGE_SIZE as u32,
             page_size: PAGE_SIZE as u32,
             kind: 0,
             cacheable: false,
-            permissions: MemoryPermissions::READ_WRITE,
+
             fixed_offset: None,
         })
         .unwrap()

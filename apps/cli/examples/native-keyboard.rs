@@ -9,28 +9,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let monitor = device.validation_monitor();
     let memory = nixe_memory::Machine::new(4 * 1024 * 1024 * 1024)?;
-    let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
-        memory.clone(),
-        device,
-        nixe_gpu_maxwell::MAXWELL_SHADER_NAMESPACE,
-        nixe_gpu_vulkan::cache::CacheConfiguration::default(),
-        128 * 1024 * 1024,
-    )?;
-    renderer.attach_presentation(client, true)?;
-    let frontend = nixe_gpu_maxwell::MaxwellNativeFrontend::new(
-        renderer.device_profile().shader_compiler.clone(),
-    );
+    let device_memory = nixe_gpu_maxwell::MaxwellDeviceMemory::new(memory.clone());
+    let native_memory = device_memory.device().clone();
+    let initialize = move || {
+        let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
+            native_memory,
+            device,
+            nixe_gpu_maxwell::MAXWELL_SHADER_NAMESPACE,
+            nixe_gpu_vulkan::cache::CacheConfiguration::default(),
+            128 * 1024 * 1024,
+        )
+        .map_err(|error| nixe_gpu::BackendRuntimeError::Backend(error.to_string().into()))?;
+        renderer
+            .attach_presentation(client, true)
+            .map_err(|error| nixe_gpu::BackendRuntimeError::Backend(error.to_string().into()))?;
+        Ok((renderer, ()))
+    };
+    let frontend = move |renderer: std::rc::Rc<
+        std::cell::RefCell<Option<nixe_gpu_vulkan::NativeGpuExecution>>,
+    >| { nixe_gpu_vulkan::MaxwellVulkanRasterizer::new(renderer) };
     let kernel = nixe_scheduler::SchedulerState::new(
         nixe_horizon::switch_1_scheduler_profile(),
         nixe_runtime::VirtualClock::default(),
     );
-    let video = nixe_horizon::VideoSystem::with_gpu_frontend(
-        memory,
+    let (video, ()) = nixe_horizon::VideoSystem::with_gpu_frontend(
+        device_memory,
         &kernel,
         Some(window.mailbox()),
-        renderer,
+        initialize,
         frontend,
-    );
+    )?;
     let control = window.control();
     let host = window.keyboard_host();
     let session = host.open(

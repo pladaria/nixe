@@ -11,7 +11,6 @@ use nixe_cpu_direct_memory::{CapturedFault, FaultDisposition, NativeInvocation, 
 use nixe_memory::{
     AccessOperation, AccessOrdering, AccessResult, AddressSpace, AtomicAccess, AtomicOperation,
     CoreContext, GuestVirtualAddress, MemoryError, MemoryPermissions, NativeAdmission,
-    NativeReadArea,
 };
 use std::{
     ffi::c_void,
@@ -21,7 +20,6 @@ pub struct Core {
     handle: Arc<Native>,
     context: CoreContext,
     code: CodeCache,
-    read_area: Option<NativeReadArea>,
     control: CpuControl,
 }
 pub struct Configuration {
@@ -46,7 +44,6 @@ struct Callbacks<'a> {
     admission: &'a NativeAdmission<'a>,
     timer: &'a dyn ArchitecturalTimer,
     cache: &'a mut CodeCache,
-    read_area: &'a mut Option<NativeReadArea>,
     process: &'a crate::process::Process,
     core: *mut c_void,
     code: Vec<CodeCapture>,
@@ -73,6 +70,7 @@ impl Core {
                     code,
                     memory,
                     counter,
+                    instruction_cache,
                 },
                 space.native_data_base().as_ptr() as usize,
                 space.native_page_table_base() as usize,
@@ -103,7 +101,6 @@ impl Core {
             handle,
             context,
             code: CodeCache::default(),
-            read_area: None,
             control,
         })
     }
@@ -128,11 +125,17 @@ impl Core {
             ));
         }
         // A failed speculative fetch may already have generated a NoExecute
-        // terminal. Retire that terminal before retrying the captured word.
+        // terminal. Retire the page terminals before retrying its captured input.
         record(Counter::InvalidationCalls, 1);
-        record(Counter::InvalidationBytes, 4);
+        record(Counter::InvalidationBytes, nixe_memory::PAGE_SIZE);
         let _measurement = Timer::new(Counter::InvalidationNanoseconds);
-        if !unsafe { ffi::nixe_dynarmic_invalidate(self.handle.pointer, code.address().get(), 4) } {
+        if !unsafe {
+            ffi::nixe_dynarmic_invalidate(
+                self.handle.pointer,
+                code.page_start(),
+                nixe_memory::PAGE_SIZE as usize,
+            )
+        } {
             return Err(self.context.fail(MemoryError::Execution(ffi::error())));
         }
         self.code.install(self.space().identity(), code)
@@ -187,7 +190,6 @@ impl Core {
             admission: &admission,
             timer,
             cache: &mut self.code,
-            read_area: &mut self.read_area,
             process,
             core: handle.pointer,
             code: Vec::new(),
@@ -326,7 +328,7 @@ unsafe extern "C" fn code(opaque: *mut c_void, address: u64, output: *mut u32) -
             if !context
                 .code
                 .iter()
-                .any(|pending| pending.address() == capture.address())
+                .any(|pending| pending.covers(capture.address()))
             {
                 context.code.push(capture);
             }
@@ -337,11 +339,30 @@ unsafe extern "C" fn code(opaque: *mut c_void, address: u64, output: *mut u32) -
         Err(_) => false,
     }
 }
+unsafe extern "C" fn instruction_cache(opaque: *mut c_void) {
+    unsafe { &mut *opaque.cast::<Callbacks<'_>>() }
+        .cache
+        .clear();
+}
 unsafe extern "C" fn counter(opaque: *mut c_void) -> u64 {
     unsafe { &*opaque.cast::<Callbacks<'_>>() }
         .timer
         .snapshot()
         .counter
+}
+fn resume_memory(context: &mut Callbacks<'_>) -> Result<(), MemoryError> {
+    context.admission.resume()?;
+    // Suspended native frames keep their code until Run returns. Apply queued
+    // invalidations before resuming that frame, as for any real memory wait.
+    context.admission.synchronize_code(|range| {
+        if unsafe {
+            ffi::nixe_dynarmic_invalidate(context.core, range.start.get(), range.bytes as usize)
+        } {
+            Ok(())
+        } else {
+            Err(MemoryError::Execution(ffi::error()))
+        }
+    })
 }
 unsafe extern "C" fn memory(
     opaque: *mut c_void,
@@ -367,7 +388,7 @@ unsafe extern "C" fn memory(
     if context.error.is_some() {
         return false;
     }
-    let capture = (|| {
+    let capture: Result<bool, MemoryAccessFailure> = (|| {
         if operation == 2 && !address.is_multiple_of(u64::from(bytes)) {
             unsafe {
                 *value = 0;
@@ -381,12 +402,10 @@ unsafe extern "C" fn memory(
         let address = GuestVirtualAddress::new(address);
         let input = unsafe { u128::from(*value) | (u128::from(*value.add(1)) << 64) };
         if operation == 0
-            && let Some(result) = context.space.read_native(
-                context.admission,
-                address,
-                bytes as usize,
-                context.read_area.as_ref(),
-            )?
+            && let Some(result) =
+                context
+                    .space
+                    .read_native(context.admission, address, bytes as usize)?
         {
             unsafe {
                 *value = result as u64;
@@ -407,8 +426,28 @@ unsafe extern "C" fn memory(
             context
                 .space
                 .capture_native(context.admission, address, u64::from(bytes), required)?;
+        if operation == 0 {
+            let admission = context.admission;
+            admission.suspend();
+            let completed = admission.read_captured::<MemoryAccessFailure>(&ranges, |area| {
+                let operation = AccessOperation::Flush(area);
+                let result = context
+                    .process
+                    .resolve_access(context.space.machine().access_captured(&ranges, operation))?;
+                match result {
+                    AccessResult::Flushed => Ok(()),
+                    _ => Err(MemoryError::Invalid("native flush returned a data operation").into()),
+                }
+            });
+            resume_memory(context)?;
+            let result = completed?;
+            unsafe {
+                *value = result as u64;
+                *value.add(1) = (result >> 64) as u64;
+            }
+            return Ok(true);
+        }
         let access = match operation {
-            0 => AccessOperation::ReadNative,
             1 => AccessOperation::Write(input.to_le_bytes()[..bytes as usize].into()),
             2 => {
                 let expected =
@@ -424,51 +463,29 @@ unsafe extern "C" fn memory(
             }
             _ => unreachable!(),
         };
+        let cached = operation == 1
+            && context
+                .space
+                .has_cached_pages(context.admission, address, u64::from(bytes))?;
         context.admission.suspend();
         let completed = context
             .process
-            .resolve_access(context.space.machine().access_captured(&ranges, access));
-        context.admission.resume()?;
-        // Dynarmic queues invalidations while Run is active. Its generated code
-        // is retired only after return, so no suspended native frame is freed.
-        context.admission.synchronize_code(|range| {
-            if unsafe {
-                ffi::nixe_dynarmic_invalidate(context.core, range.start.get(), range.bytes as usize)
-            } {
-                Ok(())
-            } else {
-                Err(MemoryError::Execution(ffi::error()))
-            }
-        })?;
-        match completed {
-            Ok(AccessResult::NativeRead {
-                bytes: result,
-                area,
-            }) => {
-                let mut data = [0; 16];
-                data[..result.len()].copy_from_slice(&result);
-                let result = u128::from_le_bytes(data);
+            .resolve_access(context.admission.access_captured(&ranges, cached, access));
+        resume_memory(context)?;
+        match completed? {
+            AccessResult::Written(_) => Ok(true),
+            AccessResult::Atomic { written, .. } => {
                 unsafe {
-                    *value = result as u64;
-                    *value.add(1) = (result >> 64) as u64;
+                    *value = u64::from(written);
                 }
-                *context.read_area = area;
+                Ok(true)
             }
-            Ok(AccessResult::Written(_)) => {}
-            Ok(AccessResult::Atomic { written, .. }) => unsafe {
-                *value = u64::from(written);
-            },
-            Ok(_) => return Err(MemoryError::Invalid("unexpected native access completion")),
-            Err(error) => {
-                context.error = Some(error);
-                return Ok(false);
-            }
+            _ => Err(MemoryError::Invalid("native store returned a read operation").into()),
         }
-        Ok(true)
     })();
     match capture {
         Ok(done) => done,
-        Err(error) if error.is_access_fault() => {
+        Err(MemoryAccessFailure::Memory(error)) if error.is_access_fault() => {
             // The normal callback policy does not abort or reconstruct an
             // invalid guest instruction. Match the reference default values.
             unsafe {
@@ -477,9 +494,13 @@ unsafe extern "C" fn memory(
             }
             true
         }
-        Err(error) => {
-            let error = context.process.fail(Arc::new(error));
+        Err(MemoryAccessFailure::Memory(error)) => {
+            let error = context.process.fail(error);
             context.error = Some(MemoryAccessFailure::Memory(error));
+            false
+        }
+        Err(MemoryAccessFailure::Stopped) => {
+            context.error = Some(MemoryAccessFailure::Stopped);
             false
         }
     }

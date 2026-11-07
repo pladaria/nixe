@@ -1,14 +1,14 @@
 //! Canonical guest observations for shader compilation. Mutable memory access
 //! ends at capture; workers receive owned environments and immutable metadata.
 
-pub(crate) mod archive;
+pub mod archive;
 mod graphics;
 mod program;
 mod texture;
-pub use super::memory::MaxwellShaderMemoryCache as MemoryCache;
+pub use super::memory::{ShaderCache, ShaderInfo};
 pub use graphics::graphics_request;
-pub(crate) use graphics::{GraphicsSource, graphics_source};
-pub use program::{CapturedProgram, capture_program};
+pub use graphics::{GraphicsSource, graphics_source};
+pub use program::capture_program;
 
 pub const MAXWELL_SHADER_NAMESPACE: nixe_gpu::shader_identity::ShaderNamespace =
     nixe_gpu::shader_identity::ShaderNamespace {
@@ -16,15 +16,13 @@ pub const MAXWELL_SHADER_NAMESPACE: nixe_gpu::shader_identity::ShaderNamespace =
         isa: 1,
     };
 
-use super::memory::{MaxwellShaderMemoryView, MaxwellShaderRead};
+use super::memory::ShaderMemory;
 use crate::{MaxwellGpuMemory, MaxwellShaderStage};
 use nixe_shader_recompiler::{
     CompileError, Compiler, Result,
-    artifact::ShaderInfo,
     diagnostics::FailureCategory,
-    environment::{Environment, EnvironmentMetadata, RecordingEnvironment, SnapshotEnvironment},
+    environment::{Environment, EnvironmentMetadata, RecordingEnvironment},
     maxwell::header::ProgramHeader,
-    profile::{CompilerSettings, HostTranslateInfo},
     types::*,
 };
 use std::collections::BTreeMap;
@@ -43,7 +41,7 @@ pub struct TexturePool {
     pub via_header_index: bool,
 }
 
-/// Addresses are freshness facts, not compilation content.
+/// Mutable guest bindings consumed while creating a compiler environment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CaptureBindings {
     pub constant_buffers: [Option<BufferBinding>; 32],
@@ -53,260 +51,78 @@ pub struct CaptureBindings {
     pub geometry_passthrough_mask: Option<[u32; 8]>,
 }
 
+#[derive(Clone)]
 pub struct CaptureRequest {
     pub address: u64,
     pub metadata: EnvironmentMetadata,
     pub bindings: CaptureBindings,
 }
 
-/// Freshness state remains on the command processor side of the boundary.
-#[derive(Clone, Debug)]
-pub struct CapturedStage {
-    address: u64,
-    request_metadata: EnvironmentMetadata,
-    pub environment: Arc<SnapshotEnvironment>,
-    pub info: Arc<ShaderInfo>,
-    code_dependencies: Arc<[MaxwellShaderRead]>,
+pub(super) fn invalid(message: impl std::fmt::Display) -> CompileError {
+    CompileError::new(FailureCategory::InvalidArgument, message.to_string())
 }
 
-impl CapturedStage {
-    pub fn is_current(&self, space: &MaxwellGpuMemory) -> bool {
-        self.memory_is_current(space)
-    }
-
-    fn refresh(
-        &self,
-        request: &CaptureRequest,
-        space: &MaxwellGpuMemory,
-        memory: &mut MemoryCache,
-        access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<Option<Self>> {
-        if self.request_is_current(request, space) {
-            return Ok(Some(self.clone()));
-        }
-        if self.address != request.address || self.request_metadata != request.metadata {
-            return Ok(None);
-        }
-        let mut code_dependencies = Vec::with_capacity(self.code_dependencies.len());
-        {
-            let mut view = MaxwellShaderMemoryView::new(space, memory, access);
-            for previous in self.code_dependencies.iter() {
-                if previous.is_current(space) {
-                    code_dependencies.push(previous.clone());
-                } else {
-                    let current = view
-                        .read(previous.stage, previous.address, previous.bytes.len())
-                        .map_err(|error| invalid(error.to_string()))?;
-                    if current.bytes != previous.bytes {
-                        return Ok(None);
-                    }
-                    code_dependencies.push(current);
-                }
-            }
-        }
-        Ok(Some(Self {
-            address: self.address,
-            request_metadata: self.request_metadata.clone(),
-            environment: self.environment.clone(),
-            info: self.info.clone(),
-            code_dependencies: code_dependencies.into(),
-        }))
-    }
-}
-
-pub fn capture(
-    compiler: &mut Compiler,
-    space: &MaxwellGpuMemory,
-    request: CaptureRequest,
-    host: &HostTranslateInfo,
-    settings: &CompilerSettings,
-    memory: &mut MemoryCache,
-    access: &mut nixe_gpu::MemoryAccess<'_>,
-) -> Result<(CapturedStage, nixe_shader_recompiler::session::ProgramId)> {
-    let request_metadata = request.metadata.clone();
-    let mut source = CaptureEnvironment {
-        memory: MaxwellShaderMemoryView::new(space, memory, access),
-        address: request.address,
-        metadata: request.metadata,
-        bindings: request.bindings,
-        code_dependencies: Vec::new(),
-        textures: BTreeMap::new(),
-    };
-    source.initialize_metadata()?;
-    let mut recorder = RecordingEnvironment::new(&mut source);
-    let program = compiler.translate(&mut recorder, host, settings)?;
-    let environment = recorder.into_snapshot();
-    source.consolidate_code();
-    let captured = CapturedStage {
-        address: source.address,
-        request_metadata,
-        environment: Arc::new(environment),
-        info: Arc::new(compiler.inspect_program(
-            program,
-            nixe_gpu::shader_compilation::resources::resource_info,
-        )?),
-        code_dependencies: source.code_dependencies.into(),
-    };
-    Ok((captured, program))
-}
-
-fn invalid(message: impl Into<String>) -> CompileError {
-    CompileError::new(FailureCategory::InvalidArgument, message)
-}
-
+/// GenericEnvironment owns a cached instruction span only while the graphics
+/// owner captures a pipeline's compile-time observations.
 struct CaptureEnvironment<'a, 'm> {
-    memory: MaxwellShaderMemoryView<'a, 'm>,
+    memory: ShaderMemory<'a, 'm>,
     address: u64,
     metadata: EnvironmentMetadata,
     bindings: CaptureBindings,
-    code_dependencies: Vec<MaxwellShaderRead>,
+    code: Vec<u8>,
+    read_lowest: u32,
+    read_highest: u32,
     textures: BTreeMap<TextureHandle, [u32; 8]>,
 }
-
-impl CaptureEnvironment<'_, '_> {
-    fn initialize_metadata(&mut self) -> Result<()> {
-        if self.metadata.stage != Stage::Compute {
-            let bytes = self.read_code(self.address, 80)?;
-            self.metadata.sph = ProgramHeader::from_bytes(bytes.as_ref().try_into().unwrap());
-            self.metadata.local_memory_size =
-                EnvironmentMetadata::graphics_local_memory_size(&self.metadata.sph)?;
-            if self.metadata.stage == Stage::Geometry
-                && self.metadata.sph.geometry_passthrough() != 0
+impl<'a, 'm> CaptureEnvironment<'a, 'm> {
+    fn new(
+        space: &'a MaxwellGpuMemory,
+        request: CaptureRequest,
+        size: Option<usize>,
+        access: &'a mut nixe_gpu::MemoryAccess<'m>,
+    ) -> Result<Self> {
+        let mut memory = ShaderMemory::new(space, access);
+        let code = if let Some(size) = size {
+            memory.read_code(request.address, size)?
+        } else {
+            Vec::new()
+        };
+        let mut result = Self {
+            memory,
+            address: request.address,
+            metadata: request.metadata,
+            bindings: request.bindings,
+            code,
+            read_lowest: u32::MAX,
+            read_highest: 0,
+            textures: BTreeMap::new(),
+        };
+        if result.metadata.stage != Stage::Compute {
+            let header = if let Some(header) = result.code.get(..80) {
+                ProgramHeader::from_bytes(header.try_into().unwrap())
+            } else {
+                let bytes = result.memory.read_code(result.address, 80)?;
+                ProgramHeader::from_bytes(bytes.as_slice().try_into().unwrap())
+            };
+            result.metadata.local_memory_size =
+                EnvironmentMetadata::graphics_local_memory_size(&header)?;
+            result.metadata.sph = header;
+            if result.metadata.stage == Stage::Geometry
+                && result.metadata.sph.geometry_passthrough() != 0
             {
-                self.metadata.gp_passthrough_mask =
-                    self.bindings.geometry_passthrough_mask.ok_or_else(|| {
+                result.metadata.gp_passthrough_mask =
+                    result.bindings.geometry_passthrough_mask.ok_or_else(|| {
                         invalid("Geometry passthrough attribute mask was not captured")
                     })?;
             }
         }
-        Ok(())
+        Ok(result)
     }
-
-    fn matches_snapshot(&mut self, snapshot: &SnapshotEnvironment) -> Result<bool> {
-        self.initialize_metadata()?;
-        if &self.metadata != snapshot.metadata() {
-            return Ok(false);
-        }
-        let observed = snapshot.observations();
-        let Some((&first, _)) = observed.instructions.first_key_value() else {
-            return Ok(false);
-        };
-        let last = observed.instructions.last_key_value().unwrap().0.0;
-        let begin = first
-            .0
-            .checked_sub(self.metadata.start_address.0)
-            .ok_or_else(|| invalid("Cached instruction precedes program start"))?;
-        let size = u64::from(last) + 8 - u64::from(first.0);
-        if size > 16 * 1024 * 1024 {
-            return Ok(false);
-        }
-        let address = self
-            .address
-            .checked_add(u64::from(begin))
-            .ok_or_else(|| invalid("Cached shader address overflows"))?;
-        let bytes = self.read_code(address, size as usize)?;
-        for (&offset, &word) in &observed.instructions {
-            let at = (offset.0 - first.0) as usize;
-            if bytes[at..at + 8] != word.to_le_bytes() {
-                return Ok(false);
-            }
-        }
-        for (key, &word) in &observed.cbuf_words {
-            if self.read_cbuf_value(key.index, key.offset)? != word {
-                return Ok(false);
-            }
-        }
-        for (&key, &handle) in &observed.texture_handles {
-            // Handles locate mutable resources; they are not shader constants.
-            // Validate precisely the properties observed through each expression.
-            let current = self.read_texture_handle(key)?;
-            if let Some(&kind) = observed.texture_types.get(&handle)
-                && self.read_texture_type(current)? != kind
-            {
-                return Ok(false);
-            }
-            if let Some(&format) = observed.texture_pixel_formats.get(&handle)
-                && self.read_texture_pixel_format(current)? != format
-            {
-                return Ok(false);
-            }
-            if let Some(&integer) = observed.texture_integer_formats.get(&handle)
-                && self.is_texture_pixel_format_integer(current)? != integer
-            {
-                return Ok(false);
-            }
-        }
-        // Also preserve observations made through literal handles, including
-        // literals which happened to alias an expression's captured handle.
-        for (&handle, &kind) in &observed.texture_types {
-            if self.read_texture_type(handle)? != kind {
-                return Ok(false);
-            }
-        }
-        for (&handle, &format) in &observed.texture_pixel_formats {
-            if self.read_texture_pixel_format(handle)? != format {
-                return Ok(false);
-            }
-        }
-        for (&handle, &integer) in &observed.texture_integer_formats {
-            if self.is_texture_pixel_format_integer(handle)? != integer {
-                return Ok(false);
-            }
-        }
-        if let Some(value) = observed.viewport_transform_state
-            && self.read_viewport_transform_state()? != value
-        {
-            return Ok(false);
-        }
-        for (key, &replacement) in &observed.replacements {
-            if self.get_replace_const_buffer(key.index, key.offset)? != replacement {
-                return Ok(false);
-            }
-        }
-        self.consolidate_code();
-        Ok(true)
-    }
-
-    fn consolidate_code(&mut self) {
-        let Some(begin) = self.code_dependencies.iter().map(|read| read.address).min() else {
-            return;
-        };
-        let Some(end) = self
-            .code_dependencies
-            .iter()
-            .filter_map(|read| read.address.checked_add(read.bytes.len() as u64))
-            .max()
-        else {
-            return;
-        };
-        let Ok(size) = usize::try_from(end - begin) else {
-            return;
-        };
-        // Keep one retained source proof for the contiguous shader, including
-        // control words. Sparse or oversized programs retain their exact reads.
-        let Ok(read) = self.read_memory(begin, size) else {
-            return;
-        };
-        if self.code_dependencies.iter().all(|previous| {
-            let offset = (previous.address - begin) as usize;
-            read.bytes.get(offset..offset + previous.bytes.len()) == Some(previous.bytes.as_ref())
-        }) {
-            self.code_dependencies.clear();
-            self.code_dependencies.push(read);
-        }
-    }
-    fn read(&mut self, address: u64, size: usize) -> Result<Arc<[u8]>> {
+    fn read(&self, address: u64, size: usize) -> Result<Arc<[u8]>> {
         self.memory
             .read_data(self.shader_stage(), address, size)
-            .map_err(|error| invalid(error.to_string()))
+            .map_err(invalid)
     }
-    fn read_code(&mut self, address: u64, size: usize) -> Result<Arc<[u8]>> {
-        let read = self.read_memory(address, size)?;
-        let bytes = read.bytes.clone();
-        self.code_dependencies.push(read);
-        Ok(bytes)
-    }
-
     fn shader_stage(&self) -> MaxwellShaderStage {
         match self.metadata.stage {
             Stage::VertexA => MaxwellShaderStage::VertexCullBeforeFetch,
@@ -317,12 +133,6 @@ impl CaptureEnvironment<'_, '_> {
             Stage::Fragment => MaxwellShaderStage::Pixel,
             Stage::Compute => MaxwellShaderStage::Compute,
         }
-    }
-
-    fn read_memory(&mut self, address: u64, size: usize) -> Result<MaxwellShaderRead> {
-        self.memory
-            .read(self.shader_stage(), address, size)
-            .map_err(|error| invalid(error.to_string()))
     }
 
     fn texture(&mut self, handle: TextureHandle) -> Result<[u32; 8]> {
@@ -370,13 +180,17 @@ impl Environment for CaptureEnvironment<'_, '_> {
         if relative & 7 != 0 {
             return Err(invalid("Unaligned shader instruction address"));
         }
+        self.read_lowest = self.read_lowest.min(offset.0);
+        self.read_highest = self.read_highest.max(offset.0);
+        let at = relative as usize;
+        if let Some(bytes) = self.code.get(at..at + 8) {
+            return Ok(u64::from_le_bytes(bytes.try_into().unwrap()));
+        }
         let address = self
             .address
             .checked_add(u64::from(relative))
             .ok_or_else(|| invalid("Instruction address overflows"))?;
-        Ok(u64::from_le_bytes(
-            self.read_code(address, 8)?.as_ref().try_into().unwrap(),
-        ))
+        self.memory.instruction(address)
     }
 
     fn read_cbuf_value(&mut self, index: CbufIndex, offset: ByteOffset) -> Result<u32> {
@@ -441,276 +255,63 @@ impl Environment for CaptureEnvironment<'_, '_> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::shader::test_support::{mapped_memory, write_shader_words};
-    use nixe_gpu::shader_encoding;
-
-    pub(super) fn refresh_unchanged(
-        captured: &CapturedStage,
-        space: &MaxwellGpuMemory,
-    ) -> CapturedStage {
-        let request = CaptureRequest {
-            address: captured.address,
-            metadata: captured.request_metadata.clone(),
-            bindings: CaptureBindings::default(),
-        };
-        let refreshed = captured
-            .refresh(
-                &request,
-                space,
-                &mut MemoryCache::default(),
-                &mut crate::test_memory::apply,
-            )
-            .unwrap()
-            .expect("unchanged consumed shader inputs");
-        assert_eq!(captured.environment, refreshed.environment);
-        assert!(refreshed.is_current(space));
-        refreshed
-    }
-
-    #[test]
-    fn instruction_reads_share_one_code_proof_and_detect_real_rewrites() {
-        use nixe_shader_recompiler::maxwell::decode::Opcode;
-        let (allocation, space, base) = mapped_memory();
-        let mov = Opcode::MOV32I.encoding().value | 7 << 16 | 15 << 12;
-        for (offset, instruction) in [(8, mov), (16, mov | 1), (24, 0xe300_0000_0007_000f)] {
-            crate::test_memory::write(&allocation, offset, &instruction.to_le_bytes()).unwrap();
-        }
-
-        let mut compiler = Compiler::new().unwrap();
-        let (captured, _) = capture(
-            &mut compiler,
-            space.memory(),
-            CaptureRequest {
-                address: base,
-                metadata: EnvironmentMetadata {
-                    stage: Stage::Compute,
-                    workgroup_size: [1; 3],
-                    ..Default::default()
-                },
-                bindings: CaptureBindings::default(),
-            },
-            &HostTranslateInfo::default(),
-            &CompilerSettings::default(),
-            &mut MemoryCache::default(),
-            &mut crate::test_memory::apply,
-        )
-        .unwrap();
-        assert_eq!(captured.environment.observations().instructions.len(), 3);
-        assert_eq!(captured.code_dependencies.len(), 1);
-        assert_eq!(captured.code_dependencies[0].bytes.len(), 24);
-        crate::test_memory::write(&allocation, 0x800, &[1]).unwrap();
-        assert!(captured.is_current(space.memory()));
-        crate::test_memory::write(&allocation, 16, &(mov | 2).to_le_bytes()).unwrap();
-        assert!(!captured.is_current(space.memory()));
-    }
-
-    #[test]
-    fn mutable_shader_data_reads_do_not_observe_or_protect_pages() {
-        let (allocation, space, base) = mapped_memory();
-        crate::test_memory::write(&allocation, 0x100, &7u32.to_le_bytes()).unwrap();
-        let machine = space.memory().machine();
-        let before = machine.tracking_statistics();
-        let mut memory = MemoryCache::default();
-        let mut access = crate::test_memory::access(machine);
-        let mut view = MaxwellShaderMemoryView::new(space.memory(), &mut memory, &mut access);
-        assert_eq!(
-            view.read_data(MaxwellShaderStage::Compute, base + 0x100, 4)
-                .unwrap()
-                .as_ref(),
-            &7u32.to_le_bytes()
-        );
-        let after_read = machine.tracking_statistics();
-        assert_eq!(
-            after_read.observer_registrations,
-            before.observer_registrations
-        );
-        assert_eq!(after_read.protection_calls, before.protection_calls);
-        crate::test_memory::write(&allocation, 0x100, &8u32.to_le_bytes()).unwrap();
-        assert_eq!(
-            view.read_data(MaxwellShaderStage::Compute, base + 0x100, 4)
-                .unwrap()
-                .as_ref(),
-            &8u32.to_le_bytes()
-        );
-        assert_eq!(
-            machine.tracking_statistics().protection_calls,
-            before.protection_calls
-        );
-    }
-
-    #[test]
-    fn restored_environment_rechecks_mutable_compilation_observations() {
-        use nixe_shader_recompiler::environment::HandleKey;
-        let (allocation, space, base) = mapped_memory();
-        crate::test_memory::write(&allocation, 8, &0xe300_0000_0007_000fu64.to_le_bytes()).unwrap();
-        crate::test_memory::write(&allocation, 0x100, &7u32.to_le_bytes()).unwrap();
-        let format = 8 | [7, 10, 13, 16]
-            .into_iter()
-            .map(|shift| 2 << shift)
-            .sum::<u32>();
-        crate::test_memory::write(&allocation, 0x200, &format.to_le_bytes()).unwrap();
-        crate::test_memory::write(&allocation, 0x210, &(1u32 << 23).to_le_bytes()).unwrap();
-        crate::test_memory::write(&allocation, 0x214, &(1u32 << 31).to_le_bytes()).unwrap();
-        let metadata = EnvironmentMetadata {
-            stage: Stage::Compute,
-            ..Default::default()
-        };
-        let mut bindings = CaptureBindings {
-            texture_pool: Some(TexturePool {
-                address: base + 0x200,
-                maximum_index: 1,
-                via_header_index: false,
-            }),
-            ..Default::default()
-        };
-        bindings.constant_buffers[0] = Some(BufferBinding {
-            address: base + 0x100,
-            size: 8,
-        });
-        let mut memory = MemoryCache::default();
-        let mut access = crate::test_memory::access(space.memory().machine());
-        let snapshot = {
-            let mut source = CaptureEnvironment {
-                memory: MaxwellShaderMemoryView::new(space.memory(), &mut memory, &mut access),
-                address: base,
-                metadata: metadata.clone(),
-                bindings: bindings.clone(),
-                code_dependencies: Vec::new(),
-                textures: BTreeMap::new(),
+/// The raw-code cache hashes bytecode before pipeline translation, as Eden.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/shader_environment.cpp#L156-L163
+pub(super) fn analyze_code(
+    space: &MaxwellGpuMemory,
+    request: &CaptureRequest,
+    access: &mut nixe_gpu::MemoryAccess<'_>,
+) -> Result<ShaderInfo> {
+    use nixe_gpu::shader_identity::cityhash::city_hash64;
+    use nixe_shader_recompiler::maxwell::{flow::FlowGraph, location::Location};
+    const BLOCK: usize = 0x1000;
+    const MAXIMUM: usize = 0x100000;
+    let mut source = CaptureEnvironment::new(space, request.clone(), None, access)?;
+    let mut code = vec![0; MAXIMUM];
+    for offset in (0..MAXIMUM).step_by(BLOCK) {
+        let address = request
+            .address
+            .checked_add(offset as u64)
+            .ok_or_else(|| invalid("Shader address overflows"))?;
+        source
+            .memory
+            .read_code_into(address, &mut code[offset..offset + BLOCK])?;
+        for index in (offset..offset + BLOCK).step_by(8) {
+            let word = u64::from_le_bytes(code[index..index + 8].try_into().unwrap());
+            let size = if matches!(word, 0xe240_0fff_ff87_000f | 0xe240_0fff_ff07_000f) {
+                Some(index)
+            } else if !source.metadata.is_proprietary_driver && word == 0xe300_0000_0007_000f {
+                Some(index + 8)
+            } else {
+                None
             };
-            let mut recorder = RecordingEnvironment::new(&mut source);
-            recorder.read_instruction(ProgramOffset(8)).unwrap();
-            assert_eq!(
-                recorder
-                    .read_cbuf_value(CbufIndex(0), ByteOffset(0))
-                    .unwrap(),
-                7
-            );
-            let handle = recorder
-                .read_texture_handle(HandleKey {
-                    offset: ByteOffset(4),
-                    count: 1,
-                    ..Default::default()
-                })
-                .unwrap();
-            assert_eq!(handle, TextureHandle(0));
-            assert_eq!(
-                recorder.read_texture_type(handle).unwrap(),
-                TextureType::Color2D
-            );
-            assert_eq!(
-                recorder.read_texture_pixel_format(handle).unwrap(),
-                TexturePixelFormat::A8B8G8R8_UNORM
-            );
-            assert!(!recorder.is_texture_pixel_format_integer(handle).unwrap());
-            recorder.read_viewport_transform_state().unwrap();
-            recorder
-                .get_replace_const_buffer(CbufIndex(0), ByteOffset(0))
-                .unwrap();
-            recorder.into_snapshot()
-        };
-        let mut matches = || {
-            CaptureEnvironment {
-                memory: MaxwellShaderMemoryView::new(space.memory(), &mut memory, &mut access),
-                address: base,
-                metadata: metadata.clone(),
-                bindings: bindings.clone(),
-                code_dependencies: Vec::new(),
-                textures: BTreeMap::new(),
+            if let Some(size) = size {
+                return Ok(ShaderInfo {
+                    unique_hash: city_hash64(&code[..size]),
+                    size_bytes: size + 8,
+                    header: ProgramHeader::from_bytes(code[..80].try_into().unwrap()),
+                });
             }
-            .matches_snapshot(&snapshot)
-            .unwrap()
-        };
-        assert!(matches());
-        // A different handle with the same observed properties retains shader
-        // specialization. A dimension change requires a different capture.
-        crate::test_memory::write(&allocation, 0x220, &format.to_le_bytes()).unwrap();
-        crate::test_memory::write(&allocation, 0x230, &(1u32 << 23).to_le_bytes()).unwrap();
-        crate::test_memory::write(&allocation, 0x234, &(1u32 << 31).to_le_bytes()).unwrap();
-        crate::test_memory::write(&allocation, 0x104, &1u32.to_le_bytes()).unwrap();
-        assert!(matches());
-        crate::test_memory::write(&allocation, 0x230, &(5u32 << 23).to_le_bytes()).unwrap();
-        assert!(!matches());
-        crate::test_memory::write(&allocation, 0x104, &0u32.to_le_bytes()).unwrap();
-        assert!(matches());
-        for (offset, changed, original) in [
-            (0x100, 8, 7),
-            (0x104, 1, 0),
-            (0x210, 5 << 23, 1 << 23),
-            (
-                0x200,
-                8 | [7, 10, 13, 16]
-                    .into_iter()
-                    .map(|shift| 4 << shift)
-                    .sum::<u32>(),
-                format,
-            ),
-        ] {
-            crate::test_memory::write(&allocation, offset, &changed.to_le_bytes()).unwrap();
-            assert!(!matches(), "changed input at {offset:#x}");
-            crate::test_memory::write(&allocation, offset, &original.to_le_bytes()).unwrap();
-            assert!(matches());
         }
     }
-
-    #[test]
-    fn compute_capture_replays_owned_code_and_tracks_instruction_changes() {
-        let (allocation, space, base) = mapped_memory();
-        let exit = 0xe300_0000_0007_000fu64;
-        crate::test_memory::write(&allocation, 8, &exit.to_le_bytes()).unwrap();
-
-        let mut compiler = Compiler::new().unwrap();
-        let request = |address| CaptureRequest {
-            address,
-            metadata: EnvironmentMetadata {
-                stage: Stage::Compute,
-                workgroup_size: [4, 2, 1],
-                ..Default::default()
-            },
-            bindings: CaptureBindings::default(),
-        };
-        let (captured, _) = capture(
-            &mut compiler,
-            space.memory(),
-            request(base),
-            &HostTranslateInfo::default(),
-            &CompilerSettings::default(),
-            &mut MemoryCache::default(),
-            &mut crate::test_memory::apply,
-        )
-        .unwrap();
-        assert_eq!(captured.environment.observations().instructions.len(), 1);
-        assert!(captured.is_current(space.memory()));
-        crate::test_memory::write(&allocation, 0x800, &[1, 2, 3, 4]).unwrap();
-        let captured = refresh_unchanged(&captured, space.memory());
-        write_shader_words(space.memory(), &[(base + 8, 0)]);
-        assert!(!captured.is_current(space.memory()));
-        crate::test_memory::write(&allocation, 0x108, &exit.to_le_bytes()).unwrap();
-        let (relocated, _) = capture(
-            &mut compiler,
-            space.memory(),
-            request(base + 0x100),
-            &HostTranslateInfo::default(),
-            &CompilerSettings::default(),
-            &mut MemoryCache::default(),
-            &mut crate::test_memory::apply,
-        )
-        .unwrap();
-        assert_eq!(
-            shader_encoding::bytes(captured.environment.as_ref()),
-            shader_encoding::bytes(relocated.environment.as_ref())
-        );
-        let mut environment = (*captured.environment).clone();
-        compiler.reset().unwrap();
-        compiler
-            .translate(
-                &mut environment,
-                &HostTranslateInfo::default(),
-                &CompilerSettings::default(),
-            )
-            .unwrap();
-    }
+    let start = Location::new(source.metadata.entry_address()?)?;
+    let _graph = FlowGraph::analyze(&mut source, start, request.metadata.stage == Stage::VertexA)?;
+    let size = source
+        .read_highest
+        .checked_sub(source.read_lowest)
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(|| invalid("Shader control flow has no instruction span"))?
+        as usize;
+    let offset = source
+        .read_lowest
+        .checked_sub(source.metadata.start_address.0)
+        .ok_or_else(|| invalid("Shader instruction span precedes its start"))?;
+    let code = source
+        .memory
+        .read_code(request.address + u64::from(offset), size)?;
+    Ok(ShaderInfo {
+        unique_hash: city_hash64(&code),
+        size_bytes: size,
+        header: source.metadata.sph,
+    })
 }

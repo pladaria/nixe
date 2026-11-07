@@ -1,7 +1,7 @@
 //! GM20B `FERMI_TWOD_A` engine boundary.
 
 mod beta;
-pub(crate) mod blit;
+pub mod blit;
 pub use blit::MaxwellTwoDBlitOperation;
 mod methods;
 mod notify;
@@ -32,17 +32,8 @@ pub use state::{
     MaxwellTwoDState, MaxwellTwoDStateWrite,
 };
 
-use crate::engines::PendingEngineOperation;
 use nixe_gpu::GpuClassId;
 
-use super::MaxwellEngineDispatchError;
-use crate::MaxwellMethodDispatch;
+pub(super) use methods::call_method;
 
 pub(super) const CLASS: GpuClassId = GpuClassId(0x902d);
-
-pub(super) fn preflight(
-    method: MaxwellMethodDispatch,
-    candidate: &mut MaxwellTwoDState,
-) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
-    methods::preflight(method, candidate)
-}

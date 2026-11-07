@@ -1,6 +1,5 @@
 //! `FERMI_TWOD_A` method declarations and validated register writes.
 
-use crate::engines::PendingEngineOperation;
 use nixe_gpu::GpuMethodId;
 
 use super::{
@@ -11,8 +10,8 @@ use super::{
     MaxwellTwoDProcessingClusters, MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableStateWrite,
     MaxwellTwoDState, MaxwellTwoDStateWrite,
 };
+use crate::MaxwellMethodSource;
 use crate::engines::{MaxwellEngineDispatchError, MaxwellEngineMethodMetadata};
-use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
 const CLASS_NAME: &str = "FERMI_TWOD_A";
 
@@ -148,17 +147,17 @@ methods!(
     ),
 );
 
-pub(super) fn preflight(
-    method: MaxwellMethodDispatch,
+pub(in crate::engines) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    source: MaxwellMethodSource,
     candidate: &mut MaxwellTwoDState,
-) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
-    if let Some(result) = super::blit::apply(method, candidate) {
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<bool, crate::engines::MaxwellEngineStreamError> {
+    if let Some(result) = super::blit::apply(source, candidate, execution) {
         return result;
     }
-    if let Some(result) = super::solid::apply(method, candidate) {
+    if let Some(result) = super::solid::apply(source, candidate, execution) {
         return result;
     }
-    let source = method.source();
     let declaration = METHODS
         .iter()
         .find(|declaration| declaration.metadata.method() == source.method())
@@ -168,7 +167,7 @@ pub(super) fn preflight(
         })?;
 
     if source.argument() & !declaration.defined_mask != 0 {
-        return Err(invalid_value(source, declaration));
+        return Err((invalid_value(source, declaration)).into());
     }
 
     let write = match declaration.action {
@@ -237,7 +236,7 @@ pub(super) fn preflight(
     };
 
     candidate.apply(write);
-    Ok(None)
+    Ok(true)
 }
 
 fn invalid_value(

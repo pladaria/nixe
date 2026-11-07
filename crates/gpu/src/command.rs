@@ -39,66 +39,10 @@ pub enum PrimitiveTopology {
     Triangles,
     TriangleStrip,
     TriangleFan,
-    /// Independent groups of four perimeter-ordered vertices, with the fourth
-    /// vertex supplying constant interpolants. Incomplete groups are discarded.
+    /// Independent groups of four perimeter-ordered vertices.
     Quads,
+    QuadStrip,
     Patches,
-}
-
-/// Rasterization rule applied after triangle assembly.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum TriangleRasterization {
-    /// Cover samples inside the triangle edges.
-    #[default]
-    Fill,
-    /// Cover the triangle's axis-aligned post-projection bounding box while
-    /// retaining the original triangle's interpolation planes.
-    FillRectangle,
-    /// Rasterize triangle boundaries as rectangular lines. When `smooth` is
-    /// set, coverage modulates fragment output zero's alpha after shading.
-    /// Width is a positive finite float in framebuffer pixels, stored as bits
-    /// for exact state identity. Backends validate host limits when consumed.
-    Wireframe { width_bits: u32, smooth: bool },
-}
-
-/// Explicit rectangular coverage for line primitives, independently of polygon mode.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct LineRasterization {
-    pub width_bits: u32,
-    pub smooth: bool,
-}
-
-/// Polygon depth offset: constant factor in host depth-format units, slope
-/// factor and signed clamp. Float bits preserve exact pipeline identity.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct DepthBias {
-    pub constant_bits: u32,
-    pub slope_scale_bits: u32,
-    pub clamp_bits: u32,
-}
-
-/// Front-facing winding in framebuffer coordinates (X right, Y down), after
-/// viewport transformation. Counterclockwise means negative shoelace area.
-/// Changing the viewport determinant changes facing; it does not change this
-/// state. Both WebGPU and Vulkan use this convention:
-/// https://gpuweb.github.io/gpuweb/#polygon-rasterization
-/// https://docs.vulkan.org/spec/latest/chapters/primsrast.html#primsrast-polygons-basic
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum FrontFace {
-    #[default]
-    CounterClockwise,
-    Clockwise,
-}
-
-/// Faces discarded after polygon assembly, without suppressing shader execution
-/// before rasterization. Points and direct lines are not affected.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum CullMode {
-    #[default]
-    None,
-    Front,
-    Back,
-    FrontAndBack,
 }
 
 /// Comparison applied by the legacy fixed-function alpha test.
@@ -119,33 +63,6 @@ pub enum AlphaCompareOperation {
 pub struct AlphaTest {
     pub comparison: AlphaCompareOperation,
     pub reference_bits: u32,
-}
-
-/// Width and interpretation of indices in an index buffer.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum IndexType {
-    Uint8,
-    Uint16,
-    Uint32,
-}
-
-/// Direct draw arguments. Indirect argument buffers are explicit accesses and
-/// can be added as a later verified operation form without changing these.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum DrawArguments {
-    NonIndexed {
-        first_vertex: u32,
-        vertex_count: u32,
-        first_instance: u32,
-        instance_count: u32,
-    },
-    Indexed {
-        first_index: u32,
-        index_count: u32,
-        vertex_offset: i32,
-        first_instance: u32,
-        instance_count: u32,
-    },
 }
 
 /// Window-space fragment bounds. Empty rectangles still execute vertex shaders.
@@ -233,91 +150,6 @@ impl FragmentDepthTransform {
         self.0.map(f32::from_bits)
     }
 }
-
-/// Backend-independent affine transform from normalized device coordinates to
-/// framebuffer coordinates: `window = ndc * scale + offset`.
-///
-/// The depth interval is retained independently because guest APIs may program
-/// clip-depth bounds that cannot be reconstructed from the Z coefficients.
-///
-/// IEEE-754 bit patterns are retained so negative viewport axes and exact guest
-/// state survive frontend lowering without relying on one host API convention.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ViewportTransform {
-    scale: [u32; 3],
-    offset: [u32; 3],
-    depth_range: [u32; 2],
-    depth_clip_negative_one_to_one: bool,
-    fragment_depth_transform: Option<FragmentDepthTransform>,
-}
-
-impl ViewportTransform {
-    pub fn new(
-        scale: [f32; 3],
-        offset: [f32; 3],
-        depth_range: [f32; 2],
-    ) -> Result<Self, CommandDescriptionError> {
-        if scale
-            .into_iter()
-            .chain(offset)
-            .chain(depth_range)
-            .any(|value| !value.is_finite())
-        {
-            return Err(CommandDescriptionError::NonFiniteViewportTransform);
-        }
-        if scale[0] == 0.0 || scale[1] == 0.0 {
-            return Err(CommandDescriptionError::EmptyViewport);
-        }
-        Ok(Self {
-            scale: scale.map(f32::to_bits),
-            offset: offset.map(f32::to_bits),
-            depth_range: depth_range.map(f32::to_bits),
-            depth_clip_negative_one_to_one: false,
-            fragment_depth_transform: None,
-        })
-    }
-
-    #[must_use]
-    pub fn scale(self) -> [f32; 3] {
-        self.scale.map(f32::from_bits)
-    }
-
-    #[must_use]
-    pub fn offset(self) -> [f32; 3] {
-        self.offset.map(f32::from_bits)
-    }
-
-    /// Selects the homogeneous clip-space Z interval before the affine viewport.
-    /// The default is zero-to-one; negative-one-to-one requires a final-stage
-    /// position conversion on host APIs with a zero-to-one clip volume.
-    pub fn with_negative_one_to_one_depth(mut self, enabled: bool) -> Self {
-        self.depth_clip_negative_one_to_one = enabled;
-        self
-    }
-
-    #[must_use]
-    pub const fn depth_clip_negative_one_to_one(self) -> bool {
-        self.depth_clip_negative_one_to_one
-    }
-
-    pub fn with_fragment_depth_transform(mut self, transform: FragmentDepthTransform) -> Self {
-        self.fragment_depth_transform = Some(transform);
-        self
-    }
-
-    #[must_use]
-    pub const fn fragment_depth_transform(self) -> Option<FragmentDepthTransform> {
-        self.fragment_depth_transform
-    }
-
-    /// Returns the affine viewport endpoints in window-space depth.
-    #[must_use]
-    pub fn depth_range(self) -> [f32; 2] {
-        self.depth_range.map(f32::from_bits)
-    }
-}
-
-impl DrawArguments {}
 
 /// One fully specified direct draw dependency set.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -517,120 +349,6 @@ pub enum DepthCompareOperation {
     Always,
 }
 
-/// Effective depth-test state carried by one neutral draw.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct DepthState {
-    pub test_enabled: bool,
-    pub write_enabled: bool,
-    pub compare: DepthCompareOperation,
-}
-
-impl DepthState {
-    pub const DISABLED: Self = Self {
-        test_enabled: false,
-        write_enabled: false,
-        compare: DepthCompareOperation::Always,
-    };
-
-    #[must_use]
-    pub const fn new(
-        test_enabled: bool,
-        write_enabled: bool,
-        compare: DepthCompareOperation,
-    ) -> Self {
-        Self {
-            test_enabled,
-            write_enabled,
-            compare,
-        }
-    }
-}
-
-/// Fixed-function stencil operations, applied before the eight-bit write mask.
-/// https://docs.vulkan.org/spec/latest/chapters/fragops.html#fragops-stencil
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum StencilOperation {
-    Keep,
-    Zero,
-    Replace,
-    IncrementClamp,
-    DecrementClamp,
-    Invert,
-    IncrementWrap,
-    DecrementWrap,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct StencilFaceState {
-    pub compare: DepthCompareOperation,
-    pub fail: StencilOperation,
-    pub depth_fail: StencilOperation,
-    pub pass: StencilOperation,
-    pub read_mask: u8,
-    pub write_mask: u8,
-    pub reference: u8,
-}
-
-impl StencilFaceState {
-    #[must_use]
-    pub const fn read_only(compare: DepthCompareOperation, read_mask: u8, reference: u8) -> Self {
-        Self {
-            compare,
-            read_mask,
-            reference,
-            write_mask: 0,
-            fail: StencilOperation::Keep,
-            depth_fail: StencilOperation::Keep,
-            pass: StencilOperation::Keep,
-        }
-    }
-
-    #[must_use]
-    pub fn writes(self) -> bool {
-        self.write_mask != 0
-            && self
-                .reachable_operations()
-                .any(|op| op != StencilOperation::Keep)
-    }
-
-    #[must_use]
-    pub fn uses_reference(self) -> bool {
-        !matches!(
-            self.compare,
-            DepthCompareOperation::Always | DepthCompareOperation::Never
-        ) || (self.write_mask != 0
-            && self
-                .reachable_operations()
-                .any(|op| op == StencilOperation::Replace))
-    }
-
-    fn reachable_operations(self) -> impl Iterator<Item = StencilOperation> {
-        [
-            (self.fail, self.compare != DepthCompareOperation::Always),
-            (
-                self.depth_fail,
-                self.compare != DepthCompareOperation::Never,
-            ),
-            (self.pass, self.compare != DepthCompareOperation::Never),
-        ]
-        .into_iter()
-        .filter_map(|(op, reachable)| reachable.then_some(op))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct StencilTestState {
-    pub front: StencilFaceState,
-    pub back: StencilFaceState,
-}
-
-impl StencilTestState {
-    #[must_use]
-    pub fn writes(self) -> bool {
-        self.front.writes() || self.back.writes()
-    }
-}
-
 /// Backend-independent device cache-maintenance operation.
 ///
 /// This is an ordering command, not a model of any host GPU's physical cache.
@@ -678,7 +396,6 @@ pub enum CommandDescriptionError {
     CopySizeMismatch,
     ClearValueMismatch,
     NonFiniteClearValue,
-    NonFiniteViewportTransform,
     InvalidFragmentDepthTransform,
     EmptyViewport,
     EmptyDraw,
@@ -713,9 +430,7 @@ impl Display for CommandDescriptionError {
             }
             Self::NonFiniteClearValue => formatter.write_str("clear value is not finite"),
             Self::InvalidFragmentDepthTransform => formatter.write_str("fragment depth transform requires finite coefficients and ordered bounds inside [0,1]"),
-            Self::NonFiniteViewportTransform => {
-                formatter.write_str("viewport transform contains a non-finite component")
-            }
+
             Self::EmptyViewport => formatter.write_str("viewport transform has an empty axis"),
             Self::EmptyDraw => formatter.write_str("draw has no vertices, indices, or instances"),
             Self::IndexBufferMismatch => {
@@ -758,29 +473,3 @@ impl Display for CommandDescriptionError {
 }
 
 impl std::error::Error for CommandDescriptionError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn viewport_transform_preserves_negative_axes_and_rejects_invalid_values() {
-        let viewport =
-            ViewportTransform::new([640.0, -360.0, 0.5], [640.0, 360.0, 0.5], [0.0, 1.0]).unwrap();
-        assert_eq!(viewport.scale(), [640.0, -360.0, 0.5]);
-        assert_eq!(viewport.offset(), [640.0, 360.0, 0.5]);
-        assert_eq!(viewport.depth_range(), [0.0, 1.0]);
-        assert_eq!(
-            ViewportTransform::new([0.0, 1.0, 1.0], [0.0; 3], [0.0, 1.0]),
-            Err(CommandDescriptionError::EmptyViewport)
-        );
-        assert_eq!(
-            ViewportTransform::new([1.0, f32::NAN, 1.0], [0.0; 3], [0.0, 1.0]),
-            Err(CommandDescriptionError::NonFiniteViewportTransform)
-        );
-        assert_eq!(
-            ViewportTransform::new([1.0; 3], [0.0; 3], [0.0, f32::INFINITY]),
-            Err(CommandDescriptionError::NonFiniteViewportTransform)
-        );
-    }
-}

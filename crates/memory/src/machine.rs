@@ -128,7 +128,6 @@ struct MachineInner {
     aliases: Mutex<crate::aliases::Aliases>,
     tracking: crate::tracking::Tracking,
     cpu_writes: crate::cpu_writes::CpuWrites,
-    physical_access: crate::physical_access::PhysicalAccess,
     device_endpoint: Mutex<Option<Weak<dyn crate::DeviceAccessEndpoint>>>,
     next_access: AtomicU64,
     pressure: pressure::AllocationPressure,
@@ -181,21 +180,6 @@ pub struct Allocation {
 /// accounting charge. One allocation pin can cover all its physical extents.
 #[derive(Clone)]
 pub struct AllocationPin(Arc<PhysicalPin>);
-
-/// One owner's live, contiguous RAM input. The physical lease moves with the
-/// command cursor across suspension; it needs no separately allocated Arc pin.
-pub struct RamSource {
-    address: crate::HostAddress,
-    _pin: PhysicalPin,
-}
-impl RamSource {
-    /// Raw owner reads must remain within this retained source. Effects can
-    /// change coherence later, exactly as for a native command stream; this is
-    /// neither a byte snapshot nor a CPU visibility grant.
-    pub fn address(&self) -> crate::HostAddress {
-        self.address
-    }
-}
 
 /// Cached metadata does not keep physical RAM alive after guest ownership and
 /// actual captured requests have gone. Native device/upload handles retain
@@ -274,7 +258,6 @@ impl Machine {
             aliases: Mutex::new(crate::aliases::Aliases::default()),
             tracking: crate::tracking::Tracking::new(capacity),
             cpu_writes: crate::cpu_writes::CpuWrites::default(),
-            physical_access: crate::physical_access::PhysicalAccess::new(capacity),
             device_endpoint: Mutex::new(None),
             next_access: AtomicU64::new(1),
             pressure: pressure::AllocationPressure::default(),
@@ -345,9 +328,6 @@ impl Machine {
     }
     pub(crate) fn tracking(&self) -> &crate::tracking::Tracking {
         &self.0.tracking
-    }
-    pub(crate) fn physical_access(&self) -> &crate::physical_access::PhysicalAccess {
-        &self.0.physical_access
     }
     pub(crate) fn device_endpoint(&self) -> &Mutex<Option<Weak<dyn crate::DeviceAccessEndpoint>>> {
         &self.0.device_endpoint
@@ -629,39 +609,6 @@ impl WeakAllocation {
     pub fn upgrade_range(&self, offset: u64, bytes: u64) -> Option<AllocationPin> {
         self.record.upgrade()?.pin(offset, bytes).ok()
     }
-    /// Select RAM-current command bytes without shared pin allocation. The
-    /// graphics owner keeps the returned source until its final raw read.
-    /// Eden's DMA pusher likewise owns the accepted input through consumption.
-    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp
-    pub fn try_ram_source(
-        &self,
-        offset: u64,
-        bytes: u64,
-    ) -> Result<Option<RamSource>, MemoryError> {
-        let record = self
-            .record
-            .upgrade()
-            .ok_or(MemoryError::Invalid("RAM source allocation has retired"))?;
-        let pin = record.pin_unshared(offset, bytes)?;
-        let address = {
-            let mut extents = record.physical_extents(offset, bytes);
-            let Some(extent) = extents.next() else {
-                return Ok(None);
-            };
-            if extents.next().is_some() {
-                return Ok(None);
-            }
-            let _access = record.machine.physical_access().enter(extent);
-            if record.machine.has_device_pages(extent) {
-                return Ok(None);
-            }
-            record
-                .machine
-                .arena()
-                .host_address(extent.start, extent.bytes)
-        };
-        Ok(address.map(|address| RamSource { address, _pin: pin }))
-    }
     /// Borrow live RAM only through this synchronous streaming copy. Actual
     /// escaping inputs still retain their own physical leases. Eden likewise
     /// copies fast uniforms directly into their mapped upload destination.
@@ -683,34 +630,15 @@ impl WeakAllocation {
                 "reference exceeds its physical allocation",
             ));
         }
-        let mut references = record.references.lock().unwrap();
+        let references = record.references.lock().unwrap();
         references.check_live(offset, bytes)?;
         // Keeping this guard through the copy prevents the last guest or pin
         // reference from reaching zero. No transient page counts are needed.
         let mut copied = 0;
         for extent in record.physical_extents(offset, bytes) {
-            let Some(_access) = record.machine.physical_access().try_enter(extent) else {
-                // Waiting must release the reference lock. Promote the live
-                // input to an owned lease before letting a final guest/pin
-                // release retire it, then use ordinary retained admission.
-                references.retain(offset, bytes, Reference::Pin)?;
-                let _pin = PhysicalPin {
-                    record: Arc::clone(&record),
-                    offset,
-                    bytes,
-                };
-                drop(references);
-                // SAFETY: the promoted lease retains the entire input. This
-                // path can wait without holding its reference-count lock.
-                return unsafe {
-                    record
-                        .machine
-                        .capture_stream_extents(record.physical_extents(offset, bytes), destination)
-                };
-            };
             let count = extent.bytes as usize;
-            // SAFETY: admission covers this extent and the live reference
-            // counts remain locked until all synchronous reads finish.
+            // SAFETY: live reference counts retain this extent until all
+            // synchronous reads finish.
             unsafe {
                 record
                     .machine

@@ -188,9 +188,24 @@ impl Compiler {
                 offset: a.offset,
             })
             .collect();
-        let vertex = vk::PipelineVertexInputStateCreateInfo::default()
+        let divisors: Vec<_> = s
+            .vertex_divisors
+            .iter()
+            .map(
+                |&(binding, divisor)| vk::VertexInputBindingDivisorDescriptionEXT {
+                    binding,
+                    divisor,
+                },
+            )
+            .collect();
+        let mut divisor_info = vk::PipelineVertexInputDivisorStateCreateInfoEXT::default()
+            .vertex_binding_divisors(&divisors);
+        let mut vertex = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&bindings)
             .vertex_attribute_descriptions(&attributes);
+        if !divisors.is_empty() {
+            vertex = vertex.push_next(&mut divisor_info);
+        }
         let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(s.topology)
             .primitive_restart_enable(s.primitive_restart);
@@ -253,6 +268,12 @@ impl Compiler {
         let attachments: Vec<_> = s
             .colors
             .iter()
+            .take(
+                s.colors
+                    .iter()
+                    .rposition(|(format, _)| *format != vk::Format::UNDEFINED)
+                    .map_or(0, |i| i + 1),
+            )
             .map(|(_, b)| {
                 vk::PipelineColorBlendAttachmentState::default()
                     .blend_enable(b.enabled)
@@ -269,24 +290,21 @@ impl Compiler {
             .attachments(&attachments)
             .logic_op_enable(s.logic_enabled)
             .logic_op(s.logic_op);
-        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&self.dynamic);
-        let formats: Vec<_> = if out || linking {
-            s.colors.iter().map(|(f, _)| *f).collect()
-        } else {
-            Vec::new()
-        };
-        let mut rendering = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&formats)
-            .depth_attachment_format(if fs || out || linking {
+        let dynamic_states = self.dynamic_states(s);
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let mut pass_key = crate::render_pass::Key {
+            samples: s.samples,
+            depth: if s.depth_format != vk::Format::UNDEFINED {
                 s.depth_format
             } else {
-                vk::Format::UNDEFINED
-            })
-            .stencil_attachment_format(if fs || out || linking {
                 s.stencil_format
-            } else {
-                vk::Format::UNDEFINED
-            });
+            },
+            ..Default::default()
+        };
+        for (slot, &(format, _)) in pass_key.colors.iter_mut().zip(s.colors.iter()) {
+            *slot = format;
+        }
+        let render_pass = self.owner.render_pass(pass_key)?;
         let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(mask);
         let mut linking_info = vk::PipelineLibraryCreateInfoKHR::default().libraries(libraries);
         let mut feedback = vk::PipelineCreationFeedback::default();
@@ -297,7 +315,8 @@ impl Compiler {
         let mut info = vk::GraphicsPipelineCreateInfo::default()
             .layout(layout.handle)
             .stages(&stages)
-            .push_next(&mut rendering);
+            .render_pass(render_pass)
+            .subpass(0);
         if vi {
             info = info
                 .vertex_input_state(&vertex)

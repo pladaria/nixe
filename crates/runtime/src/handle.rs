@@ -395,68 +395,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_memory_owned_access_preserves_aliases_and_excludes_page_padding() {
-        use nixe_memory::{AccessOperation, AddressSpace, AddressWidth, Observation, PAGE_SIZE};
-        let machine = nixe_memory::Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(PAGE_SIZE);
-        space
-            .map(
-                base,
-                allocation.clone(),
-                0,
-                PAGE_SIZE,
-                MemoryPermissions::READ,
-            )
-            .unwrap();
-        let memory =
-            SharedMemoryObject::new(allocation, PAGE_SIZE as usize - 7, MemoryPermissions::READ)
-                .unwrap();
-        let captured = space.capture(base, 4, MemoryPermissions::READ).unwrap();
-        let observation = Observation::default();
-        machine
-            .access_captured(
-                &captured,
-                AccessOperation::ReadObserved(observation.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        memory
-            .write(0, &[1, 2, 3, 4])
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(observation.is_invalid());
-        assert_eq!(
-            space.read_value(base, 4).unwrap().into_ready().unwrap(),
-            0x04030201
-        );
-        assert!(memory.write(memory.size() - 1, &[9, 9]).is_err());
-        assert!(memory.read(memory.size(), 1).is_err());
-        assert!(memory.write(usize::MAX, &[9]).is_err());
-        assert_eq!(
-            &*memory
-                .read(memory.size() - 1, 1)
-                .unwrap()
-                .into_ready()
-                .unwrap(),
-            &[0]
-        );
-        space.unmap(base, PAGE_SIZE).unwrap();
-        drop(captured);
-        memory.write(0, &[5]).unwrap().into_ready().unwrap();
-        assert_eq!(&*memory.read(0, 1).unwrap().into_ready().unwrap(), &[5]);
-        drop(memory);
-        assert_eq!(machine.statistics().allocated_bytes, 0);
-    }
-
-    #[test]
     fn session_transports_one_in_flight_request_and_reply_per_owner() {
         let (server, client) = SessionObject::create_pair(&crate::process::tests::test_kernel());
         assert_eq!(

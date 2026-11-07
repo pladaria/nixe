@@ -29,7 +29,7 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
     let mappings = Arc::new(BTreeMap::from([(
         0x1000,
         Mapping {
-            physical: nixe_gpu::physical::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
+            physical: nixe_memory::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
             object,
             references: 1,
         },
@@ -377,7 +377,7 @@ fn opaque_nv12_plane_copy_preserves_crop_pitch_and_tiled_padding() {
     let mappings = Arc::new(BTreeMap::from([(
         0x1000,
         Mapping {
-            physical: nixe_gpu::physical::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
+            physical: nixe_memory::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
             object,
             references: 1,
         },

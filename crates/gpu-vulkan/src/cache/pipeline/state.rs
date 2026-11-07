@@ -60,6 +60,8 @@ impl Default for StencilState {
 pub struct GraphicsState {
     pub vertex_bindings: Arc<[VertexBinding]>,
     pub vertex_attributes: Arc<[VertexAttribute]>,
+    /// Native (binding, instance divisor) entries; absent entries use one.
+    pub vertex_divisors: Arc<[(u32, u32)]>,
     pub topology: vk::PrimitiveTopology,
     pub primitive_restart: bool,
     pub patch_points: u32,
@@ -93,6 +95,7 @@ impl GraphicsState {
         Self {
             vertex_bindings: Arc::from([]),
             vertex_attributes: Arc::from([]),
+            vertex_divisors: Arc::from([]),
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             primitive_restart: false,
             patch_points: 0,
@@ -137,6 +140,63 @@ impl GraphicsState {
             self.front = StencilState::default();
             self.back = StencilState::default();
         }
+        if dynamic.contains(&vk::DynamicState::PRIMITIVE_TOPOLOGY)
+            && dynamic.contains(&vk::DynamicState::PRIMITIVE_RESTART_ENABLE)
+        {
+            self.topology = topology_class(self.topology);
+        }
+        if dynamic.contains(&vk::DynamicState::PRIMITIVE_RESTART_ENABLE) {
+            self.primitive_restart = false;
+            self.raster_discard = false;
+            self.depth_bias = false;
+        }
+        if dynamic.contains(&vk::DynamicState::VERTEX_INPUT_EXT) {
+            self.vertex_bindings = Arc::from([]);
+            self.vertex_attributes = Arc::from([]);
+            self.vertex_divisors = Arc::from([]);
+        } else if dynamic.contains(&vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE) {
+            for binding in Arc::make_mut(&mut self.vertex_bindings) {
+                binding.stride = 0;
+            }
+        }
+        if dynamic.contains(&vk::DynamicState::COLOR_BLEND_ENABLE_EXT) {
+            self.colors = self
+                .colors
+                .iter()
+                .map(|&(format, _)| (format, BlendState::opaque()))
+                .collect();
+        }
         self
+    }
+}
+
+/// Eden collapses triangle assembly variants only when both EDS1 and EDS2
+/// are present. Line strips retain their own representative.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+pub(crate) fn topology_class(topology: vk::PrimitiveTopology) -> vk::PrimitiveTopology {
+    match topology {
+        vk::PrimitiveTopology::TRIANGLE_STRIP | vk::PrimitiveTopology::TRIANGLE_FAN => {
+            vk::PrimitiveTopology::TRIANGLE_LIST
+        }
+        vk::PrimitiveTopology::LINE_STRIP_WITH_ADJACENCY => {
+            vk::PrimitiveTopology::LINE_LIST_WITH_ADJACENCY
+        }
+        vk::PrimitiveTopology::TRIANGLE_STRIP_WITH_ADJACENCY => {
+            vk::PrimitiveTopology::TRIANGLE_LIST_WITH_ADJACENCY
+        }
+        _ => topology,
+    }
+}
+/// Matches Eden IsPrimitiveRestartSupported for the actual native topology.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+pub(crate) fn restart_supported(topology: vk::PrimitiveTopology, support: [bool; 2]) -> bool {
+    match topology {
+        vk::PrimitiveTopology::PATCH_LIST => support[1],
+        vk::PrimitiveTopology::POINT_LIST
+        | vk::PrimitiveTopology::LINE_LIST
+        | vk::PrimitiveTopology::TRIANGLE_LIST
+        | vk::PrimitiveTopology::LINE_LIST_WITH_ADJACENCY
+        | vk::PrimitiveTopology::TRIANGLE_LIST_WITH_ADJACENCY => support[0],
+        _ => true,
     }
 }

@@ -1,5 +1,5 @@
 use super::*;
-pub(super) fn solid_clear_value(
+pub fn solid_clear_value(
     packed: u32,
     color_format: u8,
     guest_format: super::super::threed::MaxwellThreeDGuestImageFormat,

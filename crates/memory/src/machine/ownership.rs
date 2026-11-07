@@ -280,7 +280,6 @@ impl AllocationRecord {
         let extents = self.physical_ranges(ranges);
         // No guest mapping or actual input names these pages. Invalidate their
         // watches before publishing them under another allocation identity.
-        self.machine.tracking().retire(&extents);
         let mut state = self.machine.0.state.lock().unwrap();
         for extent in &extents {
             let first = extent.start.get() / PAGE_SIZE;
@@ -315,81 +314,6 @@ impl AllocationRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn owned_access_never_touches_lease_counts_even_when_invalidating_aliases() {
-        use crate::{
-            AccessOperation, AddressSpace, AddressWidth, AllocationRange, GuestVirtualAddress,
-            MemoryPermissions, Observation,
-        };
-        let machine = Machine::new(6 * PAGE_SIZE).unwrap();
-        let account = machine.account(6 * PAGE_SIZE).unwrap();
-        let mut occupied: Vec<_> = (0..6)
-            .map(|_| Some(account.allocate(PAGE_SIZE).unwrap()))
-            .collect();
-        for i in [0, 2, 4] {
-            occupied[i] = None;
-        }
-        let allocation = account.allocate(3 * PAGE_SIZE).unwrap();
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(PAGE_SIZE);
-        space
-            .map(
-                base,
-                allocation.clone(),
-                0,
-                3 * PAGE_SIZE,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        let offset = PAGE_SIZE - 2;
-        let range = AllocationRange::new(allocation.pin(), offset, 6).unwrap();
-        assert_eq!(range.physical_extents().count(), 2);
-        for observed in [false, true] {
-            let observation = Observation::default();
-            if observed {
-                machine
-                    .access_captured(
-                        std::slice::from_ref(&range),
-                        AccessOperation::ReadObserved(observation.clone()),
-                    )
-                    .unwrap()
-                    .into_ready()
-                    .unwrap();
-            }
-            // Both transient pinning and unpinning acquire this mutex. Holding
-            // it proves their absence, not merely a zero net reference delta.
-            let references = allocation.ownership.record.references.lock().unwrap();
-            let completed = std::thread::scope(|scope| {
-                let (sender, receiver) = std::sync::mpsc::channel();
-                let owner = &allocation;
-                let worker = scope.spawn(move || {
-                    owner.write(offset, &[9; 6]).unwrap().into_ready().unwrap();
-                    assert_eq!(
-                        &*owner.read(offset, 6).unwrap().into_ready().unwrap(),
-                        &[9; 6]
-                    );
-                    sender.send(()).unwrap();
-                });
-                let completed = receiver.recv_timeout(std::time::Duration::from_secs(2));
-                drop(references); // Let a regressed worker exit before failing.
-                worker.join().unwrap();
-                completed
-            });
-            assert!(
-                completed.is_ok(),
-                "owned access acquired physical lease counts"
-            );
-            assert_eq!(observation.is_invalid(), observed);
-            assert_eq!(
-                space
-                    .read_value(base.checked_add(offset).unwrap(), 2)
-                    .unwrap()
-                    .into_ready()
-                    .unwrap(),
-                0x0909
-            );
-        }
-    }
 
     #[test]
     fn owned_access_respects_partial_ownership_and_rejects_out_of_bounds_before_writes() {
@@ -473,65 +397,6 @@ mod tests {
         assert_eq!(machine.statistics().allocated_bytes, 3 * PAGE_SIZE);
         drop(replacement);
         assert_eq!(machine.statistics().allocated_bytes, 0);
-    }
-
-    #[test]
-    fn blocked_stream_releases_reference_lock_and_retains_its_input_without_guest_charge() {
-        use std::time::{Duration, Instant};
-
-        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
-        let account = machine.account(2 * PAGE_SIZE).unwrap();
-        let allocation = account.allocate(PAGE_SIZE).unwrap();
-        allocation
-            .write(0, &[0x41; 32])
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let weak = allocation.pin().downgrade();
-        let record = Arc::clone(&allocation.ownership.record);
-        let extent = record.physical_extents(0, PAGE_SIZE).next().unwrap();
-        // This test is the sole physical-protection writer. Keeping the guest
-        // alive until the reader promotes prevents an overlapping retirement.
-        let closed = machine.physical_access().close(&[extent]);
-        closed.wait();
-        let worker = std::thread::spawn(move || {
-            let mut bytes = [0; 32];
-            weak.capture_stream(0, &mut bytes).unwrap();
-            bytes
-        });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let promoted = loop {
-            if let Ok(references) = record.references.try_lock()
-                && references.pages[0].pins == 1
-            {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::yield_now();
-        };
-        if !promoted {
-            // A regressed reader must still be allowed to exit before failing.
-            drop(closed);
-            worker.join().unwrap();
-            panic!("blocked stream held reference counts or failed to retain its input");
-        }
-        drop(allocation);
-        assert_eq!(account.used_bytes(), 0);
-        assert_eq!(machine.statistics().retained_bytes, PAGE_SIZE);
-        let replacement = account.allocate(PAGE_SIZE).unwrap();
-        let replacement_extent = replacement
-            .physical_extents(0, PAGE_SIZE)
-            .unwrap()
-            .next()
-            .unwrap();
-        assert_ne!(replacement_extent.start, extent.start);
-        drop(closed);
-        assert_eq!(worker.join().unwrap(), [0x41; 32]);
-        assert_eq!(machine.statistics().retained_bytes, 0);
-        assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
-        assert!(record.pin(0, PAGE_SIZE).is_err());
     }
 
     #[test]

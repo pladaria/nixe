@@ -7,19 +7,25 @@ mod aliases;
 mod captured;
 mod cpu_writes;
 mod device_access;
+pub mod device_memory;
+mod physical_mapping;
+mod range_set;
+pub use physical_mapping::{PhysicalMapping, PhysicalSpan};
+pub use range_set::{OverlapRangeSet, RangeSet};
 mod heap;
 mod host;
 mod intervals;
 mod machine;
-mod physical_access;
 mod raw;
+mod sparse_array;
+pub use sparse_array::SparseArray;
 pub mod trace;
 mod tracking;
 mod transition;
 mod virtual_arena;
 pub use address_space::{
-    AddressSpace, AllocationRange, CodeFetch, MappingObservation, MappingVersion, NativeCodePage,
-    PageEntry, Translation, capture_subrange,
+    AddressSpace, AllocationRange, CodeFetch, DeviceSharedMemory, MappingObservation,
+    MappingVersion, NativeCodePage, PageEntry, Translation, capture_subrange,
 };
 pub use captured::CapturedMemory;
 pub use device_access::{
@@ -32,12 +38,11 @@ pub use host::{HostAddress, PhysicalArena};
 pub use intervals::{IntervalIndex, IntervalKey};
 pub use machine::{
     Allocation, AllocationFuture, AllocationObservation, AllocationPin, Machine, MemoryAccount,
-    MemoryError, MemoryStatistics, RamSource, WeakAllocation,
+    MemoryError, MemoryStatistics, WeakAllocation,
 };
 
 pub use tracking::{
-    MappedRamReader, Observation, PhysicalCapture, ResourceRead, ResourceReader,
-    TrackingStatistics, WriteSource,
+    PhysicalCapture, ResourceRead, ResourceReader, ResourceWriter, TrackingStatistics, WriteSource,
 };
 pub use transition::{CodeInvalidation, CoreContext, NativeAdmission};
 pub use virtual_arena::{AddressWidth, MemoryPermissions, VirtualArena};

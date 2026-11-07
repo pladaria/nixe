@@ -141,9 +141,6 @@ struct UserConfig {
     size_t processor_id = 0;
     ExclusiveMonitor* global_monitor = nullptr;
 
-    /// Tagged process page table used after an ordinary fastmem protection fault.
-    uintptr_t canonical_page_table = 0;
-
     /// This selects other optimizations than can't otherwise be disabled by setting other
     /// configuration options. This includes:
     /// - IR optimizations
@@ -211,11 +208,12 @@ struct UserConfig {
     /// Determines the size of page_table. Valid values are between 12 and 64 inclusive.
     /// This is only used if page_table is not nullptr.
     size_t page_table_address_space_bits = 36;
-    /// Masks out the first N bits in host pointers from the page table.
-    /// The intention behind this is to allow users of Dynarmic to pack attributes in the
-    /// same integer and update the pointer attribute pair atomically.
-    /// If the configured value is 3, all pointers will be forcefully aligned to 8 bytes.
-    int page_table_pointer_mask_bits = 0;
+    /// Bit mask selecting the pointer from a tagged atomic page-table entry.
+    /// Zero leaves the pointer unchanged. The process owns all tag publication.
+    std::uint64_t page_table_pointer_mask = 0;
+    /// A set bit at this position routes access to the memory callback before
+    /// consuming the pointer. Used by rasterizer-cached and checked pages.
+    std::optional<std::uint8_t> page_table_marked_bit = std::nullopt;
     /// Determines what happens if the guest accesses an entry that is off the end of the
     /// page table. If true, Dynarmic will silently mirror page_table's address space. If
     /// false, accessing memory outside of page_table bounds will result in a call to the

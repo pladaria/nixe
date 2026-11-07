@@ -1,7 +1,7 @@
 //! Native transfers and exact canonical write footprints.
 use super::commands::plane_range;
 use super::*;
-impl VulkanResidency {
+impl Residency<'_> {
     pub(super) fn transfer_planes(
         &self,
         source: ImageId,
@@ -30,29 +30,28 @@ impl VulkanResidency {
         }
         Ok(selected)
     }
-    pub(super) fn image_planes_access(
+    pub(super) fn image_planes_transfer(
         &mut self,
         id: ImageId,
         planes: impl IntoIterator<Item = ImagePlane>,
-        scope: AccessScope,
-        conventional: vk::ImageLayout,
-    ) -> Result<(vk::Image, vk::ImageLayout), VulkanError> {
-        let mut ranges = smallvec::SmallVec::<[vk::ImageSubresourceRange; 2]>::new();
+    ) -> Result<(vk::Image, vk::ImageSubresourceRange), VulkanError> {
+        let mut range = vk::ImageSubresourceRange::default();
         for plane in planes {
-            if let Some(range) = ranges.iter_mut().find(|range| {
-                range.base_mip_level == plane.mip_level
-                    && range.base_array_layer == plane.array_layer
-            }) {
-                range.aspect_mask |= plane.aspect;
+            if range.level_count == 0 {
+                range = plane_range(plane);
             } else {
-                ranges.push(plane_range(plane));
+                let mip = range.base_mip_level.min(plane.mip_level);
+                let layer = range.base_array_layer.min(plane.array_layer);
+                range.level_count =
+                    (range.base_mip_level + range.level_count).max(plane.mip_level + 1) - mip;
+                range.layer_count =
+                    (range.base_array_layer + range.layer_count).max(plane.array_layer + 1) - layer;
+                range.base_mip_level = mip;
+                range.base_array_layer = layer;
+                range.aspect_mask |= plane.aspect;
             }
         }
-        let mut native = None;
-        for range in ranges {
-            native = Some(self.image_access_subresources(id, range, scope, conventional)?);
-        }
-        native.ok_or(VulkanError::InvalidResource("image access has no planes"))
+        self.transfer_image(id, range)
     }
     /// Exact byte-range fill. Native aligned words cover the interior; at most
     /// six staging bytes preserve boundary bytes without a read-modify-write
@@ -86,7 +85,7 @@ impl VulkanResidency {
                 .collect();
             self.write_buffer(id, offset + prefix + middle, &bytes)?;
         }
-        self.device.work_ticket()
+        Ok(self.runtime.device.current_work())
     }
     pub fn fill_buffer(
         &mut self,
@@ -101,23 +100,20 @@ impl VulkanResidency {
                 "native fill requires a four-byte aligned interval; byte masks require a conversion helper",
             ));
         }
-        let writer = self.prepare_write(Resource::Buffer(id), offset, size)?;
-        let buffer = self.buffer_access_range(
-            id,
-            offset,
-            size,
-            AccessScope::new(
-                vk::PipelineStageFlags2::CLEAR,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-        )?;
-        self.device.begin_recording()?;
-        self.barriers.emit(&mut self.device);
-        self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.cmd_fill_buffer(buffer, offset, size, value);
-        })?;
+        if self.buffer_cache.get(id).device_address.is_some() {
+            self.ensure_buffer_range(id, offset, size)?;
+        }
+        self.prepare_write(Resource::Buffer(id), offset, size)?;
+        let buffer = self.use_buffer(id, offset, size)?;
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        {
+            let device = &mut self.runtime.device;
+            unsafe {
+                device.dispatch.cmd_fill_buffer(buffer, offset, size, value);
+            }
+        };
         self.finish_buffer_write(id, offset, size)?;
-        self.device.work_ticket()
+        Ok(self.runtime.device.current_work())
     }
     pub(super) fn checked_image_rect(
         &self,
@@ -126,7 +122,8 @@ impl VulkanResidency {
         rect: vk::Rect2D,
     ) -> Result<ImagePlane, VulkanError> {
         let p = *self
-            .image(id)?
+            .texture_cache
+            .get(id)
             .planes
             .get(plane)
             .ok_or(VulkanError::InvalidResource("missing image plane"))?;
@@ -158,162 +155,6 @@ impl VulkanResidency {
         }
         Ok(p)
     }
-    pub(super) fn prepare_image_rect(
-        &mut self,
-        id: ImageId,
-        p: ImagePlane,
-        rect: vk::Rect2D,
-    ) -> Result<WriterId, VulkanError> {
-        if self.image(id)?.decoded.is_some() {
-            return Err(VulkanError::InvalidResource(
-                "decoded compressed textures are read-only; writes require the encoded canonical representation",
-            ));
-        }
-        // Exact transfers only author this rectangle. Conditional shader writes
-        // prepare initialized contents in program/attachment consumption instead.
-        self.invalidate_cpu_resources(&[])?;
-        self.prepare_image_write(id, p, rect)
-    }
-    pub(super) fn finish_image_rect(
-        &mut self,
-        id: ImageId,
-        p: ImagePlane,
-        rect: vk::Rect2D,
-    ) -> Result<(), VulkanError> {
-        let full = self.image(id)?.planes.len() == 1 && rect == full_rect(p);
-        if full {
-            if self
-                .image(id)?
-                .contents
-                .geometry
-                .iter()
-                .all(|f| f.mapping().is_injective())
-                && self
-                    .image(id)?
-                    .contents
-                    .device
-                    .iter()
-                    .any(ResourceObservation::is_invalid)
-            {
-                let geometry = self.image(id)?.contents.geometry.clone();
-                let observed = geometry
-                    .into_iter()
-                    .map(|f| self.authority.observe_native(Resource::Image(id), f))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.images[id.slot]
-                    .entry
-                    .as_mut()
-                    .expect("image")
-                    .contents
-                    .device = observed;
-            }
-            self.images[id.slot]
-                .entry
-                .as_mut()
-                .expect("image")
-                .synchronized = true;
-        }
-        // Bound cached replay plans after their commands have been published.
-        // Authority retains any released writer that still owns newest bytes.
-        if self.image(id)?.write_plans.len() > 64 {
-            let plans =
-                std::mem::take(&mut self.images[id.slot].entry.as_mut().unwrap().write_plans);
-            for (_, writer) in plans {
-                self.authority.release_writer(writer)?;
-            }
-        }
-        self.track_image_cpu(id)?;
-        self.define_image_rect(id, p, rect);
-        self.advance_image_producer(id)
-    }
-    /// The native content version changes for every accepted write, including
-    /// writes whose physical coverage is already current in a rendering scope.
-    pub(super) fn advance_image_producer(&mut self, id: ImageId) -> Result<(), VulkanError> {
-        let work = self.device.work_ticket()?;
-        let entry = self.images[id.slot].entry.as_mut().expect("image");
-        entry.producer = Some(work);
-        entry.version = entry
-            .version
-            .checked_add(1)
-            .ok_or(VulkanError::InvalidResource("image version exhausted"))?;
-        Ok(())
-    }
-    pub(super) fn define_image_rect(&mut self, id: ImageId, p: ImagePlane, rect: vk::Rect2D) {
-        let entry = self.images[id.slot].entry.as_mut().expect("image");
-        let plane = entry
-            .planes
-            .iter()
-            .position(|plane| *plane == p)
-            .expect("plane identity");
-        if entry.discarded.is_empty() {
-            return;
-        }
-        let mut remaining = Vec::new();
-        for (index, undefined) in entry.discarded.drain(..) {
-            if index != plane {
-                remaining.push((index, undefined));
-            } else {
-                remaining.extend(
-                    subtract_rect(undefined, rect)
-                        .into_iter()
-                        .map(|rect| (index, rect)),
-                );
-            }
-        }
-        entry.discarded = remaining;
-    }
-    pub(super) fn mark_image_discarded(&mut self, id: ImageId, p: ImagePlane, rect: vk::Rect2D) {
-        let entry = self.images[id.slot].entry.as_mut().expect("image");
-        let plane = entry
-            .planes
-            .iter()
-            .position(|plane| *plane == p)
-            .expect("plane");
-        let contains = |outer: vk::Rect2D, inner: vk::Rect2D| {
-            outer.offset.x <= inner.offset.x
-                && outer.offset.y <= inner.offset.y
-                && outer.offset.x as i64 + i64::from(outer.extent.width)
-                    >= inner.offset.x as i64 + i64::from(inner.extent.width)
-                && outer.offset.y as i64 + i64::from(outer.extent.height)
-                    >= inner.offset.y as i64 + i64::from(inner.extent.height)
-        };
-        if entry
-            .discarded
-            .iter()
-            .any(|&(p, old)| p == plane && contains(old, rect))
-        {
-            return;
-        }
-        entry
-            .discarded
-            .retain(|&(p, old)| p != plane || !contains(rect, old));
-        entry.discarded.push((plane, rect));
-    }
-    pub(super) fn require_image_initialized(
-        &self,
-        id: ImageId,
-        p: ImagePlane,
-        rect: vk::Rect2D,
-    ) -> Result<(), VulkanError> {
-        let entry = self.image(id)?;
-        if entry
-            .discarded
-            .iter()
-            .any(|&(plane, undefined)| entry.planes[plane] == p && intersects(undefined, rect))
-        {
-            log::debug!(
-                "undefined native image {:?} plane {:?} requested {:?}; discarded={:?}",
-                id,
-                p,
-                rect,
-                self.image(id)?.discarded
-            );
-            return Err(VulkanError::InvalidResource(
-                "image read consumes undefined or discarded texels; an actual producer is required",
-            ));
-        }
-        Ok(())
-    }
     pub fn clear_color_image(
         &mut self,
         id: ImageId,
@@ -321,7 +162,8 @@ impl VulkanResidency {
         value: vk::ClearColorValue,
     ) -> Result<WorkTicket, VulkanError> {
         let p = *self
-            .image(id)?
+            .texture_cache
+            .get(id)
             .planes
             .get(plane)
             .ok_or(VulkanError::InvalidResource("missing clear plane"))?;
@@ -336,31 +178,31 @@ impl VulkanResidency {
                 "native color clear requires an uncompressed color plane",
             ));
         }
-        if self.image(id)?.description.image_type == vk::ImageType::TYPE_3D
-            && self.image(id)?.description.extent.depth > 1
+        if self.texture_cache.get(id).description.image_type == vk::ImageType::TYPE_3D
+            && self.texture_cache.get(id).description.extent.depth > 1
         {
-            return self.clear_image_rect(id, plane, full_rect(p), vk::ClearValue { color: value });
+            let view = self.attachment_view(id, plane)?;
+            return self.clear_view_rect(
+                view,
+                plane,
+                full_rect(p),
+                vk::ClearValue { color: value },
+            );
         }
         let rect = full_rect(p);
-        let writer = self.prepare_image_rect(id, p, rect)?;
-        let (image, layout) = self.image_access_subresources(
-            id,
-            plane_range(p),
-            AccessScope::new(
-                vk::PipelineStageFlags2::CLEAR,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        )?;
-        self.barriers.emit(&mut self.device);
-        self.device.begin_recording()?;
-        self.publish_effect(&[writer], |device| unsafe {
-            device
-                .dispatch
-                .cmd_clear_color_image(image, layout, &value, &[plane_range(p)]);
-        })?;
-        self.finish_image_rect(id, p, rect)?;
-        self.device.work_ticket()
+        let invalidate = self.is_full_image_clear(id, p, rect, p.aspect);
+        self.prepare_image(id, true, invalidate)?;
+        let (image, layout) = self.transfer_image(id, plane_range(p))?;
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        {
+            let device = &mut self.runtime.device;
+            unsafe {
+                device
+                    .dispatch
+                    .clear_color_image(image, layout, &value, &[plane_range(p)]);
+            }
+        };
+        Ok(self.runtime.device.current_work())
     }
     pub fn clear_depth_stencil(
         &mut self,
@@ -370,7 +212,8 @@ impl VulkanResidency {
         stencil: u32,
     ) -> Result<WorkTicket, VulkanError> {
         let p = *self
-            .image(id)?
+            .texture_cache
+            .get(id)
             .planes
             .get(plane)
             .ok_or(VulkanError::InvalidResource("missing clear aspect"))?;
@@ -390,37 +233,31 @@ impl VulkanResidency {
             ));
         }
         let rect = full_rect(p);
-        let writer = self.prepare_image_rect(id, p, rect)?;
-        let (image, layout) = self.image_access_subresources(
-            id,
-            plane_range(p),
-            AccessScope::new(
-                vk::PipelineStageFlags2::CLEAR,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        )?;
-        self.barriers.emit(&mut self.device);
-        self.device.begin_recording()?;
-        self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.cmd_clear_depth_stencil_image(
-                image,
-                layout,
-                // Vulkan validates depth even when only stencil is selected.
-                // https://docs.vulkan.org/spec/latest/chapters/clears.html#VUID-VkClearDepthStencilValue-depth-00022
-                &vk::ClearDepthStencilValue {
-                    depth: if p.aspect == vk::ImageAspectFlags::DEPTH {
-                        depth
-                    } else {
-                        0.0
+        let invalidate = self.is_full_image_clear(id, p, rect, p.aspect);
+        self.prepare_image(id, true, invalidate)?;
+        let (image, layout) = self.transfer_image(id, plane_range(p))?;
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        {
+            let device = &mut self.runtime.device;
+            unsafe {
+                device.dispatch.clear_depth_stencil_image(
+                    image,
+                    layout,
+                    // Vulkan validates depth even when only stencil is selected.
+                    // https://docs.vulkan.org/spec/latest/chapters/clears.html#VUID-VkClearDepthStencilValue-depth-00022
+                    &vk::ClearDepthStencilValue {
+                        depth: if p.aspect == vk::ImageAspectFlags::DEPTH {
+                            depth
+                        } else {
+                            0.0
+                        },
+                        stencil,
                     },
-                    stencil,
-                },
-                &[plane_range(p)],
-            );
-        })?;
-        self.finish_image_rect(id, p, rect)?;
-        self.device.work_ticket()
+                    &[plane_range(p)],
+                );
+            }
+        };
+        Ok(self.runtime.device.current_work())
     }
     /// Resolve native samples directly into canonical single-sample storage.
     /// https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdResolveImage.html
@@ -433,15 +270,15 @@ impl VulkanResidency {
         destination_plane: usize,
         destination_offset: vk::Offset2D,
     ) -> Result<WorkTicket, VulkanError> {
-        self.ensure_image(source)?;
+        self.prepare_image(source, false, false)?;
         let src = self.checked_image_rect(source, source_plane, source_rect)?;
         let rect = vk::Rect2D {
             offset: destination_offset,
             extent: source_rect.extent,
         };
         let dst = self.checked_image_rect(destination, destination_plane, rect)?;
-        let s = self.image(source)?.description;
-        let d = self.image(destination)?.description;
+        let s = self.texture_cache.get(source).description;
+        let d = self.texture_cache.get(destination).description;
         if s.samples == vk::SampleCountFlags::TYPE_1
             || d.samples != vk::SampleCountFlags::TYPE_1
             || s.format != d.format
@@ -452,26 +289,10 @@ impl VulkanResidency {
                 "color resolve requires matching formats and a multisample source",
             ));
         }
-        self.ensure_image_initialized(source, src, source_rect)?;
-        let writer = self.prepare_image_rect(destination, dst, rect)?;
-        let (source, source_layout) = self.image_access_subresources(
-            source,
-            plane_range(src),
-            AccessScope::new(
-                vk::PipelineStageFlags2::RESOLVE,
-                vk::AccessFlags2::TRANSFER_READ,
-            ),
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        )?;
-        let (destination_handle, destination_layout) = self.image_access_subresources(
-            destination,
-            plane_range(dst),
-            AccessScope::new(
-                vk::PipelineStageFlags2::RESOLVE,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        )?;
+        self.prepare_image(destination, true, false)?;
+        let (source, source_layout) = self.transfer_image(source, plane_range(src))?;
+        let (destination_handle, destination_layout) =
+            self.transfer_image(destination, plane_range(dst))?;
         let region = vk::ImageResolve::default()
             .src_subresource(src.layers())
             .dst_subresource(dst.layers())
@@ -490,19 +311,20 @@ impl VulkanResidency {
                 height: rect.extent.height,
                 depth: 1,
             });
-        self.barriers.emit(&mut self.device);
-        self.device.begin_recording()?;
-        self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.cmd_resolve_image(
-                source,
-                source_layout,
-                destination_handle,
-                destination_layout,
-                &[region],
-            );
-        })?;
-        self.finish_image_rect(destination, dst, rect)?;
-        self.device.work_ticket()
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        {
+            let device = &mut self.runtime.device;
+            unsafe {
+                device.dispatch.resolve_image(
+                    source,
+                    source_layout,
+                    destination_handle,
+                    destination_layout,
+                    &[region],
+                );
+            }
+        };
+        Ok(self.runtime.device.current_work())
     }
     /// Copy all selected aspects in one native command. Overlapping self-copies
     /// capture every source plane before publishing any destination plane.
@@ -515,16 +337,15 @@ impl VulkanResidency {
         source_rect: vk::Rect2D,
         destination_offset: vk::Offset2D,
     ) -> Result<WorkTicket, VulkanError> {
-        self.ensure_image(source)?;
+        self.prepare_image(source, false, false)?;
         let rect = vk::Rect2D {
             offset: destination_offset,
             extent: source_rect.extent,
         };
         let selected = self.transfer_planes(source, destination, planes, source_rect, rect)?;
-        let source_description = self.image(source)?.description;
-        let destination_description = self.image(destination)?.description;
+        let source_description = self.texture_cache.get(source).description;
+        let destination_description = self.texture_cache.get(destination).description;
         for &(src, dst) in &selected {
-            self.ensure_image_initialized(source, src, source_rect)?;
             if source_description.samples != destination_description.samples
                 || !format::copy_compatible(
                     source_description.format,
@@ -548,18 +369,8 @@ impl VulkanResidency {
                 "overlapping multisample image copy requires a sample-preserving snapshot",
             ));
         }
-        let mut writers = smallvec::SmallVec::<[WriterId; 2]>::new();
-        for &(_, dst) in &selected {
-            writers.push(self.prepare_image_rect(destination, dst, rect)?);
-        }
-        let read_scope = AccessScope::new(
-            vk::PipelineStageFlags2::COPY,
-            vk::AccessFlags2::TRANSFER_READ,
-        );
-        let write_scope = AccessScope::new(
-            vk::PipelineStageFlags2::COPY,
-            vk::AccessFlags2::TRANSFER_WRITE,
-        );
+        self.prepare_image(destination, true, false)?;
+
         let extent = vk::Extent3D {
             width: rect.extent.width,
             height: rect.extent.height,
@@ -605,54 +416,43 @@ impl VulkanResidency {
                 );
             }
             let scratch = Arc::new(self.temporary_buffer(size, &[Resource::Image(source)])?);
-            let (handle, read_layout) = self.image_planes_access(
-                source,
-                selected.iter().map(|(src, _)| *src),
-                read_scope,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            )?;
-            self.barriers.emit(&mut self.device);
-            let work = self.device.work_ticket()?;
-            self.device.retire_buffer(Arc::clone(&scratch), work)?;
+            let (handle, read_layout) =
+                self.image_planes_transfer(source, selected.iter().map(|(src, _)| *src))?;
+            self.runtime.barriers.emit(&mut self.runtime.device)?;
+            let work = self.runtime.device.current_work();
+            self.runtime
+                .device
+                .retire_buffer(Arc::clone(&scratch), work)?;
             unsafe {
-                self.device.dispatch.cmd_copy_image_to_buffer(
+                self.runtime.device.dispatch.copy_image_to_buffer(
                     handle,
                     read_layout,
                     scratch.handle,
                     &reads,
                 );
             }
-            super::recording::scratch_read_barrier(&mut self.device, scratch.handle, size);
-            let (_, write_layout) = self.image_planes_access(
-                destination,
-                selected.iter().map(|(_, dst)| *dst),
-                write_scope,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            )?;
-            self.barriers.emit(&mut self.device);
-            self.publish_effect(&writers, |device| unsafe {
-                device.dispatch.cmd_copy_buffer_to_image(
-                    scratch.handle,
-                    handle,
-                    write_layout,
-                    &writes,
-                );
-            })?;
-            let work = self.device.work_ticket()?;
-            self.device.retire_buffer(scratch, work)?;
+
+            let (_, write_layout) =
+                self.image_planes_transfer(destination, selected.iter().map(|(_, dst)| *dst))?;
+            self.runtime.barriers.emit(&mut self.runtime.device)?;
+            {
+                let device = &mut self.runtime.device;
+                unsafe {
+                    device.dispatch.copy_buffer_to_image(
+                        scratch.handle,
+                        handle,
+                        write_layout,
+                        &writes,
+                    );
+                }
+            };
+            let work = self.runtime.device.current_work();
+            self.runtime.device.retire_buffer(scratch, work)?;
         } else {
-            let (source_handle, source_layout) = self.image_planes_access(
-                source,
-                selected.iter().map(|(src, _)| *src),
-                read_scope,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            )?;
-            let (destination_handle, destination_layout) = self.image_planes_access(
-                destination,
-                selected.iter().map(|(_, dst)| *dst),
-                write_scope,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            )?;
+            let (source_handle, source_layout) =
+                self.image_planes_transfer(source, selected.iter().map(|(src, _)| *src))?;
+            let (destination_handle, destination_layout) =
+                self.image_planes_transfer(destination, selected.iter().map(|(_, dst)| *dst))?;
             let regions: smallvec::SmallVec<[_; 2]> = selected
                 .iter()
                 .map(|&(src, dst)| {
@@ -672,21 +472,21 @@ impl VulkanResidency {
                         .extent(extent)
                 })
                 .collect();
-            self.barriers.emit(&mut self.device);
-            self.publish_effect(&writers, |device| unsafe {
-                device.dispatch.cmd_copy_image(
-                    source_handle,
-                    source_layout,
-                    destination_handle,
-                    destination_layout,
-                    &regions,
-                );
-            })?;
+            self.runtime.barriers.emit(&mut self.runtime.device)?;
+            {
+                let device = &mut self.runtime.device;
+                unsafe {
+                    device.dispatch.copy_image(
+                        source_handle,
+                        source_layout,
+                        destination_handle,
+                        destination_layout,
+                        &regions,
+                    );
+                }
+            };
         }
-        for &(_, dst) in &selected {
-            self.finish_image_rect(destination, dst, rect)?;
-        }
-        self.device.work_ticket()
+        Ok(self.runtime.device.current_work())
     }
 }
 pub(super) fn same_subresource(a: ImagePlane, b: ImagePlane) -> bool {
@@ -703,50 +503,4 @@ pub(super) fn full_rect(p: ImagePlane) -> vk::Rect2D {
             height: p.extent.height,
         },
     }
-}
-pub(super) fn intersects(a: vk::Rect2D, b: vk::Rect2D) -> bool {
-    a.offset.x < b.offset.x + b.extent.width as i32
-        && b.offset.x < a.offset.x + a.extent.width as i32
-        && a.offset.y < b.offset.y + b.extent.height as i32
-        && b.offset.y < a.offset.y + a.extent.height as i32
-}
-pub(super) fn subtract_rect(a: vk::Rect2D, b: vk::Rect2D) -> Vec<vk::Rect2D> {
-    if !intersects(a, b) {
-        return vec![a];
-    }
-    let left = a.offset.x.max(b.offset.x);
-    let right = (a.offset.x + a.extent.width as i32).min(b.offset.x + b.extent.width as i32);
-    let top = a.offset.y.max(b.offset.y);
-    let bottom = (a.offset.y + a.extent.height as i32).min(b.offset.y + b.extent.height as i32);
-    [
-        (
-            a.offset.x,
-            a.offset.y,
-            a.extent.width as i32,
-            top - a.offset.y,
-        ),
-        (
-            a.offset.x,
-            bottom,
-            a.extent.width as i32,
-            a.offset.y + a.extent.height as i32 - bottom,
-        ),
-        (a.offset.x, top, left - a.offset.x, bottom - top),
-        (
-            right,
-            top,
-            a.offset.x + a.extent.width as i32 - right,
-            bottom - top,
-        ),
-    ]
-    .into_iter()
-    .filter(|&(_, _, width, height)| width > 0 && height > 0)
-    .map(|(x, y, width, height)| vk::Rect2D {
-        offset: vk::Offset2D { x, y },
-        extent: vk::Extent2D {
-            width: width as u32,
-            height: height as u32,
-        },
-    })
-    .collect()
 }

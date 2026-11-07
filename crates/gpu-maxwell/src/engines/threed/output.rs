@@ -327,15 +327,6 @@ impl MaxwellThreeDStencilOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum MaxwellThreeDBlendOp {
-    Add,
-    Subtract,
-    ReverseSubtract,
-    Min,
-    Max,
-}
-
 /// Bitwise operation applied between fragment and color-target values.
 ///
 /// All sixteen encodings are published in NVIDIA's pinned `MAXWELL_B` header:
@@ -382,34 +373,6 @@ impl MaxwellThreeDLogicOp {
             0x150f => Self::Set,
             _ => return None,
         })
-    }
-
-    #[must_use]
-    pub const fn raw(self) -> u32 {
-        self as u32
-    }
-}
-
-/// Whether `SET_BLEND(0)` supplies the blend enable for every color target.
-/// Disabled selects each physical target's own `SET_BLEND(i)` instead. This
-/// selector is independent of common versus per-target blend equations.
-///
-/// NVIDIA's `SET_SINGLE_ROP_CONTROL` (0x135c):
-/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h>
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[repr(u32)]
-pub enum MaxwellThreeDSingleRopControl {
-    Disabled = 0,
-    Enabled = 1,
-}
-
-impl MaxwellThreeDSingleRopControl {
-    pub(super) const fn parse(raw: u32) -> Option<Self> {
-        match raw {
-            0 => Some(Self::Disabled),
-            1 => Some(Self::Enabled),
-            _ => None,
-        }
     }
 
     #[must_use]
@@ -606,35 +569,6 @@ impl MaxwellThreeDBlendControlState<'_> {
     }
 }
 
-impl MaxwellThreeDBlendOp {
-    pub(super) const fn parse(raw: u32) -> Option<Self> {
-        match raw {
-            0x8006 | 1 => Some(Self::Add),
-            0x800a | 2 => Some(Self::Subtract),
-            0x800b | 3 => Some(Self::ReverseSubtract),
-            0x8007 | 4 => Some(Self::Min),
-            0x8008 | 5 => Some(Self::Max),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[repr(transparent)]
-pub struct MaxwellThreeDBlendFactor(u32);
-impl MaxwellThreeDBlendFactor {
-    pub(in crate::engines) fn parse(raw: u32) -> Option<Self> {
-        const OGL: &[u32] = &[
-            0x4000, 0x4001, 0x4300, 0x4301, 0x4302, 0x4303, 0x4304, 0x4305, 0x4306, 0x4307, 0x4308,
-            0xc001, 0xc002, 0xc003, 0xc004, 0xc900, 0xc901, 0xc902, 0xc903,
-        ];
-        ((1..=0x13).contains(&raw) || OGL.contains(&raw)).then_some(Self(raw))
-    }
-    #[must_use]
-    pub const fn raw(self) -> u32 {
-        self.0
-    }
-}
 impl MaxwellThreeDSampleMode {
     pub(super) const fn parse(raw: u32) -> Option<Self> {
         match raw {
@@ -651,47 +585,6 @@ impl MaxwellThreeDSampleMode {
             11 => Some(Self::Coverage4x2x24),
             _ => None,
         }
-    }
-}
-
-/// Per-component color-write mask for one render target.
-///
-/// NVIDIA's public `MAXWELL_B` header exposes eight masks and a separate
-/// `SET_SINGLE_CT_WRITE_CONTROL` selector. Keeping both pieces of state lets
-/// draw validation select the effective mask without discarding guest intent.
-/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1266-L1269>
-/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3580-L3592>
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct MaxwellThreeDColorMask {
-    pub red: bool,
-    pub green: bool,
-    pub blue: bool,
-    pub alpha: bool,
-}
-impl MaxwellThreeDColorMask {
-    pub(super) const fn parse(raw: u32) -> Option<Self> {
-        if raw & !0x1111 != 0 {
-            return None;
-        }
-        Some(Self {
-            red: raw & 1 != 0,
-            green: raw & 0x10 != 0,
-            blue: raw & 0x100 != 0,
-            alpha: raw & 0x1000 != 0,
-        })
-    }
-
-    #[must_use]
-    pub const fn raw(self) -> u32 {
-        self.red as u32
-            | ((self.green as u32) << 4)
-            | ((self.blue as u32) << 8)
-            | ((self.alpha as u32) << 12)
-    }
-
-    #[must_use]
-    pub const fn all_enabled(self) -> bool {
-        self.red && self.green && self.blue && self.alpha
     }
 }
 
@@ -754,7 +647,6 @@ pub enum MaxwellThreeDFixedFunctionRegister {
     DepthCompare,
     StencilTestEnable,
     TwoSidedStencilTestEnable,
-    BlendPerTargetEnable,
     AntiAliasEnable,
     AlphaToCoverageEnable,
     SampleMode,
@@ -789,13 +681,6 @@ pub enum MaxwellThreeDFixedFunctionRegister {
     BackStencilReference,
     BackStencilCompareMask,
     BackStencilWriteMask,
-    BlendSeparateAlpha,
-    BlendColorOp,
-    BlendColorSource,
-    BlendColorDestination,
-    BlendAlphaOp,
-    BlendAlphaSource,
-    BlendAlphaDestination,
     BlendConstantRed,
     BlendConstantGreen,
     BlendConstantBlue,
@@ -810,7 +695,6 @@ pub enum MaxwellThreeDFixedFunctionRegister {
     DepthBoundsMax,
     LogicOpEnable,
     LogicOpFunction,
-    SingleColorTargetWriteControl,
     AlphaTestEnable,
     AlphaTestReference,
     AlphaTestFunction,
@@ -829,8 +713,6 @@ pub enum MaxwellThreeDFixedFunctionValue {
     CullFace(MaxwellThreeDCullFace),
     Compare(MaxwellThreeDCompareOp),
     StencilOp(MaxwellThreeDStencilOp),
-    BlendOp(MaxwellThreeDBlendOp),
-    BlendFactor(MaxwellThreeDBlendFactor),
     LogicOp(MaxwellThreeDLogicOp),
     ProvokingVertex(MaxwellThreeDProvokingVertex),
     PixelShaderSaturate(MaxwellThreeDPixelShaderSaturate),
@@ -1149,9 +1031,6 @@ impl<'a> MaxwellThreeDFixedFunctionState<'a> {
             R::BackStencilCompareMask => self
                 .registers
                 .read(0x0f5c, |raw| (raw & !0xff == 0).then_some(V::Mask(raw))),
-            R::SingleColorTargetWriteControl => self
-                .registers
-                .read(0x0f90, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
             R::DepthBoundsMin => self.registers.read(0x0f9c, |raw| {
                 Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
             }),
@@ -1195,9 +1074,6 @@ impl<'a> MaxwellThreeDFixedFunctionState<'a> {
             R::ShadeMode => self.registers.read(0x12d4, |raw| {
                 MaxwellThreeDShadeMode::parse(raw).map(V::ShadeMode)
             }),
-            R::BlendPerTargetEnable => self
-                .registers
-                .read(0x12e4, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
             R::DepthWriteEnable => self
                 .registers
                 .read(0x12e8, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
@@ -1224,27 +1100,6 @@ impl<'a> MaxwellThreeDFixedFunctionState<'a> {
             }),
             R::BlendConstantAlpha => self.registers.read(0x1328, |raw| {
                 Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
-            }),
-            R::BlendSeparateAlpha => self
-                .registers
-                .read(0x133c, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
-            R::BlendColorOp => self.registers.read(0x1340, |raw| {
-                MaxwellThreeDBlendOp::parse(raw).map(V::BlendOp)
-            }),
-            R::BlendColorSource => self.registers.read(0x1344, |raw| {
-                MaxwellThreeDBlendFactor::parse(raw).map(V::BlendFactor)
-            }),
-            R::BlendColorDestination => self.registers.read(0x1348, |raw| {
-                MaxwellThreeDBlendFactor::parse(raw).map(V::BlendFactor)
-            }),
-            R::BlendAlphaOp => self.registers.read(0x134c, |raw| {
-                MaxwellThreeDBlendOp::parse(raw).map(V::BlendOp)
-            }),
-            R::BlendAlphaSource => self.registers.read(0x1350, |raw| {
-                MaxwellThreeDBlendFactor::parse(raw).map(V::BlendFactor)
-            }),
-            R::BlendAlphaDestination => self.registers.read(0x1358, |raw| {
-                MaxwellThreeDBlendFactor::parse(raw).map(V::BlendFactor)
             }),
             R::StencilTestEnable => self
                 .registers
@@ -1364,40 +1219,6 @@ impl<'a> MaxwellThreeDFixedFunctionState<'a> {
                 })
             }),
         }
-    }
-    #[must_use]
-    pub fn blend_enable(&self, target: usize) -> MaxwellThreeDRegister<bool> {
-        self.registers.read(0x1360 + target as u32 * 4, |raw| {
-            (raw <= 1).then_some(raw != 0)
-        })
-    }
-    #[must_use]
-    pub fn color_mask(&self, target: usize) -> MaxwellThreeDRegister<MaxwellThreeDColorMask> {
-        self.registers.read(0x1a00 + target as u32 * 4, |raw| {
-            MaxwellThreeDColorMask::parse(raw)
-        })
-    }
-    #[must_use]
-    pub fn single_rop_control(&self) -> MaxwellThreeDRegister<MaxwellThreeDSingleRopControl> {
-        self.registers
-            .read(0x135c, MaxwellThreeDSingleRopControl::parse)
-    }
-    #[must_use]
-    pub fn per_target_blend(
-        &self,
-        target: usize,
-        field: usize,
-    ) -> MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue> {
-        use MaxwellThreeDFixedFunctionValue as V;
-        self.registers.read(
-            0x1e00 + target as u32 * 0x20 + field as u32 * 4,
-            |raw| match field {
-                0 => (raw <= 1).then_some(V::Boolean(raw != 0)),
-                1 | 4 => MaxwellThreeDBlendOp::parse(raw).map(V::BlendOp),
-                2 | 3 | 5 | 6 => MaxwellThreeDBlendFactor::parse(raw).map(V::BlendFactor),
-                _ => None,
-            },
-        )
     }
     #[must_use]
     pub fn blend_controls(&self) -> MaxwellThreeDBlendControlState<'a> {

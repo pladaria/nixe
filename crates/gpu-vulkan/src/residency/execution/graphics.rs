@@ -1,18 +1,27 @@
 use super::*;
 mod clear;
-#[derive(Clone, Copy, Debug)]
+pub(crate) use clear::{DeferredClear, RenderPassState};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VertexBuffer {
     pub binding: u32,
     pub buffer: BufferId,
     pub offset: u64,
     pub size: u64,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexBuffer {
     pub buffer: BufferId,
     pub offset: u64,
     pub size: u64,
     pub kind: vk::IndexType,
+}
+/// A native runtime-generated index window. LUT storage belongs to the buffer
+/// runtime; scratch reservations belong to the scheduler's current tick.
+pub(crate) struct NativeIndexBuffer {
+    pub(crate) buffer: vk::Buffer,
+    pub(crate) offset: u64,
+    pub(crate) size: u64,
+    pub(crate) kind: vk::IndexType,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum Draw {
@@ -37,9 +46,24 @@ pub enum Draw {
         indexed: bool,
     },
 }
+impl Draw {
+    pub(crate) fn is_empty(self) -> bool {
+        match self {
+            Self::Direct {
+                vertices,
+                instances,
+                ..
+            } => vertices == 0 || instances == 0,
+            Self::Indexed {
+                indices, instances, ..
+            } => indices == 0 || instances == 0,
+            Self::Indirect { count, .. } => count == 0,
+        }
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentSource {
-    Canonical { image: ImageId, plane: usize },
+    Canonical { view: ImageViewId, plane: usize },
     ResidentOnly(super::super::attachment::AttachmentId),
 }
 #[derive(Clone, Copy)]
@@ -51,7 +75,7 @@ pub struct RenderAttachment {
 }
 impl RenderAttachment {
     pub fn color(
-        image: ImageId,
+        view: ImageViewId,
         plane: usize,
         load: AttachmentLoad,
         store: AttachmentStore,
@@ -62,7 +86,7 @@ impl RenderAttachment {
             AttachmentLoad::Discard => (vk::AttachmentLoadOp::DONT_CARE, [0.; 4]),
         };
         Self {
-            source: AttachmentSource::Canonical { image, plane },
+            source: AttachmentSource::Canonical { view, plane },
             load,
             store: match store {
                 AttachmentStore::Store => vk::AttachmentStoreOp::STORE,
@@ -80,15 +104,13 @@ pub struct RenderingTargets {
     pub depth: Option<RenderAttachment>,
     pub stencil: Option<RenderAttachment>,
 }
-#[derive(Clone)]
 struct Attachment {
     description: RenderAttachment,
     plane: ImagePlane,
-    physical: Option<Arc<Footprint>>,
     view: Arc<crate::AllocatedImageView>,
-    layout: vk::ImageLayout,
     format: vk::Format,
     samples: vk::SampleCountFlags,
+    size: vk::Extent3D,
 }
 pub struct PreparedTargets {
     binding_revision: AtomicU64,
@@ -96,49 +118,150 @@ pub struct PreparedTargets {
     colors: Box<[Option<Attachment>]>,
     depth: Option<Attachment>,
     stencil: Option<Attachment>,
-    native_colors: Box<[vk::RenderingAttachmentInfo<'static>]>,
-    native_depth: Option<vk::RenderingAttachmentInfo<'static>>,
-    native_stencil: Option<vk::RenderingAttachmentInfo<'static>>,
-}
-impl Clone for PreparedTargets {
-    fn clone(&self) -> Self {
-        Self {
-            binding_revision: self.binding_revision.load(Ordering::Relaxed).into(),
-            area: self.area,
-            colors: self.colors.clone(),
-            depth: self.depth.clone(),
-            stencil: self.stencil.clone(),
-            native_colors: self.native_colors.clone(),
-            native_depth: self.native_depth,
-            native_stencil: self.native_stencil,
-        }
-    }
+    framebuffer: Arc<crate::render_pass::Framebuffer>,
+    pass: crate::render_pass::Key,
+    clear_values: Box<[vk::ClearValue]>,
+    maps: smallvec::SmallVec<[(u64, u64); 9]>,
+    images: smallvec::SmallVec<[(vk::Image, vk::ImageSubresourceRange); 9]>,
+    attachment_operations: bool,
 }
 impl PreparedTargets {
-    fn compatible(&self, other: &Self) -> bool {
-        let same = |a: &Option<Attachment>, b: &Option<Attachment>| match (a, b) {
-            (None, None) => true,
-            (Some(a), Some(b)) => {
-                a.description.source == b.description.source
-                    && a.view.handle == b.view.handle
-                    && a.plane == b.plane
-                    && a.layout == b.layout
-                    && a.samples == b.samples
-                    && a.format == b.format
-            }
-            _ => false,
+    fn new(
+        owner: Arc<crate::device::DeviceOwner>,
+        binding_revision: u64,
+        area: vk::Rect2D,
+        colors: Box<[Option<Attachment>]>,
+        depth: Option<Attachment>,
+        stencil: Option<Attachment>,
+        maps: smallvec::SmallVec<[(u64, u64); 9]>,
+    ) -> Result<Self, VulkanError> {
+        let mut pass = crate::render_pass::Key::default();
+        let mut views = Vec::new();
+        let mut retained = Vec::new();
+        let mut clear_values = Vec::new();
+        let mut extent = vk::Extent2D {
+            width: u32::MAX,
+            height: u32::MAX,
         };
-        self.area == other.area
-            && self.colors.len() == other.colors.len()
-            && self
-                .colors
+        let mut capture = |a: &Attachment| {
+            extent.width = extent.width.min(a.size.width);
+            extent.height = extent.height.min(a.size.height);
+            views.push(a.view.handle);
+            retained.push(Arc::clone(&a.view));
+            clear_values.push(a.description.clear);
+        };
+        for (i, a) in colors.iter().enumerate() {
+            let Some(a) = a else {
+                continue;
+            };
+            pass.colors[i] = a.format;
+            pass.samples = a.samples;
+            if a.description.load == vk::AttachmentLoadOp::CLEAR {
+                pass.color_clear |= 1 << i;
+            }
+            if a.description.load == vk::AttachmentLoadOp::DONT_CARE {
+                pass.color_dont_care |= 1 << i;
+            }
+            if a.description.store == vk::AttachmentStoreOp::DONT_CARE {
+                pass.color_discard |= 1 << i;
+            }
+            capture(a);
+        }
+        if let Some(a) = depth.as_ref().or(stencil.as_ref()) {
+            pass.depth = a.format;
+            pass.samples = a.samples;
+            capture(a);
+            let clear = clear_values.last_mut().unwrap();
+            if let Some(d) = &depth {
+                pass.depth_load = d.description.load;
+                pass.depth_store = d.description.store;
+                clear.depth_stencil.depth = unsafe { d.description.clear.depth_stencil.depth };
+            }
+            if let Some(st) = &stencil {
+                pass.stencil_load = st.description.load;
+                pass.stencil_store = st.description.store;
+                clear.depth_stencil.stencil = unsafe { st.description.clear.depth_stencil.stencil };
+            }
+        }
+        // Eden's framebuffer dimensions follow the requested render area,
+        // clamped to the logical attachment views rather than backing images.
+        extent.width = extent
+            .width
+            .min((area.offset.x as u32 + area.extent.width).max(1));
+        extent.height = extent
+            .height
+            .min((area.offset.y as u32 + area.extent.height).max(1));
+        // Eden Framebuffer captures native images/ranges at construction.
+        // EndRenderPass consumes this span without rebuilding target metadata.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L3045-L3155
+        let mut images = smallvec::SmallVec::new();
+        let mut attachment_operations = false;
+        for a in colors
+            .iter()
+            .flatten()
+            .chain(depth.iter())
+            .chain(stencil.iter())
+        {
+            if a.samples != pass.samples || !Arc::ptr_eq(&a.view.image.owner, &owner) {
+                return Err(VulkanError::InvalidResource(
+                    "framebuffer attachments use incompatible sample counts or devices",
+                ));
+            }
+            attachment_operations |= a.description.load != vk::AttachmentLoadOp::LOAD
+                || a.description.store != vk::AttachmentStoreOp::STORE;
+            let image = a.view.image.handle;
+            let range =
+                commands::plane_range(a.plane).aspect_mask(sync::native_image_aspects(a.format));
+            if !images
                 .iter()
-                .zip(other.colors.iter())
-                .all(|(a, b)| same(a, b))
-            && self.native_depth.map(|a| a.store_op) == other.native_depth.map(|a| a.store_op)
-            && self.native_stencil.map(|a| a.store_op) == other.native_stencil.map(|a| a.store_op)
-            && same(&self.depth, &other.depth)
-            && same(&self.stencil, &other.stencil)
+                .any(|(old, r): &(vk::Image, vk::ImageSubresourceRange)| {
+                    *old == image
+                        && r.aspect_mask == range.aspect_mask
+                        && r.base_mip_level == range.base_mip_level
+                        && r.level_count == range.level_count
+                        && r.base_array_layer == range.base_array_layer
+                        && r.layer_count == range.layer_count
+                })
+            {
+                images.push((image, range));
+            }
+        }
+        let framebuffer =
+            unsafe { crate::render_pass::Framebuffer::new(owner, pass, &views, extent, retained)? };
+        Ok(Self {
+            binding_revision: binding_revision.into(),
+            area,
+            colors,
+            depth,
+            stencil,
+            framebuffer,
+            pass,
+            clear_values: clear_values.into_boxed_slice(),
+            maps,
+            images,
+            attachment_operations,
+        })
+    }
+    pub(crate) fn render_area(&self) -> vk::Rect2D {
+        self.area
+    }
+    pub(crate) fn has_color(&self, slot: usize) -> bool {
+        self.colors.get(slot).is_some_and(Option::is_some)
+    }
+    pub(crate) fn depth_stencil_aspects(&self) -> vk::ImageAspectFlags {
+        let mut aspects = vk::ImageAspectFlags::empty();
+        if self.depth.is_some() {
+            aspects |= vk::ImageAspectFlags::DEPTH;
+        }
+        if self.stencil.is_some() {
+            aspects |= vk::ImageAspectFlags::STENCIL;
+        }
+        aspects
+    }
+    fn same_framebuffer(&self, other: &Self) -> bool {
+        self.framebuffer.handle == other.framebuffer.handle
+            && self.framebuffer.render_pass == other.framebuffer.render_pass
+            && self.area == other.area
     }
     fn attachments(&self) -> impl Iterator<Item = &Attachment> {
         self.colors
@@ -148,93 +271,60 @@ impl PreparedTargets {
             .chain(self.stencil.iter())
     }
 }
-fn read_only_attachment(a: &Attachment, state: &GraphicsState) -> bool {
-    let preserve = a.description.load == vk::AttachmentLoadOp::LOAD
-        && a.description.store == vk::AttachmentStoreOp::STORE;
-    preserve
-        && if a.plane.aspect == vk::ImageAspectFlags::DEPTH {
-            !state.depth_write
-        } else if a.plane.aspect == vk::ImageAspectFlags::STENCIL {
-            !state.stencil_test
-                || [state.front, state.back].iter().all(|s| {
-                    [s.fail, s.pass, s.depth_fail]
-                        .iter()
-                        .all(|op| *op == vk::StencilOp::KEEP)
-                })
-        } else {
-            false
-        }
-}
-
-pub struct PreparedDraw {
-    binding_revision: AtomicU64,
-    native_vertices: Arc<[(u32, vk::Buffer, u64)]>,
-    native_index: Option<(vk::Buffer, u64, vk::IndexType)>,
-    batchable: bool,
-    graphics: PreparedGraphics,
-    targets: Arc<PreparedTargets>,
-    vertices: Box<[VertexBuffer]>,
-    index: Option<IndexBuffer>,
-    inline_index: Option<Arc<[u8]>>,
-    feedback_aspects: vk::ImageAspectFlags,
-    rendering_feedback: crate::dispatch::RenderingFeedback,
-}
-impl PreparedDraw {
-    pub(crate) fn can_group(&self) -> bool {
-        self.batchable
+fn read_only_state(aspect: vk::ImageAspectFlags, state: &GraphicsState) -> bool {
+    if aspect == vk::ImageAspectFlags::DEPTH {
+        !state.depth_write
+    } else if aspect == vk::ImageAspectFlags::STENCIL {
+        !state.stencil_test
+            || [state.front, state.back].iter().all(|s| {
+                [s.fail, s.pass, s.depth_fail]
+                    .iter()
+                    .all(|op| *op == vk::StencilOp::KEEP)
+            })
+    } else {
+        false
     }
 }
-impl VulkanResidency {
-    pub(crate) fn draw_current(&self, draw: &PreparedDraw) -> bool {
-        if draw.binding_revision.load(Ordering::Relaxed) == self.binding_revision {
-            return true;
-        }
-        // A cache deletion is an invalidation hint. Preserve every current
-        // selection whose own resource IDs and generations remain valid.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
-        if !self.program_current(&draw.graphics.program)
-            || !self.targets_current(&draw.targets)
-            || draw
-                .vertices
-                .iter()
-                .any(|vertex| !self.buffer_binding_current(vertex.buffer))
-            || draw
-                .index
-                .is_some_and(|index| !self.buffer_binding_current(index.buffer))
-        {
-            return false;
-        }
-        draw.binding_revision
-            .store(self.binding_revision, Ordering::Relaxed);
-        true
-    }
 
+/// Image selections consumed by ConfigureDraw. Buffer selections stay in
+/// BufferCache; this span follows Eden's FillImageViews/CheckFeedbackLoop.
+pub(crate) struct ShaderImage {
+    pub(crate) view: ImageViewId,
+    pub(crate) descriptor: usize,
+    // The texture cache owns guest samplers; HostProgram owns utility samplers.
+    // Configure captures native handles after those actual owners retain them.
+    pub(crate) sampler: Option<vk::Sampler>,
+}
+impl Residency<'_> {
     pub(crate) fn targets_current(&self, targets: &PreparedTargets) -> bool {
-        if targets.binding_revision.load(Ordering::Relaxed) == self.binding_revision {
+        if targets.binding_revision.load(Ordering::Relaxed) == self.texture_cache.binding_revision {
             return true;
         }
         if targets
             .attachments()
             .any(|attachment| match attachment.description.source {
-                AttachmentSource::Canonical { image, .. } => !self.image_binding_current(image),
-                AttachmentSource::ResidentOnly(id) => self.attachment(id).is_err(),
+                AttachmentSource::Canonical { view, .. } => {
+                    self.texture_cache.views.get(view).is_none_or(|current| {
+                        !self.texture_cache.binding_current(current.image)
+                            || !Arc::ptr_eq(&current.native, &attachment.view)
+                    })
+                }
+                AttachmentSource::ResidentOnly(id) => self
+                    .texture_cache
+                    .attachments
+                    .get(id)
+                    .is_none_or(|current| !Arc::ptr_eq(&current.view, &attachment.view)),
             })
         {
             return false;
         }
         targets
             .binding_revision
-            .store(self.binding_revision, Ordering::Relaxed);
+            .store(self.texture_cache.binding_revision, Ordering::Relaxed);
         true
     }
-    fn rendering_matches(&self, draw: &PreparedDraw) -> bool {
-        self.device.submission.recording.is_some_and(|index| {
-            let slot = &self.device.submission.slots[index];
-            slot.rendering_feedback == draw.rendering_feedback
-                && slot.active_targets.as_ref().is_some_and(|active| {
-                    Arc::ptr_eq(active, &draw.targets) || active.compatible(&draw.targets)
-                })
-        })
+    fn rendering_matches(&self, targets: &Arc<PreparedTargets>) -> bool {
+        self.runtime.device.render_pass_matches(targets)
     }
 
     pub fn prepare_targets(
@@ -242,7 +332,8 @@ impl VulkanResidency {
         targets: RenderingTargets,
     ) -> Result<Arc<PreparedTargets>, VulkanError> {
         if targets.colors.len() > 8
-            || targets.colors.len() > self.device.profile().limits.max_color_attachments as usize
+            || targets.colors.len()
+                > self.runtime.device.profile().limits.max_color_attachments as usize
         {
             return Err(VulkanError::InvalidResource(
                 "rendering targets exceed supported color attachment slots",
@@ -265,6 +356,99 @@ impl VulkanResidency {
             .stencil
             .map(|a| self.prepare_attachment(a, area, vk::ImageAspectFlags::STENCIL))
             .transpose()?;
+        self.create_framebuffer(area, colors, depth, stencil)
+    }
+
+    /// Construct cached native attachment metadata directly from the current
+    /// view slots. Host RenderingTargets never enter this cache-owned path.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L569-L582
+    pub(in crate::residency) fn framebuffer_from_targets(
+        &mut self,
+        key: crate::residency::texture_bindings::FramebufferKey,
+    ) -> Result<Arc<PreparedTargets>, VulkanError> {
+        let mut size = key.size;
+        for view in key.views.iter().copied().flatten() {
+            let extent = self.texture_cache.views[view].description.size;
+            size[0] = size[0].min(extent.width);
+            size[1] = size[1].min(extent.height);
+        }
+        let area = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: size[0],
+                height: size[1],
+            },
+        };
+        let color_count = key.views[..8]
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(0, |i| i + 1);
+        if color_count > self.runtime.device.profile().limits.max_color_attachments as usize {
+            return Err(VulkanError::InvalidResource(
+                "framebuffer exceeds native color attachment slots",
+            ));
+        }
+        let mut attachment = |view, aspect| {
+            let plane = self.image_view_plane(view, aspect)?;
+            self.prepare_attachment(
+                RenderAttachment {
+                    source: AttachmentSource::Canonical { view, plane },
+                    load: vk::AttachmentLoadOp::LOAD,
+                    store: vk::AttachmentStoreOp::STORE,
+                    clear: vk::ClearValue::default(),
+                },
+                area,
+                aspect,
+            )
+        };
+        let colors = key.views[..color_count]
+            .iter()
+            .map(|&view| {
+                view.map(|view| attachment(view, vk::ImageAspectFlags::COLOR))
+                    .transpose()
+            })
+            .collect::<Result<Box<[_]>, VulkanError>>()?;
+        let mut depth = None;
+        let mut stencil = None;
+        if let Some(view) = key.views[8] {
+            let aspects = self.texture_cache.views[view].description.aspects;
+            if aspects.contains(vk::ImageAspectFlags::DEPTH) {
+                let plane = self.image_view_plane(view, vk::ImageAspectFlags::DEPTH)?;
+                depth = Some(self.prepare_attachment(
+                    RenderAttachment {
+                        source: AttachmentSource::Canonical { view, plane },
+                        load: vk::AttachmentLoadOp::LOAD,
+                        store: vk::AttachmentStoreOp::STORE,
+                        clear: vk::ClearValue::default(),
+                    },
+                    area,
+                    vk::ImageAspectFlags::DEPTH,
+                )?);
+            }
+            if aspects.contains(vk::ImageAspectFlags::STENCIL) {
+                let plane = self.image_view_plane(view, vk::ImageAspectFlags::STENCIL)?;
+                stencil = Some(self.prepare_attachment(
+                    RenderAttachment {
+                        source: AttachmentSource::Canonical { view, plane },
+                        load: vk::AttachmentLoadOp::LOAD,
+                        store: vk::AttachmentStoreOp::STORE,
+                        clear: vk::ClearValue::default(),
+                    },
+                    area,
+                    vk::ImageAspectFlags::STENCIL,
+                )?);
+            }
+        }
+        self.create_framebuffer(area, colors, depth, stencil)
+    }
+
+    fn create_framebuffer(
+        &mut self,
+        area: vk::Rect2D,
+        colors: Box<[Option<Attachment>]>,
+        depth: Option<Attachment>,
+        stencil: Option<Attachment>,
+    ) -> Result<Arc<PreparedTargets>, VulkanError> {
         if let (Some(d), Some(s)) = (&depth, &stencil)
             && d.view.handle != s.view.handle
         {
@@ -272,79 +456,62 @@ impl VulkanResidency {
                 "depth and stencil attachments must use the same native view",
             ));
         }
-        let native = |a: &Attachment| {
-            vk::RenderingAttachmentInfo::default()
-                .image_view(a.view.handle)
-                .image_layout(a.layout)
-                .load_op(a.description.load)
-                .store_op(a.description.store)
-                .clear_value(a.description.clear)
-        };
-        let native_colors = colors
+        let mut maps = smallvec::SmallVec::new();
+        for a in colors
             .iter()
-            .map(|a| {
-                a.as_ref()
-                    .map_or_else(vk::RenderingAttachmentInfo::default, native)
-            })
-            .collect();
-        let native_depth = depth.as_ref().map(native);
-        let native_stencil = stencil.as_ref().map(native);
-        Ok(Arc::new(PreparedTargets {
-            binding_revision: self.binding_revision.into(),
+            .flatten()
+            .chain(depth.iter())
+            .chain(stencil.iter())
+        {
+            if let AttachmentSource::Canonical { view, .. } = a.description.source {
+                maps.extend_from_slice(
+                    &self
+                        .texture_cache
+                        .get(self.texture_cache.views[view].image)
+                        .maps,
+                );
+            }
+        }
+        Ok(Arc::new(PreparedTargets::new(
+            Arc::clone(&self.runtime.device.owner),
+            self.texture_cache.binding_revision,
             area,
             colors,
             depth,
             stencil,
-            native_colors,
-            native_depth,
-            native_stencil,
-        }))
+            maps,
+        )?))
     }
+
     fn prepare_attachment(
         &mut self,
         a: RenderAttachment,
         area: vk::Rect2D,
         aspect: vk::ImageAspectFlags,
     ) -> Result<Attachment, VulkanError> {
-        let (description, p, view, physical) = match a.source {
-            AttachmentSource::Canonical { image, plane } => {
+        let (description, p, view, size) = match a.source {
+            AttachmentSource::Canonical { view, plane } => {
+                let image = self.texture_cache.views[view].image;
                 let p = self.checked_image_rect(image, plane, area)?;
-                let description = self.image(image)?.description;
-                let aspects = if aspect != vk::ImageAspectFlags::COLOR
-                    && super::super::format::copy_block(
-                        description.format,
-                        vk::ImageAspectFlags::DEPTH,
-                    )
-                    .is_some()
-                    && super::super::format::copy_block(
-                        description.format,
-                        vk::ImageAspectFlags::STENCIL,
-                    )
-                    .is_some()
+                let mut description = self.texture_cache.get(image).description;
+                let d = self.image_view_description(view)?;
+                if (area.offset.x as u32).saturating_add(area.extent.width) > d.size.width
+                    || (area.offset.y as u32).saturating_add(area.extent.height) > d.size.height
                 {
-                    vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
-                } else {
-                    aspect
-                };
-                let view = self.image_view(
-                    image,
-                    ImageViewDescription {
-                        format: description.format,
-                        view_type: vk::ImageViewType::TYPE_2D,
-                        aspects,
-                        base_mip: p.mip_level,
-                        mip_count: 1,
-                        base_layer: p.array_layer + p.depth_slice,
-                        layer_count: 1,
-                        swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
-                    },
-                )?;
-                (
-                    description,
-                    p,
-                    self.image_view_lease(view)?,
-                    self.image(image)?.contents.geometry.get(plane).cloned(),
-                )
+                    return Err(VulkanError::InvalidResource(
+                        "render area exceeds the logical image view",
+                    ));
+                }
+                if d.base_mip != p.mip_level
+                    || d.base_layer != p.array_layer + p.depth_slice
+                    || !d.aspects.contains(aspect)
+                {
+                    return Err(VulkanError::InvalidResource(
+                        "attachment view does not select its physical plane",
+                    ));
+                }
+                description.format = d.format;
+                (description, p, self.image_view_lease(view)?, d.size)
             }
             AttachmentSource::ResidentOnly(id) => {
                 let entry = self.attachment(id)?;
@@ -381,7 +548,7 @@ impl VulkanResidency {
                     block_extent,
                     bytes_per_block,
                 };
-                (d, p, Arc::clone(&entry.view), None)
+                (d, p, Arc::clone(&entry.view), d.extent)
             }
         };
         if p.aspect != aspect || p.extent.depth != 1 {
@@ -421,57 +588,40 @@ impl VulkanResidency {
         Ok(Attachment {
             description: a,
             plane: p,
-            physical,
             view,
-            layout: shader_attachment_layout(description.usage, self.unified_layouts),
             format: description.format,
             samples: description.samples,
+            size,
         })
     }
 
-    pub(crate) fn prepare_inline_index_draw(
-        &mut self,
-        graphics: PreparedGraphics,
-        targets: Arc<PreparedTargets>,
-        vertices: Box<[VertexBuffer]>,
-        bytes: Arc<[u8]>,
-    ) -> Result<PreparedDraw, VulkanError> {
-        if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
-            return Err(VulkanError::InvalidResource(
-                "inline UINT32 indices require a nonempty aligned payload",
-            ));
-        }
-        let mut draw = self.prepare_draw(graphics, targets, vertices, None)?;
-        draw.inline_index = Some(bytes);
-        Ok(draw)
+    fn vertex_binding(&self, slot: u32) -> Result<VertexBuffer, VulkanError> {
+        self.runtime
+            .buffer_bindings
+            .channel
+            .vertex_buffers
+            .get(slot as usize)
+            .copied()
+            .flatten()
+            .ok_or(VulkanError::InvalidResource(
+                "shader consumes a null vertex buffer",
+            ))
     }
-
-    pub fn prepare_draw(
+    fn validate_framebuffer(
         &self,
-        graphics: PreparedGraphics,
-        targets: Arc<PreparedTargets>,
-        vertices: Box<[VertexBuffer]>,
-        index: Option<IndexBuffer>,
-    ) -> Result<PreparedDraw, VulkanError> {
-        if !self.program_current(&graphics.program)
-            || !self.targets_current(&targets)
-            || vertices
-                .iter()
-                .any(|vertex| !self.buffer_binding_current(vertex.buffer))
-            || index
-                .as_ref()
-                .is_some_and(|index| !self.buffer_binding_current(index.buffer))
-        {
+        state: &GraphicsState,
+        targets: &PreparedTargets,
+    ) -> Result<(), VulkanError> {
+        if !self.targets_current(targets) {
             return Err(VulkanError::InvalidResource(
-                "draw selects retired native bindings",
+                "framebuffer selects a retired image",
             ));
         }
-        let state = &graphics.parameters.state;
         if state.colors.len() != targets.colors.len()
             || state
                 .colors
                 .iter()
-                .zip(targets.colors.iter())
+                .zip(&targets.colors)
                 .any(|((format, _), a)| {
                     *format != a.as_ref().map_or(vk::Format::UNDEFINED, |a| a.format)
                 })
@@ -486,381 +636,243 @@ impl VulkanResidency {
                     .as_ref()
                     .map_or(vk::Format::UNDEFINED, |a| a.format)
             || targets.attachments().any(|a| {
-                a.samples != state.samples || !Arc::ptr_eq(&a.view.image.owner, &self.device.owner)
+                a.samples != state.samples
+                    || !Arc::ptr_eq(&a.view.image.owner, &self.runtime.device.owner)
             })
         {
             return Err(VulkanError::InvalidResource(
                 "rendering attachments differ from the compiled formats/sample count/device",
             ));
         }
-        // Read-only depth/stencil can also be sampled. STORE is allowed to
-        // write even when the pipeline disables depth/stencil updates; use NONE
-        // to preserve the original producer and avoid a render-pass data race.
-        // https://docs.vulkan.org/spec/latest/chapters/renderpass.html#renderpass-common-data-races
-        let mut targets = targets;
-        if targets
-            .attachments()
-            .any(|a| read_only_attachment(a, state))
-        {
-            let targets = Arc::make_mut(&mut targets);
-            for (attachment, native) in [
-                (&targets.depth, &mut targets.native_depth),
-                (&targets.stencil, &mut targets.native_stencil),
-            ] {
-                if attachment
-                    .as_ref()
-                    .is_some_and(|a| read_only_attachment(a, state))
-                {
-                    native.as_mut().unwrap().store_op = vk::AttachmentStoreOp::NONE;
-                }
-            }
-        }
+        Ok(())
+    }
+    fn draw_feedback(
+        &self,
+        id: ImageId,
+        range: vk::ImageSubresourceRange,
+        scope: AccessScope,
+        targets: &PreparedTargets,
+        read_only: &impl Fn(vk::ImageAspectFlags) -> Result<bool, VulkanError>,
+    ) -> Result<vk::ImageAspectFlags, VulkanError> {
         let mut feedback_aspects = vk::ImageAspectFlags::empty();
-        let mut rendering_feedback = crate::dispatch::RenderingFeedback::default();
-        for resource in &graphics.program.uses {
-            if let Use::Image { id, range, scope } = resource {
-                let overlaps = |a: &Attachment| {
-                    matches!(a.description.source,AttachmentSource::Canonical {image,..} if image==*id)
-                        && (range.base_mip_level..range.base_mip_level + range.level_count)
-                            .contains(&a.plane.mip_level)
-                        && (range.base_array_layer..range.base_array_layer + range.layer_count)
-                            .contains(&a.plane.array_layer)
-                };
-                let mut feedback = false;
-                for a in targets.attachments().filter(|a| overlaps(a)) {
-                    // Load/store operations can touch adjacent depth/stencil
-                    // aspects too. Both must be read-only before sharing reads.
-                    if scope.writes() {
+        {
+            let overlaps = |a: &Attachment| {
+                matches!(a.description.source,AttachmentSource::Canonical {view,..} if self.texture_cache.views[view].image==id)
+                    && (range.base_mip_level..range.base_mip_level + range.level_count)
+                        .contains(&a.plane.mip_level)
+                    && (range.base_array_layer..range.base_array_layer + range.layer_count)
+                        .contains(&a.plane.array_layer)
+            };
+            for a in targets.attachments().filter(|a| overlaps(a)) {
+                // Load/store operations can touch adjacent depth/stencil
+                // aspects too. Both must be read-only before sharing reads.
+                if scope.writes() {
+                    return Err(VulkanError::InvalidResource(
+                        "shader storage writes cannot alias a rendering attachment",
+                    ));
+                }
+                let preserve = a.description.load == vk::AttachmentLoadOp::LOAD
+                    && a.description.store == vk::AttachmentStoreOp::STORE;
+                if !(preserve && read_only(a.plane.aspect)?) {
+                    if !self.runtime.device.profile().attachment_feedback_loop
+                        || !self
+                            .texture_cache
+                            .get(id)
+                            .description
+                            .usage
+                            .contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT)
+                    {
                         return Err(VulkanError::InvalidResource(
-                            "shader storage writes cannot alias a rendering attachment",
+                            "attachment feedback requires Vulkan feedback-loop support",
                         ));
                     }
-                    if !read_only_attachment(a, state) {
-                        if !self.device.profile().attachment_feedback_loop
-                            || !self
-                                .image(*id)?
-                                .description
-                                .usage
-                                .contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT)
-                        {
-                            return Err(VulkanError::InvalidResource(
-                                "attachment feedback requires Vulkan feedback-loop support",
-                            ));
+                    feedback_aspects |= range.aspect_mask;
+                }
+            }
+        }
+        Ok(feedback_aspects)
+    }
+    pub(crate) fn retain_target_resources(&mut self, targets: &PreparedTargets) {
+        self.runtime
+            .constructing
+            .extend(
+                targets
+                    .attachments()
+                    .filter_map(|a| match a.description.source {
+                        AttachmentSource::Canonical { view, .. } => {
+                            Some(Resource::Image(self.texture_cache.views[view].image))
                         }
-                        feedback_aspects |= range.aspect_mask;
-                        feedback = true;
-                    }
-                }
-                if feedback && self.unified_layouts {
-                    // GENERAL needs explicit feedback semantics only for a
-                    // view actually read while used as a writable attachment.
-                    // Include adjacent depth/stencil attachments sharing it.
-                    // https://docs.vulkan.org/spec/latest/chapters/renderpass.html#renderpass-feedbackloop
-                    for (index, attachment) in targets.colors.iter().enumerate() {
-                        if attachment.as_ref().is_some_and(overlaps) {
-                            rendering_feedback.colors |= 1 << index;
-                        }
-                    }
-                    rendering_feedback.depth |= targets.depth.as_ref().is_some_and(overlaps);
-                    rendering_feedback.stencil |= targets.stencil.as_ref().is_some_and(overlaps);
-                }
-            }
-        }
-        if vertices.len() != state.vertex_bindings.len()
-            || state
-                .vertex_bindings
-                .iter()
-                .any(|b| vertices.iter().filter(|v| v.binding == b.binding).count() != 1)
-        {
-            return Err(VulkanError::InvalidResource(
-                "vertex streams do not match compiled binding slots",
-            ));
-        }
-        for vertex in &vertices {
-            self.check_buffer_range(vertex.buffer, vertex.offset, vertex.size)?;
-            if !self
-                .buffer(vertex.buffer)?
-                .usage
-                .contains(vk::BufferUsageFlags::VERTEX_BUFFER)
-            {
-                return Err(VulkanError::InvalidResource(
-                    "vertex stream lacks VERTEX_BUFFER usage",
-                ));
-            }
-        }
-        let index = index.map(|i| {
-            let size = match i.kind { vk::IndexType::UINT16 => 2, vk::IndexType::UINT32 => 4, vk::IndexType::UINT8_EXT if self.device.profile().index_uint8 => 1, _ => return Err(VulkanError::InvalidResource("native index type requires UINT16/UINT32; frontend must widen unsupported UINT8")) };
-            self.check_buffer_range(i.buffer,i.offset,i.size)?;
-            if !i.offset.is_multiple_of(size) || !self.buffer(i.buffer)?.usage.contains(vk::BufferUsageFlags::INDEX_BUFFER) { return Err(VulkanError::InvalidResource("index stream requires aligned INDEX_BUFFER storage")); }
-            Ok(i)
-        }).transpose()?;
-        // Retain the selected planes once. Physical overlap relationships are
-        // built with resource registration, as in the texture cache's retained
-        // overlapping/aliased image lists, rather than rediscovered per draw.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/image_base.h#L118-L119
-        let attachment_planes = || {
-            targets.attachments().filter_map(|attachment| {
-                let AttachmentSource::Canonical { image, .. } = attachment.description.source
-                else {
-                    return None;
-                };
-                Some((Resource::Image(image), attachment.physical.as_deref()?))
-            })
-        };
-        let buffer_overlaps = |id: BufferId, offset, bytes| -> Result<bool, VulkanError> {
-            let entry = self.buffer(id)?;
-            if entry.contents.geometry.is_empty() {
-                return Ok(false);
-            }
-            let mut candidates = attachment_planes()
-                .filter(|(target, _)| {
-                    self.authority
-                        .resources_may_overlap(Resource::Buffer(id), *target)
-                })
-                .peekable();
-            if candidates.peek().is_none() {
-                return Ok(false);
-            }
-            let [full] = entry.contents.geometry.as_slice() else {
-                return Err(VulkanError::InvalidResource(
-                    "vertex/storage binding requires a linear physical buffer",
-                ));
-            };
-            let footprint = Footprint::new(
-                Arc::clone(full.mapping()),
-                nixe_gpu::physical::WriteDomain::Buffer {
-                    start: offset,
-                    bytes,
-                },
-            )?;
-            Ok(candidates.any(|(_, target)| target.intersects(&footprint)))
-        };
-        let mut batchable = !graphics.program.uses.iter().any(|usage| match usage {
-            Use::Buffer { scope, .. } | Use::Image { scope, .. } => scope.writes(),
-        }) && targets.attachments().all(|a| {
-            a.description.load == vk::AttachmentLoadOp::LOAD
-                && a.description.store == vk::AttachmentStoreOp::STORE
-        });
-        if batchable {
-            for vertex in &vertices {
-                if buffer_overlaps(vertex.buffer, vertex.offset, vertex.size)? {
-                    batchable = false;
-                    break;
-                }
-            }
-        }
-        if batchable && let Some(index) = &index {
-            batchable = !buffer_overlaps(index.buffer, index.offset, index.size)?;
-        }
-        if batchable {
-            for usage in &graphics.program.uses {
-                let overlaps = match *usage {
-                    Use::Buffer {
-                        id, offset, size, ..
-                    } => buffer_overlaps(id, offset, size)?,
-                    Use::Image { id, range, .. } => {
-                        let entry = self.image(id)?;
-                        !entry.contents.geometry.is_empty()
-                            && attachment_planes().any(|(target, footprint)| {
-                                self.authority
-                                    .resources_may_overlap(Resource::Image(id), target)
-                                    && entry.planes.iter().zip(&entry.contents.geometry).any(
-                                        |(&plane, source)| {
-                                            super::plane_in_range(plane, range)
-                                                && footprint.intersects(source)
-                                        },
-                                    )
-                            })
-                    }
-                };
-                if overlaps {
-                    batchable = false;
-                    break;
-                }
-            }
-        }
-        let native_vertices = vertices
-            .iter()
-            .map(|v| {
-                self.buffer(v.buffer)
-                    .map(|entry| (v.binding, entry.native.handle, v.offset))
-            })
-            .collect::<Result<_, _>>()?;
-        let native_index = index
-            .as_ref()
-            .map(|i| {
-                self.buffer(i.buffer)
-                    .map(|entry| (entry.native.handle, i.offset, i.kind))
-            })
-            .transpose()?;
-        Ok(PreparedDraw {
-            binding_revision: self.binding_revision.into(),
-            native_vertices,
-            native_index,
-            batchable,
-            graphics,
-            targets,
-            vertices,
-            index,
-            inline_index: None,
-            feedback_aspects,
-            rendering_feedback,
-        })
+                        AttachmentSource::ResidentOnly(_) => None,
+                    }),
+            );
     }
     /// Consume immediately, synchronizing contents independently of cached bindings.
     pub fn draw(
         &mut self,
-        prepared: &PreparedDraw,
+        graphics: &HostGraphics,
+        targets: &Arc<PreparedTargets>,
         draw: Draw,
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
-        let retained = self.constructing.len();
-        self.retain_program_effect(&prepared.graphics.program);
-        self.constructing.extend(
-            prepared
-                .vertices
-                .iter()
-                .map(|vertex| Resource::Buffer(vertex.buffer)),
-        );
-        self.constructing.extend(
-            prepared
-                .index
-                .iter()
-                .map(|index| Resource::Buffer(index.buffer)),
-        );
-        self.constructing
-            .extend(prepared.targets.attachments().filter_map(|attachment| {
-                match attachment.description.source {
-                    AttachmentSource::Canonical { image, .. } => Some(Resource::Image(image)),
-                    _ => None,
-                }
-            }));
-        self.constructing
+        // Host utilities accept independently constructed pipeline/framebuffer
+        // captures. Guest draws derive both from their owning caches directly.
+        self.validate_framebuffer(
+            graphics
+                .program
+                .pipeline
+                .graphics
+                .as_ref()
+                .expect("graphics pipeline"),
+            targets,
+        )?;
+        let retained = self.runtime.constructing.len();
+        self.retain_host_program(&graphics.program);
+        self.retain_target_resources(targets);
+        for binding in graphics.parameters.state.vertex_bindings.iter() {
+            let vertex = self.vertex_binding(binding.binding)?;
+            self.runtime
+                .constructing
+                .push(Resource::Buffer(vertex.buffer));
+        }
+        if matches!(
+            draw,
+            Draw::Indexed { .. } | Draw::Indirect { indexed: true, .. }
+        ) && let Some(index) = self.runtime.buffer_bindings.channel.index_buffer
+        {
+            self.runtime
+                .constructing
+                .push(Resource::Buffer(index.buffer));
+        }
+        self.runtime
+            .constructing
             .extend(std::iter::once(&draw).filter_map(|draw| match draw {
                 Draw::Indirect { buffer, .. } => Some(Resource::Buffer(*buffer)),
                 _ => None,
             }));
-        let result = self.record_draw_inner(prepared, draw, push);
-        self.device.submission.release_stream_uploads();
-        self.constructing.truncate(retained);
-        result
-    }
-    fn record_draw_inner(
-        &mut self,
-        prepared: &PreparedDraw,
-        draw: Draw,
-        push: &[u8],
-    ) -> Result<WorkTicket, VulkanError> {
-        if !self.deferred_clears.is_empty() && !self.clear_matches_targets(&prepared.targets) {
-            self.realize_deferred_clears()?;
-        }
-        if !prepared.can_group() || !self.rendering_matches(prepared) {
-            self.device.end_rendering();
-        }
-        let graphics = &prepared.graphics;
-        let empty = match draw {
-            Draw::Direct {
-                vertices,
-                instances,
-                ..
-            } => vertices == 0 || instances == 0,
-            Draw::Indexed {
-                indices, instances, ..
-            } => indices == 0 || instances == 0,
-            Draw::Indirect { count, .. } => count == 0,
-        };
-        {
-            match draw {
-                Draw::Indexed {
-                    indices,
-                    first_index,
-                    ..
-                } if !empty => {
-                    let (element, size) = match (&prepared.index, &prepared.inline_index) {
-                        (Some(i), None) => (
-                            match i.kind {
-                                vk::IndexType::UINT16 => 2,
-                                vk::IndexType::UINT8_EXT => 1,
-                                _ => 4,
-                            },
-                            i.size,
-                        ),
-                        (None, Some(index)) => (4, index.len() as u64),
-                        _ => {
-                            return Err(VulkanError::InvalidResource(
-                                "indexed draw has no unique index stream",
-                            ));
+        let result = (|| {
+            if !draw.is_empty() {
+                let enabled = graphics
+                    .parameters
+                    .state
+                    .vertex_bindings
+                    .iter()
+                    .fold(0u32, |mask, binding| mask | (1 << binding.binding));
+                self.bind_host_geometry_buffers(None, enabled, draw, None, |binding| {
+                    graphics
+                        .parameters
+                        .state
+                        .vertex_bindings
+                        .iter()
+                        .find(|v| v.binding == binding)
+                        .expect("enabled host vertex input")
+                        .stride
+                })?;
+            }
+            let mut descriptors = if draw.is_empty() {
+                DescriptorQueue {
+                    record: None,
+                    dynamic_offsets: None,
+                    update: None,
+                }
+            } else {
+                let descriptors = self.stream_graphics(&graphics.program)?;
+                self.host_program_access(&graphics.program)?;
+                descriptors
+            };
+            if !draw.is_empty() && descriptors.record.is_none() && descriptors.update.is_none() {
+                descriptors.record = self.host_descriptor_record(&graphics.program)?;
+            }
+            if descriptors.dynamic_offsets.is_none() {
+                descriptors.dynamic_offsets = Some(graphics.program.dynamic_offsets.clone());
+            }
+            let mut images = smallvec::SmallVec::<[ShaderImage; 16]>::new();
+            for &descriptor in &graphics.program.pipeline.image_bindings {
+                if let Some(binding) = graphics.program.bindings.get(descriptor) {
+                    match binding {
+                        HostBinding::Image(view) => images.push(ShaderImage {
+                            view: view.id,
+                            descriptor,
+                            sampler: None,
+                        }),
+                        HostBinding::CombinedImageSampler { image, sampler } => {
+                            images.push(ShaderImage {
+                                view: image.id,
+                                descriptor,
+                                sampler: Some(sampler.handle),
+                            })
                         }
-                    };
-                    if (u64::from(first_index) + u64::from(indices)) * element > size {
-                        return Err(VulkanError::InvalidResource(
-                            "indexed draw exceeds bound index window",
-                        ));
+                        _ => unreachable!("compiled shader image slot"),
                     }
                 }
-                _ => {}
             }
+            let result = self.record_draw_inner(
+                &graphics.program.pipeline,
+                targets,
+                &images,
+                descriptors,
+                draw,
+                push,
+                |aspect| Ok(read_only_state(aspect, &graphics.parameters.state)),
+                |residency| {
+                    residency.graphics_state(&graphics.program.pipeline, &graphics.parameters)
+                },
+            )?;
+            if !draw.is_empty() {
+                self.host_program_written(&graphics.program)?;
+            }
+            Ok(result)
+        })();
+        self.runtime.constructing.truncate(retained);
+        result
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_draw_inner(
+        &mut self,
+        pipeline: &Arc<NativePipeline>,
+        targets: &Arc<PreparedTargets>,
+        images: &[ShaderImage],
+        descriptors: DescriptorQueue,
+        draw: Draw,
+        push: &[u8],
+        read_only: impl Fn(vk::ImageAspectFlags) -> Result<bool, VulkanError>,
+        record_state: impl FnOnce(&mut Self) -> Result<(), VulkanError>,
+    ) -> Result<WorkTicket, VulkanError> {
+        // Configure consumes the current image IDs, as Eden CheckFeedbackLoop
+        // does; there is no second draw-owned set of descriptor/geometry slots.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+        let mut feedback_aspects = vk::ImageAspectFlags::empty();
+        for image in images {
+            let range = self.texture_cache.views[image.view].native.range;
+            let scope = pipeline.resources[image.descriptor];
+            let aspects = self.draw_feedback(
+                self.texture_cache.views[image.view].image,
+                range,
+                scope,
+                targets,
+                &read_only,
+            )?;
+            feedback_aspects |= aspects;
         }
-        // Inline command bytes use the shared streaming/staging pool directly.
-        // The actual consumer tick keeps their bytes alive through GPU completion.
-        let inline_binding = if empty {
-            None
-        } else {
-            match &prepared.inline_index {
-                Some(bytes) => {
-                    let slice = self.device.submission.reserve_upload_aligned(
-                        &mut self.device.dispatch,
-                        bytes,
-                        4,
-                    )?;
-                    self.device.submission.retain_stream_upload(&slice);
-                    let buffer = Arc::clone(self.device.submission.staging_buffer(&slice));
-                    self.statistics.cpu_streamed_bytes += bytes.len() as u64;
-                    Some((buffer, slice.offset, vk::IndexType::UINT32))
-                }
-                None => None,
-            }
-        };
-        let streaming = !empty;
-        let streams = if streaming {
-            self.stream_graphics(&graphics.program)?
-        } else {
-            GraphicsStreams {
-                dynamic_offsets: None,
-                record: None,
-            }
-        };
-        let record = streams.record;
-        self.invalidate_cpu_resources(&[])?;
-        let mut writers = smallvec::SmallVec::new();
+        // Scheduler::RequestRenderpass continues the current framebuffer even
+        // when a shader writes storage resources. Guest memory barriers and
+        // operations outside a pass own those dependencies, not shader metadata.
+        // Explicit host attachment loads/stores still execute once per call.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_scheduler.cpp#L204-L223
+        let attachment_operations = targets.attachment_operations;
+        if attachment_operations
+            || !feedback_aspects.is_empty()
+            || (!self.rendering_matches(targets)
+                && !self.runtime.device.deferred_clear_matches(targets))
+        {
+            self.runtime.device.end_rendering()?;
+        }
+        let empty = draw.is_empty();
+        let DescriptorQueue {
+            record,
+            dynamic_offsets,
+            update,
+        } = descriptors;
         let indirect = if !empty {
-            {
-                writers = self.program_access_except(&graphics.program)?;
-                for vertex in prepared.vertices.iter() {
-                    self.ensure_buffer_range(vertex.buffer, vertex.offset, vertex.size)?;
-                    self.buffer_access_range(
-                        vertex.buffer,
-                        vertex.offset,
-                        vertex.size,
-                        AccessScope::new(
-                            vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT,
-                            vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
-                        ),
-                    )?;
-                }
-                if let Some(index) = &prepared.index {
-                    self.ensure_buffer_range(index.buffer, index.offset, index.size)?;
-                    self.buffer_access_range(
-                        index.buffer,
-                        index.offset,
-                        index.size,
-                        AccessScope::new(
-                            vk::PipelineStageFlags2::INDEX_INPUT,
-                            vk::AccessFlags2::INDEX_READ,
-                        ),
-                    )?;
-                }
-            }
             if let Draw::Indirect {
                 buffer,
                 offset,
@@ -869,14 +881,9 @@ impl VulkanResidency {
                 indexed,
             } = draw
             {
-                if indexed && prepared.index.is_none() && prepared.inline_index.is_none() {
-                    return Err(VulkanError::InvalidResource(
-                        "indexed indirect draw has no index stream",
-                    ));
-                }
                 let element = if indexed { 20 } else { 16 };
-                if count > self.device.profile().limits.max_draw_indirect_count
-                    || count > 1 && self.device.profile().core.multi_draw_indirect == 0
+                if count > self.runtime.device.profile().limits.max_draw_indirect_count
+                    || count > 1 && self.runtime.device.profile().core.multi_draw_indirect == 0
                     || count > 1 && (stride < element || !stride.is_multiple_of(4))
                 {
                     return Err(VulkanError::InvalidResource(
@@ -885,7 +892,14 @@ impl VulkanResidency {
                 }
                 // Indirect firstInstance is a guest producer's contract: native support
                 // is required rather than reading back and rewriting its commands.
-                if self.device.profile().core.draw_indirect_first_instance == 0 {
+                if self
+                    .runtime
+                    .device
+                    .profile()
+                    .core
+                    .draw_indirect_first_instance
+                    == 0
+                {
                     return Err(VulkanError::InvalidResource(
                         "indirect draws require drawIndirectFirstInstance",
                     ));
@@ -901,357 +915,142 @@ impl VulkanResidency {
         } else {
             None
         };
-        for a in prepared.targets.attachments() {
-            if let AttachmentSource::Canonical { image, .. } = a.description.source {
-                if a.description.load == vk::AttachmentLoadOp::LOAD {
-                    // LOAD preserves prior contents, including undefined texels
-                    // outside the draw's actual fragment coverage. Prepare current
-                    // memory/aliases without requiring a fully authored render area.
-                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L2504-L2523
-                    // https://docs.vulkan.org/refpages/latest/refpages/source/VkAttachmentLoadOp.html
-                    self.ensure_image(image)?;
-                } else {
-                    // CLEAR and DONT_CARE do not consume the previous texels.
-                    self.invalidate_cpu_resources(&[])?;
-                }
-                if !read_only_attachment(a, &graphics.parameters.state)
-                    && (!empty || a.description.load == vk::AttachmentLoadOp::CLEAR)
-                {
-                    let entry = self.image(image)?;
-                    let incomplete = a.description.load == vk::AttachmentLoadOp::LOAD
-                        && entry.discarded.iter().any(|&(index, rect)| {
-                            entry.planes[index] == a.plane
-                                && transfers::intersects(rect, prepared.targets.area)
-                        });
-                    if incomplete {
-                        for rect in preserved_draw_rects(
-                            prepared.targets.area,
-                            entry.discarded.iter().filter_map(|&(index, rect)| {
-                                (entry.planes[index] == a.plane).then_some(rect)
-                            }),
-                            &graphics.parameters.scissors,
-                        ) {
-                            writers.push(self.prepare_image_rect(image, a.plane, rect)?);
-                        }
+        // UpdateRenderTargets prepares each color image and the combined
+        // depth/stencil image once. Draw coverage never invalidates an image.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L457-L490
+        for a in targets
+            .colors
+            .iter()
+            .filter_map(Option::as_ref)
+            .chain(targets.depth.as_ref().or(targets.stencil.as_ref()))
+        {
+            if let AttachmentSource::Canonical { view, .. } = a.description.source {
+                let image = self.texture_cache.views[view].image;
+                let clear_aspects = if a.plane.aspect == vk::ImageAspectFlags::COLOR {
+                    if a.description.load == vk::AttachmentLoadOp::CLEAR {
+                        vk::ImageAspectFlags::COLOR
                     } else {
-                        writers.push(self.prepare_image_rect(
-                            image,
-                            a.plane,
-                            prepared.targets.area,
-                        )?);
+                        vk::ImageAspectFlags::empty()
                     }
-                }
+                } else {
+                    targets
+                        .depth
+                        .iter()
+                        .chain(targets.stencil.iter())
+                        .filter(|a| a.description.load == vk::AttachmentLoadOp::CLEAR)
+                        .fold(vk::ImageAspectFlags::empty(), |aspects, a| {
+                            aspects | a.plane.aspect
+                        })
+                };
+                let invalidate = !clear_aspects.is_empty()
+                    && self.is_full_image_clear(image, a.plane, targets.area, clear_aspects);
+                self.prepare_image(image, true, invalidate)?;
             }
         }
-        let record = if empty || record.is_some() {
-            record
-        } else {
-            self.program_record(&graphics.program)?
-        };
         // Framebuffer operations in one rendering instance already execute in
         // rasterization order. Only unchanged native attachments can continue;
-        // shader writes/feedback, imports and real hazards terminate the scope.
+        // imports and real native dependencies terminate the scope.
         // https://docs.vulkan.org/spec/latest/chapters/primsrast.html#primsrast-order
-        if !self.barriers.is_empty() {
-            self.device.end_rendering();
+        if !self.runtime.barriers.is_empty() {
+            self.runtime.device.end_rendering()?;
         }
-        let continuing = self.rendering_matches(prepared);
-        if !continuing {
-            for a in prepared.targets.attachments() {
-                let (stages, access) = if a.plane.aspect == vk::ImageAspectFlags::COLOR {
-                    (
-                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                        vk::AccessFlags2::COLOR_ATTACHMENT_READ
-                            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                    )
-                } else {
-                    (
-                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    )
-                };
-                let access = if read_only_attachment(a, &graphics.parameters.state) {
-                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                } else {
-                    access
-                };
-                let scope = AccessScope::new(stages, access);
+        let continuing = self.rendering_matches(targets);
+        if !continuing && !self.runtime.device.deferred_clear_matches(targets) {
+            for a in targets.attachments() {
                 match a.description.source {
-                    AttachmentSource::Canonical { image, .. } => {
-                        self.image_access_subresources(
-                            image,
-                            commands::plane_range(a.plane),
-                            scope,
-                            a.layout,
-                        )?;
+                    AttachmentSource::Canonical { view, .. } => {
+                        let image = self.texture_cache.views[view].image;
+                        self.use_image(image)?;
                     }
                     AttachmentSource::ResidentOnly(id) => {
-                        self.attachment_access(id, scope, vk::ImageLayout::GENERAL)?;
+                        self.use_attachment(id)?;
                     }
                 }
             }
-            self.barriers.emit(&mut self.device);
+            self.runtime.barriers.emit(&mut self.runtime.device)?;
         }
         if empty {
-            self.device.begin_recording()?;
         } else {
-            self.program_bind_record(
-                &graphics.program,
+            self.bind_pipeline_descriptors(
+                pipeline,
                 push,
                 record.as_ref(),
-                streams
-                    .dynamic_offsets
-                    .as_deref()
-                    .unwrap_or(&graphics.program.dynamic_offsets),
+                dynamic_offsets.as_deref().unwrap_or(&[]),
+                update,
             )?;
-            self.graphics_state(graphics)?;
-            self.set_feedback_loop(prepared.feedback_aspects);
+            self.set_feedback_loop(feedback_aspects);
         }
-        if let Some(offsets) = streams.dynamic_offsets {
-            self.descriptor_offsets = offsets;
+        // Eden updates dynamic state before recording the draw, including an
+        // empty draw. Consuming a channel's flags must update native state even
+        // when this draw has no vertices, so the next draw can reuse it.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+        record_state(self)?;
+        if let Some(offsets) = dynamic_offsets {
+            self.runtime.descriptor_offsets = offsets;
         }
-        let index_binding = prepared.native_index;
-        let clears = std::mem::take(&mut self.deferred_clears);
-        self.publish_effect(&writers, |device| {
-            let index = device.submission.recording.unwrap();
-            let slot = &mut device.submission.slots[index];
-            if slot
-                .target_handles
-                .insert(Arc::as_ptr(&prepared.targets) as usize)
+        self.runtime.device.request_render_pass(targets)?;
+        {
+            let device = &mut self.runtime.device;
             {
-                slot.native_targets.push(Arc::clone(&prepared.targets));
-            }
-            // Actual use ticks retain vertex/index storage through cache merges
-            // and prevent eviction before this command reservation retires.
-            let raw = &mut device.dispatch;
-            unsafe {
-                if !empty {
-                    // Unchanged channel slots reach recording as the same owned
-                    // selection. Keep that selection alive while it is bound;
-                    // changed selections update only their concrete vertex slots.
-                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-                    if !slot
-                        .current_vertices
-                        .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(current, &prepared.native_vertices))
-                    {
-                        for &(binding, buffer, offset) in prepared.native_vertices.iter() {
-                            let index = binding as usize;
-                            if slot.vertex_bindings.len() <= index {
-                                slot.vertex_bindings.resize(index + 1, None);
-                            }
-                            let value = (buffer, offset);
-                            if slot.vertex_bindings[index] != Some(value) {
-                                device.submission.statistics.vertex_binds += 1;
-                                raw.cmd_bind_vertex_buffers(binding, &[buffer], &[offset]);
-                                slot.vertex_bindings[index] = Some(value);
-                            }
-                        }
-                        slot.current_vertices = Some(Arc::clone(&prepared.native_vertices));
-                    }
-                    if let Some(value) = inline_binding
-                        .as_ref()
-                        .map(|(buffer, offset, kind)| (buffer.handle, *offset, *kind))
-                        .or(index_binding)
-                        && slot.index_binding != Some(value)
-                    {
-                        device.submission.statistics.index_binds += 1;
-                        raw.cmd_bind_index_buffer(value.0, value.1, value.2);
-                        slot.index_binding = Some(value);
-                    }
-                }
-                if !continuing {
-                    let targets = &prepared.targets;
-                    let mut colors = smallvec::SmallVec::<[_; 8]>::new();
-                    let mut depth = targets.native_depth;
-                    let mut stencil = targets.native_stencil;
-                    if !clears.is_empty() {
-                        colors.extend_from_slice(&targets.native_colors);
-                        let apply =
-                            |a: &Attachment, native: &mut vk::RenderingAttachmentInfo<'_>| {
-                                if let Some(clear) = clears.iter().find(|clear| {
-                                    a.description.source
-                                        == AttachmentSource::Canonical {
-                                            image: clear.image,
-                                            plane: clear.plane_index,
-                                        }
-                                }) {
-                                    native.load_op = vk::AttachmentLoadOp::CLEAR;
-                                    native.clear_value = clear.value;
+                let raw = &mut device.dispatch;
+                unsafe {
+                    if !empty {
+                        device.submission.statistics.draw_calls += 1;
+                        {
+                            match draw {
+                                Draw::Direct {
+                                    vertices,
+                                    instances,
+                                    first_vertex,
+                                    first_instance,
+                                } => {
+                                    raw.cmd_draw(vertices, instances, first_vertex, first_instance)
                                 }
-                            };
-                        for (a, n) in targets.colors.iter().zip(colors.iter_mut()) {
-                            if let Some(a) = a {
-                                apply(a, n);
-                            }
-                        }
-                        if let Some((a, n)) = targets.depth.as_ref().zip(depth.as_mut()) {
-                            apply(a, n);
-                        }
-                        if let Some((a, n)) = targets.stencil.as_ref().zip(stencil.as_mut()) {
-                            apply(a, n);
-                        }
-                    }
-                    let mut info = vk::RenderingInfo::default()
-                        .render_area(targets.area)
-                        .layer_count(1)
-                        .color_attachments(if clears.is_empty() {
-                            &targets.native_colors
-                        } else {
-                            &colors
-                        });
-                    if let Some(depth) = &depth {
-                        info = info.depth_attachment(depth);
-                    }
-                    if let Some(stencil) = &stencil {
-                        info = info.stencil_attachment(stencil);
-                    }
-                    // No render-pass object, framebuffer cache, HAL encoder or backend segment.
-                    // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdBeginRendering.html
-                    device.submission.statistics.rendering_scopes += 1;
-                    raw.begin_rendering(&info, prepared.rendering_feedback);
-                    slot.active_targets = Some(Arc::clone(&prepared.targets));
-                    slot.rendering_feedback = prepared.rendering_feedback;
-                }
-                if !empty {
-                    device.submission.statistics.draw_calls += 1;
-                    {
-                        match draw {
-                            Draw::Direct {
-                                vertices,
-                                instances,
-                                first_vertex,
-                                first_instance,
-                            } => raw.cmd_draw(vertices, instances, first_vertex, first_instance),
-                            Draw::Indexed {
-                                indices,
-                                instances,
-                                first_index,
-                                vertex_offset,
-                                first_instance,
-                            } => raw.cmd_draw_indexed(
-                                indices,
-                                instances,
-                                first_index,
-                                vertex_offset,
-                                first_instance,
-                            ),
-                            Draw::Indirect {
-                                offset,
-                                count,
-                                stride,
-                                indexed,
-                                ..
-                            } => {
-                                if indexed {
-                                    raw.cmd_draw_indexed_indirect(
-                                        indirect.unwrap(),
-                                        offset,
-                                        count,
-                                        stride,
-                                    );
-                                } else {
-                                    raw.cmd_draw_indirect(indirect.unwrap(), offset, count, stride);
+                                Draw::Indexed {
+                                    indices,
+                                    instances,
+                                    first_index,
+                                    vertex_offset,
+                                    first_instance,
+                                } => raw.cmd_draw_indexed(
+                                    indices,
+                                    instances,
+                                    first_index,
+                                    vertex_offset,
+                                    first_instance,
+                                ),
+                                Draw::Indirect {
+                                    offset,
+                                    count,
+                                    stride,
+                                    indexed,
+                                    ..
+                                } => {
+                                    if indexed {
+                                        raw.cmd_draw_indexed_indirect(
+                                            indirect.unwrap(),
+                                            offset,
+                                            count,
+                                            stride,
+                                        );
+                                    } else {
+                                        raw.cmd_draw_indirect(
+                                            indirect.unwrap(),
+                                            offset,
+                                            count,
+                                            stride,
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        })?;
-        if !prepared.can_group() {
-            self.device.end_rendering();
+        };
+        if attachment_operations {
+            self.runtime.device.end_rendering()?;
         }
-        if !empty {
-            self.program_written(&graphics.program)?;
-        }
-        for a in prepared.targets.attachments() {
-            if read_only_attachment(a, &graphics.parameters.state)
-                || (empty
-                    && a.description.load == vk::AttachmentLoadOp::LOAD
-                    && a.description.store == vk::AttachmentStoreOp::STORE)
-            {
-                continue;
-            }
-            match a.description.source {
-                AttachmentSource::Canonical { image, .. } => {
-                    let incomplete = a.description.load == vk::AttachmentLoadOp::LOAD
-                        && self
-                            .image(image)?
-                            .discarded
-                            .iter()
-                            .any(|&(index, undefined)| {
-                                self.image(image).unwrap().planes[index] == a.plane
-                                    && transfers::intersects(undefined, prepared.targets.area)
-                            });
-                    if incomplete {
-                        // STORE preserves old defined contents and the draw
-                        // can produce only inside its scissors. Do not publish
-                        // undefined padding as newly written guest bytes.
-                        let regions = preserved_draw_rects(
-                            prepared.targets.area,
-                            self.image(image)?
-                                .discarded
-                                .iter()
-                                .filter_map(|&(index, rect)| {
-                                    (self.image(image).unwrap().planes[index] == a.plane)
-                                        .then_some(rect)
-                                }),
-                            &graphics.parameters.scissors,
-                        );
-                        for rect in regions {
-                            self.finish_image_rect(image, a.plane, rect)?;
-                        }
-                    } else if continuing {
-                        // The first draw already published this exact coverage
-                        // at the current ticket. A continued LOAD/STORE scope
-                        // permits no shader writes, attachment feedback, native
-                        // imports or intervening commands that can consume or
-                        // replace that authority. CPU visibility also ends and
-                        // submits rendering before exposing bytes. Keep version
-                        // changes per draw, without walking every target page.
-                        self.advance_image_producer(image)?;
-                        self.statistics.attachment_publication_hits += 1;
-                    } else if !(empty && a.description.load == vk::AttachmentLoadOp::DONT_CARE) {
-                        self.finish_image_rect(image, a.plane, prepared.targets.area)?;
-                    }
-                    if a.description.store == vk::AttachmentStoreOp::DONT_CARE
-                        || empty && a.description.load == vk::AttachmentLoadOp::DONT_CARE
-                    {
-                        self.mark_image_discarded(image, a.plane, prepared.targets.area);
-                    }
-                }
-                AttachmentSource::ResidentOnly(_) => {}
-            }
-        }
-        self.device.work_ticket()
+        Ok(self.runtime.device.current_work())
     }
-}
-
-/// The cold path for a target that still has undefined texels. Ordinary draws
-/// retain the single-rectangle publication and continued-rendering fast path.
-fn preserved_draw_rects(
-    area: vk::Rect2D,
-    undefined: impl Iterator<Item = vk::Rect2D>,
-    scissors: &[vk::Rect2D],
-) -> Vec<vk::Rect2D> {
-    let mut produced = vec![area];
-    for undefined in undefined {
-        let mut untouched = vec![undefined];
-        for &scissor in scissors {
-            untouched = untouched
-                .into_iter()
-                .flat_map(|rect| transfers::subtract_rect(rect, scissor))
-                .collect();
-        }
-        for untouched in untouched {
-            produced = produced
-                .into_iter()
-                .flat_map(|rect| transfers::subtract_rect(rect, untouched))
-                .collect();
-        }
-    }
-    produced
 }

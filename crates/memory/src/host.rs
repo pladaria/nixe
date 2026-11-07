@@ -14,20 +14,28 @@ const BASE_ALIGNMENT: usize = 2 * 1024 * 1024;
 pub struct HostAddress(usize);
 impl HostAddress {
     /// Construct an address without borrowing its storage. Dereferencing still
-    /// requires the caller to retain and admit the complete physical range.
+    /// requires retained backing and the access/coherence rules of its owner.
     pub fn from_pointer(pointer: *mut u8) -> Self {
         Self(pointer as usize)
     }
     pub fn as_ptr(self) -> *mut u8 {
         self.0 as *mut u8
     }
-    /// Read a live command word without creating a Rust reference to guest RAM.
+    /// Read a live GPU word without creating a Rust reference to guest RAM.
     ///
     /// # Safety
-    /// The caller retains the physical allocation, ensures four readable bytes
-    /// at `offset`, and resolves device coherence on the command owner.
+    /// The caller retains the backing storage, ensures four readable bytes
+    /// at `offset`, and resolves device coherence on the consuming owner.
     pub unsafe fn read_u32(self, offset: usize) -> u32 {
         unsafe { crate::raw::read_value(self.as_ptr().add(offset), 4) as u32 }
+    }
+    /// Read a live GPU scalar without forming a Rust reference to guest RAM.
+    ///
+    /// # Safety
+    /// The caller ensures eight readable bytes at `offset` in retained machine
+    /// RAM and resolves device coherence before consuming the pointer.
+    pub unsafe fn read_u64(self, offset: usize) -> u64 {
+        unsafe { crate::raw::read_value(self.as_ptr().add(offset), 8) as u64 }
     }
 
     /// Copy admitted command words into disjoint owned host storage.

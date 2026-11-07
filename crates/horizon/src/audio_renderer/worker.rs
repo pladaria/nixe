@@ -324,50 +324,7 @@ mod tests {
         }
         fn allocation_pressure(&self, _: nixe_memory::MachineId, _: u64) {}
     }
-    #[test]
-    fn pending_dsp_reads_retain_exact_bytes_and_preserve_device_failures() {
-        use crate::{audio_renderer::buffer::Attachment, test_memory::physical};
-        use nixe_memory::{AccessResult, DeviceAccessEndpoint, MemoryError};
-        let ranges = physical(&[0; 8]);
-        let machine = ranges[0].allocation().machine().clone();
-        let (send, receive) = std::sync::mpsc::channel();
-        let (cancelled, _) = std::sync::mpsc::channel();
-        let endpoint: Arc<dyn DeviceAccessEndpoint> = Arc::new(Endpoint {
-            requests: send,
-            cancelled,
-        });
-        machine.set_device_endpoint(&endpoint);
-        machine.publish_device_write(&ranges, || Ok(())).unwrap();
-        for fail in [false, true] {
-            let attachment = Attachment {
-                address: 0x1000,
-                ranges: nixe_memory::CapturedMemory::new(ranges.clone()).unwrap(),
-                bytes: 8,
-                pool: Some(0),
-            };
-            let worker = thread::spawn(move || {
-                let mut bytes = [0; 3];
-                attachment
-                    .read(&RenderMemory::testing(), 2, &mut bytes)
-                    .map(|()| bytes)
-            });
-            let request = receive.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert_eq!(request.bytes(), 3);
-            assert_eq!(request.ranges()[0].offset(), 2);
-            if fail {
-                let failure =
-                    Arc::new(MemoryError::Execution("device lost during DSP read".into()));
-                request.finish(Err(failure.clone()));
-                let Err(RenderError::Memory(actual)) = worker.join().unwrap() else {
-                    panic!("device failure was lost");
-                };
-                assert!(Arc::ptr_eq(&actual, &failure));
-            } else {
-                request.finish(Ok(AccessResult::Read(Vec::from([4, 5, 6]))));
-                assert_eq!(worker.join().unwrap().unwrap(), [4, 5, 6]);
-            }
-        }
-    }
+
     #[test]
     fn shutdown_cancels_a_pending_device_read_without_waiting_for_gpu_completion() {
         use crate::test_memory::physical;

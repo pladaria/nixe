@@ -1590,7 +1590,7 @@ pub use events::{
 };
 pub use kernel_wait::{KernelWait, WaitEffect, WaitOutcome, WaitPhase};
 pub use property::{ThreadPropertyGuard, ThreadPropertyLock};
-pub use timer::{Deadline, TimerStopped};
+pub use timer::{Deadline, LoopingEvent, TimerStopped};
 pub use waits::{LockHandoff, OrderedWaitKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

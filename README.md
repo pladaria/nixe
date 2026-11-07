@@ -112,16 +112,19 @@ not be counted as hardware validation. Errors after GPU initialization remain
 test failures. Opt-in native tests and their additional requirements are described
 in [the native Vulkan guide](crates/gpu-vulkan/README.md).
 
-### CPU profiling
+## Acknowledgements
 
-Build the profiling binary, then capture a 30-second headless execution:
+Nixe is grateful to the projects and communities whose work has helped make this emulator possible:
 
-```bash
-cargo build-profile
-./scripts/profile.sh <id | name>
-```
-
-The script writes `perf.data` in the repository root.
+- [Switchbrew](https://switchbrew.org/), for its extensive documentation of the Nintendo Switch and its
+  system software.
+- [Atmosphère](https://github.com/Atmosphere-NX/Atmosphere), for its open-source Switch system software and
+  technical references.
+- [libnx](https://github.com/switchbrew/libnx), for its Switch homebrew library, which serves as a reference
+  for system interfaces and homebrew behavior.
+- [Eden](https://git.eden-emu.dev/eden-emu/eden) and yuzu, for the many architectural and optimization ideas
+  drawn from their emulators, as well as code used in parts of Nixe.
+- [Dynarmic](https://github.com/lioncash/dynarmic), for the dynamic recompiler used by Nixe's CPU emulation.
 
 ## Contributing
 

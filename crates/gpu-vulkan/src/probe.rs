@@ -1,8 +1,8 @@
 //! Optional native binding probe, excluded from the normal renderer build.
-use crate::{BufferBinding, VulkanError, VulkanResidency, device::DeviceOwner};
+use crate::{BufferBinding, Residency, VulkanError, device::DeviceOwner};
 use ash::vk;
-use nixe_gpu::physical::PhysicalMapping;
 use nixe_memory::AllocationRange;
+use nixe_memory::PhysicalMapping;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -24,7 +24,7 @@ pub struct BindingMeasurement {
     pub cpu_ns_per_dispatch: f64,
     pub gpu_ns_per_dispatch: f64,
 }
-impl VulkanResidency {
+impl Residency<'_> {
     pub fn measure_bindings(
         &mut self,
         dispatches: u32,
@@ -35,8 +35,8 @@ impl VulkanResidency {
                 "binding probe counts must be nonzero",
             ));
         }
-        let owner = Arc::clone(&self.device.owner);
-        let family = self.device.queues().graphics_compute_family;
+        let owner = Arc::clone(&self.runtime.device.owner);
+        let family = self.runtime.device.queues().graphics_compute_family;
         let properties = unsafe {
             owner
                 .instance
@@ -44,7 +44,15 @@ impl VulkanResidency {
                 .get_physical_device_queue_family_properties(owner.physical)
         };
         let bits = properties[family as usize].timestamp_valid_bits;
-        if bits == 0 || self.device.profile().limits.timestamp_compute_and_graphics == 0 {
+        if bits == 0
+            || self
+                .runtime
+                .device
+                .profile()
+                .limits
+                .timestamp_compute_and_graphics
+                == 0
+        {
             return Err(VulkanError::InvalidResource(
                 "binding probe needs graphics/compute queue timestamps",
             ));
@@ -61,16 +69,20 @@ impl VulkanResidency {
             BufferBinding::DescriptorBuffer,
         ] {
             if binding == BufferBinding::DeviceAddress
-                && (!self.device.profile().buffer_device_address
-                    || self.device.profile().core.shader_int64 == 0)
+                && (!self.runtime.device.profile().buffer_device_address
+                    || self.runtime.device.profile().core.shader_int64 == 0)
                 || binding == BufferBinding::DescriptorBuffer
-                    && !self.device.profile().descriptor_buffer
+                    && !self.runtime.device.profile().descriptor_buffer
             {
                 continue;
             }
-            let allocation = self.memory().account(4096)?.allocate(4096)?;
+            let allocation = self
+                .device_memory()
+                .machine()
+                .account(4096)?
+                .allocate(4096)?;
             let range = AllocationRange::new(allocation.pin(), 0, 4096)?;
-            self.memory().write_resolved(
+            self.device_memory().machine().write_resolved(
                 std::slice::from_ref(&range),
                 &0x44332211u32.to_ne_bytes().repeat(1024),
             )?;
@@ -85,8 +97,8 @@ impl VulkanResidency {
                 .buffer;
             // Compile and establish residency before either clock starts.
             self.swap_rgba8_words_binding(buffer, 0, 1024, binding)?;
-            let work = self.flush()?.expect("warmup recording");
-            self.device.wait_for_work(work, Duration::MAX)?;
+            let work = self.flush()?;
+            self.runtime.device.wait_for_work(work, Duration::MAX)?;
             let mut cpu = Vec::new();
             let mut gpu = Vec::new();
             for _ in 0..trials {
@@ -103,14 +115,17 @@ impl VulkanResidency {
                     owner: Arc::clone(&owner),
                     handle,
                 });
-                let index = self.device.begin_recording()?;
-                self.device.submission.slots[index]
+                let index = self.runtime.device.recording_slot()?;
+                self.runtime.device.submission.slots[index]
                     .probe_queries
                     .push(Arc::clone(&query));
 
                 unsafe {
-                    self.device.dispatch.cmd_reset_query_pool(handle, 0, 2);
-                    self.device.dispatch.timestamp(
+                    self.runtime
+                        .device
+                        .dispatch
+                        .cmd_reset_query_pool(handle, 0, 2);
+                    self.runtime.device.dispatch.timestamp(
                         vk::PipelineStageFlags2::ALL_COMMANDS,
                         handle,
                         0,
@@ -122,14 +137,14 @@ impl VulkanResidency {
                 }
                 let elapsed = start.elapsed().as_nanos() as f64;
                 unsafe {
-                    self.device.dispatch.timestamp(
+                    self.runtime.device.dispatch.timestamp(
                         vk::PipelineStageFlags2::ALL_COMMANDS,
                         handle,
                         1,
                     );
                 }
-                let work = self.flush()?.expect("probe recording");
-                self.device.wait_for_work(work, Duration::MAX)?;
+                let work = self.flush()?;
+                self.runtime.device.wait_for_work(work, Duration::MAX)?;
                 let mut ticks = [0u64; 2];
                 unsafe {
                     owner.device.get_query_pool_results(
@@ -143,7 +158,7 @@ impl VulkanResidency {
                 cpu.push(elapsed / f64::from(dispatches));
                 gpu.push(
                     ((ticks[1].wrapping_sub(ticks[0])) & mask) as f64
-                        * f64::from(self.device.profile().limits.timestamp_period)
+                        * f64::from(self.runtime.device.profile().limits.timestamp_period)
                         / f64::from(dispatches),
                 );
             }

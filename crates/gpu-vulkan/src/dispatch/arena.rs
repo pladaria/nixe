@@ -13,21 +13,22 @@ struct Vtable {
 struct Header {
     table: &'static Vtable,
     next: u32,
-    lengths: [u32; 3],
+    lengths: [u32; 4],
 }
 pub(super) struct Plan {
     layout: Layout,
     capture: usize,
-    arrays: [usize; 3],
-    lengths: [u32; 3],
+    arrays: [usize; 4],
+    lengths: [u32; 4],
 }
 impl Plan {
-    pub fn new<F, A, B, C>(lengths: [u32; 3]) -> Self {
+    pub fn new<F, A, B, C, D>(lengths: [u32; 4]) -> Self {
         const {
             assert!(align_of::<F>() <= 16);
             assert!(align_of::<A>() <= 16);
             assert!(align_of::<B>() <= 16);
             assert!(align_of::<C>() <= 16);
+            assert!(align_of::<D>() <= 16);
         }
         let (layout, capture) = Layout::new::<Header>().extend(Layout::new::<F>()).unwrap();
         let (layout, a) = layout
@@ -39,10 +40,13 @@ impl Plan {
         let (layout, c) = layout
             .extend(Layout::array::<C>(lengths[2] as usize).unwrap())
             .unwrap();
+        let (layout, d) = layout
+            .extend(Layout::array::<D>(lengths[3] as usize).unwrap())
+            .unwrap();
         Self {
             layout: layout.align_to(16).unwrap().pad_to_align(),
             capture,
-            arrays: [a, b, c],
+            arrays: [a, b, c, d],
             lengths,
         }
     }
@@ -80,13 +84,13 @@ impl Arena {
     /// `arrays` contain only owned Copy values safe to transfer to the worker.
     /// `plan` describes these capture/array types and lengths; it fits the arena
     /// or the arena is empty and may grow before placing its first capture.
-    pub unsafe fn push<F, A: Copy, B: Copy, C: Copy>(
+    pub unsafe fn push<F, A: Copy, B: Copy, C: Copy, D: Copy>(
         &mut self,
-        arrays: (&[A], &[B], &[C]),
+        arrays: (&[A], &[B], &[C], &[D]),
         function: F,
         plan: Plan,
     ) where
-        F: Fn(&mut Context, &[A], &[B], &[C]) -> Result<(), NativeFailure> + Send + 'static,
+        F: Fn(&mut Context, &[A], &[B], &[C], &[D]) -> Result<(), NativeFailure> + Send + 'static,
     {
         if self.count == 0 && plan.layout.size() > self.storage.capacity() * 16 {
             // One oversized operation is kept whole; storage grows only while
@@ -100,7 +104,7 @@ impl Arena {
         unsafe {
             base.cast::<Header>().write(Header {
                 table: &Vtable {
-                    invoke: invoke::<F, A, B, C>,
+                    invoke: invoke::<F, A, B, C, D>,
                     destroy: destroy::<F>,
                 },
                 next: next_u32,
@@ -121,6 +125,11 @@ impl Arena {
                 arrays.2.as_ptr(),
                 base.add(plan.arrays[2]).cast::<C>(),
                 arrays.2.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                arrays.3.as_ptr(),
+                base.add(plan.arrays[3]).cast::<D>(),
+                arrays.3.len(),
             );
         }
         self.used = next;
@@ -187,15 +196,15 @@ unsafe fn destroy<F>(header: *mut Header) {
     let (_, offset) = Layout::new::<Header>().extend(Layout::new::<F>()).unwrap();
     unsafe { std::ptr::drop_in_place(header.cast::<u8>().add(offset).cast::<F>()) };
 }
-unsafe fn invoke<F, A, B, C>(
+unsafe fn invoke<F, A, B, C, D>(
     header: *mut Header,
     context: &mut Context,
 ) -> Result<(), NativeFailure>
 where
-    F: Fn(&mut Context, &[A], &[B], &[C]) -> Result<(), NativeFailure>,
+    F: Fn(&mut Context, &[A], &[B], &[C], &[D]) -> Result<(), NativeFailure>,
 {
     let lengths = unsafe { (*header).lengths };
-    let plan = Plan::new::<F, A, B, C>(lengths);
+    let plan = Plan::new::<F, A, B, C, D>(lengths);
     let base = header.cast::<u8>();
     unsafe {
         let function = &*base.add(plan.capture).cast::<F>();
@@ -204,6 +213,7 @@ where
             std::slice::from_raw_parts(base.add(plan.arrays[0]).cast::<A>(), lengths[0] as usize),
             std::slice::from_raw_parts(base.add(plan.arrays[1]).cast::<B>(), lengths[1] as usize),
             std::slice::from_raw_parts(base.add(plan.arrays[2]).cast::<C>(), lengths[2] as usize),
+            std::slice::from_raw_parts(base.add(plan.arrays[3]).cast::<D>(), lengths[3] as usize),
         )
     }
 }

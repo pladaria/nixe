@@ -28,11 +28,6 @@ pub enum VulkanError {
         cause: Box<VulkanError>,
     },
     Memory(std::sync::Arc<nixe_memory::MemoryError>),
-    ResidencyPressure {
-        requested: u64,
-        allocated: u64,
-        budget: u64,
-    },
 }
 
 impl VulkanError {
@@ -61,7 +56,6 @@ impl Display for VulkanError {
             Self::InvalidResource(e) => write!(f, "invalid Vulkan resource: {e}"),
             Self::Validation(e) => write!(f, "Vulkan validation reported errors: {}", e.join("; ")),
             Self::Memory(error) => write!(f, "Vulkan physical memory: {error}"),
-            Self::ResidencyPressure { requested, allocated, budget } => write!(f, "Vulkan residency budget exhausted: requested {requested}, live/in-flight allocations {allocated}, budget {budget}; authoritative or leased contents cannot be discarded"),
             Self::QueueStopped => f.write_str("Vulkan queue is stopped after shutdown or a terminal device error"),
             Self::SubmissionFailed { tick, cause } => write!(f, "Vulkan submission tick {tick} failed: {cause}"),
         }

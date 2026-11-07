@@ -3,9 +3,24 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, mpsc};
 
-use nixe_memory::AllocationRange;
+use crate::{BackendInstanceId, ImageDescription};
 
-use crate::{BackendInstanceId, BackingView, ImageDescription, ImageMemoryLayout};
+/// Pixel rectangle selected from a resident source image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameCrop {
+    pub left: u32,
+    pub top: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Android display transform applied after cropping the source image.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FrameTransform {
+    pub flip_horizontal: bool,
+    pub flip_vertical: bool,
+    pub rotate_90_clockwise: bool,
+}
 
 /// Channel order declared by a host presentation buffer.
 ///
@@ -18,26 +33,6 @@ pub enum PresentationImageFormat {
     Bgra8,
     Rgb565,
     Rgba4444,
-}
-
-/// Complete retained source for one GPU presentation operation.
-///
-/// The accepted physical inputs survive CPU remap or nvmap-handle retirement.
-/// Cached interpretation metadata holds weak identities; the graphics owner
-/// consumes these inputs before delegating native recording.
-#[derive(Clone, Debug)]
-pub struct PresentationImageRequest {
-    /// Whether canonical bytes can be decoded as this image. Opaque storage
-    /// requires a current resident producer; importing it would corrupt pixels.
-    pub allow_canonical_import: bool,
-    pub backing: BackingView,
-    pub width: u32,
-    pub height: u32,
-    pub format: PresentationImageFormat,
-    pub layout: ImageMemoryLayout,
-    pub row_pitch: u32,
-    /// Exact accepted source pins, released after the graphics owner consumes it.
-    pub inputs: Vec<AllocationRange>,
 }
 
 /// An immutable presentation lease over a backend-resident image.

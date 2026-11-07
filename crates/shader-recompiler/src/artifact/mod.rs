@@ -77,7 +77,6 @@ pub enum StageProvenance {
     Guest,
     MergedVertex,
     LayerPassthrough,
-    HostQuad,
     HostTessellationControl,
 }
 

@@ -132,7 +132,7 @@ impl MaxwellThreeDRenderEnableState<'_> {
             *self.address_lower().value()?,
         ))
     }
-    pub(in crate::engines) fn execution_mode(&self) -> Option<MaxwellThreeDRenderEnableMode> {
+    pub fn execution_mode(&self) -> Option<MaxwellThreeDRenderEnableMode> {
         match self.override_mode().value()? {
             MaxwellThreeDRenderEnableOverride::AlwaysRender => {
                 Some(MaxwellThreeDRenderEnableMode::Enabled)

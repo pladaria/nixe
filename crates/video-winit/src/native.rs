@@ -165,7 +165,7 @@ impl Presenter {
                 &self.common.window,
             )
         });
-        // The GPU owner already retains the last immutable scanout. Capturing
+        // The GPU owner retains the last completed composition. Capturing
         // it does not require a new guest frame, including during host pause.
         let screenshot = self
             .common

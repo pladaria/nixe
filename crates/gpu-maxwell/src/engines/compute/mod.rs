@@ -7,7 +7,7 @@ mod operations;
 mod qmd;
 mod state;
 
-pub(crate) use launch::{ComputeResources, resolve_compute_launch};
+pub use launch::resolve_compute_launch;
 pub use launch::{MaxwellComputeLaunch, MaxwellComputeLaunchError, MaxwellResolvedComputeLaunch};
 
 pub use operations::{
@@ -28,19 +28,8 @@ pub use state::{
     MaxwellComputeSmCount, MaxwellComputeSpaVersion, MaxwellComputeState, MaxwellComputeStateWrite,
 };
 
-use crate::engines::PendingEngineOperation;
 use nixe_gpu::GpuClassId;
 
-use super::MaxwellEngineDispatchError;
-use crate::MaxwellMethodDispatch;
+pub(super) use methods::call_method;
 
 pub(super) const CLASS: GpuClassId = GpuClassId(0xb1c0);
-
-pub(super) fn preflight(
-    class: GpuClassId,
-    method: MaxwellMethodDispatch,
-    candidate: &mut MaxwellComputeState,
-) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
-    debug_assert_eq!(class, CLASS);
-    methods::preflight(method, candidate)
-}

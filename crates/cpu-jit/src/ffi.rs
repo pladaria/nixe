@@ -6,6 +6,7 @@ pub struct Callbacks {
     pub code: unsafe extern "C" fn(*mut c_void, u64, *mut u32) -> bool,
     pub memory: unsafe extern "C" fn(*mut c_void, u64, u32, u32, *mut u64, *const u64) -> bool,
     pub counter: unsafe extern "C" fn(*mut c_void) -> u64,
+    pub instruction_cache: unsafe extern "C" fn(*mut c_void),
 }
 #[repr(C)]
 #[derive(Default)]

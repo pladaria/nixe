@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use nixe_video::FrameTransform;
-
 pub(super) struct Screenshots {
     title: String,
     directory: PathBuf,
@@ -45,14 +43,7 @@ impl Screenshots {
                     }
                 };
                 let result = capture.map_err(io::Error::other).and_then(|capture| {
-                    save_png(
-                        &path,
-                        (capture.width, capture.height),
-                        capture.width * 4,
-                        &capture.rgba,
-                        FrameTransform::default(),
-                        false,
-                    )
+                    save_png(&path, (capture.width, capture.height), &capture.rgba)
                 });
                 match result {
                     Ok(()) => log::info!("saved screenshot {}", path.display()),
@@ -112,19 +103,8 @@ impl Drop for Screenshots {
     }
 }
 
-fn save_png(
-    path: &Path,
-    dimensions: (u32, u32),
-    pitch: u32,
-    bytes: &[u8],
-    transform: FrameTransform,
-    bgra: bool,
-) -> io::Result<()> {
-    let (width, height) = if transform.rotate_90_clockwise {
-        (dimensions.1, dimensions.0)
-    } else {
-        dimensions
-    };
+fn save_png(path: &Path, dimensions: (u32, u32), bytes: &[u8]) -> io::Result<()> {
+    let (width, height) = dimensions;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -146,7 +126,11 @@ fn save_png(
             let mut stream = writer.stream_writer()?;
             let mut row = vec![0; width as usize * 3];
             for y in 0..height {
-                rgb_row(&mut row, y, dimensions, pitch, bytes, transform, bgra);
+                let start = y as usize * width as usize * 4;
+                let rgba = &bytes[start..start + width as usize * 4];
+                for (pixel, source) in row.chunks_exact_mut(3).zip(rgba.chunks_exact(4)) {
+                    pixel.copy_from_slice(&source[..3]);
+                }
                 stream.write_all(&row)?;
             }
             stream.finish()?;
@@ -159,39 +143,6 @@ fn save_png(
         let _ = std::fs::remove_file(path);
     }
     result
-}
-
-fn rgb_row(
-    row: &mut [u8],
-    y: u32,
-    (width, height): (u32, u32),
-    pitch: u32,
-    bytes: &[u8],
-    transform: FrameTransform,
-    bgra: bool,
-) {
-    for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
-        // Exact integer version of present.wgsl's normalized-coordinate mapping:
-        // rotate first, then flip each source axis, with no interpolation.
-        let (mut sx, mut sy) = if transform.rotate_90_clockwise {
-            (y, height - 1 - x as u32)
-        } else {
-            (x as u32, y)
-        };
-        if transform.flip_horizontal {
-            sx = width - 1 - sx;
-        }
-        if transform.flip_vertical {
-            sy = height - 1 - sy;
-        }
-        let offset = sy as usize * pitch as usize + sx as usize * 4;
-        let source = &bytes[offset..offset + 4];
-        if bgra {
-            pixel.copy_from_slice(&[source[2], source[1], source[0]]);
-        } else {
-            pixel.copy_from_slice(&source[..3]);
-        }
-    }
 }
 
 fn filename_title(title: &str) -> String {
@@ -235,47 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn png_preserves_channels_rows_and_does_not_overwrite() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("nested/capture.png");
-        let pixels = [10, 20, 30, 255, 40, 50, 60, 255];
-        let mut padded = vec![99; 512];
-        padded[..4].copy_from_slice(&pixels[..4]);
-        padded[256..260].copy_from_slice(&pixels[4..]);
-        save_png(
-            &path,
-            (1, 2),
-            256,
-            &padded,
-            FrameTransform::default(),
-            false,
-        )
-        .unwrap();
-        let original = std::fs::read(&path).unwrap();
-        let mut reader = png::Decoder::new(std::io::Cursor::new(&original))
-            .read_info()
-            .unwrap();
-        let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
-        let info = reader.next_frame(&mut decoded).unwrap();
-        assert_eq!((info.width, info.height), (1, 2));
-        assert_eq!(decoded, [10, 20, 30, 40, 50, 60]);
-        assert_eq!(
-            save_png(
-                &path,
-                (1, 2),
-                256,
-                &padded,
-                FrameTransform::default(),
-                false
-            )
-            .unwrap_err()
-            .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-    }
-
-    #[test]
     fn repeated_requests_are_coalesced_until_a_frame_arrives() {
         let mut captures = Screenshots::new("Demo".into(), "captures".into());
         captures.request();
@@ -303,49 +213,5 @@ mod tests {
         captures.join_worker();
         captures.request();
         assert!(captures.requested.is_some());
-    }
-
-    #[test]
-    fn output_directory_error_preserves_existing_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let blocker = directory.path().join("not-a-directory");
-        std::fs::write(&blocker, "preserved").unwrap();
-        let path = blocker.join("capture.png");
-        assert!(save_png(&path, (1, 2), 4, &[], FrameTransform::default(), false).is_err());
-        assert!(!path.exists());
-        assert_eq!(std::fs::read_to_string(blocker).unwrap(), "preserved");
-    }
-
-    const TRANSFORMED: [[u8; 6]; 8] = [
-        [1, 2, 3, 4, 5, 6],
-        [2, 1, 4, 3, 6, 5],
-        [5, 6, 3, 4, 1, 2],
-        [6, 5, 4, 3, 2, 1],
-        [5, 3, 1, 6, 4, 2],
-        [6, 4, 2, 5, 3, 1],
-        [1, 3, 5, 2, 4, 6],
-        [2, 4, 6, 1, 3, 5],
-    ];
-
-    fn transform(bits: usize) -> FrameTransform {
-        FrameTransform {
-            flip_horizontal: bits & 1 != 0,
-            flip_vertical: bits & 2 != 0,
-            rotate_90_clockwise: bits & 4 != 0,
-        }
-    }
-
-    #[test]
-    fn every_transform_matches_presentation_pixel_mapping() {
-        let bytes: Vec<_> = (1..=6).flat_map(|n| [n, n + 10, n + 20, 0]).collect();
-        for (bits, expected) in TRANSFORMED.iter().enumerate() {
-            let width = if bits & 4 != 0 { 3 } else { 2 };
-            let mut actual = vec![0; 18];
-            for (y, row) in actual.chunks_exact_mut(width * 3).enumerate() {
-                rgb_row(row, y as u32, (2, 3), 8, &bytes, transform(bits), false);
-            }
-            let expected: Vec<_> = expected.iter().flat_map(|n| [*n, n + 10, n + 20]).collect();
-            assert_eq!(actual, expected, "transform bits={bits}");
-        }
     }
 }

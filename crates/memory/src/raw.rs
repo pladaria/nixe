@@ -166,8 +166,9 @@ pub(crate) unsafe fn copy(source: *const u8, destination: *mut u8, bytes: usize)
     }
 }
 /// # Safety
-/// The source is admitted guest RAM with stable physical lifetime. Destination
-/// is exclusively owned host memory, disjoint from the guest backing.
+/// The source is live RAM in a retained machine. The caller resolves coherence;
+/// the instruction copy permits guest races without forming Rust references.
+/// Destination is exclusively owned host memory, disjoint from guest backing.
 #[inline]
 pub(crate) unsafe fn capture(mut source: *const u8, destination: &mut [u8]) {
     // Block-linear textures copy adjacent 16-byte runs. Load/store the whole

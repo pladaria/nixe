@@ -352,16 +352,12 @@ impl HorizonSvcDispatcher {
         })
     }
 
-    /// Wake the host supervisor for asynchronous input and display publications.
+    /// Wake the host supervisor for asynchronous input publications.
     #[must_use]
     pub fn with_host_events(
         self: std::sync::Arc<Self>,
         events: nixe_runtime::ExternalEventSender,
     ) -> std::sync::Arc<Self> {
-        self.resources
-            .graphics
-            .video
-            .set_host_events(events.clone());
         self.resources.system.hid.set_completion_events(events);
         self
     }
@@ -494,21 +490,19 @@ impl HorizonSvcDispatcher {
         self.resources.graphics.video.clone()
     }
 
-    /// Advances the guest display clock and signals VI VSync when due.
-    pub fn advance_video(
+    pub fn start_video(
         self: &std::sync::Arc<Self>,
-        elapsed: Duration,
-    ) -> Result<u64, crate::FramebufferError> {
-        self.resources.graphics.video.advance(elapsed)
+        events: nixe_runtime::ExternalEventSender,
+    ) -> Result<(), crate::FramebufferError> {
+        self.resources.graphics.video.start_conductor(events)
+    }
+    pub fn check_video(self: &std::sync::Arc<Self>) -> Result<(), crate::FramebufferError> {
+        self.resources.graphics.video.check_conductor()
     }
 
     /// Parks audio command execution while preserving guest session state.
     pub fn set_host_paused(self: &std::sync::Arc<Self>, paused: bool) {
         self.resources.audio.renderers.set_host_paused(paused);
-    }
-
-    pub fn next_video_deadline(self: &std::sync::Arc<Self>) -> Duration {
-        self.resources.graphics.video.next_display_deadline()
     }
 
     /// Publishes the latest player-one controller state to Horizon HID.

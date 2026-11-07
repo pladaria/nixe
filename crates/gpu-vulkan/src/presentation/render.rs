@@ -142,6 +142,38 @@ struct Texture {
     size: [usize; 2],
     sampler: Arc<Sampler>,
 }
+pub(crate) struct LayerImage {
+    pub view: Arc<AllocatedImageView>,
+    pub extent: [u32; 2],
+    pub format: vk::Format,
+    pub encoding: nixe_gpu::PresentationImageFormat,
+    pub crop: nixe_gpu::FrameCrop,
+    pub transform: nixe_gpu::FrameTransform,
+}
+impl LayerImage {
+    pub fn dimensions(&self) -> [u32; 2] {
+        if self.transform.rotate_90_clockwise {
+            [self.crop.height, self.crop.width]
+        } else {
+            [self.crop.width, self.crop.height]
+        }
+    }
+    pub fn content_rect(&self, extent: [u32; 2]) -> nixe_gpu::FrameCrop {
+        let [width, height] = self.dimensions().map(u64::from);
+        let [ow, oh] = extent.map(u64::from);
+        let (w, h) = if ow * height <= oh * width {
+            (ow, ow * height / width)
+        } else {
+            (oh * width / height, oh)
+        };
+        nixe_gpu::FrameCrop {
+            left: ((ow - w) / 2) as u32,
+            top: ((oh - h) / 2) as u32,
+            width: w as u32,
+            height: h as u32,
+        }
+    }
+}
 pub(crate) struct ScreenRenderer {
     pipelines: HashMap<(vk::Format, u8), Arc<NativePipeline>>,
     linear: Arc<Sampler>,
@@ -195,9 +227,8 @@ impl ScreenRenderer {
     }
     pub fn update_textures(
         &mut self,
-        cache: &mut VulkanResidency,
+        cache: &mut crate::residency::Residency<'_>,
         ui: &mut UiFrame,
-        samplers: &mut SamplerCache,
     ) -> Result<(), VulkanError> {
         for (id, deltas) in &ui.textures.set {
             for delta in deltas {
@@ -246,16 +277,18 @@ impl ScreenRenderer {
                         vk::SamplerAddressMode::MIRRORED_REPEAT
                     }
                 };
-                let sampler = samplers.get(
-                    &vk::SamplerCreateInfo::default()
-                        .min_filter(filter(delta.options.minification))
-                        .mag_filter(filter(delta.options.magnification))
-                        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-                        .address_mode_u(wrap)
-                        .address_mode_v(wrap)
-                        .address_mode_w(wrap)
-                        .max_lod(0.),
-                )?;
+                let sampler = Arc::clone(
+                    cache.texture_cache.samplers.get(
+                        &vk::SamplerCreateInfo::default()
+                            .min_filter(filter(delta.options.minification))
+                            .mag_filter(filter(delta.options.magnification))
+                            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                            .address_mode_u(wrap)
+                            .address_mode_v(wrap)
+                            .address_mode_w(wrap)
+                            .max_lod(0.),
+                    )?,
+                );
                 self.textures
                     .get_mut(id)
                     .ok_or(VulkanError::InvalidResource(
@@ -276,17 +309,15 @@ impl ScreenRenderer {
                         "UI texture update exceeds allocation",
                     ));
                 }
-                cache.device_mut().end_rendering();
+                cache.device_mut().end_rendering()?;
                 let device = cache.device_mut();
-                let slice = device
-                    .submission
-                    .reserve_upload(&mut device.dispatch, &bytes)?;
+                let slice = device.submission.reserve_upload(&bytes)?;
                 let device = cache.device_mut();
 
                 let old = if delta.pos.is_none() {
                     vk::ImageLayout::UNDEFINED
                 } else {
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    vk::ImageLayout::GENERAL
                 };
                 transition(
                     device,
@@ -327,13 +358,13 @@ impl ScreenRenderer {
                     device,
                     texture.view.image.handle,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
                     vk::PipelineStageFlags2::TRANSFER,
                     vk::AccessFlags2::TRANSFER_WRITE,
                     vk::PipelineStageFlags2::FRAGMENT_SHADER,
                     vk::AccessFlags2::SHADER_SAMPLED_READ,
                 );
-                let work = cache.device_mut().work_ticket()?;
+                let work = cache.device_mut().current_work();
                 cache
                     .device_mut()
                     .retire_image_views(vec![Arc::clone(&texture.view)], work)?;
@@ -350,27 +381,26 @@ impl ScreenRenderer {
     #[allow(clippy::too_many_arguments)]
     pub fn screen(
         &self,
-        cache: &mut VulkanResidency,
+        cache: &mut crate::residency::Residency<'_>,
         descriptors: &mut DescriptorCache,
         pipeline: Arc<NativePipeline>,
-        frame: &frames::Snapshot,
-        source: &Source,
-        target: vk::ImageView,
+        frame: &LayerImage,
+        target: &Arc<crate::render_pass::Framebuffer>,
         extent: vk::Extent2D,
         format: vk::Format,
         letterbox: bool,
     ) -> Result<(), VulkanError> {
-        if source.crop.width == 0
-            || source.crop.height == 0
-            || source
+        if frame.crop.width == 0
+            || frame.crop.height == 0
+            || frame
                 .crop
                 .left
-                .checked_add(source.crop.width)
+                .checked_add(frame.crop.width)
                 .is_none_or(|x| x > frame.extent[0])
-            || source
+            || frame
                 .crop
                 .top
-                .checked_add(source.crop.height)
+                .checked_add(frame.crop.height)
                 .is_none_or(|y| y > frame.extent[1])
         {
             return Err(VulkanError::InvalidResource(
@@ -387,7 +417,7 @@ impl ScreenRenderer {
             &[
                 DescriptorResource::Image {
                     view: Arc::clone(&frame.view),
-                    layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    layout: vk::ImageLayout::GENERAL,
                 },
                 DescriptorResource::Sampler(Arc::clone(sampler)),
             ],
@@ -404,7 +434,7 @@ impl ScreenRenderer {
             extent,
         );
         if letterbox {
-            let [width, height] = source.dimensions().map(u64::from);
+            let [width, height] = frame.dimensions().map(u64::from);
             let ow = u64::from(extent.width);
             let oh = u64::from(extent.height);
             let (w, h) = if ow * height <= oh * width {
@@ -424,19 +454,19 @@ impl ScreenRenderer {
         let graphics = cache.prepare_host_graphics(pipeline, record, parameters)?;
         let mut push = [0u8; 32];
         for (i, value) in [
-            source.crop.left as f32 / frame.extent[0] as f32,
-            source.crop.top as f32 / frame.extent[1] as f32,
-            source.crop.width as f32 / frame.extent[0] as f32,
-            source.crop.height as f32 / frame.extent[1] as f32,
+            frame.crop.left as f32 / frame.extent[0] as f32,
+            frame.crop.top as f32 / frame.extent[1] as f32,
+            frame.crop.width as f32 / frame.extent[0] as f32,
+            frame.crop.height as f32 / frame.extent[1] as f32,
         ]
         .into_iter()
         .enumerate()
         {
             push[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
-        let bits = u32::from(source.transform.flip_horizontal)
-            | (u32::from(source.transform.flip_vertical) << 1)
-            | (u32::from(source.transform.rotate_90_clockwise) << 2);
+        let bits = u32::from(frame.transform.flip_horizontal)
+            | (u32::from(frame.transform.flip_vertical) << 1)
+            | (u32::from(frame.transform.rotate_90_clockwise) << 2);
         for (i, value) in [
             bits,
             0,
@@ -451,25 +481,22 @@ impl ScreenRenderer {
         cache.bind_host_graphics(&graphics, &push)?;
         let device = cache.device_mut();
 
-        let attachments = [vk::RenderingAttachmentInfo::default()
-            .image_view(target)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(vk::ClearValue {
+        let mut pass = target.key;
+        pass.color_clear = 1;
+        device.begin_render_pass(
+            target,
+            pass,
+            vk::Rect2D {
+                offset: Default::default(),
+                extent,
+            },
+            &[vk::ClearValue {
                 color: vk::ClearColorValue {
                     float32: [0., 0., 0., 1.],
                 },
-            })];
-        let info = vk::RenderingInfo::default()
-            .render_area(vk::Rect2D {
-                offset: Default::default(),
-                extent,
-            })
-            .layer_count(1)
-            .color_attachments(&attachments);
+            }],
+        )?;
         unsafe {
-            device.dispatch.begin_rendering(&info, Default::default());
             device.dispatch.cmd_draw(3, 1, 0, 0);
             device.dispatch.end_rendering();
         }
@@ -478,11 +505,11 @@ impl ScreenRenderer {
     #[allow(clippy::too_many_arguments)]
     pub fn ui(
         &mut self,
-        cache: &mut VulkanResidency,
+        cache: &mut crate::residency::Residency<'_>,
         descriptors: &mut DescriptorCache,
         pipeline: Arc<NativePipeline>,
         ui: &mut UiFrame,
-        target: vk::ImageView,
+        target: &Arc<crate::render_pass::Framebuffer>,
         extent: vk::Extent2D,
         format: vk::Format,
     ) -> Result<(), VulkanError> {
@@ -532,13 +559,9 @@ impl ScreenRenderer {
         // The owner staging arena also serves vertex/index fetch directly;
         // these slices cannot recycle before this command slot completes.
         let device = cache.device_mut();
-        let slot = device.begin_recording()?;
-        let vertices = device
-            .submission
-            .reserve_upload(&mut device.dispatch, &self.vertices)?;
-        let indices = device
-            .submission
-            .reserve_upload(&mut device.dispatch, &self.indices)?;
+        let slot = device.recording_slot()?;
+        let vertices = device.submission.reserve_upload(&self.vertices)?;
+        let indices = device.submission.reserve_upload(&self.indices)?;
         let vertex_handle = cache
             .device_mut()
             .submission
@@ -552,8 +575,7 @@ impl ScreenRenderer {
         let mut push = [0u8; 8];
         push[..4].copy_from_slice(&(extent.width as f32 / ui.pixels_per_point).to_le_bytes());
         push[4..8].copy_from_slice(&(extent.height as f32 / ui.pixels_per_point).to_le_bytes());
-        cache.device_mut().end_rendering();
-        cache.device_mut().begin_recording()?;
+        cache.device_mut().end_rendering()?;
 
         let dependency = [vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -568,24 +590,15 @@ impl ScreenRenderer {
                 .dispatch
                 .barrier(&vk::DependencyInfo::default().memory_barriers(&dependency));
         }
-        let attachments = [vk::RenderingAttachmentInfo::default()
-            .image_view(target)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(vk::AttachmentStoreOp::STORE)];
-        let info = vk::RenderingInfo::default()
-            .render_area(vk::Rect2D {
+        cache.device_mut().begin_render_pass(
+            target,
+            target.key,
+            vk::Rect2D {
                 offset: Default::default(),
                 extent,
-            })
-            .layer_count(1)
-            .color_attachments(&attachments);
-        unsafe {
-            cache
-                .device_mut()
-                .dispatch
-                .begin_rendering(&info, Default::default());
-        }
+            },
+            &[],
+        )?;
         let draw_result = (|| -> Result<(), VulkanError> {
             for (texture, clip, first, count, base) in ranges {
                 let texture = self
@@ -599,7 +612,7 @@ impl ScreenRenderer {
                     &[
                         DescriptorResource::Image {
                             view: Arc::clone(&texture.view),
-                            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            layout: vk::ImageLayout::GENERAL,
                         },
                         DescriptorResource::Sampler(Arc::clone(&texture.sampler)),
                     ],
@@ -630,11 +643,21 @@ impl ScreenRenderer {
                 let device = cache.device_mut();
 
                 unsafe {
-                    device.dispatch.cmd_bind_vertex_buffers(
-                        0,
-                        &[vertex_handle],
-                        &[vertices.offset],
-                    );
+                    if device.profile().dynamic_state.base {
+                        device.dispatch.cmd_bind_vertex_buffers2(
+                            0,
+                            &[vertex_handle],
+                            &[vertices.offset],
+                            &[vertices.size],
+                            &[std::mem::size_of::<egui::epaint::Vertex>() as u64],
+                        );
+                    } else {
+                        device.dispatch.cmd_bind_vertex_buffers(
+                            0,
+                            &[vertex_handle],
+                            &[vertices.offset],
+                        );
+                    }
                     device.dispatch.cmd_bind_index_buffer(
                         index_handle,
                         indices.offset,
@@ -642,7 +665,7 @@ impl ScreenRenderer {
                     );
                     device.dispatch.cmd_draw_indexed(count, 1, first, base, 0);
                 }
-                let work = cache.device_mut().work_ticket()?;
+                let work = cache.device_mut().current_work();
                 cache
                     .device_mut()
                     .retire_image_views(vec![Arc::clone(&texture.view)], work)?;
@@ -652,12 +675,8 @@ impl ScreenRenderer {
         unsafe {
             cache.device_mut().dispatch.end_rendering();
         }
-        // Host UI changed raw vertex/index binds; invalidate guest bind knowledge.
-        cache.device_mut().submission.slots[slot]
-            .vertex_bindings
-            .clear();
-        cache.device_mut().submission.slots[slot].current_vertices = None;
-        cache.device_mut().submission.slots[slot].index_binding = None;
+        // Host UI changed raw vertex binds; invalidate the current guest channel.
+        cache.device_mut().submission.slots[slot].vertex_channel = None;
         draw_result?;
         self.free_textures(ui);
         Ok(())

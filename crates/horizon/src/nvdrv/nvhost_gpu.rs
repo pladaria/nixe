@@ -623,9 +623,8 @@ fn submit_gpfifo(
         request,
         dispatch,
         channel,
-        dispatch_address_space.memory().clone(),
+        dispatch_address_space.id(),
         reservation.clone(),
-        Arc::clone(resources.control),
         permit,
     );
 

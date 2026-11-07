@@ -2,8 +2,6 @@
 
 use std::fmt::{Display, Formatter};
 
-use nixe_memory::MemoryPermissions;
-
 use super::{
     MaxwellComputeAddress, MaxwellComputeState,
     qmd::{MaxwellComputeQmd, QMD_SIZE},
@@ -51,43 +49,14 @@ impl MaxwellComputeLaunch {
 /// Failure while consuming a scheduled QMD. No completion is emitted on failure.
 #[derive(Clone, Debug)]
 pub enum MaxwellComputeLaunchError {
-    Resource {
-        source: Box<MaxwellMethodSource>,
-        error: Box<crate::MaxwellThreeDResourceError>,
-    },
     Execution {
         source: Box<MaxwellMethodSource>,
         reason: &'static str,
-    },
-    Buffer {
-        source: Box<MaxwellMethodSource>,
-        binding: u8,
-        reason: &'static str,
-    },
-    StorageDescriptor {
-        source: Box<MaxwellMethodSource>,
-        binding: u8,
-        offset: u32,
-        address: u64,
-        size: u64,
     },
     Address {
         source: Box<MaxwellMethodSource>,
         address: u64,
         error: MaxwellGpuAccessError,
-    },
-    GlobalBufferAddress {
-        source: Box<MaxwellMethodSource>,
-        constant_buffer: u8,
-        byte_offset: u32,
-        address: u64,
-        size: u64,
-        error: MaxwellGpuAccessError,
-    },
-    CanonicalRead {
-        source: Box<MaxwellMethodSource>,
-        address: u64,
-        error: std::sync::Arc<nixe_memory::MemoryError>,
     },
     QmdVersion {
         source: Box<MaxwellMethodSource>,
@@ -108,21 +77,9 @@ pub enum MaxwellComputeLaunchError {
 impl Display for MaxwellComputeLaunchError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Resource { source, error } => write!(
-                f,
-                "compute resource resolution failed: {error}; source=[{source}]"
-            ),
             Self::Execution { source, reason } => {
                 write!(f, "unsupported compute launch: {reason}; source=[{source}]")
             }
-            Self::Buffer {
-                source,
-                binding,
-                reason,
-            } => write!(
-                f,
-                "compute buffer binding {binding} is unsupported: {reason}; source=[{source}]"
-            ),
             Self::Address {
                 source,
                 address,
@@ -130,35 +87,6 @@ impl Display for MaxwellComputeLaunchError {
             } => write!(
                 f,
                 "compute memory access failed: address={address:#012x} source=[{source}]: {error}"
-            ),
-            Self::StorageDescriptor {
-                source,
-                binding,
-                offset,
-                address,
-                size,
-            } => write!(
-                f,
-                "invalid compute storage descriptor: c[{binding}][{offset:#x}] address={address:#012x} size={size:#x}; source=[{source}]"
-            ),
-            Self::GlobalBufferAddress {
-                source,
-                constant_buffer,
-                byte_offset,
-                address,
-                size,
-                error,
-            } => write!(
-                f,
-                "compute global buffer access failed: c[{constant_buffer}][{byte_offset:#x}] address={address:#012x} size={size:#x} source=[{source}]: {error}"
-            ),
-            Self::CanonicalRead {
-                source,
-                address,
-                error,
-            } => write!(
-                f,
-                "compute canonical read failed: address={address:#012x} source=[{source}]: {error}"
             ),
             Self::QmdVersion {
                 source,
@@ -191,95 +119,19 @@ pub struct MaxwellResolvedComputeLaunch {
     source: MaxwellMethodSource,
     program_address: u64,
     qmd: MaxwellComputeQmd,
-    pub(crate) texture_pool: Option<crate::recompiler::TexturePool>,
-    pub(crate) sampler_pool: Option<crate::recompiler::TexturePool>,
+    pub texture_pool: Option<crate::recompiler::TexturePool>,
+    pub sampler_pool: Option<crate::recompiler::TexturePool>,
     texture_cbuf: u32,
 }
 
-pub(crate) struct ComputeResources {
-    pub bindings: Vec<(
-        nixe_gpu::shader_module::ResourceId,
-        Option<crate::MaxwellResolvedRange>,
-    )>,
-    pub textures: Option<super::super::threed::ComputeTextures>,
-    inputs: [Option<(u64, u64)>; 8],
-    descriptors: Vec<crate::shader::memory::MaxwellShaderRead>,
-    address_space: crate::MaxwellAddressSpaceId,
-    mapping_generation: u64,
-}
-impl ComputeResources {
-    pub(crate) fn refresh(
-        &mut self,
-        launch: &MaxwellResolvedComputeLaunch,
-        space: &MaxwellGpuMemory,
-        memory: &mut crate::recompiler::MemoryCache,
-        access: &mut nixe_gpu::MemoryAccess<'_>,
-        textures: &mut super::super::threed::MaxwellThreeDResolvedResourceCache,
-    ) -> Result<bool, MaxwellComputeLaunchError> {
-        if self.address_space != space.id()
-            || self.inputs.iter().enumerate().any(|(slot, input)| {
-                input.is_some_and(|expected| launch.qmd.constant_buffer(slot as u8) != Ok(expected))
-            })
-        {
-            return Ok(false);
-        }
-        let generation = space.mapping_generation().get();
-        if self.mapping_generation != generation {
-            if self
-                .bindings
-                .iter()
-                .filter_map(|(_, range)| range.as_ref())
-                .any(|range| {
-                    range
-                        .segments()
-                        .iter()
-                        .any(|s| !space.retained_mapping_is_current(s.mapping()))
-                })
-            {
-                return Ok(false);
-            }
-            self.mapping_generation = generation;
-        }
-        let mut view = crate::shader::memory::MaxwellShaderMemoryView::new(space, memory, access);
-        for previous in &mut self.descriptors {
-            if previous.is_current(space) {
-                continue;
-            }
-            let current = view
-                .read(
-                    crate::MaxwellShaderStage::Compute,
-                    previous.address,
-                    previous.bytes.len(),
-                )
-                .map_err(|error| MaxwellComputeLaunchError::CanonicalRead {
-                    source: Box::new(launch.source),
-                    address: previous.address,
-                    error: std::sync::Arc::new(nixe_memory::MemoryError::Execution(
-                        error.to_string().into(),
-                    )),
-                })?;
-            if current.bytes != previous.bytes {
-                return Ok(false);
-            }
-            *previous = current;
-        }
-        if let Some(current) = &mut self.textures {
-            return current
-                .refresh(launch, space, textures, access)
-                .map_err(|error| MaxwellComputeLaunchError::Resource {
-                    source: Box::new(launch.source),
-                    error: Box::new(error),
-                });
-        }
-        Ok(true)
-    }
-}
-
 impl MaxwellResolvedComputeLaunch {
-    pub(crate) fn constant_buffer(&self, slot: u8) -> Result<(u64, u64), &'static str> {
+    pub(crate) fn source(&self) -> MaxwellMethodSource {
+        self.source
+    }
+    pub fn constant_buffer(&self, slot: u8) -> Result<(u64, u64), &'static str> {
         self.qmd.constant_buffer(slot)
     }
-    pub(crate) fn validate_execution(&self) -> Result<(), MaxwellComputeLaunchError> {
+    pub fn validate_execution(&self) -> Result<(), MaxwellComputeLaunchError> {
         self.qmd
             .validate_execution()
             .map_err(|reason| MaxwellComputeLaunchError::Execution {
@@ -288,16 +140,24 @@ impl MaxwellResolvedComputeLaunch {
             })
     }
 
-    pub(crate) fn workgroups(&self) -> [u32; 3] {
+    pub fn shader_address(&self) -> u64 {
+        self.program_address
+    }
+    pub fn shared_memory_size(&self) -> u32 {
+        self.qmd.shared_memory_size()
+    }
+    pub fn workgroup_size(&self) -> [u32; 3] {
+        self.qmd.workgroup_size()
+    }
+    pub fn workgroups(&self) -> [u32; 3] {
         self.qmd.workgroups()
     }
 }
 
-pub(crate) fn resolve_compute_launch(
+pub fn resolve_compute_launch(
     launch: &MaxwellComputeLaunch,
     state: &MaxwellComputeState,
     address_space: &MaxwellGpuMemory,
-    access: &mut nixe_gpu::MemoryAccess<'_>,
 ) -> Result<MaxwellResolvedComputeLaunch, MaxwellComputeLaunchError> {
     let source = launch.source();
     if state.shader_exceptions_enable().value() == Some(&true) {
@@ -318,7 +178,7 @@ pub(crate) fn resolve_compute_launch(
         .map_err(memory_error)?;
     let mut bytes = [0; QMD_SIZE];
     address_space
-        .read_into(gpu_address, &mut bytes, access)
+        .read_into_unsafe(gpu_address, &mut bytes)
         .map_err(memory_error)?;
     let qmd = MaxwellComputeQmd::decode(&bytes).map_err(|(major, minor)| {
         MaxwellComputeLaunchError::QmdVersion {
@@ -411,651 +271,19 @@ impl MaxwellResolvedComputeLaunch {
             bindings,
         }
     }
-
-    pub(crate) fn native_resources(
-        &self,
-        info: &nixe_shader_recompiler::artifact::ShaderInfo,
-        storage_alignment: u64,
-        space: &MaxwellGpuMemory,
-        memory: &mut crate::recompiler::MemoryCache,
-        access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<ComputeResources, MaxwellComputeLaunchError> {
-        use nixe_shader_recompiler::{Stage, artifact::ResourceSource};
-        let fail = |binding, reason| MaxwellComputeLaunchError::Buffer {
-            source: Box::new(self.source),
-            binding,
-            reason,
-        };
-        let resolve = |address, size, permissions| {
-            let error = |error| MaxwellComputeLaunchError::Address {
-                source: Box::new(self.source),
-                address,
-                error,
-            };
-            space
-                .address(address)
-                .map_err(MaxwellGpuAccessError::Address)
-                .map_err(error)
-                .and_then(|address| {
-                    space
-                        .resolve_range(address, size, permissions)
-                        .map_err(error)
-                })
-        };
-        let resource = |source: &ResourceSource, index: u32| {
-            nixe_gpu::shader_module::guest_resource(Stage::Compute, source, index, 0)
-                .map_err(|_| fail(0, "compute resource identity exceeds host limits"))
-        };
-        let mut result = Vec::new();
-        let mut inputs = [None; 8];
-        let mut descriptors = Vec::new();
-        let mut memory = crate::shader::memory::MaxwellShaderMemoryView::new(space, memory, access);
-        for (index, descriptor) in info.constant_buffer_descriptors.iter().enumerate() {
-            let slot = u8::try_from(descriptor.index.0)
-                .map_err(|_| fail(0, "constant-buffer index exceeds QMD limits"))?;
-            let (address, size) = self
-                .qmd
-                .constant_buffer(slot)
-                .map_err(|reason| fail(slot, reason))?;
-            inputs[slot as usize] = Some((address, size));
-            result.push((
-                resource(
-                    &ResourceSource::ConstantBuffer(descriptor.clone()),
-                    index as u32,
-                )?,
-                Some(resolve(address, size, MemoryPermissions::READ)?),
-            ));
-        }
-        for (index, descriptor) in info.storage_buffers_descriptors.iter().enumerate() {
-            let slot = u8::try_from(descriptor.cbuf_index.0)
-                .map_err(|_| fail(0, "storage descriptor cbuf index exceeds QMD limits"))?;
-            let offset = u64::from(descriptor.cbuf_offset.0);
-            let (cb, size) = self
-                .qmd
-                .constant_buffer(slot)
-                .map_err(|reason| fail(slot, reason))?;
-            inputs[slot as usize] = Some((cb, size));
-            if offset + 12 > size {
-                return Err(fail(slot, "storage descriptor exceeds its constant buffer"));
-            }
-            let pointer_address = cb
-                .checked_add(offset)
-                .ok_or_else(|| fail(slot, "storage descriptor address overflows"))?;
-            let read = memory
-                .read(crate::MaxwellShaderStage::Compute, pointer_address, 12)
-                .map_err(|error| MaxwellComputeLaunchError::CanonicalRead {
-                    source: Box::new(self.source),
-                    address: pointer_address,
-                    error: std::sync::Arc::new(nixe_memory::MemoryError::Execution(
-                        error.to_string().into(),
-                    )),
-                })?;
-            descriptors.push(read);
-            let bytes = &descriptors.last().unwrap().bytes;
-            let address = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-            let size = u64::from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
-            if address == 0 {
-                result.push((
-                    resource(
-                        &ResourceSource::StorageBuffer(descriptor.clone()),
-                        index as u32,
-                    )?,
-                    None,
-                ));
-                continue;
-            }
-            if size == 0 || address & 3 != 0 {
-                return Err(MaxwellComputeLaunchError::StorageDescriptor {
-                    source: Box::new(self.source),
-                    binding: slot,
-                    offset: descriptor.cbuf_offset.0,
-                    address,
-                    size,
-                });
-            }
-            let permissions = if descriptor.is_written {
-                MemoryPermissions::READ_WRITE
-            } else {
-                MemoryPermissions::READ
-            };
-            let aligned = address / storage_alignment * storage_alignment;
-            let range = resolve(aligned, size + address - aligned, permissions).map_err(
-                |error| match error {
-                    MaxwellComputeLaunchError::Address {
-                        source,
-                        address,
-                        error,
-                    } => MaxwellComputeLaunchError::GlobalBufferAddress {
-                        source,
-                        constant_buffer: slot,
-                        byte_offset: descriptor.cbuf_offset.0,
-                        address,
-                        size,
-                        error,
-                    },
-                    error => error,
-                },
-            )?;
-            result.push((
-                resource(
-                    &ResourceSource::StorageBuffer(descriptor.clone()),
-                    index as u32,
-                )?,
-                Some(range),
-            ));
-        }
-        // Handle constant buffers are consumed on the command owner, even when
-        // texture lowering removed the corresponding loads from the shader.
-        // https://github.com/eden-emulator/mirror/blob/master/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
-        for descriptor in &info.texture_descriptors {
-            for index in [
-                Some(descriptor.cbuf_index),
-                descriptor
-                    .has_secondary
-                    .then_some(descriptor.secondary_cbuf_index),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                let slot = u8::try_from(index.0)
-                    .ok()
-                    .filter(|&slot| slot < 8)
-                    .ok_or_else(|| fail(0, "texture cbuf index exceeds QMD limits"))?;
-                inputs[usize::from(slot)] = Some(
-                    self.qmd
-                        .constant_buffer(slot)
-                        .map_err(|reason| fail(slot, reason))?,
-                );
-            }
-        }
-        result.sort_unstable_by_key(|(resource, _)| *resource);
-        Ok(ComputeResources {
-            bindings: result,
-            textures: None,
-            inputs,
-            descriptors,
-            address_space: space.id(),
-            mapping_generation: space.mapping_generation().get(),
-        })
-    }
 }
 
-#[cfg(test)]
-mod native_tests {
-    use super::*;
-    use crate::execution::MaxwellFrontend;
-    use nixe_gpu::{FrontendSubmissionId, native::NativeCommand};
-    use std::sync::Arc;
-
-    fn source() -> MaxwellMethodSource {
-        let mut channel = crate::engines::tests::three_d_channel();
-        crate::engines::tests::program_three_d(&mut channel, 0x19d0, 0x3c)
-    }
-    fn qmd(words: [u32; 64]) -> MaxwellComputeQmd {
-        MaxwellComputeQmd::decode(
-            &words
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
-        )
-        .unwrap()
-    }
-    #[test]
-    fn native_compute_uses_owned_captures_and_specializes_execution_facts() {
-        let (allocation, space, base) = crate::shader::test_support::mapped_memory();
-        crate::test_memory::write(&allocation, 8, &0xe300_0000_0007_000fu64.to_le_bytes()).unwrap();
-        let mut words = [0; 64];
-        words[0x48 / 4] = (4 << 16) | 0x17;
-        words[0x4c / 4] = 0x0001_0001;
-        words[0x30 / 4] = 1;
-        words[0x34 / 4] = 0x0001_0001;
-        let launch = |words| MaxwellResolvedComputeLaunch {
-            source: source(),
-            program_address: base,
-            qmd: qmd(words),
+#[cfg(feature = "test-support")]
+impl MaxwellResolvedComputeLaunch {
+    pub fn fixture(source: MaxwellMethodSource, program_address: u64, words: [u32; 64]) -> Self {
+        let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        Self {
+            source,
+            program_address,
+            qmd: MaxwellComputeQmd::decode(bytes.as_slice().try_into().unwrap()).unwrap(),
             texture_pool: None,
             sampler_pool: None,
             texture_cbuf: 0,
-        };
-        let config = nixe_gpu::shader_compilation::Configuration {
-            profile: nixe_shader_recompiler::Profile {
-                supported_spirv: 0x10500,
-                unified_descriptor_binding: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut frontend = crate::MaxwellNativeFrontend::new(config.clone());
-
-        let first = frontend
-            .lower_launch(
-                &launch(words),
-                space.memory(),
-                FrontendSubmissionId::new(1),
-                &mut crate::test_memory::access(space.memory().machine()),
-            )
-            .unwrap();
-        let NativeCommand::Dispatch { program: first, .. } = first.command else {
-            panic!("dispatch expected")
-        };
-        let inputs = &first.shader;
-        let artifacts = inputs
-            .compile(
-                &mut nixe_shader_recompiler::Compiler::new().unwrap(),
-                &config,
-                None,
-            )
-            .unwrap();
-        assert_eq!(artifacts[0].execution.workgroup_size, [4, 1, 1]);
-        words[0x30 / 4] = 5;
-        let second = frontend
-            .lower_launch(
-                &launch(words),
-                space.memory(),
-                FrontendSubmissionId::new(2),
-                &mut crate::test_memory::access(space.memory().machine()),
-            )
-            .unwrap();
-        let NativeCommand::Dispatch {
-            program: second,
-            groups,
-        } = second.command
-        else {
-            panic!("dispatch expected")
-        };
-        assert_eq!(groups, [5, 1, 1]);
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(frontend.statistics.shader_captures, 1);
-        words[0x44 / 4] = 64;
-        let third = frontend
-            .lower_launch(
-                &launch(words),
-                space.memory(),
-                FrontendSubmissionId::new(3),
-                &mut crate::test_memory::access(space.memory().machine()),
-            )
-            .unwrap();
-        let NativeCommand::Dispatch { program: third, .. } = third.command else {
-            panic!("dispatch expected")
-        };
-        assert_ne!(first.shader.identity, third.shader.identity);
-        assert_eq!(frontend.statistics.shader_captures, 2);
-    }
-
-    #[test]
-    fn compute_texture_arrays_consume_qmd_handles_and_refresh_changed_descriptors() {
-        use crate::engines::threed::{
-            MaxwellThreeDResolvedBinding, MaxwellThreeDResolvedResource,
-            MaxwellThreeDResolvedResourceCache,
-        };
-        use nixe_shader_recompiler::{
-            artifact::{ShaderInfo, TextureDescriptor},
-            types::{ByteOffset, CbufIndex, TextureType},
-        };
-        let (allocation, space, base) = crate::shader::test_support::mapped_memory();
-        let write_words = |offset, words: &[u32]| {
-            crate::test_memory::write(
-                &allocation,
-                offset,
-                &words
-                    .iter()
-                    .flat_map(|w| w.to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap()
-        };
-        let mut words = [0; 64];
-        words[0x48 / 4] = 0x17;
-        words[0x50 / 4] = 1;
-        words[0x74 / 4] = base as u32 + 0x100;
-        words[0x78 / 4] = (base >> 32) as u32 | (64 << 15);
-        let format = 0x08
-            | (2 << 7)
-            | (2 << 10)
-            | (2 << 13)
-            | (2 << 16)
-            | (2 << 19)
-            | (3 << 22)
-            | (4 << 25)
-            | (5 << 28);
-        let mut info = ShaderInfo::default();
-        info.texture_descriptors.push(TextureDescriptor {
-            texture_type: TextureType::Color2D,
-            cbuf_index: CbufIndex(0),
-            cbuf_offset: ByteOffset(0),
-            count: 2,
-            size_shift: 2,
-            ..Default::default()
-        });
-        for linked in [false, true] {
-            words[0x2c / 4] = u32::from(linked) << 30;
-            let pool = |offset| {
-                Some(crate::recompiler::TexturePool {
-                    address: base + offset,
-                    maximum_index: 0xfffff,
-                    via_header_index: linked,
-                })
-            };
-            let launch = MaxwellResolvedComputeLaunch {
-                source: source(),
-                program_address: base,
-                qmd: qmd(words),
-                texture_pool: pool(0x200),
-                sampler_pool: pool(0x300),
-                texture_cbuf: 0,
-            };
-            for index in 0..2 {
-                write_words(
-                    0x200 + index * 32,
-                    &[
-                        format,
-                        (base + 0x400 + index * 0x200) as u32,
-                        (base >> 32) as u32 | (2 << 21),
-                        2,
-                        7 | (1 << 23),
-                        7 | (1 << 31),
-                        0,
-                        0,
-                    ],
-                );
-                write_words(
-                    0x300 + index * 32,
-                    &[0, 2 | (2 << 4) | (3 << 6), 0, 0, 0, 0, 0, 0],
-                );
-            }
-            write_words(0x100, &[1, if linked { 0 } else { 1 << 20 }]);
-            let mut cache = MaxwellThreeDResolvedResourceCache::new(256);
-            let mut reads = crate::recompiler::MemoryCache::default();
-            let mut resources = launch
-                .native_resources(
-                    &info,
-                    256,
-                    space.memory(),
-                    &mut reads,
-                    &mut crate::test_memory::access(space.memory().machine()),
-                )
-                .unwrap();
-            resources.textures = cache
-                .resolve_compute_textures(
-                    &launch,
-                    &info,
-                    space.memory(),
-                    &mut crate::test_memory::access(space.memory().machine()),
-                )
-                .unwrap();
-            let textures = resources.textures.as_ref().unwrap();
-            assert_eq!(textures.bindings.len(), 4);
-            let images = textures
-                .bindings
-                .iter()
-                .filter_map(
-                    |(_, location)| match textures.resources.binding_at(*location) {
-                        Some(MaxwellThreeDResolvedBinding::Resource(
-                            MaxwellThreeDResolvedResource::Image { view: image, .. },
-                        )) => Some(image.source().offset().get()),
-                        Some(MaxwellThreeDResolvedBinding::Sampler(_)) => None,
-                        _ => panic!("resolved compute texture binding expected"),
-                    },
-                )
-                .collect::<Vec<_>>();
-            assert_eq!(images, [base + 0x600, base + 0x400]);
-            let refresh = |resources: &mut ComputeResources,
-                           cache: &mut MaxwellThreeDResolvedResourceCache,
-                           reads: &mut crate::recompiler::MemoryCache| {
-                resources
-                    .refresh(
-                        &launch,
-                        space.memory(),
-                        reads,
-                        &mut crate::test_memory::access(space.memory().machine()),
-                        cache,
-                    )
-                    .unwrap()
-            };
-            assert!(refresh(&mut resources, &mut cache, &mut reads));
-            write_words(0x110, &[42]);
-            assert!(
-                refresh(&mut resources, &mut cache, &mut reads),
-                "ordinary uniform contents are not handle dependencies"
-            );
-            write_words(
-                0x300 + if linked { 32 } else { 0 } + 4,
-                &[1 | (1 << 4) | (2 << 6)],
-            );
-            assert!(
-                !refresh(&mut resources, &mut cache, &mut reads),
-                "sampler RAM changes must invalidate without QMD writes"
-            );
-            resources.textures = cache
-                .resolve_compute_textures(
-                    &launch,
-                    &info,
-                    space.memory(),
-                    &mut crate::test_memory::access(space.memory().machine()),
-                )
-                .unwrap();
-            assert!(refresh(&mut resources, &mut cache, &mut reads));
-            write_words(0x200 + 32 + 16, &[6 | (1 << 23)]);
-            assert!(
-                !refresh(&mut resources, &mut cache, &mut reads),
-                "TIC RAM changes must invalidate without QMD writes"
-            );
-            resources.textures = cache
-                .resolve_compute_textures(
-                    &launch,
-                    &info,
-                    space.memory(),
-                    &mut crate::test_memory::access(space.memory().machine()),
-                )
-                .unwrap();
-            assert!(refresh(&mut resources, &mut cache, &mut reads));
-            write_words(0x100, &[0]);
-            assert!(
-                !refresh(&mut resources, &mut cache, &mut reads),
-                "handle RAM changes must invalidate without QMD writes"
-            );
         }
-    }
-
-    #[test]
-    fn native_storage_resources_use_descriptor_metadata_and_committed_runtime_extent() {
-        use nixe_shader_recompiler::{
-            artifact::{ConstantBufferDescriptor, ShaderInfo, StorageBufferDescriptor},
-            types::{ByteOffset, CbufIndex},
-        };
-        let (_allocation, mut space, base) = crate::shader::test_support::mapped_memory();
-        let mut words = [0; 64];
-        words[0x48 / 4] = 0x17;
-        words[0x50 / 4] = 1;
-        words[0x74 / 4] = base as u32 + 0x100;
-        words[0x78 / 4] = (base >> 32) as u32 | (64 << 15);
-        let launch = MaxwellResolvedComputeLaunch {
-            source: source(),
-            program_address: base,
-            qmd: qmd(words),
-            texture_pool: None,
-            sampler_pool: None,
-            texture_cbuf: 0,
-        };
-        let info = &mut ShaderInfo::default();
-        info.constant_buffer_descriptors
-            .push(ConstantBufferDescriptor {
-                index: CbufIndex(0),
-                count: 1,
-            })
-            .unwrap();
-        info.storage_buffers_descriptors
-            .push(StorageBufferDescriptor {
-                cbuf_index: CbufIndex(0),
-                cbuf_offset: ByteOffset(16),
-                count: 1,
-                is_written: true,
-            })
-            .unwrap();
-        crate::shader::test_support::write_shader_words(
-            space.memory(),
-            &[
-                (base + 0x110, base as u32 + 0x304),
-                (base + 0x114, (base >> 32) as u32),
-                (base + 0x118, 128),
-            ],
-        );
-        let mut cache = crate::recompiler::MemoryCache::default();
-        let mut textures =
-            super::super::super::threed::MaxwellThreeDResolvedResourceCache::default();
-        let mut resources = launch
-            .native_resources(
-                info,
-                256,
-                space.memory(),
-                &mut cache,
-                &mut crate::test_memory::access(space.memory().machine()),
-            )
-            .unwrap();
-        assert_eq!(resources.bindings.len(), 2);
-        assert_eq!(
-            resources.bindings[0]
-                .1
-                .as_ref()
-                .unwrap()
-                .segments()
-                .iter()
-                .map(|s| s.size())
-                .sum::<u64>(),
-            64
-        );
-        assert_eq!(
-            resources.bindings[1]
-                .1
-                .as_ref()
-                .unwrap()
-                .segments()
-                .iter()
-                .map(|s| s.size())
-                .sum::<u64>(),
-            132
-        );
-        use crate::engines::tests::register_benchmark::ALLOCATIONS;
-        let mut no_read = |_, _| panic!("unchanged bindings must not access guest memory");
-        ALLOCATIONS.with(|n| n.set(Some(0)));
-        let start = std::time::Instant::now();
-        for _ in 0..10000 {
-            assert!(
-                resources
-                    .refresh(
-                        &launch,
-                        space.memory(),
-                        &mut cache,
-                        &mut no_read,
-                        &mut textures
-                    )
-                    .unwrap()
-            );
-        }
-        let elapsed = start.elapsed();
-        let allocations = ALLOCATIONS.with(|n| n.replace(None).unwrap());
-        assert_eq!(allocations, 0);
-        println!(
-            "compute retained bindings: 10000 warm iterations, {elapsed:?}, {allocations} allocations, no memory reads"
-        );
-        let unrelated = crate::test_memory::allocate(space.memory().machine(), 0x1000);
-        space
-            .map(crate::MaxwellMapRequest {
-                allocation: crate::MaxwellAllocationId::new(9),
-                backing: crate::test_memory::ranges(&unrelated),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0,
-                kind: 0,
-                cacheable: false,
-                permissions: nixe_memory::MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        assert_ne!(
-            resources.mapping_generation,
-            space.memory().mapping_generation().get()
-        );
-        assert!(
-            resources
-                .refresh(
-                    &launch,
-                    space.memory(),
-                    &mut cache,
-                    &mut no_read,
-                    &mut textures
-                )
-                .unwrap()
-        );
-        assert_eq!(
-            resources.mapping_generation,
-            space.memory().mapping_generation().get()
-        );
-        // A runtime uniform shares the page with the SSBO pointer but is not
-        // itself a binding dependency. Refresh its proof without resolving again.
-        crate::shader::test_support::write_shader_words(space.memory(), &[(base + 0x104, 42)]);
-        assert!(
-            resources
-                .refresh(
-                    &launch,
-                    space.memory(),
-                    &mut cache,
-                    &mut crate::test_memory::access(space.memory().machine()),
-                    &mut textures
-                )
-                .unwrap()
-        );
-        assert!(
-            resources
-                .refresh(
-                    &launch,
-                    space.memory(),
-                    &mut cache,
-                    &mut no_read,
-                    &mut textures
-                )
-                .unwrap()
-        );
-        // A descriptor-only change must invalidate, including retries before a
-        // successful rebuild. No QMD/register write accompanies the RAM write.
-        crate::shader::test_support::write_shader_words(
-            space.memory(),
-            &[(base + 0x110, base as u32 + 0x404)],
-        );
-        for _ in 0..2 {
-            assert!(
-                !resources
-                    .refresh(
-                        &launch,
-                        space.memory(),
-                        &mut cache,
-                        &mut crate::test_memory::access(space.memory().machine()),
-                        &mut textures
-                    )
-                    .unwrap()
-            );
-        }
-        info.storage_buffers_descriptors
-            .push(StorageBufferDescriptor {
-                cbuf_index: CbufIndex(0),
-                cbuf_offset: ByteOffset(32),
-                count: 1,
-                is_written: true,
-            })
-            .unwrap();
-        let resources = launch
-            .native_resources(
-                info,
-                256,
-                space.memory(),
-                &mut crate::recompiler::MemoryCache::default(),
-                &mut crate::test_memory::access(space.memory().machine()),
-            )
-            .unwrap();
-        assert_eq!(resources.bindings.len(), 3);
-        assert!(resources.bindings[2].1.is_none());
     }
 }

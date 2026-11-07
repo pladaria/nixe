@@ -2,17 +2,17 @@
 //!
 //! https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clb1c0qmd.h#L236-L451
 
-pub(super) const QMD_SIZE: usize = 0x100;
+pub const QMD_SIZE: usize = 0x100;
 
 /// Retain the complete descriptor and validate controls at dispatch consumption.
-pub(super) struct MaxwellComputeQmd {
+pub struct MaxwellComputeQmd {
     words: [u32; QMD_SIZE / 4],
 }
 
 impl MaxwellComputeQmd {
     /// Consume launch controls before scheduling host work. Queue execution,
     /// releases, reference counters and resumed grids need distinct semantics.
-    pub(super) fn validate_execution(&self) -> Result<(), &'static str> {
+    pub fn validate_execution(&self) -> Result<(), &'static str> {
         // deko3d leaves this at reset. Validate even when translation is cached.
         // https://github.com/devkitPro/deko3d/blob/master/source/maxwell/gpu_compute.cpp
         if self.sass_version() != 0 {
@@ -50,7 +50,7 @@ impl MaxwellComputeQmd {
         // are likewise irrelevant with their enables clear.
         Ok(())
     }
-    pub(super) fn decode(bytes: &[u8; QMD_SIZE]) -> Result<Self, (u8, u8)> {
+    pub fn decode(bytes: &[u8; QMD_SIZE]) -> Result<Self, (u8, u8)> {
         let words = std::array::from_fn(|index| {
             u32::from_le_bytes(bytes[4 * index..4 * index + 4].try_into().unwrap())
         });
@@ -62,15 +62,15 @@ impl MaxwellComputeQmd {
         Ok(Self { words })
     }
 
-    pub(super) fn program_offset(&self) -> u32 {
+    pub fn program_offset(&self) -> u32 {
         self.words[0x20 / 4]
     }
 
-    pub(super) fn sass_version(&self) -> u8 {
+    pub fn sass_version(&self) -> u8 {
         (self.words[0xbc / 4] >> 24) as u8
     }
 
-    pub(super) fn constant_buffer(&self, slot: u8) -> Result<(u64, u64), &'static str> {
+    pub fn constant_buffer(&self, slot: u8) -> Result<(u64, u64), &'static str> {
         if slot >= 8 || self.words[0x50 / 4] & (1 << slot) == 0 {
             return Err("constant buffer slot is not valid in the QMD");
         }
@@ -88,11 +88,11 @@ impl MaxwellComputeQmd {
         // and pending writes, never a stale copy of a driver constant buffer.
         Ok((address, size))
     }
-    pub(super) fn constant_buffer_enabled(&self, slot: u8) -> bool {
+    pub fn constant_buffer_enabled(&self, slot: u8) -> bool {
         slot < 8 && self.words[0x50 / 4] & (1 << slot) != 0
     }
 
-    pub(super) fn workgroups(&self) -> [u32; 3] {
+    pub fn workgroups(&self) -> [u32; 3] {
         [
             self.words[0x30 / 4],
             self.words[0x34 / 4] & 0xffff,
@@ -100,7 +100,7 @@ impl MaxwellComputeQmd {
         ]
     }
 
-    pub(super) fn workgroup_size(&self) -> [u32; 3] {
+    pub fn workgroup_size(&self) -> [u32; 3] {
         [
             self.words[0x48 / 4] >> 16,
             self.words[0x4c / 4] & 0xffff,
@@ -108,13 +108,13 @@ impl MaxwellComputeQmd {
         ]
     }
 
-    pub(super) fn shared_memory_size(&self) -> u32 {
+    pub fn shared_memory_size(&self) -> u32 {
         self.words[0x44 / 4] & 0x3ffff
     }
-    pub(super) fn local_memory_size(&self) -> u32 {
+    pub fn local_memory_size(&self) -> u32 {
         (self.words[0xb4 / 4] & 0xfffff) + (self.words[0xbc / 4] & 0xfffff)
     }
-    pub(super) fn linked_samplers(&self) -> bool {
+    pub fn linked_samplers(&self) -> bool {
         self.words[0x2c / 4] & (1 << 30) != 0
     }
 }

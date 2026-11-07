@@ -9,8 +9,8 @@ use std::fmt::{Display, Formatter};
 use nixe_gpu::{FrontendSubmissionId, GpuVirtualAddress, MappingGeneration};
 
 use crate::{
-    MaxwellAddressSpaceId, MaxwellChannelId, MaxwellGpuAccessError, MaxwellGpuMemory,
-    MaxwellGpuProfile, MaxwellMappingId,
+    MaxwellAddressSpaceId, MaxwellChannelId, MaxwellGpuAccessError, MaxwellGpuMemoryHandle,
+    MaxwellGpuProfile,
 };
 
 /// Size of one hardware-format GPFIFO descriptor.
@@ -224,7 +224,7 @@ impl MaxwellValidatedGpfifoSubmission {
     }
 }
 
-/// Exact pointer-free source location used by packet and retention errors.
+/// Exact hardware command cursor used by packet and execution errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellGpfifoSourceLocation {
     pub channel: MaxwellChannelId,
@@ -232,22 +232,14 @@ pub struct MaxwellGpfifoSourceLocation {
     pub entry_index: u32,
     pub pushbuffer: GpuVirtualAddress,
     pub word_offset: u64,
-    pub mapping: MaxwellMappingId,
-    pub generation: MappingGeneration,
 }
 
 impl Display for MaxwellGpfifoSourceLocation {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{} {} gpfifo-entry={} pushbuffer={} word-offset={} {} {}",
-            self.channel,
-            self.frontend,
-            self.entry_index,
-            self.pushbuffer,
-            self.word_offset,
-            self.mapping,
-            self.generation
+            "{} {} gpfifo-entry={} pushbuffer={} word-offset={}",
+            self.channel, self.frontend, self.entry_index, self.pushbuffer, self.word_offset
         )
     }
 }
@@ -341,7 +333,7 @@ pub fn validate_gpfifo_submission(
     channel: &crate::MaxwellChannelConfiguration,
     frontend: FrontendSubmissionId,
     decoded: MaxwellDecodedGpfifoSubmission,
-    address_space: &MaxwellGpuMemory,
+    address_space: &MaxwellGpuMemoryHandle,
 ) -> Result<MaxwellValidatedGpfifoSubmission, MaxwellGpfifoSourceError> {
     let channel_id = channel.id();
     let expected_address_space =

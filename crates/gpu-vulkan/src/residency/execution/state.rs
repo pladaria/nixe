@@ -1,8 +1,8 @@
 use super::*;
-/// Immutable changed-state preparation. Unchanged draws compare one Arc identity;
-/// values are not hashed and setters are not repeated on the recording path.
 pub struct GraphicsParameters {
     pub state: GraphicsState,
+    pub(crate) vertex_input: crate::native::VertexInput,
+    pub(crate) blending: crate::native::Blending,
     pub viewports: Box<[vk::Viewport]>,
     pub scissors: Box<[vk::Rect2D]>,
     pub line_width: f32,
@@ -14,25 +14,10 @@ pub struct GraphicsParameters {
     pub stencil_reference: [u32; 2],
 }
 impl GraphicsParameters {
-    fn same_state(&self, other: &Self) -> bool {
-        self.state == other.state
-            && self.viewports.len() == other.viewports.len()
-            && self.viewports.iter().zip(&other.viewports).all(|(a, b)| {
-                [a.x, a.y, a.width, a.height, a.min_depth, a.max_depth].map(f32::to_bits)
-                    == [b.x, b.y, b.width, b.height, b.min_depth, b.max_depth].map(f32::to_bits)
-            })
-            && self.scissors == other.scissors
-            && self.line_width.to_bits() == other.line_width.to_bits()
-            && self.depth_bias.map(f32::to_bits) == other.depth_bias.map(f32::to_bits)
-            && self.blend_constants.map(f32::to_bits) == other.blend_constants.map(f32::to_bits)
-            && self.depth_bounds.map(f32::to_bits) == other.depth_bounds.map(f32::to_bits)
-            && self.stencil_compare_mask == other.stencil_compare_mask
-            && self.stencil_write_mask == other.stencil_write_mask
-            && self.stencil_reference == other.stencil_reference
-    }
-
     pub fn new(state: GraphicsState, extent: vk::Extent2D) -> Self {
         Self {
+            vertex_input: crate::native::VertexInput::host(&state),
+            blending: crate::native::Blending::host(&state),
             state,
             viewports: Box::new([vk::Viewport {
                 x: 0.,
@@ -56,45 +41,17 @@ impl GraphicsParameters {
         }
     }
 }
-pub struct PreparedGraphics {
-    pub(super) program: Arc<PreparedProgram>,
-    pub(super) parameters: Arc<GraphicsParameters>,
+pub struct HostGraphics {
+    pub(crate) program: HostProgram,
+    pub(crate) parameters: GraphicsParameters,
 }
-#[derive(Clone)]
-pub(crate) struct PreparedGraphicsState {
-    pipeline: Arc<NativePipeline>,
-    parameters: Arc<GraphicsParameters>,
-}
-impl PreparedGraphicsState {
-    pub(crate) fn bind(
+impl Residency<'_> {
+    pub fn prepare_host_pipeline(
         &self,
-        program: Arc<PreparedProgram>,
-    ) -> Result<PreparedGraphics, VulkanError> {
-        if !Arc::ptr_eq(&self.pipeline, &program.pipeline) {
-            return Err(VulkanError::InvalidResource(
-                "graphics state belongs to another pipeline",
-            ));
-        }
-        Ok(PreparedGraphics {
-            program,
-            parameters: Arc::clone(&self.parameters),
-        })
-    }
-}
-impl VulkanResidency {
-    pub fn prepare_graphics(
-        &self,
-        program: PreparedProgram,
+        program: HostProgram,
         parameters: GraphicsParameters,
-    ) -> Result<PreparedGraphics, VulkanError> {
-        self.prepare_graphics_state(Arc::clone(&program.pipeline), parameters)?
-            .bind(Arc::new(program))
-    }
-    pub(crate) fn prepare_graphics_state(
-        &self,
-        pipeline: Arc<NativePipeline>,
-        parameters: GraphicsParameters,
-    ) -> Result<PreparedGraphicsState, VulkanError> {
+    ) -> Result<HostGraphics, VulkanError> {
+        let pipeline = &program.pipeline;
         if pipeline.bind_point != vk::PipelineBindPoint::GRAPHICS
             || pipeline.graphics.as_ref()
                 != Some(
@@ -108,7 +65,23 @@ impl VulkanResidency {
                 "graphics parameters differ from the compiled static pipeline state",
             ));
         }
-        let profile = self.device.profile();
+        parameters
+            .vertex_input
+            .validate(self.runtime.device.profile())?;
+        parameters
+            .blending
+            .validate(self.runtime.device.profile(), &parameters.state)?;
+        self.validate_dynamic_parameters(&parameters)?;
+        Ok(HostGraphics {
+            program,
+            parameters,
+        })
+    }
+    pub(crate) fn validate_dynamic_parameters(
+        &self,
+        parameters: &GraphicsParameters,
+    ) -> Result<(), VulkanError> {
+        let profile = self.runtime.device.profile();
         let limits = &profile.limits;
         if parameters.viewports.len() != parameters.state.viewport_count as usize
             || parameters.scissors.len() != parameters.viewports.len()
@@ -181,37 +154,48 @@ impl VulkanResidency {
                 "depth bounds exceed enabled normalized depthBounds contract",
             ));
         }
-        Ok(PreparedGraphicsState {
-            pipeline,
-            parameters: Arc::new(parameters),
-        })
+        Ok(())
     }
     pub(crate) fn graphics_state(
         &mut self,
-        graphics: &PreparedGraphics,
+        pipeline: &Arc<NativePipeline>,
+        p: &GraphicsParameters,
     ) -> Result<(), VulkanError> {
-        let index = self.device.begin_recording()?;
-        let slot = &mut self.device.submission.slots[index];
-        if slot
-            .graphics_parameters
-            .as_ref()
-            .is_some_and(|old| Arc::ptr_eq(old, &graphics.parameters))
-        {
-            return Ok(());
-        }
-        if slot
-            .graphics_parameters
-            .as_ref()
-            .is_some_and(|old| old.same_state(&graphics.parameters))
-        {
-            slot.graphics_parameters = Some(Arc::clone(&graphics.parameters));
-            return Ok(());
-        }
-        self.device.submission.statistics.graphics_updates += 1;
-        let p = &graphics.parameters;
-        let raw = &mut self.device.dispatch;
-
+        let index = self.runtime.device.recording_slot()?;
+        // Explicit host draws disturb the native context, as UI recording does
+        // in Eden. The next guest draw consumes its complete invalidation set.
+        self.runtime.device.submission.slots[index].graphics_state = Default::default();
+        let raw = &mut self.runtime.device.dispatch;
         unsafe {
+            if pipeline
+                .dynamic_states
+                .contains(&vk::DynamicState::COLOR_BLEND_ENABLE_EXT)
+                && p.blending.count != 0
+            {
+                let count = p.blending.count;
+                raw.cmd_set_color_blend_enable(
+                    &p.blending.attachments.map(|b| u32::from(b.enabled))[..count],
+                );
+                raw.cmd_set_color_write_mask(
+                    &p.blending.attachments.map(|b| b.write_mask)[..count],
+                );
+                raw.cmd_set_color_blend_equation(
+                    &p.blending.attachments.map(|b| vk::ColorBlendEquationEXT {
+                        src_color_blend_factor: b.src_color,
+                        dst_color_blend_factor: b.dst_color,
+                        color_blend_op: b.color_op,
+                        src_alpha_blend_factor: b.src_alpha,
+                        dst_alpha_blend_factor: b.dst_alpha,
+                        alpha_blend_op: b.alpha_op,
+                    })[..count],
+                );
+            }
+            if pipeline
+                .dynamic_states
+                .contains(&vk::DynamicState::VERTEX_INPUT_EXT)
+            {
+                raw.cmd_set_vertex_input(&p.vertex_input.bindings, &p.vertex_input.attributes);
+            }
             raw.cmd_set_viewport(0, &p.viewports);
             raw.cmd_set_scissor(0, &p.scissors);
             raw.cmd_set_line_width(p.line_width);
@@ -225,19 +209,15 @@ impl VulkanResidency {
                 raw.cmd_set_stencil_write_mask(face, p.stencil_write_mask[index]);
                 raw.cmd_set_stencil_reference(face, p.stencil_reference[index]);
             }
-            if graphics
-                .program
-                .pipeline
+            if pipeline
                 .dynamic_states
                 .contains(&vk::DynamicState::DEPTH_BOUNDS)
             {
                 raw.cmd_set_depth_bounds(p.depth_bounds[0], p.depth_bounds[1]);
             }
-            if self.device.dispatch.state.is_some() {
-                self.device.dispatch.dynamic_state(&p.state);
-            }
+            raw.dynamic_state(&p.state);
         }
-        slot.graphics_parameters = Some(Arc::clone(&graphics.parameters));
+        self.runtime.device.submission.statistics.graphics_updates += 1;
         Ok(())
     }
 }

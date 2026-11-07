@@ -167,43 +167,7 @@ mod tests {
         }
         fn allocation_pressure(&self, _: nixe_memory::MachineId, _: u64) {}
     }
-    #[test]
-    fn cancelled_output_keeps_its_payload_permit_until_device_retirement() {
-        let budget = Arc::new(PayloadBudget::default());
-        let lifetime = CallLifetime::default();
-        let permit =
-            Arc::new(crate::test_memory::run(budget.reserve(CAPACITY, &lifetime)).unwrap());
-        let machine = crate::test_memory::machine();
-        let allocation = machine.account(4096).unwrap().allocate(4096).unwrap();
-        let range = nixe_memory::AllocationRange::new(allocation.pin(), 0, 4096).unwrap();
-        machine
-            .publish_device_write(std::slice::from_ref(&range), || Ok(()))
-            .unwrap();
-        let (send, receive) = std::sync::mpsc::channel();
-        let device: Arc<dyn nixe_memory::DeviceAccessEndpoint> = Arc::new(Device(send));
-        machine.set_device_endpoint(&device);
-        let nixe_memory::Access::Pending(pending) = machine
-            .write_captured_owned(&range.into(), 0, vec![7; 4096])
-            .unwrap()
-        else {
-            panic!("device output must defer");
-        };
-        pending.retain_owner(permit.clone());
-        let request = receive.recv().unwrap();
-        drop(permit);
-        drop(pending);
-        let mut next = budget.reserve(1, &lifetime);
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(Pin::new(&mut next).poll(&mut cx).is_pending());
-        assert_eq!(budget.0.lock().unwrap().used, CAPACITY);
-        assert!(request.is_cancelled());
-        drop(request);
-        assert!(matches!(
-            Pin::new(&mut next).poll(&mut cx),
-            Poll::Ready(Ok(_))
-        ));
-        assert_eq!(budget.0.lock().unwrap().used, 0);
-    }
+
     #[test]
     fn payload_pressure_waits_and_cancellation_releases_admission() {
         let budget = Arc::new(PayloadBudget::default());

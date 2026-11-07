@@ -1,4 +1,4 @@
-//! Binding ABI experiment, available only with the explicit binding-probe feature.
+//! HostBinding ABI experiment, available only with the explicit binding-probe feature.
 use super::*;
 use crate::{BufferBinding, device::DeviceOwner};
 use std::collections::HashMap;
@@ -65,7 +65,7 @@ impl Descriptors {
         self.pool = vk::DescriptorPool::null();
     }
 }
-impl VulkanResidency {
+impl Residency<'_> {
     pub fn swap_rgba8_words(
         &mut self,
         buffer: BufferId,
@@ -74,7 +74,7 @@ impl VulkanResidency {
     ) -> Result<WorkTicket, VulkanError> {
         self.swap_rgba8_words_binding(buffer, offset, count, BufferBinding::DescriptorSet)
     }
-    /// Binding candidates for the focused probe. Guest shader ABI selection is
+    /// HostBinding candidates for the focused probe. Guest shader ABI selection is
     /// frozen before compilation; this helper does not select a guest backend.
     pub fn swap_rgba8_words_binding(
         &mut self,
@@ -83,8 +83,8 @@ impl VulkanResidency {
         count: u32,
         binding: BufferBinding,
     ) -> Result<WorkTicket, VulkanError> {
-        self.ensure_buffer(id)?;
         let size = u64::from(count) * 4;
+        self.ensure_buffer_range(id, offset, size)?;
         self.check_buffer_range(id, offset, size)?;
         if !offset.is_multiple_of(4) {
             return Err(VulkanError::InvalidResource(
@@ -92,10 +92,10 @@ impl VulkanResidency {
             ));
         }
         if binding == BufferBinding::DeviceAddress
-            && (!self.device.profile().buffer_device_address
-                || self.device.profile().core.shader_int64 == 0)
+            && (!self.runtime.device.profile().buffer_device_address
+                || self.runtime.device.profile().core.shader_int64 == 0)
             || binding == BufferBinding::DescriptorBuffer
-                && !self.device.profile().descriptor_buffer
+                && !self.runtime.device.profile().descriptor_buffer
         {
             return Err(VulkanError::InvalidResource(
                 "binding probe candidate is unsupported by the selected device",
@@ -103,7 +103,8 @@ impl VulkanResidency {
         }
         if binding != BufferBinding::DescriptorSet
             && !self
-                .buffer(id)?
+                .buffer_cache
+                .get(id)
                 .usage
                 .contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
         {
@@ -112,7 +113,8 @@ impl VulkanResidency {
             ));
         }
         if !self
-            .buffer(id)?
+            .buffer_cache
+            .get(id)
             .usage
             .contains(vk::BufferUsageFlags::STORAGE_BUFFER)
         {
@@ -120,8 +122,14 @@ impl VulkanResidency {
                 "compute conversion requires storage-buffer usage",
             ));
         }
-        if self.buffer(id)?.native.size()
-            > u64::from(self.device.profile().limits.max_storage_buffer_range)
+        if self.buffer_cache.get(id).native.size()
+            > u64::from(
+                self.runtime
+                    .device
+                    .profile()
+                    .limits
+                    .max_storage_buffer_range,
+            )
             && binding != BufferBinding::DeviceAddress
         {
             return Err(VulkanError::InvalidResource(
@@ -129,19 +137,26 @@ impl VulkanResidency {
             ));
         }
         let groups = count.div_ceil(64);
-        if groups > self.device.profile().limits.max_compute_work_group_count[0] {
+        if groups
+            > self
+                .runtime
+                .device
+                .profile()
+                .limits
+                .max_compute_work_group_count[0]
+        {
             return Err(VulkanError::InvalidResource(
                 "conversion dispatch exceeds host workgroup count; split the word interval",
             ));
         }
-        let owner = Arc::clone(&self.device.owner);
-        let program = self.helpers.compute(&owner, binding)?;
+        let owner = Arc::clone(&self.runtime.device.owner);
+        let program = self.runtime.helpers.compute(&owner, binding)?;
         let (pipeline, layout, set_layout) = (program.pipeline, program.layout, program.set_layout);
-        let buffer = self.buffer(id)?.native.handle;
-        let index = self.device.begin_recording()?;
-        let range = self.buffer(id)?.native.size();
+        let buffer = self.buffer_cache.get(id).native.handle;
+        let index = self.runtime.device.recording_slot()?;
+        let range = self.buffer_cache.get(id).native.size();
         let key = (set_layout, buffer, range);
-        let descriptors = &self.device.submission.slots[index].descriptors;
+        let descriptors = &self.runtime.device.submission.slots[index].descriptors;
         let mut data = if binding == BufferBinding::DeviceAddress {
             None
         } else if let Some((previous, data)) = descriptors.last
@@ -152,13 +167,18 @@ impl VulkanResidency {
             descriptors.cache.get(&key).copied()
         };
         if binding != BufferBinding::DeviceAddress && data.is_none() {
-            if self.device.submission.slots[index].descriptors.cache.len() == DESCRIPTOR_CAPACITY {
+            if self.runtime.device.submission.slots[index]
+                .descriptors
+                .cache
+                .len()
+                == DESCRIPTOR_CAPACITY
+            {
                 return Err(VulkanError::InvalidResource(
                     "binding probe descriptor storage exhausted",
                 ));
             }
             if binding == BufferBinding::DescriptorSet {
-                let descriptors = &mut self.device.submission.slots[index].descriptors;
+                let descriptors = &mut self.runtime.device.submission.slots[index].descriptors;
                 if descriptors.pool == vk::DescriptorPool::null() {
                     let sizes = [vk::DescriptorPoolSize::default()
                         .ty(vk::DescriptorType::STORAGE_BUFFER)
@@ -198,15 +218,16 @@ impl VulkanResidency {
                 data = Some(BindingData::Set(set));
             } else {
                 let extension = self
+                    .runtime
                     .descriptor_dispatch
                     .as_ref()
                     .expect("enabled descriptor dispatch");
                 let size = unsafe { extension.get_descriptor_set_layout_size(set_layout) };
                 let binding_offset =
                     unsafe { extension.get_descriptor_set_layout_binding_offset(set_layout, 0) };
-                let descriptor_size = self.device.profile().storage_buffer_descriptor_size;
+                let descriptor_size = self.runtime.device.profile().storage_buffer_descriptor_size;
                 let mut descriptor = vec![0; descriptor_size];
-                let address = self.buffer(id)?.address;
+                let address = self.buffer_cache.get(id).address;
                 let address_info = vk::DescriptorAddressInfoEXT::default()
                     .address(address)
                     .range(range);
@@ -218,8 +239,12 @@ impl VulkanResidency {
                 unsafe {
                     extension.get_descriptor(&info, &mut descriptor);
                 }
-                let alignment = self.device.profile().descriptor_buffer_offset_alignment;
-                if self.device.submission.slots[index]
+                let alignment = self
+                    .runtime
+                    .device
+                    .profile()
+                    .descriptor_buffer_offset_alignment;
+                if self.runtime.device.submission.slots[index]
                     .descriptors
                     .arena
                     .is_none()
@@ -228,7 +253,7 @@ impl VulkanResidency {
                         .max(alignment)
                         .max(owner.non_coherent_atom_size)
                         .next_power_of_two();
-                    self.constructing.push(Resource::Buffer(id));
+                    self.runtime.constructing.push(Resource::Buffer(id));
                     let allocated = allocate_buffer_charged(
                         &owner,
                         stride * DESCRIPTOR_CAPACITY as u64,
@@ -237,7 +262,8 @@ impl VulkanResidency {
                         MemoryLocation::CpuToGpu,
                         AllocationMode::Dedicated,
                         "helper descriptor arena",
-                        |bytes| self.reserve(bytes),
+                        0,
+                        |bytes| self.charge(bytes),
                     );
                     self.unpin(Resource::Buffer(id));
                     let allocated = allocated?;
@@ -251,14 +277,14 @@ impl VulkanResidency {
                             "descriptor arena address violates host alignment",
                         ));
                     }
-                    let descriptors = &mut self.device.submission.slots[index].descriptors;
+                    let descriptors = &mut self.runtime.device.submission.slots[index].descriptors;
                     descriptors.address = address;
                     descriptors.arena = Some(DescriptorArena {
                         buffer: Arc::new(allocated),
                         cursor: 0,
                     });
                 }
-                let descriptors = &mut self.device.submission.slots[index].descriptors;
+                let descriptors = &mut self.runtime.device.submission.slots[index].descriptors;
                 let arena = descriptors.arena.as_mut().expect("descriptor arena");
                 let offset =
                     arena
@@ -268,42 +294,38 @@ impl VulkanResidency {
                         ))?;
                 // Atom-isolated descriptor bytes are immutable until this slot completes.
                 unsafe {
-                    arena
-                        .buffer
-                        .write_range(offset + binding_offset, &descriptor)
+                    arena.buffer.write_with(
+                        offset + binding_offset,
+                        descriptor.len() as u64,
+                        |bytes| {
+                            bytes.copy_from_slice(&descriptor);
+                            Ok(())
+                        },
+                    )
                 }?;
                 data = Some(BindingData::Buffer(descriptors.address, offset));
             }
-            self.device.submission.slots[index]
+            self.runtime.device.submission.slots[index]
                 .descriptors
                 .cache
                 .insert(key, data.expect("created binding"));
         }
         if let Some(data) = data {
-            self.device.submission.slots[index].descriptors.last = Some((key, data));
+            self.runtime.device.submission.slots[index].descriptors.last = Some((key, data));
         }
-        self.buffer_access_range(
-            id,
-            offset,
-            size,
-            AccessScope::new(
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-            ),
-        )?;
-        let address = self.buffer(id)?.address;
-        self.barriers.emit(&mut self.device);
-        let slot = &mut self.device.submission.slots[index];
+        self.use_buffer(id, offset, size)?;
+        let address = self.buffer_cache.get(id).address;
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        let slot = &mut self.runtime.device.submission.slots[index];
 
         slot.bound_compute = 0;
         // This explicit diagnostic bind invalidates the producer's prepared binding.
         slot.bound_compute_binding = 0;
-        let extension = self.descriptor_dispatch.clone();
+        let extension = self.runtime.descriptor_dispatch.clone();
         // The probe uses the same typed command arena and worker context as
         // guest graphics; no drain or owner-thread command recording is needed.
         unsafe {
-            self.device.dispatch.record(move |ctx| {
-                ctx.flush_draw();
+            self.runtime.device.dispatch.record(move |ctx| {
                 let command = ctx.command;
                 let device = &ctx.device;
                 device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -367,11 +389,14 @@ impl VulkanResidency {
                 Ok(())
             })
         };
-        let writer = self.prepare_write(Resource::Buffer(id), offset, size)?;
-        self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.cmd_dispatch(groups, 1, 1);
-        })?;
+        self.prepare_write(Resource::Buffer(id), offset, size)?;
+        {
+            let device = &mut self.runtime.device;
+            unsafe {
+                device.dispatch.cmd_dispatch(groups, 1, 1);
+            }
+        };
         self.finish_buffer_write(id, offset, size)?;
-        self.device.work_ticket()
+        Ok(self.runtime.device.current_work())
     }
 }

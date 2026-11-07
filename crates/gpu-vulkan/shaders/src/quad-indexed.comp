@@ -1,0 +1,28 @@
+// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/host_shaders/vulkan_quad_indexed.comp
+#version 460 core
+layout(local_size_x = 1024) in;
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer { uint input_indexes[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer OutputBuffer { uint output_indexes[]; };
+layout(push_constant) uniform PushConstants {
+    uint base_vertex;
+    int index_shift;
+    int is_strip;
+    int source_index; // Element offset within the aligned storage descriptor.
+};
+void main() {
+    int primitive = int(gl_GlobalInvocationID.x);
+    if (primitive * 6 >= output_indexes.length()) { return; }
+    int index_size = 8 << index_shift;
+    int flipped_shift = 2 - index_shift;
+    int mask = (1 << flipped_shift) - 1;
+    const int quads_swizzle[6] = int[](0, 1, 2, 0, 2, 3);
+    const int strip_swizzle[6] = int[](0, 3, 1, 0, 2, 3);
+    for (uint vertex = 0; vertex < 6; ++vertex) {
+        int offset = source_index + (is_strip == 0 ? primitive * 4 + quads_swizzle[vertex] : primitive * 2 + strip_swizzle[vertex]);
+        uint packed_input = input_indexes[offset >> flipped_shift];
+        uint index = bitfieldExtract(packed_input, (offset & mask) * index_size, index_size);
+        output_indexes[primitive * 6 + vertex] = index + base_vertex;
+    }
+}

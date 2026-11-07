@@ -38,6 +38,7 @@ struct NixeCallbacks {
   bool (*memory)(void *, std::uint64_t, std::uint32_t, std::uint32_t, std::uint64_t *,
                  const std::uint64_t *);
   std::uint64_t (*counter)(void *);
+  void (*instruction_cache)(void *);
 };
 struct NixeExit {
   std::uint32_t kind, detail;
@@ -81,13 +82,22 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.fastmem_exclusive_access = true;
     conf.unsafe_optimizations = true;
     conf.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
-#if defined(__x86_64__)
-    conf.canonical_page_table = page_table;
-#endif
+    // Share the process bank with standard Dynarmic page-table fallback, as
+    // Eden's ArmDynarmic64::MakeJit. Each entry is a VA-relative RAM pointer;
+    // marked cached/checked pages enter the memory owner's callbacks.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/arm/dynarmic/arm_dynarmic_64.cpp#L199-L218
+    conf.page_table = reinterpret_cast<void **>(page_table);
+    conf.page_table_address_space_bits = address_bits;
+    conf.page_table_pointer_mask = ~std::uint64_t{0xfff};
+    conf.page_table_marked_bit = std::uint8_t{0};
+    conf.silently_mirror_page_table = false;
+    conf.absolute_offset_page_table = true;
+    conf.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;
+    conf.only_detect_misalignment_via_page_table_on_page_boundary = true;
     conf.fastmem_address_space_bits = address_bits;
     conf.silently_mirror_fastmem = false;
-    // Fault attribution selects the canonical PTE fallback after a fault.
-    // Untouched sites retain plain fastmem; a reopened page is direct again.
+    // A fault recompiles this site through the shared page-table pointer.
+    // Untouched sites keep fastmem; unmarked pages use direct RAM pointers.
     conf.recompile_on_fastmem_failure = true;
     conf.recompile_on_exclusive_fastmem_failure = true;
     jit = std::make_unique<Dynarmic::A64::Jit>(conf);
@@ -168,6 +178,8 @@ struct Core final : Dynarmic::A64::UserCallbacks {
   }
   void InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op,
                                        std::uint64_t value) override {
+    // Eden invalidates its current instruction page before processing IC.
+    callbacks.instruction_cache(context);
     switch (op) {
     case Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU:
       jit->InvalidateCacheRange(value & ~std::uint64_t{63}, 64);
@@ -176,9 +188,9 @@ struct Core final : Dynarmic::A64::UserCallbacks {
       jit->ClearCache();
       break;
     default:
-      jit->HaltExecution(HaltReason::CacheInvalidation);
       break;
     }
+    jit->HaltExecution(HaltReason::CacheInvalidation);
   }
   void AddTicks(std::uint64_t) override { std::terminate(); }
   std::uint64_t GetTicksRemaining() override { std::terminate(); }

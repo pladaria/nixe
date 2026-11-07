@@ -1,297 +1,246 @@
-//! Assemble hardware instance sequences before resource capture and native work.
+//! Primitive execution follows Maxwell DrawManager: counters program state,
+//! END executes general/inline draws, and instance sequences finish at a new
+//! first BEGIN or the end of their macro.
+//! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/draw_manager.cpp
 use super::*;
 use crate::MaxwellMethodSource;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct InstanceRun {
-    trigger: MaxwellThreeDOperationTrigger,
-    first: u32,
-    count: u32,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Mode {
+    #[default]
+    General,
+    Instance,
+    Inline,
+}
+/// Current hardware draw state, owned by the channel's DrawManager. Native
+/// consumers borrow this state; compilation keys never stand in for it.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.h
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaxwellThreeDDrawState {
+    pub topology: u32,
+    pub indexed: bool,
+    pub vertex_first: u32,
+    pub vertex_count: u32,
+    pub index: MaxwellThreeDDrawIndexBuffer,
+    pub base_vertex: u32,
+    pub base_instance: u32,
+    pub instance_count: u32,
+    mode: Mode,
+    instances: u32,
+    source: Option<MaxwellMethodSource>,
+    preparing: Option<MaxwellMethodSource>,
+    pub(super) inline_indices: Vec<u8>,
+    pub(super) inline_draw_pending: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaxwellThreeDDrawIndexBuffer {
+    pub address: u64,
+    pub limit: u64,
+    pub format: u32,
+    pub first: u32,
+    pub count: u32,
+}
+impl MaxwellThreeDDrawState {
+    pub fn inline_indices(&self) -> Option<&[u8]> {
+        self.inline_draw_pending
+            .then_some(self.inline_indices.as_slice())
+    }
 }
 
 pub(in crate::engines) fn is_pending(state: &MaxwellThreeDFrontendState) -> bool {
-    state.instance_run.is_some()
+    state.draw.mode == Mode::Instance && state.draw.instances != 0
 }
 
-// Eden's draw manager likewise defers instance sequences until another method
-// consumes them. Resource/state writes and observable operations flush first.
-// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/draw_manager.cpp
-pub(in crate::engines) async fn before_method<E>(
-    state: &mut MaxwellThreeDFrontendState,
-    source: MaxwellMethodSource,
-    consume: &mut impl AsyncFnMut(
-        PendingEngineOperation,
-        &MaxwellThreeDState,
-        Option<(u32, u32)>,
-    ) -> Result<(), E>,
-) -> Result<(), E> {
-    if !admit_method(state, source.method(), source.argument()) {
-        flush(state, consume).await?;
-    }
-    Ok(())
-}
-
-/// Admit methods that preserve a deferred instance run without constructing an
-/// asynchronous effect. Only an actual draw boundary requires the consumer.
+/// Only a new first BEGIN consumes a deferred instance sequence. Ordinary
+/// register writes do not probe/compare the previous draw's state.
 #[inline]
-pub(super) fn admit_method(
+pub(in crate::engines) fn admit_method(
     state: &mut MaxwellThreeDFrontendState,
     method: GpuMethodId,
     argument: u32,
 ) -> bool {
-    let Some(run) = state.instance_run else {
+    if method.0 != 0x1618 || !is_pending(state) {
         return true;
-    };
-    admit_pending_method(state, run, method, argument)
+    }
+    let argument = state.mme().resolve_shadow_argument(method, argument);
+    MaxwellThreeDBegin::parse(argument)
+        .is_none_or(|begin| begin.instance() != MaxwellThreeDBeginInstance::First)
 }
 
-#[inline(never)]
-fn admit_pending_method(
+pub(super) fn begin(
     state: &mut MaxwellThreeDFrontendState,
-    run: InstanceRun,
-    method: GpuMethodId,
     argument: u32,
-) -> bool {
-    if super::registers::passive(method)
-        && state.mme().shadow_ram_control().value()
-            != Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay)
-        && state.raw_register_value(method) == Some(argument)
-    {
-        return true;
-    }
-    let method = method.0;
-    let continuing = state.mme().shadow_ram_control().value()
-        != Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay)
-        && match method {
-            0x1614 => argument == 0,
-            0x1618 => MaxwellThreeDBegin::parse(argument).is_some_and(|next| {
-                next.instance() == MaxwellThreeDBeginInstance::Subsequent
-                    && state
-                        .operation_state()
-                        .vertex_input()
-                        .primitive()
-                        .begin()
-                        .value()
-                        .is_some_and(|prior| {
-                            next.topology() == prior.topology()
-                                && next.split_mode() == prior.split_mode()
-                                && next.preserve_primitive_id() == prior.preserve_primitive_id()
-                        })
-            }),
-            0x0d78 | 0x17e0 => {
-                let same = match run.trigger {
-                    MaxwellThreeDOperationTrigger::DrawVertexArray { vertex_count, .. } => {
-                        method == 0x0d78 && argument == vertex_count
-                    }
-                    MaxwellThreeDOperationTrigger::DrawIndexBuffer { index_count, .. } => {
-                        method == 0x17e0 && argument == index_count
-                    }
-                    _ => false,
-                };
-                same && run.first.checked_add(run.count)
-                    == Some(
-                        state
-                            .operation_state()
-                            .vertex_input()
-                            .primitive()
-                            .instance_index(),
-                    )
-            }
-            _ => false,
-        };
-    if continuing && method == 0x1618 {
-        state.complete_draw_end();
-    }
-    continuing
-}
-
-pub(in crate::engines) async fn operation<E>(
-    state: &mut MaxwellThreeDFrontendState,
-    operation: PendingEngineOperation,
-    consume: &mut impl AsyncFnMut(
-        PendingEngineOperation,
-        &MaxwellThreeDState,
-        Option<(u32, u32)>,
-    ) -> Result<(), E>,
-) -> Result<(), E> {
-    if defer(state, &operation) {
-        return Ok(());
-    }
-    flush(state, consume).await?;
-    consume(operation, state.operation_state(), None).await
-}
-
-pub(super) fn defer(
-    state: &mut MaxwellThreeDFrontendState,
-    operation: &PendingEngineOperation,
-) -> bool {
-    if let PendingEngineOperation::ThreeD(trigger) = *operation
-        && trigger.is_draw()
-        && state.operation_state().inline_index().is_none()
-    {
-        if let Some(run) = &mut state.instance_run {
-            run.count += 1;
-        } else {
-            state.instance_run = Some(InstanceRun {
-                trigger,
-                first: state
-                    .operation_state()
-                    .vertex_input()
-                    .primitive()
-                    .instance_index(),
-                count: 1,
-            });
+    value: MaxwellThreeDBegin,
+    origin: impl FnOnce() -> MaxwellMethodSource,
+) {
+    match value.instance() {
+        MaxwellThreeDBeginInstance::First => {
+            debug_assert!(!is_pending(state));
+            state.draw.instances = 0;
+            state.draw.mode = Mode::General;
         }
-        return true;
+        MaxwellThreeDBeginInstance::Subsequent => {
+            state.draw.instances = state.draw.instances.wrapping_add(1);
+            state.draw.mode = Mode::Instance;
+            state.draw.source = Some(origin());
+        }
+        MaxwellThreeDBeginInstance::Unchanged => {}
     }
-    false
+    state.draw.topology = u32::from(value.topology());
+    state.begin_primitive(argument, value);
 }
-
-pub(in crate::engines) async fn flush<E>(
-    state: &mut MaxwellThreeDFrontendState,
-    consume: &mut impl AsyncFnMut(
-        PendingEngineOperation,
-        &MaxwellThreeDState,
-        Option<(u32, u32)>,
-    ) -> Result<(), E>,
-) -> Result<(), E> {
-    if let Some(run) = state.instance_run.take() {
-        consume(
-            PendingEngineOperation::ThreeD(run.trigger),
-            state.operation_state(),
-            Some((run.first, run.count)),
-        )
-        .await?;
-        state.complete_draw_end();
+pub(super) fn index_count(state: &mut MaxwellThreeDFrontendState) {
+    state.draw.indexed = true;
+}
+pub(super) fn inline(state: &mut MaxwellThreeDFrontendState) {
+    state.draw.mode = Mode::Inline;
+}
+fn capture(state: &mut MaxwellThreeDFrontendState, instances: Option<u32>) {
+    let r = state.operation_state().register_words();
+    let indexed = state.draw.indexed || state.draw.mode == Mode::Inline;
+    let vertices = (!indexed).then(|| (r[0x0d74 / 4], r[0x0d78 / 4]));
+    let index = indexed.then(|| MaxwellThreeDDrawIndexBuffer {
+        address: (u64::from(r[0x17c8 / 4]) << 32) | u64::from(r[0x17cc / 4]),
+        limit: (u64::from(r[0x17d0 / 4]) << 32) | u64::from(r[0x17d4 / 4]),
+        format: r[0x17d8 / 4],
+        first: r[0x17dc / 4],
+        count: r[0x17e0 / 4],
+    });
+    let base_vertex = r[0x1434 / 4];
+    let base_instance = r[0x1438 / 4];
+    let topology = if r[0x1948 / 4] == 1 {
+        match r[0x1970 / 4] {
+            0 => state.draw.topology,
+            1 => 0,
+            2 => 1,
+            value => value,
+        }
+    } else {
+        state.draw.topology
+    };
+    state.draw.topology = topology;
+    if let Some((first, count)) = vertices {
+        state.draw.vertex_first = first;
+        state.draw.vertex_count = count;
     }
+    if let Some(index) = index {
+        state.draw.index = index;
+    }
+    state.draw.base_vertex = base_vertex;
+    state.draw.base_instance = base_instance;
+    state.draw.instance_count = instances.unwrap_or(1);
+    if state.draw.mode == Mode::Inline {
+        state.draw.indexed = true;
+        state.draw.index.format = 2;
+        state.draw.index.first = 0;
+        state.draw.index.count = state.publish_inline_indices();
+    }
+}
+fn complete(state: &mut MaxwellThreeDFrontendState) {
+    state.complete_inline_draw();
+    if state.draw.mode == Mode::General {
+        state.draw.indexed = false;
+    }
+}
+pub(super) fn end<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    state: &mut MaxwellThreeDFrontendState,
+    argument: u32,
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+    origin: impl Fn() -> MaxwellMethodSource,
+) -> Result<bool, MaxwellEngineStreamError> {
+    if argument > 1 {
+        return Err(invalid_encoding(origin(), "END", "expected boolean 0 or 1").into());
+    }
+    state.end_primitive(argument);
+    if state.draw.mode == Mode::Instance {
+        state.draw.source = Some(origin());
+        return Ok(true);
+    }
+    Ok(submit(state, None, execution, origin)?)
+}
+pub(super) fn clear<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    state: &mut MaxwellThreeDFrontendState,
+    argument: u32,
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+    origin: impl Fn() -> MaxwellMethodSource,
+) -> Result<bool, MaxwellEngineStreamError> {
+    let value = MaxwellThreeDClearSurface::parse(argument).ok_or_else(|| {
+        invalid_encoding(
+            origin(),
+            "CLEAR_SURFACE",
+            "invalid target, layer, or reserved bits",
+        )
+    })?;
+    if value.depth() || value.stencil() || value.color_mask() != 0 {
+        execution.clear(state.operation_state(), origin)?;
+    }
+    Ok(true)
+}
+fn submit<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    state: &mut MaxwellThreeDFrontendState,
+    instances: Option<u32>,
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+    origin: impl Fn() -> MaxwellMethodSource,
+) -> Result<bool, crate::MaxwellSubmissionExecutionError> {
+    debug_assert!(state.draw.preparing.is_none());
+    capture(state, instances);
+    if execution.draw(state.operation_state(), &state.draw, &origin)? {
+        complete(state);
+        Ok(true)
+    } else {
+        state.draw.preparing = Some(origin());
+        Ok(false)
+    }
+}
+/// Only native preparation retries. Registers, uploads and signals are never replayed.
+pub(in crate::engines) async fn wait_preparation<
+    L: crate::MaxwellFrontend,
+    H: crate::MaxwellCommandHost,
+>(
+    state: &mut MaxwellThreeDFrontendState,
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<(), crate::MaxwellSubmissionExecutionError> {
+    let source = state.draw.preparing.expect("unavailable native draw");
+    execution
+        .wait_draw(state.operation_state(), &state.draw, source)
+        .await?;
+    state.draw.preparing = None;
+    complete(state);
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::*;
-    use nixe_gpu::MappingGeneration;
-    use nixe_gpu::{FrontendSubmissionId, GpuVirtualAddress};
-    use std::convert::Infallible;
-
-    fn source() -> MaxwellMethodSource {
-        let decoded = decode_maxwell_pushbuffer([Ok(MaxwellPushbufferWord::new(
-            (4 << 29) | (0x3800 / 4),
-            MaxwellGpfifoSourceLocation {
-                channel: MaxwellChannelId::new(1),
-                frontend: FrontendSubmissionId::new(1),
-                entry_index: 0,
-                word_offset: 0,
-                pushbuffer: GpuVirtualAddress::try_new(0x1000, 40).unwrap(),
-                mapping: MaxwellMappingId::new(1),
-                generation: MappingGeneration::new(1),
-            },
-        ))])
-        .unwrap();
-        let MaxwellDecodedPacket::Methods(packet) = &decoded.packets()[0] else {
-            panic!()
-        };
-        MaxwellMethodSource::decoded(
-            packet.methods().first().unwrap(),
-            packet.subchannel().unwrap(),
-        )
+/// A new first BEGIN or macro completion consumes the live deferred instance draw.
+pub(in crate::engines) fn flush<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    state: &mut MaxwellThreeDFrontendState,
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<bool, crate::MaxwellSubmissionExecutionError> {
+    if !is_pending(state) {
+        return Ok(true);
     }
-
-    fn execute(methods: &[(u32, u32)]) -> Vec<(u32, u32, u32, u32)> {
-        let mut state = MaxwellThreeDFrontendState::default();
-        let mut observed = Vec::new();
-        let mut consume = async |operation,
-                                 state: &MaxwellThreeDState,
-                                 instances: Option<(u32, u32)>| {
-            let PendingEngineOperation::ThreeD(trigger) = operation else {
-                panic!("draw")
-            };
-            let count = match trigger {
-                MaxwellThreeDOperationTrigger::DrawVertexArray { vertex_count, .. } => vertex_count,
-                _ => panic!("vertex draw"),
-            };
-            assert!(
-                state.vertex_input().primitive().active_begin().is_some(),
-                "draw capture precedes its deferred END"
-            );
-            let (first, instances) = instances.unwrap();
-            observed.push((
-                first,
-                instances,
-                count,
-                state
-                    .vertex_input()
-                    .assembly()
-                    .global_base_instance_index()
-                    .value()
-                    .copied()
-                    .unwrap_or(0),
-            ));
-            Ok::<_, Infallible>(())
-        };
-        let mut host = MmeDispatchHost {
-            profile: &SWITCH_1_GM20B_PROFILE,
-            source: source(),
-            candidate: &mut state,
-            consume: &mut consume,
-            pending: None,
-            _error: std::marker::PhantomData,
-        };
-        for &(method, value) in methods {
-            let method = (method / 4) as u16;
-            if host
-                .try_emit_method(method, value)
-                .unwrap_or_else(|_| panic!("admit method"))
-            {
-                continue;
-            }
-            match crate::test_memory::ready(host.finish_method(method, value)) {
-                Ok(()) => {}
-                Err(MaxwellThreeDMmeDispatchError::Dispatch(error)) => panic!("{error}"),
-                Err(MaxwellThreeDMmeDispatchError::Consumer(never)) => match never {},
-            }
-        }
-        crate::test_memory::ready(flush(host.candidate, host.consume)).unwrap();
-        assert!(
-            !host
-                .candidate
-                .operation_state()
-                .vertex_input()
-                .primitive()
-                .is_open()
-        );
-        observed
+    let source = state
+        .draw
+        .source
+        .expect("deferred instance BEGIN/END source");
+    if !submit(
+        state,
+        Some(state.draw.instances.wrapping_add(1)),
+        execution,
+        || source,
+    )? {
+        return Ok(false);
     }
-
-    #[test]
-    fn hardware_instances_are_one_resource_capture_and_draw() {
-        let mut methods = vec![(0x1618, 4), (0x0d78, 3), (0x1614, 0)];
-        for _ in 0..63 {
-            methods.extend([(0x1618, 1 << 26 | 4), (0x0d78, 3), (0x1614, 0)]);
-        }
-        assert_eq!(execute(&methods), [(0, 64, 3, 0)]);
-    }
-
-    #[test]
-    fn state_changes_reset_geometry_and_restarted_sequences_flush_before_mutation() {
-        assert_eq!(
-            execute(&[
-                (0x1618, 4),
-                (0x0d78, 3),
-                (0x1614, 0),
-                (0x1618, 1 << 26 | 4),
-                (0x0d78, 3),
-                (0x1614, 0),
-                (0x1438, 9),
-                (0x1618, 1 << 26 | 4),
-                (0x0d78, 6),
-                (0x1614, 0),
-                (0x1618, 4),
-                (0x0d78, 3),
-                (0x1614, 0),
-            ]),
-            [(0, 2, 3, 0), (2, 1, 6, 9), (0, 1, 3, 9)]
-        );
-    }
+    state.draw.instances = 0;
+    state.draw.indexed = false;
+    Ok(true)
+}
+pub(in crate::engines) async fn wait_flush<
+    L: crate::MaxwellFrontend,
+    H: crate::MaxwellCommandHost,
+>(
+    state: &mut MaxwellThreeDFrontendState,
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<(), crate::MaxwellSubmissionExecutionError> {
+    wait_preparation(state, execution).await?;
+    state.draw.instances = 0;
+    state.draw.indexed = false;
+    Ok(())
 }

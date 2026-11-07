@@ -87,17 +87,6 @@ impl CapturedMemory {
             .map(|(range, offset, bytes)| range.slice(offset, bytes))
             .collect()
     }
-    pub(crate) fn views(
-        &self,
-        offset: u64,
-        bytes: u64,
-    ) -> Result<Vec<AllocationRange>, MemoryError> {
-        self.selected(offset, bytes)?
-            .map(|(range, offset, bytes)| {
-                AllocationRange::new(range.allocation().clone(), range.offset() + offset, bytes)
-            })
-            .collect()
-    }
 }
 impl std::ops::Index<usize> for CapturedMemory {
     type Output = AllocationRange;

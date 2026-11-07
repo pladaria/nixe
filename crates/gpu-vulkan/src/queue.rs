@@ -42,22 +42,50 @@ pub enum WorkStatus {
     Complete,
 }
 #[must_use = "consume or explicitly discard the reserved readback"]
-#[derive(Debug)]
 pub struct ReadbackTicket {
     pub(crate) work: WorkTicket,
     pub(crate) slice: Slice,
+    allocation: staging::ReadbackAllocation,
+    progress: Arc<progress::SubmissionProgress>,
+}
+impl std::fmt::Debug for ReadbackTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadbackTicket")
+            .field("work", &self.work)
+            .field("slice", &self.slice)
+            .finish()
+    }
 }
 impl ReadbackTicket {
+    /// Consume this reservation after its native timeline has completed.
+    /// Staging ownership and progress travel with the reservation, so the
+    /// fencing thread needs neither the recorder nor its mutable staging pool.
+    pub fn completed(self) -> Result<CompletedReadback, VulkanError> {
+        self.progress.check(self.work.tick)?;
+        if self.work.tick > self.progress.completed() {
+            return Err(VulkanError::InvalidResource(
+                "readback work has not completed",
+            ));
+        }
+        if !self.allocation.valid(self.work.tick) {
+            return Err(VulkanError::InvalidResource(
+                "stale or cancelled readback reservation",
+            ));
+        }
+        let bytes = unsafe { self.allocation.completed_bytes(&self.slice)? };
+        let pointer = std::ptr::NonNull::new(bytes.as_ptr().cast_mut()).expect("mapped readback");
+        let length = bytes.len();
+        Ok(CompletedReadback {
+            _ticket: self,
+            pointer,
+            length,
+        })
+    }
     pub fn work(&self) -> WorkTicket {
         self.work
     }
 }
 
-impl Drop for ReadbackTicket {
-    fn drop(&mut self) {
-        self.slice.release_readback();
-    }
-}
 /// Mapped bytes from completed GPU work. Owning the reservation prevents staging
 /// recycling through consumption, cancellation, early returns and unwinding.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
@@ -108,6 +136,8 @@ pub(crate) struct Slot {
     pub tick: u64,
     pub retired_buffers: Vec<Arc<AllocatedBuffer>>,
     pub retired_images: Vec<Arc<AllocatedImage>>,
+    pub framebuffers: Vec<Arc<crate::render_pass::Framebuffer>>,
+    pub framebuffer_handles: rustc_hash::FxHashSet<vk::Framebuffer>,
     pub retained_views: Vec<Arc<crate::AllocatedImageView>>,
     pub native_pipelines: Vec<Arc<crate::cache::NativePipeline>>,
     pub native_bindings: Vec<Arc<crate::cache::BindingRecord>>,
@@ -124,17 +154,12 @@ pub(crate) struct Slot {
     pub descriptors: crate::residency::probe_commands::Descriptors,
     pub bound_compute: usize,
     pub bound_graphics: usize,
-    pub vertex_bindings: Vec<Option<(vk::Buffer, u64)>>,
-    pub current_vertices: Option<Arc<[(u32, vk::Buffer, u64)]>>,
-    pub index_binding: Option<(vk::Buffer, u64, vk::IndexType)>,
+    pub vertex_channel: Option<u64>,
     pub push_layout: vk::PipelineLayout,
     pub push_stages: vk::ShaderStageFlags,
     pub push_bytes: Vec<u8>,
-    pub native_targets: Vec<Arc<crate::PreparedTargets>>,
-    pub active_targets: Option<Arc<crate::PreparedTargets>>,
-    pub rendering_feedback: crate::dispatch::RenderingFeedback,
-    pub target_handles: rustc_hash::FxHashSet<usize>,
-    pub graphics_parameters: Option<Arc<crate::GraphicsParameters>>,
+    pub active_render_pass: Option<crate::residency::execution::RenderPassState>,
+    pub graphics_state: crate::native::maxwell::dynamic_state::CommandState,
     pub feedback_aspects: Option<vk::ImageAspectFlags>,
     pub bound_compute_binding: usize,
 }
@@ -151,6 +176,8 @@ impl Slot {
             tick: 0,
             retired_buffers: Vec::new(),
             retired_images: Vec::new(),
+            framebuffers: Vec::new(),
+            framebuffer_handles: Default::default(),
             retained_views: Vec::new(),
             native_pipelines: Vec::new(),
             native_bindings: Vec::new(),
@@ -167,17 +194,12 @@ impl Slot {
             descriptors: crate::residency::probe_commands::Descriptors::new(),
             bound_compute: 0,
             bound_graphics: 0,
-            vertex_bindings: Vec::new(),
-            current_vertices: None,
-            index_binding: None,
+            vertex_channel: None,
             push_layout: vk::PipelineLayout::null(),
             push_stages: vk::ShaderStageFlags::empty(),
             push_bytes: Vec::new(),
-            native_targets: Vec::new(),
-            active_targets: None,
-            rendering_feedback: Default::default(),
-            target_handles: Default::default(),
-            graphics_parameters: None,
+            active_render_pass: None,
+            graphics_state: Default::default(),
             feedback_aspects: None,
             bound_compute_binding: 0,
         };
@@ -216,12 +238,14 @@ pub(crate) struct QueueState {
     pub statistics: RecordingStatistics,
     owner: Arc<DeviceOwner>,
     pub timeline: vk::Semaphore,
+    pub(crate) wait_for_idle_event: vk::Event,
     instance: BackendInstanceId,
     family: u32,
     pub(crate) staging: staging::StagingPool,
     pub slots: Vec<Slot>,
     in_flight: std::collections::VecDeque<usize>,
     pub recording: Option<usize>,
+    pub(crate) deferred_clear: Option<crate::residency::execution::DeferredClear>,
     next_slot: usize,
     pub scheduled: u64,
     pub completed: u64,
@@ -231,20 +255,21 @@ pub(crate) struct QueueState {
 impl QueueState {
     pub(crate) fn end_rendering(&mut self, dispatch: &mut crate::dispatch::Dispatch) {
         if let Some(index) = self.recording
-            && self.slots[index].active_targets.take().is_some()
+            && let Some(active) = self.slots[index].active_render_pass.take()
         {
-            unsafe { dispatch.end_rendering() };
+            active.end(dispatch);
         }
     }
     pub fn new(
         owner: Arc<DeviceOwner>,
         family: u32,
-        _dispatch: &crate::dispatch::Dispatch,
+        dispatch: &mut crate::dispatch::Dispatch,
     ) -> Result<Self, VulkanError> {
         static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
         let instance = NEXT_INSTANCE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
             .map_err(|_| VulkanError::InvalidResource("Vulkan instance identity exhausted"))?;
+        let staging = staging::StagingPool::new(Arc::clone(&owner))?;
         let mut kind = vk::SemaphoreTypeCreateInfo::default()
             .semaphore_type(vk::SemaphoreType::TIMELINE)
             .initial_value(0);
@@ -252,19 +277,21 @@ impl QueueState {
         let info = vk::SemaphoreCreateInfo::default().push_next(&mut kind);
         let timeline = unsafe { owner.device.create_semaphore(&info, None) }
             .map_err(|e| VulkanError::vk("vkCreateSemaphore(owner timeline)", e))?;
-        let state = Self {
+        let mut state = Self {
             frame_metrics: frame_metrics::Recorder::new(),
             calibration,
-            recording_handle: _dispatch.recording_handle(),
+            recording_handle: dispatch.recording_handle(),
             progress: Arc::new(progress::SubmissionProgress::default()),
-            staging: staging::StagingPool::new(Arc::clone(&owner)),
+            staging,
             owner,
             timeline,
+            wait_for_idle_event: vk::Event::null(),
             instance: BackendInstanceId::new(instance),
             family,
             slots: Vec::new(),
             in_flight: Default::default(),
             recording: None,
+            deferred_clear: None,
             next_slot: 0,
             statistics: Default::default(),
             scheduled: 0,
@@ -272,7 +299,21 @@ impl QueueState {
             stopped: false,
             lost: false,
         };
+        // One device event is reused in queue order, as RasterizerVulkan's WFI
+        // event. Queue shutdown drains both recording and GPU use before drop.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L231
+        state.wait_for_idle_event = unsafe {
+            state
+                .owner
+                .device
+                .create_event(&vk::EventCreateInfo::default(), None)
+        }
+        .map_err(|e| VulkanError::vk("vkCreateEvent(wait for idle)", e))?;
+        state
+            .owner
+            .name(state.wait_for_idle_event, "nixe wait for idle")?;
         state.owner.name(timeline, "nixe submission timeline")?;
+        state.allocate_context(dispatch)?;
         Ok(state)
     }
     pub(crate) fn is_device_lost(&self) -> bool {
@@ -320,7 +361,7 @@ impl QueueState {
         self.progress.failure().unwrap().error()
     }
     fn check_ticket(&self, ticket: WorkTicket) -> Result<(), VulkanError> {
-        let last = self.scheduled + u64::from(self.recording.is_some());
+        let last = self.current_tick();
         if ticket.instance != self.instance || ticket.tick == 0 || ticket.tick > last {
             return Err(VulkanError::InvalidResource(
                 "foreign or unissued queue ticket",
@@ -436,11 +477,11 @@ impl QueueState {
             {
                 slot.retired_buffers.clear();
                 slot.retired_images.clear();
+                slot.framebuffers.clear();
+                slot.framebuffer_handles.clear();
                 slot.retained_views.clear();
-                slot.graphics_parameters = None;
+                slot.graphics_state = Default::default();
                 slot.feedback_aspects = None;
-                slot.native_targets.clear();
-                slot.target_handles.clear();
                 slot.native_bindings.clear();
                 slot.native.retire_descriptor_pools();
                 slot.native_pipelines.clear();
@@ -451,23 +492,15 @@ impl QueueState {
             }
         }
     }
-    /// Prepared mapped inputs can outlive an intervening dependency submit.
-    /// Their stream regions, not the completed command context, stay reserved.
-    pub(crate) fn retain_stream_upload(&mut self, slice: &Slice) {
-        self.staging.defer_regions(self.staging.regions(slice));
-    }
-    pub(crate) fn release_stream_uploads(&mut self) {
-        let consumer = self.scheduled + u64::from(self.recording.is_some());
-        self.staging.release_regions(consumer);
-    }
-    pub fn begin(
+    // Scheduler always owns a context for CurrentTick. Allocation occurs only
+    // at construction and after sealing a submission, never at resource use.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_scheduler.cpp#L40-L67
+    fn allocate_context(
         &mut self,
         dispatch: &mut crate::dispatch::Dispatch,
-    ) -> Result<usize, VulkanError> {
+    ) -> Result<(), VulkanError> {
         self.check_running()?;
-        if let Some(index) = self.recording {
-            return Ok(index);
-        }
+        debug_assert!(self.recording.is_none());
         self.reclaim_known()?;
         let find = |slots: &[Slot], next: usize, completed: u64| {
             (next..slots.len())
@@ -507,11 +540,14 @@ impl QueueState {
             self.timeline,
         )?;
         let slot = &mut self.slots[index];
-        slot.frame = self.frame_metrics.begin_submission();
+        // Frame ownership is attached by begin_frame_work or when this
+        // context is sealed. Eagerly opening a context must not hold the
+        // preceding frame's measurement open through the next frame.
+        slot.frame = None;
         if let Some(timing) = &mut slot.timing {
             timing.begin(
                 dispatch,
-                slot.frame.is_some() || cfg!(feature = "performance-counters"),
+                self.frame_metrics.is_active() || cfg!(feature = "performance-counters"),
             );
         }
         slot.tick = tick;
@@ -519,13 +555,11 @@ impl QueueState {
         slot.descriptors.reset(&self.owner)?;
         slot.bound_compute = 0;
         slot.bound_graphics = 0;
-        slot.vertex_bindings.clear();
-        slot.current_vertices = None;
-        slot.index_binding = None;
+        slot.vertex_channel = None;
         slot.push_layout = vk::PipelineLayout::null();
         slot.push_stages = vk::ShaderStageFlags::empty();
         slot.push_bytes.clear();
-        slot.graphics_parameters = None;
+        slot.graphics_state = Default::default();
         slot.feedback_aspects = None;
         slot.bound_compute_binding = 0;
         slot.bound_graphics_binding = 0;
@@ -534,36 +568,30 @@ impl QueueState {
         slot.bound_compute_layout = vk::PipelineLayout::null();
         slot.bound_graphics_layout = vk::PipelineLayout::null();
         self.recording = Some(index);
-        Ok(index)
+        Ok(())
     }
-    pub fn reserve_upload(
-        &mut self,
-        dispatch: &mut crate::dispatch::Dispatch,
-        bytes: &[u8],
-    ) -> Result<Slice, VulkanError> {
-        self.reserve_upload_aligned(dispatch, bytes, 4)
+    pub fn reserve_upload(&mut self, bytes: &[u8]) -> Result<Slice, VulkanError> {
+        self.reserve_upload_aligned(bytes, 4)
     }
     pub(crate) fn reserve_upload_aligned(
         &mut self,
-        dispatch: &mut crate::dispatch::Dispatch,
         bytes: &[u8],
         alignment: u64,
     ) -> Result<Slice, VulkanError> {
-        let slice = self.reserve_slice(dispatch, bytes.len() as u64, true, alignment)?;
-        let buffer = self.staging_buffer(&slice);
-        unsafe { buffer.write_range(slice.offset, bytes) }?;
+        let slice = self.reserve_slice(bytes.len() as u64, staging::Usage::Upload, alignment)?;
+        unsafe {
+            self.staging.write_with(&slice, |destination| {
+                destination.copy_from_slice(bytes);
+                Ok(())
+            })
+        }?;
         Ok(slice)
     }
-    pub fn reserve_readback(
-        &mut self,
-        dispatch: &mut crate::dispatch::Dispatch,
-        size: u64,
-    ) -> Result<(Slice, ReadbackTicket), VulkanError> {
-        self.reserve_readback_aligned(dispatch, size, 4)
+    pub fn reserve_readback(&mut self, size: u64) -> Result<(Slice, ReadbackTicket), VulkanError> {
+        self.reserve_readback_aligned(size, 4)
     }
     pub fn reserve_readback_aligned(
         &mut self,
-        dispatch: &mut crate::dispatch::Dispatch,
         size: u64,
         alignment: u64,
     ) -> Result<(Slice, ReadbackTicket), VulkanError> {
@@ -572,38 +600,41 @@ impl QueueState {
                 "staging alignment must be a nonzero power of two",
             ));
         }
-        let slice = self.reserve_slice(dispatch, size, false, alignment)?;
+        let slice = self.reserve_slice(size, staging::Usage::Download, alignment)?;
         Ok((
-            slice.clone(),
+            slice,
             ReadbackTicket {
                 work: self.ticket(self.scheduled + 1),
                 slice,
+                allocation: self.staging.retain_readback(&slice),
+                progress: Arc::clone(&self.progress),
             },
         ))
     }
     pub(crate) fn reserve_slice(
         &mut self,
-        dispatch: &mut crate::dispatch::Dispatch,
         size: u64,
-        upload: bool,
+        usage: staging::Usage,
         alignment: u64,
     ) -> Result<Slice, VulkanError> {
-        let index = self.begin(dispatch)?;
+        if self.stopped {
+            return Err(VulkanError::QueueStopped);
+        }
         let slice = self.staging.reserve(
             size,
             alignment,
-            upload,
-            self.slots[index].tick,
+            usage,
+            self.current_tick(),
             self.completed.max(self.progress.completed()),
         )?;
         Ok(slice)
     }
-    pub(crate) fn staging_buffer<'a>(&mut self, slice: &'a Slice) -> &'a Arc<AllocatedBuffer> {
-        let tick = self
-            .recording
-            .map_or(self.scheduled, |i| self.slots[i].tick);
-        self.staging.mark_used(slice, tick);
+    pub(crate) fn staging_buffer(&self, slice: &Slice) -> &Arc<AllocatedBuffer> {
         self.staging.buffer(slice)
+    }
+    #[inline]
+    fn current_tick(&self) -> u64 {
+        self.scheduled + 1
     }
     pub unsafe fn flush(
         &mut self,
@@ -611,11 +642,9 @@ impl QueueState {
         dispatch: &mut crate::dispatch::Dispatch,
         waits: &[vk::SemaphoreSubmitInfo<'_>],
         extra_signals: &[vk::SemaphoreSubmitInfo<'_>],
-    ) -> Result<Option<WorkTicket>, VulkanError> {
+    ) -> Result<WorkTicket, VulkanError> {
         self.check_running()?;
-        let Some(index) = self.recording else {
-            return Ok(None);
-        };
+        let index = self.recording.ok_or(VulkanError::QueueStopped)?;
         if waits
             .iter()
             .chain(extra_signals)
@@ -626,6 +655,9 @@ impl QueueState {
             ));
         }
         self.end_rendering(dispatch);
+        if self.slots[index].frame.is_none() {
+            self.slots[index].frame = self.frame_metrics.begin_submission();
+        }
         let slot = &self.slots[index];
         let tick = slot.tick;
         {
@@ -687,7 +719,8 @@ impl QueueState {
         self.in_flight.push_back(index);
         self.scheduled = tick;
         self.recording = None;
-        Ok(Some(self.ticket(tick)))
+        self.allocate_context(dispatch)?;
+        Ok(self.ticket(tick))
     }
     fn wait_for_completion(
         &mut self,
@@ -848,7 +881,12 @@ impl Drop for QueueState {
             );
             std::process::abort();
         }
-        unsafe { self.owner.device.destroy_semaphore(self.timeline, None) };
+        unsafe {
+            self.owner
+                .device
+                .destroy_event(self.wait_for_idle_event, None);
+            self.owner.device.destroy_semaphore(self.timeline, None);
+        }
     }
 }
 
@@ -866,33 +904,26 @@ impl VulkanDevice {
     pub(crate) fn completed_tick(&self) -> u64 {
         self.submission.completed
     }
-    pub(crate) fn preceding_work(&self) -> Option<WorkTicket> {
-        let tick = self
-            .submission
-            .recording
-            .map_or(self.submission.scheduled, |slot| {
-                self.submission.slots[slot].tick
-            });
-        (tick != 0).then(|| self.submission.ticket(tick))
-    }
-    pub(crate) fn submission_instance(&self) -> BackendInstanceId {
-        self.submission.instance
-    }
-    pub(crate) fn end_rendering(&mut self) {
+    pub(crate) fn end_rendering(&mut self) -> Result<(), VulkanError> {
+        self.realize_deferred_clear()?;
         self.submission.end_rendering(&mut self.dispatch);
+        Ok(())
     }
-    pub(crate) fn begin_recording(&mut self) -> Result<usize, VulkanError> {
-        self.submission.begin(&mut self.dispatch)
+    /// Index of the scheduler's already allocated command context. A stopped
+    /// device has no context; this query never allocates or admits native work.
+    #[inline]
+    pub(crate) fn recording_slot(&self) -> Result<usize, VulkanError> {
+        self.submission.recording.ok_or(VulkanError::QueueStopped)
     }
-
-    /// Reserve an ordered completion point, including a real signal for work
-    /// with no commands. A flush accepts it; host polling alone is not guest success.
-    pub fn work_ticket(&mut self) -> Result<WorkTicket, VulkanError> {
-        self.begin_recording()?;
-        Ok(self.submission.ticket(self.submission.scheduled + 1))
+    /// The scheduler's current ordered completion point, as CurrentTick. A
+    /// flush seals this tick even when it contains no native commands.
+    #[inline]
+    pub fn current_work(&self) -> WorkTicket {
+        self.submission.ticket(self.submission.current_tick())
     }
     /// Submit recorded commands and signal the single timeline, without waiting.
-    pub fn flush(&mut self) -> Result<Option<WorkTicket>, VulkanError> {
+    pub fn flush(&mut self) -> Result<WorkTicket, VulkanError> {
+        self.realize_deferred_clear()?;
         unsafe {
             self.submission
                 .flush(self.queue, &mut self.dispatch, &[], &[])
@@ -919,51 +950,6 @@ impl VulkanDevice {
     }
     pub fn queue_usage(&self) -> QueueUsage {
         self.submission.usage()
-    }
-    /// Consume only completed work. The owner must explicitly flush and wait or
-    /// poll beforehand; publishing these bytes never submits or waits for work.
-    pub fn completed_readback(
-        &mut self,
-        ticket: ReadbackTicket,
-    ) -> Result<CompletedReadback, VulkanError> {
-        self.validate_readback(&ticket)?;
-        if ticket.work.tick > self.submission.completed {
-            return Err(VulkanError::InvalidResource(
-                "readback work has not completed",
-            ));
-        }
-        let bytes = unsafe {
-            self.submission
-                .staging
-                .buffer(&ticket.slice)
-                .completed_bytes(ticket.slice.offset, ticket.slice.size)?
-        };
-        let pointer = std::ptr::NonNull::new(bytes.as_ptr().cast_mut()).expect("mapped readback");
-        let length = bytes.len();
-        Ok(CompletedReadback {
-            _ticket: ticket,
-            pointer,
-            length,
-        })
-    }
-    pub fn discard_readback(&mut self, ticket: ReadbackTicket) -> Result<(), VulkanError> {
-        self.validate_readback(&ticket)?;
-        drop(ticket);
-        self.submission.reclaim(self.submission.completed);
-        Ok(())
-    }
-    fn validate_readback(&self, ticket: &ReadbackTicket) -> Result<(), VulkanError> {
-        self.submission.check_ticket(ticket.work)?;
-        if !self
-            .submission
-            .staging
-            .valid_readback(&ticket.slice, ticket.work.tick)
-        {
-            return Err(VulkanError::InvalidResource(
-                "stale or consumed readback ticket",
-            ));
-        }
-        Ok(())
     }
     pub fn retire_buffer(
         &mut self,

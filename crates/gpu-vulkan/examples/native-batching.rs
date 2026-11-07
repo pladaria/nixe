@@ -1,11 +1,11 @@
 //! Saturate production residency/recording without guest presentation pacing.
 use ash::vk;
-use nixe_gpu::physical::PhysicalMapping;
-use nixe_gpu_vulkan::{DeviceOptions, VulkanDevice, VulkanResidency};
+use nixe_gpu_vulkan::{DeviceOptions, Residency, VulkanDevice, VulkanResidency};
+use nixe_memory::PhysicalMapping;
 use nixe_memory::{AllocationRange, Machine, PAGE_SIZE};
 use std::time::Instant;
 
-fn batch(cache: &mut VulkanResidency, buffer: nixe_gpu_vulkan::BufferId, commands: u32) {
+fn batch(cache: &mut Residency<'_>, buffer: nixe_gpu_vulkan::BufferId, commands: u32) {
     for value in 0..commands {
         cache.fill_buffer(buffer, 0, PAGE_SIZE, value).unwrap();
     }
@@ -35,7 +35,13 @@ fn main() {
             | vk::PhysicalDeviceType::INTEGRATED_GPU
             | vk::PhysicalDeviceType::VIRTUAL_GPU
     ));
-    let mut cache = VulkanResidency::new(machine, device, 16 * 1024 * 1024).unwrap();
+    let mut cache_owner = VulkanResidency::new(
+        nixe_memory::device_memory::DeviceMemory::new(machine, 34),
+        device,
+        16 * 1024 * 1024,
+    )
+    .unwrap();
+    let mut cache = cache_owner.access();
     let mapping = PhysicalMapping::new(&[range]).unwrap();
     let buffer = cache
         .buffer_for_deferred_import(mapping, vk::BufferUsageFlags::TRANSFER_DST)

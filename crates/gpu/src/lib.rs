@@ -6,24 +6,20 @@
 mod access;
 mod address;
 mod allocation;
-pub mod authority;
+pub mod memory_tracker;
 pub mod persistent_cache;
 pub mod physical;
 mod working_set;
 pub use working_set::{Equivalent, WorkingSet};
-mod color;
 mod command;
 mod conversion;
-pub use color::{
-    BlendComponent, BlendFactor, BlendOperation, ColorBlendState, ColorOutputState, ColorWriteMask,
-};
 pub use conversion::{ConversionImage, Nv12ColorTransform, Nv12Planes};
 mod diagnostics;
 mod execution;
 mod presentation;
 mod resource;
 mod runtime;
-pub use execution::{GpuExecution, MemoryAccess, OwnerAccess, PreparedStateId};
+pub use execution::{FenceAction, GpuExecution, MemoryAccess, OwnerMemory};
 mod tessellation;
 pub use tessellation::{
     TessellationControl, TessellationDomain, TessellationMode, TessellationOutput,
@@ -47,19 +43,17 @@ pub use allocation::{
 
 pub use command::{
     AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore, BlitFilter,
-    CacheMaintenanceOperation, ClearValue, CommandDescriptionError, CullMode, DepthBias,
-    DepthCompareOperation, DepthState, DrawArguments, FragmentDepthTransform, FrontFace,
-    ImageOrigin, IndexType, LineRasterization, PrimitiveTopology, ScissorRect, StencilFaceState,
-    StencilOperation, StencilTestState, TriangleRasterization, VertexAttribute,
+    CacheMaintenanceOperation, ClearValue, CommandDescriptionError, DepthCompareOperation,
+    FragmentDepthTransform, ImageOrigin, PrimitiveTopology, ScissorRect, VertexAttribute,
     VertexComponentCount, VertexComponentWidth, VertexFormat, VertexPositionTransform,
-    VertexStepMode, ViewportTransform,
+    VertexStepMode,
 };
 pub use diagnostics::{
     CpuVirtualAddress, GpfifoEntryIndex, GpuChannelId, GpuClassId, GpuMethodId,
     GraphicsAllocationId, GraphicsGapKind,
 };
 pub use presentation::{
-    PresentationImageFormat, PresentationImageId, PresentationImageRequest, PresentationLease,
+    FrameCrop, FrameTransform, PresentationImageFormat, PresentationImageId, PresentationLease,
     PresentationRelease, ResidentImage,
 };
 pub use resource::{
@@ -68,7 +62,7 @@ pub use resource::{
     QueryPoolId, RenderPassId, ResourceDescriptionError, SampleCount, SamplerDescription,
     SamplerId, ShaderId, ShaderStage,
 };
-pub use runtime::{BackendExecutionCompletion, BackendRuntimeError};
+pub use runtime::BackendRuntimeError;
 pub use submission::{BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId};
 pub use synchronization::{
     GuestSyncpointId, GuestSyncpointValue, GuestTimeline, GuestTimelinePoint, OwnerMismatch,

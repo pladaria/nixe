@@ -2,8 +2,8 @@
 
 use nixe_gpu::{GpuClassId, GpuMethodId};
 
-use super::{MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation};
-use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
+use super::{MaxwellEngineDispatchError, MaxwellEngineMethodMetadata};
+use crate::MaxwellMethodSource;
 
 pub(super) const CLASS: GpuClassId = GpuClassId(0xa140);
 const CLASS_NAME: &str = "MAXWELL_INLINE_TO_MEMORY_A";
@@ -550,11 +550,52 @@ methods!(
     LOAD_INLINE_DATA => (0x01b4, "LOAD_INLINE_DATA", u32::MAX, MethodAction::Data),
 );
 
-pub(super) fn preflight(
-    method: MaxwellMethodDispatch,
+fn process_data(
+    source: MaxwellMethodSource,
     candidate: &mut MaxwellInlineToMemoryState,
-) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
-    let source = method.source();
+) -> Result<MaxwellInlineToMemoryUpload, MaxwellEngineDispatchError> {
+    let raw = source.argument();
+    let pending = candidate.pending().ok_or_else(|| {
+        invalid_encoding(
+            source,
+            "LOAD_INLINE_DATA",
+            "inline data requires an armed LAUNCH_DMA transfer",
+        )
+    })?;
+    let next_offset = pending.next_offset().checked_add(4).ok_or_else(|| {
+        invalid_encoding(source, "LOAD_INLINE_DATA", "inline upload cursor overflows")
+    })?;
+    if next_offset > pending.byte_length() {
+        return Err(invalid_encoding(
+            source,
+            "LOAD_INLINE_DATA",
+            "inline data exceeds the armed transfer length",
+        ));
+    }
+    let write = MaxwellInlineToMemoryStateWrite::Data {
+        value: raw,
+        next_offset,
+        source,
+    };
+    let upload = MaxwellInlineToMemoryUpload {
+        address: pending.address(),
+        offset: pending.layout.offset(
+            pending.next_offset() % pending.line_length,
+            pending.next_offset() / pending.line_length,
+        ) as u32,
+        remaining_bytes: pending.byte_length() - pending.next_offset(),
+        value: raw,
+        source,
+    };
+    candidate.apply(write);
+    Ok(upload)
+}
+
+pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    source: MaxwellMethodSource,
+    candidate: &mut MaxwellInlineToMemoryState,
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<bool, super::MaxwellEngineStreamError> {
     let declaration = METHODS
         .iter()
         .find(|declaration| declaration.metadata.method() == source.method())
@@ -563,53 +604,19 @@ pub(super) fn preflight(
             class_name: CLASS_NAME,
         })?;
     if source.argument() & !declaration.defined_mask != 0 {
-        return Err(MaxwellEngineDispatchError::InvalidMethodValue {
+        return Err((MaxwellEngineDispatchError::InvalidMethodValue {
             source,
             metadata: declaration.metadata,
             defined_mask: declaration.defined_mask,
-        });
+        })
+        .into());
     }
 
     let raw = source.argument();
     if matches!(declaration.action, MethodAction::Data) {
-        let pending = candidate.pending().ok_or_else(|| {
-            invalid_encoding(
-                source,
-                declaration.metadata.method_name(),
-                "inline data requires an armed LAUNCH_DMA transfer",
-            )
-        })?;
-        let next_offset = pending.next_offset().checked_add(4).ok_or_else(|| {
-            invalid_encoding(
-                source,
-                declaration.metadata.method_name(),
-                "inline upload cursor overflows",
-            )
-        })?;
-        if next_offset > pending.byte_length() {
-            return Err(invalid_encoding(
-                source,
-                declaration.metadata.method_name(),
-                "inline data exceeds the armed transfer length",
-            ));
-        }
-        let write = MaxwellInlineToMemoryStateWrite::Data {
-            value: raw,
-            next_offset,
-            source,
-        };
-        let upload = MaxwellInlineToMemoryUpload {
-            address: pending.address(),
-            offset: pending.layout.offset(
-                pending.next_offset() % pending.line_length,
-                pending.next_offset() / pending.line_length,
-            ) as u32,
-            remaining_bytes: pending.byte_length() - pending.next_offset(),
-            value: raw,
-            source,
-        };
-        candidate.apply(write);
-        return Ok(Some(PendingEngineOperation::InlineToMemory(upload)));
+        let upload = process_data(source, candidate)?;
+        execution.inline_to_memory(upload, None)?;
+        return Ok(true);
     }
 
     let write = match declaration.action {
@@ -637,18 +644,19 @@ pub(super) fn preflight(
         MethodAction::OriginY => MaxwellInlineToMemoryStateWrite::OriginY { value: raw, source },
         MethodAction::Launch => {
             if raw & !0x0000_1051 != 0 {
-                return Err(invalid_encoding(
+                return Err((invalid_encoding(
                     source,
                     declaration.metadata.method_name(),
                     "interrupt, reduction, and semaphore release inline uploads are not implemented",
-                ));
+                )).into());
             }
             if candidate.pending().is_some() {
-                return Err(invalid_encoding(
+                return Err((invalid_encoding(
                     source,
                     declaration.metadata.method_name(),
                     "cannot replace an incomplete inline upload",
-                ));
+                ))
+                .into());
             }
             let upper = *candidate.address_upper().value().ok_or_else(|| {
                 invalid_encoding(
@@ -686,11 +694,12 @@ pub(super) fn preflight(
                 )
             })?;
             if line_length == 0 || !line_length.is_multiple_of(4) {
-                return Err(invalid_encoding(
+                return Err((invalid_encoding(
                     source,
                     declaration.metadata.method_name(),
                     "inline upload length must be nonzero and word-aligned",
-                ));
+                ))
+                .into());
             }
             let byte_length = line_length
                 .checked_mul(line_count)
@@ -715,11 +724,12 @@ pub(super) fn preflight(
                     })?
                 };
                 if line_count > 1 && pitch < line_length {
-                    return Err(invalid_encoding(
+                    return Err((invalid_encoding(
                         source,
                         "LAUNCH_DMA",
                         "destination pitch is smaller than the line length",
-                    ));
+                    ))
+                    .into());
                 }
                 DestinationLayout::Pitch { pitch }
             } else {
@@ -741,21 +751,23 @@ pub(super) fn preflight(
                 let y = required(&candidate.origin_y)?;
                 let height_log2 = (block_size >> 4) & 0xf;
                 if block_size & 0xf0f != 0 || height_log2 > 5 || depth != 1 || layer != 0 {
-                    return Err(invalid_encoding(
+                    return Err((invalid_encoding(
                         source,
                         "LAUNCH_DMA",
                         "only two-dimensional, one-GOB-wide block-linear uploads are implemented",
-                    ));
+                    ))
+                    .into());
                 }
                 if !x.is_multiple_of(4)
                     || x.checked_add(line_length).is_none_or(|end| end > width)
                     || y.checked_add(line_count).is_none_or(|end| end > height)
                 {
-                    return Err(invalid_encoding(
+                    return Err((invalid_encoding(
                         source,
                         "LAUNCH_DMA",
                         "block-linear upload is unaligned or exceeds destination dimensions",
-                    ));
+                    ))
+                    .into());
                 }
                 DestinationLayout::BlockLinear {
                     width_in_gobs: u64::from(width).div_ceil(64),
@@ -771,11 +783,12 @@ pub(super) fn preflight(
                     .checked_add(last_byte + 1)
                     .is_none_or(|end| end > 1 << 40)
             {
-                return Err(invalid_encoding(
+                return Err((invalid_encoding(
                     source,
                     "LAUNCH_DMA",
                     "inline upload GPU range overflows",
-                ));
+                ))
+                .into());
             }
             MaxwellInlineToMemoryStateWrite::Launch {
                 value: MaxwellInlineToMemoryLaunch::new(
@@ -798,7 +811,7 @@ pub(super) fn preflight(
         MethodAction::Data => unreachable!("LOAD_INLINE_DATA returns before state decoding"),
     };
     candidate.apply(write);
-    Ok(None)
+    Ok(true)
 }
 
 fn invalid_encoding(
@@ -817,15 +830,13 @@ fn invalid_encoding(
 /// A block-linear GOB changes address permutation at each 16-byte X segment.
 pub(super) fn data_words(
     candidate: &mut MaxwellInlineToMemoryState,
+    method: GpuMethodId,
     subchannel: crate::MaxwellPushbufferSubchannel,
-    words: crate::MaxwellMethodSpan<'_>,
+    words: crate::MaxwellDmaArguments<'_>,
 ) -> Result<(MaxwellInlineToMemoryUpload, usize), MaxwellEngineDispatchError> {
-    let source = MaxwellMethodSource::decoded(words.first().unwrap(), subchannel);
+    let source = words.source(0, method, subchannel);
     let pending = candidate.pending();
-    let applied = preflight(
-        MaxwellMethodDispatch::class_method(source, CLASS),
-        candidate,
-    )?;
+    let upload = process_data(source, candidate)?;
     let pending = pending.expect("validated inline data has an armed transfer");
     let remaining = pending.byte_length - pending.next_offset;
     let row = pending.line_length - pending.next_offset % pending.line_length;
@@ -838,14 +849,11 @@ pub(super) fn data_words(
     };
     let count = words.len().min((remaining.min(contiguous) / 4) as usize);
     debug_assert!(count != 0);
-    let last = MaxwellMethodSource::decoded(words.get(count - 1).unwrap(), subchannel);
+    let last = words.source(count - 1, method, subchannel);
     candidate.apply(MaxwellInlineToMemoryStateWrite::Data {
         value: last.argument(),
         next_offset: pending.next_offset + count as u32 * 4,
         source: last,
     });
-    let Some(PendingEngineOperation::InlineToMemory(upload)) = applied else {
-        unreachable!()
-    };
     Ok((upload, count))
 }

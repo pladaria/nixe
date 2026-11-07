@@ -245,8 +245,7 @@ struct PresenterState {
     keyboard_redraw_at: Instant,
     screenshots: Option<screenshot::Screenshots>,
 }
-const TITLE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
-const FRAME_RATE_SMOOTHING_WEIGHT: f64 = 0.35;
+const TITLE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug)]
 struct FrameRateTracker {
@@ -273,14 +272,7 @@ impl FrameRateTracker {
         if elapsed < TITLE_REFRESH_INTERVAL {
             return false;
         }
-        let sample = f64::from(self.guest_frames) / elapsed.as_secs_f64();
-        self.frames_per_second = Some(match self.frames_per_second {
-            Some(previous) => {
-                previous * (1.0 - FRAME_RATE_SMOOTHING_WEIGHT)
-                    + sample * FRAME_RATE_SMOOTHING_WEIGHT
-            }
-            None => sample,
-        });
+        self.frames_per_second = Some(f64::from(self.guest_frames) / elapsed.as_secs_f64());
         self.sample_started = now;
         self.guest_frames = 0;
         true
@@ -930,29 +922,6 @@ mod tests {
         assert_eq!(
             window_title("Metal", None, None),
             "nixe - Metal | - | -- FPS"
-        );
-    }
-
-    #[test]
-    fn frame_rate_uses_guest_frames_and_smoothed_half_second_samples() {
-        let started = Instant::now();
-        let mut tracker = FrameRateTracker::new(started);
-        for _ in 0..30 {
-            tracker.record_frame();
-        }
-        assert!(!tracker.refresh(started + Duration::from_millis(499)));
-        assert!(tracker.frames_per_second().is_none());
-        assert!(tracker.refresh(started + Duration::from_millis(500)));
-        assert_eq!(tracker.frames_per_second(), Some(60.0));
-
-        for _ in 0..20 {
-            tracker.record_frame();
-        }
-        assert!(tracker.refresh(started + Duration::from_millis(1000)));
-        assert_eq!(tracker.frames_per_second(), Some(53.0));
-        assert_eq!(
-            tracker.next_refresh(),
-            started + Duration::from_millis(1500)
         );
     }
 

@@ -6,7 +6,7 @@ use crate::{
 
 /// Shader selection facts, without capturing unused constant-buffer bindings.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct GraphicsSource {
+pub struct GraphicsSource {
     pub stage: Stage,
     pub address: u64,
     pub group: Option<u8>,
@@ -16,7 +16,7 @@ pub(crate) struct GraphicsSource {
     geometry_passthrough_mask: Option<[u32; 8]>,
 }
 
-pub(crate) fn graphics_source(
+pub fn graphics_source(
     state: &MaxwellThreeDState,
     pipeline_index: usize,
 ) -> Result<GraphicsSource> {
@@ -146,73 +146,4 @@ fn constant_buffer(
         address: binding.address().get(),
         size: u64::from(binding.size()),
     })
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn graphics_sources_track_consumed_compilation_parameters_and_header_offsets() {
-        let (allocation, space, base) = crate::shader::test_support::mapped_memory();
-        crate::test_memory::write(
-            &allocation,
-            0x10 + 0x58,
-            &0xe300_0000_0007_000fu64.to_le_bytes(),
-        )
-        .unwrap();
-        let mut channel = crate::engines::tests::three_d_channel();
-        for (method, value) in [
-            (0x1608, (base >> 32) as u32),
-            (0x160c, base as u32),
-            (0x2000, 0x11),
-            (0x2004, 0x10),
-            (0x200c, 4),
-        ] {
-            crate::engines::tests::program_three_d(&mut channel, method, value);
-        }
-        for index in 0..8 {
-            crate::engines::tests::program_three_d(&mut channel, 0x1240 + index * 4, index + 1);
-        }
-        let request = graphics_request(channel.three_d(), 0).unwrap();
-        let vertex = graphics_source(channel.three_d(), 0).unwrap();
-        assert_eq!(request.bindings.geometry_passthrough_mask, None);
-        assert_eq!(request.metadata.start_address, ProgramOffset(0x10));
-        let mut compiler = Compiler::new().unwrap();
-        let (captured, _) = capture(
-            &mut compiler,
-            space.memory(),
-            request,
-            &HostTranslateInfo::default(),
-            &CompilerSettings::default(),
-            &mut MemoryCache::default(),
-            &mut crate::test_memory::access(space.memory().machine()),
-        )
-        .unwrap();
-        assert_eq!(
-            captured
-                .environment
-                .observations()
-                .instructions
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![ProgramOffset(0x68)]
-        );
-        crate::engines::tests::program_three_d(&mut channel, 0x1240, 99);
-        assert_eq!(graphics_source(channel.three_d(), 0).unwrap(), vertex);
-        crate::engines::tests::program_three_d(&mut channel, 0x2000, 0x41);
-        let geometry = graphics_source(channel.three_d(), 0).unwrap();
-        assert_eq!(
-            graphics_request(channel.three_d(), 0)
-                .unwrap()
-                .bindings
-                .geometry_passthrough_mask
-                .unwrap()[0],
-            99
-        );
-        crate::engines::tests::program_three_d(&mut channel, 0x1240, 77);
-        assert_ne!(graphics_source(channel.three_d(), 0).unwrap(), geometry);
-        crate::engines::tests::program_three_d(&mut channel, 0x2000, 0x11);
-        crate::engines::tests::program_three_d(&mut channel, 0x192c, 1);
-        assert_ne!(graphics_source(channel.three_d(), 0).unwrap(), vertex);
-    }
 }

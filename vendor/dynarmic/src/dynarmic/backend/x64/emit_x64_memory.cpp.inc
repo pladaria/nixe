@@ -55,7 +55,6 @@ template<std::size_t bitsize, auto callback>
 void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst, const std::optional<DoNotFastmemMarker>& fastmem_marker) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const bool ordered = IsOrdered(args[2].GetImmediateAccType());
-    const bool non_writing_ordered_read = ordered && bitsize != 128 && UseNonWritingOrderedReads(conf);
 
     if (!conf.page_table && !fastmem_marker) {
         // Neither fastmem nor page table: Use callbacks
@@ -98,8 +97,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst, const std::
         bool require_abort_handling;
         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, inst->GetArg(1));
 
-        if (non_writing_ordered_read) code.mfence();
-        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && !non_writing_ordered_read);
+        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
@@ -121,8 +119,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst, const std::
         // Use page table
         ASSERT(conf.page_table);
         const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr);
-        if (non_writing_ordered_read) code.mfence();
-        EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && !non_writing_ordered_read);
+        EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);

@@ -6,6 +6,8 @@ mod arena;
 mod record;
 mod slot;
 mod state;
+mod transfer;
+pub(crate) use state::DynamicState;
 mod worker;
 pub(crate) use slot::CommandSlot;
 use worker::Recorder;
@@ -15,25 +17,30 @@ pub(crate) use worker::{QueueSubmission, RecordingHandle};
 struct Functions {
     submit: vk::PFN_vkQueueSubmit2,
     barrier: vk::PFN_vkCmdPipelineBarrier2,
-    begin: vk::PFN_vkCmdBeginRendering,
-    end: vk::PFN_vkCmdEndRendering,
+    begin: vk::PFN_vkCmdBeginRenderPass,
+    end: vk::PFN_vkCmdEndRenderPass,
     #[cfg(feature = "binding-probe")]
     timestamp: vk::PFN_vkCmdWriteTimestamp2,
     state: Option<StateDispatch>,
+    state2: Option<State2Dispatch>,
     feedback: Option<vk::PFN_vkCmdSetAttachmentFeedbackLoopEnableEXT>,
+    vertex_input: Option<vk::PFN_vkCmdSetVertexInputEXT>,
+    vertex_buffers2: Option<vk::PFN_vkCmdBindVertexBuffers2>,
+    blending: Option<BlendingDispatch>,
+    push_descriptor: Option<vk::PFN_vkCmdPushDescriptorSetWithTemplateKHR>,
+}
+
+#[derive(Clone, Copy)]
+struct BlendingDispatch {
+    enable: vk::PFN_vkCmdSetColorBlendEnableEXT,
+    equation: vk::PFN_vkCmdSetColorBlendEquationEXT,
+    mask: vk::PFN_vkCmdSetColorWriteMaskEXT,
 }
 
 pub(crate) struct Dispatch {
     recorder: Recorder,
-    pub state: Option<StateDispatch>,
+    pub dynamic_mask: u16,
     pub release_swapchain_images: Option<vk::PFN_vkReleaseSwapchainImagesEXT>,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct RenderingFeedback {
-    pub colors: u8,
-    pub depth: bool,
-    pub stencil: bool,
 }
 
 impl Dispatch {
@@ -57,33 +64,29 @@ impl Dispatch {
     pub fn new(
         instance: &Instance,
         device: &Device,
-        path: ApiPath,
-        maintenance: crate::SwapchainMaintenance,
-        dynamic: bool,
-        feedback_loop: bool,
+        profile: &crate::DeviceProfile,
         queue_mutex: std::sync::Arc<std::sync::Mutex<()>>,
     ) -> Result<Self, VulkanError> {
-        let (submit, barrier, begin, end) = match path {
-            ApiPath::Core13 => {
-                let f = device.fp_v1_3();
-                (
-                    f.queue_submit2,
-                    f.cmd_pipeline_barrier2,
-                    f.cmd_begin_rendering,
-                    f.cmd_end_rendering,
-                )
-            }
+        let path = profile.api_path;
+        let maintenance = profile.swapchain_maintenance;
+        let dynamic = profile.dynamic_state.base;
+        let feedback_loop = profile.attachment_feedback_loop;
+        let push_descriptor = profile.max_push_descriptors != 0;
+        let (submit, barrier) = match path {
+            ApiPath::Core13 => (
+                device.fp_v1_3().queue_submit2,
+                device.fp_v1_3().cmd_pipeline_barrier2,
+            ),
             ApiPath::Khr12 => {
                 let sync = ash::khr::synchronization2::Device::new(instance, device);
-                let rendering = ash::khr::dynamic_rendering::Device::new(instance, device);
                 (
                     sync.fp().queue_submit2_khr,
                     sync.fp().cmd_pipeline_barrier2_khr,
-                    rendering.fp().cmd_begin_rendering_khr,
-                    rendering.fp().cmd_end_rendering_khr,
                 )
             }
         };
+        let begin = device.fp_v1_0().cmd_begin_render_pass;
+        let end = device.fp_v1_0().cmd_end_render_pass;
         #[cfg(feature = "binding-probe")]
         let timestamp = match path {
             ApiPath::Core13 => device.fp_v1_3().cmd_write_timestamp2,
@@ -119,6 +122,7 @@ impl Dispatch {
             ApiPath::Core13 => {
                 let f = device.fp_v1_3();
                 StateDispatch {
+                    topology: f.cmd_set_primitive_topology,
                     cull: f.cmd_set_cull_mode,
                     front: f.cmd_set_front_face,
                     depth_test: f.cmd_set_depth_test_enable,
@@ -133,6 +137,7 @@ impl Dispatch {
                 let extension = ash::ext::extended_dynamic_state::Device::new(instance, device);
                 let f = extension.fp();
                 StateDispatch {
+                    topology: f.cmd_set_primitive_topology_ext,
                     cull: f.cmd_set_cull_mode_ext,
                     front: f.cmd_set_front_face_ext,
                     depth_test: f.cmd_set_depth_test_enable_ext,
@@ -144,6 +149,27 @@ impl Dispatch {
                 }
             }
         });
+        let state2 = profile.dynamic_state.base2.then(|| match path {
+            ApiPath::Core13 => {
+                let f = device.fp_v1_3();
+                State2Dispatch {
+                    restart: f.cmd_set_primitive_restart_enable,
+                    discard: f.cmd_set_rasterizer_discard_enable,
+                    bias: f.cmd_set_depth_bias_enable,
+                }
+            }
+            ApiPath::Khr12 => {
+                let extension = ash::ext::extended_dynamic_state2::Device::new(instance, device);
+                let f = extension.fp();
+                State2Dispatch {
+                    restart: f.cmd_set_primitive_restart_enable_ext,
+                    discard: f.cmd_set_rasterizer_discard_enable_ext,
+                    bias: f.cmd_set_depth_bias_enable_ext,
+                }
+            }
+        });
+        let dynamic_mask =
+            if state.is_some() { 0x3ff } else { 0 } | if state2.is_some() { 0x1c00 } else { 0 };
         let feedback = feedback_loop.then(|| {
             ash::ext::attachment_feedback_loop_dynamic_state::Device::new(instance, device)
                 .fp()
@@ -159,13 +185,42 @@ impl Dispatch {
                 #[cfg(feature = "binding-probe")]
                 timestamp,
                 state,
+                state2,
                 feedback,
+                vertex_buffers2: dynamic.then(|| match path {
+                    ApiPath::Core13 => device.fp_v1_3().cmd_bind_vertex_buffers2,
+                    ApiPath::Khr12 => {
+                        ash::ext::extended_dynamic_state::Device::new(instance, device)
+                            .fp()
+                            .cmd_bind_vertex_buffers2_ext
+                    }
+                }),
+                vertex_input: profile.dynamic_state.vertex_input.then(|| {
+                    ash::ext::vertex_input_dynamic_state::Device::new(instance, device)
+                        .fp()
+                        .cmd_set_vertex_input_ext
+                }),
+                blending: profile.dynamic_state.blending().then(|| {
+                    let extension =
+                        ash::ext::extended_dynamic_state3::Device::new(instance, device);
+                    let f = extension.fp();
+                    BlendingDispatch {
+                        enable: f.cmd_set_color_blend_enable_ext,
+                        equation: f.cmd_set_color_blend_equation_ext,
+                        mask: f.cmd_set_color_write_mask_ext,
+                    }
+                }),
+                push_descriptor: push_descriptor.then(|| {
+                    ash::khr::push_descriptor::Device::new(instance, device)
+                        .fp()
+                        .cmd_push_descriptor_set_with_template_khr
+                }),
             },
             queue_mutex,
         )?;
         Ok(Self {
             recorder,
-            state,
+            dynamic_mask,
             release_swapchain_images,
         })
     }
@@ -177,7 +232,6 @@ impl Dispatch {
         index: u32,
     ) {
         self.recorder.record(move |ctx| {
-            ctx.flush_draw();
             unsafe { (ctx.functions.timestamp)(ctx.command, stage, pool, index) };
             Ok(())
         });
@@ -193,6 +247,11 @@ impl Dispatch {
     }
     pub fn dispatch_work(&mut self) -> Result<(), VulkanError> {
         self.recorder.flush_chunks()
+    }
+    /// Scheduler::WaitWorker dispatches the current chunk and waits only for
+    /// native recording, independently of queue/GPU completion.
+    pub(crate) fn wait_worker(&mut self) -> Result<(), VulkanError> {
+        self.recorder.finish()
     }
     pub fn begin_submission_timing(&mut self, pool: vk::QueryPool) {
         self.recorder.record(move |ctx| {
@@ -213,7 +272,6 @@ impl Dispatch {
     }
     pub unsafe fn cmd_set_feedback_loop(&mut self, aspects: vk::ImageAspectFlags) {
         self.recorder.record(move |ctx| {
-            ctx.flush_draw();
             unsafe {
                 (ctx.functions
                     .feedback
@@ -224,40 +282,230 @@ impl Dispatch {
             Ok(())
         });
     }
-    pub unsafe fn dynamic_state(&mut self, state: &crate::cache::GraphicsState) {
-        let s = state::DynamicState::from(state);
+    pub unsafe fn cmd_set_cull_mode(&mut self, value: vk::CullModeFlags) {
         self.recorder.record(move |ctx| {
-            ctx.flush_draw();
-            let state = ctx
-                .functions
-                .state
-                .as_ref()
-                .expect("enabled native dynamic state");
+            unsafe {
+                (ctx.functions
+                    .state
+                    .as_ref()
+                    .expect("enabled native dynamic state")
+                    .cull)(ctx.command, value);
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn cmd_set_front_face(&mut self, value: vk::FrontFace) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .state
+                    .as_ref()
+                    .expect("enabled native dynamic state")
+                    .front)(ctx.command, value);
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn cmd_set_depth_test_enable(&mut self, value: bool) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .state
+                    .as_ref()
+                    .expect("enabled native dynamic state")
+                    .depth_test)(ctx.command, u32::from(value));
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn cmd_set_depth_write_enable(&mut self, value: bool) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .state
+                    .as_ref()
+                    .expect("enabled native dynamic state")
+                    .depth_write)(ctx.command, u32::from(value));
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn cmd_set_depth_compare_op(&mut self, value: vk::CompareOp) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .state
+                    .as_ref()
+                    .expect("enabled native dynamic state")
+                    .depth_compare)(ctx.command, value);
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn cmd_set_depth_bounds_test_enable(&mut self, value: bool) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .state
+                    .as_ref()
+                    .expect("enabled native dynamic state")
+                    .depth_bounds)(ctx.command, u32::from(value));
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn cmd_set_stencil_test_enable(&mut self, value: bool) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .state
+                    .as_ref()
+                    .expect("enabled native dynamic state")
+                    .stencil_test)(ctx.command, u32::from(value));
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn cmd_set_primitive_topology(&mut self, value: vk::PrimitiveTopology) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .state
+                    .as_ref()
+                    .expect("enabled native dynamic state")
+                    .topology)(ctx.command, value);
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn cmd_set_primitive_restart_enable(&mut self, value: bool) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .state2
+                    .as_ref()
+                    .expect("enabled native dynamic state")
+                    .restart)(ctx.command, u32::from(value));
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn cmd_set_rasterizer_discard_enable(&mut self, value: bool) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .state2
+                    .as_ref()
+                    .expect("enabled native dynamic state")
+                    .discard)(ctx.command, u32::from(value));
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn cmd_set_depth_bias_enable(&mut self, value: bool) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .state2
+                    .as_ref()
+                    .expect("enabled native dynamic state")
+                    .bias)(ctx.command, u32::from(value));
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn cmd_set_stencil_op(
+        &mut self,
+        face: vk::StencilFaceFlags,
+        value: crate::cache::StencilState,
+    ) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .state
+                    .as_ref()
+                    .expect("enabled native stencil state")
+                    .stencil)(
+                    ctx.command,
+                    face,
+                    value.fail,
+                    value.pass,
+                    value.depth_fail,
+                    value.compare,
+                );
+            }
+            Ok(())
+        });
+    }
+    pub unsafe fn dynamic_state(&mut self, state: &crate::cache::GraphicsState) -> u16 {
+        let s = DynamicState::from(state);
+        let changed = self.dynamic_mask;
+        if changed == 0 {
+            return 0;
+        }
+        self.recorder.record(move |ctx| {
             let command = ctx.command;
             unsafe {
-                (state.cull)(command, s.cull);
-                (state.front)(command, s.front_face);
-                (state.depth_test)(command, u32::from(s.depth_test));
-                (state.depth_write)(command, u32::from(s.depth_write));
-                (state.depth_compare)(command, s.depth_compare);
-                (state.depth_bounds)(command, u32::from(s.depth_bounds));
-                (state.stencil_test)(command, u32::from(s.stencil_test));
-                for (face, stencil) in [
-                    (vk::StencilFaceFlags::FRONT, s.front),
-                    (vk::StencilFaceFlags::BACK, s.back),
-                ] {
-                    (state.stencil)(
-                        command,
-                        face,
-                        stencil.fail,
-                        stencil.pass,
-                        stencil.depth_fail,
-                        stencil.compare,
-                    );
+                if let Some(state) = ctx.functions.state.as_ref() {
+                    if changed & (1 << 9) != 0 {
+                        (state.topology)(command, s.topology);
+                    }
+                    if changed & (1 << 0) != 0 {
+                        (state.cull)(command, s.cull);
+                    }
+                    if changed & (1 << 1) != 0 {
+                        (state.front)(command, s.front_face);
+                    }
+                    if changed & (1 << 2) != 0 {
+                        (state.depth_test)(command, u32::from(s.depth_test));
+                    }
+                    if changed & (1 << 3) != 0 {
+                        (state.depth_write)(command, u32::from(s.depth_write));
+                    }
+                    if changed & (1 << 4) != 0 {
+                        (state.depth_compare)(command, s.depth_compare);
+                    }
+                    if changed & (1 << 5) != 0 {
+                        (state.depth_bounds)(command, u32::from(s.depth_bounds));
+                    }
+                    if changed & (1 << 6) != 0 {
+                        (state.stencil_test)(command, u32::from(s.stencil_test));
+                    }
+                    for (index, (face, stencil)) in [
+                        (vk::StencilFaceFlags::FRONT, s.front),
+                        (vk::StencilFaceFlags::BACK, s.back),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        if changed & (1 << (7 + index)) == 0 {
+                            continue;
+                        }
+                        (state.stencil)(
+                            command,
+                            face,
+                            stencil.fail,
+                            stencil.pass,
+                            stencil.depth_fail,
+                            stencil.compare,
+                        );
+                    }
+                }
+                if let Some(state) = ctx.functions.state2.as_ref() {
+                    if changed & (1 << 10) != 0 {
+                        (state.restart)(command, u32::from(s.primitive_restart));
+                    }
+                    if changed & (1 << 11) != 0 {
+                        (state.discard)(command, u32::from(s.raster_discard));
+                    }
+                    if changed & (1 << 12) != 0 {
+                        (state.bias)(command, u32::from(s.depth_bias));
+                    }
                 }
             }
             Ok(())
         });
+        changed
     }
     /// All chains must be null; array elements contain only native handles and scalars.
     pub unsafe fn barrier(&mut self, info: &vk::DependencyInfo<'_>) {
@@ -306,7 +554,6 @@ impl Dispatch {
                 buffers,
                 images,
                 move |ctx, memory, buffers, images| {
-                    ctx.flush_draw();
                     let info = vk::DependencyInfo::default()
                         .dependency_flags(flags)
                         .memory_barriers(memory)
@@ -318,92 +565,32 @@ impl Dispatch {
             )
         };
     }
-    pub unsafe fn begin_rendering(
-        &mut self,
-        info: &vk::RenderingInfo<'_>,
-        feedback: RenderingFeedback,
-    ) {
+    pub unsafe fn begin_render_pass(&mut self, info: &vk::RenderPassBeginInfo<'_>) {
         debug_assert!(info.p_next.is_null());
-        let own = |v: &vk::RenderingAttachmentInfo<'_>| {
-            debug_assert!(v.p_next.is_null());
-            vk::RenderingAttachmentInfo::default()
-                .image_view(v.image_view)
-                .image_layout(v.image_layout)
-                .resolve_mode(v.resolve_mode)
-                .resolve_image_view(v.resolve_image_view)
-                .resolve_image_layout(v.resolve_image_layout)
-                .load_op(v.load_op)
-                .store_op(v.store_op)
-                .clear_value(v.clear_value)
-        };
-        let colors = if info.color_attachment_count == 0 {
+        let clears = if info.clear_value_count == 0 {
             &[]
         } else {
             unsafe {
-                std::slice::from_raw_parts(
-                    info.p_color_attachments,
-                    info.color_attachment_count as usize,
-                )
+                std::slice::from_raw_parts(info.p_clear_values, info.clear_value_count as usize)
             }
         };
-        debug_assert!(colors.iter().all(|v| v.p_next.is_null()));
-        let depth = unsafe { info.p_depth_attachment.as_ref() }.map(own);
-        let stencil = unsafe { info.p_stencil_attachment.as_ref() }.map(own);
-        let flags = info.flags;
+        let pass = info.render_pass;
+        let framebuffer = info.framebuffer;
         let area = info.render_area;
-        let layers = info.layer_count;
-        let mask = info.view_mask;
         unsafe {
-            self.recorder.record_array(colors, move |ctx, colors| {
-                ctx.flush_draw();
-                // Only the typed flags cross the recording boundary. Construct
-                // pNext chains here, where their storage outlives the Vulkan call.
-                let extension = crate::extensions::AttachmentFeedbackLoop::enabled();
-                let extension_ptr = std::ptr::from_ref(&extension).cast();
-                let mut feedback_colors = smallvec::SmallVec::<[_; 8]>::new();
-                if feedback.colors != 0 {
-                    feedback_colors.extend_from_slice(colors);
-                    for (index, attachment) in feedback_colors.iter_mut().enumerate() {
-                        if u32::from(feedback.colors) & (1 << index) != 0 {
-                            attachment.p_next = extension_ptr;
-                        }
-                    }
-                }
-                let mut depth = depth;
-                let mut stencil = stencil;
-                if feedback.depth {
-                    depth.as_mut().expect("feedback depth attachment").p_next = extension_ptr;
-                }
-                if feedback.stencil {
-                    stencil
-                        .as_mut()
-                        .expect("feedback stencil attachment")
-                        .p_next = extension_ptr;
-                }
-                let mut info = vk::RenderingInfo::default()
-                    .flags(flags)
+            self.recorder.record_array(clears, move |ctx, clear| {
+                let info = vk::RenderPassBeginInfo::default()
+                    .render_pass(pass)
+                    .framebuffer(framebuffer)
                     .render_area(area)
-                    .layer_count(layers)
-                    .view_mask(mask)
-                    .color_attachments(if feedback.colors == 0 {
-                        colors
-                    } else {
-                        &feedback_colors
-                    });
-                if let Some(depth) = &depth {
-                    info = info.depth_attachment(depth);
-                }
-                if let Some(stencil) = &stencil {
-                    info = info.stencil_attachment(stencil);
-                }
-                (ctx.functions.begin)(ctx.command, &info);
+                    .clear_values(clear);
+                (ctx.functions.begin)(ctx.command, &info, vk::SubpassContents::INLINE);
                 Ok(())
-            })
-        };
+            });
+        }
     }
     pub unsafe fn end_rendering(&mut self) {
         self.recorder.record(|ctx| {
-            ctx.flush_draw();
             unsafe { (ctx.functions.end)(ctx.command) };
             Ok(())
         });
@@ -412,6 +599,7 @@ impl Dispatch {
 
 #[derive(Clone, Copy)]
 pub(crate) struct StateDispatch {
+    pub topology: vk::PFN_vkCmdSetPrimitiveTopology,
     pub cull: vk::PFN_vkCmdSetCullMode,
     pub front: vk::PFN_vkCmdSetFrontFace,
     pub depth_test: vk::PFN_vkCmdSetDepthTestEnable,
@@ -420,4 +608,11 @@ pub(crate) struct StateDispatch {
     pub depth_bounds: vk::PFN_vkCmdSetDepthBoundsTestEnable,
     pub stencil_test: vk::PFN_vkCmdSetStencilTestEnable,
     pub stencil: vk::PFN_vkCmdSetStencilOp,
+}
+
+#[derive(Clone, Copy)]
+struct State2Dispatch {
+    restart: vk::PFN_vkCmdSetPrimitiveRestartEnable,
+    discard: vk::PFN_vkCmdSetRasterizerDiscardEnable,
+    bias: vk::PFN_vkCmdSetDepthBiasEnable,
 }

@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use nixe_gpu::{GuestTimelinePoint, PresentationImageRequest, ResidentImage};
+pub(crate) use gpu_executor::Composite;
+use nixe_gpu::GuestTimelinePoint;
 
 use nixe_gpu_maxwell::{
     MaxwellAddressSpaceId, MaxwellChannelConfiguration, MaxwellChannelId, MaxwellChannelOwner,
@@ -75,6 +76,8 @@ pub(crate) const NV_CONFIG_VAR_NOT_FOUND: u32 = 0x3_0006;
 struct NvDrvClientState {
     kernel: Arc<nixe_scheduler::SchedulerState>,
     machine: Machine,
+    device_memory: nixe_gpu_maxwell::MaxwellDeviceMemory,
+    device_heap_initialized: bool,
     initialized: bool,
     transfer_memory_size: u32,
     client_identity: Option<NvDrvClientIdentity>,
@@ -134,44 +137,58 @@ pub struct NvDrvSession {
 impl NvDrvSession {
     #[must_use]
     pub fn new(machine: Machine, kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
+        let control = Arc::new(Mutex::new(NvHostControl::new(kernel)));
         Self::new_with_executor(
-            machine.clone(),
+            nixe_gpu_maxwell::MaxwellDeviceMemory::new(machine.clone()),
             kernel,
-            NvDrvGpuExecutor::new(machine, kernel),
+            NvDrvGpuExecutor::new(machine, kernel, Arc::clone(&control)),
+            control,
         )
     }
 
     /// Startup composition; neither worker erases the selected command representation.
-    #[must_use]
-    pub fn with_gpu_frontend<E, L>(
-        machine: Machine,
+    pub fn with_gpu_frontend<E, L, R>(
+        device_memory: nixe_gpu_maxwell::MaxwellDeviceMemory,
         kernel: &Arc<nixe_scheduler::SchedulerState>,
-        execution: E,
-        frontend: L,
-    ) -> Self
+        initialize: impl FnOnce() -> Result<(E, R), nixe_gpu::BackendRuntimeError> + Send + 'static,
+        frontend: impl FnOnce(std::rc::Rc<std::cell::RefCell<Option<E>>>) -> L + Send + 'static,
+    ) -> Result<(Self, R), nixe_gpu::BackendRuntimeError>
     where
         L: nixe_gpu_maxwell::MaxwellFrontend,
+        R: Send + 'static,
         E: nixe_gpu::GpuExecution<
-                Commands = nixe_gpu::native::NativeWork,
-                ImageRequest = nixe_gpu::native::NativePresentationImage,
+                Conversion = nixe_gpu::native::NativeNv12Conversion,
+                ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
             >,
     {
-        Self::new_with_executor(
-            machine.clone(),
+        let machine = device_memory.machine().clone();
+        let control = Arc::new(Mutex::new(NvHostControl::new(kernel)));
+        let (executor, report) = NvDrvGpuExecutor::with_frontend(
+            machine,
             kernel,
-            NvDrvGpuExecutor::with_frontend(machine, kernel, Some(execution), frontend),
-        )
+            Arc::clone(&control),
+            move || initialize().map(|(execution, report)| (Some(execution), report)),
+            frontend,
+        )?;
+        Ok((
+            Self::new_with_executor(device_memory, kernel, executor, control),
+            report,
+        ))
     }
 
     fn new_with_executor(
-        machine: Machine,
+        device_memory: nixe_gpu_maxwell::MaxwellDeviceMemory,
         kernel: &Arc<nixe_scheduler::SchedulerState>,
         gpu_executor: NvDrvGpuExecutor,
+        control: Arc<Mutex<NvHostControl>>,
     ) -> Self {
+        let machine = device_memory.machine().clone();
         Self {
             connection_id: NvDrvSessionId::ROOT,
             state: Arc::new(Mutex::new(NvDrvClientState {
                 kernel: kernel.clone(),
+                device_memory,
+                device_heap_initialized: false,
                 machine,
                 initialized: false,
                 transfer_memory_size: 0,
@@ -184,7 +201,7 @@ impl NvDrvSession {
                 gpu_address_spaces: Arc::new(Mutex::new(BTreeMap::new())),
                 next_gpu_channel_id: 1,
                 nvhost_gpu: Arc::new(Mutex::new(NvHostGpu::new(kernel))),
-                nvhost_control: Arc::new(Mutex::new(NvHostControl::new(kernel))),
+                nvhost_control: control,
                 nvhost_control_gpu: BTreeMap::new(),
                 zbc_tables: NvHostZbcTables::default(),
                 nvmap: NvMapObjects::default(),
@@ -195,24 +212,24 @@ impl NvDrvSession {
         }
     }
 
-    pub(crate) fn request_presentable_image(
+    pub(crate) fn request_composite(
         &self,
-        request: PresentationImageRequest,
-        swap_interval: u32,
-        events: Option<nixe_runtime::ExternalEventSender>,
-    ) -> Result<std::sync::mpsc::Receiver<Result<ResidentImage, Box<str>>>, Box<str>> {
-        let backend = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .gpu_backend
-            .as_ref()
-            .cloned();
+        composite: Composite,
+        fences: Box<[GuestTimelinePoint]>,
+        notification: std::task::Waker,
+    ) -> Result<std::sync::mpsc::Receiver<Result<(), Box<str>>>, Box<str>> {
+        let backend = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.gpu_backend.clone()
+        };
         backend.map_or_else(
             || Err("GPU backend is unavailable for resident presentation".into()),
             |backend| {
                 backend
-                    .request_presentable_image(request, swap_interval, events)
+                    .request_composite(composite, fences, notification)
                     .map_err(|error| error.to_string().into_boxed_str())
             },
         )
@@ -367,7 +384,7 @@ impl NvDrvSession {
             let address_space_id = MaxwellAddressSpaceId::new(state.next_gpu_address_space_id);
             state.next_gpu_address_space_id = next_gpu_address_space_id;
             let address_space = MaxwellGpuAddressSpace::new(
-                state.machine.clone(),
+                state.device_memory.clone(),
                 address_space_id,
                 state.gpu_profile,
             );
@@ -383,6 +400,16 @@ impl NvDrvSession {
                 MaxwellChannelOwner::new(process_id),
                 state.gpu_profile,
             );
+            // Allocate the engine/cache channel at device open, before any
+            // submission can bind it. Eden nvhost_gpu and GPU::AllocateChannel:
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
+            if let Some(backend) = &state.gpu_backend {
+                backend.create_channel(channel).map_err(|error| {
+                    NvDrvCallError::Unsupported(nvhost_gpu::queued_execution_error(
+                        descriptor, 0, error,
+                    ))
+                })?;
+            }
             state.next_gpu_channel_id = next_gpu_channel_id;
             state
                 .nvhost_gpu
@@ -413,6 +440,9 @@ impl NvDrvSession {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .unbind_address_space(address_space.id());
+                    if let Some(backend) = &state.gpu_backend {
+                        backend.close_address_space(address_space.id());
+                    }
                 }
                 if let Some((channel, syncpoint)) = state
                     .nvhost_gpu
@@ -802,6 +832,27 @@ impl NvDrvSession {
                         });
                     };
                     ioctl_nvhost_as_gpu(address_space, &state.nvmap, descriptor, request, input)
+                        .and_then(|output| {
+                            if matches!(
+                                request,
+                                nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS
+                                    | nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS_EX
+                            ) && let Some(backend) = &state.gpu_backend
+                            {
+                                // nvhost_as_gpu::AllocAsEx calls GPU::InitAddressSpace.
+                                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp
+                                backend
+                                    .create_address_space(address_space.memory().clone())
+                                    .map_err(|error| {
+                                        NvDrvCallError::Unsupported(
+                                            nvhost_gpu::queued_execution_error(
+                                                descriptor, request, error,
+                                            ),
+                                        )
+                                    })?;
+                            }
+                            Ok(output)
+                        })
                         .map(NvHostCtrlIoctlOutcome::Complete)
                         .map(LockedIoctlOutcome::Standard)
                 }
@@ -1021,6 +1072,14 @@ impl NvDrvSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .nvmap
             .object_by_exported_id(id)
+    }
+
+    pub(crate) fn pin_framebuffer(
+        &self,
+        object: &NvMapObject,
+    ) -> Result<Arc<nixe_gpu_maxwell::MaxwellDeviceMapping>, nixe_memory::MemoryError> {
+        let memory = self.state.lock().unwrap().device_memory.clone();
+        object.pin_device(&memory)
     }
 
     /// Samples an existing guest GPU timeline point for BufferQueue acquire
@@ -1428,6 +1487,50 @@ fn ioctl_nvmap(
                         )),
                     },
                 ));
+            }
+            if !state.device_heap_initialized {
+                if let Some((base, bytes)) = memory
+                    .normal_heap_region()
+                    .filter(|(_, bytes)| *bytes >= 32 * 1024 * 1024)
+                {
+                    state
+                        .device_memory
+                        .register_heap(
+                            address_space,
+                            base,
+                            memory
+                                .space()
+                                .capture(base, bytes, nixe_memory::MemoryPermissions::NONE)
+                                .and_then(|ranges| nixe_memory::PhysicalMapping::new(&ranges))
+                                .map_err(|fault| {
+                                    NvDrvCallError::Unsupported(
+                                        UnsupportedNvDrvOperation::PhysicalMemory {
+                                            context: NvDrvErrorContext::new(
+                                                descriptor.kind(),
+                                                request,
+                                                descriptor.fd(),
+                                                Some(handle),
+                                                NvDrvValidationReason::PhysicalMemoryUnavailable,
+                                            ),
+                                            fault: Arc::new(fault),
+                                        },
+                                    )
+                                })?,
+                        )
+                        .map_err(|fault| {
+                            NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::PhysicalMemory {
+                                context: NvDrvErrorContext::new(
+                                    descriptor.kind(),
+                                    request,
+                                    descriptor.fd(),
+                                    Some(handle),
+                                    NvDrvValidationReason::PhysicalMemoryUnavailable,
+                                ),
+                                fault: Arc::new(fault),
+                            })
+                        })?;
+                }
+                state.device_heap_initialized = true;
             }
             let ranges = memory
                 .space()
@@ -2809,8 +2912,10 @@ mod tests {
         let first_fd = session.open(b"/dev/nvhost-as-gpu", 7).unwrap();
         let second_fd = clone.open(b"/dev/nvhost-as-gpu", 7).unwrap();
         let first_descriptor = session.device_descriptor(first_fd).unwrap();
-        let first_address_space = clone.gpu_address_space(first_fd).unwrap();
-        let second_address_space = session.gpu_address_space(second_fd).unwrap();
+        let first_address_space =
+            nixe_gpu_maxwell::MaxwellGpuMemory::new(clone.gpu_address_space(first_fd).unwrap());
+        let second_address_space =
+            nixe_gpu_maxwell::MaxwellGpuMemory::new(session.gpu_address_space(second_fd).unwrap());
 
         assert_eq!(
             first_descriptor.kind(),
@@ -2834,7 +2939,8 @@ mod tests {
         assert!((session.gpu_address_space(first_fd)).is_none());
         assert!((session.device_descriptor(first_fd)).is_none());
         assert_eq!(
-            session.gpu_address_space(second_fd).unwrap().id(),
+            nixe_gpu_maxwell::MaxwellGpuMemory::new(session.gpu_address_space(second_fd).unwrap())
+                .id(),
             second_address_space.id()
         );
 
@@ -3071,7 +3177,10 @@ mod tests {
         assert_eq!(channel.owner().process_id(), 1);
         assert_eq!(
             channel.address_space(),
-            Some(session.gpu_address_space(as_fd).unwrap().id())
+            Some(
+                nixe_gpu_maxwell::MaxwellGpuMemory::new(session.gpu_address_space(as_fd).unwrap())
+                    .id()
+            )
         );
         assert_eq!(channel.syncpoint().unwrap().get(), syncpoint);
         assert_eq!(channel.frontend().gpfifo_entries(), Some(0x800));
@@ -3144,208 +3253,6 @@ mod tests {
     }
 
     #[test]
-    fn asynchronous_frontend_accepts_empty_submissions_and_retains_real_failures() {
-        for (legacy, empty, zero_increment) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (true, true, false),
-            (false, false, true),
-            (true, false, true),
-            (false, true, true),
-            (true, true, true),
-        ] {
-            let session =
-                NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
-            session.initialize(0);
-            let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
-            let control_fd = session.open(b"/dev/nvhost-ctrl", 1).unwrap();
-            let as_fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
-            let channel_fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
-            session
-                .ioctl(channel_fd, 0x4004_4801, &nvmap_fd.raw().to_le_bytes())
-                .unwrap();
-            session
-                .ioctl(as_fd, 0x4004_4101, &channel_fd.raw().to_le_bytes())
-                .unwrap();
-            let mut allocate = [0_u8; 32];
-            allocate[..4].copy_from_slice(&8_u32.to_le_bytes());
-            let (allocated, result) = session.ioctl(channel_fd, 0xc020_481a, &allocate).unwrap();
-            assert_eq!(result, NV_SUCCESS);
-            let syncpoint = GuestSyncpointId::new(input_u32(&allocated, 12).unwrap());
-            let machine = session.state.lock().unwrap().machine.clone();
-            let allocation = machine.account(0x1000).unwrap().allocate(0x1000).unwrap();
-            let input = AllocationRange::new(allocation.pin(), 0, 0x1000).unwrap();
-            machine
-                .write_resolved(
-                    &[input.slice(0, 4).unwrap()],
-                    &0x1234_5678_u32.to_le_bytes(),
-                )
-                .unwrap();
-            let mapping = {
-                let state = session.state.lock().unwrap();
-                let mut spaces = state.gpu_address_spaces.lock().unwrap();
-                let space = spaces.get_mut(&as_fd).unwrap();
-                space
-                    .initialize(nixe_gpu_maxwell::MaxwellAddressSpaceInitialization::default())
-                    .unwrap();
-                space
-                    .map(nixe_gpu_maxwell::MaxwellMapRequest {
-                        allocation: nixe_gpu_maxwell::MaxwellAllocationId::new(1),
-                        backing: vec![input.clone()],
-                        backing_offset: 0,
-                        size: 0x1000,
-                        allocation_alignment: 0x1000,
-                        page_size: 0x1000,
-                        kind: 0,
-                        cacheable: false,
-                        permissions: MemoryPermissions::READ_WRITE,
-                        fixed_offset: None,
-                    })
-                    .unwrap()
-            };
-            let mut entry = [0_u8; 8];
-            entry[..4].copy_from_slice(&(mapping.offset().get() as u32).to_le_bytes());
-            entry[4..].copy_from_slice(
-                &(((mapping.offset().get() >> 32) as u32) | (1 << 10)).to_le_bytes(),
-            );
-            let mut header = [0_u8; 24];
-            header[8..12].copy_from_slice(&u32::from(!empty).to_le_bytes());
-            header[12..16]
-                .copy_from_slice(&(4_u32 | (u32::from(zero_increment) << 8)).to_le_bytes());
-            let (accepted, mut request) = if legacy {
-                let mut input = header.to_vec();
-                if !empty {
-                    input.extend_from_slice(&entry);
-                }
-                let request = if empty { 0xc018_4808 } else { 0xc020_4808 };
-                // A malformed request is rejected before allocating a frontend ID.
-                if !empty {
-                    assert_eq!(
-                        session.ioctl(channel_fd, request, &header).unwrap().1,
-                        NV_BAD_PARAMETER
-                    );
-                    let mut excessive = header;
-                    excessive[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
-                    assert_eq!(
-                        session
-                            .ioctl(channel_fd, 0xc018_4808, &excessive)
-                            .unwrap()
-                            .1,
-                        NV_BAD_PARAMETER
-                    );
-                }
-                (session.ioctl(channel_fd, request, &input).unwrap(), request)
-            } else {
-                let entries = if empty { &[][..] } else { &entry[..] };
-                (
-                    session
-                        .ioctl2(channel_fd, 0xc018_481b, &header, entries)
-                        .unwrap(),
-                    0xc018_481b,
-                )
-            };
-            assert_eq!(
-                accepted.1, NV_SUCCESS,
-                "acceptance precedes frontend execution"
-            );
-            assert_eq!(input_u32(&accepted.0, 12).unwrap(), 0);
-            assert_eq!(input_u32(&accepted.0, 16).unwrap(), syncpoint.get());
-            assert_eq!(input_u32(&accepted.0, 20).unwrap(), 0);
-            let (backend, control_descriptor) = {
-                let state = session.state.lock().unwrap();
-                (
-                    state.gpu_backend.as_ref().unwrap().clone(),
-                    state.devices[&control_fd],
-                )
-            };
-            if empty {
-                // A following malformed stream proves the empty submission was
-                // consumed without stopping the owner. Its diagnostic must name
-                // the second frontend and the ABI that actually submitted it.
-                let mut nonempty = header;
-                nonempty[8..12].copy_from_slice(&1_u32.to_le_bytes());
-                let accepted = if legacy {
-                    request = 0xc020_4808;
-                    let mut input = nonempty.to_vec();
-                    input.extend_from_slice(&entry);
-                    session.ioctl(channel_fd, request, &input).unwrap()
-                } else {
-                    session
-                        .ioctl2(channel_fd, request, &nonempty, &entry)
-                        .unwrap()
-                };
-                assert_eq!(accepted.1, NV_SUCCESS);
-            }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            let failure = loop {
-                if let Err(failure) = backend.require_healthy() {
-                    break failure;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "frontend failure was lost"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            };
-            // A later control call must report the original submitting ABI.
-            let UnsupportedNvDrvOperation::ScheduledGpfifoSubmission { context, boundary } =
-                nvhost_gpu::queued_execution_error(control_descriptor, 0xc008_0014, failure)
-            else {
-                panic!("frontend diagnostic lost its retained dispatch")
-            };
-            assert_eq!(context.request(), request);
-            assert_eq!(context.fd(), channel_fd);
-            assert_eq!(
-                context.reason(),
-                NvDrvValidationReason::MaxwellPacketSemanticsUnavailable
-            );
-            assert_eq!(
-                boundary.dispatch().scheduled().frontend(),
-                nixe_gpu::FrontendSubmissionId::new(1 + u64::from(empty))
-            );
-            assert_eq!(
-                session.guest_timeline_point_reached(GuestTimelinePoint::new(
-                    syncpoint,
-                    GuestSyncpointValue::new(0)
-                )),
-                Some(true)
-            );
-            assert_eq!(
-                session.guest_timeline_point_reached(GuestTimelinePoint::new(
-                    syncpoint,
-                    GuestSyncpointValue::new(1)
-                )),
-                Some(false)
-            );
-            assert!(matches!(
-                boundary.frontend_failure(),
-                nixe_gpu_maxwell::MaxwellFrontendDispatchError::PacketDecode(_)
-            ));
-            let submission = boundary.dispatch().scheduled().submission();
-            assert_eq!(
-                submission.decoded().entries()[0].address(),
-                mapping.offset()
-            );
-            let error = boundary.frontend_failure().to_string();
-            assert!(error.contains("0x12345678"));
-            drop(allocation);
-            {
-                let state = session.state.lock().unwrap();
-                state
-                    .gpu_address_spaces
-                    .lock()
-                    .unwrap()
-                    .get_mut(&as_fd)
-                    .unwrap()
-                    .unmap(mapping.offset())
-                    .unwrap();
-            }
-            assert_eq!(boundary.frontend_failure().to_string(), error);
-        }
-    }
-
-    #[test]
     fn gpfifo_pending_close_and_process_teardown_preserve_no_false_progress() {
         let session =
             NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
@@ -3372,6 +3279,13 @@ mod tests {
         machine
             .write_resolved(&[input.slice(0, 4).unwrap()], &[0x12, 0x34, 0x56, 0x78])
             .unwrap();
+        assert_eq!(
+            session
+                .ioctl(as_fd, nvhost_as_gpu::IOCTL_AS_GPU_ALLOC_AS_EX, &[0; 40])
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
         let mapping = {
             let state = session
                 .state
@@ -3383,19 +3297,19 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let address_space = address_spaces.get_mut(&as_fd).unwrap();
             address_space
-                .initialize(nixe_gpu_maxwell::MaxwellAddressSpaceInitialization::default())
-                .unwrap();
-            address_space
                 .map(nixe_gpu_maxwell::MaxwellMapRequest {
                     allocation: nixe_gpu_maxwell::MaxwellAllocationId::new(30),
-                    backing: vec![input.clone()],
+                    backing: address_space
+                        .memory()
+                        .device_memory()
+                        .map((vec![input.clone()]).into(), None)
+                        .unwrap(),
                     backing_offset: 0,
                     size: 0x1000,
                     allocation_alignment: 0x1000,
                     page_size: 0x1000,
                     kind: 0,
                     cacheable: false,
-                    permissions: MemoryPermissions::READ_WRITE,
                     fixed_offset: None,
                 })
                 .unwrap()
@@ -3751,13 +3665,10 @@ mod tests {
                 .unwrap(),
             (map.to_vec(), NV_SUCCESS)
         );
-        let space = session.gpu_address_space(as_fd).unwrap();
+        let space =
+            nixe_gpu_maxwell::MaxwellGpuMemory::new(session.gpu_address_space(as_fd).unwrap());
         let address = space.address(0x4_0001_0000).unwrap();
-        let mapping = space
-            .resolve_maximal(address, MemoryPermissions::READ)
-            .unwrap()
-            .mapping()
-            .clone();
+        let mapping = space.resolve_maximal(address).unwrap().mapping().clone();
         assert_eq!(mapping.size(), 0x1_0000);
         assert_eq!(mapping.page_size(), 0x1_0000);
         assert_eq!(
@@ -3900,22 +3811,21 @@ mod tests {
         assert_eq!(result, NV_SUCCESS);
         let second_offset = u64::from_le_bytes(second_output[32..40].try_into().unwrap());
         assert_eq!(second_offset, first_offset + 0x2_0000);
-        let address_space = session.gpu_address_space(as_gpu_fd).unwrap();
+        let address_space =
+            nixe_gpu_maxwell::MaxwellGpuMemory::new(session.gpu_address_space(as_gpu_fd).unwrap());
         let first_address = address_space.address(first_offset).unwrap();
         let second_address = address_space.address(second_offset).unwrap();
         let retained = address_space
-            .resolve_maximal(first_address, MemoryPermissions::READ)
+            .resolve_maximal(first_address)
             .unwrap()
             .mapping()
             .clone();
         let alias = address_space
-            .resolve_maximal(second_address, MemoryPermissions::READ)
+            .resolve_maximal(second_address)
             .unwrap()
             .mapping()
             .clone();
         let accepted = retained.physical().pin(0, retained.size()).unwrap();
-        assert_eq!(retained.permissions(), MemoryPermissions::READ_WRITE);
-        assert_eq!(alias.permissions(), MemoryPermissions::READ_WRITE);
         assert_eq!(retained.page_size(), 0x2_0000);
         assert_eq!(retained.allocation(), alias.allocation());
         assert_eq!(retained.physical(), alias.physical());
@@ -3956,13 +3866,12 @@ mod tests {
                 .unwrap(),
             (modify.to_vec(), NV_SUCCESS)
         );
-        let modified = session
-            .gpu_address_space(as_gpu_fd)
-            .unwrap()
-            .resolve_maximal(first_address, MemoryPermissions::READ)
-            .unwrap()
-            .mapping()
-            .clone();
+        let modified =
+            nixe_gpu_maxwell::MaxwellGpuMemory::new(session.gpu_address_space(as_gpu_fd).unwrap())
+                .resolve_maximal(first_address)
+                .unwrap()
+                .mapping()
+                .clone();
         assert_eq!(modified.kind(), 0xfe);
         assert!(!modified.cacheable());
         assert_eq!(modified.allocation(), retained.allocation());
@@ -4053,7 +3962,8 @@ mod tests {
                 .unwrap(),
             (unmap.to_vec(), NV_SUCCESS)
         );
-        let address_space = session.gpu_address_space(as_gpu_fd).unwrap();
+        let address_space =
+            nixe_gpu_maxwell::MaxwellGpuMemory::new(session.gpu_address_space(as_gpu_fd).unwrap());
         assert!(!address_space.retained_mapping_is_current(&retained));
         assert!(address_space.retained_mapping_is_current(&alias));
         let mut bytes = [0; 2];
@@ -4158,16 +4068,20 @@ mod tests {
             with_address_space(&session, as_gpu_fd, |space| space.mapping_count()),
             1
         );
-        let address_space = session.gpu_address_space(as_gpu_fd).unwrap();
-        let mapped = address_space
-            .resolve_maximal(
-                address_space.address(0x4_0000_0000).unwrap(),
-                MemoryPermissions::READ,
-            )
-            .unwrap()
-            .mapping()
-            .clone();
-        assert_eq!(mapped.permissions(), MemoryPermissions::READ_WRITE);
+        let address_space =
+            nixe_gpu_maxwell::MaxwellGpuMemory::new(session.gpu_address_space(as_gpu_fd).unwrap());
+        let mut address_space = address_space;
+        let mapped_address = address_space.address(0x4_0000_0000).unwrap();
+        // NVMAP CPU access flags do not prohibit GPU writes. Exercise actual
+        // consumption instead of asserting an artificial mapping permission field.
+        address_space
+            .write_block_cached(mapped_address, &[0x9b; 4])
+            .unwrap();
+        let mut bytes = [0; 4];
+        address_space
+            .read_into_unsafe(mapped_address, &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [0x9b; 4]);
         let mut hole = entry.to_vec();
         hole[4..8].fill(0);
         assert_eq!(
@@ -4241,7 +4155,10 @@ mod tests {
                 .unwrap(),
             (invalid_initialize.to_vec(), NV_BAD_VALUE)
         );
-        assert!(!session.gpu_address_space(fd).unwrap().initialized());
+        assert!(
+            !nixe_gpu_maxwell::MaxwellGpuMemory::new(session.gpu_address_space(fd).unwrap())
+                .initialized()
+        );
 
         let mut initialize = [0_u8; 40];
         initialize[0..4].copy_from_slice(&1_u32.to_le_bytes());

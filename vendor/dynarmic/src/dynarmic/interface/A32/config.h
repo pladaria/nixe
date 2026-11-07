@@ -163,11 +163,12 @@ struct UserConfig {
     ///       So there might be wrongly faulted pages which maps to nullptr.
     ///       This can be avoided by carefully allocating the memory region.
     bool absolute_offset_page_table = false;
-    /// Masks out the first N bits in host pointers from the page table.
-    /// The intention behind this is to allow users of Dynarmic to pack attributes in the
-    /// same integer and update the pointer attribute pair atomically.
-    /// If the configured value is 3, all pointers will be forcefully aligned to 8 bytes.
-    int page_table_pointer_mask_bits = 0;
+    /// Bit mask selecting the pointer from a tagged atomic page-table entry.
+    /// Zero leaves the pointer unchanged. The process owns all tag publication.
+    std::uint64_t page_table_pointer_mask = 0;
+    /// A set bit at this position routes access to the memory callback before
+    /// consuming the pointer. Used by rasterizer-cached and checked pages.
+    std::optional<std::uint8_t> page_table_marked_bit = std::nullopt;
     /// Determines if we should detect memory accesses via page_table that straddle are
     /// misaligned. Accesses that straddle page boundaries will fallback to the relevant
     /// memory callback.

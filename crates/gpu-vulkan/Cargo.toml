@@ -16,6 +16,7 @@ egui.workspace = true
 nixe-video.workspace = true
 raw-window-handle.workspace = true
 nixe-gpu.workspace = true
+nixe-gpu-maxwell.workspace = true
 nixe-shader-recompiler.workspace = true
 
 [features]
@@ -27,6 +28,7 @@ name = "binding-probe"
 required-features = ["binding-probe"]
 
 [dev-dependencies]
+nixe-gpu-maxwell = { workspace = true, features = ["test-support"] }
 rspirv = "0.13"
 tempfile.workspace = true
 

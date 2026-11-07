@@ -491,23 +491,17 @@ async fn dispatch_binder_relay(
                 .await?;
             let mut encoded = vec![0_u8; input_size];
             process.read(input, 0, &mut encoded).await?;
-            let mut transaction =
-                video
-                    .transact_binder(binder_id, code, &encoded)
-                    .map_err(|error| match error {
-                        crate::parcel::ParcelError::Malformed(reason) => {
-                            IpcWireError::Malformed(reason)
-                        }
-                        crate::parcel::ParcelError::Unsupported(detail) => {
-                            IpcWireError::UnsupportedService(
-                                UnsupportedServiceOperation::CommandVariant {
-                                    service: "IGraphicBufferProducer",
-                                    command_id: code,
-                                    detail,
-                                },
-                            )
-                        }
-                    })?;
+            let mut call = video
+                .transact_binder(binder_id, code, &encoded)
+                .map_err(|error| producer_error(code, error))?;
+            let mut transaction = std::future::poll_fn(|cx| {
+                use std::future::Future;
+                process.lifetime().check()?;
+                std::pin::Pin::new(&mut call)
+                    .poll(cx)
+                    .map(|result| result.map_err(|error| producer_error(code, error)))
+            })
+            .await?;
             log::trace!(
                 "Binder producer {binder_id} completed transaction {code:#x}{}",
                 if transaction.queued.is_some() {
@@ -584,6 +578,19 @@ async fn dispatch_binder_relay(
                 .encode()?,
                 Some(handle),
             ))
+        }
+    }
+}
+
+fn producer_error(code: u32, error: crate::parcel::ParcelError) -> IpcWireError {
+    match error {
+        crate::parcel::ParcelError::Malformed(reason) => IpcWireError::Malformed(reason),
+        crate::parcel::ParcelError::Unsupported(detail) => {
+            IpcWireError::UnsupportedService(UnsupportedServiceOperation::CommandVariant {
+                service: "IGraphicBufferProducer",
+                command_id: code,
+                detail,
+            })
         }
     }
 }

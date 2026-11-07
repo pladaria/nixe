@@ -41,6 +41,9 @@ impl Recorder {
             pending_tick: None,
         }
     }
+    pub(super) fn is_active(&self) -> bool {
+        self.current.is_some()
+    }
     pub fn begin_cpu(&mut self) {
         if self.current.is_some() {
             return;

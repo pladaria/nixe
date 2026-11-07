@@ -7,8 +7,8 @@ use super::memory_copy::{
     MaxwellMemoryCopyRemap, required_range_size,
 };
 
-use super::{MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation};
-use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
+use super::{MaxwellEngineDispatchError, MaxwellEngineMethodMetadata};
+use crate::MaxwellMethodSource;
 
 pub(super) const CLASS: GpuClassId = GpuClassId(0xb0b5);
 const CLASS_NAME: &str = "MAXWELL_DMA_COPY_A";
@@ -199,11 +199,11 @@ methods!(
     SET_SRC_ORIGIN => (0x073c, "SET_SRC_ORIGIN", u32::MAX, SourcePositionXy),
 );
 
-pub(super) fn preflight(
-    method: MaxwellMethodDispatch,
+pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    source: MaxwellMethodSource,
     candidate: &mut MaxwellDmaCopyState,
-) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
-    let source = method.source();
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<bool, super::MaxwellEngineStreamError> {
     let declaration = METHODS
         .iter()
         .find(|declaration| declaration.metadata.method() == source.method())
@@ -212,11 +212,12 @@ pub(super) fn preflight(
             class_name: CLASS_NAME,
         })?;
     if source.argument() & !declaration.defined_mask != 0 {
-        return Err(MaxwellEngineDispatchError::InvalidMethodValue {
+        return Err((MaxwellEngineDispatchError::InvalidMethodValue {
             source,
             metadata: declaration.metadata,
             defined_mask: declaration.defined_mask,
-        });
+        })
+        .into());
     }
 
     if (declaration.register == MaxwellDmaCopyRegisterName::RenderEnableControl
@@ -227,11 +228,12 @@ pub(super) fn preflight(
                 | MaxwellDmaCopyRegisterName::DestinationPhysicalTarget
         ) && source.argument() > 2)
     {
-        return Err(MaxwellEngineDispatchError::InvalidMethodValue {
+        return Err((MaxwellEngineDispatchError::InvalidMethodValue {
             source,
             metadata: declaration.metadata,
             defined_mask: declaration.defined_mask,
-        });
+        })
+        .into());
     }
     let write = MaxwellDmaCopyStateWrite {
         register: declaration.register,
@@ -244,7 +246,10 @@ pub(super) fn preflight(
         None
     };
     candidate.apply(write);
-    Ok(operation.map(PendingEngineOperation::MemoryCopy))
+    if let Some(operation) = operation {
+        execution.copy_memory(operation)?;
+    }
+    Ok(true)
 }
 
 fn build_operation(

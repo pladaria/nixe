@@ -119,18 +119,20 @@ impl MaxwellMemoryCopyOperation {
         })
     }
 
-    pub(crate) const fn has_remap(self) -> bool {
-        self.remap.is_some()
+    pub const fn source_layout(self) -> MaxwellMemoryCopyLayout {
+        self.source_layout
     }
-
-    pub(crate) fn has_block_layout(self) -> bool {
-        matches!(
-            self.source_layout,
-            MaxwellMemoryCopyLayout::BlockLinear { .. }
-        ) || matches!(
-            self.destination_layout,
-            MaxwellMemoryCopyLayout::BlockLinear { .. }
-        )
+    pub const fn destination_layout(self) -> MaxwellMemoryCopyLayout {
+        self.destination_layout
+    }
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+    pub const fn has_remap(self) -> bool {
+        self.remap.is_some()
     }
 
     /// Contiguous byte runs in both layouts. A Tegra GOB has 16-byte contiguous

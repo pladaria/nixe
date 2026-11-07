@@ -417,68 +417,6 @@ impl MaxwellThreeDVertexStreamState<'_> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum MaxwellThreeDIndexElementSize {
-    OneByte,
-    TwoBytes,
-    FourBytes,
-}
-
-impl MaxwellThreeDIndexElementSize {
-    pub(super) const fn parse(raw: u32) -> Option<Self> {
-        match raw {
-            0 => Some(Self::OneByte),
-            1 => Some(Self::TwoBytes),
-            2 => Some(Self::FourBytes),
-            _ => None,
-        }
-    }
-    #[must_use]
-    pub const fn bytes(self) -> u64 {
-        match self {
-            Self::OneByte => 1,
-            Self::TwoBytes => 2,
-            Self::FourBytes => 4,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDIndexBufferState<'a> {
-    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
-}
-impl MaxwellThreeDIndexBufferState<'_> {
-    #[must_use]
-    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
-        self.registers.read(0x17c8, |raw| u8::try_from(raw).ok())
-    }
-    #[must_use]
-    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
-        self.registers.read(0x17cc, Some)
-    }
-    #[must_use]
-    pub fn limit_upper(&self) -> MaxwellThreeDRegister<u8> {
-        self.registers.read(0x17d0, |raw| u8::try_from(raw).ok())
-    }
-    #[must_use]
-    pub fn limit_lower(&self) -> MaxwellThreeDRegister<u32> {
-        self.registers.read(0x17d4, Some)
-    }
-    #[must_use]
-    pub fn element_size(&self) -> MaxwellThreeDRegister<MaxwellThreeDIndexElementSize> {
-        self.registers
-            .read(0x17d8, MaxwellThreeDIndexElementSize::parse)
-    }
-    #[must_use]
-    pub fn first(&self) -> MaxwellThreeDRegister<u32> {
-        self.registers.read(0x17dc, Some)
-    }
-    #[must_use]
-    pub fn count(&self) -> MaxwellThreeDRegister<u32> {
-        self.registers.read(0x17e0, Some)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(transparent)]
 pub struct MaxwellThreeDPrimitiveTopology(u16);
 
@@ -632,16 +570,10 @@ impl MaxwellThreeDBalancedPrimitiveWorkload {
 pub(super) struct MaxwellThreeDPrimitiveSequence {
     begin: MaxwellThreeDRegister<MaxwellThreeDBegin>,
     end: MaxwellThreeDRegister<bool>,
-    instance_index: u32,
     open: bool,
 }
 impl MaxwellThreeDPrimitiveSequence {
     pub(super) fn begin(&mut self, raw: u32, value: MaxwellThreeDBegin) {
-        self.instance_index = match value.instance() {
-            MaxwellThreeDBeginInstance::First => 0,
-            MaxwellThreeDBeginInstance::Subsequent => self.instance_index.wrapping_add(1),
-            MaxwellThreeDBeginInstance::Unchanged => self.instance_index,
-        };
         self.begin = MaxwellThreeDRegister::decoded(raw, value);
         self.open = true;
     }
@@ -728,10 +660,6 @@ impl<'a> MaxwellThreeDPrimitiveState<'a> {
     #[must_use]
     pub const fn is_open(&self) -> bool {
         self.sequence.open
-    }
-    #[must_use]
-    pub const fn instance_index(&self) -> u32 {
-        self.sequence.instance_index
     }
 }
 
@@ -824,12 +752,6 @@ impl<'a> MaxwellThreeDVertexInputState<'a> {
         MaxwellThreeDVertexStreamState {
             registers: self.registers,
             index,
-        }
-    }
-    #[must_use]
-    pub fn index(&self) -> MaxwellThreeDIndexBufferState<'a> {
-        MaxwellThreeDIndexBufferState {
-            registers: self.registers,
         }
     }
     #[must_use]

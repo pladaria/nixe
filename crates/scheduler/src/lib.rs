@@ -13,10 +13,10 @@ pub use lifecycle::{
 };
 pub use scheduler::{
     Completion, Deadline, EventFuture, EventNotifications, EventObject, IdealCore, KernelWait,
-    Lease, LeaseGeneration, LockHandoff, LockKey, OrderedWaitKind, ReadableEventObject,
-    ScheduledThreadConfig, ScheduledThreadView, SchedulerError, SchedulerState, Selection,
-    ThreadPropertyGuard, ThreadPropertyLock, TimerStopped, WaitEffect, WaitOutcome, WaitPhase,
-    WaitStart, WakeToken, WritableEventObject, YieldMigration,
+    Lease, LeaseGeneration, LockHandoff, LockKey, LoopingEvent, OrderedWaitKind,
+    ReadableEventObject, ScheduledThreadConfig, ScheduledThreadView, SchedulerError,
+    SchedulerState, Selection, ThreadPropertyGuard, ThreadPropertyLock, TimerStopped, WaitEffect,
+    WaitOutcome, WaitPhase, WaitStart, WakeToken, WritableEventObject, YieldMigration,
 };
 pub use topology::{
     CoreSet, CoreSetError, MachineSchedulerProfile, MachineSchedulerProfileError, PriorityRange,

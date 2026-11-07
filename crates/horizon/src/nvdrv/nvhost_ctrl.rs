@@ -1,6 +1,6 @@
 //! Switch `/dev/nvhost-ctrl` syncpoint and event ABI.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -180,15 +180,28 @@ struct DirectWait {
     readable: ReadableEventObject,
 }
 
+struct GuestAction {
+    target: GuestTimelinePoint,
+    action: Arc<super::gpu_executor::PendingComposite>,
+}
+impl std::fmt::Debug for GuestAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuestAction")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Process-client host-control state.
 ///
 /// Timelines are neutral `nixe-gpu` objects shared by all control descriptors;
 /// event slots remain descriptor-owned Horizon/runtime resources.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct NvHostControl {
     kernel: Arc<nixe_scheduler::SchedulerState>,
     timelines: BTreeMap<GuestSyncpointId, GuestTimeline>,
     channel_syncpoints: BTreeMap<GuestSyncpointId, u64>,
+    guest_actions: BTreeMap<GuestSyncpointId, VecDeque<GuestAction>>,
     devices: BTreeMap<NvDrvFileDescriptor, NvHostCtrlDevice>,
     direct_waits: BTreeMap<NvHostCtrlWaiterId, DirectWait>,
     next_timeline_instance: u64,
@@ -201,6 +214,7 @@ impl NvHostControl {
             kernel: kernel.clone(),
             timelines: BTreeMap::new(),
             channel_syncpoints: BTreeMap::new(),
+            guest_actions: BTreeMap::new(),
             devices: BTreeMap::new(),
             direct_waits: BTreeMap::new(),
             next_timeline_instance: 1,
@@ -288,6 +302,7 @@ impl NvHostControl {
             .map(|timeline| timeline.current_point().value())
             .unwrap_or(GuestSyncpointValue::new(0));
         let instance = self.allocate_timeline_instance(descriptor, request)?;
+        self.guest_actions.remove(&id);
         self.timelines.insert(
             id,
             GuestTimeline::new(id, instance, timeline_owner(descriptor), initial_value),
@@ -340,13 +355,70 @@ impl NvHostControl {
             .map(|timeline| timeline.guest_has_reached(point.value()))
     }
 
+    /// RegisterGuestAction observes command consumption; CPU events still wait
+    /// for their ordered memory publication. Return reached actions to the GPU
+    /// owner so its callbacks execute inline, outside the host-control borrow.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/gpu.cpp#L254-L292
+    pub(super) fn register_guest_action(
+        &mut self,
+        target: GuestTimelinePoint,
+        action: Arc<super::gpu_executor::PendingComposite>,
+    ) -> Result<Option<Arc<super::gpu_executor::PendingComposite>>, Box<str>> {
+        let timeline = self
+            .timelines
+            .get(&target.syncpoint())
+            .ok_or_else(|| Box::<str>::from("composition fence references an unknown syncpoint"))?;
+        if timeline.guest_has_reached(target.value()) {
+            return Ok(Some(action));
+        } else {
+            let current = timeline.guest_point().value().get();
+            let distance = target.value().get().wrapping_sub(current);
+            let actions = self.guest_actions.entry(target.syncpoint()).or_default();
+            // RegisterAction orders thresholds; Increment consumes only the
+            // reached prefix. Relative distances retain syncpoint wrap semantics.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/host1x/syncpoint_manager.cpp#L13-L33
+            let index = actions
+                .partition_point(|a| a.target.value().get().wrapping_sub(current) < distance);
+            actions.insert(index, GuestAction { target, action });
+        }
+        Ok(None)
+    }
+    fn take_guest_actions(
+        &mut self,
+        id: GuestSyncpointId,
+    ) -> Vec<Arc<super::gpu_executor::PendingComposite>> {
+        let mut ready = Vec::new();
+        let Some(actions) = self.guest_actions.get_mut(&id) else {
+            return ready;
+        };
+        let timeline = self
+            .timelines
+            .get(&id)
+            .expect("registered guest action timeline");
+        while actions
+            .front()
+            .is_some_and(|a| timeline.guest_has_reached(a.target.value()))
+        {
+            let action = actions.pop_front().unwrap();
+            ready.push(action.action);
+        }
+        if actions.is_empty() {
+            self.guest_actions.remove(&id);
+        }
+        ready
+    }
+    pub(super) fn cancel_guest_actions(&mut self) {
+        self.guest_actions.clear();
+    }
+
     pub(super) fn consume_channel_increment(
         &mut self,
         descriptor: NvDrvDeviceDescriptor,
         request: u32,
         reservation: &ReservedTimelinePoint,
-    ) -> Result<GuestTimelinePoint, NvDrvCallError> {
-        self.timeline_mut(descriptor, reservation.point().syncpoint())?
+    ) -> Result<Vec<Arc<super::gpu_executor::PendingComposite>>, NvDrvCallError> {
+        let point = self
+            .timeline_mut(descriptor, reservation.point().syncpoint())?
             .consume_increment(timeline_owner(descriptor), reservation)
             .map_err(|_| {
                 NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::Ioctl {
@@ -356,11 +428,13 @@ impl NvHostControl {
                         NvDrvValidationReason::TimelineOrderingUnavailable,
                     ),
                 })
-            })
+            })?;
+        Ok(self.take_guest_actions(point.syncpoint()))
     }
 
     #[cfg(test)]
     pub(super) fn install_test_timeline(&mut self, id: GuestSyncpointId) {
+        self.guest_actions.remove(&id);
         self.timelines.insert(
             id,
             GuestTimeline::new(
@@ -776,6 +850,9 @@ impl NvHostControl {
     }
 
     fn signal_reached(&mut self, id: GuestSyncpointId, value: GuestSyncpointValue) {
+        for action in self.take_guest_actions(id) {
+            action.signal_from_cpu();
+        }
         if let Some(progress) = &self.progress {
             let mut generation = progress
                 .0
@@ -834,6 +911,7 @@ impl NvHostControl {
             return Ok(());
         }
         let instance = self.allocate_timeline_instance(descriptor, IOCTL_SYNCPT_READ)?;
+        self.guest_actions.remove(&id);
         self.timelines.insert(
             id,
             GuestTimeline::new(

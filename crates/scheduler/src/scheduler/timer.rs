@@ -42,6 +42,7 @@ enum Action {
     Wait(Weak<KernelWait>),
     Alarm(Weak<Alarm>),
     Preempt(u64),
+    Looping(Weak<Looping>),
 }
 
 impl Action {
@@ -52,6 +53,9 @@ impl Action {
                 .upgrade()
                 .is_some_and(|alarm| alarm.state.load(Ordering::Acquire) == 0),
             Self::Preempt(_) => true,
+            Self::Looping(event) => event
+                .upgrade()
+                .is_some_and(|event| event.state.load(Ordering::Acquire) == 0),
         }
     }
 }
@@ -335,6 +339,19 @@ impl Timers {
                     let next = now.saturating_add(interval - (now - entry.deadline) % interval);
                     self.insert(next, Action::Preempt(interval));
                 }
+                Action::Looping(event) => {
+                    if let Some(active) = event.upgrade()
+                        && active.state.load(Ordering::Acquire) == 0
+                    {
+                        active.notification.wake_by_ref();
+                        // CoreTiming reschedules from the prior deadline. Its
+                        // signal consumer coalesces notifications, not the timer.
+                        let next = entry.deadline.saturating_add(active.interval.get());
+                        if !self.insert(next, Action::Looping(event)) {
+                            active.finish(2);
+                        }
+                    }
+                }
             }
         }
         count
@@ -379,6 +396,11 @@ impl Timers {
                     }
                 }
                 Action::Preempt(_) => {}
+                Action::Looping(event) => {
+                    if let Some(event) = event.upgrade() {
+                        event.finish(2);
+                    }
+                }
             }
         }
         if self.shared.failed.load(Ordering::Acquire) {
@@ -424,6 +446,68 @@ impl Alarm {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerStopped;
+
+#[derive(Debug)]
+struct Looping {
+    state: AtomicU8,
+    interval: std::num::NonZeroU64,
+    notification: Waker,
+    live: Arc<AtomicUsize>,
+}
+impl Looping {
+    fn finish(&self, result: u8) -> bool {
+        if self
+            .state
+            .compare_exchange(0, result, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.live.fetch_sub(1, Ordering::Release);
+            if result == 2 {
+                self.notification.wake_by_ref();
+            }
+            return true;
+        }
+        false
+    }
+}
+
+/// An owned CoreTiming-style looping event in the existing kernel deadline heap.
+/// The callback only wakes its consumer. Deadlines advance by the period;
+/// the consumer's signal coalesces notifications while it is busy.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/vi/conductor.cpp#L29-L42
+#[derive(Debug)]
+pub struct LoopingEvent {
+    kernel: Weak<SchedulerState>,
+    event: Arc<Looping>,
+}
+impl LoopingEvent {
+    pub fn cancel(&self) {
+        if !self.event.finish(1) {
+            return;
+        }
+        if let Some(kernel) = self.kernel.upgrade() {
+            // UnscheduleEvent(Wait) also waits out an in-flight callback.
+            drop(
+                kernel
+                    .timers
+                    .shared
+                    .advance
+                    .lock()
+                    .expect("timer advance lock poisoned"),
+            );
+            kernel.timers.invalidate();
+            kernel.clock.wake_timers();
+        }
+    }
+    pub fn is_stopped(&self) -> bool {
+        self.event.state.load(Ordering::Acquire) != 0
+    }
+}
+impl Drop for LoopingEvent {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
 
 /// A service deadline uses the kernel heap and does not occupy a host worker.
 pub struct Deadline {
@@ -528,6 +612,32 @@ impl SchedulerState {
             deadline,
             alarm: None,
         }
+    }
+
+    pub fn schedule_looping_event(
+        self: &Arc<Self>,
+        deadline: u64,
+        interval: std::num::NonZeroU64,
+        notification: Waker,
+    ) -> Result<LoopingEvent, TimerStopped> {
+        self.timers.shared.live.fetch_add(1, Ordering::Relaxed);
+        let event = Arc::new(Looping {
+            state: AtomicU8::new(0),
+            interval,
+            notification,
+            live: Arc::clone(&self.timers.shared.live),
+        });
+        if !self
+            .timers
+            .insert(deadline, Action::Looping(Arc::downgrade(&event)))
+        {
+            event.finish(2);
+            return Err(TimerStopped);
+        }
+        Ok(LoopingEvent {
+            kernel: Arc::downgrade(self),
+            event,
+        })
     }
 
     pub fn arm_deadline(&self, wait: &Arc<KernelWait>, deadline: u64) {

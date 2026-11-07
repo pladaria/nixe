@@ -1,19 +1,20 @@
-//! Immutable guest facts at the native execution boundary. No host handles,
+//! Owned guest facts at the native execution boundary. No host handles,
 //! resource-creation transactions, pass commands or aggregate access plans.
-use crate::physical::{Footprint, PhysicalMapping};
+use crate::physical::Footprint;
 use crate::*;
 use nixe_memory::AllocationRange;
-use std::{
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::sync::Arc;
 
-/// Framebuffer source legalized by the console frontend. No guest tiling or
-/// logical allocation IDs cross the native presentation boundary.
+/// Framebuffer selected by its SMMU device address, as in Eden's FramebufferConfig.
+/// The console request retains the NvMap pin until the graphics owner consumes it.
 #[derive(Clone, Debug)]
 pub struct NativePresentationImage {
-    pub inputs: Vec<AllocationRange>,
-    pub planes: Arc<[GuestImagePlane]>,
+    pub crop: crate::FrameCrop,
+    pub transform: crate::FrameTransform,
+    pub address: u64,
+    pub size: u64,
+    pub layout: ImageMemoryLayout,
+    pub row_pitch: u32,
     pub extent: [u32; 2],
     pub format: crate::PresentationImageFormat,
     pub allow_canonical_import: bool,
@@ -21,373 +22,183 @@ pub struct NativePresentationImage {
 
 #[derive(Clone, Debug)]
 pub struct GuestImage {
-    /// Stable while the frontend's resolved view remains interned.
-    pub view_identity: Option<PreparedStateId>,
     pub planes: Arc<[GuestImagePlane]>,
     pub description: ImageDescription,
     pub swizzle: Swizzle,
-    /// Frontend-defined sample grid in each canonical plane. Native raster
-    /// coordinates stay in pixels; byte authority covers every stored sample.
+    /// Frontend-defined sample grid in each guest plane. Native raster
+    /// coordinates stay in pixels; each plane includes every stored sample.
     pub sample_grid: [u32; 2],
-    /// Opaque compression/MSAA bytes cannot be imported as ordinary texels.
-    pub canonical_texels: bool,
 }
-impl GuestImage {
-    pub fn same_prepared_view(&self, other: &Self) -> bool {
-        match (self.view_identity, other.view_identity) {
-            (Some(a), Some(b)) => a == b,
-            (None, None) => self.same_view(other),
-            _ => false,
+/// Canonical renderer flags are set by register writes and consumed directly
+/// by raster state, shader, buffer and texture owners on the GPU thread.
+/// The engine owns this bank exclusively. Resource retirement invalidates the
+/// affected selections in their buffer/texture owners; CPU texture deletion
+/// never accesses the engine bank. Cell keeps shared register consumers usable
+/// without making the bank Sync or paying atomic operations on register writes.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+#[derive(Clone, Debug)]
+pub struct GraphicsDirty([std::cell::Cell<u64>; 4]);
+impl Default for GraphicsDirty {
+    fn default() -> Self {
+        Self([
+            std::cell::Cell::new(Self::ALL as u64),
+            std::cell::Cell::new((Self::ALL >> 64) as u64),
+            std::cell::Cell::new(0),
+            std::cell::Cell::new(0),
+        ])
+    }
+}
+impl GraphicsDirty {
+    /// The unused entry receives writes that do not affect a renderer consumer,
+    /// as Eden Dirty::NullEntry. It is never part of a consumed group.
+    pub const NULL_INDEX: u8 = 0;
+    pub const VERTEX_SHIFT: u32 = 1;
+    pub const VERTICES: u128 = (u32::MAX as u128) << Self::VERTEX_SHIFT;
+    pub const INDEX: u128 = 1 << 33;
+    pub const BUFFERS: u128 = Self::VERTICES | Self::INDEX;
+    pub const COLOR_SHIFT: u32 = 34;
+    pub const COLORS: u128 = 0xff << Self::COLOR_SHIFT;
+    pub const DEPTH: u128 = 1 << 42;
+    pub const TARGETS: u128 = Self::COLORS | Self::DEPTH;
+    pub const FRAMEBUFFER: u128 = 1 << 43;
+    /// RT control forces the texture owner to look up its current target slots.
+    /// It does not eagerly dirty every individual attachment at admission.
+    pub const RENDER_TARGET_CONTROL: u128 = 1 << 49;
+    pub const VERTEX_INPUT: u128 = 1 << 44;
+    pub const BLEND_EQUATIONS: u128 = 1 << 45;
+    pub const BLEND_ENABLE: u128 = 1 << 56;
+    pub const COLOR_MASK: u128 = 1 << 57;
+    pub const COLOR_OUTPUT: u128 = Self::BLEND_EQUATIONS | Self::BLEND_ENABLE | Self::COLOR_MASK;
+    pub const PIPELINE_STATE: u128 = 1 << 46;
+    pub const VIEWPORT: u128 = 1 << 47;
+    pub const SCISSOR: u128 = 1 << 48;
+    pub const BLEND_CONSTANTS: u128 = 1 << 51;
+    pub const ALPHA_TEST: u128 = 1 << 52;
+    pub const SHADERS: u128 = 1 << 53;
+    pub const TARGET_FORMAT: u128 = 1 << 54;
+    pub const LINE_WIDTH: u128 = 1 << 58;
+    pub const DEPTH_BIAS: u128 = 1 << 59;
+    pub const DEPTH_BOUNDS: u128 = 1 << 60;
+    pub const CULL_MODE: u128 = 1 << 61;
+    pub const FRONT_FACE: u128 = 1 << 62;
+    pub const DEPTH_TEST: u128 = 1 << 63;
+    pub const DEPTH_WRITE: u128 = 1 << 64;
+    pub const DEPTH_COMPARE: u128 = 1 << 65;
+    pub const STENCIL_TEST: u128 = 1 << 66;
+    pub const STENCIL_OP: u128 = 1 << 67;
+    pub const STENCIL_PROPERTIES: u128 = 1 << 68;
+    pub const STENCIL_REFERENCE: u128 = 1 << 69;
+    pub const STENCIL_WRITE_MASK: u128 = 1 << 70;
+    pub const STENCIL_COMPARE: u128 = 1 << 71;
+    pub const PRIMITIVE_RESTART: u128 = 1 << 72;
+    pub const RASTERIZER_DISCARD: u128 = 1 << 73;
+    pub const DEPTH_BIAS_ENABLE: u128 = 1 << 74;
+    pub const DEPTH_BOUNDS_ENABLE: u128 = 1 << 75;
+    /// Aggregate vertex-buffer changes consumed by dynamic vertex input. The
+    /// buffer cache independently consumes the individual VERTICES slots.
+    pub const VERTEX_BUFFERS: u128 = 1 << 76;
+    pub const NATIVE_STATE: u128 = Self::VERTEX_INPUT
+        | Self::COLOR_OUTPUT
+        | Self::VIEWPORT
+        | Self::SCISSOR
+        | Self::BLEND_CONSTANTS
+        | Self::LINE_WIDTH
+        | Self::DEPTH_BIAS
+        | Self::DEPTH_BOUNDS
+        | Self::CULL_MODE
+        | Self::FRONT_FACE
+        | Self::DEPTH_TEST
+        | Self::DEPTH_WRITE
+        | Self::DEPTH_COMPARE
+        | Self::STENCIL_TEST
+        | Self::STENCIL_OP
+        | Self::STENCIL_PROPERTIES
+        | Self::STENCIL_REFERENCE
+        | Self::STENCIL_WRITE_MASK
+        | Self::STENCIL_COMPARE
+        | Self::PRIMITIVE_RESTART
+        | Self::RASTERIZER_DISCARD
+        | Self::DEPTH_BIAS_ENABLE
+        | Self::DEPTH_BOUNDS_ENABLE;
+    pub const PARAMETERS: u128 = Self::NATIVE_STATE
+        | Self::VERTEX_BUFFERS
+        | Self::PIPELINE_STATE
+        | Self::ALPHA_TEST
+        | Self::TARGET_FORMAT;
+    pub const ALL: u128 = Self::BUFFERS
+        | Self::TARGETS
+        | Self::RENDER_TARGET_CONTROL
+        | Self::FRAMEBUFFER
+        | Self::PARAMETERS
+        | Self::SHADERS;
+    /// Indexed writes touch one host word, as Maxwell3D::DirtyState::Flags.
+    /// The 256-bit bank accepts every u8 table index without a bounds check.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.h#L3150-L3157
+    #[inline(always)]
+    pub fn mark_index(&self, index: u8) {
+        let word = &self.0[usize::from(index >> 6)];
+        word.set(word.get() | (1_u64 << (index & 63)));
+    }
+    #[inline]
+    pub fn bits(&self, mask: u128) -> u128 {
+        let bits = u128::from(self.0[0].get()) | (u128::from(self.0[1].get()) << 64);
+        bits & mask
+    }
+    #[inline]
+    pub fn mark(&self, mask: u128) {
+        let low = mask as u64;
+        let high = (mask >> 64) as u64;
+        if low != 0 {
+            self.0[0].set(self.0[0].get() | low);
+        }
+        if high != 0 {
+            self.0[1].set(self.0[1].get() | high);
         }
     }
-    pub fn same_view(&self, other: &Self) -> bool {
-        self.same_storage(other) && self.swizzle == other.swizzle
+    #[inline]
+    pub fn is_dirty(&self, mask: u128) -> bool {
+        self.bits(mask) != 0
     }
-    pub fn same_storage(&self, other: &Self) -> bool {
-        self.description == other.description
-            && self.sample_grid == other.sample_grid
-            && self.canonical_texels == other.canonical_texels
-            && self.planes == other.planes
-    }
-}
-#[derive(Clone, Debug)]
-pub enum GuestBinding {
-    /// An explicitly unbound buffer: reads return zero and writes are discarded.
-    NullBuffer,
-    Buffer(Arc<PhysicalMapping>),
-    Image {
-        image: GuestImage,
-        /// Shader view dimensionality remains arrayed for a single layer.
-        arrayed: bool,
-    },
-    Sampler(SamplerDescription),
-}
-#[derive(Clone, Debug)]
-pub struct GuestVertexBuffer {
-    pub binding: u32,
-    pub backing: Arc<PhysicalMapping>,
-}
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct GuestVertexLayout {
-    pub binding: u32,
-    pub stride: u32,
-    pub step: VertexStepMode,
-    pub attributes: Box<[VertexAttribute]>,
-}
-pub type GuestShaderCode = crate::shader_compilation::ShaderInputs;
-#[derive(Clone, Debug)]
-pub struct GuestProgram {
-    pub identity: PreparedStateId,
-    pub shader: Arc<GuestShaderCode>,
-    /// Sorted semantic resource identities; artifact metadata assigns dense bindings.
-    pub bindings: Box<[(crate::shader_module::ResourceId, GuestBinding)]>,
-    pub shared_memory_bytes: u32,
-}
-/// Index bytes come either from guest memory or from ordered inline methods.
-#[derive(Clone, Debug)]
-pub enum GuestIndexBuffer {
-    Canonical(Arc<PhysicalMapping>, IndexType),
-    Inline(Arc<[u8]>),
-}
-#[derive(Clone, Debug)]
-pub struct GuestDrawState {
-    pub identity: PreparedStateId,
-    pub program: Arc<GuestProgram>,
-    pub vertices: Arc<[GuestVertexBuffer]>,
-    pub index: Option<GuestIndexBuffer>,
-    pub colors: Arc<[GuestImage]>,
-    pub depth_stencil: Option<GuestImage>,
-    pub parameters: Arc<GuestDrawParameters>,
-}
-/// Borrowed semantic state for lookup before allocating an owned draw snapshot.
-/// Prepared identities and physical bindings share the owned state's exact key.
-#[derive(Clone, Copy)]
-pub struct GuestDrawStateKey<'a> {
-    pub program: PreparedStateId,
-    pub parameters: PreparedStateId,
-    pub vertices: &'a [GuestVertexBuffer],
-    pub index: Option<&'a GuestIndexBuffer>,
-    pub colors: &'a [GuestImage],
-    pub depth_stencil: Option<&'a GuestImage>,
-}
-impl GuestDrawState {
-    pub fn key(&self) -> GuestDrawStateKey<'_> {
-        GuestDrawStateKey {
-            program: self.program.identity,
-            parameters: self.parameters.identity,
-            vertices: &self.vertices,
-            index: self.index.as_ref(),
-            colors: &self.colors,
-            depth_stencil: self.depth_stencil.as_ref(),
-        }
-    }
-}
-impl PartialEq for GuestDrawState {
-    fn eq(&self, other: &Self) -> bool {
-        self.key() == other.key()
-    }
-}
-impl Eq for GuestDrawState {}
-impl Hash for GuestDrawState {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.key().hash(state);
-    }
-}
-impl crate::Equivalent<Arc<GuestDrawState>> for GuestDrawStateKey<'_> {
-    fn equivalent(&self, other: &Arc<GuestDrawState>) -> bool {
-        *self == other.key()
-    }
-}
-impl PartialEq for GuestDrawStateKey<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        let (a, b) = (self, other);
-        a.parameters == b.parameters
-            && a.program == b.program
-            && a.vertices.len() == b.vertices.len()
-            && a.vertices
-                .iter()
-                .zip(b.vertices.iter())
-                .all(|(a, b)| a.binding == b.binding && a.backing == b.backing)
-            && match (a.index, b.index) {
-                (None, None) => true,
-                (
-                    Some(GuestIndexBuffer::Canonical(a, at)),
-                    Some(GuestIndexBuffer::Canonical(b, bt)),
-                ) => at == bt && a == b,
-                (Some(GuestIndexBuffer::Inline(a)), Some(GuestIndexBuffer::Inline(b))) => {
-                    Arc::ptr_eq(a, b)
-                }
-                _ => false,
-            }
-            && a.colors.len() == b.colors.len()
-            && a.colors
-                .iter()
-                .zip(b.colors.iter())
-                .all(|(a, b)| a.same_prepared_view(b))
-            && match (a.depth_stencil, b.depth_stencil) {
-                (None, None) => true,
-                (Some(a), Some(b)) => a.same_prepared_view(b),
-                _ => false,
-            }
-    }
-}
-impl Eq for GuestDrawStateKey<'_> {}
-impl Hash for GuestDrawStateKey<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let a = self;
-        a.parameters.hash(state);
-        a.program.hash(state);
-        a.vertices.len().hash(state);
-        for vertex in a.vertices.iter() {
-            vertex.binding.hash(state);
-            vertex.backing.hash(state);
-        }
-        match a.index {
-            None => 0_u8.hash(state),
-            Some(GuestIndexBuffer::Canonical(backing, kind)) => {
-                1_u8.hash(state);
-                backing.hash(state);
-                kind.hash(state);
-            }
-            Some(GuestIndexBuffer::Inline(bytes)) => {
-                2_u8.hash(state);
-                (Arc::as_ptr(bytes) as *const u8).hash(state);
-            }
-        }
-        a.colors.len().hash(state);
-        for image in a.colors.iter().chain(a.depth_stencil) {
-            image.view_identity.is_some().hash(state);
-            if let Some(identity) = image.view_identity {
-                identity.hash(state);
-            } else {
-                image.planes.hash(state);
-                image.description.hash(state);
-                image.swizzle.hash(state);
-                image.sample_grid.hash(state);
-                image.canonical_texels.hash(state);
-            }
-        }
-        a.depth_stencil.is_some().hash(state);
+    #[inline]
+    pub fn take(&self, mask: u128) -> u128 {
+        let low = self.0[0].get();
+        let high = self.0[1].get();
+        self.0[0].set(low & !(mask as u64));
+        self.0[1].set(high & !((mask >> 64) as u64));
+        (u128::from(low) | (u128::from(high) << 64)) & mask
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub struct GuestShaderState {
-    pub point_size_bits: Option<u32>,
-    pub y_negate: bool,
-    pub force_early_z: bool,
+/// Current device binding, independent of physical coherence geometry.
+/// The native buffer cache resolves the physical bytes only on cache creation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestBufferRange {
+    pub address: u64,
+    pub size: u64,
 }
-/// Validated draw semantics independent of current physical buffer/descriptor
-/// bindings. Address changes retain this identity and its compiled preparation.
+pub type GuestShaderCode = crate::shader_compilation::ShaderInputs;
+/// The host video conversion which can wait for its native pipeline. Maxwell
+/// copies, ordering and reports use direct owner calls instead of this payload.
 #[derive(Clone, Debug)]
-pub struct GuestDrawParameters {
-    pub shader_state: GuestShaderState,
-    pub identity: PreparedStateId,
-    pub vertices: Box<[GuestVertexLayout]>,
-    pub color_formats: Box<[ImageFormat]>,
-    pub depth_stencil_format: Option<ImageFormat>,
-    pub samples: SampleCount,
-    pub extent: [u32; 2],
-    /// Attachment load/store bounds, independent of the viewport and dynamic
-    /// scissor. The allocated image can include texels outside this region.
-    pub render_area: ScissorRect,
-    pub topology: PrimitiveTopology,
-    pub restart: bool,
-    pub provoking_first: bool,
-    pub raster: TriangleRasterization,
-    pub line: Option<LineRasterization>,
-    pub front_face: FrontFace,
-    pub cull: CullMode,
-    pub depth_bias: Option<DepthBias>,
-    pub viewport: Option<ViewportTransform>,
-    pub position_transform: Option<VertexPositionTransform>,
-    pub scissor: ScissorRect,
-    pub depth: DepthState,
-    pub stencil: Option<StencilTestState>,
-    pub color_outputs: Box<[ColorOutputState]>,
-    pub blend_constants: [f32; 4],
-    pub alpha_test: Option<AlphaTest>,
-    pub tessellation: Option<TessellationState>,
-    pub sample_mask: u64,
-    pub alpha_to_coverage: bool,
-}
-#[derive(Clone, Copy, Debug)]
-pub struct BufferCopyRegion {
-    pub source: u64,
-    pub destination: u64,
-    pub bytes: u64,
-}
-#[derive(Clone, Debug)]
-pub enum NativeCommand {
-    CopyBuffer {
-        source: Arc<PhysicalMapping>,
-        destination: Arc<PhysicalMapping>,
-        regions: Box<[BufferCopyRegion]>,
-    },
-    Sequence(Box<[NativeCommand]>),
-    /// Orders the device stream without waiting for it on the host.
-    WaitForIdle,
-    /// Ordered report payload. A fence commits preceding buffer publications.
-    /// Ordinary inline writes execute directly on the command owner.
-    ReportMemory {
-        target: Vec<AllocationRange>,
-        offset: u64,
-        bytes: Arc<[u8]>,
-        fence: bool,
-    },
-    Draw {
-        state: Arc<GuestDrawState>,
-        arguments: DrawArguments,
-    },
-    Dispatch {
-        program: Arc<GuestProgram>,
-        groups: [u32; 3],
-    },
-    Clear {
-        image: GuestImage,
-        rectangle: ScissorRect,
-        value: ClearValue,
-    },
-    Blit {
-        source: GuestImage,
-        destination: GuestImage,
-        source_rectangle: ScissorRect,
-        destination_rectangle: ScissorRect,
-        linear: bool,
-        resolve: bool,
-        sampling: Option<([i64; 2], [i64; 2])>,
-    },
-    Ordering(CacheMaintenanceOperation),
-    ConvertNv12 {
-        destination: Box<GuestImage>,
-        source: Nv12Planes,
-        transform: Nv12ColorTransform,
-    },
-}
-#[derive(Clone, Debug)]
-pub struct NativeWork {
+pub struct NativeNv12Conversion {
     pub frontend: FrontendSubmissionId,
-    pub command: NativeCommand,
+    pub destination: Box<GuestImage>,
+    pub source: Nv12Planes,
+    pub transform: Nv12ColorTransform,
 }
-impl NativeCommand {
+impl NativeNv12Conversion {
     pub fn retain_inputs(
         &self,
         inputs: &mut Vec<AllocationRange>,
     ) -> Result<(), nixe_memory::MemoryError> {
-        fn buffer(
-            input: &PhysicalMapping,
-            inputs: &mut Vec<AllocationRange>,
-        ) -> Result<(), nixe_memory::MemoryError> {
-            inputs.extend(input.pin(0, input.bytes())?);
-            Ok(())
-        }
-        fn image(
-            input: &GuestImage,
-            inputs: &mut Vec<AllocationRange>,
-        ) -> Result<(), nixe_memory::MemoryError> {
-            for plane in input.planes.iter() {
-                let range = plane.footprint.bounds();
-                inputs.extend(
-                    plane
-                        .footprint
-                        .mapping()
-                        .pin(range.start, range.end - range.start)?,
-                );
-            }
-            Ok(())
-        }
-        fn program(
-            input: &GuestProgram,
-            inputs: &mut Vec<AllocationRange>,
-        ) -> Result<(), nixe_memory::MemoryError> {
-            for (_, binding) in &input.bindings {
-                match binding {
-                    GuestBinding::Buffer(input) => buffer(input, inputs)?,
-                    GuestBinding::Image { image: input, .. } => image(input, inputs)?,
-                    GuestBinding::NullBuffer | GuestBinding::Sampler(_) => {}
-                }
-            }
-            Ok(())
-        }
-        match self {
-            Self::CopyBuffer {
-                source,
-                destination,
-                ..
-            } => {
-                buffer(source, inputs)?;
-                buffer(destination, inputs)?;
-            }
-            Self::Sequence(commands) => {
-                for command in commands {
-                    command.retain_inputs(inputs)?;
-                }
-            }
-            Self::Draw { state, .. } => {
-                program(&state.program, inputs)?;
-                for vertex in state.vertices.iter() {
-                    buffer(&vertex.backing, inputs)?;
-                }
-                if let Some(GuestIndexBuffer::Canonical(input, _)) = &state.index {
-                    buffer(input, inputs)?;
-                }
-                for input in state.colors.iter().chain(state.depth_stencil.iter()) {
-                    image(input, inputs)?;
-                }
-            }
-            Self::Dispatch { program: input, .. } => program(input, inputs)?,
-            Self::Clear { image: input, .. } => image(input, inputs)?,
-            Self::Blit {
-                source,
-                destination,
-                ..
-            } => {
-                image(source, inputs)?;
-                image(destination, inputs)?;
-            }
-            Self::ConvertNv12 { destination, .. } => image(destination, inputs)?,
-            // ReportMemory already owns its exact AllocationRange values.
-            Self::ReportMemory { .. } | Self::WaitForIdle | Self::Ordering(_) => {}
+        for plane in self.destination.planes.iter() {
+            let range = plane.footprint.bounds();
+            inputs.extend(
+                plane
+                    .footprint
+                    .mapping()
+                    .pin(range.start, range.end - range.start)?,
+            );
         }
         Ok(())
     }
@@ -408,105 +219,4 @@ pub struct GuestImagePlane {
     pub footprint: Arc<Footprint>,
     pub row_pitch: u64,
     pub bytes_per_block: u32,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nixe_memory::{Allocation, Machine, PAGE_SIZE};
-
-    fn program(backing: Arc<PhysicalMapping>) -> Arc<GuestProgram> {
-        Arc::new(GuestProgram {
-            identity: PreparedStateId::new(1, 1),
-            shader: Arc::new(GuestShaderCode {
-                identity: crate::shader_identity::ContentId::of(b"suspended-input-test", &[]),
-                stages: Box::new([]),
-            }),
-            bindings: Box::new([(
-                crate::shader_module::ResourceId(0),
-                GuestBinding::Buffer(backing),
-            )]),
-            shared_memory_bytes: 0,
-        })
-    }
-    fn input(allocation: &Allocation, start: u64, bytes: u64) -> Arc<PhysicalMapping> {
-        PhysicalMapping::new(&[AllocationRange::new(
-            allocation.pin_range(start, bytes).unwrap(),
-            start,
-            bytes,
-        )
-        .unwrap()])
-        .unwrap()
-    }
-    fn batch(program: Arc<GuestProgram>) -> NativeWork {
-        NativeWork {
-            frontend: FrontendSubmissionId::new(1),
-            command: NativeCommand::Dispatch {
-                program,
-                groups: [1, 1, 1],
-            },
-        }
-    }
-
-    #[test]
-    fn suspended_input_keeps_its_original_page_until_consumption_and_caches_remain_weak() {
-        let machine = Machine::new(3 * PAGE_SIZE).unwrap();
-        let account = machine.account(3 * PAGE_SIZE).unwrap();
-        let allocation = account.allocate(3 * PAGE_SIZE).unwrap();
-        let mapping = input(&allocation, PAGE_SIZE + 17, 8);
-        let cached = program(Arc::clone(&mapping));
-        let work = batch(Arc::clone(&cached));
-        let mut retained = Vec::new();
-        work.command.retain_inputs(&mut retained).unwrap();
-        drop(allocation);
-        assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
-        let recycled = account.allocate(2 * PAGE_SIZE).unwrap();
-        machine
-            .write_resolved(&mapping.pin(0, 8).unwrap(), &[0x5a; 8])
-            .unwrap();
-        let mut bytes = [0; 8];
-        machine
-            .capture_stream(&mapping.pin(0, 8).unwrap(), &mut bytes)
-            .unwrap();
-        assert_eq!(bytes, [0x5a; 8]);
-        drop((retained, work));
-        assert_eq!(machine.statistics().allocated_bytes, 2 * PAGE_SIZE);
-        assert!(
-            mapping.pin(0, 8).is_err(),
-            "prepared/cache references must not own RAM"
-        );
-        drop((cached, recycled));
-        assert_eq!(machine.statistics().allocated_bytes, 0);
-    }
-
-    #[test]
-    fn warm_metadata_and_a_failed_suspension_capture_cannot_retain_guest_ram() {
-        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
-        let account = machine.account(2 * PAGE_SIZE).unwrap();
-        let first = account.allocate(PAGE_SIZE).unwrap();
-        let retired = account.allocate(PAGE_SIZE).unwrap();
-        let retired_mapping = input(&retired, 0, 4);
-        let unused = batch(program(Arc::clone(&retired_mapping)));
-        drop(retired);
-        assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
-        let work = NativeWork {
-            frontend: FrontendSubmissionId::new(2),
-            command: NativeCommand::Sequence(Box::new([
-                NativeCommand::Dispatch {
-                    program: program(input(&first, 0, 4)),
-                    groups: [1, 1, 1],
-                },
-                NativeCommand::Dispatch {
-                    program: program(retired_mapping),
-                    groups: [1, 1, 1],
-                },
-            ])),
-        };
-        let mut retained = Vec::new();
-        assert!(work.command.retain_inputs(&mut retained).is_err());
-        drop(retained);
-        drop(first);
-        assert_eq!(machine.statistics().allocated_bytes, 0);
-        drop((unused, work));
-    }
 }

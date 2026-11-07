@@ -188,6 +188,28 @@ impl ProcessMemory {
         let allocation = account.allocate(bytes)?;
         self.map(start, allocation, 0, bytes, mapping)
     }
+    /// NvCore reserves its device heap from the largest current normal region,
+    /// as Eden's Container::OpenSession does, preserving adjacent object offsets.
+    pub fn normal_heap_region(&self) -> Option<(GuestVirtualAddress, u64)> {
+        let regions = self.regions.lock().unwrap();
+        let mut current = (0u64, 0u64);
+        let mut largest = current;
+        for (&start, region) in regions.iter() {
+            if region.mapping.kind != MemoryKind::Heap {
+                continue;
+            }
+            if current.1 == start {
+                current.1 = region.end;
+            } else {
+                current = (start, region.end);
+            }
+            if current.1 - current.0 > largest.1 - largest.0 {
+                largest = current;
+            }
+        }
+        (largest.1 > largest.0)
+            .then_some((GuestVirtualAddress::new(largest.0), largest.1 - largest.0))
+    }
     pub fn heap_size(&self) -> u64 {
         if self.closed.load(Ordering::Acquire) {
             0

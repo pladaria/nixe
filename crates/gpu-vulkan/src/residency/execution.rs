@@ -1,4 +1,4 @@
-//! Prepared native execution. Descriptor reflection supplies the access scopes;
+//! Prepared native execution. Descriptor reflection supplies the resource roles;
 //! callers cannot omit shader writes from canonical ownership or synchronization.
 use super::*;
 use crate::cache::{
@@ -6,28 +6,27 @@ use crate::cache::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 mod graphics;
+mod guest;
+mod host;
 mod state;
+pub(crate) use graphics::NativeIndexBuffer;
 pub use graphics::{
-    AttachmentSource, Draw, IndexBuffer, PreparedDraw, PreparedTargets, RenderAttachment,
-    RenderingTargets, VertexBuffer,
+    AttachmentSource, Draw, IndexBuffer, PreparedTargets, RenderAttachment, RenderingTargets,
+    VertexBuffer,
 };
-pub(crate) use state::PreparedGraphicsState;
-pub use state::{GraphicsParameters, PreparedGraphics};
+pub(crate) use graphics::{DeferredClear, RenderPassState, ShaderImage};
+pub use state::{GraphicsParameters, HostGraphics};
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ShaderAccess {
-    pub read: vk::PipelineStageFlags2,
-    pub write: vk::PipelineStageFlags2,
-}
 pub(crate) fn shader_accesses(
     shader: &ShaderArtifact,
     layout: &crate::cache::LayoutKey,
-) -> Box<[ShaderAccess]> {
+) -> Box<[AccessScope]> {
     layout
         .bindings
         .iter()
         .map(|b| {
-            let mut access = ShaderAccess::default();
+            let mut read = vk::PipelineStageFlags2::empty();
+            let mut write = vk::PipelineStageFlags2::empty();
             for stage in &shader.stages {
                 let flags = shader_stage(stage.stage);
                 for binding in stage
@@ -37,14 +36,35 @@ pub(crate) fn shader_accesses(
                     .filter(|r| r.binding == b.binding)
                 {
                     if binding.readable {
-                        access.read |= flags;
+                        read |= flags;
                     }
                     if binding.writable {
-                        access.write |= flags;
+                        write |= flags;
                     }
                 }
             }
-            access
+            let mut flags = vk::AccessFlags2::empty();
+            if !read.is_empty() {
+                flags |= if matches!(
+                    b.kind,
+                    vk::DescriptorType::SAMPLED_IMAGE
+                        | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                        | vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                ) {
+                    vk::AccessFlags2::SHADER_SAMPLED_READ
+                } else if matches!(
+                    b.kind,
+                    vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                ) {
+                    vk::AccessFlags2::UNIFORM_READ
+                } else {
+                    vk::AccessFlags2::SHADER_STORAGE_READ
+                };
+            }
+            if !write.is_empty() {
+                flags |= vk::AccessFlags2::SHADER_STORAGE_WRITE;
+            }
+            AccessScope::new(read | write, flags)
         })
         .collect()
 }
@@ -61,30 +81,44 @@ fn shader_stage(stage: nixe_gpu::ShaderStage) -> vk::PipelineStageFlags2 {
         ShaderStage::Compute => vk::PipelineStageFlags2::COMPUTE_SHADER,
     }
 }
+/// Host utility inputs retain their actual native allocation. Compact cache
+/// IDs select coherence metadata; native identity prevents reuse from accepting
+/// an unrelated resource after explicit retirement or an overlapping merge.
 #[derive(Clone)]
-pub enum Binding {
+pub struct HostBuffer {
+    pub(super) id: BufferId,
+    native: Arc<AllocatedBuffer>,
+}
+#[derive(Clone)]
+pub struct HostImage {
+    pub(super) id: ImageViewId,
+    pub(super) image: ImageId,
+    native: Arc<crate::AllocatedImageView>,
+}
+#[derive(Clone)]
+pub enum HostBinding {
     NullBuffer,
     TexelBuffer {
-        buffer: BufferId,
+        buffer: HostBuffer,
         offset: u64,
         size: u64,
         format: vk::Format,
         element_bytes: u32,
     },
     Buffer {
-        buffer: BufferId,
+        buffer: HostBuffer,
         offset: u64,
         size: u64,
     },
-    Image(ImageViewId),
+    Image(HostImage),
     CombinedImageSampler {
-        image: ImageViewId,
+        image: HostImage,
         sampler: Arc<Sampler>,
     },
     Sampler(Arc<Sampler>),
 }
 #[derive(Clone, Copy)]
-pub(super) enum Use {
+pub(super) enum HostBindingAccess {
     Buffer {
         id: BufferId,
         offset: u64,
@@ -93,75 +127,160 @@ pub(super) enum Use {
     },
     Image {
         id: ImageId,
-        range: vk::ImageSubresourceRange,
         scope: AccessScope,
     },
 }
-/// Prepared selections retain native resources and their descriptor record. Sets
-/// belong to native layout banks and recycle after their actual GPU use retires.
-pub struct PreparedProgram {
+/// Host utility shader captures. Guest Configure uses cache-owned hardware
+/// banks and DescriptorQueue directly; it never constructs this object.
+pub struct HostProgram {
     binding_revision: AtomicU64,
     pub(super) pipeline: Arc<NativePipeline>,
     // Explicit host bindings are owned by the host texture cache.
-    record: std::sync::Mutex<ProgramRecord>,
-    bindings: Box<[Binding]>,
-    resources: Box<[DescriptorResource]>,
-    pub(super) uses: Box<[Use]>,
-    // Uniform slot indices grouped by their streamed canonical access window.
-    uniform_bindings: Box<[usize]>,
-    uniforms: Box<[(usize, buffer::BufferStreamRequest, std::ops::Range<usize>)]>,
-    unaligned_uniforms: bool,
-    dynamic_offsets: Box<[u32]>,
+    record: std::cell::RefCell<ProgramRecord>,
+    // Explicit host resources use owned captures; guest resources use residency
+    // use ticks and the native execution owner's persistent sampler cache.
+    bindings: Vec<HostBinding>,
+    unaligned_uniforms: usize,
+    dynamic_offsets: Vec<u32>,
 }
 #[derive(Default)]
 struct ProgramRecord {
     current: Option<Arc<BindingRecord>>,
     streamed: bool,
 }
-pub(super) struct UniformUpdate {
-    buffer: Arc<AllocatedBuffer>,
-    offset: u64,
-}
-impl PreparedProgram {
-    fn canonical_resources(&self, resources: &mut Vec<DescriptorResource>) {
-        resources.extend_from_slice(&self.resources);
-        for (&index, &dynamic) in self
-            .pipeline
-            .layout
-            .dynamic_bindings
-            .iter()
-            .zip(&self.dynamic_offsets)
-        {
-            if let DescriptorResource::Buffer { offset, .. } = &mut resources[index] {
-                *offset -= u64::from(dynamic);
-            }
-        }
-    }
-    pub(crate) fn pipeline(&self) -> &Arc<NativePipeline> {
-        &self.pipeline
-    }
-
-    pub(crate) fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + std::mem::size_of_val(self.uses.as_ref())
-            + std::mem::size_of_val(self.uniform_bindings.as_ref())
-            + std::mem::size_of_val(self.uniforms.as_ref())
-            + std::mem::size_of_val(self.dynamic_offsets.as_ref())
-            + std::mem::size_of_val(self.bindings.as_ref())
-            + std::mem::size_of_val(self.resources.as_ref())
-            + BindingRecord::capture_bytes(self.resources.len())
-    }
-}
 #[derive(Clone, Copy, Debug)]
 pub enum Dispatch {
     Direct([u32; 3]),
     Indirect { buffer: BufferId, offset: u64 },
 }
-struct GraphicsStreams {
-    dynamic_offsets: Option<Vec<u32>>,
-    record: Option<Arc<BindingRecord>>,
+pub(crate) struct DescriptorQueue {
+    pub(crate) dynamic_offsets: Option<Vec<u32>>,
+    pub(crate) record: Option<Arc<BindingRecord>>,
+    pub(crate) update: Option<crate::cache::DescriptorUpdate>,
 }
-impl VulkanResidency {
+impl Residency<'_> {
+    pub fn host_buffer(&self, id: BufferId) -> Result<HostBuffer, VulkanError> {
+        let entry = self
+            .buffer_cache
+            .buffers
+            .get(id)
+            .filter(|entry| entry.binding_valid)
+            .ok_or(VulkanError::InvalidResource("retired host buffer input"))?;
+        Ok(HostBuffer {
+            id,
+            native: Arc::clone(&entry.native),
+        })
+    }
+    pub fn host_image(&self, id: ImageViewId) -> Result<HostImage, VulkanError> {
+        let view = self
+            .texture_cache
+            .views
+            .get(id)
+            .filter(|view| self.texture_cache.binding_current(view.image))
+            .ok_or(VulkanError::InvalidResource("retired host image input"))?;
+        Ok(HostImage {
+            id,
+            image: view.image,
+            native: Arc::clone(&view.native),
+        })
+    }
+    fn host_binding_usage(&self, program: &HostProgram, index: usize) -> Option<HostBindingAccess> {
+        let scope = program.pipeline.resources[index];
+        if scope.stages.is_empty() {
+            return None;
+        }
+        match &program.bindings[index] {
+            HostBinding::Buffer {
+                buffer,
+                offset,
+                size,
+            }
+            | HostBinding::TexelBuffer {
+                buffer,
+                offset,
+                size,
+                ..
+            } => Some(HostBindingAccess::Buffer {
+                id: buffer.id,
+                offset: *offset,
+                size: *size,
+                scope,
+            }),
+            HostBinding::Image(id) | HostBinding::CombinedImageSampler { image: id, .. } => {
+                Some(HostBindingAccess::Image {
+                    id: id.image,
+                    scope,
+                })
+            }
+            HostBinding::NullBuffer | HostBinding::Sampler(_) => None,
+        }
+    }
+    fn canonical_resource(
+        &self,
+        program: &HostProgram,
+        index: usize,
+    ) -> Result<DescriptorResource, VulkanError> {
+        let mut resource = match &program.bindings[index] {
+            HostBinding::NullBuffer => DescriptorResource::NullBuffer,
+            HostBinding::Buffer {
+                buffer,
+                offset,
+                size,
+            } => DescriptorResource::Buffer {
+                buffer: Arc::clone(&buffer.native),
+                offset: *offset,
+                range: *size,
+            },
+            HostBinding::TexelBuffer {
+                buffer,
+                offset,
+                size,
+                format,
+                element_bytes,
+            } => DescriptorResource::TexelBuffer {
+                buffer: Arc::clone(&buffer.native),
+                offset: *offset,
+                range: *size,
+                format: *format,
+                element_bytes: *element_bytes,
+            },
+            HostBinding::Image(id) | HostBinding::CombinedImageSampler { image: id, .. } => {
+                let layout = vk::ImageLayout::GENERAL;
+                let view = Arc::clone(&id.native);
+                if let HostBinding::CombinedImageSampler { sampler, .. } = &program.bindings[index]
+                {
+                    DescriptorResource::CombinedImageSampler {
+                        view,
+                        layout,
+                        sampler: Arc::clone(sampler),
+                    }
+                } else {
+                    DescriptorResource::Image { view, layout }
+                }
+            }
+            HostBinding::Sampler(sampler) => DescriptorResource::Sampler(Arc::clone(sampler)),
+        };
+        if let Ok(slot) = program
+            .pipeline
+            .layout
+            .dynamic_bindings
+            .binary_search(&index)
+            && let DescriptorResource::Buffer { offset, .. } = &mut resource
+        {
+            *offset -= u64::from(program.dynamic_offsets[slot]);
+        }
+        Ok(resource)
+    }
+    fn canonical_resources(
+        &self,
+        program: &HostProgram,
+        resources: &mut Vec<DescriptorResource>,
+    ) -> Result<(), VulkanError> {
+        for index in 0..program.bindings.len() {
+            resources.push(self.canonical_resource(program, index)?);
+        }
+        Ok(())
+    }
     /// Host-only sampled resources are synchronized by their concrete owner;
     /// they have no invented canonical guest-memory access declarations.
     pub(crate) fn prepare_host_graphics(
@@ -169,42 +288,39 @@ impl VulkanResidency {
         pipeline: Arc<NativePipeline>,
         record: Arc<BindingRecord>,
         parameters: GraphicsParameters,
-    ) -> Result<PreparedGraphics, VulkanError> {
-        let dynamic_offsets = vec![0; pipeline.layout.dynamic_bindings.len()].into_boxed_slice();
-        self.prepare_graphics(
-            PreparedProgram {
-                binding_revision: self.binding_revision.into(),
+    ) -> Result<HostGraphics, VulkanError> {
+        let dynamic_offsets = vec![0; pipeline.layout.dynamic_bindings.len()];
+        self.prepare_host_pipeline(
+            HostProgram {
+                binding_revision: self.texture_cache.binding_revision.into(),
                 pipeline,
                 dynamic_offsets,
-                record: std::sync::Mutex::new(ProgramRecord {
+                record: std::cell::RefCell::new(ProgramRecord {
                     current: Some(record),
                     streamed: false,
                 }),
-                bindings: Box::new([]),
-                resources: Box::new([]),
-                uses: Box::new([]),
-                uniform_bindings: Box::new([]),
-                uniforms: Box::new([]),
-                unaligned_uniforms: false,
+                bindings: Vec::new(),
+                unaligned_uniforms: 0,
             },
             parameters,
         )
     }
     pub(crate) fn bind_host_graphics(
         &mut self,
-        graphics: &PreparedGraphics,
+        graphics: &HostGraphics,
         push: &[u8],
     ) -> Result<(), VulkanError> {
-        self.device.end_rendering();
-        self.graphics_state(graphics)?;
+        self.runtime.device.end_rendering()?;
+        self.graphics_state(&graphics.program.pipeline, &graphics.parameters)?;
         self.set_feedback_loop(vk::ImageAspectFlags::empty());
-        self.program_bind(&graphics.program, push).map(|_| ())
+        self.bind_host_program(&graphics.program, push).map(|_| ())
     }
     fn set_feedback_loop(&mut self, aspects: vk::ImageAspectFlags) {
-        if !self.device.profile().attachment_feedback_loop {
+        if !self.runtime.device.profile().attachment_feedback_loop {
             return;
         }
-        let slot = &mut self.device.submission.slots[self
+        let slot = &mut self.runtime.device.submission.slots[self
+            .runtime
             .device
             .submission
             .recording
@@ -213,391 +329,132 @@ impl VulkanResidency {
             return;
         }
         unsafe {
-            self.device.dispatch.cmd_set_feedback_loop(aspects);
+            self.runtime.device.dispatch.cmd_set_feedback_loop(aspects);
         }
         slot.feedback_aspects = Some(aspects);
     }
-    pub(crate) fn program_current(&self, program: &PreparedProgram) -> bool {
-        if program.binding_revision.load(Ordering::Relaxed) == self.binding_revision {
+    pub(crate) fn host_program_current(&self, program: &HostProgram) -> bool {
+        if program.binding_revision.load(Ordering::Relaxed) == self.texture_cache.binding_revision {
             return true;
         }
-        if !self.bindings_current(&program.bindings) {
+        if !program
+            .bindings
+            .iter()
+            .all(|binding| self.input_binding_current(binding))
+        {
             return false;
         }
         program
             .binding_revision
-            .store(self.binding_revision, Ordering::Relaxed);
+            .store(self.texture_cache.binding_revision, Ordering::Relaxed);
         true
     }
-    pub(crate) fn bindings_current(&self, bindings: &[Binding]) -> bool {
-        bindings.iter().all(|binding| match binding {
-            Binding::Buffer { buffer, .. } | Binding::TexelBuffer { buffer, .. } => {
-                self.buffer_binding_current(*buffer)
-            }
-            Binding::Image(view) | Binding::CombinedImageSampler { image: view, .. } => {
-                self.image_binding_current(view.image)
+    fn input_binding_current(&self, binding: &HostBinding) -> bool {
+        match binding {
+            HostBinding::Buffer { buffer, .. } | HostBinding::TexelBuffer { buffer, .. } => self
+                .buffer_cache
+                .buffers
+                .get(buffer.id)
+                .is_some_and(|entry| {
+                    entry.binding_valid && Arc::ptr_eq(&entry.native, &buffer.native)
+                }),
+            HostBinding::Image(view) | HostBinding::CombinedImageSampler { image: view, .. } => {
+                self.texture_cache.views.get(view.id).is_some_and(|entry| {
+                    self.texture_cache.binding_current(entry.image)
+                        && Arc::ptr_eq(&entry.native, &view.native)
+                })
             }
             _ => true,
-        })
+        }
     }
-    pub fn prepare_program(
-        &self,
-        pipeline: Arc<NativePipeline>,
-        bindings: &[Binding],
-    ) -> Result<PreparedProgram, VulkanError> {
-        if !Arc::ptr_eq(&pipeline.owner, &self.device.owner)
-            || bindings.len() != pipeline.layout.key.bindings.len()
-        {
-            return Err(VulkanError::InvalidResource(
-                "prepared program has a foreign pipeline or incorrect binding count",
-            ));
+    fn stream_graphics(&mut self, program: &HostProgram) -> Result<DescriptorQueue, VulkanError> {
+        self.runtime.streamed_uses.clear();
+        if program.bindings.is_empty() || program.pipeline.layout.uniform_bindings.is_empty() {
+            // Host descriptors and layouts without uniforms need no per-use
+            // uniform selection.
+            return Ok(DescriptorQueue {
+                dynamic_offsets: None,
+                record: None,
+                update: None,
+            });
         }
-        let mut resources = Vec::with_capacity(bindings.len());
-        let mut uses = Vec::<Use>::new();
-        for ((binding, reflected), access) in bindings
-            .iter()
-            .zip(&pipeline.layout.key.bindings)
-            .zip(&pipeline.resources)
-        {
-            let stages = access.read | access.write;
-            let mut flags = vk::AccessFlags2::empty();
-            if !access.read.is_empty() {
-                flags |= if matches!(
-                    reflected.kind,
-                    vk::DescriptorType::SAMPLED_IMAGE
-                        | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
-                        | vk::DescriptorType::UNIFORM_TEXEL_BUFFER
-                ) {
-                    vk::AccessFlags2::SHADER_SAMPLED_READ
-                } else if matches!(
-                    reflected.kind,
-                    vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
-                ) {
-                    vk::AccessFlags2::UNIFORM_READ
-                } else {
-                    vk::AccessFlags2::SHADER_STORAGE_READ
-                };
-            }
-            if !access.write.is_empty() {
-                flags |= vk::AccessFlags2::SHADER_STORAGE_WRITE;
-            }
-            let scope = AccessScope::new(stages, flags);
-            match binding {
-                Binding::NullBuffer => {
-                    if !self.device.profile().null_descriptor
-                        || !matches!(
-                            reflected.kind,
-                            vk::DescriptorType::STORAGE_BUFFER
-                                | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
-                                | vk::DescriptorType::UNIFORM_BUFFER
-                                | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
-                        )
-                    {
-                        return Err(VulkanError::InvalidResource(
-                            "null buffer descriptor is not supported for this binding",
-                        ));
-                    }
-                    resources.push(DescriptorResource::NullBuffer);
-                }
-                Binding::Buffer {
-                    buffer,
-                    offset,
-                    size,
-                }
-                | Binding::TexelBuffer {
-                    buffer,
-                    offset,
-                    size,
-                    ..
-                } => {
-                    self.check_buffer_range(*buffer, *offset, *size)?;
-                    let lease = self.buffer_lease(*buffer)?;
-                    resources.push(match binding {
-                        Binding::TexelBuffer {
-                            format,
-                            element_bytes,
-                            ..
-                        } => DescriptorResource::TexelBuffer {
-                            buffer: lease,
-                            offset: *offset,
-                            range: *size,
-                            format: *format,
-                            element_bytes: *element_bytes,
-                        },
-                        _ => DescriptorResource::Buffer {
-                            buffer: lease,
-                            offset: *offset,
-                            range: *size,
-                        },
-                    });
-                    if !stages.is_empty() {
-                        uses.push(Use::Buffer {
-                            id: *buffer,
-                            offset: *offset,
-                            size: *size,
-                            scope,
-                        });
-                    }
-                }
-                Binding::Image(view) | Binding::CombinedImageSampler { image: view, .. } => {
-                    let image = self.image(view.image)?;
-                    let description = image
-                        .views
-                        .get(view.view)
-                        .ok_or(VulkanError::InvalidResource("absent prepared image view"))?;
-                    if reflected.kind == vk::DescriptorType::STORAGE_IMAGE
-                        && description.swizzle != [vk::ComponentSwizzle::IDENTITY; 4]
-                    {
-                        return Err(VulkanError::InvalidResource(
-                            "storage image descriptors require identity component mapping",
-                        ));
-                    }
-                    if description.aspects
-                        == vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
-                    {
-                        return Err(VulkanError::InvalidResource(
-                            "shader descriptors require an individual depth or stencil view aspect",
-                        ));
-                    }
-                    let usage = if reflected.kind == vk::DescriptorType::STORAGE_IMAGE {
-                        vk::ImageUsageFlags::STORAGE
-                    } else {
-                        vk::ImageUsageFlags::SAMPLED
-                    };
-                    if !image.description.usage.contains(usage) {
-                        return Err(VulkanError::InvalidResource(
-                            "shader image requires sampled/storage usage",
-                        ));
-                    }
-                    // The chosen layout remains fixed for this image's lifetime,
-                    // including when it is used as a rendering attachment.
-                    let layout =
-                        shader_attachment_layout(image.description.usage, self.unified_layouts);
-                    let view_lease = self.image_view_lease(*view)?;
-                    resources.push(match binding {
-                        Binding::CombinedImageSampler { sampler, .. } => {
-                            DescriptorResource::CombinedImageSampler {
-                                view: view_lease,
-                                layout,
-                                sampler: Arc::clone(sampler),
-                            }
-                        }
-                        _ => DescriptorResource::Image {
-                            view: view_lease,
-                            layout,
-                        },
-                    });
-                    // Views are validated once when created. Keep their native
-                    // ranges instead of expanding and rejoining every mip/layer.
-                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L519-L538
-                    if !stages.is_empty() {
-                        let volume = image.description.image_type == vk::ImageType::TYPE_3D;
-                        for aspect in [
-                            vk::ImageAspectFlags::COLOR,
-                            vk::ImageAspectFlags::DEPTH,
-                            vk::ImageAspectFlags::STENCIL,
-                        ] {
-                            if description.aspects.contains(aspect) {
-                                uses.push(Use::Image {
-                                    id: view.image,
-                                    range: vk::ImageSubresourceRange::default()
-                                        .aspect_mask(aspect)
-                                        .base_mip_level(description.base_mip)
-                                        .level_count(description.mip_count)
-                                        .base_array_layer(if volume {
-                                            0
-                                        } else {
-                                            description.base_layer
-                                        })
-                                        .layer_count(if volume {
-                                            1
-                                        } else {
-                                            description.layer_count
-                                        }),
-                                    scope,
-                                });
-                            }
-                        }
-                    }
-                }
-                Binding::Sampler(sampler) => {
-                    resources.push(DescriptorResource::Sampler(Arc::clone(sampler)))
-                }
-            }
-        }
-        let merged = merge_program_uses(uses);
-        let binding_uses: Box<[_]> = bindings.iter().map(|binding| match binding {
-            Binding::Buffer { buffer, offset, size } | Binding::TexelBuffer { buffer, offset, size, .. } => merged.iter().position(|usage| matches!(usage,
-                Use::Buffer { id, offset: start, size: length, .. } if id == buffer && *start <= *offset && *offset + *size <= *start + *length
-            )),
-            _ => None,
-        }).collect();
-        let limits = self.device.profile().limits;
-        // Unaligned uniforms are rebound to an aligned immutable allocation at
-        // consumption, either a CPU stream or a native copy of retained data.
-        let mut unaligned_uniforms = false;
-        for (resource, binding) in resources.iter_mut().zip(&pipeline.layout.key.bindings) {
-            if matches!(
-                binding.kind,
-                vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
-            ) && let DescriptorResource::Buffer { offset, .. } = resource
-                && !offset.is_multiple_of(limits.min_uniform_buffer_offset_alignment)
-            {
-                *offset = 0;
-                unaligned_uniforms = true;
-            }
-        }
-        let dynamic_offsets = pipeline
-            .layout
-            .split_dynamic_offsets(&mut resources, &self.device.profile().limits, Vec::new())?
-            .into_boxed_slice();
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
-        let mut uniform_bindings: Vec<_> = pipeline
-            .layout
-            .uniform_bindings
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, binding)| {
-                let index = binding_uses[binding.resource]?;
-                matches!(merged[index], Use::Buffer { scope, size, .. }
-                    if scope.access == vk::AccessFlags2::UNIFORM_READ && size <= 64 * 1024)
-                .then_some((index, slot))
-            })
-            .collect();
-        uniform_bindings.sort_unstable_by_key(|&(index, _)| index);
-        let uniforms = merged
-            .iter()
-            .enumerate()
-            .filter_map(|(index, usage)| match *usage {
-                Use::Buffer {
-                    id,
-                    offset,
-                    size,
-                    scope,
-                } if scope.access == vk::AccessFlags2::UNIFORM_READ && size <= 64 * 1024 => Some((
-                    index,
-                    buffer::BufferStreamRequest {
-                        id,
-                        offset,
-                        size,
-                        alignment: scope.buffer_alignment(&limits),
-                    },
-                    uniform_bindings.partition_point(|&(usage, _)| usage < index)
-                        ..uniform_bindings.partition_point(|&(usage, _)| usage <= index),
-                )),
-                _ => None,
-            })
-            .collect();
-        // Keep the resolved native selection. Its handles and image layouts
-        // remain valid until binding_revision changes; streaming replaces only
-        // uniform slices. Do not resolve every buffer/view again at each draw.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-        for (resource, binding) in resources.iter_mut().zip(bindings) {
-            if let (
-                DescriptorResource::Buffer { offset, .. },
-                Binding::Buffer { offset: source, .. },
-            ) = (resource, binding)
-            {
-                *offset = *source;
-            }
-        }
-        Ok(PreparedProgram {
-            binding_revision: self.binding_revision.into(),
-            pipeline,
-            record: std::sync::Mutex::default(),
-            bindings: bindings.to_vec().into_boxed_slice(),
-            resources: resources.into_boxed_slice(),
-            uses: merged.into_boxed_slice(),
-            uniform_bindings: uniform_bindings
-                .into_iter()
-                .map(|(_, binding)| binding)
-                .collect(),
-            uniforms,
-            unaligned_uniforms,
-            dynamic_offsets,
-        })
-    }
-    fn stream_graphics(
-        &mut self,
-        program: &PreparedProgram,
-    ) -> Result<GraphicsStreams, VulkanError> {
-        self.streamed_uses.clear();
-        let mut updates = std::mem::take(&mut self.uniform_updates);
+        let mut updates = std::mem::take(&mut self.runtime.uniform_updates);
         // The layout already assigns each uniform its descriptor slot. Keep a
         // direct indexed selection through streaming, realignment and binding,
         // as Eden's BindHostGraphicsUniformBuffer does for its binding_index.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L932
         updates.resize_with(program.pipeline.layout.uniform_bindings.len(), || None);
         debug_assert!(updates.iter().all(Option::is_none));
-        let mut streamed = false;
-        for (index, request, bindings) in &program.uniforms {
-            self.uniform_cache_shots[0] += 1;
-            let unaligned = !request.offset.is_multiple_of(request.alignment);
-            if !unaligned && request.size > self.uniform_stream_limit {
-                continue;
-            }
-            let Some((buffer, base)) = self.stream_buffer(*request)? else {
+        // Eden selects streaming from this uniform range's GPU modifications.
+        // Read-only aliases and adjacent bindings do not change its contents.
+        // stream_buffer checks exact producers before capturing RAM; prior GPU
+        // writes still use the native buffer or an aligned device-side copy.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L932
+        for (slot, uniform) in program.pipeline.layout.uniform_bindings.iter().enumerate() {
+            let Some(HostBindingAccess::Buffer {
+                id,
+                offset,
+                size,
+                scope,
+            }) = self.host_binding_usage(program, uniform.resource)
+            else {
                 continue;
             };
-            for &slot in &program.uniform_bindings[bindings.clone()] {
-                let resource = program.pipeline.layout.uniform_bindings[slot].resource;
-                let DescriptorResource::Buffer { offset, .. } = &program.resources[resource] else {
-                    return Err(VulkanError::InvalidResource(
-                        "streamed uniform binding requires a buffer",
-                    ));
-                };
-                updates[slot] = Some(UniformUpdate {
-                    buffer: Arc::clone(&buffer),
-                    offset: base + *offset - request.offset,
-                });
-                streamed = true;
+            if size > 64 * 1024 {
+                continue;
             }
-            self.streamed_uses.push(*index);
-        }
-        if !streamed && !program.unaligned_uniforms {
-            self.uniform_updates = updates;
-            return Ok(GraphicsStreams {
-                dynamic_offsets: None,
-                record: None,
-            });
+            let request = buffer::BufferStreamRequest {
+                id,
+                offset,
+                size,
+                alignment: scope.buffer_alignment(&self.runtime.device.profile().limits),
+            };
+            self.runtime.buffer_bindings.channel.uniform_cache_shots[0] += 1;
+            if request.offset.is_multiple_of(request.alignment)
+                && request.size > self.runtime.buffer_bindings.channel.uniform_stream_limit
+            {
+                continue;
+            }
+            let Some(update) = self.stream_buffer(request)? else {
+                continue;
+            };
+            updates[slot] = Some(update);
+            self.runtime.streamed_uses.push(uniform.resource);
         }
         let uniform_alignment = self
+            .runtime
             .device
             .profile()
             .limits
             .min_uniform_buffer_offset_alignment;
-        if program.unaligned_uniforms {
+        if program.unaligned_uniforms != 0 {
             for (index, slot) in program.pipeline.layout.uniform_bindings.iter().enumerate() {
-                let DescriptorResource::Buffer { offset, range, .. } =
-                    &program.resources[slot.resource]
+                let HostBinding::Buffer {
+                    buffer: id,
+                    offset: source,
+                    size,
+                } = &program.bindings[slot.resource]
                 else {
                     continue;
                 };
                 let offset = updates[index]
                     .as_ref()
-                    .map_or(*offset, |update| update.offset);
-                if !offset.is_multiple_of(uniform_alignment)
-                    && let Binding::Buffer {
-                        buffer,
-                        offset: source,
-                        ..
-                    } = program.bindings[slot.resource]
-                {
-                    let (buffer, offset) = self.aligned_uniform_copy(buffer, source, *range)?;
-                    updates[index] = Some(UniformUpdate { buffer, offset });
+                    .map_or(*source, |update| update.offset);
+                if !offset.is_multiple_of(uniform_alignment) {
+                    updates[index] = Some(self.aligned_uniform_copy(id.id, *source, *size)?);
                 }
             }
         }
-        let mut dynamic_offsets = std::mem::take(&mut self.descriptor_offsets);
+        let mut dynamic_offsets = std::mem::take(&mut self.runtime.descriptor_offsets);
         dynamic_offsets.clear();
         dynamic_offsets.extend_from_slice(&program.dynamic_offsets);
-        let mut selected = program.record.lock().unwrap();
-        let mut resources = std::mem::take(&mut self.descriptor_resources);
+        let mut selected = program.record.borrow_mut();
+        let mut resources = std::mem::take(&mut self.runtime.descriptor_resources);
         resources.clear();
         if selected.current.is_none() {
-            program.canonical_resources(&mut resources);
+            self.canonical_resources(program, &mut resources)?;
         }
-        let limits = &self.device.profile().limits;
+        let limits = &self.runtime.device.profile().limits;
         // Uniform slots update offsets directly. Clone immutable images,
         // samplers and other buffers only when a native descriptor base changes.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
@@ -605,19 +462,23 @@ impl VulkanResidency {
             // Consume the selection now so no streamed buffer survives into a
             // later draw or a program with a different uniform layout.
             let update = updates[index].take();
-            let canonical = &program.resources[slot.resource];
+            let canonical = &program.bindings[slot.resource];
             let (buffer, mut offset, range) = match canonical {
-                DescriptorResource::Buffer {
-                    buffer,
+                HostBinding::Buffer {
+                    buffer: id,
                     offset,
-                    range,
+                    size,
                 } => {
-                    let (buffer, offset) = update
-                        .as_ref()
-                        .map_or((buffer, *offset), |update| (&update.buffer, update.offset));
-                    (Some(buffer), offset, *range)
+                    let native = &self.buffer_cache.get(id.id).native;
+                    let (buffer, offset) = update.as_ref().map_or((native, *offset), |update| {
+                        (
+                            self.runtime.device.submission.staging.buffer(update),
+                            update.offset,
+                        )
+                    });
+                    (Some(buffer), offset, *size)
                 }
-                DescriptorResource::NullBuffer => (None, 0, 0),
+                HostBinding::NullBuffer => (None, 0, 0),
                 _ => {
                     return Err(VulkanError::InvalidResource(
                         "uniform descriptor requires a buffer",
@@ -674,119 +535,138 @@ impl VulkanResidency {
         let result = if changed {
             self.native_descriptors(&program.pipeline.layout, &resources)
         } else {
-            self.device.submission.statistics.descriptor_payload_hits += 1;
+            self.runtime
+                .device
+                .submission
+                .statistics
+                .descriptor_payload_hits += 1;
             Ok(Arc::clone(selected.current.as_ref().unwrap()))
         };
         resources.clear();
         debug_assert!(updates.iter().all(Option::is_none));
-        self.descriptor_resources = resources;
-        self.uniform_updates = updates;
+        self.runtime.descriptor_resources = resources;
+        self.runtime.uniform_updates = updates;
         let record = result?;
         if changed {
             selected.current = Some(Arc::clone(&record));
         }
         selected.streamed = true;
-        Ok(GraphicsStreams {
+        Ok(DescriptorQueue {
             dynamic_offsets: Some(dynamic_offsets),
             record: Some(record),
+            update: None,
         })
     }
-    fn program_access_except(
-        &mut self,
-        program: &PreparedProgram,
-    ) -> Result<smallvec::SmallVec<[WriterId; 16]>, VulkanError> {
-        let mut writers = smallvec::SmallVec::new();
-        let mut prepared_image = None;
-        for (index, &resource) in program.uses.iter().enumerate() {
-            if self.streamed_uses.binary_search(&index).is_ok() {
+    fn host_program_access(&mut self, program: &HostProgram) -> Result<(), VulkanError> {
+        // Synchronize current cache selections before recording shader access.
+        // Overlapping bindings share the cache-owned modified ranges.
+        let mut images: smallvec::SmallVec<[ImageId; 16]> = smallvec::SmallVec::new();
+        for index in 0..program.bindings.len() {
+            if self.runtime.streamed_uses.binary_search(&index).is_ok() {
                 continue;
             }
+            let Some(resource) = self.host_binding_usage(program, index) else {
+                continue;
+            };
             match resource {
-                Use::Buffer {
+                HostBindingAccess::Buffer {
                     id,
                     offset,
                     size,
                     scope,
                 } => {
-                    let uploaded = self.statistics.cpu_uploaded_bytes;
+                    let uploaded = self.runtime.statistics.cpu_uploaded_bytes;
                     self.ensure_buffer_range(id, offset, size)?;
                     if scope.access == vk::AccessFlags2::UNIFORM_READ
                         && size <= 64 * 1024
-                        && self.statistics.cpu_uploaded_bytes == uploaded
+                        && self.runtime.statistics.cpu_uploaded_bytes == uploaded
                     {
-                        self.uniform_cache_hits[0] += 1;
+                        self.runtime.buffer_bindings.channel.uniform_cache_hits[0] += 1;
                     }
-                    // Preserve bytes not actually written by a conditional shader
-                    // store, even in a descriptor classified as write-only.
-                    if scope.writes() {
-                        writers.push(self.prepare_write(Resource::Buffer(id), offset, size)?);
-                    }
-                    self.buffer_access_range(id, offset, size, scope)?;
                 }
-                Use::Image { id, range, scope } => {
-                    // Image uses are grouped by ID in the prepared program.
-                    if prepared_image != Some(id) {
-                        self.ensure_image(id)?;
-                        prepared_image = Some(id);
+                HostBindingAccess::Image { id, .. } => {
+                    if !images.contains(&id) {
+                        self.prepare_image(id, false, false)?;
+                        images.push(id);
                     }
-                    if scope.writes() {
-                        let planes = self.image(id)?.planes.clone();
-                        for &plane in planes.iter().filter(|plane| plane_in_range(**plane, range)) {
-                            self.require_image_initialized(id, plane, transfers::full_rect(plane))?;
-                            writers.push(self.prepare_image_rect(
-                                id,
-                                plane,
-                                transfers::full_rect(plane),
-                            )?);
-                        }
-                    }
-                    self.image_access_subresources(
-                        id,
-                        range,
-                        scope,
-                        shader_attachment_layout(
-                            self.image(id)?.description.usage,
-                            self.unified_layouts,
-                        ),
-                    )?;
                 }
             }
         }
-        Ok(writers)
-    }
-    pub(super) fn program_written(&mut self, program: &PreparedProgram) -> Result<(), VulkanError> {
-        for &resource in &program.uses {
+        for index in 0..program.bindings.len() {
+            if self.runtime.streamed_uses.binary_search(&index).is_ok() {
+                continue;
+            }
+            let Some(resource) = self.host_binding_usage(program, index) else {
+                continue;
+            };
             match resource {
-                Use::Buffer {
+                HostBindingAccess::Buffer {
                     id,
                     offset,
                     size,
                     scope,
-                } if scope.writes() => self.finish_buffer_write(id, offset, size)?,
-                Use::Image { id, range, scope } if scope.writes() => {
-                    let planes = self.image(id)?.planes.clone();
-                    for &plane in planes.iter().filter(|plane| plane_in_range(**plane, range)) {
-                        self.finish_image_rect(id, plane, transfers::full_rect(plane))?;
+                } => {
+                    if scope.writes() {
+                        self.prepare_write(Resource::Buffer(id), offset, size)?;
                     }
+                    self.use_buffer(id, offset, size)?;
                 }
+                HostBindingAccess::Image { id, scope, .. } => {
+                    if scope.writes() {
+                        self.mark_image_modified(id)?;
+                    }
+                    self.shader_image(id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn host_program_written(
+        &mut self,
+        program: &HostProgram,
+    ) -> Result<(), VulkanError> {
+        if program.bindings.is_empty() {
+            return Ok(());
+        }
+        if !program.pipeline.shader_writes {
+            return Ok(());
+        }
+        for index in 0..program.bindings.len() {
+            if self.runtime.streamed_uses.binary_search(&index).is_ok() {
+                continue;
+            }
+            match self.host_binding_usage(program, index) {
+                Some(HostBindingAccess::Buffer {
+                    id,
+                    offset,
+                    size,
+                    scope,
+                }) if scope.writes() => self.finish_buffer_write(id, offset, size)?,
                 _ => {}
             }
         }
         Ok(())
     }
-    pub(super) fn program_bind(
+
+    pub(super) fn bind_host_program(
         &mut self,
-        program: &PreparedProgram,
+        program: &HostProgram,
         push: &[u8],
     ) -> Result<(), VulkanError> {
-        let record = self.program_record(program)?;
-        self.program_bind_record(program, push, record.as_ref(), &program.dynamic_offsets)
+        let record = self.host_descriptor_record(program)?;
+        self.bind_pipeline_descriptors(
+            &program.pipeline,
+            push,
+            record.as_ref(),
+            &program.dynamic_offsets,
+            None,
+        )
     }
-    fn program_record(
+    fn host_descriptor_record(
         &mut self,
-        program: &PreparedProgram,
+        program: &HostProgram,
     ) -> Result<Option<Arc<BindingRecord>>, VulkanError> {
-        let mut selected = program.record.lock().unwrap();
+        let mut selected = program.record.borrow_mut();
         if !selected.streamed
             && let Some(record) = &selected.current
         {
@@ -795,81 +675,123 @@ impl VulkanResidency {
         if program.bindings.is_empty() {
             return Ok(None);
         }
-        let mut resources = std::mem::take(&mut self.descriptor_resources);
+        let mut resources = std::mem::take(&mut self.runtime.descriptor_resources);
         resources.clear();
-        program.canonical_resources(&mut resources);
+        self.canonical_resources(program, &mut resources)?;
         let result = self.native_descriptors(&program.pipeline.layout, &resources);
         resources.clear();
-        self.descriptor_resources = resources;
+        self.runtime.descriptor_resources = resources;
         let record = result?;
         selected.current = Some(Arc::clone(&record));
         selected.streamed = false;
         Ok(Some(record))
     }
-    pub(crate) fn retain_program_effect(&mut self, program: &PreparedProgram) {
-        self.constructing
-            .extend(program.bindings.iter().filter_map(|binding| match binding {
-                Binding::Buffer { buffer, .. } | Binding::TexelBuffer { buffer, .. } => {
-                    Some(Resource::Buffer(*buffer))
+    pub(crate) fn retain_host_program(&mut self, program: &HostProgram) {
+        for binding in &program.bindings {
+            match binding {
+                HostBinding::Buffer { buffer: id, .. }
+                | HostBinding::TexelBuffer { buffer: id, .. } => {
+                    self.runtime.constructing.push(Resource::Buffer(id.id))
                 }
-                Binding::Image(view) | Binding::CombinedImageSampler { image: view, .. } => {
-                    Some(Resource::Image(view.image))
+                HostBinding::Image(id) | HostBinding::CombinedImageSampler { image: id, .. } => {
+                    self.runtime.constructing.push(Resource::Image(id.image))
                 }
-                _ => None,
-            }));
+                _ => {}
+            }
+        }
     }
     fn native_descriptors(
         &mut self,
         layout: &Arc<crate::cache::PipelineLayout>,
         resources: &[DescriptorResource],
     ) -> Result<Arc<BindingRecord>, VulkanError> {
-        self.device.begin_recording()?;
-        let descriptors = &mut self.descriptors;
+        let descriptors = &mut self.runtime.descriptors;
         let before = descriptors.hits();
         let result = descriptors.get(layout, resources);
         let hits = descriptors.hits() - before;
-        self.device.submission.statistics.descriptor_payload_hits += hits;
-        self.device
+        self.runtime
+            .device
+            .submission
+            .statistics
+            .descriptor_payload_hits += hits;
+        self.runtime
+            .device
             .submission
             .statistics
             .descriptor_payload_captures += u64::from(result.is_ok() && hits == 0);
         result
     }
-    fn program_bind_record(
+    pub(super) fn bind_pipeline_descriptors(
         &mut self,
-        program: &PreparedProgram,
+        pipeline: &Arc<NativePipeline>,
         push: &[u8],
         record: Option<&Arc<BindingRecord>>,
         dynamic_offsets: &[u32],
+        entries: Option<crate::cache::DescriptorUpdate>,
     ) -> Result<(), VulkanError> {
-        if push.len() < program.pipeline.layout.key.push_bytes as usize
+        // Empty layouts have no update template or descriptor set to bind.
+        let entries = entries.filter(|entries| !entries.is_empty());
+        if push.len() < pipeline.layout.key.push_bytes as usize
             || !push.len().is_multiple_of(4)
-            || push.len() > self.device.profile().limits.max_push_constants_size as usize
+            || push.len() > self.runtime.device.profile().limits.max_push_constants_size as usize
         {
             return Err(VulkanError::InvalidResource(
                 "push constants must cover the compiled ABI within host size/alignment limits",
             ));
         }
-        self.device.bind_native_pipeline(&program.pipeline)?;
-        if let Some(record) = record {
-            self.device
-                .bind_native_descriptors(&program.pipeline, record, dynamic_offsets)?;
+        self.runtime.device.bind_native_pipeline(pipeline)?;
+        if let Some(entries) = entries {
+            unsafe {
+                if pipeline.layout.push_descriptor {
+                    self.runtime
+                        .device
+                        .dispatch
+                        .push_descriptor_queue(&pipeline.layout, entries);
+                } else {
+                    self.runtime.device.dispatch.bind_descriptor_queue(
+                        pipeline.bind_point,
+                        Arc::clone(&pipeline.layout),
+                        entries,
+                        dynamic_offsets,
+                    );
+                }
+            }
+            self.runtime.device.submission.statistics.descriptor_binds += 1;
+            self.runtime
+                .device
+                .submission
+                .statistics
+                .descriptor_payload_captures += 1;
+        } else if let Some(record) = record {
+            self.runtime
+                .device
+                .bind_native_descriptors(pipeline, record, dynamic_offsets)?;
         }
-        let index = self.device.begin_recording()?;
+        let index = self.runtime.device.recording_slot()?;
 
-        let slot = &mut self.device.submission.slots[index];
-        let layout = program.pipeline.layout.handle;
-        let stages = program.pipeline.layout.key.push_stages;
-        let push = &push[..program.pipeline.layout.key.push_bytes as usize];
+        let slot = &mut self.runtime.device.submission.slots[index];
+        if entries.is_some() {
+            // Pushing an incompatible layout disturbs a previously bound set.
+            // Its cached identity must not suppress the next set bind.
+            if pipeline.bind_point == vk::PipelineBindPoint::COMPUTE {
+                slot.bound_compute_binding = 0;
+            } else {
+                slot.bound_graphics_binding = 0;
+            }
+        }
+        let layout = pipeline.layout.handle;
+        let stages = pipeline.layout.key.push_stages;
+        let push = &push[..pipeline.layout.key.push_bytes as usize];
         if !push.is_empty()
             && (slot.push_layout != layout || slot.push_stages != stages || slot.push_bytes != push)
         {
             unsafe {
-                self.device
+                self.runtime
+                    .device
                     .dispatch
                     .cmd_push_constants(layout, stages, 0, push);
             }
-            self.device.submission.statistics.push_updates += 1;
+            self.runtime.device.submission.statistics.push_updates += 1;
             slot.push_layout = layout;
             slot.push_stages = stages;
             slot.push_bytes.clear();
@@ -879,23 +801,22 @@ impl VulkanResidency {
     }
     pub fn dispatch(
         &mut self,
-        program: &PreparedProgram,
+        program: &HostProgram,
         dispatch: Dispatch,
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
-        let retained = self.constructing.len();
-        self.retain_program_effect(program);
+        let retained = self.runtime.constructing.len();
+        self.retain_host_program(program);
         if let Dispatch::Indirect { buffer, .. } = dispatch {
-            self.constructing.push(Resource::Buffer(buffer));
+            self.runtime.constructing.push(Resource::Buffer(buffer));
         }
         let result = self.dispatch_inner(program, dispatch, push);
-        self.device.submission.release_stream_uploads();
-        self.constructing.truncate(retained);
+        self.runtime.constructing.truncate(retained);
         result
     }
     fn dispatch_inner(
         &mut self,
-        program: &PreparedProgram,
+        program: &HostProgram,
         dispatch: Dispatch,
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
@@ -907,7 +828,13 @@ impl VulkanResidency {
         if let Dispatch::Direct(groups) = dispatch {
             if groups
                 .iter()
-                .zip(self.device.profile().limits.max_compute_work_group_count)
+                .zip(
+                    self.runtime
+                        .device
+                        .profile()
+                        .limits
+                        .max_compute_work_group_count,
+                )
                 .any(|(&n, max)| n > max)
             {
                 return Err(VulkanError::InvalidResource(
@@ -915,44 +842,48 @@ impl VulkanResidency {
                 ));
             }
             if groups.contains(&0) {
-                return self.device.work_ticket();
+                return Ok(self.runtime.device.current_work());
             }
         }
         let streams = self.stream_graphics(program)?;
-        let writers = self.program_access_except(program)?;
+        self.host_program_access(program)?;
         let indirect = match dispatch {
             Dispatch::Indirect { buffer, offset } => {
                 Some(self.indirect_buffer(buffer, offset, 12)?)
             }
             _ => None,
         };
-        self.barriers.emit(&mut self.device);
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
         let record = match streams.record {
             Some(record) => Some(record),
-            None => self.program_record(program)?,
+            None => self.host_descriptor_record(program)?,
         };
-        self.program_bind_record(
-            program,
+        self.bind_pipeline_descriptors(
+            &program.pipeline,
             push,
             record.as_ref(),
             streams
                 .dynamic_offsets
                 .as_deref()
                 .unwrap_or(&program.dynamic_offsets),
+            streams.update,
         )?;
         if let Some(offsets) = streams.dynamic_offsets {
-            self.descriptor_offsets = offsets;
+            self.runtime.descriptor_offsets = offsets;
         }
-        self.publish_effect(&writers, |device| unsafe {
-            match dispatch {
-                Dispatch::Direct([x, y, z]) => device.dispatch.cmd_dispatch(x, y, z),
-                Dispatch::Indirect { offset, .. } => device
-                    .dispatch
-                    .cmd_dispatch_indirect(indirect.unwrap(), offset),
+        {
+            let device = &mut self.runtime.device;
+            unsafe {
+                match dispatch {
+                    Dispatch::Direct([x, y, z]) => device.dispatch.cmd_dispatch(x, y, z),
+                    Dispatch::Indirect { offset, .. } => device
+                        .dispatch
+                        .cmd_dispatch_indirect(indirect.unwrap(), offset),
+                }
             }
-        })?;
-        self.program_written(program)?;
-        self.device.work_ticket()
+        };
+        self.host_program_written(program)?;
+        Ok(self.runtime.device.current_work())
     }
     pub(super) fn indirect_buffer(
         &mut self,
@@ -962,7 +893,8 @@ impl VulkanResidency {
     ) -> Result<vk::Buffer, VulkanError> {
         if !offset.is_multiple_of(4)
             || !self
-                .buffer(buffer)?
+                .buffer_cache
+                .get(buffer)
                 .usage
                 .contains(vk::BufferUsageFlags::INDIRECT_BUFFER)
         {
@@ -971,277 +903,8 @@ impl VulkanResidency {
             ));
         }
         self.ensure_buffer_range(buffer, offset, size)?;
-        self.buffer_access_range(
-            buffer,
-            offset,
-            size,
-            AccessScope::new(
-                vk::PipelineStageFlags2::DRAW_INDIRECT,
-                vk::AccessFlags2::INDIRECT_COMMAND_READ,
-            ),
-        )
+        self.use_buffer(buffer, offset, size)
     }
 }
 #[cfg(test)]
 pub(crate) mod tests;
-
-fn plane_in_range(plane: ImagePlane, range: vk::ImageSubresourceRange) -> bool {
-    range.aspect_mask.intersects(plane.aspect)
-        && (range.base_mip_level..range.base_mip_level + range.level_count)
-            .contains(&plane.mip_level)
-        && (range.base_array_layer..range.base_array_layer + range.layer_count)
-            .contains(&plane.array_layer)
-}
-
-// Only descriptor boundaries partition simultaneous image accesses. Texture
-// dimensions and layer counts do not determine the size of this preparation.
-fn merge_program_uses(mut uses: Vec<Use>) -> Vec<Use> {
-    uses.sort_unstable_by_key(|usage| match *usage {
-        Use::Buffer { id, offset, .. } => [0, id.slot as u64, u64::from(id.generation), 0, offset],
-        Use::Image { id, range, .. } => [
-            1,
-            id.slot as u64,
-            u64::from(id.generation),
-            u64::from(range.aspect_mask.as_raw()),
-            0,
-        ],
-    });
-    let mut merged = Vec::with_capacity(uses.len());
-    let mut group = None;
-    let mut group_start = 0;
-    for usage in uses {
-        match usage {
-            Use::Buffer {
-                id,
-                offset,
-                size,
-                scope,
-            } => {
-                if let Some(Use::Buffer {
-                    id: previous,
-                    offset: start,
-                    size: length,
-                    scope: access,
-                }) = merged.last_mut()
-                    && *previous == id
-                    && offset <= *start + *length
-                {
-                    *length = (*start + *length).max(offset + size) - *start;
-                    access.stages |= scope.stages;
-                    access.access |= scope.access;
-                } else {
-                    merged.push(usage);
-                }
-            }
-            Use::Image { id, range, scope } => {
-                let key = (id, range.aspect_mask);
-                if group != Some(key) {
-                    group = Some(key);
-                    group_start = merged.len();
-                }
-                let mut pending: smallvec::SmallVec<[vk::ImageSubresourceRange; 4]> =
-                    smallvec::smallvec![range];
-                let mut pieces: smallvec::SmallVec<[Use; 4]> = smallvec::SmallVec::new();
-                for old in &mut merged[group_start..] {
-                    let Use::Image {
-                        range: previous,
-                        scope: access,
-                        ..
-                    } = *old
-                    else {
-                        unreachable!()
-                    };
-                    let Some(overlap) = image_range_overlap(previous, range) else {
-                        continue;
-                    };
-                    let combined = AccessScope::new(
-                        access.stages | scope.stages,
-                        access.access | scope.access,
-                    );
-                    if combined != access {
-                        subtract_image_range(previous, overlap, |range| {
-                            pieces.push(Use::Image {
-                                id,
-                                range,
-                                scope: access,
-                            });
-                        });
-                        *old = Use::Image {
-                            id,
-                            range: overlap,
-                            scope: combined,
-                        };
-                    }
-                    let mut index = 0;
-                    while index < pending.len() {
-                        let piece = pending[index];
-                        if let Some(overlap) = image_range_overlap(piece, previous) {
-                            let _ = pending.swap_remove(index);
-                            subtract_image_range(piece, overlap, |range| pending.push(range));
-                        } else {
-                            index += 1;
-                        }
-                    }
-                    if pending.is_empty() {
-                        break;
-                    }
-                }
-                merged.extend(pieces);
-                merged.extend(
-                    pending
-                        .into_iter()
-                        .map(|range| Use::Image { id, range, scope }),
-                );
-            }
-        }
-    }
-    coalesce_image_uses(&mut merged);
-    merged
-}
-
-fn image_range_overlap(
-    a: vk::ImageSubresourceRange,
-    b: vk::ImageSubresourceRange,
-) -> Option<vk::ImageSubresourceRange> {
-    let mip = a.base_mip_level.max(b.base_mip_level);
-    let mip_end = (a.base_mip_level + a.level_count).min(b.base_mip_level + b.level_count);
-    let layer = a.base_array_layer.max(b.base_array_layer);
-    let layer_end = (a.base_array_layer + a.layer_count).min(b.base_array_layer + b.layer_count);
-    (mip < mip_end && layer < layer_end).then(|| vk::ImageSubresourceRange {
-        aspect_mask: a.aspect_mask,
-        base_mip_level: mip,
-        level_count: mip_end - mip,
-        base_array_layer: layer,
-        layer_count: layer_end - layer,
-    })
-}
-
-fn subtract_image_range(
-    range: vk::ImageSubresourceRange,
-    cut: vk::ImageSubresourceRange,
-    mut emit: impl FnMut(vk::ImageSubresourceRange),
-) {
-    for (mip, mip_end, layer, layer_end) in [
-        (
-            range.base_mip_level,
-            cut.base_mip_level,
-            range.base_array_layer,
-            range.base_array_layer + range.layer_count,
-        ),
-        (
-            cut.base_mip_level + cut.level_count,
-            range.base_mip_level + range.level_count,
-            range.base_array_layer,
-            range.base_array_layer + range.layer_count,
-        ),
-        (
-            cut.base_mip_level,
-            cut.base_mip_level + cut.level_count,
-            range.base_array_layer,
-            cut.base_array_layer,
-        ),
-        (
-            cut.base_mip_level,
-            cut.base_mip_level + cut.level_count,
-            cut.base_array_layer + cut.layer_count,
-            range.base_array_layer + range.layer_count,
-        ),
-    ] {
-        if mip < mip_end && layer < layer_end {
-            emit(vk::ImageSubresourceRange {
-                base_mip_level: mip,
-                level_count: mip_end - mip,
-                base_array_layer: layer,
-                layer_count: layer_end - layer,
-                ..range
-            });
-        }
-    }
-}
-
-fn coalesce_image_uses(uses: &mut Vec<Use>) {
-    for layers in [true, false] {
-        uses.sort_unstable_by_key(|usage| match *usage {
-            Use::Buffer {
-                id, offset, size, ..
-            } => [
-                0,
-                id.slot as u64,
-                u64::from(id.generation),
-                0,
-                0,
-                0,
-                0,
-                0,
-                offset,
-                size,
-            ],
-            Use::Image { id, range, scope } => {
-                let (base, count, next, length) = if layers {
-                    (
-                        range.base_mip_level,
-                        range.level_count,
-                        range.base_array_layer,
-                        range.layer_count,
-                    )
-                } else {
-                    (
-                        range.base_array_layer,
-                        range.layer_count,
-                        range.base_mip_level,
-                        range.level_count,
-                    )
-                };
-                [
-                    1,
-                    id.slot as u64,
-                    u64::from(id.generation),
-                    scope.stages.as_raw(),
-                    scope.access.as_raw(),
-                    u64::from(range.aspect_mask.as_raw()),
-                    u64::from(base),
-                    u64::from(count),
-                    u64::from(next),
-                    u64::from(length),
-                ]
-            }
-        });
-        let mut count = 0;
-        for index in 0..uses.len() {
-            let next = uses[index];
-            if count != 0
-                && let (
-                    Use::Image { id, range, scope },
-                    Use::Image {
-                        id: other,
-                        range: b,
-                        scope: previous,
-                    },
-                ) = (&mut uses[count - 1], next)
-                && *id == other
-                && *scope == previous
-                && range.aspect_mask == b.aspect_mask
-            {
-                if layers
-                    && range.base_mip_level == b.base_mip_level
-                    && range.level_count == b.level_count
-                    && range.base_array_layer + range.layer_count == b.base_array_layer
-                {
-                    range.layer_count += b.layer_count;
-                    continue;
-                }
-                if !layers
-                    && range.base_array_layer == b.base_array_layer
-                    && range.layer_count == b.layer_count
-                    && range.base_mip_level + range.level_count == b.base_mip_level
-                {
-                    range.level_count += b.level_count;
-                    continue;
-                }
-            }
-            uses[count] = next;
-            count += 1;
-        }
-        uses.truncate(count);
-    }
-}

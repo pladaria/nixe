@@ -25,7 +25,7 @@ Linked executable pipelines also retain their library components, independently
 of compiler/cache lifetime. Vertex/index and attachment preparation pins resident
 objects; eviction cannot invalidate a live prepared reference.
 
-Read-only draws with compatible LOAD/STORE targets retain a dynamic-rendering
+Read-only draws with compatible LOAD/STORE targets retain a native render-pass
 instance across frontend deliveries, including changed pipeline parameters,
 descriptors and physical vertex bindings. Vertex/index/shader reads cannot alias
 attachment writes. Small CPU-authored shader/vertex inputs can consume immutable
@@ -155,7 +155,7 @@ Native views implement component swizzles. Immutable sampler keys include custom
 border components/format and reduction mode, with enabled feature checks. No WGSL
 border-color patch or arbitrary unkeyed sampler `pNext` state enters the recorder.
 
-Clear rectangles use dynamic rendering and `vkCmdClearAttachments`. Aligned buffer
+Clear rectangles use native render passes and `vkCmdClearAttachments`. Aligned buffer
 fills use `vkCmdFillBuffer`; arbitrary boundaries need at most six upload bytes.
 Native blits perform supported format conversion/scaling, and copies snapshot an
 overlapping source on GPU. Unsupported filter/format/depth combinations fail.

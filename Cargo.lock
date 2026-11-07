@@ -882,8 +882,6 @@ dependencies = [
 [[package]]
 name = "gpu-allocator"
 version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51255ea7cfaadb6c5f1528d43e92a82acb2b96c43365989a28b2d44ee38f8795"
 dependencies = [
  "ash",
  "log",
@@ -1402,6 +1400,7 @@ dependencies = [
  "libc",
  "log",
  "nixe-gpu",
+ "nixe-gpu-maxwell",
  "nixe-memory",
  "nixe-shader-recompiler",
  "nixe-video",
@@ -1462,6 +1461,7 @@ name = "nixe-loader-content"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "flate2",
  "log",
  "nixe-loader-storage",
  "sha2",
@@ -1500,6 +1500,7 @@ name = "nixe-memory"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustc-hash",
  "smallvec",
 ]
 

@@ -1,22 +1,29 @@
 //! Clears and conversions use native raster/transfer operations and the same
 //! resource scopes as shaders. No hidden encoder switch or broad global fence.
 use super::*;
-impl VulkanResidency {
-    pub fn clear_image_rect(
+impl Residency<'_> {
+    pub fn clear_view_rect(
         &mut self,
-        id: ImageId,
+        view: ImageViewId,
         plane: usize,
         rect: vk::Rect2D,
         value: vk::ClearValue,
     ) -> Result<WorkTicket, VulkanError> {
-        if let Some(work) = self.clear_attachment(id, plane, rect, value)? {
-            return Ok(work);
-        }
+        let id = self.texture_cache.views[view].image;
+        let selected = self.image_view_description(view)?;
         let p = self.checked_image_rect(id, plane, rect)?;
-        if rect == transfers::full_rect(p)
-            && !(self.image(id)?.description.image_type == vk::ImageType::TYPE_3D
-                && self.image(id)?.description.extent.depth > 1)
-        {
+        let description = self.texture_cache.get(id).description;
+        let usage = if p.aspect == vk::ImageAspectFlags::COLOR {
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+        } else {
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+        };
+        if !description.usage.contains(usage) {
+            if selected.format != description.format || rect != transfers::full_rect(p) {
+                return Err(VulkanError::InvalidResource(
+                    "partial image clear requires native attachment usage",
+                ));
+            }
             return if p.aspect == vk::ImageAspectFlags::COLOR {
                 self.clear_color_image(id, plane, unsafe { value.color })
             } else {
@@ -24,107 +31,15 @@ impl VulkanResidency {
                 self.clear_depth_stencil(id, plane, value.depth, value.stencil)
             };
         }
-        self.invalidate_cpu_resources(&[])?;
-        let description = self.image(id)?.description;
-        let usage = if p.aspect == vk::ImageAspectFlags::COLOR {
-            vk::ImageUsageFlags::COLOR_ATTACHMENT
-        } else {
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-        };
-        if !description.usage.contains(usage) {
-            return Err(VulkanError::InvalidResource(
-                "partial image clear requires native attachment usage",
-            ));
-        }
-        if p.aspect == vk::ImageAspectFlags::DEPTH {
-            let depth = unsafe { value.depth_stencil.depth };
-            if !depth.is_finite() || !(0. ..=1.).contains(&depth) {
-                return Err(VulkanError::InvalidResource(
-                    "depth clear requires a finite normalized value",
-                ));
-            }
-        }
-        let writer = self.prepare_image_rect(id, p, rect)?;
-        let depth = p.aspect != vk::ImageAspectFlags::COLOR;
-        let mut aspects = p.aspect;
-        if depth
-            && format::copy_block(description.format, vk::ImageAspectFlags::DEPTH).is_some()
-            && format::copy_block(description.format, vk::ImageAspectFlags::STENCIL).is_some()
-        {
-            aspects = vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL;
-        }
-        let view = self.image_view(
-            id,
-            ImageViewDescription {
-                format: description.format,
-                view_type: vk::ImageViewType::TYPE_2D,
-                aspects,
-                base_mip: p.mip_level,
-                mip_count: 1,
-                base_layer: p.array_layer + p.depth_slice,
-                layer_count: 1,
-                swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
-            },
-        )?;
-        let leased = self.image_view_lease(view)?;
-        let scope = if depth {
-            AccessScope::new(
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            )
-        } else {
-            AccessScope::new(
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            )
-        };
-        let (_, layout) = self.image_access_subresources(
-            id,
-            commands::plane_range(p),
-            scope,
-            vk::ImageLayout::GENERAL,
-        )?;
-        self.barriers.emit(&mut self.device);
-        let slot = self.device.begin_recording()?;
-
-        let attachment = vk::RenderingAttachmentInfo::default()
-            .image_view(leased.handle)
-            .image_layout(layout)
-            .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(vk::AttachmentStoreOp::STORE);
-        let colors = [attachment];
-        let mut info = vk::RenderingInfo::default()
-            .render_area(rect)
-            .layer_count(1);
-        if !depth {
-            info = info.color_attachments(&colors);
-        } else if p.aspect == vk::ImageAspectFlags::DEPTH {
-            info = info.depth_attachment(&attachment);
-        } else {
-            info = info.stencil_attachment(&attachment);
-        }
-        let clear = vk::ClearAttachment::default()
-            .aspect_mask(p.aspect)
-            .color_attachment(0)
-            .clear_value(value);
-        self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.begin_rendering(&info, Default::default());
-            device.dispatch.cmd_clear_attachments(
-                &[clear],
-                &[vk::ClearRect::default()
-                    .rect(rect)
-                    .base_array_layer(0)
-                    .layer_count(1)],
-            );
-            device.dispatch.end_rendering();
-        })?;
-        self.device.submission.slots[slot]
-            .retained_views
-            .push(leased);
-        self.finish_image_rect(id, p, rect)?;
-        self.device.work_ticket()
+        let targets = self.framebuffer_for_view(view)?;
+        self.clear_framebuffer(
+            &targets,
+            rect,
+            &[vk::ClearAttachment::default()
+                .aspect_mask(p.aspect)
+                .color_attachment(0)
+                .clear_value(value)],
+        )
     }
     #[allow(clippy::too_many_arguments)]
     pub fn blit_image(
@@ -137,8 +52,8 @@ impl VulkanResidency {
         filter: vk::Filter,
     ) -> Result<WorkTicket, VulkanError> {
         let descriptions = [
-            self.image(source)?.description,
-            self.image(destination)?.description,
+            self.texture_cache.get(source).description,
+            self.texture_cache.get(destination).description,
         ];
         // Preserve encoded bits for equal-format, unscaled nearest transfers.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
@@ -203,7 +118,7 @@ impl VulkanResidency {
             }
         }
         for (index, description) in descriptions.into_iter().enumerate() {
-            let properties = self.device.format_properties(description.format);
+            let properties = self.runtime.device.format_properties(description.format);
             let needed = if index == 0 {
                 vk::FormatFeatureFlags::BLIT_SRC
                     | if filter == vk::Filter::LINEAR {
@@ -220,31 +135,12 @@ impl VulkanResidency {
                 ));
             }
         }
-        for &(src, _) in &selected {
-            self.ensure_image_initialized(source, src, source_rect)?;
-        }
-        let mut writers = smallvec::SmallVec::<[WriterId; 2]>::new();
-        for &(_, dst) in &selected {
-            writers.push(self.prepare_image_rect(destination, dst, destination_rect)?);
-        }
-        let (source_handle, src_layout) = self.image_planes_access(
-            source,
-            selected.iter().map(|(src, _)| *src),
-            AccessScope::new(
-                vk::PipelineStageFlags2::BLIT,
-                vk::AccessFlags2::TRANSFER_READ,
-            ),
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        )?;
-        let (target, dst_layout) = self.image_planes_access(
-            destination,
-            selected.iter().map(|(_, dst)| *dst),
-            AccessScope::new(
-                vk::PipelineStageFlags2::BLIT,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        )?;
+        self.prepare_image(source, false, false)?;
+        self.prepare_image(destination, true, false)?;
+        let (source_handle, src_layout) =
+            self.image_planes_transfer(source, selected.iter().map(|(src, _)| *src))?;
+        let (target, dst_layout) =
+            self.image_planes_transfer(destination, selected.iter().map(|(_, dst)| *dst))?;
         let corners = |r: vk::Rect2D, z: u32| {
             [
                 vk::Offset3D {
@@ -291,20 +187,20 @@ impl VulkanResidency {
                 regions.push(next);
             }
         }
-        self.barriers.emit(&mut self.device);
-        self.publish_effect(&writers, |device| unsafe {
-            device.dispatch.cmd_blit_image(
-                source_handle,
-                src_layout,
-                target,
-                dst_layout,
-                &regions,
-                filter,
-            );
-        })?;
-        for &(_, dst) in &selected {
-            self.finish_image_rect(destination, dst, destination_rect)?;
-        }
-        self.device.work_ticket()
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        {
+            let device = &mut self.runtime.device;
+            unsafe {
+                device.dispatch.blit_image(
+                    source_handle,
+                    src_layout,
+                    target,
+                    dst_layout,
+                    &regions,
+                    filter,
+                );
+            }
+        };
+        Ok(self.runtime.device.current_work())
     }
 }

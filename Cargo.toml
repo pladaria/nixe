@@ -97,4 +97,5 @@ inherits = "release"
 debug = 1
 
 [patch.crates-io]
+gpu-allocator = { path = "vendor/gpu-allocator" }
 zstd-sys = { path = "crates/vendor/zstd-sys-zbic" }

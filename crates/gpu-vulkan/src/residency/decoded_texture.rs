@@ -71,7 +71,7 @@ fn decoded_format(format: ImageFormat) -> (vk::Format, u32) {
         _ => (vk::Format::R8G8B8A8_UNORM, 4),
     }
 }
-impl VulkanResidency {
+impl Residency<'_> {
     /// Native BC handles non-block-aligned dimensions directly. Decode only when
     /// the host really lacks a format, rather than inheriting WebGPU size rules.
     pub fn sampled_image_for(
@@ -79,14 +79,16 @@ impl VulkanResidency {
         geometry: Vec<Arc<Footprint>>,
         description: NativeImageDescription,
         planes: Vec<ImagePlane>,
+        guest_source: Option<texture_cache::ImageRegistration>,
     ) -> Result<ImageId, VulkanError> {
         let support = unsafe {
-            self.device
+            self.runtime
+                .device
                 .owner
                 .instance
                 .instance
                 .get_physical_device_image_format_properties(
-                    self.device.owner.physical,
+                    self.runtime.device.owner.physical,
                     description.format,
                     description.image_type,
                     vk::ImageTiling::OPTIMAL,
@@ -95,14 +97,19 @@ impl VulkanResidency {
                 )
         };
         let enabled = if codec(description.format).is_some_and(|f| f.astc_profile().is_some()) {
-            self.device.profile().core.texture_compression_astc_ldr != 0
+            self.runtime
+                .device
+                .profile()
+                .core
+                .texture_compression_astc_ldr
+                != 0
         } else if matches!(description.format.as_raw(), 131..=146) {
-            self.device.profile().core.texture_compression_bc != 0
+            self.runtime.device.profile().core.texture_compression_bc != 0
         } else {
             true
         };
         match support {
-            Ok(_) if enabled => return self.image_for(geometry, description, planes),
+            Ok(_) if enabled => return self.image_for(geometry, description, planes, guest_source),
             Err(e) if e != vk::Result::ERROR_FORMAT_NOT_SUPPORTED => {
                 return Err(VulkanError::vk("sampled image format query", e));
             }
@@ -143,17 +150,17 @@ impl VulkanResidency {
             geometry,
             target,
             native_planes,
-            true,
             Some(DecodedImage {
                 format: description.format,
                 planes,
             }),
             [1, 1],
+            guest_source,
         )?;
         Ok(id)
     }
     pub(super) fn refresh_decoded_image(&mut self, id: ImageId) -> Result<(), VulkanError> {
-        let image = self.image(id)?;
+        let image = self.texture_cache.get(id);
         let geometry = image.contents.geometry.clone();
         let encoded = image.decoded.as_ref().unwrap().clone();
         let native = image.planes.clone();
@@ -163,73 +170,19 @@ impl VulkanResidency {
             .map(|p| p.end().expect("encoded plane"))
             .max()
             .expect("encoded planes");
-        let cpu_only = geometry
-            .iter()
-            .all(|footprint| !self.authority.has_writers(footprint));
-        let mut parts = Vec::new();
-        if !cpu_only {
-            for footprint in &geometry {
-                parts.extend(self.authority.resolve_footprint(footprint)?);
-            }
+        let mut inputs = Vec::new();
+        for footprint in &geometry {
+            footprint.observed_pages(footprint.mapping(), &mut inputs)?;
         }
-        let device = vec![
-            self.authority
-                .observe_native_resource(Resource::Image(id))?,
-        ];
-        let captured = if parts.iter().all(|p| p.producer.is_none()) {
-            let mut inputs = Vec::new();
+        let inputs = nixe_gpu::physical::pin_selected_pages(inputs)?;
+        let mut captured = vec![0; bytes as usize];
+        self.runtime.memory.read_resources(&inputs, |reader| {
             for footprint in &geometry {
-                footprint.mapping().observed_pages(footprint, &mut inputs)?;
+                footprint.capture_resource(reader, 0, &mut captured)?;
             }
-            let inputs = nixe_gpu::physical::pin_selected_pages(inputs)?;
-            let mut bytes = vec![0; bytes as usize];
-            self.memory.capture_resource(&inputs, |reader| {
-                for footprint in &geometry {
-                    footprint.capture_resource(reader, 0, &mut bytes)?;
-                }
-                Ok(())
-            })?;
-            bytes
-        } else {
-            // Software decoding is an actual CPU consumer of the encoded bytes.
-            // Materialize only those inputs through the versioned readback path;
-            // it does not create a cached linear image representation.
-            self.track_image_cpu(id)?;
-            let mut inputs = Vec::new();
-            for part in &parts {
-                let mut input = None;
-                for footprint in &geometry {
-                    if let Some(range) =
-                        footprint
-                            .mapping()
-                            .pin_physical(part.allocation, part.start, part.bytes)?
-                    {
-                        input = Some(range);
-                        break;
-                    }
-                }
-                inputs.push(
-                    input.ok_or(VulkanError::InvalidResource("encoded image input retired"))?,
-                );
-            }
-            let nixe_memory::AccessResult::Read(data) =
-                self.access_memory(inputs, nixe_memory::AccessOperation::Read(Vec::new()))?
-            else {
-                return Err(VulkanError::InvalidResource(
-                    "encoded image read returned no bytes",
-                ));
-            };
-            let mut captured = vec![0; bytes as usize];
-            let mut offset = 0;
-            for part in &parts {
-                let length = part.bytes as usize;
-                captured[part.logical as usize..part.logical as usize + length]
-                    .copy_from_slice(&data[offset..offset + length]);
-                offset += length;
-            }
-            captured
-        };
-        let mut decoder = std::mem::take(&mut self.decoder);
+            Ok(())
+        })?;
+        let mut decoder = std::mem::take(&mut self.texture_cache.decoder);
         let result = (|| {
             let format = codec(encoded.format).unwrap();
             // Decode and upload each plane as one request; staging can grow
@@ -275,21 +228,11 @@ impl VulkanResidency {
                     &pixels,
                 )?;
             }
-            let work = self.device.work_ticket()?;
-            let image = self.images[id.slot].entry.as_mut().unwrap();
-            image.contents.device = device;
+            let image = &mut self.texture_cache.images[id];
             image.synchronized = true;
-            image.discarded.clear();
-            image.producer = Some(work);
-            image.version = image
-                .version
-                .checked_add(1)
-                .ok_or(VulkanError::InvalidResource(
-                    "decoded image version exhausted",
-                ))?;
             Ok(())
         })();
-        self.decoder = decoder;
+        self.texture_cache.decoder = decoder;
         result
     }
     fn upload_decoded_rect(
@@ -299,19 +242,12 @@ impl VulkanResidency {
         rect: vk::Rect2D,
         pixels: &[u8],
     ) -> Result<(), VulkanError> {
-        let slice =
-            self.device
-                .submission
-                .reserve_upload_aligned(&mut self.device.dispatch, pixels, 4)?;
-        let (image, layout) = self.image_access_subresources(
-            id,
-            commands::plane_range(p),
-            AccessScope::new(
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        )?;
+        let slice = self
+            .runtime
+            .device
+            .submission
+            .reserve_upload_aligned(pixels, 4)?;
+        let (image, layout) = self.transfer_image(id, commands::plane_range(p))?;
         let region = vk::BufferImageCopy::default()
             .buffer_offset(slice.offset)
             .image_subresource(p.layers())
@@ -325,18 +261,17 @@ impl VulkanResidency {
                 height: rect.extent.height,
                 depth: 1,
             });
-        self.barriers.emit(&mut self.device);
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
         unsafe {
-            self.device.dispatch.cmd_copy_buffer_to_image(
-                self.device.submission.staging_buffer(&slice).handle,
+            self.runtime.device.dispatch.copy_buffer_to_image(
+                self.runtime.device.submission.staging_buffer(&slice).handle,
                 image,
                 layout,
                 &[region],
             );
         }
-        self.define_image_rect(id, p, rect);
-        self.statistics.cpu_uploaded_bytes += pixels.len() as u64;
-        self.statistics.decoded_upload_commands += 1;
+        self.runtime.statistics.cpu_uploaded_bytes += pixels.len() as u64;
+        self.runtime.statistics.decoded_upload_commands += 1;
         Ok(())
     }
 }

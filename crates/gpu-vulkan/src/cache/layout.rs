@@ -149,6 +149,9 @@ impl LayoutKey {
 /// The pipeline owns semantic origins; a shared layout contains only Vulkan ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BindingOrigin {
+    pub stage: nixe_gpu::ShaderStage,
+    pub descriptor: usize,
+    pub element: u32,
     pub resource: nixe_gpu::shader_module::ResourceId,
     pub sampler: Option<nixe_gpu::shader_module::ResourceId>,
 }
@@ -163,11 +166,12 @@ pub(crate) fn binding_origins(
         .map(|slot| {
             let mut origin = None;
             for stage in &shader.stages {
-                for binding in stage
+                for (descriptor, binding) in stage
                     .module
                     .bindings
                     .iter()
-                    .filter(|b| b.binding == slot.binding)
+                    .enumerate()
+                    .filter(|(_, b)| b.binding == slot.binding)
                 {
                     if slot.element >= binding.count {
                         return Err(VulkanError::InvalidResource(
@@ -184,10 +188,15 @@ pub(crate) fn binding_origins(
                             ))
                     };
                     let current = BindingOrigin {
+                        stage: stage.stage,
+                        descriptor,
+                        element: slot.element,
                         resource: element(binding.resource)?,
                         sampler: binding.sampler.map(element).transpose()?,
                     };
-                    if origin.replace(current).is_some_and(|old| old != current) {
+                    if origin.replace(current).is_some_and(|old: BindingOrigin| {
+                        old.resource != current.resource || old.sampler != current.sampler
+                    }) {
                         return Err(VulkanError::InvalidResource(
                             "linked descriptor has conflicting resource origins",
                         ));
@@ -210,6 +219,8 @@ pub struct PipelineLayout {
     pub(crate) handle: vk::PipelineLayout,
     pub(crate) set: vk::DescriptorSetLayout,
     pub(crate) update_template: vk::DescriptorUpdateTemplate,
+    pub(crate) push_descriptor: bool,
+    pub(crate) sets_per_pool: usize,
     pub key: LayoutKey,
     pub(crate) dynamic_bindings: Box<[usize]>,
     pub(crate) uniform_bindings: Box<[UniformBinding]>,
@@ -218,37 +229,6 @@ impl PipelineLayout {
     /// Separate the stable descriptor base from the command's uint32 offset.
     /// Explicit ranges preserve shader bounds, including buffers above 4 GiB.
     // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdBindDescriptorSets.html
-    pub(crate) fn split_dynamic_offsets(
-        &self,
-        resources: &mut [DescriptorResource],
-        limits: &vk::PhysicalDeviceLimits,
-        mut offsets: Vec<u32>,
-    ) -> Result<Vec<u32>, VulkanError> {
-        offsets.clear();
-        offsets.reserve(self.dynamic_bindings.len());
-        for &index in &self.dynamic_bindings {
-            if matches!(resources.get(index), Some(DescriptorResource::NullBuffer)) {
-                offsets.push(0);
-                continue;
-            }
-            let Some(DescriptorResource::Buffer {
-                buffer,
-                offset,
-                range,
-            }) = resources.get_mut(index)
-            else {
-                return Err(VulkanError::InvalidResource(
-                    "dynamic storage binding requires a buffer",
-                ));
-            };
-            let (base, dynamic) =
-                self.split_buffer_offset(index, buffer.size(), *offset, *range, limits)?;
-            offsets.push(dynamic);
-            *offset = base;
-        }
-        Ok(offsets)
-    }
-
     pub(crate) fn split_buffer_offset(
         &self,
         index: usize,
@@ -284,12 +264,14 @@ impl Drop for PipelineLayout {
     }
 }
 struct LayoutState {
-    entries: HashMap<LayoutKey, (Arc<PipelineLayout>, u64)>,
+    entries: HashMap<(LayoutKey, vk::PipelineBindPoint), (Arc<PipelineLayout>, u64)>,
     clock: u64,
 }
 pub(super) struct LayoutCache {
     owner: Arc<DeviceOwner>,
     limits: vk::PhysicalDeviceLimits,
+    max_push_descriptors: u32,
+    sets_per_pool: usize,
     entries: usize,
     state: Mutex<LayoutState>,
 }
@@ -298,6 +280,18 @@ impl LayoutCache {
         Self {
             owner: Arc::clone(&device.owner),
             limits: device.profile().limits,
+            sets_per_pool: if device.profile().vendor_id == 0x1002 {
+                96
+            } else {
+                64
+            },
+            max_push_descriptors: if !device.profile().descriptor_buffer
+                || device.profile().bufferless_push_descriptors
+            {
+                device.profile().max_push_descriptors
+            } else {
+                0
+            },
             entries,
             state: Mutex::new(LayoutState {
                 entries: HashMap::default(),
@@ -305,21 +299,51 @@ impl LayoutCache {
             }),
         }
     }
-    pub fn get(&self, mut key: LayoutKey) -> Result<Arc<PipelineLayout>, VulkanError> {
+    pub fn get(&self, key: LayoutKey) -> Result<Arc<PipelineLayout>, VulkanError> {
+        self.get_layout(key, None)
+    }
+    pub fn get_guest(
+        &self,
+        key: LayoutKey,
+        point: vk::PipelineBindPoint,
+    ) -> Result<Arc<PipelineLayout>, VulkanError> {
+        self.get_layout(key, Some(point))
+    }
+    fn get_layout(
+        &self,
+        mut key: LayoutKey,
+        point: Option<vk::PipelineBindPoint>,
+    ) -> Result<Arc<PipelineLayout>, VulkanError> {
+        // Match Eden DescriptorLayoutBuilder::CanUsePushDescriptor. Host helper
+        // pipelines keep their descriptor-set ABI. Guest payloads bypass sets.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/pipeline_helper.h
+        let guest = point.is_some();
+        let push_descriptor = point.is_some()
+            && self.max_push_descriptors != 0
+            && key.bindings.len() <= self.max_push_descriptors as usize;
+        let point = if push_descriptor {
+            point.unwrap()
+        } else {
+            vk::PipelineBindPoint::GRAPHICS
+        };
         // Dynamic offsets keep arena positions out of descriptor identities.
         // Choose the ABI once per layout, within the host's dynamic-binding limit.
         // https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceLimits.html
-        key.select_dynamic_buffers(
-            self.limits.max_descriptor_set_storage_buffers_dynamic,
-            self.limits.max_descriptor_set_uniform_buffers_dynamic,
-        )?;
+        if !guest {
+            key.select_dynamic_buffers(
+                self.limits.max_descriptor_set_storage_buffers_dynamic,
+                self.limits.max_descriptor_set_uniform_buffers_dynamic,
+            )?;
+        }
         let mut state = self.state.lock().unwrap();
         state.clock = state.clock.wrapping_add(1);
         let clock = state.clock;
-        if let Some((layout, touched)) = state.entries.get_mut(&key) {
+        let cache_key = (key, point);
+        if let Some((layout, touched)) = state.entries.get_mut(&cache_key) {
             *touched = clock;
             return Ok(Arc::clone(layout));
         }
+        let key = cache_key.0;
         if key.push_bytes > self.limits.max_push_constants_size || !key.push_bytes.is_multiple_of(4)
         {
             return Err(VulkanError::InvalidResource(
@@ -393,7 +417,13 @@ impl LayoutCache {
             .collect();
         let set = unsafe {
             self.owner.device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                &vk::DescriptorSetLayoutCreateInfo::default()
+                    .bindings(&bindings)
+                    .flags(if push_descriptor {
+                        vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
+                    } else {
+                        vk::DescriptorSetLayoutCreateFlags::empty()
+                    }),
                 None,
             )
         }
@@ -418,6 +448,8 @@ impl LayoutCache {
             owner: Arc::clone(&self.owner),
             handle: vk::PipelineLayout::null(),
             set,
+            push_descriptor,
+            sets_per_pool: self.sets_per_pool,
             update_template: vk::DescriptorUpdateTemplate::null(),
             dynamic_bindings,
             uniform_bindings,
@@ -461,7 +493,14 @@ impl LayoutCache {
             layout.update_template = unsafe {
                 self.owner.device.create_descriptor_update_template(
                     &vk::DescriptorUpdateTemplateCreateInfo::default()
-                        .template_type(vk::DescriptorUpdateTemplateType::DESCRIPTOR_SET)
+                        .template_type(if push_descriptor {
+                            vk::DescriptorUpdateTemplateType::PUSH_DESCRIPTORS_KHR
+                        } else {
+                            vk::DescriptorUpdateTemplateType::DESCRIPTOR_SET
+                        })
+                        .pipeline_layout(layout.handle)
+                        .pipeline_bind_point(point)
+                        .set(0)
                         .descriptor_set_layout(set)
                         .descriptor_update_entries(&entries),
                     None,
@@ -484,7 +523,7 @@ impl LayoutCache {
             }
             state
                 .entries
-                .insert(layout.key.clone(), (Arc::clone(&layout), clock));
+                .insert((layout.key.clone(), point), (Arc::clone(&layout), clock));
         }
         Ok(layout)
     }
@@ -610,7 +649,10 @@ mod tests {
             origins[4],
             BindingOrigin {
                 resource: ResourceId::new(102),
-                sampler: Some(ResourceId::new(202))
+                sampler: Some(ResourceId::new(202)),
+                stage: nixe_gpu::ShaderStage::Fragment,
+                descriptor: 0,
+                element: 2,
             }
         );
         let mut other = shader.stages[0].as_ref().clone();

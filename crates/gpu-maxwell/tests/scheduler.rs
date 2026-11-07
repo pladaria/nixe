@@ -1,6 +1,6 @@
 use nixe_gpu::{FrontendSubmissionId, GuestTimelinePoint};
 use nixe_gpu_maxwell::*;
-use nixe_memory::{Allocation, Machine, MemoryPermissions, PAGE_SIZE};
+use nixe_memory::{Allocation, Machine, PAGE_SIZE};
 
 #[path = "support/memory.rs"]
 mod memory;
@@ -182,11 +182,8 @@ fn dispatch_defers_stale_mapping_detection_to_command_consumption() {
     assert_eq!(scheduler.pending_count(), 0);
     let entry = dispatched.scheduled().submission().decoded().entries()[0];
     assert!(matches!(
-        address_space.memory().resolve_range(
-            entry.address(),
-            entry.byte_count(),
-            MemoryPermissions::READ
-        ),
+        nixe_gpu_maxwell::MaxwellGpuMemory::new(address_space.memory().clone())
+            .resolve_range(entry.address(), entry.byte_count()),
         Err(MaxwellGpuAccessError::UnmappedAddress { .. })
     ));
 }

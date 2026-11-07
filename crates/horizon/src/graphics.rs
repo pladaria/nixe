@@ -1,17 +1,21 @@
 //! Switch display-service state shared by VI, Binder, and nvdrv sessions.
 
+use nixe_gpu_maxwell::PresentationImageRequest;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::task::{Context, Poll, Waker};
 
 use nixe_gpu::{
-    BackingView, BlockLinearLayout, GpuAllocationDescription, GpuAllocationId, GuestSyncpointId,
-    GuestSyncpointValue, GuestTimelinePoint, ImageMemoryLayout, PresentationImageFormat,
-    PresentationImageRequest, ResidentImage,
+    BlockLinearLayout, GuestSyncpointId, GuestSyncpointValue, GuestTimelinePoint,
+    ImageMemoryLayout, PresentationImageFormat,
 };
+use nixe_gpu::{FrameCrop, FrameTransform};
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
-use nixe_video::{DisplayClock, FrameCrop, FrameMailbox, FrameTransform, PresentationFrame};
+use nixe_video::FrameMailbox;
+mod conductor;
 
 use crate::parcel::{ParcelError, ParcelReader, ParcelWriter};
 use crate::{
@@ -72,15 +76,17 @@ impl Drop for ViVsyncEvent {
     }
 }
 
-/// BufferQueue slot-availability event, never reused as a VI or GPU event.
+/// Producer native handle. HOS signals this event on configuration/cancellation;
+/// free-slot waits belong to the independent dequeue condition below.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvnflinger/buffer_queue_producer.cpp
 #[derive(Clone, Debug)]
-struct BufferQueueAvailabilityEvent {
+struct BufferQueueWaitEvent {
     source: GraphicsEventSource,
     writable: WritableEventObject,
     readable: ReadableEventObject,
 }
 
-impl BufferQueueAvailabilityEvent {
+impl BufferQueueWaitEvent {
     fn new(kernel: &Arc<nixe_scheduler::SchedulerState>, binder_id: i32) -> Self {
         let (writable, readable) = EventObject::create_pair(kernel);
         Self {
@@ -92,10 +98,6 @@ impl BufferQueueAvailabilityEvent {
 
     fn signal(&self) {
         self.writable.signal();
-    }
-
-    fn clear(&self) {
-        self.writable.clear();
     }
 
     fn readable(&self) -> ReadableEventObject {
@@ -227,9 +229,9 @@ impl ViSession {
             return false;
         };
         let binder_id = layer.binder_id;
-        state
-            .pending_frames
-            .retain(|pending| pending.binder_id != binder_id);
+        if let Some(queue) = state.queues.get_mut(&binder_id) {
+            queue.lock().unwrap().abandon();
+        }
         true
     }
 }
@@ -251,14 +253,13 @@ pub(crate) struct LayerState {
 struct VideoState {
     next_layer_id: u64,
     layers: BTreeMap<u64, LayerState>,
-    queues: BTreeMap<i32, BufferQueue>,
+    queues: BTreeMap<i32, Arc<Mutex<BufferQueue>>>,
     vsync_events: BTreeMap<usize, WritableEventObject>,
-    display_clock: DisplayClock,
     presenter: Option<FrameMailbox>,
-    host_events: Option<nixe_runtime::ExternalEventSender>,
     nvdrv: NvDrvSession,
     next_frame_sequence: u64,
-    pending_frames: VecDeque<PendingFrame>,
+    composition_frame: u64,
+    pending_composites: Vec<std::sync::mpsc::Receiver<Result<(), Box<str>>>>,
 }
 
 /// Cloneable process display state shared across independently opened services.
@@ -266,37 +267,7 @@ struct VideoState {
 pub struct VideoSystem {
     kernel: Arc<nixe_scheduler::SchedulerState>,
     state: Arc<Mutex<VideoState>>,
-    released_slots: Arc<Mutex<Vec<ReleasedSlot>>>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ReleasedSlot {
-    binder_id: i32,
-    slot: i32,
-}
-
-#[derive(Debug)]
-struct ResidentSlotLease {
-    released_slots: Arc<Mutex<Vec<ReleasedSlot>>>,
-    released: ReleasedSlot,
-    events: Option<nixe_runtime::ExternalEventSender>,
-}
-
-impl Drop for ResidentSlotLease {
-    fn drop(&mut self) {
-        let first = {
-            let mut released = self
-                .released_slots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let first = released.is_empty();
-            released.push(self.released);
-            first
-        };
-        if first && let Some(events) = &self.events {
-            events.notify_host_service(nixe_runtime::ExternalEventSource::Worker);
-        }
-    }
+    conductor: Arc<std::sync::OnceLock<Result<conductor::Conductor, Box<str>>>>,
 }
 
 /// Resources released when one emulated process graphics system is torn down.
@@ -318,27 +289,25 @@ impl VideoSystem {
         Self::with_nvdrv(kernel, None, NvDrvSession::new(machine, kernel))
     }
 
-    /// Composes concrete native Maxwell work with its renderer before workers start.
-    #[must_use]
-    pub fn with_gpu_frontend<E, L>(
-        machine: nixe_memory::Machine,
+    /// Construct channel graphics state beside its renderer on the GPU owner.
+    pub fn with_gpu_frontend<E, L, R>(
+        device_memory: nixe_gpu_maxwell::MaxwellDeviceMemory,
         kernel: &Arc<nixe_scheduler::SchedulerState>,
         presenter: Option<FrameMailbox>,
-        execution: E,
-        frontend: L,
-    ) -> Self
+        initialize: impl FnOnce() -> Result<(E, R), nixe_gpu::BackendRuntimeError> + Send + 'static,
+        frontend: impl FnOnce(std::rc::Rc<std::cell::RefCell<Option<E>>>) -> L + Send + 'static,
+    ) -> Result<(Self, R), nixe_gpu::BackendRuntimeError>
     where
         L: nixe_gpu_maxwell::MaxwellFrontend,
+        R: Send + 'static,
         E: nixe_gpu::GpuExecution<
-                Commands = nixe_gpu::native::NativeWork,
-                ImageRequest = nixe_gpu::native::NativePresentationImage,
+                Conversion = nixe_gpu::native::NativeNv12Conversion,
+                ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
             >,
     {
-        Self::with_nvdrv(
-            kernel,
-            presenter,
-            NvDrvSession::with_gpu_frontend(machine, kernel, execution, frontend),
-        )
+        let (nvdrv, report) =
+            NvDrvSession::with_gpu_frontend(device_memory, kernel, initialize, frontend)?;
+        Ok((Self::with_nvdrv(kernel, presenter, nvdrv), report))
     }
 
     fn with_nvdrv(
@@ -353,43 +322,38 @@ impl VideoSystem {
                 layers: BTreeMap::new(),
                 queues: BTreeMap::new(),
                 vsync_events: BTreeMap::new(),
-                display_clock: DisplayClock::new(60)
-                    .expect("the fixed Switch display refresh is non-zero"),
                 presenter,
-                host_events: None,
                 nvdrv,
                 next_frame_sequence: 1,
-                pending_frames: VecDeque::new(),
+                composition_frame: 0,
+                pending_composites: Vec::new(),
             })),
-            released_slots: Arc::default(),
+            conductor: Arc::default(),
         }
     }
 
-    // Display work must make progress independently of input sampling, as in
-    // Eden's display consumer. This process uses its existing host supervisor.
-    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/vi/conductor.cpp
-    pub(crate) fn set_host_events(&self, events: nixe_runtime::ExternalEventSender) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .host_events = Some(events);
+    pub(crate) fn start_conductor(
+        &self,
+        events: nixe_runtime::ExternalEventSender,
+    ) -> Result<(), FramebufferError> {
+        self.conductor
+            .get_or_init(|| {
+                conductor::Conductor::new(
+                    Arc::clone(&self.kernel),
+                    Arc::downgrade(&self.state),
+                    events,
+                )
+                .map_err(|error| error.to_string().into_boxed_str())
+            })
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| FramebufferError::Backend(error.clone()))
     }
-
-    fn drain_released_slots(&self, state: &mut VideoState) {
-        let mut released = self
-            .released_slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for released in released.drain(..) {
-            nixe_memory::trace::event(
-                "buffer_release",
-                ((released.binder_id as u32 as u64) << 32) | released.slot as u32 as u64,
-                0,
-                0,
-            );
-            if let Some(queue) = state.queues.get_mut(&released.binder_id) {
-                let _ = queue.release(released.slot);
-            }
+    pub(crate) fn check_conductor(&self) -> Result<(), FramebufferError> {
+        match self.conductor.get() {
+            Some(Ok(conductor)) => conductor.check(),
+            Some(Err(error)) => Err(FramebufferError::Backend(error.clone())),
+            None => Ok(()),
         }
     }
 
@@ -411,6 +375,9 @@ impl VideoSystem {
     /// worker-finished event is handled.
     #[must_use]
     pub fn teardown(&self) -> GraphicsTeardownReport {
+        if let Some(Ok(conductor)) = self.conductor.get() {
+            conductor.stop();
+        }
         let nvdrv = self.nvdrv().teardown();
         let mut state = self
             .state
@@ -419,13 +386,19 @@ impl VideoSystem {
         let report = GraphicsTeardownReport {
             layers_released: state.layers.len(),
             queues_released: state.queues.len(),
-            pending_frames_released: state.pending_frames.len(),
+            pending_frames_released: state
+                .queues
+                .values()
+                .map(|q| q.lock().unwrap().pending.len())
+                .sum(),
             device_fds_released: nvdrv.device_fds_released,
             allocations_released: nvdrv.allocations_released,
         };
         state.layers.clear();
+        for queue in state.queues.values() {
+            queue.lock().unwrap().abandon();
+        }
         state.queues.clear();
-        state.pending_frames.clear();
         report
     }
 
@@ -478,9 +451,10 @@ impl VideoSystem {
             z: 0,
         };
         state.layers.insert(id, layer.clone());
-        state
-            .queues
-            .insert(binder_id, BufferQueue::new(&self.kernel, binder_id));
+        state.queues.insert(
+            binder_id,
+            Arc::new(Mutex::new(BufferQueue::new(&self.kernel, binder_id))),
+        );
         Some(layer)
     }
 
@@ -501,10 +475,9 @@ impl VideoSystem {
         let Some(layer) = state.layers.remove(&layer_id) else {
             return false;
         };
-        state.queues.remove(&layer.binder_id);
-        state
-            .pending_frames
-            .retain(|pending| pending.binder_id != layer.binder_id);
+        if let Some(queue) = state.queues.remove(&layer.binder_id) {
+            queue.lock().unwrap().abandon();
+        }
         true
     }
 
@@ -564,7 +537,7 @@ impl VideoSystem {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .queues
             .get(&binder_id)
-            .map(|queue| queue.available_event.readable())
+            .map(|queue| queue.lock().unwrap().buffer_wait_event.readable())
     }
 
     pub(crate) fn adjust_binder_refcount(
@@ -577,28 +550,34 @@ impl VideoSystem {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .queues
-            .get_mut(&binder_id)
-            .is_some_and(|queue| queue.adjust_refcount(add_value, reference_type))
+        state.queues.get_mut(&binder_id).is_some_and(|queue| {
+            queue
+                .lock()
+                .unwrap()
+                .adjust_refcount(add_value, reference_type)
+        })
     }
 
-    pub(crate) fn transact_binder(
+    pub(crate) fn transact_binder<'a>(
         &self,
         binder_id: i32,
         code: u32,
-        encoded: &[u8],
-    ) -> Result<BinderTransaction, ParcelError> {
-        let mut state = self
+        encoded: &'a [u8],
+    ) -> Result<BinderCall<'a>, ParcelError> {
+        let queue = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.drain_released_slots(&mut state);
-        let queue = state
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .queues
-            .get_mut(&binder_id)
+            .get(&binder_id)
+            .cloned()
             .ok_or(ParcelError::Malformed("unknown Binder producer object"))?;
-        queue.transact(code, encoded)
+        Ok(BinderCall {
+            queue,
+            code,
+            encoded,
+            waiter: None,
+        })
     }
 
     /// Resolves one producer reservation to canonical nvmap storage and makes
@@ -630,7 +609,7 @@ impl VideoSystem {
             validate_present_descriptor(&request.buffer, Some(crop))?;
             let transform = frame_transform(request.input.transform)?;
             let nvdrv = self.nvdrv();
-            for fence in &request.input.acquire_fences {
+            for fence in request.input.acquire_fences.iter() {
                 if !nvdrv.knows_guest_timeline_point(fence.point) {
                     return Err(FramebufferError::Malformed(
                         "QueueBuffer acquire fence references an unknown GPU syncpoint",
@@ -651,33 +630,23 @@ impl VideoSystem {
                 .validate_image_view(&request.buffer.nvmap_view_metadata())
                 .map_err(FramebufferError::NvMap)?;
 
-            let (presenting, events) = {
+            let presenting = {
                 let state = self
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (state.presenter.is_some(), state.host_events.clone())
+                state.presenter.is_some()
             };
             let mut presentation_source = request.presentation_source;
             let presentation = if presenting {
-                let source = match &presentation_source {
+                let mut source = match &presentation_source {
                     Some(source) => source.clone(),
-                    None => presentable_image_request(&request.buffer, &object)?,
+                    None => presentable_image_request(&request.buffer, &object, &nvdrv)?,
                 };
-                // queueBuffer transfers ownership to the consumer; it does not
-                // wait for that consumer to prepare or present the image.
-                // Retain the asynchronous reply with the slot until VSync and
-                // the backend has established the ordered image dependency.
-                // https://source.android.com/docs/core/graphics/arch-bq-gralloc
-                let image = nvdrv
-                    .request_presentable_image(source.clone(), request.input.swap_interval, events)
-                    .map_err(FramebufferError::Backend)?;
-                presentation_source = Some(source);
-                Some(PendingPresentation {
-                    image,
-                    crop: frame_crop(crop)?,
-                    transform,
-                })
+                source.crop = frame_crop(crop)?;
+                source.transform = transform;
+                presentation_source = Some(source.clone());
+                Some(source)
             } else {
                 None
             };
@@ -692,26 +661,24 @@ impl VideoSystem {
                 .ok_or(FramebufferError::Malformed(
                     "unknown Binder producer object",
                 ))?;
-            if !queue.commit_queue(request.slot, presentation_source) {
+            let mut queue = queue.lock().unwrap();
+            if !queue.commit_queue(
+                request.slot,
+                presentation_source,
+                request.input.sticky_transform,
+            ) {
                 return Err(FramebufferError::Malformed(
                     "QueueBuffer reservation lost slot ownership",
                 ));
             }
-            state.pending_frames.push_back(PendingFrame {
-                binder_id,
+            queue.pending.push_back(PendingFrame {
                 slot: request.slot,
                 acquire_fences: request.input.acquire_fences,
                 swap_interval: request.input.swap_interval,
-                acquired: false,
                 presentation,
             });
-            let events = state.host_events.clone();
+            drop(queue);
             drop(state);
-            // A ready image can beat QueueBuffer's commit. Wake again after
-            // installing the pending slot so that publication cannot lose it.
-            if let Some(events) = events {
-                events.notify_host_service(nixe_runtime::ExternalEventSource::Worker);
-            }
             Ok(())
         })();
 
@@ -721,180 +688,129 @@ impl VideoSystem {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(queue) = state.queues.get_mut(&binder_id) {
-                queue.rollback_queue(reserved_slot);
+                queue.lock().unwrap().rollback_queue(reserved_slot);
             }
         }
         result
     }
 
-    /// Next host deadline for servicing the guest display clock.
-    pub fn next_display_deadline(&self) -> Duration {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .display_clock
-            .next_boundary()
+    fn poll_composite_registration(state: &mut VideoState) -> Result<bool, FramebufferError> {
+        if !state.layers.values().any(|layer| layer.visible) {
+            return Ok(true);
+        }
+        // Bound in-flight compositions by the previous sync registration;
+        // guest fences and renderer publication retain their GPU-owned lives.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/gpu.cpp#L248-L295
+        while let Some(registration) = state.pending_composites.last() {
+            match registration.try_recv() {
+                Ok(result) => result.map_err(FramebufferError::Backend)?,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(FramebufferError::Backend(
+                        "GPU composition registration was cancelled".into(),
+                    ));
+                }
+            }
+            state.pending_composites.pop();
+        }
+        Ok(true)
     }
-
-    /// Advances guest display timing independently from host monitor VSync.
-    pub fn advance(&self, elapsed: Duration) -> Result<u64, FramebufferError> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.drain_released_slots(&mut state);
-        let ticks = state.display_clock.advance(elapsed);
-        if ticks.crossed == 0
-            && !state
-                .pending_frames
-                .iter()
-                .any(|frame| frame.acquired || frame.swap_interval == 0)
-        {
-            return Ok(0);
-        }
-        let display_sequence = state.display_clock.sequence();
-        for queue in state.queues.values_mut() {
-            queue.blocked_this_advance = false;
-        }
-        // The current frame sets its producer's minimum residence time. Keep
-        // VI at 60 Hz; throttle acquisition per producer, not the whole display.
-        // Never replay historical presents after a host pause. Interval zero
-        // has no refresh wait, but still requires the real acquire dependency.
-        // https://raw.githubusercontent.com/eden-emulator/mirror/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/hle/service/nvnflinger/hardware_composer.cpp
-        for _ in 0..state.pending_frames.len() {
-            let pending = state.pending_frames.front().unwrap();
-            let binder_id = pending.binder_id;
-            let queue = state
-                .queues
-                .get(&binder_id)
-                .ok_or(FramebufferError::Malformed(
-                    "pending frame lost its producer",
-                ))?;
-            if queue.blocked_this_advance
-                || !pending.acquired
-                    && (queue.next_acquire_sequence > display_sequence
-                        || (ticks.crossed == 0 && pending.swap_interval != 0))
-            {
-                state
-                    .queues
-                    .get_mut(&binder_id)
-                    .unwrap()
-                    .blocked_this_advance = true;
-                let pending = state.pending_frames.pop_front().unwrap();
-                state.pending_frames.push_back(pending);
-                continue;
-            }
-            if pending.presentation.is_none()
-                && !pending.acquire_fences.iter().all(|fence| {
-                    state
-                        .nvdrv
-                        .guest_timeline_point_reached(fence.point)
-                        .unwrap_or(false)
-                })
-            {
-                state
-                    .queues
-                    .get_mut(&binder_id)
-                    .unwrap()
-                    .blocked_this_advance = true;
-                let pending = state.pending_frames.pop_front().unwrap();
-                state.pending_frames.push_back(pending);
-                continue;
-            }
-            if !pending.acquired {
-                let key = ((pending.binder_id as u32 as u64) << 32) | pending.slot as u32 as u64;
-                let interval = pending.swap_interval;
-                nixe_memory::trace::event("vi_acquire", key, display_sequence, u64::from(interval));
-                state
-                    .queues
-                    .get_mut(&binder_id)
-                    .unwrap()
-                    .next_acquire_sequence = display_sequence.saturating_add(u64::from(interval));
-                state.pending_frames.front_mut().unwrap().acquired = true;
-            }
-            // Acquisition follows the guest display clock. Image preparation
-            // completes asynchronously and must not add another refresh period.
-            // Keep this slot leased and later frames of this producer ordered.
-            let pending = state.pending_frames.front().unwrap();
-            let image = match &pending.presentation {
-                Some(presentation) => match presentation.image.try_recv() {
-                    Ok(result) => Some(result.map_err(FramebufferError::Backend)?),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        state
-                            .queues
-                            .get_mut(&binder_id)
-                            .unwrap()
-                            .blocked_this_advance = true;
-                        let pending = state.pending_frames.pop_front().unwrap();
-                        state.pending_frames.push_back(pending);
-                        continue;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        return Err(FramebufferError::Backend(
-                            "GPU resident-image reply was lost".into(),
-                        ));
-                    }
-                },
-                None => None,
-            };
-            let pending = state.pending_frames.pop_front().unwrap();
-            nixe_memory::trace::event(
-                "vi_latch",
-                ((pending.binder_id as u32 as u64) << 32) | pending.slot as u32 as u64,
-                state.next_frame_sequence,
-                display_sequence,
-            );
-            if let Some(presentation) = pending.presentation {
-                let sequence = state.next_frame_sequence;
-                state.next_frame_sequence = state.next_frame_sequence.saturating_add(1);
-                let image = image.expect("a ready presentation owns its resident image");
-                nixe_memory::trace::event(
-                    "frame_producer",
-                    sequence,
-                    image.lease().producer().slot(),
-                    image.lease().content_version(),
-                );
-                let frame = Arc::new(PresentationFrame::new(
-                    image,
-                    presentation.crop,
-                    presentation.transform,
-                    sequence,
-                    Arc::new(ResidentSlotLease {
-                        released_slots: Arc::clone(&self.released_slots),
-                        released: ReleasedSlot {
-                            binder_id: pending.binder_id,
-                            slot: pending.slot,
-                        },
-                        events: state.host_events.clone(),
-                    }),
-                ));
-                state
-                    .presenter
-                    .as_ref()
-                    .expect("a pending presentation retains its presenter")
-                    .publish(frame);
-                log::trace!(
-                    "latched resident frame from Binder producer {} slot {} at VSync {}",
-                    pending.binder_id,
-                    pending.slot,
-                    display_sequence
-                );
-            } else if let Some(queue) = state.queues.get_mut(&pending.binder_id) {
-                let _ = queue.release(pending.slot);
-                log::debug!(
-                    "discarded headless frame from Binder producer {} slot {} at VSync {}",
-                    pending.binder_id,
-                    pending.slot,
-                    display_sequence
-                );
-            }
-        }
-        if ticks.crossed != 0 {
+    fn compose(state: &mut VideoState, registration: &Waker) -> Result<(), FramebufferError> {
+        if !state.layers.values().any(|layer| layer.visible) {
             for event in state.vsync_events.values() {
                 event.signal();
             }
+            return Ok(());
         }
-        Ok(ticks.crossed)
+        let display_sequence = state.composition_frame.saturating_add(1);
+        let VideoState {
+            queues,
+            nvdrv,
+            presenter,
+            next_frame_sequence,
+            composition_frame,
+            pending_composites,
+            ..
+        } = state;
+        for (&binder_id, queue) in &*queues {
+            let mut queue = queue.lock().unwrap();
+            if queue.acquired.is_some() {
+                continue;
+            }
+            let Some(pending) = queue.pending.front() else {
+                continue;
+            };
+            if pending.presentation.is_none()
+                && !pending
+                    .acquire_fences
+                    .iter()
+                    .all(|f| nvdrv.guest_timeline_point_reached(f.point).unwrap_or(false))
+            {
+                continue;
+            }
+            let pending = queue.pending.pop_front().unwrap();
+            queue.acquire(pending.slot, *composition_frame, pending.swap_interval)?;
+            let source_id = ((binder_id as u32 as u64) << 32) | pending.slot as u32 as u64;
+            nixe_memory::trace::event(
+                "vi_acquire",
+                source_id,
+                display_sequence,
+                u64::from(pending.swap_interval),
+            );
+            if let Some(request) = pending.presentation {
+                let sequence = *next_frame_sequence;
+                *next_frame_sequence = sequence.saturating_add(1);
+                let registration = nvdrv
+                    .request_composite(
+                        crate::nvdrv::Composite {
+                            request,
+                            swap_interval: pending.swap_interval,
+                            presenter: presenter
+                                .as_ref()
+                                .expect("resident composition retains its presenter")
+                                .clone(),
+                            sequence,
+                            source: source_id,
+                            display_sequence,
+                        },
+                        pending.acquire_fences.iter().map(|f| f.point).collect(),
+                        registration.clone(),
+                    )
+                    .map_err(FramebufferError::Backend)?;
+                pending_composites.push(registration);
+            } else {
+                nixe_memory::trace::event(
+                    "vi_latch",
+                    source_id,
+                    *next_frame_sequence,
+                    display_sequence,
+                );
+                log::debug!(
+                    "discarded headless frame from Binder producer {binder_id} slot {} at VSync {display_sequence}",
+                    pending.slot
+                );
+            }
+        }
+        // HardwareComposer counts completed compositions, including empty
+        // ones. Coalesced host timer ticks do not fabricate compositions.
+        *composition_frame = composition_frame.saturating_add(1);
+        // Release against the advanced counter in this composition, as Eden
+        // does, so interval1 does not occupy a producer slot for another tick.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/nvnflinger/hardware_composer.cpp#L165-L175
+        for (&binder_id, queue) in queues {
+            if let Some(slot) = queue.lock().unwrap().release_acquired(*composition_frame) {
+                nixe_memory::trace::event(
+                    "buffer_release",
+                    ((binder_id as u32 as u64) << 32) | slot as u32 as u64,
+                    display_sequence,
+                    0,
+                );
+            }
+        }
+        for event in state.vsync_events.values() {
+            event.signal();
+        }
+        Ok(())
     }
 }
 
@@ -908,6 +824,7 @@ enum SlotOwnership {
     Dequeued,
     Queueing,
     Queued,
+    Acquired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -928,6 +845,9 @@ pub(crate) struct GraphicBufferPlane {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GraphicBuffer {
+    width: u32,
+    height: u32,
+    window_format: u32,
     pub(crate) nvmap_id: u32,
     pub(crate) stride_pixels: u32,
     pub(crate) format: u32,
@@ -966,6 +886,35 @@ struct NvFence {
     point: GuestTimelinePoint,
 }
 
+// Keep the producer's four fence entries inline, as android::Fence does. Both
+// the queued item and its reusable slot retain the same guest fence values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NvMultiFence {
+    count: usize,
+    entries: [NvFence; 4],
+}
+
+impl Default for NvMultiFence {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            entries: [NvFence {
+                point: GuestTimelinePoint::new(
+                    GuestSyncpointId::new(u32::MAX),
+                    GuestSyncpointValue::new(0),
+                ),
+            }; 4],
+        }
+    }
+}
+
+impl std::ops::Deref for NvMultiFence {
+    type Target = [NvFence];
+    fn deref(&self) -> &Self::Target {
+        &self.entries[..self.count]
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QueueBufferInput {
     timestamp: i64,
@@ -975,7 +924,7 @@ struct QueueBufferInput {
     transform: u32,
     sticky_transform: u32,
     swap_interval: u32,
-    acquire_fences: Box<[NvFence]>,
+    acquire_fences: NvMultiFence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1003,20 +952,33 @@ struct BufferSlot {
     // native-handle fields not consumed by the presentation path.
     flattened_buffer: Box<[u8]>,
     presentation_source: Option<PresentationImageRequest>,
-    release_fences: Box<[NvFence]>,
+    release_fences: NvMultiFence,
 }
 
 #[derive(Debug)]
 struct BufferQueue {
     connected_api: Option<i32>,
+    abandoned: bool,
+    default_width: u32,
+    default_height: u32,
+    default_format: u32,
+    sticky_transform: u32,
+    next_waiter: u64,
+    dequeue_waiters: BTreeMap<u64, Waker>,
     override_max_buffer_count: i32,
     frame_counter: u64,
     weak_references: i64,
     strong_references: i64,
     slots: BTreeMap<i32, BufferSlot>,
-    available_event: BufferQueueAvailabilityEvent,
-    next_acquire_sequence: u64,
-    blocked_this_advance: bool,
+    buffer_wait_event: BufferQueueWaitEvent,
+    acquired: Option<AcquiredBuffer>,
+    pending: VecDeque<PendingFrame>,
+}
+
+#[derive(Debug)]
+struct AcquiredBuffer {
+    slot: i32,
+    release_frame: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1027,19 +989,63 @@ pub(crate) struct BinderTransaction {
 
 #[derive(Debug)]
 struct PendingFrame {
-    binder_id: i32,
     slot: i32,
-    acquire_fences: Box<[NvFence]>,
+    acquire_fences: NvMultiFence,
     swap_interval: u32,
-    acquired: bool,
-    presentation: Option<PendingPresentation>,
+    presentation: Option<PresentationImageRequest>,
 }
 
-#[derive(Debug)]
-struct PendingPresentation {
-    image: std::sync::mpsc::Receiver<Result<ResidentImage, Box<str>>>,
-    crop: FrameCrop,
-    transform: FrameTransform,
+/// One accepted producer operation. A free-slot wait releases the producer
+/// mutex and suspends its IPC continuation, just as Eden's dequeue condition
+/// releases core->mutex. It never uses the native handle exposed to the game.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvnflinger/buffer_queue_producer.cpp#L125-L228
+pub(crate) struct BinderCall<'a> {
+    queue: Arc<Mutex<BufferQueue>>,
+    code: u32,
+    encoded: &'a [u8],
+    waiter: Option<u64>,
+}
+
+impl Future for BinderCall<'_> {
+    type Output = Result<BinderTransaction, ParcelError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut queue = this.queue.lock().unwrap();
+        match queue.transact(this.code, this.encoded) {
+            Ok(None) => {
+                let id = *this.waiter.get_or_insert_with(|| {
+                    queue.next_waiter = queue
+                        .next_waiter
+                        .checked_add(1)
+                        .expect("producer dequeue waiter identity exhausted");
+                    queue.next_waiter
+                });
+                if queue
+                    .dequeue_waiters
+                    .get(&id)
+                    .is_none_or(|waker| !waker.will_wake(context.waker()))
+                {
+                    queue.dequeue_waiters.insert(id, context.waker().clone());
+                }
+                Poll::Pending
+            }
+            result => {
+                if let Some(id) = this.waiter.take() {
+                    queue.dequeue_waiters.remove(&id);
+                }
+                Poll::Ready(result.map(|result| result.expect("completed producer transaction")))
+            }
+        }
+    }
+}
+
+impl Drop for BinderCall<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.waiter.take() {
+            self.queue.lock().unwrap().dequeue_waiters.remove(&id);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1069,14 +1075,21 @@ impl BufferQueue {
     fn new(kernel: &Arc<nixe_scheduler::SchedulerState>, binder_id: i32) -> Self {
         Self {
             connected_api: None,
+            abandoned: false,
+            default_width: 1,
+            default_height: 1,
+            default_format: 1,
+            sticky_transform: 0,
+            next_waiter: 0,
+            dequeue_waiters: BTreeMap::new(),
             override_max_buffer_count: 0,
             frame_counter: 0,
             weak_references: 0,
             strong_references: 0,
             slots: BTreeMap::new(),
-            available_event: BufferQueueAvailabilityEvent::new(kernel, binder_id),
-            next_acquire_sequence: 0,
-            blocked_this_advance: false,
+            buffer_wait_event: BufferQueueWaitEvent::new(kernel, binder_id),
+            acquired: None,
+            pending: VecDeque::new(),
         }
     }
 
@@ -1096,7 +1109,11 @@ impl BufferQueue {
         true
     }
 
-    fn transact(&mut self, code: u32, encoded: &[u8]) -> Result<BinderTransaction, ParcelError> {
+    fn transact(
+        &mut self,
+        code: u32,
+        encoded: &[u8],
+    ) -> Result<Option<BinderTransaction>, ParcelError> {
         let mut reader = ParcelReader::decode(encoded)?;
         reader.read_interface_token(IGRAPHIC_BUFFER_PRODUCER)?;
         let mut writer = ParcelWriter::default();
@@ -1136,7 +1153,10 @@ impl BufferQueue {
                     -22
                 } else {
                     self.override_max_buffer_count = count;
-                    self.update_availability();
+                    self.signal_dequeue_condition();
+                    if count != 0 {
+                        self.buffer_wait_event.signal();
+                    }
                     0
                 };
                 writer.write_i32(status);
@@ -1147,7 +1167,34 @@ impl BufferQueue {
                 let _height = reader.read_u32()?;
                 let _format = reader.read_i32()?;
                 let _usage = reader.read_u32()?;
+                if self.abandoned || self.connected_api.is_none() {
+                    writer.write_i32(-1);
+                    writer.write_i32(1);
+                    writer.write_flattened(&encode_nv_multi_fence(&NvMultiFence::default()))?;
+                    writer.write_i32(-19);
+                    return Ok(Some(BinderTransaction {
+                        reply: writer.finish()?,
+                        queued: None,
+                    }));
+                }
                 let max_count = self.max_buffer_count();
+                if self.override_max_buffer_count == 0
+                    && self.slots.values().any(|slot| {
+                        matches!(
+                            slot.ownership,
+                            SlotOwnership::Dequeued | SlotOwnership::Queueing
+                        )
+                    })
+                {
+                    writer.write_i32(-1);
+                    writer.write_i32(1);
+                    writer.write_flattened(&encode_nv_multi_fence(&NvMultiFence::default()))?;
+                    writer.write_i32(-38);
+                    return Ok(Some(BinderTransaction {
+                        reply: writer.finish()?,
+                        queued: None,
+                    }));
+                }
                 // Reuse the least recently queued free slot, preserving the
                 // producer's buffer rotation rather than favoring low indices.
                 // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvnflinger/buffer_queue_producer.cpp#L126-L176
@@ -1161,17 +1208,15 @@ impl BufferQueue {
                 if let Some((&slot_index, slot)) = free {
                     slot.ownership = SlotOwnership::Dequeued;
                     writer.write_i32(slot_index);
-                    // Android's producer protocol makes the fence optional, but
-                    // libnx leaves its local NvMultiFence uninitialized when it
-                    // is absent. VI therefore always supplies a valid empty one.
+                    // Always return a valid fence object, including NoFence.
+                    // A reused slot carries the producer's previous GPU fence.
                     writer.write_i32(1);
-                    writer.write_flattened(&encode_nv_multi_fence(&slot.release_fences))?;
+                    writer.write_flattened(&encode_nv_multi_fence(&std::mem::take(
+                        &mut slot.release_fences,
+                    )))?;
                     writer.write_i32(0);
-                    self.update_availability();
                 } else {
-                    writer.write_i32(-1);
-                    writer.write_i32(0);
-                    writer.write_i32(-11);
+                    return Ok(None);
                 }
             }
             7 => {
@@ -1188,13 +1233,14 @@ impl BufferQueue {
                     ));
                 }
                 slot.ownership = SlotOwnership::Queueing;
+                slot.release_fences = input.acquire_fences;
                 queued = Some(QueuedBufferRequest {
                     slot: slot_index,
                     buffer: slot.buffer.clone(),
                     presentation_source: slot.presentation_source.clone(),
                     input,
                 });
-                write_buffer_output(&mut writer, self.pending_count());
+                self.write_buffer_output(&mut writer);
                 writer.write_i32(0);
             }
             8 => {
@@ -1213,12 +1259,31 @@ impl BufferQueue {
                 slot.release_fences = fences;
                 slot.frame_number = 0;
                 slot.ownership = SlotOwnership::Free;
-                self.update_availability();
+                self.signal_dequeue_condition();
+                self.buffer_wait_event.signal();
             }
             9 => {
-                let _what = reader.read_i32()?;
-                writer.write_i32(0);
-                writer.write_i32(0);
+                let what = reader.read_i32()?;
+                let value = match what {
+                    0 => Some(self.default_width),
+                    1 => Some(self.default_height),
+                    2 => Some(self.default_format),
+                    // HOS disables the extra async buffer and has minUndequeued=0.
+                    3 | 10 => Some(0),
+                    9 => Some(u32::from(self.pending_count() > 1)),
+                    11 => Some(self.sticky_transform),
+                    // This is the pinned producer's DefaultDataSpace query.
+                    12 => Some(self.max_buffer_count() as u32),
+                    _ => None,
+                };
+                writer.write_u32(value.unwrap_or(0));
+                writer.write_i32(if self.abandoned {
+                    -19
+                } else if value.is_some() {
+                    0
+                } else {
+                    -22
+                });
             }
             10 => {
                 let listener_present = reader.read_i32()?;
@@ -1238,13 +1303,12 @@ impl BufferQueue {
                     ));
                 }
                 if !(1..=4).contains(&api) || self.connected_api.is_some() {
-                    write_buffer_output(&mut writer, self.pending_count());
+                    self.write_buffer_output(&mut writer);
                     writer.write_i32(-22);
                 } else {
                     self.connected_api = Some(api);
-                    write_buffer_output(&mut writer, self.pending_count());
+                    self.write_buffer_output(&mut writer);
                     writer.write_i32(0);
-                    self.update_availability();
                 }
             }
             11 => {
@@ -1262,10 +1326,11 @@ impl BufferQueue {
                     self.connected_api = None;
                     self.override_max_buffer_count = 0;
                     self.frame_counter = 0;
-                    self.next_acquire_sequence = 0;
-                    self.blocked_this_advance = false;
+                    self.acquired = None;
+                    self.pending.clear();
                     self.slots.clear();
-                    self.available_event.clear();
+                    self.signal_dequeue_condition();
+                    self.buffer_wait_event.signal();
                 }
                 writer.write_i32(status);
             }
@@ -1282,11 +1347,9 @@ impl BufferQueue {
                 } else if has_buffer == 1 {
                     let flattened = reader.read_flattened()?;
                     let buffer = parse_graphic_buffer(flattened)?;
-                    if self.slots.contains_key(&slot_index) {
-                        return Err(ParcelError::Malformed(
-                            "preallocated buffer slot already exists",
-                        ));
-                    }
+                    self.default_width = buffer.width;
+                    self.default_height = buffer.height;
+                    self.default_format = buffer.window_format;
                     self.slots.insert(
                         slot_index,
                         BufferSlot {
@@ -1295,7 +1358,7 @@ impl BufferQueue {
                             buffer,
                             flattened_buffer: flattened.into(),
                             presentation_source: None,
-                            release_fences: Box::default(),
+                            release_fences: NvMultiFence::default(),
                         },
                     );
                     self.override_max_buffer_count = self.slots.len() as i32;
@@ -1304,7 +1367,12 @@ impl BufferQueue {
                         "preallocated buffer presence flag is invalid",
                     ));
                 }
-                self.update_availability();
+                self.pending.retain(|frame| frame.slot != slot_index);
+                if self.acquired.as_ref().is_some_and(|a| a.slot == slot_index) {
+                    self.acquired = None;
+                }
+                self.signal_dequeue_condition();
+                self.buffer_wait_event.signal();
             }
             _ => {
                 return Err(ParcelError::Unsupported(
@@ -1313,7 +1381,7 @@ impl BufferQueue {
             }
         }
         match writer.finish() {
-            Ok(reply) => Ok(BinderTransaction { reply, queued }),
+            Ok(reply) => Ok(Some(BinderTransaction { reply, queued })),
             Err(error) => {
                 if let Some(request) = queued {
                     self.rollback_queue(request.slot);
@@ -1356,38 +1424,83 @@ impl BufferQueue {
             .max(2)
     }
 
-    fn update_availability(&self) {
-        let max_count = self.max_buffer_count();
-        if self
-            .slots
-            .iter()
-            .any(|(&index, slot)| index < max_count && slot.ownership == SlotOwnership::Free)
-        {
-            self.available_event.signal();
-        } else {
-            self.available_event.clear();
+    fn signal_dequeue_condition(&mut self) {
+        for (_, waker) in std::mem::take(&mut self.dequeue_waiters) {
+            waker.wake();
         }
     }
 
-    fn release(&mut self, slot_index: i32) -> bool {
-        let Some(slot) = self.slots.get_mut(&slot_index) else {
-            return false;
-        };
-        if slot.ownership != SlotOwnership::Queued {
-            return false;
+    fn write_buffer_output(&self, writer: &mut ParcelWriter) {
+        writer.write_u32(self.default_width);
+        writer.write_u32(self.default_height);
+        writer.write_u32(0);
+        writer.write_u32(self.pending_count());
+    }
+
+    fn abandon(&mut self) {
+        self.abandoned = true;
+        self.pending.clear();
+        self.acquired = None;
+        for slot in self.slots.values_mut() {
+            if matches!(
+                slot.ownership,
+                SlotOwnership::Queued | SlotOwnership::Acquired
+            ) {
+                slot.ownership = SlotOwnership::Free;
+                slot.release_fences = NvMultiFence::default();
+            }
         }
+        self.signal_dequeue_condition();
+    }
+    fn acquire(&mut self, slot: i32, frame: u64, interval: u32) -> Result<(), FramebufferError> {
+        if self.acquired.is_some() {
+            return Err(FramebufferError::Malformed(
+                "producer already has an acquired framebuffer",
+            ));
+        }
+        let entry = self
+            .slots
+            .get_mut(&slot)
+            .ok_or(FramebufferError::Malformed(
+                "acquired framebuffer lost its slot",
+            ))?;
+        if entry.ownership != SlotOwnership::Queued {
+            return Err(FramebufferError::Malformed(
+                "framebuffer acquisition requires a queued slot",
+            ));
+        }
+        entry.ownership = SlotOwnership::Acquired;
+        self.acquired = Some(AcquiredBuffer {
+            slot,
+            release_frame: frame.saturating_add(u64::from(interval)),
+        });
+        self.signal_dequeue_condition();
+        Ok(())
+    }
+    fn release_acquired(&mut self, frame: u64) -> Option<i32> {
+        let acquired = self.acquired.as_ref()?;
+        if acquired.release_frame > frame {
+            return None;
+        }
+        let slot_index = self.acquired.take().unwrap().slot;
+        let slot = self
+            .slots
+            .get_mut(&slot_index)
+            .expect("acquired framebuffer slot");
+        assert_eq!(slot.ownership, SlotOwnership::Acquired);
         slot.ownership = SlotOwnership::Free;
-        // Composition is complete synchronously before this transition, so no
-        // future guest GPU point is required for the next producer dequeue.
-        slot.release_fences = Box::default();
-        self.update_availability();
-        true
+        // The pinned consumer retains the queued fence here. Dequeue returns
+        // it to the producer, then resets the slot's fence to NoFence.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvnflinger/buffer_queue_consumer.cpp#L145-L150
+        self.signal_dequeue_condition();
+        Some(slot_index)
     }
 
     fn commit_queue(
         &mut self,
         slot_index: i32,
         presentation_source: Option<PresentationImageRequest>,
+        sticky_transform: u32,
     ) -> bool {
         let Some(slot) = self.slots.get_mut(&slot_index) else {
             return false;
@@ -1401,6 +1514,8 @@ impl BufferQueue {
         self.frame_counter += 1;
         slot.frame_number = self.frame_counter;
         slot.ownership = SlotOwnership::Queued;
+        self.sticky_transform = sticky_transform;
+        self.signal_dequeue_condition();
         true
     }
 
@@ -1411,13 +1526,6 @@ impl BufferQueue {
             slot.ownership = SlotOwnership::Dequeued;
         }
     }
-}
-
-fn write_buffer_output(writer: &mut ParcelWriter, pending: u32) {
-    writer.write_u32(DEFAULT_WIDTH);
-    writer.write_u32(DEFAULT_HEIGHT);
-    writer.write_u32(0);
-    writer.write_u32(pending);
 }
 
 fn parse_graphic_buffer(bytes: &[u8]) -> Result<GraphicBuffer, ParcelError> {
@@ -1492,6 +1600,9 @@ fn parse_graphic_buffer(bytes: &[u8]) -> Result<GraphicBuffer, ParcelError> {
         });
     }
     Ok(GraphicBuffer {
+        width: word(1)?,
+        height: word(2)?,
+        window_format: word(4)?,
         nvmap_id: int(1)?,
         stride_pixels: int(9)?,
         format: int(7)?,
@@ -1535,7 +1646,7 @@ fn parse_queue_buffer_input(bytes: &[u8]) -> Result<QueueBufferInput, ParcelErro
     })
 }
 
-fn parse_nv_multi_fence(bytes: &[u8]) -> Result<Box<[NvFence]>, ParcelError> {
+fn parse_nv_multi_fence(bytes: &[u8]) -> Result<NvMultiFence, ParcelError> {
     if bytes.len() < 36 {
         return Err(ParcelError::Malformed("NvMultiFence is truncated"));
     }
@@ -1547,18 +1658,18 @@ fn parse_nv_multi_fence(bytes: &[u8]) -> Result<Box<[NvFence]>, ParcelError> {
             "NvMultiFence contains too many fences",
         ));
     }
-    Ok((0..count)
-        .map(|index| {
-            let offset = 4 + index * 8;
-            NvFence {
-                point: GuestTimelinePoint::new(
-                    GuestSyncpointId::new(u32_at(offset)),
-                    GuestSyncpointValue::new(u32_at(offset + 4)),
-                ),
-            }
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice())
+    let mut result = NvMultiFence {
+        count,
+        ..NvMultiFence::default()
+    };
+    for (index, fence) in result.entries[..count].iter_mut().enumerate() {
+        let offset = 4 + index * 8;
+        fence.point = GuestTimelinePoint::new(
+            GuestSyncpointId::new(u32_at(offset)),
+            GuestSyncpointValue::new(u32_at(offset + 4)),
+        );
+    }
+    Ok(result)
 }
 
 fn encode_nv_multi_fence(fences: &[NvFence]) -> [u8; 36] {
@@ -1665,6 +1776,7 @@ fn present_format(
 fn presentable_image_request(
     buffer: &GraphicBuffer,
     object: &NvMapObject,
+    nvdrv: &NvDrvSession,
 ) -> Result<PresentationImageRequest, FramebufferError> {
     let plane = buffer.primary_plane();
     // C32_2CRA may be scanned out from its rendered representation. Its plane
@@ -1700,43 +1812,26 @@ fn presentable_image_request(
             layer_stride: pixel_size,
         })
     };
-    let inputs = nixe_memory::capture_subrange(
-        object.ranges().ok_or(FramebufferError::Malformed(
-            "queued graphic buffer has no physical storage",
-        ))?,
-        u64::from(plane.offset),
-        pixel_size,
-    )
-    .map_err(|_| FramebufferError::Malformed("queued image plane range is invalid"))?;
-    let physical = nixe_gpu::physical::PhysicalMapping::new(&inputs).map_err(|_| {
-        FramebufferError::Malformed("queued image plane has invalid physical mapping")
-    })?;
-    let allocation = GpuAllocationDescription::new(
-        u64::from(object.size()),
-        u64::from(
-            object
-                .allocation_metadata()
-                .expect("a physically backed nvmap object has allocation metadata")
-                .alignment(),
-        ),
-    )
-    .map_err(|_| FramebufferError::Malformed("queued nvmap allocation is invalid"))?;
-    let backing = BackingView::new(
-        GpuAllocationId::new(object.id().raw()),
-        allocation,
-        u64::from(plane.offset),
-        physical,
-    )
-    .map_err(|_| FramebufferError::Malformed("queued presentation view is invalid"))?;
+    let mapping = nvdrv
+        .pin_framebuffer(object)
+        .map_err(|error| FramebufferError::Backend(error.to_string().into()))?;
     Ok(PresentationImageRequest {
+        crop: FrameCrop {
+            left: 0,
+            top: 0,
+            width: plane.width,
+            height: plane.height,
+        },
+        transform: FrameTransform::default(),
         allow_canonical_import,
-        backing,
+        mapping,
+        offset: u64::from(plane.offset),
+        size: pixel_size,
         width: plane.width,
         height: plane.height,
         format,
         layout,
         row_pitch: plane.pitch,
-        inputs,
     })
 }
 
@@ -1818,1405 +1913,4 @@ pub(crate) fn encode_native_window(binder_id: i32) -> Vec<u8> {
     // The sole object table entry at 0x38 is zero: the payload-relative offset
     // of the flattened Binder handle. All reserved fields remain zero.
     parcel
-}
-
-#[cfg(test)]
-mod tests {
-    use nixe_gpu::{
-        BackendExecutionCompletion, BackendInstanceId, BackendRuntimeError, BackendSubmissionToken,
-        ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageKind, SampleCount,
-    };
-    use nixe_memory::{AddressWidth, GuestVirtualAddress, Machine, MemoryPermissions};
-    use nixe_runtime::{
-        ProcessVirtualRegion,
-        memory::{Mapping, MemoryKind, ProcessMemory},
-    };
-    use nixe_video::FrameNotifier;
-
-    use super::*;
-
-    #[test]
-    fn display_deadline_advances_without_input_samples() {
-        let video = VideoSystem::new(
-            Machine::new(64 * 1024 * 1024).unwrap(),
-            &crate::test_memory::kernel(),
-        );
-        let first = video.next_display_deadline();
-        assert!(first > Duration::ZERO);
-        assert_eq!(video.advance(first - Duration::from_nanos(1)).unwrap(), 0);
-        assert_eq!(video.next_display_deadline(), first);
-        assert_eq!(video.advance(first).unwrap(), 1);
-        assert_eq!(video.next_display_deadline(), first * 2);
-    }
-
-    #[test]
-    fn display_clients_have_independent_events_and_unregister_on_last_close() {
-        let video = VideoSystem::new(
-            Machine::new(64 * 1024 * 1024).unwrap(),
-            &crate::test_memory::kernel(),
-        );
-        let first = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
-        let duplicate = first.clone();
-        let second = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
-        let a = first.vsync_event(DEFAULT_DISPLAY_ID).unwrap();
-        assert_eq!(
-            duplicate.vsync_event(DEFAULT_DISPLAY_ID).unwrap_err(),
-            crate::HorizonIpcResult::VI_PERMISSION_DENIED
-        );
-        assert!(!a.is_signalled());
-        video.advance(video.next_display_deadline()).unwrap();
-        assert!(a.is_signalled());
-        let b = second.vsync_event(DEFAULT_DISPLAY_ID).unwrap();
-        assert!(
-            !b.is_signalled(),
-            "a new client must not inherit an earlier tick"
-        );
-        a.clear();
-        drop(first);
-        video.advance(video.next_display_deadline()).unwrap();
-        assert!(a.is_signalled());
-        assert!(b.is_signalled());
-        a.clear();
-        b.clear();
-        drop(duplicate);
-        video.advance(video.next_display_deadline()).unwrap();
-        assert!(
-            !a.is_signalled(),
-            "the closed client must no longer receive ticks"
-        );
-        assert!(b.is_signalled());
-        drop(second);
-        assert!(video.state.lock().unwrap().vsync_events.is_empty());
-    }
-
-    fn rgba_pitch_buffer(nvmap_id: u32) -> GraphicBuffer {
-        GraphicBuffer {
-            nvmap_id,
-            stride_pixels: 4,
-            format: 1,
-            external_format: 1,
-            usage: 0x100,
-            total_size: 0x1000,
-            planes: vec![GraphicBufferPlane {
-                width: 4,
-                height: 4,
-                color_format: 0x0100_532120,
-                layout: 1,
-                pitch: 16,
-                offset: 0,
-                kind: 0,
-                block_height_log2: 0,
-                scan_format: 0,
-                second_field_offset: 0,
-                flags: 0,
-                size: 64,
-            }]
-            .into_boxed_slice(),
-        }
-    }
-
-    fn video_with_rgba_nvmap() -> (VideoSystem, i32, GraphicBuffer) {
-        let machine = Machine::new(64 * 1024 * 1024).unwrap();
-        configure_rgba_nvmap(
-            VideoSystem::new(machine.clone(), &crate::test_memory::kernel()),
-            machine,
-        )
-    }
-
-    fn rgb565_block_buffer(nvmap_id: u32) -> GraphicBuffer {
-        GraphicBuffer {
-            nvmap_id,
-            stride_pixels: 32,
-            format: 4,
-            external_format: 4,
-            usage: 0x100,
-            total_size: 0x1000,
-            planes: vec![GraphicBufferPlane {
-                width: 32,
-                height: 16,
-                color_format: 0x010a_881210,
-                layout: 3,
-                pitch: 64,
-                offset: 0,
-                kind: 0xfe,
-                block_height_log2: 0,
-                scan_format: 0,
-                second_field_offset: 0,
-                flags: 0,
-                size: 0x1000,
-            }]
-            .into_boxed_slice(),
-        }
-    }
-
-    fn configure_rgba_nvmap(
-        video: VideoSystem,
-        machine: Machine,
-    ) -> (VideoSystem, i32, GraphicBuffer) {
-        let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
-        let nvdrv = video.nvdrv();
-        let account = machine.account(64 * 1024 * 1024).unwrap();
-        let allocation = account.allocate(0x1000).unwrap();
-        let memory = ProcessMemory::new(
-            account,
-            machine.account(64 * 1024 * 1024).unwrap(),
-            AddressWidth::Bits32,
-            ProcessVirtualRegion::new(GuestVirtualAddress::new(0x1000000), 0x400000),
-            0,
-        )
-        .unwrap();
-        let address_space = memory.space().identity();
-        let address = GuestVirtualAddress::new(0x4000);
-        memory
-            .map(
-                address,
-                allocation,
-                0,
-                0x1000,
-                Mapping {
-                    kind: MemoryKind::Heap,
-                    permissions: MemoryPermissions::READ_WRITE,
-                    uncached: false,
-                    locked: false,
-                    permission_locked: false,
-                },
-            )
-            .unwrap();
-        nvdrv.initialize(0);
-        let fd = nvdrv.open(b"/dev/nvmap", 44).unwrap();
-        let mut create = [0_u8; 8];
-        create[..4].copy_from_slice(&0x1000_u32.to_le_bytes());
-        let (created, error) = nvdrv
-            .ioctl(fd, super::super::nvdrv::IOCTL_NVMAP_CREATE, &create)
-            .unwrap();
-        assert_eq!(error, super::super::nvdrv::NV_SUCCESS);
-        let handle = u32::from_le_bytes(created[4..8].try_into().unwrap());
-        let mut allocate = [0_u8; 32];
-        allocate[..4].copy_from_slice(&handle.to_le_bytes());
-        allocate[4..8].copy_from_slice(&0x4000_0000_u32.to_le_bytes());
-        allocate[12..16].copy_from_slice(&0x1000_u32.to_le_bytes());
-        allocate[24..32].copy_from_slice(&address.get().to_le_bytes());
-        assert_eq!(
-            nvdrv
-                .ioctl_with_memory(fd, 0xc020_0104, &allocate, 44, address_space, &memory)
-                .unwrap()
-                .1,
-            super::super::nvdrv::NV_SUCCESS
-        );
-        let mut get_id = [0_u8; 8];
-        get_id[4..8].copy_from_slice(&handle.to_le_bytes());
-        let (get_id, error) = nvdrv.ioctl(fd, 0xc008_010e, &get_id).unwrap();
-        assert_eq!(error, super::super::nvdrv::NV_SUCCESS);
-        let exported_id = u32::from_le_bytes(get_id[..4].try_into().unwrap());
-        (video, layer.binder_id, rgba_pitch_buffer(exported_id))
-    }
-
-    #[derive(Debug)]
-    struct ResidentTestRuntime {
-        preparation_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
-    }
-
-    impl ResidentTestRuntime {
-        fn new() -> Self {
-            Self {
-                preparation_gate: None,
-            }
-        }
-    }
-
-    impl nixe_gpu::GpuExecution for ResidentTestRuntime {
-        fn end_command_list(&mut self) -> Result<(), nixe_gpu::BackendRuntimeError> {
-            Ok(())
-        }
-        fn signal_fence(
-            &mut self,
-            _: nixe_gpu::FrontendSubmissionId,
-        ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
-            unreachable!("presentation fixture emits no syncpoint")
-        }
-        type Commands = nixe_gpu::native::NativeWork;
-        type ImageRequest = nixe_gpu::native::NativePresentationImage;
-        fn flush(&mut self) -> Result<(), nixe_gpu::BackendRuntimeError> {
-            Ok(())
-        }
-        fn consume(&mut self, _batch: &Self::Commands) -> Result<bool, BackendRuntimeError> {
-            unreachable!("resident presentation fixture records no GPU work")
-        }
-        fn submit(
-            &mut self,
-            _frontend: nixe_gpu::FrontendSubmissionId,
-        ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
-            unreachable!("resident presentation fixture submits no GPU work")
-        }
-        fn poll_completion(
-            &mut self,
-        ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-            Ok(None)
-        }
-
-        fn access_memory(
-            &mut self,
-            _: Vec<nixe_memory::AllocationRange>,
-            _: nixe_memory::AccessOperation,
-        ) -> Result<nixe_gpu::OwnerAccess, BackendRuntimeError> {
-            unreachable!("presentation fixture consumes no guest memory")
-        }
-        unsafe fn memory_written(
-            &mut self,
-            _: nixe_memory::MachineId,
-            _: &[(nixe_memory::AllocationId, nixe_memory::Extent)],
-        ) -> Result<(), BackendRuntimeError> {
-            unreachable!("fixture does not produce native memory")
-        }
-        fn queue_device_access(
-            &mut self,
-            _: nixe_memory::DeviceAccessRequest,
-        ) -> Result<(), BackendRuntimeError> {
-            unreachable!("presentation fixture has no device-written memory")
-        }
-        fn cancel_device_access(
-            &mut self,
-            _: nixe_memory::AccessRequestId,
-        ) -> Result<(), BackendRuntimeError> {
-            unreachable!("presentation fixture has no pending access")
-        }
-        fn progress(&mut self) -> Result<(), BackendRuntimeError> {
-            Ok(())
-        }
-        fn fail_device_accesses(&mut self, _: Arc<nixe_memory::MemoryError>) {}
-        fn retire_physical_memory(
-            &mut self,
-            _: nixe_memory::MachineId,
-            _: nixe_memory::AllocationId,
-            _: &[nixe_memory::Extent],
-        ) -> Result<(), BackendRuntimeError> {
-            Ok(())
-        }
-        fn release_guest_memory(
-            &mut self,
-            _: nixe_memory::MachineId,
-            _: nixe_memory::AllocationId,
-        ) -> Result<(), BackendRuntimeError> {
-            Ok(())
-        }
-        fn allocation_pressure(
-            &mut self,
-            _: nixe_memory::MachineId,
-            _: u64,
-        ) -> Result<(), BackendRuntimeError> {
-            Ok(())
-        }
-
-        fn acquire_presentable_image(
-            &mut self,
-            request: Self::ImageRequest,
-            _swap_interval: u32,
-        ) -> Result<ResidentImage, BackendRuntimeError> {
-            if let Some((entered, release)) = &self.preparation_gate {
-                entered.send(()).unwrap();
-                release.recv().unwrap();
-            }
-            let instance = BackendInstanceId::new(7);
-            let description = ImageDescription::new(
-                ImageDimension::Two,
-                ImageExtent {
-                    width: request.extent[0],
-                    height: request.extent[1],
-                    depth: 1,
-                },
-                match request.format {
-                    PresentationImageFormat::Rgba8
-                    | PresentationImageFormat::Rgbx8
-                    | PresentationImageFormat::Rgb565
-                    | PresentationImageFormat::Rgba4444 => ImageFormat::Rgba8Unorm,
-                    PresentationImageFormat::Bgra8 => ImageFormat::Bgra8Unorm,
-                },
-                ImageKind::Color,
-                1,
-                1,
-                SampleCount::One,
-            )
-            .unwrap();
-            Ok(ResidentImage::from_lease(
-                description,
-                nixe_gpu::PresentationLease::new(
-                    nixe_gpu::PresentationImageId {
-                        slot: 1,
-                        generation: 1,
-                    },
-                    1,
-                    BackendSubmissionToken::new(instance, 1, 1),
-                    std::sync::mpsc::channel().0,
-                ),
-            ))
-        }
-
-        fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
-            Ok(())
-        }
-    }
-
-    #[derive(Debug)]
-    struct ResidentTestNotifier;
-
-    impl FrameNotifier for ResidentTestNotifier {
-        fn frame_available(&self) {}
-    }
-
-    #[test]
-    fn failed_or_lost_resident_image_reply_stops_presentation() {
-        for failure in [Some("image preparation failed"), None] {
-            let video = VideoSystem::new(
-                Machine::new(64 * 1024 * 1024).unwrap(),
-                &crate::test_memory::kernel(),
-            );
-            let (sender, receiver) = std::sync::mpsc::channel();
-            video
-                .state
-                .lock()
-                .unwrap()
-                .queues
-                .insert(1, BufferQueue::new(&crate::test_memory::kernel(), 1));
-            video
-                .state
-                .lock()
-                .unwrap()
-                .pending_frames
-                .push_back(PendingFrame {
-                    binder_id: 1,
-                    slot: 0,
-                    acquire_fences: Box::default(),
-                    swap_interval: 1,
-                    acquired: false,
-                    presentation: Some(PendingPresentation {
-                        image: receiver,
-                        crop: frame_crop(CropRect {
-                            left: 0,
-                            top: 0,
-                            right: 4,
-                            bottom: 4,
-                        })
-                        .unwrap(),
-                        transform: frame_transform(0).unwrap(),
-                    }),
-                });
-            if let Some(message) = failure {
-                sender.send(Err(Box::<str>::from(message))).unwrap();
-            }
-            drop(sender);
-            let error = video.advance(Duration::from_millis(17)).unwrap_err();
-            assert_eq!(
-                error,
-                FramebufferError::Backend(
-                    failure
-                        .unwrap_or("GPU resident-image reply was lost")
-                        .into(),
-                )
-            );
-            assert_eq!(video.state.lock().unwrap().pending_frames.len(), 1);
-        }
-    }
-
-    #[test]
-    fn native_window_contains_a_flattened_binder_and_its_object_offset() {
-        let encoded = encode_native_window(7);
-        let word =
-            |offset| u32::from_le_bytes(encoded[offset..offset + 4].try_into().unwrap()) as usize;
-        let data = &encoded[word(4)..word(4) + word(0)];
-        let objects = &encoded[word(12)..word(12) + word(8)];
-        assert_eq!(objects.len(), 4);
-        let object_offset = u32::from_le_bytes(objects.try_into().unwrap()) as usize;
-        assert_eq!(object_offset, 0);
-        let binder = &data[object_offset..object_offset + 0x28];
-        assert_eq!(u32::from_le_bytes(binder[..4].try_into().unwrap()), 2);
-        assert_eq!(i32::from_le_bytes(binder[8..12].try_into().unwrap()), 7);
-        assert_eq!(&binder[0x18..0x20], b"dispdrv\0");
-        assert_eq!(&binder[4..8], &[0; 4]);
-        assert_eq!(&binder[12..24], &[0; 12]);
-        assert_eq!(&binder[32..40], &[0; 8]);
-        assert_eq!(word(12) + objects.len(), encoded.len());
-    }
-
-    #[test]
-    fn software_framebuffer_becomes_a_retained_gpu_import_request() {
-        let (video, _, rgba) = video_with_rgba_nvmap();
-        let buffer = rgb565_block_buffer(rgba.nvmap_id);
-        let object = video
-            .nvdrv()
-            .nvmap_object_by_id(NvMapExportedId::new(buffer.nvmap_id))
-            .unwrap();
-
-        let request = presentable_image_request(&buffer, &object).unwrap();
-
-        assert_eq!(request.format, PresentationImageFormat::Rgb565);
-        assert_eq!(request.backing.size(), 0x1000);
-        assert_eq!(request.row_pitch, 64);
-        assert_eq!(
-            request.layout,
-            ImageMemoryLayout::BlockLinear(BlockLinearLayout {
-                block_width_log2: 0,
-                block_height_log2: 0,
-                block_depth_log2: 0,
-                layer_stride: 0x1000,
-            })
-        );
-    }
-
-    #[test]
-    fn compressed_scanout_requires_a_resident_image_and_excludes_metadata_padding() {
-        let (video, _, mut buffer) = video_with_rgba_nvmap();
-        buffer.planes[0].layout = 3;
-        buffer.planes[0].kind = 0xdb;
-        buffer.planes[0].pitch = 64;
-        buffer.planes[0].block_height_log2 = 0;
-        buffer.planes[0].size = 0x1000;
-        let object = video
-            .nvdrv()
-            .nvmap_object_by_id(NvMapExportedId::new(buffer.nvmap_id))
-            .unwrap();
-        validate_present_descriptor(&buffer, None).unwrap();
-        let request = presentable_image_request(&buffer, &object).unwrap();
-        assert!(!request.allow_canonical_import);
-        assert_eq!(request.backing.size(), 512);
-        assert!(matches!(
-            request.layout,
-            ImageMemoryLayout::BlockLinear(BlockLinearLayout {
-                layer_stride: 512,
-                ..
-            })
-        ));
-        buffer.planes[0].kind = 0xdc;
-        assert!(validate_present_descriptor(&buffer, None).is_err());
-    }
-
-    #[test]
-    fn layers_have_stable_distinct_binder_objects() {
-        let video = VideoSystem::new(
-            Machine::new(64 * 1024 * 1024).unwrap(),
-            &crate::test_memory::kernel(),
-        );
-        let first = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
-        let second = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
-        assert_ne!(first.id, second.id);
-        assert_ne!(first.binder_id, second.binder_id);
-        assert_eq!(video.layer(first.id), Some(first));
-    }
-
-    #[test]
-    fn closing_a_vi_connection_preserves_the_managed_layer_and_shared_session_ownership() {
-        let video = VideoSystem::new(
-            Machine::new(64 * 1024 * 1024).unwrap(),
-            &crate::test_memory::kernel(),
-        );
-        let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
-        let session = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
-        let cloned = session.clone();
-        let unrelated = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
-        assert!(!session.close_layer(layer.id));
-        assert_eq!(session.open_layer(layer.id), Some(layer.clone()));
-        assert!(cloned.open_layer(layer.id).is_none());
-        assert!(!unrelated.close_layer(layer.id));
-        assert!(cloned.close_layer(layer.id));
-        assert!(!session.close_layer(layer.id));
-        assert_eq!(video.layer(layer.id), Some(layer.clone()));
-        assert_eq!(session.open_layer(layer.id), Some(layer.clone()));
-        assert!(video.remove_layer(layer.id));
-        assert!(session.open_layer(layer.id).is_none());
-        assert!(!session.close_layer(layer.id));
-    }
-
-    #[test]
-    fn layer_geometry_and_binder_references_are_retained() {
-        let video = VideoSystem::new(
-            Machine::new(64 * 1024 * 1024).unwrap(),
-            &crate::test_memory::kernel(),
-        );
-        let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
-
-        assert!(video.set_layer_position(layer.id, 12.5, -4.0));
-        assert!(video.set_layer_size(layer.id, 640, 360));
-        assert!(video.set_layer_z(layer.id, -3));
-        let updated = video.layer(layer.id).unwrap();
-        assert_eq!((updated.x, updated.y), (12.5, -4.0));
-        assert_eq!((updated.width, updated.height, updated.z), (640, 360, -3));
-
-        assert!(video.adjust_binder_refcount(layer.binder_id, 1, 0));
-        assert!(video.adjust_binder_refcount(layer.binder_id, 1, 1));
-        assert!(video.adjust_binder_refcount(layer.binder_id, -1, 1));
-        assert!(!video.adjust_binder_refcount(layer.binder_id, -1, 1));
-        assert!(!video.adjust_binder_refcount(layer.binder_id, 1, 2));
-    }
-
-    #[test]
-    fn graphics_teardown_releases_layers_queues_and_nvdrv_state() {
-        let video = VideoSystem::new(
-            Machine::new(64 * 1024 * 1024).unwrap(),
-            &crate::test_memory::kernel(),
-        );
-        let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
-        let nvdrv = video.nvdrv();
-        nvdrv.initialize(0);
-        let map_fd = nvdrv.open(b"/dev/nvmap", 1).unwrap();
-        let _gpu_fd = nvdrv.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
-        let mut create = [0_u8; 8];
-        create[..4].copy_from_slice(&0x1000_u32.to_le_bytes());
-        nvdrv
-            .ioctl(map_fd, super::super::nvdrv::IOCTL_NVMAP_CREATE, &create)
-            .unwrap();
-        let mut tpc_masks = [0_u8; 24];
-        tpc_masks[0..4].copy_from_slice(&8_u32.to_le_bytes());
-        tpc_masks[8..16].copy_from_slice(&1_u64.to_le_bytes());
-        assert_eq!(
-            nvdrv.ioctl(_gpu_fd, 0xc018_4706, &tpc_masks).unwrap().1,
-            super::super::nvdrv::NV_SUCCESS
-        );
-
-        assert_eq!(video.active_layer_count(), 1);
-        assert!(video.binder_event(layer.binder_id).is_some());
-        assert_eq!(
-            video.teardown(),
-            GraphicsTeardownReport {
-                layers_released: 1,
-                queues_released: 1,
-                pending_frames_released: 0,
-                device_fds_released: 2,
-                allocations_released: 1,
-            }
-        );
-        assert_eq!(video.active_layer_count(), 0);
-        assert!(video.binder_event(layer.binder_id).is_none());
-        assert_eq!(video.teardown(), GraphicsTeardownReport::default());
-    }
-
-    #[test]
-    fn queue_buffer_input_preserves_crop_transform_timing_and_fences() {
-        let mut bytes = [0_u8; 84];
-        bytes[0..8].copy_from_slice(&123_i64.to_le_bytes());
-        bytes[8..12].copy_from_slice(&1_i32.to_le_bytes());
-        for (offset, value) in [(12, 2_i32), (16, 3), (20, 10), (24, 20)] {
-            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        }
-        bytes[28..32].copy_from_slice(&7_u32.to_le_bytes());
-        bytes[32..36].copy_from_slice(&5_u32.to_le_bytes());
-        bytes[36..40].copy_from_slice(&4_u32.to_le_bytes());
-        bytes[44..48].copy_from_slice(&1_u32.to_le_bytes());
-        bytes[48..52].copy_from_slice(&1_u32.to_le_bytes());
-        bytes[52..56].copy_from_slice(&9_u32.to_le_bytes());
-        bytes[56..60].copy_from_slice(&44_u32.to_le_bytes());
-
-        let input = parse_queue_buffer_input(&bytes).unwrap();
-        assert_eq!(input.timestamp, 123);
-        assert!(input.auto_timestamp);
-        assert_eq!(
-            input.crop,
-            CropRect {
-                left: 2,
-                top: 3,
-                right: 10,
-                bottom: 20
-            }
-        );
-        assert_eq!(
-            (input.scaling_mode, input.transform, input.sticky_transform),
-            (7, 5, 4)
-        );
-        assert_eq!(input.swap_interval, 1);
-        assert_eq!(input.acquire_fences[0].point.to_string(), "syncpoint=9:44");
-    }
-
-    #[test]
-    fn graphic_buffer_parser_preserves_all_registered_planes_and_usage() {
-        let mut words = vec![0_u32; 10 + 81];
-        words[0] = 0x4742_4652;
-        words[9] = 81;
-        let int = |index: usize| 10 + index;
-        words[int(1)] = 77;
-        words[int(3)] = 0xdaff_caff;
-        words[int(6)] = 0x1234_5678;
-        words[int(7)] = 1;
-        words[int(8)] = 5;
-        words[int(9)] = 128;
-        words[int(10)] = 0x6000;
-        words[int(11)] = 3;
-        for plane in 0..3_usize {
-            let base = 13 + plane * 22;
-            words[int(base)] = 128 >> plane;
-            words[int(base + 1)] = 64 >> plane;
-            words[int(base + 2)] = 0x532120 + u32::try_from(plane).unwrap();
-            words[int(base + 3)] = 1;
-            words[int(base + 4)] = if plane == 0 { 3 } else { 1 };
-            words[int(base + 5)] = 512 >> plane;
-            words[int(base + 7)] = u32::try_from(plane * 0x2000).unwrap();
-            words[int(base + 8)] = if plane == 0 { 0xfe } else { 0 };
-            words[int(base + 9)] = u32::try_from(plane).unwrap();
-            words[int(base + 10)] = 9;
-            words[int(base + 11)] = 10;
-            words[int(base + 12)] = 11;
-            words[int(base + 13)] = 12;
-            words[int(base + 14)] = 0x2000;
-        }
-        let bytes = words
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect::<Vec<_>>();
-
-        let parsed = parse_graphic_buffer(&bytes).unwrap();
-        assert_eq!(
-            (parsed.nvmap_id, parsed.usage, parsed.external_format),
-            (77, 0x1234_5678, 5)
-        );
-        assert_eq!(parsed.planes.len(), 3);
-        assert_eq!(
-            (parsed.planes[2].width, parsed.planes[2].offset),
-            (32, 0x4000)
-        );
-        assert_eq!(
-            (
-                parsed.planes[1].scan_format,
-                parsed.planes[1].second_field_offset
-            ),
-            (9, 10)
-        );
-        assert_eq!(parsed.planes[0].flags, (u64::from(12_u32) << 32) | 11);
-    }
-
-    fn producer_request() -> ParcelWriter {
-        let mut writer = ParcelWriter::default();
-        writer.write_u32(0x100);
-        let token = IGRAPHIC_BUFFER_PRODUCER.encode_utf16().collect::<Vec<_>>();
-        writer.write_i32(i32::try_from(token.len()).unwrap());
-        let mut bytes = token
-            .into_iter()
-            .chain([0])
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>();
-        bytes.resize((bytes.len() + 3) & !3, 0);
-        for word in bytes.chunks_exact(4) {
-            writer.write_u32(u32::from_le_bytes(word.try_into().unwrap()));
-        }
-        writer
-    }
-
-    #[test]
-    fn producer_connection_tracks_api_and_rejects_mismatched_disconnects() {
-        let connect = |api| {
-            let mut request = producer_request();
-            for value in [0, api, 0] {
-                request.write_i32(value);
-            }
-            request.finish().unwrap()
-        };
-        let disconnect = |api| {
-            let mut request = producer_request();
-            request.write_i32(api);
-            request.finish().unwrap()
-        };
-        let status = |reply: BinderTransaction, connect: bool| {
-            let mut reader = ParcelReader::decode(&reply.reply).unwrap();
-            if connect {
-                for _ in 0..4 {
-                    reader.read_u32().unwrap();
-                }
-            }
-            reader.read_i32().unwrap()
-        };
-        for api in 1..=4 {
-            let mut queue = BufferQueue::new(&crate::test_memory::kernel(), 4);
-            assert_eq!(status(queue.transact(10, &connect(api)).unwrap(), true), 0);
-            assert_eq!(queue.connected_api, Some(api));
-            assert_eq!(
-                status(queue.transact(10, &connect(api)).unwrap(), true),
-                -22
-            );
-            assert_eq!(
-                status(queue.transact(11, &disconnect(api % 4 + 1)).unwrap(), false),
-                -22
-            );
-            assert_eq!(queue.connected_api, Some(api));
-            queue.next_acquire_sequence = 100;
-            queue.blocked_this_advance = true;
-            assert_eq!(
-                status(queue.transact(11, &disconnect(api)).unwrap(), false),
-                0
-            );
-            assert!((queue.connected_api).is_none());
-            assert_eq!(queue.next_acquire_sequence, 0);
-            assert!(!queue.blocked_this_advance);
-            assert_eq!(
-                status(queue.transact(11, &disconnect(api)).unwrap(), false),
-                -19
-            );
-        }
-        for api in [0, 5, -1] {
-            let mut queue = BufferQueue::new(&crate::test_memory::kernel(), 4);
-            assert_eq!(
-                status(queue.transact(10, &connect(api)).unwrap(), true),
-                -22
-            );
-            assert!((queue.connected_api).is_none());
-        }
-    }
-
-    #[test]
-    fn set_buffer_count_limits_dequeue_and_respects_producer_ownership() {
-        let mut queue = BufferQueue::new(&crate::test_memory::kernel(), 4);
-        let slot = BufferSlot {
-            ownership: SlotOwnership::Free,
-            frame_number: 0,
-            buffer: GraphicBuffer {
-                nvmap_id: 1,
-                stride_pixels: 1,
-                format: 1,
-                external_format: 1,
-                usage: 0,
-                total_size: 4,
-                planes: Box::new([]),
-            },
-            flattened_buffer: Box::new([]),
-            presentation_source: None,
-            release_fences: Box::new([]),
-        };
-        for index in 0..3 {
-            queue.slots.insert(index, slot.clone());
-        }
-        let set_count = |queue: &mut BufferQueue, count| {
-            let mut request = producer_request();
-            request.write_i32(count);
-            let reply = queue.transact(2, &request.finish().unwrap()).unwrap();
-            ParcelReader::decode(&reply.reply)
-                .unwrap()
-                .read_i32()
-                .unwrap()
-        };
-        let dequeue = |queue: &mut BufferQueue| {
-            let mut request = producer_request();
-            for value in [0, 1, 1, 1, 0] {
-                request.write_i32(value);
-            }
-            let reply = queue.transact(3, &request.finish().unwrap()).unwrap();
-            let mut reader = ParcelReader::decode(&reply.reply).unwrap();
-            let slot = reader.read_i32().unwrap();
-            if reader.read_i32().unwrap() != 0 {
-                reader.read_flattened().unwrap();
-            }
-            (slot, reader.read_i32().unwrap())
-        };
-        let cancel = |queue: &mut BufferQueue, index| {
-            let mut request = producer_request();
-            request.write_i32(index);
-            request
-                .write_flattened(&encode_nv_multi_fence(&[]))
-                .unwrap();
-            queue.transact(8, &request.finish().unwrap()).unwrap();
-        };
-
-        for invalid in [-1, MAX_BUFFER_SLOTS + 1] {
-            assert_eq!(set_count(&mut queue, invalid), -22);
-        }
-        assert_eq!(set_count(&mut queue, 3), 0);
-        let mut connect = producer_request();
-        for value in [0, 2, 0] {
-            connect.write_i32(value);
-        }
-        queue.transact(10, &connect.finish().unwrap()).unwrap();
-        assert!(queue.available_event.readable().is_signalled());
-        for index in 0..3 {
-            assert_eq!(dequeue(&mut queue), (index, 0));
-        }
-        assert!(!queue.available_event.readable().is_signalled());
-        assert_eq!(set_count(&mut queue, 2), -22);
-        assert_eq!(queue.override_max_buffer_count, 3);
-
-        for index in 0..3 {
-            cancel(&mut queue, index);
-        }
-        assert_eq!(set_count(&mut queue, 2), 0);
-        assert_eq!(dequeue(&mut queue), (0, 0));
-        assert_eq!(dequeue(&mut queue), (1, 0));
-        assert_eq!(dequeue(&mut queue), (-1, -11));
-        assert!(!queue.available_event.readable().is_signalled());
-        cancel(&mut queue, 0);
-        cancel(&mut queue, 1);
-        assert_eq!(set_count(&mut queue, 0), 0);
-        assert_eq!(queue.max_buffer_count(), 2);
-
-        assert_eq!(set_count(&mut queue, 3), 0);
-        for index in [2, 1, 0] {
-            queue.slots.get_mut(&index).unwrap().ownership = SlotOwnership::Queueing;
-            assert!(queue.commit_queue(index, None));
-            assert!(queue.release(index));
-        }
-        for index in [2, 1, 0] {
-            assert_eq!(dequeue(&mut queue), (index, 0));
-        }
-        // Cancelled buffers are eligible immediately, ahead of queued history.
-        cancel(&mut queue, 0);
-        cancel(&mut queue, 2);
-        assert_eq!(dequeue(&mut queue), (0, 0));
-        assert_eq!(dequeue(&mut queue), (2, 0));
-    }
-
-    #[test]
-    fn request_buffer_returns_the_registered_descriptor_only_to_its_producer() {
-        let mut queue = BufferQueue::new(&crate::test_memory::kernel(), 4);
-        let request = |slot| {
-            let mut writer = producer_request();
-            writer.write_i32(slot);
-            writer.finish().unwrap()
-        };
-        let assert_error = |reply: &[u8], status| {
-            let mut reader = ParcelReader::decode(reply).unwrap();
-            assert_eq!(reader.read_i32().unwrap(), 0);
-            assert_eq!(reader.read_i32().unwrap(), status);
-        };
-        assert_error(&queue.transact(1, &request(0)).unwrap().reply, -19);
-
-        let mut connect = producer_request();
-        for value in [0, 2, 0] {
-            connect.write_i32(value);
-        }
-        let reply = queue.transact(10, &connect.finish().unwrap()).unwrap();
-        let mut reader = ParcelReader::decode(&reply.reply).unwrap();
-        for _ in 0..4 {
-            reader.read_u32().unwrap();
-        }
-        assert_eq!(reader.read_i32().unwrap(), 0);
-
-        // Include native-handle words the normalized presentation metadata does
-        // not retain, so reconstruction from GraphicBuffer cannot pass this test.
-        let mut words = (0..45_u32)
-            .map(|word| 0x1234_0000 + word)
-            .collect::<Vec<_>>();
-        words[..10].copy_from_slice(&[0x4742_4652, 128, 64, 128, 1, 0x300, 42, 0, 0, 35]);
-        words[11] = 77;
-        words[13] = 0xdaff_caff;
-        words[16..22].copy_from_slice(&[0x300, 1, 1, 128, 0x8000, 1]);
-        words[23..29].copy_from_slice(&[128, 64, 0x532120, 1, 1, 512]);
-        words[30..39].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0x8000, 0]);
-        let flattened = words
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let mut register = producer_request();
-        register.write_i32(0);
-        register.write_i32(1);
-        register.write_flattened(&flattened).unwrap();
-        queue.transact(14, &register.finish().unwrap()).unwrap();
-        assert_eq!(queue.override_max_buffer_count, 1);
-        assert_error(&queue.transact(1, &request(0)).unwrap().reply, -22);
-
-        let mut dequeue = producer_request();
-        for value in [0, 128, 64, 1, 0x300] {
-            dequeue.write_u32(value);
-        }
-        let reply = queue.transact(3, &dequeue.finish().unwrap()).unwrap();
-        let mut reader = ParcelReader::decode(&reply.reply).unwrap();
-        assert_eq!(reader.read_i32().unwrap(), 0);
-        assert_eq!(reader.read_i32().unwrap(), 1);
-        assert!(
-            parse_nv_multi_fence(reader.read_flattened().unwrap())
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(reader.read_i32().unwrap(), 0);
-
-        for _ in 0..2 {
-            let reply = queue.transact(1, &request(0)).unwrap();
-            let mut reader = ParcelReader::decode(&reply.reply).unwrap();
-            assert_eq!(reader.read_i32().unwrap(), 1);
-            assert_eq!(reader.read_flattened().unwrap(), flattened);
-            assert_eq!(reader.read_i32().unwrap(), 0);
-            assert_eq!(queue.slots[&0].ownership, SlotOwnership::Dequeued);
-        }
-        for slot in [-1, 1, MAX_BUFFER_SLOTS] {
-            assert_error(&queue.transact(1, &request(slot)).unwrap().reply, -22);
-        }
-        for ownership in [SlotOwnership::Queueing, SlotOwnership::Queued] {
-            queue.slots.get_mut(&0).unwrap().ownership = ownership;
-            assert_error(&queue.transact(1, &request(0)).unwrap().reply, -22);
-        }
-        queue.slots.get_mut(&0).unwrap().ownership = SlotOwnership::Dequeued;
-        let mut cancel = producer_request();
-        cancel.write_i32(0);
-        cancel.write_flattened(&encode_nv_multi_fence(&[])).unwrap();
-        queue.transact(8, &cancel.finish().unwrap()).unwrap();
-        assert_error(&queue.transact(1, &request(0)).unwrap().reply, -22);
-
-        let mut disconnect = producer_request();
-        disconnect.write_i32(2);
-        queue.transact(11, &disconnect.finish().unwrap()).unwrap();
-        assert!(queue.slots.is_empty());
-        assert_error(&queue.transact(1, &request(0)).unwrap().reply, -19);
-    }
-
-    #[test]
-    fn queue_reservation_rolls_back_without_releasing_producer_ownership() {
-        let buffer = GraphicBuffer {
-            nvmap_id: 1,
-            stride_pixels: 1,
-            format: 1,
-            external_format: 1,
-            usage: 0,
-            total_size: 4,
-            planes: vec![GraphicBufferPlane {
-                width: 1,
-                height: 1,
-                color_format: 0x0100_532120,
-                layout: 1,
-                pitch: 4,
-                offset: 0,
-                kind: 0,
-                block_height_log2: 0,
-                scan_format: 0,
-                second_field_offset: 0,
-                flags: 0,
-                size: 4,
-            }]
-            .into_boxed_slice(),
-        };
-        let mut queue = BufferQueue::new(&crate::test_memory::kernel(), 4);
-        queue.slots.insert(
-            2,
-            BufferSlot {
-                ownership: SlotOwnership::Queueing,
-                frame_number: 0,
-                buffer,
-                flattened_buffer: Box::default(),
-                presentation_source: None,
-                release_fences: Box::default(),
-            },
-        );
-
-        queue.rollback_queue(2);
-        assert_eq!(queue.slots[&2].ownership, SlotOwnership::Dequeued);
-        assert!(!queue.release(2));
-        queue.slots.get_mut(&2).unwrap().ownership = SlotOwnership::Queueing;
-        assert!(queue.commit_queue(2, None));
-        assert!(!queue.commit_queue(2, None));
-        assert!(queue.release(2));
-        assert_eq!(queue.slots[&2].ownership, SlotOwnership::Free);
-    }
-
-    #[test]
-    fn headless_discard_waits_for_the_acquire_fence_without_materializing_a_frame() {
-        let (video, binder_id, buffer) = video_with_rgba_nvmap();
-        let syncpoint = GuestSyncpointId::new(9);
-        video.nvdrv().install_test_timeline(syncpoint);
-        {
-            let mut state = video.state.lock().unwrap();
-            state.queues.get_mut(&binder_id).unwrap().slots.insert(
-                0,
-                BufferSlot {
-                    ownership: SlotOwnership::Queueing,
-                    frame_number: 0,
-                    buffer: buffer.clone(),
-                    flattened_buffer: Box::default(),
-                    presentation_source: None,
-                    release_fences: Box::default(),
-                },
-            );
-        }
-        video
-            .queue_graphic_buffer(
-                binder_id,
-                QueuedBufferRequest {
-                    slot: 0,
-                    buffer,
-                    presentation_source: None,
-                    input: QueueBufferInput {
-                        timestamp: 0,
-                        auto_timestamp: true,
-                        crop: CropRect {
-                            left: 0,
-                            top: 0,
-                            right: 4,
-                            bottom: 4,
-                        },
-                        scaling_mode: 0,
-                        transform: 0,
-                        sticky_transform: 0,
-                        swap_interval: 1,
-                        acquire_fences: vec![NvFence {
-                            point: GuestTimelinePoint::new(syncpoint, GuestSyncpointValue::new(1)),
-                        }]
-                        .into_boxed_slice(),
-                    },
-                },
-            )
-            .unwrap();
-
-        assert_eq!(video.advance(Duration::from_millis(17)).unwrap(), 1);
-        assert_eq!(
-            video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,
-            SlotOwnership::Queued
-        );
-
-        video.nvdrv().advance_test_timeline(syncpoint);
-        assert_eq!(video.advance(Duration::from_millis(34)).unwrap(), 1);
-        assert_eq!(
-            video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,
-            SlotOwnership::Free
-        );
-    }
-
-    fn queue_headless_test_frame(
-        video: &VideoSystem,
-        binder_id: i32,
-        buffer: &GraphicBuffer,
-        slot: i32,
-        swap_interval: u32,
-        acquire_fences: Box<[NvFence]>,
-    ) {
-        video
-            .state
-            .lock()
-            .unwrap()
-            .queues
-            .get_mut(&binder_id)
-            .unwrap()
-            .slots
-            .insert(
-                slot,
-                BufferSlot {
-                    ownership: SlotOwnership::Queueing,
-                    frame_number: 0,
-                    buffer: buffer.clone(),
-                    flattened_buffer: Box::default(),
-                    presentation_source: None,
-                    release_fences: Box::default(),
-                },
-            );
-        video
-            .queue_graphic_buffer(
-                binder_id,
-                QueuedBufferRequest {
-                    slot,
-                    buffer: buffer.clone(),
-                    presentation_source: None,
-                    input: QueueBufferInput {
-                        timestamp: 0,
-                        auto_timestamp: true,
-                        crop: CropRect {
-                            left: 0,
-                            top: 0,
-                            right: 4,
-                            bottom: 4,
-                        },
-                        scaling_mode: 0,
-                        transform: 0,
-                        sticky_transform: 0,
-                        swap_interval,
-                        acquire_fences,
-                    },
-                },
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn swap_interval_holds_the_previous_frame_without_throttling_other_producers() {
-        let (video, binder, buffer) = video_with_rgba_nvmap();
-        let other = video.create_layer(DEFAULT_DISPLAY_ID).unwrap().binder_id;
-        queue_headless_test_frame(&video, binder, &buffer, 0, 2, Box::default());
-        queue_headless_test_frame(&video, binder, &buffer, 1, 1, Box::default());
-        queue_headless_test_frame(&video, binder, &buffer, 2, 1, Box::default());
-        queue_headless_test_frame(&video, other, &buffer, 0, 1, Box::default());
-        queue_headless_test_frame(&video, other, &buffer, 1, 1, Box::default());
-        let ownership =
-            |producer, slot| video.state.lock().unwrap().queues[&producer].slots[&slot].ownership;
-        assert_eq!(video.advance(Duration::from_millis(17)).unwrap(), 1);
-        assert_eq!(ownership(binder, 0), SlotOwnership::Free);
-        assert_eq!(ownership(binder, 1), SlotOwnership::Queued);
-        assert_eq!(ownership(other, 0), SlotOwnership::Free);
-        assert_eq!(video.advance(Duration::from_millis(34)).unwrap(), 1);
-        assert_eq!(ownership(binder, 1), SlotOwnership::Queued);
-        assert_eq!(ownership(other, 1), SlotOwnership::Free);
-        assert_eq!(video.advance(Duration::from_millis(51)).unwrap(), 1);
-        assert_eq!(ownership(binder, 1), SlotOwnership::Free);
-        assert_eq!(ownership(binder, 2), SlotOwnership::Queued);
-        assert_eq!(video.advance(Duration::from_millis(68)).unwrap(), 1);
-        assert_eq!(ownership(binder, 2), SlotOwnership::Free);
-    }
-
-    #[test]
-    fn zero_swap_interval_does_not_wait_for_refresh_but_keeps_real_acquire_fences() {
-        let (video, binder, buffer) = video_with_rgba_nvmap();
-        let syncpoint = GuestSyncpointId::new(11);
-        video.nvdrv().install_test_timeline(syncpoint);
-        queue_headless_test_frame(
-            &video,
-            binder,
-            &buffer,
-            0,
-            0,
-            vec![NvFence {
-                point: GuestTimelinePoint::new(syncpoint, GuestSyncpointValue::new(1)),
-            }]
-            .into_boxed_slice(),
-        );
-        assert_eq!(video.advance(Duration::ZERO).unwrap(), 0);
-        assert_eq!(
-            video.state.lock().unwrap().queues[&binder].slots[&0].ownership,
-            SlotOwnership::Queued
-        );
-        video.nvdrv().advance_test_timeline(syncpoint);
-        assert_eq!(video.advance(Duration::from_millis(1)).unwrap(), 0);
-        assert_eq!(
-            video.state.lock().unwrap().queues[&binder].slots[&0].ownership,
-            SlotOwnership::Free
-        );
-    }
-
-    #[test]
-    fn a_long_host_pause_does_not_replay_missed_refreshes_as_a_present_burst() {
-        let (video, binder, buffer) = video_with_rgba_nvmap();
-        queue_headless_test_frame(&video, binder, &buffer, 0, 3, Box::default());
-        queue_headless_test_frame(&video, binder, &buffer, 1, 1, Box::default());
-        queue_headless_test_frame(&video, binder, &buffer, 2, 1, Box::default());
-        assert_eq!(video.advance(Duration::from_secs(1)).unwrap(), 60);
-        assert_eq!(video.state.lock().unwrap().pending_frames.len(), 2);
-        assert_eq!(video.advance(Duration::from_millis(1050)).unwrap(), 3);
-        assert_eq!(video.state.lock().unwrap().pending_frames.len(), 1);
-    }
-
-    #[test]
-    fn resident_frame_skips_cpu_materialization_and_retains_its_buffer_slot() {
-        let mailbox = FrameMailbox::with_notifier(Arc::new(ResidentTestNotifier));
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let mut backend = ResidentTestRuntime::new();
-        backend.preparation_gate = Some((entered_tx, release_rx));
-        let machine = Machine::new(64 * 1024 * 1024).unwrap();
-        let video = VideoSystem::with_gpu_frontend(
-            machine.clone(),
-            &crate::test_memory::kernel(),
-            Some(mailbox.clone()),
-            backend,
-            nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),
-        );
-        let (video, binder_id, buffer) = configure_rgba_nvmap(video, machine);
-        let mut runtime = nixe_runtime::Runtime::try_new(Arc::clone(&video.kernel)).unwrap();
-        video.set_host_events(runtime.event_sender());
-        let syncpoint = GuestSyncpointId::new(11);
-        video.nvdrv().install_test_timeline(syncpoint);
-        {
-            let mut state = video.state.lock().unwrap();
-            state.queues.get_mut(&binder_id).unwrap().slots.insert(
-                0,
-                BufferSlot {
-                    ownership: SlotOwnership::Queueing,
-                    frame_number: 0,
-                    buffer: buffer.clone(),
-                    flattened_buffer: Box::default(),
-                    presentation_source: None,
-                    release_fences: Box::default(),
-                },
-            );
-        }
-        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
-        let producer = video.clone();
-        let worker = std::thread::spawn(move || {
-            let result = producer.queue_graphic_buffer(
-                binder_id,
-                QueuedBufferRequest {
-                    slot: 0,
-                    buffer,
-                    presentation_source: None,
-                    input: QueueBufferInput {
-                        timestamp: 0,
-                        auto_timestamp: true,
-                        crop: CropRect {
-                            left: 0,
-                            top: 0,
-                            right: 4,
-                            bottom: 4,
-                        },
-                        scaling_mode: 0,
-                        transform: 0,
-                        sticky_transform: 0,
-                        swap_interval: 1,
-                        acquire_fences: vec![NvFence {
-                            point: GuestTimelinePoint::new(syncpoint, GuestSyncpointValue::new(1)),
-                        }]
-                        .into_boxed_slice(),
-                    },
-                },
-            );
-            queued_tx.send(result).unwrap();
-        });
-        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let queued = queued_rx.recv_timeout(Duration::from_secs(5));
-        if queued.is_err() {
-            release_tx.send(()).unwrap();
-            worker.join().unwrap();
-            panic!("QueueBuffer waited for resident image preparation");
-        }
-        queued.unwrap().unwrap();
-        worker.join().unwrap();
-        runtime.drain_external_events().unwrap();
-        assert_eq!(video.advance(Duration::from_millis(17)).unwrap(), 1);
-        assert!(mailbox.take_latest().is_none());
-        assert_eq!(
-            video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,
-            SlotOwnership::Queued
-        );
-        release_tx.send(()).unwrap();
-        // No input samples, guest waits or new refresh can wake this host.
-        // The asynchronous image reply must wake the actual supervisor inbox.
-        let waiting = std::time::Instant::now();
-        runtime.wait_events(Duration::from_secs(5)).unwrap();
-        assert!(
-            waiting.elapsed() < Duration::from_secs(2),
-            "image readiness did not wake VI"
-        );
-        assert_eq!(video.advance(Duration::from_millis(18)).unwrap(), 0);
-        let frame = mailbox
-            .take_latest()
-            .expect("ready image published before the next refresh");
-        assert_eq!((frame.width(), frame.height()), (4, 4));
-        {
-            let state = video.state.lock().unwrap();
-            let slot = &state.queues[&binder_id].slots[&0];
-            assert_eq!(slot.ownership, SlotOwnership::Queued);
-            assert!(slot.presentation_source.is_some());
-        }
-
-        runtime.drain_external_events().unwrap();
-        drop(frame);
-        let waiting = std::time::Instant::now();
-        runtime.wait_events(Duration::from_secs(5)).unwrap();
-        assert!(
-            waiting.elapsed() < Duration::from_secs(2),
-            "released slot did not wake VI"
-        );
-        video.advance(Duration::ZERO).unwrap();
-        assert_eq!(
-            video.state.lock().unwrap().queues[&binder_id].slots[&0].ownership,
-            SlotOwnership::Free
-        );
-    }
-
-    #[test]
-    fn repeated_fenced_frames_rotate_slots_and_release_every_owner() {
-        let (video, binder_id, buffer) = video_with_rgba_nvmap();
-        let syncpoint = GuestSyncpointId::new(10);
-        video.nvdrv().install_test_timeline(syncpoint);
-        {
-            let mut state = video.state.lock().unwrap();
-            let queue = state.queues.get_mut(&binder_id).unwrap();
-            for slot in [0, 1] {
-                queue.slots.insert(
-                    slot,
-                    BufferSlot {
-                        ownership: SlotOwnership::Queueing,
-                        frame_number: 0,
-                        buffer: buffer.clone(),
-                        flattened_buffer: Box::default(),
-                        presentation_source: None,
-                        release_fences: Box::default(),
-                    },
-                );
-            }
-        }
-
-        let mut elapsed = Duration::ZERO;
-        for (frame, slot) in [0, 1].into_iter().enumerate() {
-            let required = GuestSyncpointValue::new((frame + 1) as u32);
-            video
-                .queue_graphic_buffer(
-                    binder_id,
-                    QueuedBufferRequest {
-                        slot,
-                        buffer: buffer.clone(),
-                        presentation_source: None,
-                        input: QueueBufferInput {
-                            timestamp: frame as i64,
-                            auto_timestamp: false,
-                            crop: CropRect {
-                                left: 0,
-                                top: 0,
-                                right: 4,
-                                bottom: 4,
-                            },
-                            scaling_mode: 0,
-                            transform: 0,
-                            sticky_transform: 0,
-                            swap_interval: 1,
-                            acquire_fences: vec![NvFence {
-                                point: GuestTimelinePoint::new(syncpoint, required),
-                            }]
-                            .into_boxed_slice(),
-                        },
-                    },
-                )
-                .unwrap();
-
-            elapsed += Duration::from_millis(17);
-            assert_eq!(video.advance(elapsed).unwrap(), 1);
-            assert_eq!(
-                video.state.lock().unwrap().queues[&binder_id].slots[&slot].ownership,
-                SlotOwnership::Queued
-            );
-
-            video.nvdrv().advance_test_timeline(syncpoint);
-            elapsed += Duration::from_millis(17);
-            assert_eq!(video.advance(elapsed).unwrap(), 1);
-            assert_eq!(
-                video.state.lock().unwrap().queues[&binder_id].slots[&slot].ownership,
-                SlotOwnership::Free
-            );
-        }
-
-        let report = video.teardown();
-        assert_eq!(report.layers_released, 1);
-        assert_eq!(report.queues_released, 1);
-        assert_eq!(report.pending_frames_released, 0);
-    }
-
-    #[test]
-    fn teardown_drops_queued_images_without_publishing_or_releasing_afterwards() {
-        let (video, binder_id, buffer) = video_with_rgba_nvmap();
-        {
-            let mut state = video.state.lock().unwrap();
-            state.queues.get_mut(&binder_id).unwrap().slots.insert(
-                0,
-                BufferSlot {
-                    ownership: SlotOwnership::Queueing,
-                    frame_number: 0,
-                    buffer: buffer.clone(),
-                    flattened_buffer: Box::default(),
-                    presentation_source: None,
-                    release_fences: Box::default(),
-                },
-            );
-        }
-        video
-            .queue_graphic_buffer(
-                binder_id,
-                QueuedBufferRequest {
-                    slot: 0,
-                    buffer,
-                    presentation_source: None,
-                    input: QueueBufferInput {
-                        timestamp: 0,
-                        auto_timestamp: true,
-                        crop: CropRect {
-                            left: 0,
-                            top: 0,
-                            right: 4,
-                            bottom: 4,
-                        },
-                        scaling_mode: 0,
-                        transform: 0,
-                        sticky_transform: 0,
-                        swap_interval: 1,
-                        acquire_fences: Box::default(),
-                    },
-                },
-            )
-            .unwrap();
-        let report = video.teardown();
-        assert_eq!(report.pending_frames_released, 1);
-        assert_eq!(video.advance(Duration::from_secs(1)).unwrap(), 60);
-    }
 }

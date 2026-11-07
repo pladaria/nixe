@@ -67,6 +67,18 @@ impl<T> Pending<T> {
     pub fn poll(&self) -> Option<Result<T>> {
         self.0.result.get().cloned()
     }
+    pub fn wait(&self) -> Result<T> {
+        if let Some(result) = self.poll() {
+            return result;
+        }
+        let lock = self.0.notification.lock().unwrap();
+        let _wait = self
+            .0
+            .ready
+            .wait_while(lock, |_| self.0.result.get().is_none())
+            .unwrap();
+        self.poll().expect("completed compilation")
+    }
     pub fn wait_timeout(&self, timeout: Duration) -> Option<Result<T>> {
         if let Some(result) = self.poll() {
             return Some(result);

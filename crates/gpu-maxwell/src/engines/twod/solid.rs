@@ -8,8 +8,7 @@ use super::{
     blit::{BlitSurface, BlitSurfaceLayout},
     *,
 };
-use crate::engines::PendingEngineOperation;
-use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
+use crate::{MaxwellEngineDispatchError, MaxwellMethodSource};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct SolidState {
@@ -23,12 +22,12 @@ pub(super) struct SolidState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellTwoDSolidOperation {
-    pub(crate) source: MaxwellMethodSource,
-    pub(crate) destination: BlitSurface,
-    pub(crate) compression: bool,
-    pub(crate) zeta: bool,
-    pub(crate) color: u32,
-    pub(crate) rectangle: [u32; 4],
+    pub source: MaxwellMethodSource,
+    pub destination: BlitSurface,
+    pub compression: bool,
+    pub zeta: bool,
+    pub color: u32,
+    pub rectangle: [u32; 4],
 }
 
 fn error(source: MaxwellMethodSource, reason: &'static str) -> MaxwellEngineDispatchError {
@@ -114,17 +113,18 @@ fn launch(
     })
 }
 
-pub(super) fn apply(
-    method: MaxwellMethodDispatch,
+pub(super) fn apply<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    source: MaxwellMethodSource,
     state: &mut MaxwellTwoDState,
-) -> Option<Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError>> {
-    let source = method.source();
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Option<Result<bool, crate::engines::MaxwellEngineStreamError>> {
     let address = source.method().0;
     if matches!(address, 0x0604 | 0x060c) && state.solid.mode.value() != Some(&4) {
-        return Some(Err(error(
+        return Some(Err((error(
             source,
             "only solid RECT primitives are implemented",
-        )));
+        ))
+        .into()));
     }
     let (register, mask) = match address {
         0x02b8 => (&mut state.solid.zeta, 1),
@@ -143,16 +143,14 @@ pub(super) fn apply(
         _ => return None,
     };
     if source.argument() & !mask != 0 {
-        return Some(Err(error(source, "reserved bits are set")));
+        return Some(Err((error(source, "reserved bits are set")).into()));
     }
     *register = MaxwellTwoDRegister::programmed(source.argument(), source.argument(), source);
-    let operation = if address == 0x060c {
-        match launch(state, source) {
-            Ok(rect) => Some(PendingEngineOperation::TwoDSolid(rect)),
-            Err(e) => return Some(Err(e)),
+    Some((|| {
+        if address == 0x060c {
+            Ok(execution.solid(&launch(state, source)?)?)
+        } else {
+            Ok(true)
         }
-    } else {
-        None
-    };
-    Some(Ok(operation))
+    })())
 }

@@ -71,7 +71,7 @@ impl MaxwellThreeDTessellationMode {
     }
 }
 
-pub(in crate::engines) fn draw_state(
+pub fn patch_state(
     state: &super::MaxwellThreeDState,
 ) -> Result<Option<nixe_gpu::TessellationState>, super::MaxwellLoweringError> {
     use super::{
@@ -84,17 +84,6 @@ pub(in crate::engines) fn draw_state(
             .map(|i| bindings.pipeline(i))
             .any(|p| p.enabled().value() == Some(&true) && p.stage().value() == Some(&stage))
     };
-    let patches = state
-        .vertex_input()
-        .primitive()
-        .active_begin()
-        .is_some_and(|b| b.topology() == 14);
-    if !patches {
-        if enabled(Stage::TessellationInit) || enabled(Stage::Tessellation) {
-            return Err(Error::TessellationStageTopology);
-        }
-        return Ok(None);
-    }
     let size = state
         .vertex_input()
         .primitive()

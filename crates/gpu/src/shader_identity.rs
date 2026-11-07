@@ -1,5 +1,6 @@
 //! Content identities shared by shader capture, artifacts and host caches.
 use sha2::{Digest, Sha256};
+pub mod cityhash;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ContentId(pub [u8; 32]);

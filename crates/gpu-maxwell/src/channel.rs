@@ -203,7 +203,7 @@ pub struct MaxwellChannelFrontendState {
     legacy_mem_op_a: Option<u32>,
     host_semaphore: [u32; 3],
     reference_count: u32,
-    subchannel_bindings: [Option<GpuClassId>; 8],
+    subchannel_bindings: [Option<crate::engines::Engine>; 8],
 }
 
 impl MaxwellChannelFrontendState {
@@ -220,15 +220,24 @@ impl MaxwellChannelFrontendState {
         &self,
         subchannel: MaxwellPushbufferSubchannel,
     ) -> Option<GpuClassId> {
-        self.subchannel_bindings[subchannel.get() as usize]
+        match self.subchannel_bindings[subchannel.get() as usize] {
+            Some(engine) => Some(engine.class()),
+            None => None,
+        }
     }
 
+    pub(crate) const fn subchannel_engine(
+        &self,
+        subchannel: MaxwellPushbufferSubchannel,
+    ) -> Option<crate::engines::Engine> {
+        self.subchannel_bindings[subchannel.get() as usize]
+    }
     pub(crate) fn bind_subchannel(
         &mut self,
         subchannel: MaxwellPushbufferSubchannel,
-        class: GpuClassId,
-    ) -> Option<GpuClassId> {
-        self.subchannel_bindings[subchannel.get() as usize].replace(class)
+        engine: crate::engines::Engine,
+    ) {
+        self.subchannel_bindings[subchannel.get() as usize] = Some(engine);
     }
 
     pub(crate) fn set_legacy_mem_op_a(&mut self, operand: u32) {
@@ -306,7 +315,7 @@ pub struct MaxwellChannelConfiguration {
 }
 
 /// Engine registers owned exclusively by the GPU command processor.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct MaxwellGpuChannel {
     configuration: MaxwellChannelConfiguration,
     frontend: MaxwellChannelFrontendState,
@@ -315,7 +324,7 @@ pub struct MaxwellGpuChannel {
     inline_to_memory: MaxwellInlineToMemoryState,
     two_d: MaxwellTwoDState,
     three_d: MaxwellThreeDFrontendState,
-    pub(crate) commands: crate::pushbuffer::packet::CommandState,
+    pub(crate) commands: crate::pushbuffer::dma::CommandState,
 }
 impl std::ops::Deref for MaxwellGpuChannel {
     type Target = MaxwellChannelConfiguration;
@@ -772,23 +781,6 @@ mod tests {
         assert_eq!(channel.owner().process_id(), 9);
         assert_eq!(channel.profile_id(), SWITCH_1_GM20B_PROFILE.id());
         assert_eq!(channel.frontend(), &MaxwellChannelFrontendState::default());
-    }
-
-    #[test]
-    fn frontend_subchannel_bindings_replace_and_reset_without_backend_state() {
-        let subchannel = MaxwellPushbufferSubchannel::try_new(0).unwrap();
-        let first = SWITCH_1_GM20B_PROFILE.classes().three_d();
-        let replacement = SWITCH_1_GM20B_PROFILE.classes().compute();
-        let mut frontend = MaxwellChannelFrontendState::default();
-
-        assert_eq!(frontend.bind_subchannel(subchannel, first), None);
-        assert_eq!(
-            frontend.bind_subchannel(subchannel, replacement),
-            Some(first)
-        );
-        assert_eq!(frontend.subchannel_binding(subchannel), Some(replacement));
-        frontend.reset_subchannel_bindings();
-        assert_eq!(frontend.subchannel_binding(subchannel), None);
     }
 
     #[test]

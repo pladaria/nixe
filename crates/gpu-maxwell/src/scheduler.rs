@@ -12,7 +12,7 @@ use nixe_gpu::{FrontendSubmissionId, GuestTimelinePoint, ReservedTimelinePoint};
 
 use crate::{
     MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelSchedulingPolicy,
-    MaxwellFrontendDispatchError, MaxwellGpfifoSourceError, MaxwellGpuMemory,
+    MaxwellFrontendDispatchError, MaxwellGpfifoSourceError, MaxwellGpuMemoryHandle,
     MaxwellValidatedGpfifoSubmission,
 };
 
@@ -339,7 +339,7 @@ impl MaxwellScheduler {
     pub fn dispatch_next(
         &mut self,
         dependency_reached: bool,
-        address_space: &MaxwellGpuMemory,
+        address_space: &MaxwellGpuMemoryHandle,
     ) -> Result<Option<MaxwellFrontendDispatch>, MaxwellScheduleError> {
         let Some(next) = self.queued.front() else {
             return Ok(None);

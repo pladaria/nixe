@@ -388,7 +388,7 @@ macro_rules! tagged {
     };
 }
 tagged!(ResourceAccess { 0 => Read, 1 => Write, 2 => ReadWrite });
-tagged!(StageProvenance { 0 => Guest, 1 => MergedVertex, 2 => LayerPassthrough, 3 => HostQuad, 4 => HostTessellationControl });
+tagged!(StageProvenance { 0 => Guest, 1 => MergedVertex, 2 => LayerPassthrough, 4 => HostTessellationControl });
 tagged!(HostUniformLayout {
     0 => RescalingPushConstants { texture_mask_offset, texture_mask_words, image_mask_offset, image_mask_words, down_factor_offset },
     1 => RenderAreaPushConstants { offset, size },

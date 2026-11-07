@@ -1,5 +1,5 @@
 //! Immutable host facts and initialization-time choices, never guest semantics.
-use crate::extensions::{self, ShaderFma, UnifiedLayouts};
+use crate::extensions::{self, ShaderFma};
 use ash::{Instance, vk};
 use std::{collections::HashSet, ffi::CStr};
 
@@ -38,6 +38,7 @@ pub struct DeviceProfile {
     pub pipeline_creation_cache_control: bool,
     pub limits: vk::PhysicalDeviceLimits,
     pub core: vk::PhysicalDeviceFeatures,
+    pub formats: [vk::FormatProperties; 185],
     pub null_descriptor: bool,
     pub float_controls: FloatControls,
     pub subgroup: SubgroupSupport,
@@ -49,6 +50,8 @@ pub struct DeviceProfile {
     pub runtime_descriptor_array: bool,
     pub buffer_device_address: bool,
     pub descriptor_buffer: bool,
+    pub max_push_descriptors: u32,
+    pub bufferless_push_descriptors: bool,
     pub descriptor_buffer_image_layout_ignored: bool,
     pub descriptor_buffer_offset_alignment: u64,
     pub storage_buffer_descriptor_size: usize,
@@ -57,6 +60,7 @@ pub struct DeviceProfile {
     pub transform_feedback: bool,
     pub provoking_vertex_last: bool,
     pub index_uint8: bool,
+    pub primitive_restart: [bool; 2], // list, patch list
     pub fill_rectangle: bool,
     pub custom_border_color: bool,
     pub custom_border_color_without_format: bool,
@@ -64,7 +68,6 @@ pub struct DeviceProfile {
     pub rectangular_lines: bool,
     pub smooth_lines: bool,
     pub bresenham_lines: bool,
-    pub unified_image_layouts: bool,
     pub attachment_feedback_loop: bool,
     pub swapchain_maintenance: SwapchainMaintenance,
     pub swapchain_mutable_format: bool,
@@ -106,6 +109,9 @@ pub struct DynamicStateSupport {
     pub logic_op: bool,
     pub patch_control_points: bool,
     pub vertex_input: bool,
+    pub vertex_divisor: bool,
+    pub vertex_zero_divisor: bool,
+    pub max_vertex_divisor: u32,
     pub polygon_mode: bool,
     pub depth_clamp_enable: bool,
     pub rasterization_samples: bool,
@@ -114,6 +120,14 @@ pub struct DynamicStateSupport {
     pub color_blend_enable: bool,
     pub color_blend_equation: bool,
     pub color_write_mask: bool,
+}
+impl DynamicStateSupport {
+    /// Eden enables the three blending states together, with a real static
+    /// pipeline path on devices missing any member of the group.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/vulkan_common/vulkan_device.cpp
+    pub(crate) fn blending(&self) -> bool {
+        self.color_blend_enable && self.color_blend_equation && self.color_write_mask
+    }
 }
 #[derive(Debug)]
 pub struct PortabilitySupport {
@@ -176,7 +190,6 @@ pub(crate) fn baseline_missing(
     version: u32,
     timeline: bool,
     synchronization2: bool,
-    dynamic_rendering: bool,
     ext: &ExtensionSet,
 ) -> Vec<&'static str> {
     let mut missing = Vec::new();
@@ -189,16 +202,8 @@ pub(crate) fn baseline_missing(
     if !synchronization2 {
         missing.push("synchronization2 feature");
     }
-    if !dynamic_rendering {
-        missing.push("dynamicRendering feature");
-    }
-    if version < vk::API_VERSION_1_3 {
-        if !ext.contains(ash::khr::synchronization2::NAME) {
-            missing.push("VK_KHR_synchronization2");
-        }
-        if !ext.contains(ash::khr::dynamic_rendering::NAME) {
-            missing.push("VK_KHR_dynamic_rendering");
-        }
+    if version < vk::API_VERSION_1_3 && !ext.contains(ash::khr::synchronization2::NAME) {
+        missing.push("VK_KHR_synchronization2");
     }
     missing
 }
@@ -215,7 +220,6 @@ macro_rules! optional_features {
             pub v11: vk::PhysicalDeviceVulkan11Features<'static>,
             pub v12: vk::PhysicalDeviceVulkan12Features<'static>,
             pub sync: vk::PhysicalDeviceSynchronization2Features<'static>,
-            pub rendering: vk::PhysicalDeviceDynamicRenderingFeatures<'static>,
             pub subgroup: vk::PhysicalDeviceSubgroupSizeControlFeatures<'static>,
             pub cache_control:vk::PhysicalDevicePipelineCreationCacheControlFeatures<'static>,
             $(pub $field: $ty,)+
@@ -227,7 +231,6 @@ macro_rules! optional_features {
                 let mut result = Self::default();
                 let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut result.v11).push_next(&mut result.v12);
                 if version >= vk::API_VERSION_1_3 || ext.contains(ash::khr::synchronization2::NAME) { query = query.push_next(&mut result.sync); }
-                if version >= vk::API_VERSION_1_3 || ext.contains(ash::khr::dynamic_rendering::NAME) { query = query.push_next(&mut result.rendering); }
                 if version >= vk::API_VERSION_1_3 || ext.contains(ash::ext::subgroup_size_control::NAME) {
                     result.chains.subgroup = true;
                     query = query.push_next(&mut result.subgroup);
@@ -252,7 +255,6 @@ macro_rules! optional_features {
                 result.v12.p_next = std::ptr::null_mut();
                 result.v11.p_next = std::ptr::null_mut();
                 result.sync.p_next = std::ptr::null_mut();
-                result.rendering.p_next = std::ptr::null_mut();
                 result.subgroup.p_next = std::ptr::null_mut();
                 result.cache_control.p_next=std::ptr::null_mut();
                 $(result.$field.p_next = std::ptr::null_mut();)+
@@ -260,7 +262,7 @@ macro_rules! optional_features {
             }
             pub fn enable_info(&mut self) -> vk::DeviceCreateInfo<'_> {
                 let mut info = vk::DeviceCreateInfo::default().enabled_features(&self.core)
-                    .push_next(&mut self.v11).push_next(&mut self.v12).push_next(&mut self.sync).push_next(&mut self.rendering);
+                    .push_next(&mut self.v11).push_next(&mut self.v12).push_next(&mut self.sync);
                 if self.chains.subgroup { info = info.push_next(&mut self.subgroup); }
                 if self.chains.cache_control {info=info.push_next(&mut self.cache_control);}
                 $(if self.chains.$field { info = info.push_next(&mut self.$field); })+
@@ -287,6 +289,7 @@ optional_features! {
     state1: vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT<'static> => fixed!(ash::ext::extended_dynamic_state::NAME),
     state2: vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT<'static> => fixed!(ash::ext::extended_dynamic_state2::NAME),
     state3: vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT<'static> => fixed!(ash::ext::extended_dynamic_state3::NAME),
+    vertex_divisor: vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT<'static> => fixed!(ash::ext::vertex_attribute_divisor::NAME),
     vertex_input: vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT<'static> => fixed!(ash::ext::vertex_input_dynamic_state::NAME),
     gpl: vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT<'static> => fixed!(ash::ext::graphics_pipeline_library::NAME),
     descriptors: vk::PhysicalDeviceDescriptorBufferFeaturesEXT<'static> => fixed!(ash::ext::descriptor_buffer::NAME),
@@ -295,10 +298,10 @@ optional_features! {
     feedback_layout: vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT<'static> => fixed!(ash::ext::attachment_feedback_loop_layout::NAME),
     feedback_dynamic: vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT<'static> => fixed!(ash::ext::attachment_feedback_loop_dynamic_state::NAME),
     index8: vk::PhysicalDeviceIndexTypeUint8FeaturesKHR<'static> => |_, _, e: &ExtensionSet| supported(e, ash::khr::index_type_uint8::NAME).or_else(|| supported(e, ash::ext::index_type_uint8::NAME)),
+    list_restart: vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT<'static> => fixed!(ash::ext::primitive_topology_list_restart::NAME),
     custom_border: vk::PhysicalDeviceCustomBorderColorFeaturesEXT<'static> => fixed!(ash::ext::custom_border_color::NAME),
     provoking: vk::PhysicalDeviceProvokingVertexFeaturesEXT<'static> => fixed!(ash::ext::provoking_vertex::NAME),
     portability: vk::PhysicalDevicePortabilitySubsetFeaturesKHR<'static> => fixed!(ash::khr::portability_subset::NAME),
-    layouts: UnifiedLayouts<'static> => fixed!(extensions::UNIFIED_LAYOUTS),
     fma: ShaderFma<'static> => fixed!(extensions::SHADER_FMA),
     lines: vk::PhysicalDeviceLineRasterizationFeaturesKHR<'static> => |_, _, e: &ExtensionSet| supported(e, ash::khr::line_rasterization::NAME).or_else(|| supported(e, ash::ext::line_rasterization::NAME)),
     maintenance: vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'static> => |_, m, _: &ExtensionSet| match m { SwapchainMaintenance::Khr => Some(extensions::SWAPCHAIN_MAINTENANCE_KHR), SwapchainMaintenance::Ext => Some(ash::ext::swapchain_maintenance1::NAME), SwapchainMaintenance::Disabled => None },
@@ -312,10 +315,7 @@ impl FeatureSet {
         maintenance: SwapchainMaintenance,
     ) {
         if version < vk::API_VERSION_1_3 {
-            self.names.extend([
-                ash::khr::synchronization2::NAME,
-                ash::khr::dynamic_rendering::NAME,
-            ]);
+            self.names.push(ash::khr::synchronization2::NAME);
         }
         if self
             .names
@@ -371,7 +371,10 @@ impl FeatureSet {
         self.core.robust_buffer_access = vk::FALSE;
         self.robustness2.robust_buffer_access2 = vk::FALSE;
         self.robustness2.robust_image_access2 = vk::FALSE;
-        self.core.sparse_binding = vk::FALSE;
+        // MultiRange buffers alias fully bound storage on the graphics queue.
+        // The runtime also checks that queue's SPARSE_BINDING capability.
+        self.core.sparse_binding &= self.core.sparse_residency_aliased;
+        self.core.sparse_residency_aliased &= self.core.sparse_binding;
         self.core.sparse_residency_buffer = vk::FALSE;
         self.core.sparse_residency_image2_d = vk::FALSE;
         self.core.sparse_residency_image3_d = vk::FALSE;
@@ -379,12 +382,10 @@ impl FeatureSet {
         self.core.sparse_residency4_samples = vk::FALSE;
         self.core.sparse_residency8_samples = vk::FALSE;
         self.core.sparse_residency16_samples = vk::FALSE;
-        self.core.sparse_residency_aliased = vk::FALSE;
         self.v12.buffer_device_address_capture_replay = vk::FALSE;
         self.v12.buffer_device_address_multi_device = vk::FALSE;
         self.fma.float16 &= self.v12.shader_float16;
         self.fma.float64 &= self.core.shader_float64;
-        self.layouts.video = vk::FALSE;
         if maintenance != SwapchainMaintenance::Disabled
             && self.maintenance.swapchain_maintenance1 == 0
         {
@@ -398,13 +399,50 @@ impl FeatureSet {
         {
             self.names.push(ash::ext::pipeline_creation_feedback::NAME);
         }
+        if ext.contains(ash::khr::push_descriptor::NAME) {
+            self.names.push(ash::khr::push_descriptor::NAME);
+        }
         if ext.contains(ash::ext::memory_budget::NAME) {
             self.names.push(ash::ext::memory_budget::NAME);
         }
     }
 
+    /// Match the pinned desktop renderer's EDS2 default and driver policy
+    /// before creating the logical device or publishing shader/pipeline facts.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/vulkan_common/vulkan_device.cpp#L664-L707
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/vulkan_common/vulkan_device.cpp#L1283-L1293
+    fn apply_desktop_renderer_policy(&mut self, driver: vk::DriverId, driver_version: u32) {
+        // The reference compares these packed values directly. Preserve that
+        // decision, including its variant-bit masking, rather than replacing
+        // it with a comparison of decoded driver release numbers.
+        let version = (driver_version << 3) >> 3;
+        let broken_vertex_input = (driver == vk::DriverId::INTEL_PROPRIETARY_WINDOWS
+            && version < vk::make_api_version(27, 20, 100, 0))
+            || (driver == vk::DriverId::NVIDIA_PROPRIETARY
+                && version < vk::make_api_version(580, 119, 2, 0));
+        if broken_vertex_input && self.vertex_input.vertex_input_dynamic_state != 0 {
+            self.vertex_input = Default::default();
+            self.chains.vertex_input = false;
+            self.names
+                .retain(|name| *name != ash::ext::vertex_input_dynamic_state::NAME);
+            log::info!(
+                "Eden renderer policy: disabled dynamic vertex input (driver={driver:?}, packed_version={driver_version:#010x})"
+            );
+        }
+        // Desktop Eden defaults to EDS1 + EDS2. Supporting EDS3 on the host
+        // does not select its dynamic blending/enables pipeline architecture.
+        self.state3 = Default::default();
+        self.chains.state3 = false;
+        self.names
+            .retain(|name| *name != ash::ext::extended_dynamic_state3::NAME);
+        log::info!(
+            "Eden renderer policy: EDS level=2, dynamic_vertex_input={}",
+            self.vertex_input.vertex_input_dynamic_state != 0
+        );
+    }
+
     pub unsafe fn profile(
-        &self,
+        &mut self,
         instance: &Instance,
         physical: vk::PhysicalDevice,
         version: u32,
@@ -417,6 +455,8 @@ impl FeatureSet {
         let mut subgroup_control = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         let mut gpl = vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
         let mut descriptors = vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
+        let mut push = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
+        let mut vertex_divisor = vk::PhysicalDeviceVertexAttributeDivisorPropertiesEXT::default();
         let mut props = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut driver)
             .push_next(&mut floats)
@@ -434,11 +474,18 @@ impl FeatureSet {
         if self.names.contains(&ash::ext::descriptor_buffer::NAME) {
             props = props.push_next(&mut descriptors);
         }
+        if self.names.contains(&ash::khr::push_descriptor::NAME) {
+            props = props.push_next(&mut push);
+        }
+        if self.chains.vertex_divisor {
+            props = props.push_next(&mut vertex_divisor);
+        }
         // SAFETY: supported property structures are retained for the full query.
         unsafe {
             instance.get_physical_device_properties2(physical, &mut props);
         }
         let properties = props.properties;
+        self.apply_desktop_renderer_policy(driver.driver_id, properties.driver_version);
         DeviceProfile {
             shader_compiler: self.shader_configuration(
                 version,
@@ -472,6 +519,15 @@ impl FeatureSet {
                 != 0,
             limits: properties.limits,
             core: self.core,
+            // Eden Device owns immutable native format capabilities. Query
+            // once, including static pipelines and dynamic vertex inputs.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/vulkan_common/vulkan_device.cpp
+            formats: std::array::from_fn(|index| unsafe {
+                instance.get_physical_device_format_properties(
+                    physical,
+                    vk::Format::from_raw(index as i32),
+                )
+            }),
             null_descriptor: self.robustness2.null_descriptor != 0,
             float_controls: FloatControls {
                 // Mixed-width repair may need different denormal modes. Select
@@ -531,6 +587,12 @@ impl FeatureSet {
                 logic_op: self.state2.extended_dynamic_state2_logic_op != 0,
                 patch_control_points: self.state2.extended_dynamic_state2_patch_control_points != 0,
                 vertex_input: self.vertex_input.vertex_input_dynamic_state != 0,
+                vertex_divisor: self.vertex_divisor.vertex_attribute_instance_rate_divisor != 0,
+                vertex_zero_divisor: self
+                    .vertex_divisor
+                    .vertex_attribute_instance_rate_zero_divisor
+                    != 0,
+                max_vertex_divisor: vertex_divisor.max_vertex_attrib_divisor,
                 polygon_mode: self.state3.extended_dynamic_state3_polygon_mode != 0,
                 depth_clamp_enable: self.state3.extended_dynamic_state3_depth_clamp_enable != 0,
                 rasterization_samples: self.state3.extended_dynamic_state3_rasterization_samples
@@ -540,7 +602,11 @@ impl FeatureSet {
                     .state3
                     .extended_dynamic_state3_alpha_to_coverage_enable
                     != 0,
-                color_blend_enable: self.state3.extended_dynamic_state3_color_blend_enable != 0,
+                // The reference dynamic path updates all Maxwell RT slots.
+                // Other hosts retain their actual static pipeline path.
+                color_blend_enable: self.state3.extended_dynamic_state3_color_blend_enable != 0
+                    && self.core.independent_blend != 0
+                    && properties.limits.max_color_attachments >= 8,
                 color_blend_equation: self.state3.extended_dynamic_state3_color_blend_equation != 0,
                 color_write_mask: self.state3.extended_dynamic_state3_color_write_mask != 0,
             },
@@ -553,6 +619,8 @@ impl FeatureSet {
             runtime_descriptor_array: self.v12.runtime_descriptor_array != 0,
             buffer_device_address: self.v12.buffer_device_address != 0,
             descriptor_buffer: self.descriptors.descriptor_buffer != 0,
+            max_push_descriptors: push.max_push_descriptors,
+            bufferless_push_descriptors: descriptors.bufferless_push_descriptors != 0,
             descriptor_buffer_image_layout_ignored: self
                 .descriptors
                 .descriptor_buffer_image_layout_ignored
@@ -564,6 +632,10 @@ impl FeatureSet {
             transform_feedback: self.feedback.transform_feedback != 0,
             provoking_vertex_last: self.provoking.provoking_vertex_last != 0,
             index_uint8: self.index8.index_type_uint8 != 0,
+            primitive_restart: [
+                self.list_restart.primitive_topology_list_restart != 0,
+                self.list_restart.primitive_topology_patch_list_restart != 0,
+            ],
             fill_rectangle: self.names.contains(&ash::nv::fill_rectangle::NAME),
             custom_border_color: self.custom_border.custom_border_colors != 0,
             custom_border_color_without_format: self
@@ -574,7 +646,6 @@ impl FeatureSet {
             rectangular_lines: self.lines.rectangular_lines != 0,
             smooth_lines: self.lines.smooth_lines != 0,
             bresenham_lines: self.lines.bresenham_lines != 0,
-            unified_image_layouts: self.layouts.layouts != 0,
             attachment_feedback_loop: self.feedback_layout.attachment_feedback_loop_layout != 0
                 && self.feedback_dynamic.attachment_feedback_loop_dynamic_state != 0,
             swapchain_mutable_format: self
@@ -637,18 +708,6 @@ mod tests {
             Some((0, Some(0)))
         );
         assert_eq!(choose_queues(&queues, None), Some((0, None)));
-    }
-    #[test]
-    fn version_never_substitutes_for_required_feature_bits() {
-        let ext = ExtensionSet(HashSet::new());
-        assert_eq!(
-            baseline_missing(vk::API_VERSION_1_3, false, true, false, &ext),
-            ["timelineSemaphore feature", "dynamicRendering feature"]
-        );
-        assert_eq!(
-            baseline_missing(vk::API_VERSION_1_2, true, true, true, &ext),
-            ["VK_KHR_synchronization2", "VK_KHR_dynamic_rendering"]
-        );
     }
 }
 

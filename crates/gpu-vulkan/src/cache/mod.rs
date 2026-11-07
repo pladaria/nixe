@@ -14,16 +14,19 @@ mod layout;
 pub use layout::{LayoutBinding, LayoutKey, PipelineLayout};
 mod driver;
 mod pipeline;
+pub(crate) use pipeline::restart_supported;
 pub use pipeline::{
     BlendState, GraphicsState, NativePipeline, PipelineCompiler, PipelineMetrics, PipelineRecipe,
     PipelineStrategy, StencilState, VertexAttribute, VertexBinding,
 };
 mod descriptors;
+mod update_queue;
 pub use descriptors::{
     BindingRecord, CustomBorderColor, DescriptorCache, DescriptorResource, DescriptorStatistics,
     Sampler, SamplerCache, SamplerExtensions,
 };
-pub(crate) use descriptors::{DescriptorAllocator, DescriptorPool};
+pub(crate) use descriptors::{DescriptorAllocator, DescriptorEntry, DescriptorPool};
+pub(crate) use update_queue::{DescriptorUpdate, UpdateDescriptorQueue};
 
 #[derive(Clone, Debug)]
 pub struct CacheConfiguration {
@@ -34,12 +37,8 @@ pub struct CacheConfiguration {
     pub shader_bytes: usize,
     pub pipeline_entries: usize,
     pub layout_entries: usize,
-    pub sampler_entries: usize,
     pub persistent_bytes: u64,
     pub directory: Option<std::path::PathBuf>,
-    /// Application identity for startup reconstruction; driver/shader data can
-    /// still share their content-addressed caches across applications.
-    pub pipeline_namespace: Option<nixe_gpu::shader_identity::ContentId>,
 }
 impl Default for CacheConfiguration {
     fn default() -> Self {
@@ -50,13 +49,13 @@ impl Default for CacheConfiguration {
             shader_bytes: 64 * 1024 * 1024,
             pipeline_entries: 8192,
             layout_entries: 1024,
-            sampler_entries: 512,
             persistent_bytes: 128 * 1024 * 1024,
             directory: None,
-            pipeline_namespace: None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use layout::binding_origins;

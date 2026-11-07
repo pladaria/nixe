@@ -133,7 +133,7 @@ pub(crate) fn allocate_buffer(
     mode: AllocationMode,
     label: &str,
 ) -> Result<AllocatedBuffer, VulkanError> {
-    allocate_buffer_charged(owner, size, usage, location, mode, label, |_| Ok(None))
+    allocate_buffer_charged(owner, size, usage, location, mode, label, 0, |_| Ok(None))
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn allocate_buffer_charged(
@@ -143,6 +143,7 @@ pub(crate) fn allocate_buffer_charged(
     location: MemoryLocation,
     mode: AllocationMode,
     label: &str,
+    minimum_alignment: u64,
     charge: impl FnOnce(u64) -> Result<Option<AllocationCharge>, VulkanError>,
 ) -> Result<AllocatedBuffer, VulkanError> {
     let info = vk::BufferCreateInfo::default()
@@ -169,9 +170,13 @@ pub(crate) fn allocate_buffer_charged(
             .device
             .get_buffer_memory_requirements2(&info, &mut requirements);
     }
-    let requirements = requirements.memory_requirements;
+    let mut requirements = requirements.memory_requirements;
     let dedicated =
         mode == AllocationMode::Dedicated || dedicated.requires_dedicated_allocation != 0;
+    if minimum_alignment != 0 && !dedicated {
+        requirements.alignment = requirements.alignment.max(minimum_alignment);
+        requirements.size = requirements.size.next_multiple_of(minimum_alignment);
+    }
     // A dedicated allocation must use the exact driver-reported size. Its
     // final partial atom is isolated by the allocation boundary itself.
     // https://docs.vulkan.org/refpages/latest/refpages/source/VkMemoryDedicatedAllocateInfo.html
@@ -225,6 +230,43 @@ pub(crate) fn allocate_buffer_charged(
     Ok(buffer)
 }
 impl AllocatedBuffer {
+    pub(crate) fn sparse(
+        owner: &Arc<DeviceOwner>,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<Self, VulkanError> {
+        let info = vk::BufferCreateInfo::default()
+            .flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_ALIASED)
+            .size(size)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let handle = unsafe { owner.device.create_buffer(&info, None) }
+            .map_err(|error| VulkanError::vk("vkCreateBuffer(sparse)", error))?;
+        Ok(Self {
+            owner: Arc::clone(owner),
+            handle,
+            allocation: None,
+            size,
+            usage,
+            charge: None,
+            texel_views: Mutex::new(Vec::new()),
+        })
+    }
+    pub(crate) fn memory_location(&self) -> (vk::DeviceMemory, u64, u32) {
+        let allocation = self
+            .allocation
+            .as_ref()
+            .expect("ordinary source buffer allocation");
+        if allocation.is_dedicated() {
+            return (vk::DeviceMemory::null(), 0, u32::MAX);
+        }
+        (
+            unsafe { allocation.memory() },
+            allocation.offset(),
+            allocation.memory_type_index(),
+        )
+    }
+
     pub(crate) fn texel_view(
         &self,
         offset: u64,
@@ -268,6 +310,27 @@ impl AllocatedBuffer {
             .as_ref()
             .is_some_and(Allocation::is_dedicated)
     }
+    pub(crate) fn is_host_visible(&self) -> bool {
+        self.allocation
+            .as_ref()
+            .expect("bound buffer")
+            .mapped_ptr()
+            .is_some()
+    }
+    /// A pool may retain this mapped address alongside the allocation. Zero
+    /// requires the non-coherent flush/invalidate path or denotes unmapped RAM.
+    pub(crate) fn coherent_mapped_address(&self) -> usize {
+        let allocation = self.allocation.as_ref().expect("bound buffer");
+        if !allocation
+            .memory_properties()
+            .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+        {
+            return 0;
+        }
+        allocation
+            .mapped_ptr()
+            .map_or(0, |pointer| pointer.as_ptr().expose_provenance())
+    }
     pub(crate) fn host_alignment(&self) -> u64 {
         let allocation = self.allocation.as_ref().expect("bound buffer");
         if allocation
@@ -295,14 +358,6 @@ impl AllocatedBuffer {
             .memory(unsafe { allocation.memory() })
             .offset(allocation.offset() + start)
             .size(size))
-    }
-    pub(crate) unsafe fn write_range(&self, offset: u64, bytes: &[u8]) -> Result<(), VulkanError> {
-        unsafe {
-            self.write_with(offset, bytes.len() as u64, |destination| {
-                destination.copy_from_slice(bytes);
-                Ok(())
-            })
-        }
     }
     /// Caller owns fresh, atom-isolated upload space with no queued GPU use.
     pub(crate) unsafe fn write_with<T>(
@@ -480,15 +535,15 @@ mod tests {
     }
 }
 
-/// The charge follows the native allocation through timeline retirement.
-/// Metadata eviction alone cannot release this budget.
-#[derive(Clone)]
+/// The charge follows actual native allocations through timeline retirement.
+/// The limit is a frame-GC pressure threshold; Vulkan owns allocation failure.
+/// Metadata eviction alone cannot release the native allocation charge.
 pub(crate) struct AllocationBudget {
     used: Arc<std::sync::atomic::AtomicU64>,
     pub limit: u64,
 }
 pub(crate) struct AllocationCharge {
-    budget: AllocationBudget,
+    used: Arc<std::sync::atomic::AtomicU64>,
     bytes: u64,
 }
 impl AllocationBudget {
@@ -501,24 +556,23 @@ impl AllocationBudget {
     pub fn used(&self) -> u64 {
         self.used.load(std::sync::atomic::Ordering::Relaxed)
     }
-    pub fn reserve(&self, bytes: u64) -> Option<AllocationCharge> {
+    pub fn charge(&self, bytes: u64) -> Option<AllocationCharge> {
         self.used
             .fetch_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
-                |used| used.checked_add(bytes).filter(|total| *total <= self.limit),
+                |used| used.checked_add(bytes),
             )
             .ok()?;
         Some(AllocationCharge {
-            budget: self.clone(),
+            used: Arc::clone(&self.used),
             bytes,
         })
     }
 }
 impl Drop for AllocationCharge {
     fn drop(&mut self) {
-        self.budget
-            .used
+        self.used
             .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -677,17 +731,33 @@ impl AllocatedImage {
             )
         }
         .map_err(|e| VulkanError::vk("host image view", e))?;
-        Ok(Arc::new(AllocatedImageView::from_handle(self, handle)))
+        Ok(Arc::new(AllocatedImageView::from_handle(
+            self,
+            handle,
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1),
+        )))
     }
 }
 /// Independently leased view; its image remains alive until the last view/batch.
 pub struct AllocatedImageView {
     pub(crate) image: Arc<AllocatedImage>,
     pub(crate) handle: vk::ImageView,
+    pub(crate) range: vk::ImageSubresourceRange,
 }
 impl AllocatedImageView {
-    pub(crate) fn from_handle(image: Arc<AllocatedImage>, handle: vk::ImageView) -> Self {
-        Self { image, handle }
+    pub(crate) fn from_handle(
+        image: Arc<AllocatedImage>,
+        handle: vk::ImageView,
+        range: vk::ImageSubresourceRange,
+    ) -> Self {
+        Self {
+            image,
+            handle,
+            range,
+        }
     }
 }
 impl Drop for AllocatedImageView {

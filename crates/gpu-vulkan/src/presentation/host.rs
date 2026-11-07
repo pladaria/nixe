@@ -1,26 +1,15 @@
 use super::*;
 use crate::cache::{DescriptorCache, PipelineCompiler};
 use ash::vk;
-use std::collections::VecDeque;
-struct Capture {
-    view: Arc<AllocatedImageView>,
-    extent: [u32; 2],
-    next_row: u32,
-    pending: VecDeque<(ReadbackTicket, u32)>,
-    bytes: Vec<u8>,
-    reply: mpsc::Sender<Result<Screenshot, String>>,
-}
+use std::time::Duration;
 pub(crate) struct Host {
     pub client: PresentationClient,
     chains: Presenter,
-    renderer: ScreenRenderer,
     source: Option<Source>,
     ui: Option<UiFrame>,
     size: [u32; 2],
     dirty: bool,
     screenshot: Option<mpsc::Sender<Result<Screenshot, String>>>,
-    capture: Option<Capture>,
-    pending_surface: Option<wsi::Acquired>,
 }
 impl Host {
     pub fn new(
@@ -31,30 +20,22 @@ impl Host {
         Ok(Self {
             client: client.clone(),
             chains: Presenter::new(device, client.clone(), vsync)?,
-            renderer: ScreenRenderer::new(device)?,
             source: None,
             ui: None,
             size: [0, 0],
             dirty: false,
             screenshot: None,
-            capture: None,
-            pending_surface: None,
         })
     }
-    pub(crate) fn completion_point(&self) -> Option<u64> {
-        self.capture
-            .as_ref()?
-            .pending
-            .front()
-            .map(|(ticket, _)| ticket.work().tick())
+    pub fn output_format(&self) -> vk::Format {
+        self.chains.format()
     }
     pub fn service(
         &mut self,
-        cache: &mut VulkanResidency,
+        cache: &mut crate::residency::Residency<'_>,
         frames: &mut Frames,
         pipelines: &PipelineCompiler,
         descriptors: &mut DescriptorCache,
-        samplers: &mut crate::cache::SamplerCache,
     ) -> Result<(), VulkanError> {
         self.chains.poll()?;
         if self.client.stopped() {
@@ -68,17 +49,17 @@ impl Host {
             self.size = packet.size;
             if let Some(frame) = packet.frame.take() {
                 self.source = Some(Source::from_frame(&frame));
-                // The immutable native snapshot retains pixels. Release the
+                // The immutable composed frame retains pixels. Release the
                 // Horizon slot lease now, independently of WSI availability.
             }
             // Coalescing an unpresented UI frame must still consume its frees.
             // Its texture uploads already ran on this owner, and any submitted
             // draw retains its view through the ordinary graphics timeline.
             if let Some(mut old_ui) = self.ui.take() {
-                self.renderer.free_textures(&mut old_ui);
+                frames.renderer.free_textures(&mut old_ui);
             }
             if let Some(ui) = &mut packet.ui {
-                self.renderer.update_textures(cache, ui, samplers)?;
+                frames.renderer.update_textures(cache, ui)?;
             }
             self.ui = packet.ui.take();
             if packet.screenshot.is_some() {
@@ -86,40 +67,87 @@ impl Host {
             }
             self.dirty = true;
         }
-        self.service_capture(cache)?;
-        if self.capture.is_none()
-            && self.screenshot.is_some()
-            && let Some(source) = &self.source
+        // A host-paused redraw has no new Composite. Capture the retained
+        // composition, without rereading mutable guest memory or keeping a raw snapshot.
+        if self.screenshot.is_some()
+            && let Some(image) = self.source.as_ref().map(|s| s.image.clone())
         {
-            let frame = frames.get(&source.image)?;
-            let kind = u8::from(frame.format == vk::Format::R16_UINT);
-            let pipeline = self
-                .renderer
-                .pipeline(pipelines, vk::Format::R8G8B8A8_UNORM, kind)?;
+            let frame = frames.get(&image)?;
+            let extent = frame.display_extent;
+            let layer = frame.layer();
+            if let Some(work) = self.capture_source(
+                cache,
+                &mut frames.renderer,
+                pipelines,
+                descriptors,
+                &layer,
+                extent,
+            )? {
+                frames.used(&image, work)?;
+            }
+        }
+        if !self.dirty || self.size.contains(&0) || !self.chains.ready()? {
+            return Ok(());
+        }
+        let frame = frames.prepare_present(
+            cache,
+            pipelines,
+            descriptors,
+            self.source.as_ref().map(|s| &s.image),
+            self.ui.as_mut(),
+            self.size,
+            self.chains.format(),
+            self.source.as_ref().map(|s| s.sequence),
+        )?;
+        self.chains.present(frame)?;
+        self.dirty = false;
+        Ok(())
+    }
+    pub fn capture_source(
+        &mut self,
+        cache: &mut crate::residency::Residency<'_>,
+        renderer: &mut ScreenRenderer,
+        pipelines: &PipelineCompiler,
+        descriptors: &mut DescriptorCache,
+        layer: &render::LayerImage,
+        extent: [u32; 2],
+    ) -> Result<Option<WorkTicket>, VulkanError> {
+        let mut use_ticket = None;
+        if self.screenshot.is_some() {
+            let pipeline = renderer.pipeline(
+                pipelines,
+                vk::Format::R8G8B8A8_UNORM,
+                u8::from(layer.format == vk::Format::R16_UINT),
+            )?;
             {
-                let extent = source.dimensions();
                 let image = cache.allocate_host_image(extent, vk::Format::R8G8B8A8_UNORM)?;
                 let view = image.view_2d(vk::Format::R8G8B8A8_UNORM)?;
-                cache.device_mut().end_rendering();
-                cache.device_mut().begin_recording()?;
+                cache.device_mut().end_rendering()?;
 
                 render::transition(
                     cache.device_mut(),
                     view.image.handle,
                     vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
                     vk::PipelineStageFlags2::NONE,
                     vk::AccessFlags2::NONE,
                     vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                     vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 );
-                self.renderer.screen(
+                let framebuffer = crate::render_pass::Framebuffer::color(
+                    &view,
+                    vk::Format::R8G8B8A8_UNORM,
+                    vk::Extent2D {
+                        width: extent[0],
+                        height: extent[1],
+                    },
+                )?;
+                renderer.screen(
                     cache,
                     descriptors,
                     pipeline,
-                    frame,
-                    source,
-                    view.handle,
+                    layer,
+                    &framebuffer,
                     vk::Extent2D {
                         width: extent[0],
                         height: extent[1],
@@ -130,239 +158,71 @@ impl Host {
                 render::transition(
                     cache.device_mut(),
                     view.image.handle,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                     vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                     vk::PipelineStageFlags2::TRANSFER,
                     vk::AccessFlags2::TRANSFER_READ,
                 );
-                let work = cache.device_mut().work_ticket()?;
-                frames.used(&source.image, work)?;
+                let work = cache.device_mut().current_work();
                 cache
                     .device_mut()
                     .retire_image_views(vec![Arc::clone(&view)], work)?;
-                self.capture = Some(Capture {
-                    view,
-                    extent,
-                    next_row: 0,
-                    pending: VecDeque::new(),
-                    bytes: Vec::with_capacity(extent[0] as usize * extent[1] as usize * 4),
-                    reply: self.screenshot.take().unwrap(),
-                });
-                self.service_capture(cache)?;
-            }
-        }
-        if !self.dirty {
-            return Ok(());
-        }
-        let Some(acquired) = self.chains.acquire(self.size)? else {
-            return Ok(());
-        };
-        let format = acquired.format;
-        let screen = if let Some(source) = &self.source {
-            let kind = u8::from(frames.get(&source.image)?.format == vk::Format::R16_UINT);
-            Some(self.renderer.pipeline(pipelines, format, kind)?)
-        } else {
-            None
-        };
-        let ui_pipeline = if self.ui.is_some() {
-            Some(self.renderer.pipeline(pipelines, format, 2)?)
-        } else {
-            None
-        };
-        cache.device_mut().end_rendering();
-        cache.device_mut().begin_recording()?;
-        self.pending_surface = Some(acquired);
-
-        render::transition(
-            cache.device_mut(),
-            acquired.image,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            // Chain the transition with the acquire semaphore's wait.
-            // https://docs.vulkan.org/guide/latest/synchronization_examples.html
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::NONE,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        );
-        if let (Some(source), Some(pipeline)) = (&self.source, screen) {
-            let frame = frames.get(&source.image)?;
-            self.renderer.screen(
-                cache,
-                descriptors,
-                pipeline,
-                frame,
-                source,
-                acquired.view,
-                acquired.extent,
-                format,
-                true,
-            )?;
-        } else {
-            let attachments = [vk::RenderingAttachmentInfo::default()
-                .image_view(acquired.view)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0., 0., 0., 1.],
-                    },
-                })];
-            let info = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D {
-                    offset: Default::default(),
-                    extent: acquired.extent,
-                })
-                .layer_count(1)
-                .color_attachments(&attachments);
-            unsafe {
+                let device = cache.device_mut();
+                let (slice, ticket) = device
+                    .submission
+                    .reserve_readback(u64::from(extent[0]) * u64::from(extent[1]) * 4)?;
+                let device = cache.device_mut();
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(slice.offset)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: extent[0],
+                        height: extent[1],
+                        depth: 1,
+                    });
+                unsafe {
+                    device.dispatch.cmd_copy_image_to_buffer(
+                        view.image.handle,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        device.submission.staging_buffer(&slice).handle,
+                        &[region],
+                    );
+                }
+                let work = ticket.work();
+                use_ticket = Some(work);
                 cache
                     .device_mut()
-                    .dispatch
-                    .begin_rendering(&info, Default::default());
-                cache.device_mut().dispatch.end_rendering();
+                    .retire_image(Arc::clone(&view.image), work)?;
+                // Eden RenderToBuffer performs one complete download and Finish before
+                // publishing the screenshot. Completion needs no later guest frame.
+                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/renderer_vulkan.cpp#L270-L312
+                cache.flush()?;
+                cache.device_mut().wait_for_work(work, Duration::MAX)?;
+                let rgba = ticket.completed()?.to_vec();
+                let _ = self.screenshot.take().unwrap().send(Ok(Screenshot {
+                    width: extent[0],
+                    height: extent[1],
+                    rgba,
+                }));
             }
         }
-        if let (Some(ui), Some(pipeline)) = (&mut self.ui, ui_pipeline) {
-            self.renderer.ui(
-                cache,
-                descriptors,
-                pipeline,
-                ui,
-                acquired.view,
-                acquired.extent,
-                format,
-            )?;
-        }
-        render::transition(
-            cache.device_mut(),
-            acquired.image,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::ImageLayout::PRESENT_SRC_KHR,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::NONE,
-            vk::AccessFlags2::NONE,
-        );
-        let work = cache.device_mut().work_ticket()?;
-        if let Some(source) = &self.source {
-            frames.used(&source.image, work)?;
-        }
-        let wait = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(acquired.wait)
-            .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)];
-        let signal = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(acquired.signal)
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-        cache.flush_with_sync(&wait, &signal)?;
-        self.pending_surface = None;
-        self.chains
-            .present(acquired, work, self.source.as_ref().map(|s| s.sequence))?;
-        self.dirty = false;
-        Ok(())
+        Ok(use_ticket)
     }
-    fn service_capture(&mut self, cache: &mut VulkanResidency) -> Result<(), VulkanError> {
-        let Some(capture) = &mut self.capture else {
-            return Ok(());
-        };
-        cache.device_mut().poll_progress()?;
-        while capture
-            .pending
-            .front()
-            .is_some_and(|(ticket, _)| ticket.work().tick() <= cache.device().completed_tick())
-        {
-            let (ticket, _) = capture.pending.pop_front().unwrap();
-            capture
-                .bytes
-                .extend_from_slice(&cache.device_mut().completed_readback(ticket)?);
-        }
-        while capture.next_row < capture.extent[1] && capture.pending.len() < 2 {
-            let rows = (1024 * 1024 / (capture.extent[0] as usize * 4))
-                .max(1)
-                .min((capture.extent[1] - capture.next_row) as usize) as u32;
-            let size = u64::from(rows) * u64::from(capture.extent[0]) * 4;
-            cache.device_mut().end_rendering();
-            let device = cache.device_mut();
-            let (slice, ticket) = device
-                .submission
-                .reserve_readback(&mut device.dispatch, size)?;
-            let device = cache.device_mut();
-
-            let copy = vk::BufferImageCopy::default()
-                .buffer_offset(slice.offset)
-                .image_offset(vk::Offset3D {
-                    x: 0,
-                    y: capture.next_row as i32,
-                    z: 0,
-                })
-                .image_extent(vk::Extent3D {
-                    width: capture.extent[0],
-                    height: rows,
-                    depth: 1,
-                })
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .layer_count(1),
-                );
-            unsafe {
-                device.dispatch.cmd_copy_image_to_buffer(
-                    capture.view.image.handle,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    device.submission.staging_buffer(&slice).handle,
-                    &[copy],
-                );
-            }
-            cache
-                .device_mut()
-                .retire_image(Arc::clone(&capture.view.image), ticket.work())?;
-            capture.pending.push_back((ticket, capture.next_row));
-            capture.next_row += rows;
-        }
-        cache.flush()?;
-        if capture.next_row == capture.extent[1] && capture.pending.is_empty() {
-            let capture = self.capture.take().unwrap();
-            let _ = capture.reply.send(Ok(Screenshot {
-                width: capture.extent[0],
-                height: capture.extent[1],
-                rgba: capture.bytes,
-            }));
-        }
-        Ok(())
-    }
-    pub fn shutdown(&mut self, cache: &mut VulkanResidency) -> Result<(), VulkanError> {
+    pub fn shutdown(
+        &mut self,
+        cache: &mut crate::residency::Residency<'_>,
+    ) -> Result<(), VulkanError> {
         self.client.close();
         if let Some(ui) = &mut self.ui {
             ui.textures.clear();
         }
-        if let Some(frame) = self.pending_surface.take() {
-            // An interrupted recording still consumes acquisition before any
-            // submitted surface access. Track only real, accepted work in WSI.
-            let waits = [vk::SemaphoreSubmitInfo::default()
-                .semaphore(frame.wait)
-                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)];
-            if let Some(work) = cache.flush_with_sync(&waits, &[])? {
-                self.chains.graphics(work)?;
-            }
-        } else {
-            cache.flush()?;
-        }
-        if let Some(capture) = self.capture.take() {
-            for (ticket, _) in capture.pending {
-                cache.device_mut().discard_readback(ticket)?;
-            }
-            let _ = capture.reply.send(Err(
-                "presentation stopped before screenshot completion".into()
-            ));
-            let work = cache.device_mut().work_ticket()?;
-            cache
-                .device_mut()
-                .retire_image_views(vec![capture.view], work)?;
-            cache.flush()?;
-        }
+        cache.flush()?;
         self.chains.shutdown()
     }
 }

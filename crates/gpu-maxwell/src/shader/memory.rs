@@ -1,187 +1,208 @@
-//! Owned shader observations captured on the command processor.
-const MAXWELL_SHADER_READ_LIMIT: usize = 64 * 1024;
+//! Shader bytecode lookup and invalidation indexed by device address.
+//! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/shader_cache.cpp
 use crate::{MaxwellGpuAccessError, MaxwellGpuMemory, MaxwellShaderStage};
-use nixe_gpu::physical::PhysicalMapping;
-use nixe_memory::{AccessOperation, AccessResult, MemoryPermissions, Observation};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use nixe_memory::device_memory::DeviceMemory;
+use nixe_shader_recompiler::maxwell::header::ProgramHeader;
+use rustc_hash::FxHashMap as HashMap;
+use std::sync::{Arc, Mutex};
 
-pub struct MaxwellShaderMemoryCache {
-    reads: nixe_gpu::WorkingSet<(crate::MaxwellAddressSpaceId, u64, usize), MaxwellShaderRead>,
+const PAGE_BITS: u32 = 14;
+const PAGE_SIZE: u64 = 1 << PAGE_BITS;
+
+/// Immutable shader facts. Current channel selections retain these facts,
+/// independently of cache page marks and owned compiler environments.
+#[derive(Debug)]
+pub struct ShaderInfo {
+    pub unique_hash: u64,
+    pub size_bytes: usize,
+    pub header: ProgramHeader,
 }
-impl Default for MaxwellShaderMemoryCache {
-    fn default() -> Self {
-        Self {
-            reads: nixe_gpu::WorkingSet::new(4096, 32 * 1024 * 1024),
+struct Entry {
+    address: u64,
+    end: u64,
+    info: Arc<ShaderInfo>,
+}
+#[derive(Default)]
+struct Invalidations {
+    pages: HashMap<u64, Vec<Arc<Entry>>>,
+}
+struct Cache {
+    memory: DeviceMemory,
+    lookup: Mutex<HashMap<u64, Arc<Entry>>>,
+    invalidations: Mutex<Invalidations>,
+}
+impl Drop for Cache {
+    fn drop(&mut self) {
+        for entry in self.lookup.get_mut().unwrap().values() {
+            self.memory
+                .update_pages_cached_count(entry.address, entry.end - entry.address, -1)
+                .expect("registered shader cache pages");
         }
     }
 }
-pub(crate) struct MaxwellShaderMemoryView<'a, 'm> {
+#[derive(Clone)]
+pub struct ShaderCache(Arc<Cache>);
+impl ShaderCache {
+    pub fn new(memory: DeviceMemory) -> Self {
+        Self(Arc::new(Cache {
+            memory,
+            lookup: Mutex::new(HashMap::default()),
+            invalidations: Mutex::new(Invalidations::default()),
+        }))
+    }
+    pub fn try_get(&self, address: u64) -> Option<Arc<ShaderInfo>> {
+        self.0
+            .lookup
+            .lock()
+            .unwrap()
+            .get(&address)
+            .map(|entry| Arc::clone(&entry.info))
+    }
+    pub fn make_shader_info(
+        &self,
+        space: &MaxwellGpuMemory,
+        address: u64,
+        request: &super::recompiler::CaptureRequest,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
+    ) -> nixe_shader_recompiler::Result<Arc<ShaderInfo>> {
+        let info = Arc::new(super::recompiler::analyze_code(space, request, access)?);
+        let bytes = info.size_bytes as u64;
+        let end = address
+            .checked_add(bytes)
+            .ok_or_else(|| super::recompiler::invalid("Shader cache range overflows"))?;
+        let entry = Arc::new(Entry {
+            address,
+            end,
+            info: Arc::clone(&info),
+        });
+        // Register publishes one address entry and its page index together;
+        // only these cache-owned entries mark device pages cached.
+        let mut invalidations = self.0.invalidations.lock().unwrap();
+        let mut lookup = self.0.lookup.lock().unwrap();
+        if let Some(old) = lookup.get(&address) {
+            return Ok(Arc::clone(&old.info));
+        }
+        self.0
+            .memory
+            .update_pages_cached_count(address, bytes, 1)
+            .map_err(|e| super::recompiler::invalid(e.to_string()))?;
+        lookup.insert(address, Arc::clone(&entry));
+        for page in address >> PAGE_BITS..end.div_ceil(PAGE_SIZE) {
+            invalidations
+                .pages
+                .entry(page)
+                .or_default()
+                .push(Arc::clone(&entry));
+        }
+        Ok(info)
+    }
+    pub fn invalidate_region(&self, address: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let end = address + bytes;
+        let mut invalidations = self.0.invalidations.lock().unwrap();
+        let mut removed = Vec::<Arc<Entry>>::new();
+        for page in address >> PAGE_BITS..end.div_ceil(PAGE_SIZE) {
+            if let Some(entries) = invalidations.pages.get(&page) {
+                for entry in entries {
+                    if entry.address < end
+                        && address < entry.end
+                        && !removed.iter().any(|old| Arc::ptr_eq(old, entry))
+                    {
+                        removed.push(Arc::clone(entry));
+                    }
+                }
+            }
+        }
+        if removed.is_empty() {
+            return;
+        }
+        let mut lookup = self.0.lookup.lock().unwrap();
+        for entry in &removed {
+            lookup.remove(&entry.address);
+            for page in entry.address >> PAGE_BITS..entry.end.div_ceil(PAGE_SIZE) {
+                let empty = if let Some(entries) = invalidations.pages.get_mut(&page) {
+                    entries.retain(|old| !Arc::ptr_eq(old, entry));
+                    entries.is_empty()
+                } else {
+                    false
+                };
+                if empty {
+                    invalidations.pages.remove(&page);
+                }
+            }
+            self.0
+                .memory
+                .update_pages_cached_count(entry.address, entry.end - entry.address, -1)
+                .expect("invalidated shader cache pages");
+        }
+    }
+    pub fn invalidate_device_write(&self, memory: &DeviceMemory, address: u64, bytes: u64) {
+        self.invalidate_region(address, bytes);
+        memory.apply_device_aliases(address, bytes, |alias, size| {
+            self.invalidate_region(alias, size)
+        });
+    }
+}
+
+/// Only the graphics owner reads mutable guest memory. Compilation workers
+/// consume recording environments with their own instruction/data bytes.
+pub struct ShaderMemory<'a, 'm> {
     address_space: &'a MaxwellGpuMemory,
-    cache: &'a mut MaxwellShaderMemoryCache,
     access: &'a mut nixe_gpu::MemoryAccess<'m>,
 }
-#[derive(Debug)]
-pub(crate) struct MaxwellShaderRead {
-    pub(crate) address: u64,
-    pub(crate) stage: MaxwellShaderStage,
-    pub(crate) bytes: Arc<[u8]>,
-    pub(crate) physical: Arc<PhysicalMapping>,
-    observation: Observation,
-    pub(crate) mappings: Arc<[crate::MaxwellGpuMapping]>,
-    address_space: crate::MaxwellAddressSpaceId,
-    mapping_generation: AtomicU64,
-}
-impl Clone for MaxwellShaderRead {
-    fn clone(&self) -> Self {
-        Self {
-            address: self.address,
-            stage: self.stage,
-            bytes: Arc::clone(&self.bytes),
-            physical: Arc::clone(&self.physical),
-            observation: self.observation.clone(),
-            mappings: Arc::clone(&self.mappings),
-            address_space: self.address_space,
-            mapping_generation: AtomicU64::new(self.mapping_generation.load(Ordering::Relaxed)),
-        }
-    }
-}
-impl MaxwellShaderRead {
-    fn mapping_is_current(&self, space: &MaxwellGpuMemory) -> bool {
-        if self.address_space != space.id() {
-            return false;
-        }
-        let generation = space.mapping_generation().get();
-        if self.mapping_generation.load(Ordering::Relaxed) != generation {
-            if !self
-                .mappings
-                .iter()
-                .all(|mapping| space.retained_mapping_is_current(mapping))
-            {
-                return false;
-            }
-            self.mapping_generation.store(generation, Ordering::Relaxed);
-        }
-        true
-    }
-    pub(crate) fn is_current(&self, space: &MaxwellGpuMemory) -> bool {
-        !self.observation.is_invalid() && self.mapping_is_current(space)
-    }
-}
-impl<'a, 'm> MaxwellShaderMemoryView<'a, 'm> {
-    pub(crate) fn new(
+impl<'a, 'm> ShaderMemory<'a, 'm> {
+    pub fn new(
         address_space: &'a MaxwellGpuMemory,
-        cache: &'a mut MaxwellShaderMemoryCache,
         access: &'a mut nixe_gpu::MemoryAccess<'m>,
     ) -> Self {
         Self {
             address_space,
-            cache,
             access,
         }
     }
-    pub(crate) fn read(
+    pub fn read_code(
         &mut self,
-        stage: MaxwellShaderStage,
         address: u64,
         size: usize,
-    ) -> Result<MaxwellShaderRead, ShaderCaptureError> {
-        let key = (self.address_space.id(), address, size);
-        if let Some(read) = self.cache.reads.get(&key)
-            && read.is_current(self.address_space)
-        {
-            return Ok(read.clone());
-        }
-        if size > MAXWELL_SHADER_READ_LIMIT {
-            return Err(ShaderCaptureError::ReadTooLarge {
-                requested: size,
-                limit: MAXWELL_SHADER_READ_LIMIT,
-            });
-        }
-        let fail = |error| ShaderCaptureError::Memory {
-            stage,
-            address,
-            error,
-        };
-        let previous = self
-            .cache
-            .reads
-            .get(&key)
-            .filter(|read| read.mapping_is_current(self.address_space));
-        let (physical, mappings) = if let Some(previous) = previous {
-            (
-                Arc::clone(&previous.physical),
-                Arc::clone(&previous.mappings),
-            )
-        } else {
-            let base = self
-                .address_space
-                .address(address)
-                .map_err(MaxwellGpuAccessError::Address)
-                .map_err(fail)?;
-            let resolved = self
-                .address_space
-                .resolve_range(base, size as u64, MemoryPermissions::READ)
-                .map_err(fail)?;
-            let inputs = self.address_space.capture(&resolved).map_err(fail)?;
-            let physical = PhysicalMapping::new(&inputs)
-                .map_err(|e| fail(MaxwellGpuAccessError::Backing(Arc::new(e))))?;
-            let mut mappings = Vec::new();
-            for segment in resolved.segments() {
-                if !mappings
-                    .iter()
-                    .any(|m: &crate::MaxwellGpuMapping| m.id() == segment.mapping().id())
-                {
-                    mappings.push(segment.mapping().clone());
-                }
-            }
-            (physical, mappings.into())
-        };
-        let inputs = physical
-            .pin(0, size as u64)
-            .map_err(|e| fail(MaxwellGpuAccessError::Backing(Arc::new(e))))?;
-        let observation = Observation::default();
-        // Maxwell instructions are data for the ARM CPU. Observe their bytes
-        // without installing executable-ARM tracking or interrupting all cores.
-        // Existing ARM code aliases still retain their own stronger semantics.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/shader_cache.h
-        let AccessResult::Read(bytes) =
-            (self.access)(inputs, AccessOperation::ReadObserved(observation.clone()))
-                .map_err(|e| fail(MaxwellGpuAccessError::Backing(e)))?
-        else {
-            unreachable!("read returns bytes")
-        };
-        let read = MaxwellShaderRead {
-            address,
-            stage,
-            bytes: bytes.into(),
-            physical,
-            observation,
-            mappings,
-            address_space: self.address_space.id(),
-            mapping_generation: AtomicU64::new(self.address_space.mapping_generation().get()),
-        };
-        let weight = std::mem::size_of::<MaxwellShaderRead>()
-            + read.bytes.len()
-            + std::mem::size_of_val(read.mappings.as_ref())
-            + read.physical.metadata_bytes()
-            + 512;
-        self.cache.reads.insert(key, read.clone(), weight);
-        Ok(read)
+    ) -> nixe_shader_recompiler::Result<Vec<u8>> {
+        let mut output = vec![0; size];
+        self.read_code_into(address, &mut output)?;
+        Ok(output)
     }
-
-    pub(crate) fn read_data(
+    pub fn read_code_into(
         &mut self,
+        address: u64,
+        output: &mut [u8],
+    ) -> nixe_shader_recompiler::Result<()> {
+        let address = self
+            .address_space
+            .address(address)
+            .map_err(super::recompiler::invalid)?;
+        self.address_space
+            .read_into(address, output, self.access)
+            .map_err(super::recompiler::invalid)
+    }
+    pub fn instruction(&self, address: u64) -> nixe_shader_recompiler::Result<u64> {
+        let address = self
+            .address_space
+            .address(address)
+            .map_err(super::recompiler::invalid)?;
+        self.address_space
+            .read_u64(address)
+            .map_err(|e| super::recompiler::invalid(e.to_string()))
+    }
+    pub fn read_data(
+        &self,
         stage: MaxwellShaderStage,
         address: u64,
         size: usize,
     ) -> Result<Arc<[u8]>, ShaderCaptureError> {
-        if size > MAXWELL_SHADER_READ_LIMIT {
+        if size > 64 * 1024 {
             return Err(ShaderCaptureError::ReadTooLarge {
                 requested: size,
-                limit: MAXWELL_SHADER_READ_LIMIT,
+                limit: 64 * 1024,
             });
         }
         let fail = |error| ShaderCaptureError::Memory {
@@ -196,14 +217,13 @@ impl<'a, 'm> MaxwellShaderMemoryView<'a, 'm> {
             .map_err(fail)?;
         let mut bytes = vec![0; size];
         self.address_space
-            .read_into(address, &mut bytes, self.access)
+            .read_into_unsafe(address, &mut bytes)
             .map_err(fail)?;
         Ok(bytes.into())
     }
 }
-
 #[derive(Debug)]
-pub(crate) enum ShaderCaptureError {
+pub enum ShaderCaptureError {
     ReadTooLarge {
         requested: usize,
         limit: usize,
@@ -227,209 +247,5 @@ impl std::fmt::Display for ShaderCaptureError {
                 error,
             } => write!(f, "{stage:?} shader capture at {address:#x}: {error}"),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{shader::test_support::mapped_memory, test_memory};
-
-    #[test]
-    fn shader_capture_and_rewrite_keep_arm_native_execution_admitted() {
-        use nixe_memory::{AddressSpace, AddressWidth, GuestVirtualAddress};
-        let (allocation, space, base) = mapped_memory();
-        let machine = space.memory().machine();
-        let cpu = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        cpu.map(
-            GuestVirtualAddress::new(0x10000),
-            allocation.clone(),
-            0,
-            4096,
-            MemoryPermissions::READ_WRITE,
-        )
-        .unwrap();
-        let core = cpu.register_core(Arc::new(|| {
-            panic!("GPU shader observation interrupted ARM execution")
-        }));
-        let native = core.enter_native().unwrap();
-        let code_generation = machine.code_generation();
-        let mut cache = MaxwellShaderMemoryCache::default();
-        let captured = MaxwellShaderMemoryView::new(
-            space.memory(),
-            &mut cache,
-            &mut test_memory::access(machine),
-        )
-        .read(MaxwellShaderStage::Compute, base + 8, 4)
-        .unwrap();
-        test_memory::write(&allocation, 8, &[1, 2, 3, 4]).unwrap();
-        assert!(!captured.is_current(space.memory()));
-        assert_eq!(machine.code_generation(), code_generation);
-        native
-            .synchronize_code(|_| panic!("GPU shader bytes invalidated ARM translations"))
-            .unwrap();
-    }
-
-    #[test]
-    fn unchanged_shader_reads_share_owned_bytes_without_allocating_or_backend_calls() {
-        use crate::engines::tests::register_benchmark::ALLOCATIONS;
-        let (allocation, space, base) = mapped_memory();
-        let mut cache = MaxwellShaderMemoryCache::default();
-        let mut access = test_memory::access(space.memory().machine());
-        let first = MaxwellShaderMemoryView::new(space.memory(), &mut cache, &mut access)
-            .read(MaxwellShaderStage::Compute, base + 8, 4)
-            .unwrap();
-        ALLOCATIONS.with(|n| n.set(Some(0)));
-        let mut unexpected = |_, _| panic!("unchanged shader proof called the owner");
-        for _ in 0..1000 {
-            let repeated =
-                MaxwellShaderMemoryView::new(space.memory(), &mut cache, &mut unexpected)
-                    .read(MaxwellShaderStage::Compute, base + 8, 4)
-                    .unwrap();
-            assert!(Arc::ptr_eq(&first.bytes, &repeated.bytes));
-        }
-        assert_eq!(ALLOCATIONS.with(|n| n.replace(None).unwrap()), 0);
-        let code_generation = space.memory().machine().code_generation();
-        test_memory::write(&allocation, 8, &[9]).unwrap();
-        assert_eq!(space.memory().machine().code_generation(), code_generation);
-        let changed = MaxwellShaderMemoryView::new(space.memory(), &mut cache, &mut access)
-            .read(MaxwellShaderStage::Compute, base + 8, 4)
-            .unwrap();
-        assert_eq!(changed.bytes[0], 9);
-        assert_eq!(first.bytes[0], 0);
-        assert!(!first.is_current(space.memory()));
-        test_memory::write(&allocation, 8, &[0]).unwrap();
-        assert!(!first.is_current(space.memory()));
-        assert!(!changed.is_current(space.memory()));
-    }
-
-    #[test]
-    fn device_publication_is_resolved_by_the_owner_before_shader_recapture() {
-        let (allocation, space, base) = mapped_memory();
-        let memory = space.memory().machine();
-        let mut cache = MaxwellShaderMemoryCache::default();
-        let first = MaxwellShaderMemoryView::new(
-            space.memory(),
-            &mut cache,
-            &mut test_memory::access(memory),
-        )
-        .read(MaxwellShaderStage::Compute, base + 8, 4)
-        .unwrap();
-        let code_generation = memory.code_generation();
-        memory
-            .publish_device_write(&test_memory::ranges(&allocation), || Ok(()))
-            .unwrap();
-        assert_eq!(memory.code_generation(), code_generation);
-        assert!(!first.is_current(space.memory()));
-        let mut readbacks = 0;
-        let mut owner = |ranges: Vec<nixe_memory::AllocationRange>, mut operation| {
-            readbacks += 1;
-            memory.write_resolved(&ranges, &[7; 4]).map_err(Arc::new)?;
-            memory
-                .apply_resolved_access(&ranges, &mut operation)
-                .map_err(Arc::new)
-        };
-        let next = MaxwellShaderMemoryView::new(space.memory(), &mut cache, &mut owner)
-            .read(MaxwellShaderStage::Compute, base + 8, 4)
-            .unwrap();
-        assert_eq!(&*next.bytes, &[7; 4]);
-        assert_eq!(readbacks, 1);
-        assert!(!first.is_current(space.memory()));
-    }
-
-    #[test]
-    fn unrelated_mapping_refreshes_the_retained_generation_once() {
-        let (_allocation, mut space, base) = mapped_memory();
-        let memory = space.memory().machine().clone();
-        let mut cache = MaxwellShaderMemoryCache::default();
-        let read = MaxwellShaderMemoryView::new(
-            space.memory(),
-            &mut cache,
-            &mut test_memory::access(&memory),
-        )
-        .read(MaxwellShaderStage::Compute, base, 4)
-        .unwrap();
-        let old = read.mapping_generation.load(Ordering::Relaxed);
-        let unrelated = test_memory::allocate(&memory, 0x1000);
-        space
-            .map(crate::MaxwellMapRequest {
-                allocation: crate::MaxwellAllocationId::new(2),
-                backing: test_memory::ranges(&unrelated),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        assert_ne!(old, space.memory().mapping_generation().get());
-        assert!(read.is_current(space.memory()));
-        assert_eq!(
-            read.mapping_generation.load(Ordering::Relaxed),
-            space.memory().mapping_generation().get()
-        );
-        assert!(read.is_current(space.memory()));
-        let other = test_memory::allocate(&memory, 0x1000);
-        let mut other_space = crate::MaxwellGpuAddressSpace::new(
-            memory,
-            crate::MaxwellAddressSpaceId::new(2),
-            crate::SWITCH_1_GM20B_PROFILE,
-        );
-        other_space
-            .initialize(crate::MaxwellAddressSpaceInitialization::default())
-            .unwrap();
-        other_space
-            .map(crate::MaxwellMapRequest {
-                allocation: crate::MaxwellAllocationId::new(3),
-                backing: test_memory::ranges(&other),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        assert!(!read.is_current(other_space.memory()));
-    }
-
-    #[test]
-    fn remapping_gpu_va_cannot_refresh_the_old_physical_shader_proof() {
-        let (allocation, mut space, base) = mapped_memory();
-        let memory = space.memory().machine().clone();
-        let mut cache = MaxwellShaderMemoryCache::default();
-        let mut access = test_memory::access(&memory);
-        let first = MaxwellShaderMemoryView::new(space.memory(), &mut cache, &mut access)
-            .read(MaxwellShaderStage::Compute, base + 8, 4)
-            .unwrap();
-        let address = space.address(base).unwrap();
-        space.unmap(address).unwrap();
-        assert!(!first.is_current(space.memory()));
-        space.reserve(1, 0x1000, 1, base).unwrap();
-        space
-            .map(crate::MaxwellMapRequest {
-                allocation: crate::MaxwellAllocationId::new(1),
-                backing: test_memory::ranges(&allocation),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: Some(address),
-            })
-            .unwrap();
-        assert!(!first.is_current(space.memory()));
-        let current = MaxwellShaderMemoryView::new(space.memory(), &mut cache, &mut access)
-            .read(MaxwellShaderStage::Compute, base + 8, 4)
-            .unwrap();
-        assert_eq!(current.bytes, first.bytes);
-        assert!(current.is_current(space.memory()));
     }
 }

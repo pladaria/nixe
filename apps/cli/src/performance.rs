@@ -42,13 +42,6 @@ impl Capture {
                 ("GuestOwnedBytes", state.guest_owned_bytes),
                 ("RetainedPhysicalBytes", state.retained_bytes),
                 ("LivePhysicalAllocations", state.live_allocations as u64),
-                ("TrackingBitmapBytes", tracking.bitmap_bytes as u64),
-                ("TrackingDirtyQueueBytes", tracking.dirty_queue_bytes as u64),
-                ("ObserverPages", tracking.observer_pages as u64),
-                (
-                    "ObserverRegistrations",
-                    tracking.observer_registrations as u64,
-                ),
                 ("ProtectionCalls", tracking.protection_calls),
                 ("CapturedPhysicalBytes", tracking.captured_bytes),
             ];

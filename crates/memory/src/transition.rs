@@ -1,7 +1,7 @@
 //! Address-space quiescence. Stable native execution never takes a reader lock.
 use crate::{AddressSpace, GuestVirtualAddress, MemoryError};
 use std::{
-    cell::Cell,
+    cell::{Cell, OnceCell, RefCell},
     marker::PhantomData,
     rc::Rc,
     sync::{
@@ -26,7 +26,7 @@ pub struct CodeInvalidation {
 }
 #[derive(Default)]
 pub(crate) struct Quiescence {
-    writer: Mutex<()>,
+    pub(crate) writer: Mutex<()>,
     sequence: AtomicU64,
     host_accesses: AtomicUsize,
     cores: Mutex<Vec<Weak<CoreSlot>>>,
@@ -37,6 +37,11 @@ pub(crate) struct Quiescence {
 }
 pub struct CoreContext {
     writes: Arc<crate::cpu_writes::CpuWriteCollector>,
+    // Memory::gpu_device_memory and rasterizer_read_areas belong to the core,
+    // not to each scalar result or the physical allocation tracking system.
+    gpu_device: OnceCell<crate::device_memory::DeviceMemory>,
+    read_area: Cell<crate::NativeReadArea>,
+    device_address_scratch: RefCell<Vec<u32>>,
     space: Arc<AddressSpace>,
     slot: Arc<CoreSlot>,
     // Contexts may move while idle, but cannot be shared between OS threads.
@@ -99,6 +104,9 @@ impl Quiescence {
         self.cores.lock().unwrap().push(Arc::downgrade(&slot));
         CoreContext {
             writes: owner.machine().cpu_writes().register(),
+            gpu_device: OnceCell::new(),
+            read_area: Cell::new(crate::NativeReadArea::default()),
+            device_address_scratch: RefCell::new(Vec::new()),
             space: owner,
             slot,
             _not_sync: PhantomData,
@@ -186,14 +194,6 @@ impl Quiescence {
     ) -> Result<MappingTransition<'a>, MemoryError> {
         self.check()?;
         self.begin_transition_inner(writer, true)
-    }
-    pub fn begin_tracking<'a>(
-        &'a self,
-        writer: MutexGuard<'a, ()>,
-        interrupt_native: bool,
-    ) -> Result<MappingTransition<'a>, MemoryError> {
-        self.check()?;
-        self.begin_transition_inner(writer, interrupt_native)
     }
     pub fn begin_close(&self) -> Result<Option<MappingTransition<'_>>, MemoryError> {
         // Teardown must also release mappings after an earlier transition or
@@ -312,6 +312,96 @@ impl Drop for CoreContext {
 impl NativeAdmission<'_> {
     pub(crate) fn cpu_writes(&self) -> &crate::cpu_writes::CpuWriteCollector {
         &self.context.writes
+    }
+    fn gpu_device(&self) -> Option<&crate::device_memory::DeviceMemory> {
+        if self.context.gpu_device.get().is_none() {
+            let device = self.context.space.machine().gpu_device_memory()?;
+            let _ = self.context.gpu_device.set(device);
+        }
+        self.context.gpu_device.get()
+    }
+    pub(crate) fn read_area_contains(&self, extent: crate::Extent) -> bool {
+        let Some(device) = self.gpu_device() else {
+            return false;
+        };
+        let area = self.context.read_area.get();
+        let mut contains = true;
+        device.apply_on_physical(
+            extent,
+            &self.context.device_address_scratch,
+            |address, bytes| {
+                contains &= area.contains(address, bytes);
+            },
+        );
+        contains
+    }
+    pub(crate) fn collect_write(
+        &self,
+        extents: &[crate::Extent],
+        write: impl FnOnce(),
+    ) -> Result<bool, MemoryError> {
+        let Some(device) = self.gpu_device() else {
+            return Ok(false);
+        };
+        self.cpu_writes().write(
+            self.address_space().machine(),
+            device,
+            extents,
+            &self.context.device_address_scratch,
+            write,
+        )
+    }
+    /// Memory::HandleRasterizerDownload visits every current DAddr alias. Only
+    /// a nonpreemptive area crosses the graphics synchronization boundary.
+    /// Captured ranges retain the original CPU input while that boundary waits.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/memory.cpp#L681-L698
+    pub fn read_captured<E: From<MemoryError>>(
+        &self,
+        ranges: &[crate::AllocationRange],
+        mut flush: impl FnMut(crate::NativeReadArea) -> Result<(), E>,
+    ) -> Result<u128, E> {
+        assert!(
+            !self.is_active(),
+            "rasterizer callbacks require suspended native execution"
+        );
+        let machine = self.address_space().machine();
+        let size = machine.validate_ranges(ranges)?;
+        if !matches!(size, 1 | 2 | 4 | 8 | 16) {
+            return Err(MemoryError::Invalid("unsupported native read width").into());
+        }
+        if let Some(device) = self.gpu_device()
+            && let Some(rasterizer) = device.interface()
+        {
+            for extent in ranges
+                .iter()
+                .flat_map(crate::AllocationRange::physical_extents)
+            {
+                let mut result = Ok(());
+                device.apply_on_physical(
+                    extent,
+                    &self.context.device_address_scratch,
+                    |address, bytes| {
+                        if result.is_err() || self.context.read_area.get().contains(address, bytes)
+                        {
+                            return;
+                        }
+                        let mut area = rasterizer.on_cpu_read(address, bytes);
+                        if !area.preemptive {
+                            if let Err(error) = flush(area) {
+                                result = Err(error);
+                                return;
+                            }
+                            area.preemptive = true;
+                        }
+                        self.context.read_area.set(area);
+                    },
+                );
+                result?;
+            }
+        }
+        let mut bytes = [0; 16];
+        machine.capture_stream(ranges, &mut bytes[..size])?;
+        Ok(u128::from_le_bytes(bytes))
     }
     /// Call after admission and before invoking native code. Admission prevents
     /// a writer from queuing another invalidation between this drain and Run.

@@ -233,7 +233,7 @@ impl Host1x {
 
 #[derive(Clone, Debug)]
 struct Mapping {
-    physical: Arc<nixe_gpu::physical::PhysicalMapping>,
+    physical: Arc<nixe_memory::PhysicalMapping>,
     object: NvMapObject,
     references: u32,
 }
@@ -641,10 +641,10 @@ impl Host1x {
                     Arc::make_mut(&mut self.mappings).insert(
                         address,
                         Mapping {
-                            physical: nixe_gpu::physical::PhysicalMapping::new(
-                                object.ranges().unwrap(),
-                            )
-                            .map_err(|e| execution_error(descriptor, request, e.to_string()))?,
+                            physical: nixe_memory::PhysicalMapping::new(object.ranges().unwrap())
+                                .map_err(|e| {
+                                execution_error(descriptor, request, e.to_string())
+                            })?,
                             object,
                             references: 1,
                         },

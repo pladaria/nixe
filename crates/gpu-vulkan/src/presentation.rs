@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, mpsc};
 mod frames;
 mod render;
 mod wsi;
-pub(crate) use frames::Frames;
+pub(crate) use frames::{FrameStorage, Frames, PresentFrame};
 pub(crate) use render::ScreenRenderer;
 pub(crate) use wsi::Presenter;
 mod host;
@@ -40,6 +40,7 @@ impl Drop for HostFrame {
 #[derive(Default)]
 struct Control {
     pending: Option<HostFrame>,
+    size: [u32; 2],
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
     stopped: bool,
     failure: Option<String>,
@@ -89,6 +90,7 @@ impl PresentationClient {
             if state.pending.is_some() {
                 return Err("host packet submitted without admission".into());
             }
+            state.size = packet.size;
             state.pending = Some(packet);
             state.wake.clone()
         };
@@ -117,6 +119,9 @@ impl PresentationClient {
             wake();
         }
     }
+    pub(crate) fn output_size(&self) -> [u32; 2] {
+        self.0.lock().unwrap().size
+    }
     pub(crate) fn take(&self) -> Option<HostFrame> {
         self.0.lock().unwrap().pending.take()
     }
@@ -141,24 +146,13 @@ impl PresentationClient {
 #[derive(Clone)]
 pub(crate) struct Source {
     pub image: nixe_gpu::ResidentImage,
-    pub crop: nixe_video::FrameCrop,
-    pub transform: nixe_video::FrameTransform,
     pub sequence: u64,
 }
 impl Source {
     pub(crate) fn from_frame(frame: &nixe_video::PresentationFrame) -> Self {
         Self {
             image: frame.image().clone(),
-            crop: frame.crop(),
-            transform: frame.transform(),
             sequence: frame.sequence(),
-        }
-    }
-    pub(crate) fn dimensions(&self) -> [u32; 2] {
-        if self.transform.rotate_90_clockwise {
-            [self.crop.height, self.crop.width]
-        } else {
-            [self.crop.width, self.crop.height]
         }
     }
 }

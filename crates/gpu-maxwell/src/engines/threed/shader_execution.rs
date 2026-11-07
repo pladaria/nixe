@@ -386,13 +386,6 @@ impl MaxwellThreeDShaderLocalMemoryState<'_> {
             (u64::from(*self.size_upper().value()?) << 32) | u64::from(*self.size_lower().value()?),
         )
     }
-    pub(in crate::engines) fn region_is_partially_programmed(&self) -> bool {
-        let programmed = self.address_upper().raw().is_some()
-            || self.address_lower().raw().is_some()
-            || self.size_upper().raw().is_some()
-            || self.size_lower().raw().is_some();
-        programmed && (self.address().is_none() || self.size().is_none())
-    }
 }
 
 /// Directly addressable memory partition selected by `SET_L1_CONFIGURATION`.

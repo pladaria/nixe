@@ -1,8 +1,7 @@
-//! Ordered packet spans. Payloads remain borrowed from the decoded packet;
-//! only the backend's final byte payload is retained. Exceptional shadow replay
-//! uses scalar semantics, while ordinary transfers scale with physical spans.
+//! Non-incrementing DMA calls consume borrowed argument arrays directly.
+//! Exceptional shadow replay uses the same scalar engine entry as Eden.
 use super::*;
-use crate::{MaxwellDecodedMethod, MaxwellPushbufferSubchannel};
+use crate::MaxwellPushbufferSubchannel;
 
 #[derive(Clone, Copy)]
 pub(super) enum Port {
@@ -13,98 +12,62 @@ pub(super) enum Port {
 
 pub(super) const fn port(method: GpuMethodId) -> Option<Port> {
     match method.0 {
-        0x238c..=0x23fc => Some(Port::ConstantBuffer),
+        0x2390..=0x23fc => Some(Port::ConstantBuffer),
         0x1b4 => Some(Port::Embedded),
         0x1300 | 0x15e8 | 0x15ec => Some(Port::Indices),
         _ => None,
     }
 }
 
-pub(super) async fn stream_packet<E>(
+pub(super) fn call_multi_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     channel: &mut MaxwellGpuChannel,
     class: GpuClassId,
     subchannel: MaxwellPushbufferSubchannel,
-    decoded: crate::MaxwellMethodSpan<'_>,
-    first: MaxwellDecodedMethod,
+    method: GpuMethodId,
+    data: crate::MaxwellDmaArguments<'_>,
     port: Port,
-    consume: &mut impl for<'a> AsyncFnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
-) -> Result<bool, MaxwellEngineStreamError<E>> {
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<bool, MaxwellEngineStreamError> {
     let cb = matches!(port, Port::ConstantBuffer);
     let inline = matches!(port, Port::Embedded);
     let indices = matches!(port, Port::Indices);
-    let data = if cb && first.method().0 == 0x238c {
-        decoded.slice(1..)
-    } else {
-        decoded
-    };
-    if data.is_empty()
-        || if cb {
-            // Decoded packet methods are monotonic; endpoint bounds prove the
-            // entire CB aperture without reconstructing each word's provenance.
-            data.method_at(0).0 < 0x2390 || data.method_at(data.len() - 1).0 > 0x23fc
-        } else {
-            data.method_at(0) != first.method() || data.method_at(data.len() - 1) != first.method()
-        }
-    {
-        return Ok(false);
-    }
     if class == threed::CLASS {
         let state = channel.three_d_mut();
         if state.pending_notification.is_some()
-            || state.mme().shadow_ram_control().value()
-                == Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay)
+            || (!cb
+                && state.mme().shadow_ram_control().value()
+                    == Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay))
         {
             return Ok(false);
         }
     } else if !inline || (class != compute::CLASS && class != inline_to_memory::CLASS) {
         return Ok(false);
     }
-    flush_before_method(
-        channel,
-        MaxwellMethodSource::decoded(first, subchannel),
-        consume,
-    )
-    .await?;
     if class == threed::CLASS {
         let (profile, state) = channel.three_d_with_profile_mut();
         if indices {
-            threed::inline_index_words(state, subchannel, data)
+            threed::inline_index_words(state, method, subchannel, data)
                 .map_err(MaxwellEngineStreamError::dispatch)?;
             return Ok(true);
         }
         if cb {
-            if first.method().0 == 0x238c {
-                threed::call_method(
-                    profile,
-                    &mut MaxwellMethodDispatch::class_method(
-                        MaxwellMethodSource::decoded(first, subchannel),
-                        class,
-                    ),
-                    state,
-                )
-                .map_err(MaxwellEngineStreamError::dispatch)?;
-            }
-            let (upload, count) = threed::constant_buffer_words(state, subchannel, data)
-                .map_err(MaxwellEngineStreamError::dispatch)?;
-            consume(MaxwellEngineEvent {
-                instances: None,
-                operation: PendingEngineOperation::ThreeDInlineConstantBuffer(upload),
-                three_d: state.operation_state(),
-                compute: None,
-                inline_words: Some(data.slice(..count)),
-            })
-            .await
-            .map_err(MaxwellEngineStreamError::Consumer)?;
+            // ProcessCBMultiData consumes the literal packet directly, including
+            // shadow replay mode; it does not write the data port's shadow word.
+            let count = threed::process_constant_buffer_data(
+                state,
+                data.write_source(),
+                execution,
+                || data.source(0, method, subchannel),
+            )?;
             if count < data.len() {
                 threed::call_method(
                     profile,
-                    &mut MaxwellMethodDispatch::class_method(
-                        MaxwellMethodSource::decoded(data.get(count).unwrap(), subchannel),
-                        class,
-                    ),
+                    method,
+                    data.argument_at(count),
                     state,
-                )
-                .map_err(MaxwellEngineStreamError::dispatch)?;
+                    execution,
+                    || data.source(count, method, subchannel),
+                )?;
                 unreachable!("first excess CB word must report its precise range error");
             }
             return Ok(true);
@@ -116,31 +79,29 @@ pub(super) async fn stream_packet<E>(
     let mut cursor = 0;
     while cursor < data.len() {
         let tail = data.slice(cursor..);
-        let (operation, count) = if class == threed::CLASS {
+        let count = if class == threed::CLASS {
             let (_, state) = channel.three_d_with_profile_mut();
-            let (upload, count) = threed::embedded_words(state, subchannel, tail)
+            let (upload, count) = threed::embedded_words(state, method, subchannel, tail)
                 .map_err(MaxwellEngineStreamError::dispatch)?;
-            (PendingEngineOperation::InlineToMemory(upload), count)
+            execution.inline_to_memory(upload, Some(tail.slice(..count)))?;
+            count
         } else if class == compute::CLASS {
             let (upload, count) =
-                compute::data_words(class, channel.compute_mut(), subchannel, tail)
+                compute::data_words(channel.compute_mut(), method, subchannel, tail)
                     .map_err(MaxwellEngineStreamError::dispatch)?;
-            (PendingEngineOperation::ComputeInlineToMemory(upload), count)
+            execution.compute_inline(upload, Some(tail.slice(..count)))?;
+            count
         } else {
-            let (upload, count) =
-                inline_to_memory::data_words(channel.inline_to_memory_mut(), subchannel, tail)
-                    .map_err(MaxwellEngineStreamError::dispatch)?;
-            (PendingEngineOperation::InlineToMemory(upload), count)
+            let (upload, count) = inline_to_memory::data_words(
+                channel.inline_to_memory_mut(),
+                method,
+                subchannel,
+                tail,
+            )
+            .map_err(MaxwellEngineStreamError::dispatch)?;
+            execution.inline_to_memory(upload, Some(tail.slice(..count)))?;
+            count
         };
-        consume(MaxwellEngineEvent {
-            instances: None,
-            operation,
-            three_d: channel.three_d(),
-            compute: Some(channel.compute()),
-            inline_words: Some(tail.slice(..count)),
-        })
-        .await
-        .map_err(MaxwellEngineStreamError::Consumer)?;
         cursor += count;
     }
     Ok(true)

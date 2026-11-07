@@ -40,7 +40,7 @@ pub struct VulkanDevice {
     pub(crate) submission: QueueState,
     pub(crate) dispatch: Dispatch,
     pub(crate) queue: vk::Queue,
-    profile: DeviceProfile,
+    pub(crate) profile: Arc<DeviceProfile>,
     queues: QueueSelection,
     surface: Option<SurfaceProfile>,
 }
@@ -55,6 +55,8 @@ pub(crate) struct DeviceOwner {
     pub non_coherent_atom_size: u64,
     pub local_allocation_bytes: std::sync::atomic::AtomicU64,
     pub calibrated_timestamps: bool,
+    pub attachment_feedback_loop: bool,
+    pub render_passes: Mutex<crate::render_pass::Cache>,
 }
 impl DeviceOwner {
     pub fn name<T: Handle>(&self, handle: T, name: &str) -> Result<(), VulkanError> {
@@ -77,6 +79,9 @@ impl Drop for DeviceOwner {
         // All resource wrappers retain this owner. Submitted diagnostic work
         // retains its resources until completion. The allocator must die before
         // VkDevice; no ordinary shutdown requires a device-wide idle wait here.
+        for (_, pass) in self.render_passes.get_mut().unwrap().drain() {
+            unsafe { self.device.destroy_render_pass(pass, None) };
+        }
         self.allocator
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -216,6 +221,8 @@ impl VulkanDevice {
             physical: selected.physical,
             queue_mutex: Arc::new(Mutex::new(())),
             allocator: Mutex::new(None),
+            attachment_feedback_loop: selected.profile.attachment_feedback_loop,
+            render_passes: Mutex::new(Default::default()),
             debug,
             non_coherent_atom_size: selected.profile.limits.non_coherent_atom_size,
             local_allocation_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -226,13 +233,10 @@ impl VulkanDevice {
         });
         // The owner exists before any subsequent fallible creation, so failures
         // destroy the independent device and instance without a resource rollback layer.
-        let dispatch = Dispatch::new(
+        let mut dispatch = Dispatch::new(
             &owner.instance.instance,
             &owner.device,
-            selected.profile.api_path,
-            selected.profile.swapchain_maintenance,
-            selected.profile.dynamic_state.base,
-            selected.profile.attachment_feedback_loop,
+            &selected.profile,
             Arc::clone(&owner.queue_mutex),
         )?;
         debug_assert_eq!(
@@ -268,14 +272,14 @@ impl VulkanDevice {
         let submission = QueueState::new(
             Arc::clone(&owner),
             selected.queues.graphics_compute_family,
-            &dispatch,
+            &mut dispatch,
         )?;
         Ok(Self {
             owner,
             dispatch,
             queue,
             submission,
-            profile: selected.profile,
+            profile: Arc::new(selected.profile),
             queues: selected.queues,
             surface: selected.surface,
         })
@@ -318,7 +322,6 @@ impl VulkanDevice {
             version,
             features.v12.timeline_semaphore != 0,
             features.sync.synchronization2 != 0,
-            features.rendering.dynamic_rendering != 0,
             &ext,
         );
         if !missing.is_empty() {
@@ -418,6 +421,9 @@ impl VulkanDevice {
     }
     pub fn profile(&self) -> &DeviceProfile {
         &self.profile
+    }
+    pub(crate) fn profile_handle(&self) -> Arc<DeviceProfile> {
+        Arc::clone(&self.profile)
     }
     pub fn queues(&self) -> &QueueSelection {
         &self.queues

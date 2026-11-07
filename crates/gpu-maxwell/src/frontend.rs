@@ -2,13 +2,13 @@
 
 use std::fmt::{Display, Formatter};
 
-use crate::engines::{MaxwellEngineStreamError, stream_maxwell_engine_entry};
-use crate::execution::{MaxwellCommandEffects, MaxwellFrontend};
-use crate::pushbuffer::packet::CommandStream;
-pub use crate::pushbuffer::packet::MaxwellCommandSourceScratch;
+use crate::engines::{MaxwellEngineStreamError, process_maxwell_commands};
+use crate::execution::{ChannelExecution, MaxwellFrontend};
+use crate::pushbuffer::dma::CommandReader;
+pub use crate::pushbuffer::dma::MaxwellCommandSourceScratch;
 use crate::{
-    MaxwellEngineDispatchError, MaxwellFrontendDispatch, MaxwellGpuChannel, MaxwellGpuMemory,
-    MaxwellPushbufferDecodeError, MaxwellSubmissionExecutionError,
+    MaxwellEngineDispatchError, MaxwellFrontendDispatch, MaxwellGpfifoSourceError,
+    MaxwellGpuChannel, MaxwellGpuMemory, MaxwellSubmissionExecutionError,
 };
 
 /// First semantic failure while consuming a command stream.
@@ -16,7 +16,7 @@ use crate::{
 pub enum MaxwellFrontendDispatchError {
     // Effects and MME sends carry this error type through their synchronous
     // results. Keep packet provenance behind the failure-only allocation too.
-    PacketDecode(Box<MaxwellPushbufferDecodeError>),
+    CommandSource(Box<MaxwellGpfifoSourceError>),
     EngineDispatch(Box<MaxwellEngineDispatchError>),
     Execution(Box<MaxwellSubmissionExecutionError>),
 }
@@ -24,7 +24,7 @@ pub enum MaxwellFrontendDispatchError {
 impl Display for MaxwellFrontendDispatchError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PacketDecode(error) => write!(formatter, "packet decode failed: {error}"),
+            Self::CommandSource(error) => write!(formatter, "command source failed: {error}"),
             Self::EngineDispatch(error) => write!(formatter, "engine dispatch failed: {error}"),
             Self::Execution(error) => write!(formatter, "frontend lowering failed: {error}"),
         }
@@ -33,13 +33,15 @@ impl Display for MaxwellFrontendDispatchError {
 
 impl std::error::Error for MaxwellFrontendDispatchError {}
 
-/// Fetch each entry and consume engine effects in order. Packet continuation
-/// survives entry fetches; control work runs at effects and entry boundaries.
+/// Fetch each entry and consume engine effects in order. The channel DMA state
+/// survives entry fetches; entries check shutdown without servicing CPU work.
+/// CPU requests run after native draws or at the outer GPU inbox boundary.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp#L34-L45
 /// The executor selects the frontend channel before each poll of this future.
 pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellCommandHost>(
     dispatch: &MaxwellFrontendDispatch,
     channel: &mut MaxwellGpuChannel,
-    address_space: &MaxwellGpuMemory,
+    address_space: &std::cell::RefCell<MaxwellGpuMemory>,
     cache: &std::cell::RefCell<L>,
     sources: &mut MaxwellCommandSourceScratch,
     host: &mut H,
@@ -48,7 +50,7 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
     let started = std::time::Instant::now();
     let submission = dispatch.scheduled().submission();
     let frontend = dispatch.scheduled().frontend();
-    let mut effects = MaxwellCommandEffects::new(
+    let mut effects = ChannelExecution::new(
         address_space,
         frontend,
         dispatch.scheduled().completion(),
@@ -59,61 +61,44 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
         effects.set_driver_completion_increments(2);
     }
     let mut commands = std::mem::take(&mut channel.commands);
-    let mut stream = CommandStream::resume(commands.packet.take());
+    let mut stream = CommandReader::new(address_space.borrow().machine().clone());
     let execution_error = |error| MaxwellFrontendDispatchError::Execution(Box::new(error));
     let result = async {
         loop {
-            if stream.needs_entry() && stream.next_entry_waits(submission) {
-                crate::engines::finish_maxwell_engine_stream(channel, &mut async |event| {
-                    effects.push_event(event).await?;
-                    effects.control()
-                })
-                .await
-                .map_err(execution_error)?;
+            if effects.host.is_stopped() {
+                return Err(execution_error(MaxwellSubmissionExecutionError::Native(
+                    "GPU owner is shutting down".into(),
+                )));
             }
-            if stream.needs_entry()
-                && !stream
-                    .load_entry(submission, address_space, sources, effects.host)
-                    .map_err(|error| {
-                        MaxwellFrontendDispatchError::PacketDecode(Box::new(error.into()))
-                    })?
+            if !stream
+                .load_entry(submission, &address_space.borrow(), sources, effects.host)
+                .map_err(|error| MaxwellFrontendDispatchError::CommandSource(Box::new(error)))?
             {
                 break;
             }
-            stream_maxwell_engine_entry(
-                channel,
-                &mut stream,
-                #[cfg(test)]
-                None,
-                &mut commands.mme_method,
-                &mut commands.mme_parameters,
-                &mut async |event| {
-                    effects.push_event(event).await.map_err(execution_error)?;
-                    effects.control().map_err(execution_error)
-                },
-            )
-            .await
-            .map_err(|error| match error {
+            let engine_error = |error| match error {
                 MaxwellEngineStreamError::Dispatch(error) => {
                     MaxwellFrontendDispatchError::EngineDispatch(error)
                 }
-                MaxwellEngineStreamError::Consumer(error) => error,
-                MaxwellEngineStreamError::Decode(error) => {
-                    MaxwellFrontendDispatchError::PacketDecode(error)
+                MaxwellEngineStreamError::Execution(error) => {
+                    MaxwellFrontendDispatchError::Execution(error)
                 }
-            })?;
-            effects.control().map_err(execution_error)?;
+            };
+            let mut index = 0;
+            while let Some(effect) =
+                process_maxwell_commands(channel, &stream, &mut commands, &mut index, &mut effects)
+                    .map_err(engine_error)?
+            {
+                effect
+                    .complete(channel, &mut commands, &mut effects)
+                    .await
+                    .map_err(engine_error)?;
+            }
         }
-        commands.packet = stream.finish(sources);
-        crate::engines::finish_maxwell_engine_stream(channel, &mut async |event| {
-            effects.push_event(event).await?;
-            effects.control()
-        })
-        .await
-        .map_err(execution_error)?;
         Ok(())
     }
     .await;
+    stream.finish(sources);
     channel.commands = commands;
     result?;
     #[cfg(feature = "performance-counters")]
@@ -131,9 +116,8 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
         .finish(
             submission.decoded().mode().fence_get() && !submission.decoded().mode().suppress_wfi(),
         )
-        .await
         .map_err(execution_error)?;
-    // Every completed list services waiting control requests, including lists
-    // containing only passive register programming.
-    host.control().map_err(execution_error)
+    // The outer GPU loop handles pending requests after returning the channel
+    // and finishing its command list, including lists with no native draws.
+    Ok(())
 }

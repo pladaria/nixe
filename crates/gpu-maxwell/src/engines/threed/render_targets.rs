@@ -18,7 +18,7 @@ pub(super) const MAXWELL_THREE_D_DEPTH_TARGET_LAYER_RESET: u32 = 0;
 ///
 /// This is layered/multiview routing rather than a change to the attachment's
 /// memory layout. The enabled path remains an explicit lowering boundary until
-/// the neutral draw contract carries the viewport-derived target index.
+/// the native shader and framebuffer owners consume the viewport-derived target index.
 ///
 /// ABI source:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1927-L1930>
@@ -412,68 +412,6 @@ impl MaxwellThreeDCompressionThreshold {
     }
 }
 
-/// Ordered color-target routing selected by `SET_CT_SELECT`.
-///
-/// The complete register payload is retained, including selectors beyond
-/// `target_count`; they are inactive for the current draw but have no
-/// documented reset semantics and must not be discarded on write.
-///
-/// ABI source:
-/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2003-L2012>
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct MaxwellThreeDColorTargetSelection {
-    target_count: u8,
-    targets: [u8; MAXWELL_COLOR_TARGET_COUNT],
-}
-
-impl MaxwellThreeDColorTargetSelection {
-    pub(super) const fn parse(raw: u32) -> Option<Self> {
-        if raw & !0x0fff_ffff != 0 {
-            return None;
-        }
-        let target_count = (raw & 0xf) as u8;
-        if target_count as usize > MAXWELL_COLOR_TARGET_COUNT {
-            return None;
-        }
-        let mut targets = [0; MAXWELL_COLOR_TARGET_COUNT];
-        let mut index = 0;
-        while index < MAXWELL_COLOR_TARGET_COUNT {
-            targets[index] = ((raw >> (4 + index * 3)) & 7) as u8;
-            index += 1;
-        }
-        Some(Self {
-            target_count,
-            targets,
-        })
-    }
-
-    #[must_use]
-    pub const fn target_count(self) -> u8 {
-        self.target_count
-    }
-
-    #[must_use]
-    pub const fn targets(self) -> [u8; MAXWELL_COLOR_TARGET_COUNT] {
-        self.targets
-    }
-
-    #[must_use]
-    pub fn active_targets(&self) -> &[u8] {
-        &self.targets[..self.target_count as usize]
-    }
-
-    #[must_use]
-    pub const fn raw(self) -> u32 {
-        let mut raw = self.target_count as u32;
-        let mut index = 0;
-        while index < MAXWELL_COLOR_TARGET_COUNT {
-            raw |= (self.targets[index] as u32) << (4 + index * 3);
-            index += 1;
-        }
-        raw
-    }
-}
-
 impl MaxwellThreeDColorCompressionMode {
     pub(super) const fn parse(raw: u32) -> Option<Self> {
         match raw {
@@ -717,61 +655,6 @@ pub struct MaxwellThreeDClearSurface {
     array_layer: u16,
 }
 
-/// Modifiers applied by a later `CLEAR_SURFACE` trigger.
-///
-/// NVIDIA publishes the four independent boolean fields in the pinned public
-/// class header:
-/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1560-L1572>
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct MaxwellThreeDClearSurfaceControl {
-    respect_stencil_mask: bool,
-    use_clear_rect: bool,
-    use_scissor_zero: bool,
-    use_viewport_clip_zero: bool,
-}
-
-impl MaxwellThreeDClearSurfaceControl {
-    pub(super) const fn parse(raw: u32) -> Option<Self> {
-        if raw & !0x0000_1111 != 0 {
-            return None;
-        }
-        Some(Self {
-            respect_stencil_mask: raw & 0x0000_0001 != 0,
-            use_clear_rect: raw & 0x0000_0010 != 0,
-            use_scissor_zero: raw & 0x0000_0100 != 0,
-            use_viewport_clip_zero: raw & 0x0000_1000 != 0,
-        })
-    }
-
-    #[must_use]
-    pub const fn respect_stencil_mask(self) -> bool {
-        self.respect_stencil_mask
-    }
-
-    #[must_use]
-    pub const fn use_clear_rect(self) -> bool {
-        self.use_clear_rect
-    }
-
-    #[must_use]
-    pub const fn use_scissor_zero(self) -> bool {
-        self.use_scissor_zero
-    }
-
-    #[must_use]
-    pub const fn use_viewport_clip_zero(self) -> bool {
-        self.use_viewport_clip_zero
-    }
-
-    #[must_use]
-    pub const fn raw(self) -> u32 {
-        self.respect_stencil_mask as u32
-            | ((self.use_clear_rect as u32) << 4)
-            | ((self.use_scissor_zero as u32) << 8)
-            | ((self.use_viewport_clip_zero as u32) << 12)
-    }
-}
-
 impl MaxwellThreeDClearSurface {
     pub(super) const fn parse(raw: u32) -> Option<Self> {
         let color_target = ((raw >> 6) & 0xf) as u8;
@@ -832,19 +715,6 @@ impl MaxwellThreeDClearState<'_> {
         self.registers.read(0x0da0, |raw| u8::try_from(raw).ok())
     }
     #[must_use]
-    pub fn horizontal(&self) -> MaxwellThreeDRegister<MaxwellThreeDRectangle> {
-        self.registers.read(0x0d6c, super::rectangle)
-    }
-    #[must_use]
-    pub fn vertical(&self) -> MaxwellThreeDRegister<MaxwellThreeDRectangle> {
-        self.registers.read(0x0d70, super::rectangle)
-    }
-    #[must_use]
-    pub fn surface_control(&self) -> MaxwellThreeDRegister<MaxwellThreeDClearSurfaceControl> {
-        self.registers
-            .read(0x10f8, MaxwellThreeDClearSurfaceControl::parse)
-    }
-    #[must_use]
     pub fn last_surface(&self) -> MaxwellThreeDRegister<MaxwellThreeDClearSurface> {
         self.registers
             .read(0x19d0, MaxwellThreeDClearSurface::parse)
@@ -856,13 +726,6 @@ pub struct MaxwellThreeDRenderTargetState<'a> {
     pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
 impl<'a> MaxwellThreeDRenderTargetState<'a> {
-    #[must_use]
-    pub fn color_target_selection(
-        &self,
-    ) -> MaxwellThreeDRegister<MaxwellThreeDColorTargetSelection> {
-        self.registers
-            .read(0x121c, MaxwellThreeDColorTargetSelection::parse)
-    }
     #[must_use]
     pub fn srgb_write(&self) -> MaxwellThreeDRegister<bool> {
         self.registers

@@ -3,7 +3,7 @@
 //! NVDEC TBL uses 64x8-byte GOBs and at least two GOBs per block:
 //! https://github.com/averne/FFmpeg/blob/nvtegra/libavutil/hwcontext_nvtegra.c
 use super::Mapping;
-use nixe_gpu::physical::PhysicalMapping;
+use nixe_memory::PhysicalMapping;
 use nixe_memory::{
     Access, AccessOperation, AccessResult, AllocationId, AllocationRange, ArenaOffset, MachineId,
 };
@@ -1029,8 +1029,7 @@ mod tests {
         let original = Arc::new(BTreeMap::from([(
             0x1000,
             Mapping {
-                physical: nixe_gpu::physical::PhysicalMapping::new(objects[0].ranges().unwrap())
-                    .unwrap(),
+                physical: nixe_memory::PhysicalMapping::new(objects[0].ranges().unwrap()).unwrap(),
                 object: objects[0].clone(),
                 references: 1,
             },
@@ -1039,10 +1038,8 @@ mod tests {
             (
                 0x1000,
                 Mapping {
-                    physical: nixe_gpu::physical::PhysicalMapping::new(
-                        objects[1].ranges().unwrap(),
-                    )
-                    .unwrap(),
+                    physical: nixe_memory::PhysicalMapping::new(objects[1].ranges().unwrap())
+                        .unwrap(),
                     object: objects[1].clone(),
                     references: 1,
                 },
@@ -1050,10 +1047,8 @@ mod tests {
             (
                 0x3000,
                 Mapping {
-                    physical: nixe_gpu::physical::PhysicalMapping::new(
-                        objects[0].ranges().unwrap(),
-                    )
-                    .unwrap(),
+                    physical: nixe_memory::PhysicalMapping::new(objects[0].ranges().unwrap())
+                        .unwrap(),
                     object: objects[0].clone(),
                     references: 1,
                 },

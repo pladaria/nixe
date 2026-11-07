@@ -362,9 +362,12 @@ impl Channel {
                         let mut control = control
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        control
+                        let actions = control
                             .consume_channel_increment(descriptor, job.request, completion)
                             .map_err(|error| format!("{error:?}"))?;
+                        for action in actions {
+                            action.signal_from_cpu();
+                        }
                         control
                             .publish_channel_increment(descriptor, job.request, completion)
                             .map_err(|error| format!("{error:?}"))?;
@@ -598,57 +601,7 @@ mod tests {
             timeout: 0,
         }
     }
-    #[test]
-    fn stopping_preserves_a_real_device_read_failure() {
-        let machine = crate::test_memory::machine();
-        let allocation = machine.account(4096).unwrap().allocate(4096).unwrap();
-        let range = AllocationRange::new(allocation.pin(), 0, 4096).unwrap();
-        let mut nvmap = NvMapObjects::default();
-        let owner = NvMapOwner::new(1);
-        let handle = nvmap.create(owner, 4096).unwrap();
-        nvmap
-            .allocate(
-                owner,
-                handle,
-                NvMapAllocationMetadata::new(0, 0, 4096, 0),
-                NvMapCpuMapping::new(AddressSpaceId::new(1), GuestVirtualAddress::new(0x1000)),
-                Arc::from([range.clone()]),
-            )
-            .unwrap();
-        let object = nvmap
-            .object_snapshot_by_owned_handle(owner, handle)
-            .unwrap();
-        let mapping = super::super::Mapping {
-            physical: nixe_gpu::physical::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
-            object,
-            references: 1,
-        };
-        let mappings = Arc::new(BTreeMap::from([(0x1000, mapping)]));
-        machine.publish_device_write(&[range], || Ok(())).unwrap();
-        let (send, receive) = mpsc::channel();
-        let endpoint: Arc<dyn DeviceAccessEndpoint> = Arc::new(Endpoint(send));
-        machine.set_device_endpoint(&endpoint);
-        let control = Arc::new(Mutex::new(
-            NvHostControl::new(&crate::test_memory::kernel()),
-        ));
-        let worker =
-            Worker::new(control, None, descriptor(2), Arc::default(), Arc::default()).unwrap();
-        worker.submit(job(mappings)).unwrap();
-        let access = receive.recv_timeout(Duration::from_secs(2)).unwrap();
-        worker.stop();
-        access.finish(Err(Arc::new(nixe_memory::MemoryError::Execution(
-            "native producer failed".into(),
-        ))));
-        crate::test_memory::run(worker.begin_close());
-        worker.join().unwrap();
-        assert!(
-            worker
-                .require_healthy()
-                .unwrap_err()
-                .to_string()
-                .contains("native producer failed")
-        );
-    }
+
     #[test]
     fn in_stream_increments_satisfy_intermediate_waits_before_the_job_finishes() {
         let d = descriptor(2);

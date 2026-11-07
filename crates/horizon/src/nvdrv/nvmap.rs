@@ -173,15 +173,6 @@ impl NvMapAllocationMetadata {
         }
     }
 
-    /// Permissions installed in a GPU address-space mapping.
-    ///
-    /// Switch `NVMAP_IOC_ALLOC` access flags qualify the supplied CPU mapping.
-    /// `NVHOST_AS_GPU_MAP_BUFFER_EX` has no corresponding read-only flag, and
-    /// Maxwell may write an allocation created from a CPU-read-only mapping.
-    pub(super) const fn gpu_mapping_permissions(self) -> MemoryPermissions {
-        MemoryPermissions::READ_WRITE
-    }
-
     pub(super) const fn validate(self) -> Result<(), NvMapStateError> {
         if self.heap_mask != NVMAP_SYSTEM_HEAP_MASK
             || self.flags & !NVMAP_VALID_FLAGS != 0
@@ -195,11 +186,13 @@ impl NvMapAllocationMetadata {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct NvMapStorage {
     allocation: NvMapAllocationMetadata,
     cpu_mapping: NvMapCpuMapping,
     ranges: Arc<[AllocationRange]>,
+    device: std::sync::Mutex<Option<Arc<nixe_gpu_maxwell::MaxwellDeviceMapping>>>,
+    _shared: Vec<nixe_memory::DeviceSharedMemory>,
 }
 
 /// Retained semantic `nvmap` object independent from handles and exported IDs.
@@ -207,7 +200,7 @@ struct NvMapStorage {
 pub struct NvMapObject {
     id: NvMapObjectId,
     size: u32,
-    storage: Option<NvMapStorage>,
+    storage: Option<Arc<NvMapStorage>>,
 }
 
 impl NvMapObject {
@@ -230,6 +223,36 @@ impl NvMapObject {
     /// Exact accepted CPU physical spans pinned for this object's lifetime.
     pub fn ranges(&self) -> Option<&[AllocationRange]> {
         self.storage.as_ref().map(|storage| storage.ranges.as_ref())
+    }
+
+    pub(super) fn pin_device(
+        &self,
+        memory: &nixe_gpu_maxwell::MaxwellDeviceMemory,
+    ) -> Result<Arc<nixe_gpu_maxwell::MaxwellDeviceMapping>, nixe_memory::MemoryError> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or(nixe_memory::MemoryError::Invalid(
+                "NvMap object is unallocated",
+            ))?;
+        let mut current = storage.device.lock().unwrap();
+        if let Some(mapping) = &*current {
+            if !mapping.belongs_to(memory) {
+                return Err(nixe_memory::MemoryError::Invalid(
+                    "NvMap object belongs to another SMMU",
+                ));
+            }
+            return Ok(Arc::clone(mapping));
+        }
+        let mapping = memory.map(
+            Arc::clone(&storage.ranges),
+            Some((
+                storage.cpu_mapping.address_space(),
+                storage.cpu_mapping.address(),
+            )),
+        )?;
+        *current = Some(Arc::clone(&mapping));
+        Ok(mapping)
     }
 
     /// Validates an image interpretation against this object's physical storage.
@@ -552,11 +575,21 @@ impl NvMapObjects {
         if object.storage.is_some() {
             return Err(NvMapStateError::AlreadyAllocated);
         }
-        object.storage = Some(NvMapStorage {
+        // nvmap::IocAlloc locks the CPU page-table backing, independently of
+        // whether the handle has been pinned into the device table yet.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvdrv/devices/nvmap.cpp#L134-L140
+        let shared = ranges
+            .iter()
+            .map(AllocationRange::lock_for_device)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| NvMapStateError::InvalidBacking)?;
+        object.storage = Some(Arc::new(NvMapStorage {
             allocation,
             cpu_mapping,
             ranges,
-        });
+            device: std::sync::Mutex::new(None),
+            _shared: shared,
+        }));
         Ok(())
     }
 
@@ -766,26 +799,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cpu_access_flags_do_not_restrict_gpu_mapping_permissions() {
-        let read_only = NvMapAllocationMetadata::new(0, 0, 0x1000, 0);
-        assert_eq!(read_only.cpu_mapping_permissions(), MemoryPermissions::READ);
-        assert_eq!(
-            read_only.gpu_mapping_permissions(),
-            MemoryPermissions::READ_WRITE
-        );
-
-        let read_write = NvMapAllocationMetadata::new(0, 1, 0x1000, 0);
-        assert_eq!(
-            read_write.cpu_mapping_permissions(),
-            MemoryPermissions::READ_WRITE
-        );
-        assert_eq!(
-            read_write.gpu_mapping_permissions(),
-            MemoryPermissions::READ_WRITE
-        );
-    }
-
-    #[test]
     fn exported_ids_preserve_handle_identity_independently_of_export_order() {
         let owner = NvMapOwner::new(7);
         let mut objects = NvMapObjects::default();
@@ -863,7 +876,7 @@ mod tests {
         let accepted = space
             .capture(address, 0x2000, MemoryPermissions::READ)
             .unwrap();
-        let physical = nixe_gpu::physical::PhysicalMapping::new(&accepted).unwrap();
+        let physical = nixe_memory::PhysicalMapping::new(&accepted).unwrap();
         let mut objects = NvMapObjects::default();
         let owner = NvMapOwner::new(7);
         let handle = objects.create(owner, 0x1800).unwrap();
@@ -888,7 +901,7 @@ mod tests {
             0x2000
         );
         assert_eq!(
-            *nixe_gpu::physical::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
+            *nixe_memory::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
             *physical
         );
         // CPU access flags qualify capture only; GPU writes use accepted pins.

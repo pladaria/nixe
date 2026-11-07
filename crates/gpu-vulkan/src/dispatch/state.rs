@@ -1,6 +1,6 @@
 //! Owned native parameters passed to the Vulkan recording worker.
 use super::*;
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DynamicState {
     pub cull: vk::CullModeFlags,
     pub front_face: vk::FrontFace,
@@ -11,6 +11,10 @@ pub(crate) struct DynamicState {
     pub stencil_test: bool,
     pub front: crate::cache::StencilState,
     pub back: crate::cache::StencilState,
+    pub topology: vk::PrimitiveTopology,
+    pub primitive_restart: bool,
+    pub raster_discard: bool,
+    pub depth_bias: bool,
 }
 impl From<&crate::cache::GraphicsState> for DynamicState {
     fn from(state: &crate::cache::GraphicsState) -> Self {
@@ -24,6 +28,10 @@ impl From<&crate::cache::GraphicsState> for DynamicState {
             stencil_test: state.stencil_test,
             front: state.front,
             back: state.back,
+            topology: state.topology,
+            primitive_restart: state.primitive_restart,
+            raster_discard: state.raster_discard,
+            depth_bias: state.depth_bias,
         }
     }
 }

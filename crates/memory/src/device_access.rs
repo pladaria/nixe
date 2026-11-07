@@ -111,57 +111,33 @@ impl AtomicAccess {
 }
 pub enum AccessOperation {
     Read(Vec<u8>),
-    /// Native CPU read with a reusable physical RAM-coherency observation.
-    ReadNative,
-    ReadCode(crate::Observation),
-    /// Observed guest data consumed by the graphics owner, without ARM code tracking.
-    ReadObserved(crate::Observation),
+    /// Rasterizer synchronization requested by the native CPU memory owner.
+    Flush(NativeReadArea),
     Write(Vec<u8>),
     Atomic(AtomicAccess),
 }
 #[derive(Debug, Eq, PartialEq)]
 pub enum AccessResult {
     Read(Vec<u8>),
-    NativeRead {
-        bytes: Box<[u8]>,
-        area: Option<NativeReadArea>,
-    },
+    Flushed,
     Written(Vec<u8>),
-    Atomic {
-        previous: u128,
-        written: bool,
-    },
+    Atomic { previous: u128, written: bool },
 }
-/// A resolved physical interval, not cached RAM contents or allocation ownership.
-/// Native admission retains the current mapping; every use checks its physical
-/// identity and the observation invalidated by device writes or retirement.
-/// CPU stores change RAM directly and do not invalidate this coherence proof.
-#[derive(Clone, Debug)]
+/// The native memory owner's per-core RasterizerDownloadArea, in DAddr space.
+/// It retains no RAM and is not a physical translation or access permission.
+/// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/memory.cpp#L681-L698
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeReadArea {
-    pub(crate) machine: crate::MachineId,
-    pub(crate) allocation: crate::AllocationId,
-    pub(crate) start: crate::ArenaOffset,
-    pub(crate) bytes: u64,
-    pub(crate) observation: crate::Observation,
+    pub start: u64,
+    pub end: u64,
+    pub preemptive: bool,
 }
 impl NativeReadArea {
-    pub fn observation(&self) -> &crate::Observation {
-        &self.observation
+    #[inline]
+    pub fn contains(self, address: u64, bytes: u64) -> bool {
+        self.start <= address && address + bytes <= self.end
     }
 }
-impl PartialEq for NativeReadArea {
-    fn eq(&self, other: &Self) -> bool {
-        self.machine == other.machine
-            && self.allocation == other.allocation
-            && self.start == other.start
-            && self.bytes == other.bytes
-            && self
-                .observation
-                .weak_invalidation_flag()
-                .ptr_eq(&other.observation.weak_invalidation_flag())
-    }
-}
-impl Eq for NativeReadArea {}
 pub type AccessResultValue = Result<AccessResult, Arc<MemoryError>>;
 #[must_use = "a pending memory operation must be resumed or cancelled"]
 #[derive(Debug)]
@@ -262,20 +238,13 @@ impl DeviceAccessRequest {
     pub fn is_cancelled(&self) -> bool {
         self.completion.cancelled.load(Ordering::Acquire)
     }
-    /// Finish only after applying the CPU operation and releasing its exact
-    /// interval dependency on the owner. A native tick alone is not completion.
+    /// Finish after the requested RAM operation or rasterizer flush completes.
+    /// Native scalar reads consume RAM on their core after this synchronization.
     pub fn finish(mut self, result: AccessResultValue) {
         let result = result.and_then(|result| {
             let valid = match (&self.operation, &result) {
-                (
-                    AccessOperation::Read(_)
-                    | AccessOperation::ReadCode(_)
-                    | AccessOperation::ReadObserved(_),
-                    AccessResult::Read(bytes),
-                ) => bytes.len() == self.bytes,
-                (AccessOperation::ReadNative, AccessResult::NativeRead { bytes, .. }) => {
-                    bytes.len() == self.bytes
-                }
+                (AccessOperation::Read(_), AccessResult::Read(bytes)) => bytes.len() == self.bytes,
+                (AccessOperation::Flush(_), AccessResult::Flushed) => true,
                 (AccessOperation::Write(_), AccessResult::Written(bytes)) => {
                     bytes.len() == self.bytes
                 }
@@ -597,52 +566,7 @@ mod tests {
         machine.capture_stream(&[range], &mut bytes).unwrap();
         assert_eq!(bytes, [3, 4, 5, 6]);
     }
-    #[test]
-    fn owned_captured_buffers_cross_the_device_dependency_without_a_snapshot() {
-        for write in [false, true] {
-            let machine = Machine::new(PAGE_SIZE).unwrap();
-            let (_endpoint, receiver) = owner(&machine);
-            let (_allocation, range) = range(&machine, 39, 4);
-            machine
-                .write_resolved(std::slice::from_ref(&range), &[3, 4, 5, 6])
-                .unwrap();
-            machine
-                .publish_device_write(std::slice::from_ref(&range), || Ok(()))
-                .unwrap();
-            let captured = crate::CapturedMemory::from(range);
-            let mut storage = Vec::with_capacity(4096);
-            storage.resize(4, 9);
-            let address = storage.as_ptr();
-            let access = if write {
-                machine.write_captured_owned(&captured, 0, storage)
-            } else {
-                machine.read_captured_owned(&captured, 0, storage)
-            }
-            .unwrap();
-            let Access::Pending(pending) = access else {
-                panic!("device-owned bytes must defer");
-            };
-            let mut request = next(&receiver);
-            match request.operation() {
-                AccessOperation::Read(bytes) | AccessOperation::Write(bytes) => {
-                    assert_eq!(bytes.as_ptr(), address)
-                }
-                _ => panic!("unexpected operation"),
-            }
-            let result = {
-                let (ranges, operation) = request.parts_mut();
-                machine.apply_resolved_access(ranges, operation)
-            }
-            .unwrap();
-            request.finish(Ok(result));
-            let storage = match pending.wait().unwrap() {
-                AccessResult::Read(bytes) | AccessResult::Written(bytes) => bytes,
-                _ => panic!("unexpected completion"),
-            };
-            assert_eq!(storage.as_ptr(), address);
-            assert_eq!(&*storage, if write { &[9; 4] } else { &[3, 4, 5, 6] });
-        }
-    }
+
     #[test]
     fn completion_notifications_cover_both_registration_orders_and_run_unlocked() {
         let machine = Machine::new(PAGE_SIZE).unwrap();
@@ -816,317 +740,6 @@ mod tests {
             machine
                 .request_device_access(vec![range], AccessOperation::Read(Vec::new()))
                 .is_err()
-        );
-    }
-    #[test]
-    fn device_page_read_captures_physical_input_before_virtual_remap() {
-        use crate::{Access, AddressSpace, AddressWidth, GuestVirtualAddress, MemoryPermissions};
-        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
-        let (_endpoint, receiver) = owner(&machine);
-        let account = machine.account(2 * PAGE_SIZE).unwrap();
-        let first = account.allocate(PAGE_SIZE).unwrap();
-        let first_id = first.identity();
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(0x4000);
-        space
-            .map(base, first, 0, PAGE_SIZE, MemoryPermissions::READ_WRITE)
-            .unwrap();
-        space
-            .write_value(base, 4, 41)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let spans = space.capture(base, 4, MemoryPermissions::READ).unwrap();
-        machine.publish_device_write(&spans, || Ok(())).unwrap();
-        let Access::Pending(pending) = space.read_value(base, 4).unwrap() else {
-            panic!("device-owned bytes bypassed their owner")
-        };
-        let second = account.allocate(PAGE_SIZE).unwrap();
-        space
-            .remap(base, second, 0, PAGE_SIZE, MemoryPermissions::READ_WRITE)
-            .unwrap();
-        space
-            .write_value(base, 4, 99)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let mut request = next(&receiver);
-        assert_eq!(request.ranges()[0].allocation().identity(), first_id);
-        assert_eq!(request.bytes(), 4);
-        // The readback publishes the old producer's exact requested bytes.
-        machine
-            .write_resolved(request.ranges(), &88u32.to_le_bytes())
-            .unwrap();
-        let result = {
-            let (ranges, operation) = request.parts_mut();
-            machine.apply_resolved_access(ranges, operation)
-        }
-        .unwrap();
-        request.finish(Ok(result));
-        assert_eq!(
-            pending.wait().unwrap(),
-            AccessResult::Read(Vec::from(88u32.to_le_bytes()))
-        );
-        assert_eq!(space.read_value(base, 4).unwrap().into_ready().unwrap(), 99);
-    }
-    #[test]
-    fn first_gpu_publication_after_capture_routes_the_write_without_modifying_ram() {
-        use crate::{Access, AddressSpace, AddressWidth, GuestVirtualAddress, MemoryPermissions};
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let (_endpoint, receiver) = owner(&machine);
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(0x1000);
-        space
-            .map(
-                base,
-                allocation,
-                0,
-                PAGE_SIZE,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        space.write_value(base, 4, 5).unwrap().into_ready().unwrap();
-        let captured = space.capture(base, 4, MemoryPermissions::WRITE).unwrap();
-        let device = space.capture(base, 4, MemoryPermissions::READ).unwrap();
-        // A producer wins the race after the CPU has left its capture admission.
-        machine.publish_device_write(&device, || Ok(())).unwrap();
-        let Access::Pending(pending) = machine
-            .write_captured(
-                &crate::CapturedMemory::new(captured).unwrap(),
-                0,
-                &9u32.to_le_bytes(),
-            )
-            .unwrap()
-        else {
-            panic!("captured CPU write bypassed a newly published GPU producer")
-        };
-        let mut before = [0; 4];
-        machine.capture_stream(&device, &mut before).unwrap();
-        assert_eq!(before, 5u32.to_le_bytes());
-        let mut request = next(&receiver);
-        assert_eq!(request.bytes(), 4);
-        let result = {
-            let (ranges, operation) = request.parts_mut();
-            machine.apply_resolved_access(ranges, operation)
-        }
-        .unwrap();
-        // The owner retires the last device coverage before releasing this
-        // write dependency. The CPU receives completion, never a write grant.
-        machine.retire_device_pages(&device).unwrap();
-        request.finish(Ok(result));
-        assert!(matches!(pending.wait().unwrap(), AccessResult::Written(_)));
-        assert_eq!(space.read_value(base, 4).unwrap().into_ready().unwrap(), 9);
-    }
-    #[test]
-    fn owned_access_retains_only_pending_pages_and_survives_owner_release_or_cancellation() {
-        for write in [false, true] {
-            for cancel in [false, true] {
-                let machine = Machine::new(4 * PAGE_SIZE).unwrap();
-                let (_endpoint, receiver) = owner(&machine);
-                let allocation = machine
-                    .account(4 * PAGE_SIZE)
-                    .unwrap()
-                    .allocate(4 * PAGE_SIZE)
-                    .unwrap();
-                let offset = 2 * PAGE_SIZE - 2;
-                allocation
-                    .write(offset, &[3; 6])
-                    .unwrap()
-                    .into_ready()
-                    .unwrap();
-                let device = AllocationRange::new(
-                    allocation.pin_range(2 * PAGE_SIZE, 1).unwrap(),
-                    2 * PAGE_SIZE,
-                    1,
-                )
-                .unwrap();
-                machine
-                    .publish_device_write(std::slice::from_ref(&device), || Ok(()))
-                    .unwrap();
-                drop(device);
-                let pending = if write {
-                    let crate::Access::Pending(pending) =
-                        allocation.write(offset, &[7; 6]).unwrap()
-                    else {
-                        panic!("device write must defer")
-                    };
-                    pending
-                } else {
-                    let crate::Access::Pending(pending) = allocation.read(offset, 6).unwrap()
-                    else {
-                        panic!("device read must defer")
-                    };
-                    pending
-                };
-                let mut request = next(&receiver);
-                assert_eq!(request.ranges().len(), 1);
-                assert_eq!(request.ranges()[0].offset(), offset);
-                assert_eq!(request.bytes(), 6);
-                let identity = allocation.identity();
-                drop(allocation);
-                assert!(
-                    matches!(receiver.recv().unwrap(), Message::Released(owner, id) if owner == machine.identity() && id == identity)
-                );
-                assert_eq!(machine.statistics().allocated_bytes, 2 * PAGE_SIZE);
-                let mut bytes = [0; 6];
-                machine
-                    .capture_stream(request.ranges(), &mut bytes)
-                    .unwrap();
-                assert_eq!(bytes, [3; 6]); // Deferred writes leave the RAM prefix intact.
-                if cancel {
-                    drop(pending);
-                    assert!(matches!(receiver.recv().unwrap(), Message::Cancel(_)));
-                    drop(request);
-                } else {
-                    let result = {
-                        let (ranges, operation) = request.parts_mut();
-                        machine.apply_resolved_access(ranges, operation)
-                    }
-                    .unwrap();
-                    machine.retire_device_pages(request.ranges()).unwrap();
-                    request.finish(Ok(result));
-                    assert_eq!(
-                        pending.wait().unwrap(),
-                        if write {
-                            AccessResult::Written(Vec::from([7; 6]))
-                        } else {
-                            AccessResult::Read(Vec::from([3; 6]))
-                        }
-                    );
-                }
-                assert_eq!(machine.statistics().allocated_bytes, 0);
-            }
-        }
-    }
-    #[test]
-    fn indexed_subrange_device_requests_retain_only_intersecting_pages() {
-        use crate::{Access, CapturedMemory};
-        for write in [false, true] {
-            let machine = Machine::new(4 * PAGE_SIZE).unwrap();
-            let (_endpoint, receiver) = owner(&machine);
-            let allocation = machine
-                .account(4 * PAGE_SIZE)
-                .unwrap()
-                .allocate(4 * PAGE_SIZE)
-                .unwrap();
-            let ranges: Vec<_> = (0..4)
-                .map(|i| {
-                    AllocationRange::new(
-                        allocation.pin_range(i * PAGE_SIZE, PAGE_SIZE).unwrap(),
-                        i * PAGE_SIZE,
-                        PAGE_SIZE,
-                    )
-                    .unwrap()
-                })
-                .collect();
-            machine
-                .write_resolved(&ranges, &vec![0x11; 4 * PAGE_SIZE as usize])
-                .unwrap();
-            machine
-                .publish_device_write(&ranges[2..3], || Ok(()))
-                .unwrap();
-            let captured = CapturedMemory::new(ranges).unwrap();
-            let offset = 2 * PAGE_SIZE - 2;
-            let mut bytes = [0; 6];
-            let access = if write {
-                machine.write_captured(&captured, offset, &[9; 6]).unwrap()
-            } else {
-                machine
-                    .read_captured_into(&captured, offset, &mut bytes)
-                    .unwrap()
-            };
-            let Access::Pending(pending) = access else {
-                panic!("device page must defer")
-            };
-            let mut request = next(&receiver);
-            assert_eq!(request.bytes(), 6);
-            assert_eq!(request.ranges().len(), 2);
-            assert_eq!(request.ranges()[0].offset(), offset);
-            assert_eq!(request.ranges()[0].bytes(), 2);
-            assert_eq!(request.ranges()[1].offset(), 2 * PAGE_SIZE);
-            assert_eq!(request.ranges()[1].bytes(), 4);
-            drop(captured);
-            drop(allocation);
-            assert_eq!(machine.statistics().allocated_bytes, 2 * PAGE_SIZE);
-            // A write cannot partially modify the RAM prefix before deferral.
-            machine
-                .capture_stream(request.ranges(), &mut bytes)
-                .unwrap();
-            assert_eq!(bytes, [0x11; 6]);
-            let result = {
-                let (ranges, operation) = request.parts_mut();
-                machine.apply_resolved_access(ranges, operation)
-            }
-            .unwrap();
-            machine.retire_device_pages(request.ranges()).unwrap();
-            request.finish(Ok(result));
-            assert_eq!(
-                pending.wait().unwrap(),
-                if write {
-                    AccessResult::Written(Vec::from([9; 6]))
-                } else {
-                    AccessResult::Read(Vec::from([0x11; 6]))
-                }
-            );
-            assert_eq!(machine.statistics().allocated_bytes, 0);
-        }
-    }
-    #[test]
-    fn disjoint_access_in_a_device_affected_page_keeps_its_exact_byte_request() {
-        use crate::{Access, AddressSpace, AddressWidth, GuestVirtualAddress, MemoryPermissions};
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let (_endpoint, receiver) = owner(&machine);
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(0x1000);
-        space
-            .map(
-                base,
-                allocation,
-                0,
-                PAGE_SIZE,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        let cpu_address = base.checked_add(17).unwrap();
-        space
-            .write(cpu_address, &[7, 8, 9])
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let produced = space
-            .capture(base.checked_add(512).unwrap(), 16, MemoryPermissions::READ)
-            .unwrap();
-        machine.publish_device_write(&produced, || Ok(())).unwrap();
-        let mut destination = [0xaa; 3];
-        let Access::Pending(pending) = space.read_into(cpu_address, &mut destination).unwrap()
-        else {
-            panic!("device page must consult exact authority")
-        };
-        assert_eq!(destination, [0xaa; 3]);
-        let mut request = next(&receiver);
-        assert_eq!(request.ranges()[0].offset(), 17);
-        assert_eq!(request.bytes(), 3);
-        // No producer overlaps this exact demand. Owner-local RAM capture
-        // completes it without a native tick or whole-page materialization.
-        let result = {
-            let (ranges, operation) = request.parts_mut();
-            machine.apply_resolved_access(ranges, operation)
-        }
-        .unwrap();
-        request.finish(Ok(result));
-        assert_eq!(
-            pending.wait().unwrap(),
-            AccessResult::Read(Vec::from([7, 8, 9]))
         );
     }
 }

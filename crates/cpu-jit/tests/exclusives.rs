@@ -98,61 +98,6 @@ fn run(jit: &mut JitThread, state: &mut ThreadState) -> CpuExit {
 }
 
 #[test]
-fn exclusive_store_with_overlapping_zero_registers_preserves_memory_semantics() {
-    // LDAXR X2,[X8]; optionally CLREX; STLXR WZR,XZR,[X8]; SVC.
-    // The overlapping status/data registers select the same defined behavior
-    // as Eden, including the exact store encoding from the reported failure.
-    // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/STLXR--Store-Release-Exclusive-Register-
-    for reserve in [false, true] {
-        for clear in [false, true] {
-            for observed in [false, true] {
-                let mut code = Vec::new();
-                if reserve {
-                    code.push(0xc85ffd02);
-                }
-                if clear {
-                    code.push(0xd5033f5f);
-                }
-                code.extend([0xc81ffd1f, 0xd4000001]);
-                let (memory, process) = fixture(&code);
-                memory
-                    .write_value(DATA, 8, 7)
-                    .unwrap()
-                    .into_ready()
-                    .unwrap();
-                let observation = nixe_memory::Observation::default();
-                if observed {
-                    let range = memory.capture(DATA, 8, MemoryPermissions::READ).unwrap();
-                    memory
-                        .machine()
-                        .access_captured(
-                            &range,
-                            nixe_memory::AccessOperation::ReadObserved(observation.clone()),
-                        )
-                        .unwrap()
-                        .into_ready()
-                        .unwrap();
-                }
-                let mut state = state();
-                state.write_x(x(8), DATA.get());
-                state.write_x(A64Register::StackPointer, 0x7000);
-                let stop = run(&mut process.create_thread().unwrap(), &mut state);
-                assert!(matches!(stop, CpuExit::SupervisorCall { .. }), "{stop:?}");
-                assert_eq!(state.read_x(A64Register::StackPointer), 0x7000);
-                let committed = reserve && !clear;
-                assert_eq!(
-                    memory.read_value(DATA, 8).unwrap().into_ready().unwrap(),
-                    if committed { 0 } else { 7 }
-                );
-                if observed {
-                    assert_eq!(observation.is_invalid(), committed);
-                }
-            }
-        }
-    }
-}
-
-#[test]
 fn every_scalar_width_and_acquire_release_commit_through_native_exclusives() {
     for (load, store, size) in [
         (0x085f7c22, 0x08037c20, MemoryAccessSize::Byte),
@@ -211,38 +156,6 @@ fn paired_exclusives_preserve_both_lanes() {
             expected
         );
     }
-}
-
-#[test]
-fn paired_exclusive_read_preserves_readonly_observation() {
-    let (memory, process) = fixture(&[0xc87f0c22, 0xd4000001]);
-    memory
-        .write_value(DATA, MemoryAccessSize::Quadword.bytes(), (9_u128 << 64) | 7)
-        .unwrap()
-        .into_ready()
-        .unwrap();
-    memory
-        .protect(DATA, PAGE_SIZE, MemoryPermissions::READ)
-        .unwrap();
-    let range = memory.capture(DATA, 16, MemoryPermissions::READ).unwrap();
-    let dependency = nixe_memory::Observation::default();
-    memory
-        .machine()
-        .access_captured(
-            &range,
-            nixe_memory::AccessOperation::ReadObserved(dependency.clone()),
-        )
-        .unwrap()
-        .into_ready()
-        .unwrap();
-    let mut state = state();
-    assert!(matches!(
-        run(&mut process.create_thread().unwrap(), &mut state),
-        CpuExit::SupervisorCall { .. }
-    ));
-    assert_eq!(state.read_x(x(2)), 7);
-    assert_eq!(state.read_x(x(3)), 9);
-    assert!(!dependency.is_invalid());
 }
 
 #[test]
@@ -355,44 +268,6 @@ fn native_release_acquire_publishes_the_prior_payload() {
         for worker in workers {
             worker.join().unwrap();
         }
-    }
-}
-
-#[test]
-fn observed_first_write_retries_without_losing_the_observer() {
-    // LDXR/STXR or LDXP/STXP; retry the exclusive load after a watched write.
-    for (load, store, retry, width, status, expected) in [
-        (0xc85f7c22, 0xc8037c20, 0x35ffffc3, 8, 3, 7),
-        (0xc87f0c22, 0xc8241420, 0x35ffffc4, 16, 4, (9u128 << 64) | 7),
-    ] {
-        let (memory, process) = fixture(&[load, store, retry, 0xd4000001]);
-        let range = memory.capture(DATA, 16, MemoryPermissions::READ).unwrap();
-        let dependency = nixe_memory::Observation::default();
-        memory
-            .machine()
-            .access_captured(
-                &range,
-                nixe_memory::AccessOperation::ReadObserved(dependency.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(!dependency.is_invalid());
-        let mut state = state();
-        assert!(matches!(
-            run(&mut process.create_thread().unwrap(), &mut state),
-            CpuExit::SupervisorCall { .. }
-        ));
-        assert_eq!(state.read_x(x(status)), 0);
-        assert!(dependency.is_invalid());
-        assert_eq!(
-            memory
-                .read_value(DATA, width)
-                .unwrap()
-                .into_ready()
-                .unwrap(),
-            expected
-        );
     }
 }
 

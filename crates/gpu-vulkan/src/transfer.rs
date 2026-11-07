@@ -15,10 +15,8 @@ impl VulkanDevice {
             AllocationMode::Managed,
             "transfer device buffer",
         )?;
-        let source_slice = self.submission.reserve_upload(&mut self.dispatch, bytes)?;
-        let (destination_slice, ticket) = self
-            .submission
-            .reserve_readback(&mut self.dispatch, bytes.len() as u64)?;
+        let source_slice = self.submission.reserve_upload(bytes)?;
+        let (destination_slice, ticket) = self.submission.reserve_readback(bytes.len() as u64)?;
 
         let upload = self.submission.staging_buffer(&source_slice).handle;
         let download = self.submission.staging_buffer(&destination_slice).handle;
@@ -27,7 +25,8 @@ impl VulkanDevice {
             .src_offset(source_slice.offset)
             .size(bytes.len() as u64)];
         unsafe {
-            self.dispatch.cmd_copy_buffer(upload, middle, &region);
+            self.dispatch
+                .cmd_copy_buffer(upload, middle, &region, false);
         }
         let barrier = [vk::BufferMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COPY)
@@ -44,7 +43,8 @@ impl VulkanDevice {
             let region = [vk::BufferCopy::default()
                 .dst_offset(destination_slice.offset)
                 .size(bytes.len() as u64)];
-            self.dispatch.cmd_copy_buffer(middle, download, &region);
+            self.dispatch
+                .cmd_copy_buffer(middle, download, &region, false);
         }
         host_read_barrier(
             self,
@@ -80,10 +80,8 @@ impl VulkanDevice {
             mode,
             "transfer image",
         )?;
-        let source_slice = self.submission.reserve_upload(&mut self.dispatch, bytes)?;
-        let (destination_slice, ticket) = self
-            .submission
-            .reserve_readback(&mut self.dispatch, bytes.len() as u64)?;
+        let source_slice = self.submission.reserve_upload(bytes)?;
+        let (destination_slice, ticket) = self.submission.reserve_readback(bytes.len() as u64)?;
 
         let upload = self.submission.staging_buffer(&source_slice).handle;
         let download = self.submission.staging_buffer(&destination_slice).handle;
@@ -92,14 +90,10 @@ impl VulkanDevice {
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
             .layer_count(1);
-        let (destination, source) = if self.profile().unified_image_layouts {
-            (vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL)
-        } else {
-            (
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            )
-        };
+        let (destination, source) = (
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
         let barrier = [vk::ImageMemoryBarrier2::default()
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(destination)
@@ -159,25 +153,9 @@ impl VulkanDevice {
     }
     pub fn transfer_round_trip(&mut self, bytes: &[u8]) -> Result<Vec<u8>, VulkanError> {
         let ticket = self.enqueue_buffer_readback(bytes)?;
-        // This diagnostic also verifies the normalized dynamic-rendering entry
-        // points. Guest transfer recording adds no empty rendering scopes.
-
-        let info = vk::RenderingInfo::default()
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent: vk::Extent2D {
-                    width: 1,
-                    height: 1,
-                },
-            })
-            .layer_count(1);
-        unsafe {
-            self.dispatch.begin_rendering(&info, Default::default());
-            self.dispatch.end_rendering();
-        }
         self.flush()?;
         self.wait_for_work(ticket.work(), std::time::Duration::MAX)?;
-        Ok(self.completed_readback(ticket)?.to_vec())
+        Ok(ticket.completed()?.to_vec())
     }
     pub fn image_round_trip(
         &mut self,
@@ -189,7 +167,7 @@ impl VulkanDevice {
         let ticket = self.enqueue_image_readback(width, height, bytes, mode)?;
         self.flush()?;
         self.wait_for_work(ticket.work(), std::time::Duration::MAX)?;
-        Ok(self.completed_readback(ticket)?.to_vec())
+        Ok(ticket.completed()?.to_vec())
     }
 }
 pub(crate) fn host_read_barrier(

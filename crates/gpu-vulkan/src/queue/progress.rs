@@ -1,7 +1,6 @@
 //! Actual native submission progress and notifications, shared with its worker.
 use crate::VulkanError;
 use ash::vk;
-use std::collections::BTreeSet;
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -56,8 +55,6 @@ impl SubmissionFailure {
 struct Notification {
     sequence: u64,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
-    targets: BTreeSet<u64>,
-    stopping: bool,
 }
 
 #[derive(Default)]
@@ -134,66 +131,7 @@ impl SubmissionProgress {
         self.completed.load(Ordering::Acquire)
     }
     pub fn observe_completed(&self, tick: u64) {
-        let wake = {
-            let mut state = self.notification.lock().unwrap();
-            self.completed.fetch_max(tick, Ordering::Release);
-            let covered = state.targets.first().is_some_and(|&target| target <= tick);
-            while state.targets.first().is_some_and(|&target| target <= tick) {
-                state.targets.pop_first();
-            }
-            covered.then(|| state.wake.clone()).flatten()
-        };
-        if let Some(wake) = wake {
-            wake();
-        }
-    }
-    pub fn arm(&self, tick: u64) -> Result<(), VulkanError> {
-        let mut state = self.notification.lock().unwrap();
-        self.check(tick)?;
-        if tick <= self.completed() {
-            // Completion may precede registration after the owner's last
-            // poll. Eden RegisterAction invokes an already-reached action
-            // immediately; preserve that wake before the owner can sleep.
-            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/host1x/syncpoint_manager.cpp
-            let wake = state.wake.clone();
-            drop(state);
-            if let Some(wake) = wake {
-                wake();
-            }
-            return Ok(());
-        }
-        if state.stopping {
-            return Err(VulkanError::QueueStopped);
-        }
-        if state.targets.insert(tick) {
-            self.changed.notify_all();
-        }
-        Ok(())
-    }
-    pub fn next_target(&self) -> Option<u64> {
-        let mut state = self.notification.lock().unwrap();
-        loop {
-            if state.stopping {
-                return None;
-            }
-            if self.cancelled() {
-                state.targets.retain(|&tick| tick <= self.submitted());
-            }
-            if let Some(failure) = self.failure() {
-                state.targets.retain(|&tick| tick < failure.tick);
-            }
-            if let Some(&target) = state.targets.first()
-                && target <= self.submitted()
-            {
-                return Some(target);
-            }
-            state = self.changed.wait(state).unwrap();
-        }
-    }
-    pub fn stop_observer(&self) {
-        let mut state = self.notification.lock().unwrap();
-        state.stopping = true;
-        self.changed.notify_all();
+        self.completed.fetch_max(tick, Ordering::Release);
     }
     pub fn wait_submitted(
         &self,
@@ -290,41 +228,6 @@ mod tests {
             Err(VulkanError::QueueStopped)
         ));
         assert!(progress.wait_submitted(7, None).unwrap());
-    }
-
-    #[test]
-    fn observer_parks_until_actual_submission_and_reselects_the_earliest_target() {
-        let progress = Arc::new(SubmissionProgress::default());
-        progress.arm(9).unwrap();
-        let (sent, received) = std::sync::mpsc::channel();
-        let pending = Arc::clone(&progress);
-        let observer = thread::spawn(move || sent.send(pending.next_target()).unwrap());
-        assert!(received.recv_timeout(Duration::from_millis(20)).is_err());
-        progress.arm(4).unwrap();
-        progress.submitted_successfully(4);
-        assert_eq!(
-            received.recv_timeout(Duration::from_secs(1)).unwrap(),
-            Some(4)
-        );
-        observer.join().unwrap();
-        progress.observe_completed(4);
-        progress.arm(4).unwrap();
-        progress.stop_observer();
-        assert_eq!(progress.next_target(), None);
-    }
-
-    #[test]
-    fn completed_target_notifies_when_registered_after_the_owner_poll() {
-        let progress = SubmissionProgress::default();
-        let (sent, received) = std::sync::mpsc::channel();
-        progress.bind_wakeup(Arc::new(move || sent.send(()).unwrap()));
-        // No target was armed when the GPU completed. Registration is the
-        // owner's final check before sleeping for another message.
-        progress.submitted_successfully(1);
-        progress.observe_completed(1);
-        assert!(received.try_recv().is_err());
-        progress.arm(1).unwrap();
-        received.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]

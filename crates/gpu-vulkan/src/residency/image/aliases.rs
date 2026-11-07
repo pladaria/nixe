@@ -1,401 +1,237 @@
-//! Alias reconciliation consumes newest physical intersections without registering
-//! a second, linear representation of an image.
+//! Persistent image alias copies, selected by image modification ticks.
+//! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/image_base.cpp#L157-L253
+//! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L2451-L2518
 use super::*;
-use nixe_gpu::authority::ResolvedBytes;
+use nixe_gpu::physical::{ImageFootprint, ImageStorage, WriteDomain};
 
-impl VulkanResidency {
-    pub(super) fn refresh_image_intersections(
-        &mut self,
-        id: ImageId,
-        parts: &[ResolvedBytes<Resource>],
-        bytes: u64,
-    ) -> Result<(), VulkanError> {
-        let retained = self.constructing.len();
-        self.constructing.push(Resource::Image(id));
-        self.constructing
-            .extend(parts.iter().filter_map(|p| p.producer.map(|p| p.resource)));
-        let result = self.refresh_intersections_inner(id, parts, bytes);
-        self.constructing.truncate(retained);
-        result
+fn same_storage(a: ImageFootprint, b: ImageFootprint) -> bool {
+    if a.packed_bytes != b.packed_bytes
+        || a.aspect_offset != b.aspect_offset
+        || a.aspect_bytes != b.aspect_bytes
+    {
+        return false;
     }
-    fn refresh_intersections_inner(
-        &mut self,
-        id: ImageId,
-        parts: &[ResolvedBytes<Resource>],
+    match (a.storage, b.storage) {
+        (ImageStorage::Pitch { row_pitch: a }, ImageStorage::Pitch { row_pitch: b }) => a == b,
+        (
+            ImageStorage::BlockLinear {
+                block_height_log2: ah,
+                block_depth_log2: ad,
+            },
+            ImageStorage::BlockLinear {
+                block_height_log2: bh,
+                block_depth_log2: bd,
+            },
+        ) => {
+            ah == bh
+                && ad == bd
+                && (u64::from(a.columns) * u64::from(a.packed_bytes)).div_ceil(64)
+                    == (u64::from(b.columns) * u64::from(b.packed_bytes)).div_ceil(64)
+        }
+        _ => false,
+    }
+}
+fn same_backing(a: &Footprint, b: &Footprint) -> bool {
+    if a.mapping().machine() != b.mapping().machine() {
+        return false;
+    }
+    let ar = a.bounds();
+    let br = b.bounds();
+    let bytes = (ar.end - ar.start).min(br.end - br.start);
+    fn spans(
+        mapping: &nixe_memory::PhysicalMapping,
+        start: u64,
         bytes: u64,
-    ) -> Result<(), VulkanError> {
-        if self.copy_native_intersections(id, parts)? {
-            return Ok(());
-        }
-        let entry = self.image(id)?;
-        let import_cpu = entry.canonical_import;
-        let geometry = entry.contents.geometry.clone();
-        let mut changed = Vec::new();
-        for part in parts {
-            let needs_copy = match part.producer {
-                Some(source) => {
-                    !(entry.synchronized && source.sequence.get() <= entry.synchronized_sequence)
-                        && (source.resource != Resource::Image(id) || source.native != part.logical)
-                }
-                None => import_cpu && !entry.synchronized,
-            };
-            if !needs_copy {
-                continue;
+    ) -> impl Iterator<Item = (u64, nixe_memory::AllocationId, u64, u64)> + '_ {
+        mapping.spans().iter().filter_map(move |span| {
+            let begin = span.logical.max(start);
+            let end = (span.logical + span.bytes).min(start + bytes);
+            if begin >= end {
+                return None;
             }
-            for plane in entry.planes.iter() {
-                let begin = part.logical.max(plane.offset);
-                let end = (part.logical + part.bytes).min(plane.end().unwrap());
-                if begin >= end {
-                    continue;
-                }
-                let block = u64::from(plane.bytes_per_block);
-                let first = (begin - plane.offset) / plane.row_pitch;
-                let last = (end - plane.offset).div_ceil(plane.row_pitch);
-                for row in first..last {
-                    let base = plane.offset + row * plane.row_pitch;
-                    let low = begin.max(base) - base;
-                    let high = end.min(base + plane.row_bytes()) - base;
-                    if low < high {
-                        let start = base + low / block * block;
-                        let stop = base + high.div_ceil(block) * block;
-                        changed.push((start, stop - start));
-                    }
-                }
-            }
-        }
-        normalize(&mut changed);
-        let Some(&(base, _)) = changed.first() else {
-            return Ok(());
-        };
-        let &(last, length) = changed.last().unwrap();
-        let scratch_bytes = last + length - base;
-        debug_assert!(last + length <= bytes);
-        let mut selected = Vec::new();
-        for part in parts {
-            if !import_cpu && part.producer.is_none() {
-                continue;
-            }
-            let first = changed.partition_point(|&(start, size)| start + size <= part.logical);
-            for &(start, size) in &changed[first..] {
-                if start >= part.logical + part.bytes {
-                    break;
-                }
-                let low = start.max(part.logical);
-                let high = (start + size).min(part.logical + part.bytes);
-                let mut piece = *part;
-                let skip = low - part.logical;
-                piece.start = nixe_memory::ArenaOffset::new(part.start.get() + skip);
-                piece.logical = low;
-                piece.bytes = high - low;
-                if let Some(producer) = &mut piece.producer {
-                    producer.native += skip;
-                }
-                selected.push(piece);
-            }
-        }
-        let mut dirty: Vec<_> = selected
-            .iter()
-            .map(|part| (part.logical, part.bytes))
-            .collect();
-        normalize(&mut dirty);
-        let scratch = Arc::new(self.temporary_buffer(scratch_bytes, &[])?);
-        let mut captures = Vec::new();
-        let mut windows = Vec::new();
-        let mut packed = 0usize;
-        let mut images = rustc_hash::FxHashMap::<ImageId, Vec<(u64, u64, u64)>>::default();
-        let mut buffers = rustc_hash::FxHashMap::<BufferId, Vec<vk::BufferCopy>>::default();
-        for part in &selected {
-            if let Some(producer) = part.producer {
-                match producer.resource {
-                    Resource::Image(source) => {
-                        let copies = images.entry(source).or_default();
-                        if let Some((from, to, size)) = copies.last_mut()
-                            && *from + *size == producer.native
-                            && *to + *size == (part.logical - base)
-                        {
-                            *size += part.bytes;
-                        } else {
-                            copies.push((producer.native, (part.logical - base), part.bytes));
-                        }
-                    }
-                    Resource::Buffer(source) => {
-                        let copies = buffers.entry(source).or_default();
-                        if let Some(last) = copies.last_mut()
-                            && last.src_offset + last.size == producer.native
-                            && last.dst_offset + last.size == (part.logical - base)
-                        {
-                            last.size += part.bytes;
-                        } else {
-                            copies.push(
-                                vk::BufferCopy::default()
-                                    .src_offset(producer.native)
-                                    .dst_offset(part.logical - base)
-                                    .size(part.bytes),
-                            );
+            Some((
+                begin - start,
+                span.allocation,
+                span.start.get() + begin - span.logical,
+                end - begin,
+            ))
+        })
+    }
+    let mut lhs = spans(a.mapping(), ar.start, bytes).peekable();
+    lhs.peek().is_some() && lhs.eq(spans(b.mapping(), br.start, bytes))
+}
+impl Residency<'_> {
+    pub(super) fn register_image_aliases(&mut self, id: ImageId) -> Result<(), VulkanError> {
+        let mut candidates = smallvec::SmallVec::<[ImageId; 16]>::new();
+        for &(address, size) in &self.texture_cache.get(id).maps {
+            for page in address >> 20..=(address + size - 1) >> 20 {
+                if let Some(ids) = self.texture_cache.image_pages.get(&page) {
+                    for &other in ids {
+                        if other != id && !candidates.contains(&other) {
+                            candidates.push(other);
                         }
                     }
                 }
-            } else if import_cpu {
-                captures.push(nixe_memory::PhysicalCapture {
-                    source: nixe_memory::Extent {
-                        start: part.start,
-                        bytes: part.bytes,
-                    },
-                    destination: packed,
-                });
-                windows.push(((part.logical - base), packed, part.bytes as usize));
-                packed += part.bytes as usize;
             }
         }
-        if packed != 0 {
-            let mut pages = Vec::new();
-            for footprint in &geometry {
-                footprint.mapping().observed_pages(footprint, &mut pages)?;
-            }
-            let inputs = nixe_gpu::physical::pin_selected_pages(pages)?;
-            let mut captured = vec![0; packed];
-            self.memory
-                .capture_resource_scattered(&inputs, &captures, &mut captured)?;
-            let slice = self.device.submission.reserve_upload_aligned(
-                &mut self.device.dispatch,
-                &captured,
-                4,
-            )?;
-            let copies: Vec<_> = windows
-                .iter()
-                .map(|&(to, offset, bytes)| {
-                    vk::BufferCopy::default()
-                        .src_offset(slice.offset + offset as u64)
-                        .dst_offset(to)
-                        .size(bytes as u64)
-                })
-                .collect();
-            let work = self.device.work_ticket()?;
-            self.device.retire_buffer(Arc::clone(&scratch), work)?;
-            self.barriers.emit(&mut self.device);
-            let source = self.device.submission.staging_buffer(&slice).handle;
-            unsafe {
-                self.device
-                    .dispatch
-                    .cmd_copy_buffer(source, scratch.handle, &copies);
-            }
-            self.statistics.cpu_uploaded_bytes += captured.len() as u64;
-        }
-        for (source, copies) in buffers {
-            for copy in &copies {
-                self.buffer_access_range(
-                    source,
-                    copy.src_offset,
-                    copy.size,
-                    AccessScope::new(
-                        vk::PipelineStageFlags2::COPY,
-                        vk::AccessFlags2::TRANSFER_READ,
-                    ),
-                )?;
-            }
-            let native = self.buffer(source)?.native.handle;
-            self.device.begin_recording()?;
-            let work = self.device.work_ticket()?;
-            self.device.retire_buffer(Arc::clone(&scratch), work)?;
-            self.barriers.emit(&mut self.device);
-            unsafe {
-                self.device
-                    .dispatch
-                    .cmd_copy_buffer(native, scratch.handle, &copies);
-            }
-            self.statistics.gpu_copied_bytes += copies.iter().map(|c| c.size).sum::<u64>();
-        }
-        for (source, copies) in images {
-            self.copy_image_bytes(source, &scratch, &copies)?;
-        }
-        self.device.begin_recording()?;
-
-        scratch_read_barrier(&mut self.device, scratch.handle, scratch_bytes);
-        self.copy_rows_to_image(&scratch, base, id, &dirty)
-    }
-
-    /// Eden synchronizes aliases at consumption with native image copies. Here
-    /// exact authority additionally restricts each copy to the newest byte domain.
-    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
-    fn copy_native_intersections(
-        &mut self,
-        id: ImageId,
-        parts: &[ResolvedBytes<Resource>],
-    ) -> Result<bool, VulkanError> {
-        let target = self.image(id)?;
-        let mut groups = AliasCopies::default();
-        for part in parts {
-            let Some(producer) = part.producer else {
-                if target.canonical_import && !target.synchronized {
-                    return Ok(false);
-                }
-                continue;
-            };
-            if target.synchronized && producer.sequence.get() <= target.synchronized_sequence {
+        for other in candidates {
+            let target = self.texture_cache.get(id);
+            let source = self.texture_cache.get(other);
+            if target.decoded.is_some()
+                || source.decoded.is_some()
+                || target.description.image_type != source.description.image_type
+                || target.description.samples != source.description.samples
+                || target.sample_grid != source.sample_grid
+            {
                 continue;
             }
-            if producer.resource == Resource::Image(id) && producer.native == part.logical {
-                continue;
-            }
-            let Resource::Image(source) = producer.resource else {
-                return Ok(false);
-            };
-            if source == id {
-                return Ok(false);
-            }
-            let source_entry = self.image(source)?;
-            if source_entry.description.samples != target.description.samples {
-                return Ok(false);
-            }
-            let mut from = producer.native;
-            let mut to = part.logical;
-            let mut remaining = part.bytes;
-            while remaining != 0 {
-                let Some(&src) = source_entry
-                    .planes
-                    .iter()
-                    .find(|p| from >= p.offset && from < p.end().unwrap())
-                else {
-                    return Ok(false);
+            let mut forward = Vec::new();
+            let mut backward = Vec::new();
+            for (&destination, target_geometry) in
+                target.planes.iter().zip(&target.contents.geometry)
+            {
+                let WriteDomain::Image(target_domain) = target_geometry.domain() else {
+                    unreachable!("image geometry");
                 };
-                let Some(&dst) = target
-                    .planes
-                    .iter()
-                    .find(|p| to >= p.offset && to < p.end().unwrap())
-                else {
-                    return Ok(false);
-                };
-                if src.block_extent != dst.block_extent
-                    || src.bytes_per_block != dst.bytes_per_block
-                    || src.aspect != dst.aspect
-                    || !format::copy_compatible(
-                        source_entry.description.format,
-                        target.description.format,
-                        dst.aspect,
-                    )
+                for (&from, source_geometry) in source.planes.iter().zip(&source.contents.geometry)
                 {
-                    return Ok(false);
-                }
-                let block = u64::from(src.bytes_per_block);
-                let sx = (from - src.offset) % src.row_pitch;
-                let dx = (to - dst.offset) % dst.row_pitch;
-                if sx >= src.row_bytes()
-                    || dx >= dst.row_bytes()
-                    || !sx.is_multiple_of(block)
-                    || !dx.is_multiple_of(block)
-                {
-                    return Ok(false);
-                }
-                let size = remaining
-                    .min(src.row_bytes() - sx)
-                    .min(dst.row_bytes() - dx);
-                if !size.is_multiple_of(block) {
-                    return Ok(false);
-                }
-                let sy = ((from - src.offset) / src.row_pitch) as u32 * src.block_extent.height;
-                let dy = ((to - dst.offset) / dst.row_pitch) as u32 * dst.block_extent.height;
-                let sx = (sx / block) as u32 * src.block_extent.width;
-                let dx = (dx / block) as u32 * dst.block_extent.width;
-                let width = (size / block) as u32 * dst.block_extent.width;
-                let width = width.min(src.extent.width - sx).min(dst.extent.width - dx);
-                let height = src
-                    .block_extent
-                    .height
-                    .min(src.extent.height - sy)
-                    .min(dst.extent.height - dy);
-                let copy = vk::ImageCopy::default()
-                    .src_subresource(src.layers())
-                    .dst_subresource(dst.layers())
-                    .src_offset(vk::Offset3D {
-                        x: sx as i32,
-                        y: sy as i32,
-                        z: src.depth_slice as i32,
-                    })
-                    .dst_offset(vk::Offset3D {
-                        x: dx as i32,
-                        y: dy as i32,
-                        z: dst.depth_slice as i32,
-                    })
-                    .extent(vk::Extent3D {
-                        width,
-                        height,
+                    let WriteDomain::Image(source_domain) = source_geometry.domain() else {
+                        unreachable!("image geometry");
+                    };
+                    if from.aspect != destination.aspect
+                        || from.block_extent != destination.block_extent
+                        || !format::copy_compatible(
+                            source.description.format,
+                            target.description.format,
+                            from.aspect,
+                        )
+                        || !same_storage(target_domain, source_domain)
+                    {
+                        continue;
+                    }
+                    if !same_backing(target_geometry, source_geometry) {
+                        continue;
+                    }
+                    let extent = vk::Extent3D {
+                        width: destination.extent.width.min(from.extent.width),
+                        height: destination.extent.height.min(from.extent.height),
                         depth: 1,
+                    };
+                    let from_offset = vk::Offset3D {
+                        x: 0,
+                        y: 0,
+                        z: from.depth_slice as i32,
+                    };
+                    let to_offset = vk::Offset3D {
+                        x: 0,
+                        y: 0,
+                        z: destination.depth_slice as i32,
+                    };
+                    forward.push(PlaneCopies {
+                        source: from,
+                        destination,
+                        copies: vec![
+                            vk::ImageCopy::default()
+                                .src_subresource(from.layers())
+                                .dst_subresource(destination.layers())
+                                .src_offset(from_offset)
+                                .dst_offset(to_offset)
+                                .extent(extent),
+                        ],
                     });
-                push_alias_copy(&mut groups, source, src, dst, copy);
-                from += size;
-                to += size;
-                remaining -= size;
+                    backward.push(PlaneCopies {
+                        source: destination,
+                        destination: from,
+                        copies: vec![
+                            vk::ImageCopy::default()
+                                .src_subresource(destination.layers())
+                                .dst_subresource(from.layers())
+                                .src_offset(to_offset)
+                                .dst_offset(from_offset)
+                                .extent(extent),
+                        ],
+                    });
+                }
+            }
+            if !forward.is_empty() {
+                self.texture_cache.images[id].aliases.push(ImageAlias {
+                    image: other,
+                    copies: forward.into(),
+                });
+                self.texture_cache.images[other].aliases.push(ImageAlias {
+                    image: id,
+                    copies: backward.into(),
+                });
             }
         }
-        for (source, mut planes) in groups {
-            for plane in &mut planes {
-                coalesce_copies(&mut plane.copies);
-            }
-            self.copy_alias_regions(source, id, planes)?;
-        }
-        Ok(true)
+        Ok(())
     }
-
+    pub(super) fn synchronize_image_aliases(&mut self, id: ImageId) -> Result<(), VulkanError> {
+        let target = self.texture_cache.get(id);
+        let tick = target.modification_tick;
+        let mut modified = target.gpu_modified;
+        let mut newest = tick;
+        let mut aliases = smallvec::SmallVec::<[(ImageId, Arc<[PlaneCopies]>, u64); 8]>::new();
+        for alias in &target.aliases {
+            let source = self.texture_cache.get(alias.image);
+            if source.modification_tick > tick {
+                newest = newest.max(source.modification_tick);
+                modified |= source.gpu_modified;
+                aliases.push((
+                    alias.image,
+                    Arc::clone(&alias.copies),
+                    source.modification_tick,
+                ));
+            }
+        }
+        if aliases.is_empty() {
+            return Ok(());
+        }
+        aliases.sort_unstable_by_key(|alias| alias.2);
+        let retained = self.runtime.constructing.len();
+        self.runtime
+            .constructing
+            .extend(aliases.iter().map(|alias| Resource::Image(alias.0)));
+        let result: Result<(), VulkanError> = (|| {
+            for (source, copies, _) in aliases {
+                self.copy_alias_regions(source, id, &copies)?;
+            }
+            Ok(())
+        })();
+        self.runtime.constructing.truncate(retained);
+        result?;
+        let target = &mut self.texture_cache.images[id];
+        target.modification_tick = newest;
+        target.gpu_modified = modified;
+        Ok(())
+    }
     pub(super) fn copy_alias_regions(
         &mut self,
         source: ImageId,
         id: ImageId,
-        planes: smallvec::SmallVec<[PlaneCopies; 2]>,
+        planes: &[PlaneCopies],
     ) -> Result<(), VulkanError> {
-        let (native, layout) = self.image_planes_access(
-            source,
-            planes.iter().map(|plane| plane.source),
-            AccessScope::new(
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_READ,
-            ),
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        )?;
-        let (target, target_layout) = self.image_planes_access(
-            id,
-            planes.iter().map(|plane| plane.destination),
-            AccessScope::new(
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        )?;
-        self.device.begin_recording()?;
-        self.barriers.emit(&mut self.device);
-        let mut planes = planes.into_iter();
-        let first = planes.next().expect("alias copies have a source plane");
-        let mut ranges = smallvec::SmallVec::<[(ImagePlane, std::ops::Range<usize>); 2]>::new();
-        ranges.push((first.destination, 0..first.copies.len()));
-        let mut copies = first.copies;
-        for mut plane in planes {
-            let start = copies.len();
-            copies.append(&mut plane.copies);
-            ranges.push((plane.destination, start..copies.len()));
-        }
+        let (native, layout) =
+            self.image_planes_transfer(source, planes.iter().map(|plane| plane.source))?;
+        let (target, target_layout) =
+            self.image_planes_transfer(id, planes.iter().map(|plane| plane.destination))?;
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        let copies: smallvec::SmallVec<[vk::ImageCopy; 16]> = planes
+            .iter()
+            .flat_map(|plane| plane.copies.iter().copied())
+            .collect();
         unsafe {
-            self.device
+            self.runtime
+                .device
                 .dispatch
-                .cmd_copy_image(native, layout, target, target_layout, &copies);
+                .copy_image(native, layout, target, target_layout, &copies);
         }
-        self.statistics.alias_copy_commands += 1;
-        self.statistics.alias_copy_regions += copies.len() as u64;
-        for (dst, range) in ranges {
-            for copy in &copies[range] {
-                self.define_image_rect(
-                    id,
-                    dst,
-                    vk::Rect2D {
-                        offset: vk::Offset2D {
-                            x: copy.dst_offset.x,
-                            y: copy.dst_offset.y,
-                        },
-                        extent: vk::Extent2D {
-                            width: copy.extent.width,
-                            height: copy.extent.height,
-                        },
-                    },
-                );
-                self.statistics.gpu_copied_bytes +=
+        self.runtime.statistics.alias_copy_commands += 1;
+        self.runtime.statistics.alias_copy_regions += copies.len() as u64;
+        for plane in planes {
+            let dst = plane.destination;
+            for copy in &plane.copies {
+                self.runtime.statistics.gpu_copied_bytes +=
                     u64::from(copy.extent.width.div_ceil(dst.block_extent.width))
                         * u64::from(copy.extent.height.div_ceil(dst.block_extent.height))
                         * u64::from(dst.bytes_per_block);
@@ -405,72 +241,13 @@ impl VulkanResidency {
     }
 }
 
-// Physical tiling splits a rectangular write into many disjoint byte intervals.
-// Recover row runs first, then rectangles with the same source translation.
-fn coalesce_copies(copies: &mut Vec<vk::ImageCopy>) {
-    for vertical in [false, true] {
-        copies.sort_unstable_by_key(|c| {
-            let (s, d, e) = (c.src_offset, c.dst_offset, c.extent);
-            [
-                i64::from(s.x) - i64::from(d.x),
-                i64::from(s.y) - i64::from(d.y),
-                i64::from(s.z),
-                i64::from(d.z),
-                i64::from(e.depth),
-                if vertical {
-                    i64::from(d.x)
-                } else {
-                    i64::from(d.y)
-                },
-                if vertical {
-                    i64::from(e.width)
-                } else {
-                    i64::from(e.height)
-                },
-                if vertical {
-                    i64::from(d.y)
-                } else {
-                    i64::from(d.x)
-                },
-            ]
-        });
-        let mut count = 0;
-        for index in 0..copies.len() {
-            let next = copies[index];
-            if count > 0 {
-                let previous = &mut copies[count - 1];
-                let contiguous = previous.src_offset.z == next.src_offset.z
-                    && previous.dst_offset.z == next.dst_offset.z
-                    && previous.extent.depth == next.extent.depth
-                    && if vertical {
-                        previous.src_offset.x == next.src_offset.x
-                            && previous.dst_offset.x == next.dst_offset.x
-                            && previous.extent.width == next.extent.width
-                            && previous.src_offset.y + previous.extent.height as i32
-                                == next.src_offset.y
-                            && previous.dst_offset.y + previous.extent.height as i32
-                                == next.dst_offset.y
-                    } else {
-                        previous.src_offset.y == next.src_offset.y
-                            && previous.dst_offset.y == next.dst_offset.y
-                            && previous.extent.height == next.extent.height
-                            && previous.src_offset.x + previous.extent.width as i32
-                                == next.src_offset.x
-                            && previous.dst_offset.x + previous.extent.width as i32
-                                == next.dst_offset.x
-                    };
-                if contiguous {
-                    if vertical {
-                        previous.extent.height += next.extent.height;
-                    } else {
-                        previous.extent.width += next.extent.width;
-                    }
-                    continue;
-                }
+impl TextureCache {
+    pub(in crate::residency) fn unregister_image_aliases(&mut self, id: ImageId) {
+        let aliases = std::mem::take(&mut self.images[id].aliases);
+        for alias in aliases {
+            if let Some(entry) = self.images.get_mut(alias.image) {
+                entry.aliases.retain(|alias| alias.image != id);
             }
-            copies[count] = next;
-            count += 1;
         }
-        copies.truncate(count);
     }
 }

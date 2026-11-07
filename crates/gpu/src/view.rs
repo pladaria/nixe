@@ -211,14 +211,6 @@ pub struct ImageView {
     // Reidentifying a checked view never rebuilds its immutable subresource map.
     bindings: Arc<[ImageSubresourceBinding]>,
     binding_fingerprint: u64,
-    storage: ImageStorage,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ImageStorage {
-    CanonicalTexels,
-    DeviceInitializedTexels,
-    ResidentOnly,
 }
 
 impl ImageView {
@@ -268,38 +260,7 @@ impl ImageView {
             swizzle,
             bindings,
             binding_fingerprint: hasher.finish(),
-            storage: ImageStorage::CanonicalTexels,
         })
-    }
-
-    /// Retains canonical storage identity and device ownership when the byte
-    /// encoding cannot be imported/exported as ordinary texels (for example
-    /// compressed render-target storage or native multisample storage).
-    /// The frontend must materialize all consumed image contents on the device.
-    #[must_use]
-    pub fn with_resident_only_storage(mut self) -> Self {
-        self.storage = ImageStorage::ResidentOnly;
-        self
-    }
-
-    /// Requires device initialization, but allows logical texels to be exported
-    /// when the CPU actually consumes them and reimported after a CPU write.
-    #[must_use]
-    pub fn with_device_initialized_texels(mut self) -> Self {
-        self.storage = ImageStorage::DeviceInitializedTexels;
-        self
-    }
-
-    /// Whether canonical bytes can initialize a new host image without a producer.
-    #[must_use]
-    pub const fn can_initialize_from_canonical_texels(&self) -> bool {
-        matches!(self.storage, ImageStorage::CanonicalTexels)
-    }
-
-    /// Whether device-written logical texels can be exported to canonical memory.
-    #[must_use]
-    pub const fn has_canonical_texels(&self) -> bool {
-        !matches!(self.storage, ImageStorage::ResidentOnly)
     }
 
     #[must_use]
@@ -465,7 +426,7 @@ impl std::error::Error for ImageViewError {}
 
 #[cfg(test)]
 mod tests {
-    use crate::physical::PhysicalMapping;
+    use nixe_memory::PhysicalMapping;
     use nixe_memory::{AllocationRange, Machine, PAGE_SIZE};
 
     use super::*;
@@ -522,15 +483,10 @@ mod tests {
             )],
         )
         .unwrap();
-        let changed = view
-            .clone()
-            .with_image(ImageId::new(2))
-            .with_resident_only_storage();
+        let changed = view.clone().with_image(ImageId::new(2));
         assert!(std::ptr::eq(view.bindings(), changed.bindings()));
         assert_eq!(view.image(), ImageId::new(1));
         assert_eq!(changed.image(), ImageId::new(2));
-        assert!(view.can_initialize_from_canonical_texels());
-        assert!(!changed.can_initialize_from_canonical_texels());
         let mapping = changed.bindings()[0].backing().mapping().clone();
         drop(view);
         drop(changed);

@@ -4,11 +4,15 @@
 //! on host-independent GPU contracts and never on Horizon or a host backend.
 
 mod address_space;
+mod device_memory;
+pub use device_memory::{MaxwellDeviceMapping, MaxwellDeviceMemory};
 mod channel;
-mod engines;
+pub mod engines;
 mod execution;
 mod frontend;
 mod gpfifo;
+mod presentation;
+pub use presentation::{MissingGpuExecution, PresentationImageRequest};
 mod profile;
 mod pushbuffer;
 mod scheduler;
@@ -19,10 +23,10 @@ pub use shader::recompiler::MAXWELL_SHADER_NAMESPACE;
 pub use address_space::{
     MAX_MAPPING_DUMP_ENTRIES, MaxwellAddressSpaceError, MaxwellAddressSpaceId,
     MaxwellAddressSpaceInitialization, MaxwellAllocationId, MaxwellGpuAccessError,
-    MaxwellGpuAddressSpace, MaxwellGpuMapping, MaxwellGpuMemory, MaxwellGpuTranslation,
-    MaxwellMapRequest, MaxwellMappingDiagnostic, MaxwellMappingDump, MaxwellMappingId,
-    MaxwellResolvedMapping, MaxwellResolvedRange, MaxwellSparseMapping, MaxwellSparseRemapRequest,
-    MaxwellVaRegion, MaxwellVaReservation,
+    MaxwellGpuAddressSpace, MaxwellGpuMapping, MaxwellGpuMemory, MaxwellGpuMemoryHandle,
+    MaxwellGpuMemoryInterface, MaxwellMapRequest, MaxwellMappingDiagnostic, MaxwellMappingDump,
+    MaxwellMappingId, MaxwellResolvedMapping, MaxwellResolvedRange, MaxwellSparseMapping,
+    MaxwellSparseRemapRequest, MaxwellVaRegion, MaxwellVaReservation,
 };
 pub use channel::{
     MaxwellChannelConfiguration, MaxwellChannelDriverState, MaxwellChannelError,
@@ -36,7 +40,6 @@ pub use engines::{
     MAXWELL_CONSTANT_BUFFER_SLOT_COUNT, MAXWELL_PIPELINE_SHADER_COUNT,
     MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT, MAXWELL_SAMPLE_LOCATION_GROUP_COUNT,
     MAXWELL_SAMPLE_LOCATIONS_PER_GROUP, MAXWELL_SCISSOR_COUNT, MAXWELL_TESSELLATION_LOD_COUNT,
-    MAXWELL_THREE_D_MME_CAPTURED_INSTRUCTION_WORDS, MAXWELL_THREE_D_MME_CAPTURED_START_ADDRESSES,
     MAXWELL_THREE_D_MME_EMITTED_METHOD_LIMIT, MAXWELL_THREE_D_MME_EXECUTION_INSTRUCTION_LIMIT,
     MAXWELL_THREE_D_MME_SHADOW_SCRATCH_COUNT, MAXWELL_THREE_D_PRIMITIVE_AREA_MAX,
     MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
@@ -67,17 +70,15 @@ pub use engines::{
     MaxwellThreeDAttachmentReadiness, MaxwellThreeDAttributeDefaultVector,
     MaxwellThreeDAttributeDefaults, MaxwellThreeDAttributePointSize,
     MaxwellThreeDBalancedPrimitiveWorkload, MaxwellThreeDBegin, MaxwellThreeDBeginInstance,
-    MaxwellThreeDBindGroupState, MaxwellThreeDBlendControlState, MaxwellThreeDBlendFactor,
-    MaxwellThreeDBlendFloatPixelKillEnable, MaxwellThreeDBlendOp,
-    MaxwellThreeDBlendPerFormatEnable, MaxwellThreeDBlendZeroTimesAnythingIsZero,
-    MaxwellThreeDClearState, MaxwellThreeDClearSurface, MaxwellThreeDClearSurfaceControl,
+    MaxwellThreeDBindGroupState, MaxwellThreeDBlendControlState,
+    MaxwellThreeDBlendFloatPixelKillEnable, MaxwellThreeDBlendPerFormatEnable,
+    MaxwellThreeDBlendZeroTimesAnythingIsZero, MaxwellThreeDClearState, MaxwellThreeDClearSurface,
     MaxwellThreeDClipAxis, MaxwellThreeDClipIdTestEnable, MaxwellThreeDColorCompressionMode,
-    MaxwellThreeDColorMask, MaxwellThreeDColorReductionFp16Threshold,
-    MaxwellThreeDColorReductionSrgb8Threshold, MaxwellThreeDColorReductionState,
-    MaxwellThreeDColorReductionThresholdsEnable, MaxwellThreeDColorReductionThresholdsFp16,
-    MaxwellThreeDColorReductionThresholdsSrgb8, MaxwellThreeDColorReductionThresholdsUnorm8,
-    MaxwellThreeDColorReductionThresholdsUnorm10, MaxwellThreeDColorReductionThresholdsUnorm16,
-    MaxwellThreeDColorTargetFormat, MaxwellThreeDColorTargetSelection,
+    MaxwellThreeDColorReductionFp16Threshold, MaxwellThreeDColorReductionSrgb8Threshold,
+    MaxwellThreeDColorReductionState, MaxwellThreeDColorReductionThresholdsEnable,
+    MaxwellThreeDColorReductionThresholdsFp16, MaxwellThreeDColorReductionThresholdsSrgb8,
+    MaxwellThreeDColorReductionThresholdsUnorm8, MaxwellThreeDColorReductionThresholdsUnorm10,
+    MaxwellThreeDColorReductionThresholdsUnorm16, MaxwellThreeDColorTargetFormat,
     MaxwellThreeDColorTargetState, MaxwellThreeDCompareOp, MaxwellThreeDCompressionThreshold,
     MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDConservativeRasterEnable,
     MaxwellThreeDConstantBufferBinding, MaxwellThreeDConstantBufferSelectorState,
@@ -85,48 +86,44 @@ pub use engines::{
     MaxwellThreeDCullFace, MaxwellThreeDDecompressSurface, MaxwellThreeDDepthArrayControl,
     MaxwellThreeDDepthStencilFormat, MaxwellThreeDDepthStencilTargetState,
     MaxwellThreeDDepthTargetCount, MaxwellThreeDDescriptorPoolState,
-    MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDEdgeFlag,
-    MaxwellThreeDFillViaTriangleMode, MaxwellThreeDFixedFunctionRegister,
+    MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDDrawIndexBuffer, MaxwellThreeDDrawState,
+    MaxwellThreeDEdgeFlag, MaxwellThreeDFillViaTriangleMode, MaxwellThreeDFixedFunctionRegister,
     MaxwellThreeDFixedFunctionState, MaxwellThreeDFixedFunctionValue,
     MaxwellThreeDFlushPendingWrites, MaxwellThreeDFrontFace, MaxwellThreeDGuestImageFormat,
     MaxwellThreeDHybridAntiAliasCentroid, MaxwellThreeDHybridAntiAliasControl,
-    MaxwellThreeDImageKind, MaxwellThreeDImageLayout, MaxwellThreeDIndexBufferState,
-    MaxwellThreeDIndexElementSize, MaxwellThreeDInlineConstantBufferUpload,
-    MaxwellThreeDInlineToMemoryCompletion, MaxwellThreeDInlineToMemoryLaunch,
-    MaxwellThreeDInlineToMemoryLayout, MaxwellThreeDInlineToMemoryState,
-    MaxwellThreeDIteratedBlend, MaxwellThreeDIteratedBlendPassCount, MaxwellThreeDLineState,
-    MaxwellThreeDLineStippleParameters, MaxwellThreeDLogicOp, MaxwellThreeDMappingReference,
-    MaxwellThreeDMmeExecutionError, MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError,
-    MaxwellThreeDMmeRam, MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl,
-    MaxwellThreeDMmeState, MaxwellThreeDMutableMethodControl, MaxwellThreeDOperationTrigger,
-    MaxwellThreeDPatchSize, MaxwellThreeDPipelineBindingState, MaxwellThreeDPixelShaderClampRange,
-    MaxwellThreeDPixelShaderInterlockControl, MaxwellThreeDPixelShaderInterlockFragmentOrder,
-    MaxwellThreeDPixelShaderInterlockMode, MaxwellThreeDPixelShaderInterlockTileSize,
-    MaxwellThreeDPixelShaderSaturate, MaxwellThreeDPointCenterMode, MaxwellThreeDPointSize,
-    MaxwellThreeDPointSpriteOrigin, MaxwellThreeDPointSpriteRMode, MaxwellThreeDPointSpriteSelect,
+    MaxwellThreeDImageKind, MaxwellThreeDImageLayout, MaxwellThreeDInlineToMemoryCompletion,
+    MaxwellThreeDInlineToMemoryLaunch, MaxwellThreeDInlineToMemoryLayout,
+    MaxwellThreeDInlineToMemoryState, MaxwellThreeDIteratedBlend,
+    MaxwellThreeDIteratedBlendPassCount, MaxwellThreeDLineState,
+    MaxwellThreeDLineStippleParameters, MaxwellThreeDLogicOp, MaxwellThreeDMmeExecutionError,
+    MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError, MaxwellThreeDMmeRam,
+    MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl, MaxwellThreeDMmeState,
+    MaxwellThreeDMutableMethodControl, MaxwellThreeDPatchSize, MaxwellThreeDPipelineBindingState,
+    MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPixelShaderInterlockControl,
+    MaxwellThreeDPixelShaderInterlockFragmentOrder, MaxwellThreeDPixelShaderInterlockMode,
+    MaxwellThreeDPixelShaderInterlockTileSize, MaxwellThreeDPixelShaderSaturate,
+    MaxwellThreeDPointCenterMode, MaxwellThreeDPointSize, MaxwellThreeDPointSpriteOrigin,
+    MaxwellThreeDPointSpriteRMode, MaxwellThreeDPointSpriteSelect,
     MaxwellThreeDPolygonClipGeneratedEdge, MaxwellThreeDPolygonMode,
-    MaxwellThreeDPostZPixelShaderImask, MaxwellThreeDPreservedImageLayout,
-    MaxwellThreeDPrimitiveCircularBufferThrottle, MaxwellThreeDPrimitiveState,
-    MaxwellThreeDPrimitiveTopology, MaxwellThreeDProgramRegionState, MaxwellThreeDProvokingVertex,
-    MaxwellThreeDPsOutputSampleMaskUsage, MaxwellThreeDRasterBoundingBox,
-    MaxwellThreeDRasterBoundingBoxMode, MaxwellThreeDRasterState, MaxwellThreeDRawValue,
-    MaxwellThreeDRectangle, MaxwellThreeDRegister, MaxwellThreeDRenderEnableMode,
-    MaxwellThreeDRenderEnableOverride, MaxwellThreeDRenderEnableState,
-    MaxwellThreeDRenderTargetIndexOffset, MaxwellThreeDRenderTargetLayer,
-    MaxwellThreeDRenderTargetLayerControl, MaxwellThreeDRenderTargetState,
-    MaxwellThreeDReportSemaphoreControl, MaxwellThreeDReportSemaphoreOperation,
-    MaxwellThreeDReportSemaphorePipelineLocation, MaxwellThreeDReportSemaphoreState,
-    MaxwellThreeDReportSemaphoreStructureSize, MaxwellThreeDReportSemaphoreWrite,
-    MaxwellThreeDResolvedBuffer, MaxwellThreeDResolvedImage, MaxwellThreeDResolvedResource,
-    MaxwellThreeDResolvedResources, MaxwellThreeDResolvedSampler, MaxwellThreeDResourceAccess,
-    MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDSampleLocation,
-    MaxwellThreeDSampleLocationGroup, MaxwellThreeDSampleMode, MaxwellThreeDSamplerBindingMode,
-    MaxwellThreeDScissorState, MaxwellThreeDSeparateFragmentData, MaxwellThreeDShadeMode,
-    MaxwellThreeDShaderBindingState, MaxwellThreeDShaderCacheInvalidation,
-    MaxwellThreeDShaderExceptionsEnable, MaxwellThreeDShaderExecutionState,
-    MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderLocalMemoryState,
-    MaxwellThreeDShaderWatermarkRange, MaxwellThreeDShaderWatermarkTarget,
-    MaxwellThreeDSingleRopControl, MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState,
+    MaxwellThreeDPostZPixelShaderImask, MaxwellThreeDPrimitiveCircularBufferThrottle,
+    MaxwellThreeDPrimitiveState, MaxwellThreeDPrimitiveTopology, MaxwellThreeDProgramRegionState,
+    MaxwellThreeDProvokingVertex, MaxwellThreeDPsOutputSampleMaskUsage,
+    MaxwellThreeDRasterBoundingBox, MaxwellThreeDRasterBoundingBoxMode, MaxwellThreeDRasterState,
+    MaxwellThreeDRawValue, MaxwellThreeDRectangle, MaxwellThreeDRegister,
+    MaxwellThreeDRenderEnableMode, MaxwellThreeDRenderEnableOverride,
+    MaxwellThreeDRenderEnableState, MaxwellThreeDRenderTargetIndexOffset,
+    MaxwellThreeDRenderTargetLayer, MaxwellThreeDRenderTargetLayerControl,
+    MaxwellThreeDRenderTargetState, MaxwellThreeDReportSemaphoreControl,
+    MaxwellThreeDReportSemaphoreOperation, MaxwellThreeDReportSemaphorePipelineLocation,
+    MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStructureSize,
+    MaxwellThreeDReportSemaphoreWrite, MaxwellThreeDResolvedSampler, MaxwellThreeDResourceError,
+    MaxwellThreeDResourceRole, MaxwellThreeDSampleLocation, MaxwellThreeDSampleLocationGroup,
+    MaxwellThreeDSampleMode, MaxwellThreeDSamplerBindingMode, MaxwellThreeDScissorState,
+    MaxwellThreeDSeparateFragmentData, MaxwellThreeDShadeMode, MaxwellThreeDShaderBindingState,
+    MaxwellThreeDShaderCacheInvalidation, MaxwellThreeDShaderExceptionsEnable,
+    MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderLocalMemoryPerWarpSize,
+    MaxwellThreeDShaderLocalMemoryState, MaxwellThreeDShaderWatermarkRange,
+    MaxwellThreeDShaderWatermarkTarget, MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState,
     MaxwellThreeDStencilOp, MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
     MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationPlan,
     MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
@@ -178,15 +175,11 @@ pub use profile::{
 };
 pub use pushbuffer::dispatch::{
     MAXWELL_LEGACY_MEM_OP_A_METHOD, MAXWELL_LEGACY_MEM_OP_B_METHOD, MAXWELL_SET_OBJECT_METHOD,
-    MaxwellHostMethod, MaxwellHostSynchronizationKind, MaxwellMethodDispatch,
-    MaxwellMethodDispatchError, MaxwellMethodDispatchKind, MaxwellMethodSource,
-    MaxwellSetObjectTransition,
+    MaxwellHostSynchronizationKind, MaxwellMethodDispatchError, MaxwellMethodSource,
 };
-pub use pushbuffer::packet::{
-    MaxwellDecodedMethod, MaxwellMethodIterator, MaxwellMethodPacketMode, MaxwellMethodSpan,
-    MaxwellPushbufferControl, MaxwellPushbufferDecodeError, MaxwellPushbufferSubchannel,
-    MaxwellPushbufferWord,
-};
+pub(crate) use pushbuffer::dma::MaxwellDmaArguments;
+pub use pushbuffer::dma::MaxwellPushbufferSubchannel;
+
 pub use scheduler::{
     MaxwellFrontendDispatch, MaxwellFrontendDispatchBoundary, MaxwellScheduleError,
     MaxwellScheduledSubmission, MaxwellScheduler, MaxwellSchedulerSequence,
@@ -195,21 +188,10 @@ pub use scheduler::{
 
 pub use execution::{MaxwellCommandHost, MaxwellFrontend};
 
-pub use engines::{
-    MaxwellNativeFrontend, MaxwellResolvedComputeLaunch, MaxwellTwoDSolidOperation,
-    NativeFrontendStatistics,
-};
+pub use engines::{MaxwellResolvedComputeLaunch, MaxwellTwoDSolidOperation};
+pub use execution::MissingRenderer;
 
 pub use shader::recompiler;
 
-#[cfg(test)]
-mod test_memory;
-
-#[cfg(test)]
-pub use pushbuffer::packet::decode_maxwell_pushbuffer;
-
-#[cfg(test)]
-use pushbuffer::packet::{MaxwellDecodedPacket, MaxwellDecodedPushbuffer};
-
-#[cfg(test)]
-pub use pushbuffer::packet::MaxwellDecodedMethodPacket;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_memory;

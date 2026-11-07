@@ -3,8 +3,7 @@
 //! Ordinary writes update one authoritative raw word and dirty metadata.
 //! Execution methods retain ordered effects even when the argument is equal.
 //! Reference mechanisms (independently implemented):
-//! https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/maxwell_3d.cpp
-//! https://github.com/yangjieshao/Ryujinx/blob/2505a1abcd5f31e4364bfb7f9313546f1840e5e1/src/Ryujinx.Graphics.Gpu/Engine/Threed/ThreedClass.cs
+//! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
 
 use super::*;
 
@@ -149,67 +148,113 @@ pub(super) const fn passive_action(action: MethodAction) -> bool {
         | MethodAction::IncrementSyncpoint
         | MethodAction::ZCullMaintenance
         | MethodAction::ClearReportValue
-        | MethodAction::DrawVertexArray
-        | MethodAction::DrawIndexBuffer
+        | MethodAction::VertexCount
+        | MethodAction::IndexCount
         | MethodAction::Missing(..) => false,
     }
 }
 
 // Like Eden's execution mask and dirty tables, method routing is fixed at build time.
 // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
-// One write ORs the precomputed dirty routing into the channel's flag word.
-// Low 16 bits select domains, then 32 vertex slots and 8 color targets. The
-// remaining byte classifies the method and is never copied into dirty state.
-pub(super) const VERTEX_SHIFT: u32 = 16;
-pub(super) const COLOR_SHIFT: u32 = 48;
-const FAMILY_SHIFT: u32 = 56;
-const PASSIVE: u64 = 1 << 63;
-const DIRTY_MASK: u64 = (1 << FAMILY_SHIFT) - 1;
+// Each word maps directly to its canonical consumer flags. There is no
+// delayed domain/revision conversion.
+pub(super) const VERTEX_SHIFT: u32 = Flags::VERTEX_SHIFT;
+pub(super) const COLOR_SHIFT: u32 = Flags::COLOR_SHIFT;
+use nixe_gpu::native::GraphicsDirty as Flags;
+pub(super) const VERTEX_LAYOUT: u128 = Flags::VERTEX_INPUT;
+const VIEWPORT: u128 = Flags::VIEWPORT;
+const SCISSOR: u128 = Flags::SCISSOR;
+const BLEND_CONSTANTS: u128 = Flags::BLEND_CONSTANTS;
+const ALPHA_TEST: u128 = Flags::ALPHA_TEST;
+const CONFIGURATION: u128 = Flags::PIPELINE_STATE;
 
-#[derive(Clone, Copy)]
-pub(super) struct MethodInfo(u64);
-impl MethodInfo {
-    pub(super) const fn passive(self) -> bool {
-        self.0 & PASSIVE != 0
-    }
-    pub(super) const fn family(self) -> RegisterFamily {
-        match (self.0 >> FAMILY_SHIFT) & 7 {
-            1 => RegisterFamily::InlineToMemory,
-            2 => RegisterFamily::Mme,
-            3 => RegisterFamily::ConstantBuffer,
-            4 => RegisterFamily::VertexAndBinding,
-            _ => RegisterFamily::Other,
-        }
-    }
-    pub(super) const fn domains(self) -> u16 {
-        self.0 as u16
-    }
-    pub(super) const fn dirty(self) -> u64 {
-        self.0 & DIRTY_MASK
-    }
+// Dirty tables distinguish consumers, not historical register combinations.
+// Coupled state (window origin, surface clip, alpha-test activation) marks
+// every consumer, matching Eden's multi-table dirty routing.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_state_tracker.cpp
+// Raster validation consumes enabled shader stages, program-region completeness
+// and viewport mode. Code offsets, CB-group/handle selectors and geometry
+// passthrough masks belong to code/resources, not fixed-function parameters.
+// Inputs to unsupported-state checks which do not already have a dedicated
+// consumed raster/attachment flag. Keep raw admission and precise errors at
+// consumption; changed unsupported words must not hide behind a cached key.
+const fn validation_input(method: u32) -> bool {
+    matches!(method,
+        0x030c | 0x02e4 | 0x1688 | 0x13a8 | 0x07a0 | 0x0d9c | 0x0f1c
+        | 0x15b4 | 0x153c | 0x11f8 | 0x16b4 | 0x0fb4 | 0x194c | 0x197c
+        | 0x1924 | 0x1148 | 0x19bc | 0x12d4 | 0x1138 | 0x113c | 0x0754
+        | 0x1224 | 0x0dd0 | 0x19c4 | 0x19c8 | 0x1534 | 0x0fa4
+        | 0x0fbc..=0x0fc8 | 0x11e0..=0x11ec | 0x15e4 | 0x1948)
 }
-static METHODS: [MethodInfo; 4096] = {
-    let mut table = [MethodInfo(0); 4096];
+const fn parameter_dirty(method: u32, domains: u16) -> u128 {
+    if domains & (COLOR | DEPTH | TARGET_CONTROL | SAMPLE_MODE) != 0 {
+        return 0;
+    }
+    let configuration = if validation_input(method) {
+        CONFIGURATION
+    } else {
+        0
+    };
+    if matches!(method, 0x1160..=0x11dc | 0x1880..=0x18fc)
+        || (method >= 0x1c00 && method <= 0x1dfc && (method - 0x1c00) % 16 == 12)
+    {
+        return VERTEX_LAYOUT | configuration;
+    }
+    // Stride belongs to VertexBuffers, not VertexInput. Static-stride hosts
+    // read it while refreshing their fixed pipeline state, as Eden does.
+    if method >= 0x1c00 && method <= 0x1dfc && (method - 0x1c00).is_multiple_of(16) {
+        return configuration;
+    }
+    configuration
+        | match method {
+            0x0f90 | 0x1a00..=0x1a1c => Flags::COLOR_MASK,
+            0x135c | 0x1360..=0x137c => Flags::BLEND_ENABLE,
+            0x12e4 | 0x133c..=0x1358 | 0x1e00..=0x1efc => Flags::BLEND_EQUATIONS,
+            0x0a00..=0x0a1c | 0x0c00..=0x0c0c | 0x193c | 0x0d7c => VIEWPORT,
+            0x192c => VIEWPORT,
+            0x0e00..=0x0e08 => SCISSOR,
+            0x0ff4 | 0x0ff8 => VIEWPORT,
+            0x13ac => VIEWPORT | Flags::FRONT_FACE,
+            0x12cc => Flags::DEPTH_TEST | VIEWPORT,
+            0x12e8 => Flags::DEPTH_WRITE,
+            0x130c => Flags::DEPTH_COMPARE,
+            0x19bc => Flags::DEPTH_BOUNDS_ENABLE,
+            0x0f9c | 0x0fa0 => Flags::DEPTH_BOUNDS,
+            0x1918 | 0x1920 => Flags::CULL_MODE,
+            0x191c => Flags::FRONT_FACE,
+            0x037c => Flags::RASTERIZER_DISCARD,
+            0x1644 => Flags::PRIMITIVE_RESTART,
+            0x0dc0 | 0x0dc4 | 0x0dc8 => Flags::DEPTH_BIAS_ENABLE,
+            0x15bc | 0x187c | 0x156c => Flags::DEPTH_BIAS,
+            0x13b0 | 0x13b4 | 0x1570 | 0x020c => Flags::LINE_WIDTH,
+            0x1380 => Flags::STENCIL_TEST,
+            0x1384..=0x1390 | 0x1598..=0x15a4 => Flags::STENCIL_OP,
+            0x1594 => Flags::STENCIL_PROPERTIES | Flags::STENCIL_OP,
+            0x1394 | 0x0f54 => Flags::STENCIL_PROPERTIES | Flags::STENCIL_REFERENCE,
+            0x139c | 0x0f58 => Flags::STENCIL_PROPERTIES | Flags::STENCIL_WRITE_MASK,
+            0x1398 | 0x0f5c => Flags::STENCIL_PROPERTIES | Flags::STENCIL_COMPARE,
+            0x131c..=0x1328 => BLEND_CONSTANTS,
+            0x12ec => CONFIGURATION | ALPHA_TEST,
+            0x1310 | 0x1314 => ALPHA_TEST,
+            _ => {
+                if domains & PARAMETERS != 0 {
+                    CONFIGURATION
+                } else {
+                    0
+                }
+            }
+        }
+}
+
+// ProcessDirtyRegisters uses two byte indices into the canonical flag bank.
+// No family or descriptive metadata is read for ordinary register writes.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.h#L3150-L3157
+pub(super) static DIRTY_TABLES: [[u8; 0xe00]; 2] = {
+    let mut tables = [[Flags::NULL_INDEX; 0xe00]; 2];
     let mut index = 0;
-    while index < table.len() {
+    while index < 0xe00 {
         let method = index as u32 * 4;
-        let family = classify_family(method);
         let domains = dirty_domains(method);
-        let passive = if output_state(method) {
-            true
-        } else if matches!(family, RegisterFamily::VertexAndBinding) {
-            !matches!(method, 0x1614 | 0x1618) && !(method >= 0x2400 && method < 0x2500)
-        } else if (method >= 0x3400
-            && method < 0x3400 + MAXWELL_THREE_D_MME_SHADOW_SCRATCH_COUNT as u32 * 4)
-            || (method >= 0x180 && method <= 0x1ac)
-            || method == 0x238c
-        {
-            true
-        } else if let Some(declaration) = METHODS_BY_DWORD[index] {
-            passive_action(declaration.action)
-        } else {
-            false
-        };
         let vertices = if domains & VERTEX != 0 {
             let slot = if method >= 0x1f00 {
                 (method - 0x1f00) / 8
@@ -231,68 +276,107 @@ static METHODS: [MethodInfo; 4096] = {
         } else {
             0
         };
-        table[index] = MethodInfo(
-            domains as u64
-                | ((vertices as u64) << VERTEX_SHIFT)
-                | ((colors as u64) << COLOR_SHIFT)
-                | ((family as u64) << FAMILY_SHIFT)
-                | if passive { PASSIVE } else { 0 },
-        );
+        let mut flags = parameter_dirty(method, domains)
+            | ((vertices as u128) << VERTEX_SHIFT)
+            | ((colors as u128) << COLOR_SHIFT);
+        if domains & VERTEX != 0 {
+            flags |= Flags::VERTEX_BUFFERS;
+        }
+        if domains & INDEX != 0 {
+            flags |= Flags::INDEX;
+        }
+        if domains & SHADERS != 0 {
+            flags |= Flags::SHADERS;
+        }
+        // Attachment addresses/layouts dirty TextureCache slots. Only format,
+        // sample mode and Zeta enable alter native attachment parameters.
+        if matches!(method, 0x0fe8 | 0x1538 | 0x15d0)
+            || (method >= 0x0810 && method < 0x0a00 && (method - 0x0810).is_multiple_of(0x40))
+        {
+            flags |= Flags::TARGET_FORMAT;
+        }
+        if domains & DEPTH != 0 {
+            flags |= Flags::DEPTH;
+        }
+        if method == 0x1538 {
+            flags |= Flags::DEPTH;
+        }
+        if method == 0x15b8 {
+            flags = Flags::RENDER_TARGET_CONTROL;
+        }
+        if domains & TARGET_CONTROL != 0 && method != 0x1538 {
+            flags = Flags::RENDER_TARGET_CONTROL | Flags::FRAMEBUFFER;
+        }
+        if domains & SAMPLE_MODE != 0 {
+            flags = Flags::RENDER_TARGET_CONTROL | Flags::TARGET_FORMAT;
+        }
+        if domains & FRAMEBUFFER != 0 {
+            flags |= Flags::FRAMEBUFFER;
+        }
+        // Multi-consumer state uses the same two-index routing as Eden.
+        // Viewport consumption also invalidates scissors; RT control forces
+        // current target lookups in their owning texture cache.
+        assert!(flags.count_ones() <= 2);
+        if flags != 0 {
+            tables[0][index] = flags.trailing_zeros() as u8;
+            flags &= flags - 1;
+        }
+        if flags != 0 {
+            tables[1][index] = flags.trailing_zeros() as u8;
+        }
         index += 1;
     }
-    table
+    tables
 };
-
-pub(super) fn info(method: GpuMethodId) -> Option<&'static MethodInfo> {
-    (method.0 & 3 == 0)
-        .then(|| METHODS.get((method.0 / 4) as usize))
-        .flatten()
-}
-pub(super) fn passive(method: GpuMethodId) -> bool {
-    info(method).is_some_and(|info| info.passive())
-}
-
-/// Complete the valid prefix of a contiguous CB data packet in one transition.
-/// The borrowed packet remains the payload; no per-word effect/source vector is built.
-pub(in crate::engines) fn constant_buffer_words(
-    candidate: &mut MaxwellThreeDFrontendState,
-    subchannel: crate::MaxwellPushbufferSubchannel,
-    words: crate::MaxwellMethodSpan<'_>,
-) -> Result<(MaxwellThreeDInlineConstantBufferUpload, usize), MaxwellEngineDispatchError> {
-    let first = crate::MaxwellMethodSource::decoded(words.first().unwrap(), subchannel);
-    let upload = preflight_constant_buffer_load(first, candidate)?;
-    let offset = upload.offset();
-    let size = *candidate
-        .operation_state()
-        .shader_bindings()
-        .selector()
-        .size()
-        .value()
-        .unwrap();
-    let available =
-        u64::from(size - offset).min((1_u64 << 40) - upload.address().get() - u64::from(offset));
-    let count = words.len().min((available / 4) as usize);
-    debug_assert!(count != 0);
-    // The upload increments the live position; shadow RAM retains submitted
-    // method values. This is the same state used by ProcessCBMultiData and MME
-    // register reads, including a repeated write that restarts the transfer.
-    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
-    candidate.write_register(GpuMethodId(0x238c), offset + count as u32 * 4);
-    let control = candidate.mme().shadow_ram_control().value().copied();
-    for word in words.slice(..count).last_writes() {
-        let source = crate::MaxwellMethodSource::decoded(word, subchannel);
-        candidate.record_raw_register(source);
-        candidate
-            .mme_mut()
-            .track_shadow_register(control, source.method(), source.argument());
+// DmaPusher consults one execution bit before touching dirty-register routing.
+// The immutable class mask is shared by channels; no per-channel rebuild or
+// second per-method execution flag is retained.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/engine_interface.h#L46
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp#L175-L191
+static EXECUTION_MASK: [u64; 4096 / 64] = {
+    let mut mask = [0; 4096 / 64];
+    let mut index = 0;
+    while index < 4096 {
+        if !passive_method(index) {
+            mask[index / 64] |= 1 << (index % 64);
+        }
+        index += 1;
     }
-    Ok((upload, count))
+    mask
+};
+const fn passive_method(index: usize) -> bool {
+    let method = index as u32 * 4;
+    let family = classify_family(method);
+    if output_state(method) {
+        true
+    } else if matches!(family, RegisterFamily::VertexAndBinding) {
+        !matches!(method, 0x0d74 | 0x17dc | 0x1614 | 0x1618 | 0x1970)
+            && !(method >= 0x2400 && method < 0x2500)
+    } else if (method >= 0x3400
+        && method < 0x3400 + MAXWELL_THREE_D_MME_SHADOW_SCRATCH_COUNT as u32 * 4)
+        || (method >= 0x180 && method <= 0x1ac)
+    {
+        true
+    } else if let Some(declaration) = METHODS_BY_DWORD[index] {
+        passive_action(declaration.action)
+    } else {
+        false
+    }
+}
+#[inline]
+pub(super) fn executable(method: GpuMethodId) -> bool {
+    let index = (method.0 / 4) as usize;
+    method.0 & 3 != 0
+        || EXECUTION_MASK
+            .get(index / 64)
+            .is_none_or(|word| word & (1 << (index % 64)) != 0)
 }
 
 pub(in crate::engines) fn embedded_words(
     candidate: &mut MaxwellThreeDFrontendState,
+    method: GpuMethodId,
     subchannel: crate::MaxwellPushbufferSubchannel,
-    words: crate::MaxwellMethodSpan<'_>,
+    words: crate::MaxwellDmaArguments<'_>,
 ) -> Result<(MaxwellInlineToMemoryUpload, usize), MaxwellEngineDispatchError> {
     let count = words.len().min(
         candidate
@@ -300,13 +384,13 @@ pub(in crate::engines) fn embedded_words(
             .inline_to_memory()
             .pending_words(),
     );
-    let first = crate::MaxwellMethodSource::decoded(words.first().unwrap(), subchannel);
+    let first = words.source(0, method, subchannel);
     let (_, upload) =
         inline_to_memory::preflight(first, &candidate.operation_state().inline_to_memory())?
             .expect("embedded inline data");
     let upload = upload.expect("embedded inline data produces an upload");
     debug_assert!(count != 0);
-    let last = crate::MaxwellMethodSource::decoded(words.get(count - 1).unwrap(), subchannel);
+    let last = words.source(count - 1, method, subchannel);
     candidate.apply_inline(MaxwellThreeDInlineToMemoryStateWrite::Data {
         value: last.argument(),
         next_offset: upload.offset() + upload.remaining_bytes().min(count as u32 * 4),
@@ -330,17 +414,17 @@ pub(super) const VERTEX: u16 = 8;
 pub(super) const INDEX: u16 = 16;
 pub(super) const COLOR: u16 = 32;
 pub(super) const DEPTH: u16 = 64;
-pub(super) const HEADERS: u16 = 128;
-pub(super) const SAMPLERS: u16 = 256;
+pub(super) const TARGET_CONTROL: u16 = 128;
+pub(super) const FRAMEBUFFER: u16 = 256;
 pub(super) const SAMPLE_MODE: u16 = 512;
-pub(super) const SELECTION: u16 = 1024;
 
 const fn dirty_domains(method: u32) -> u16 {
     let mut flags = 0;
-    // Only attribute consumption, active targets and enabled depth/stencil tests
-    // change the role selection. Addresses and dynamic parameters bind existing slots.
-    if matches!(method, 0x1120..=0x112c | 0x1160..=0x11dc | 0x121c | 0x12cc | 0x1380 | 0x1538) {
-        flags |= SELECTION;
+    if matches!(method, 0x0ff4 | 0x0ff8) {
+        flags |= FRAMEBUFFER;
+    }
+    if matches!(method, 0x121c | 0x1538) {
+        flags |= TARGET_CONTROL;
     }
     if output_state(method)
         && !matches!(
@@ -353,7 +437,7 @@ const fn dirty_domains(method: u32) -> u16 {
     // Vertex fetch configuration and primitive sequence state.
     if matches!(method, 0x1120..=0x112c | 0x1160..=0x11dc | 0x1880..=0x18fc | 0x1c00..=0x1dfc | 0x1f00..=0x1ffc
         | 0x0374 | 0x0f84 | 0x0f88 | 0x02d0 | 0x0dcc | 0x0de8 | 0x1118 | 0x1434 | 0x1438 | 0x1610
-        | 0x1618 | 0x1644 | 0x1648 | 0x164c | 0x17c8..=0x17e0 | 0x1948 | 0x1970 | 0x0320..=0x0338)
+        | 0x1644 | 0x1648 | 0x164c | 0x17c8..=0x17e0 | 0x1948 | 0x1970 | 0x0320..=0x0338)
     {
         flags |= DRAW | PARAMETERS;
     }
@@ -396,12 +480,6 @@ const fn dirty_domains(method: u32) -> u16 {
     }
     if method == 0x15d0 {
         flags |= SAMPLE_MODE;
-    }
-    if matches!(method, 0x1574 | 0x1578 | 0x157c | 0x1234) {
-        flags |= HEADERS;
-    }
-    if matches!(method, 0x155c | 0x1560 | 0x1564 | 0x1234 | 0x157c) {
-        flags |= SAMPLERS;
     }
     if let Some(declaration) = METHODS_BY_DWORD[(method / 4) as usize]
         && matches!(
@@ -470,195 +548,4 @@ const fn dirty_domains(method: u32) -> u16 {
         flags &= !(DRAW | PARAMETERS);
     }
     flags
-}
-pub(super) const PARAMETER_METHOD_COUNT: usize = {
-    let mut count = 0;
-    let mut i = 0;
-    while i < METHODS.len() {
-        count += (METHODS[i].domains() & PARAMETERS != 0) as usize;
-        i += 1;
-    }
-    count
-};
-
-pub(super) const PARAMETER_METHODS: [GpuMethodId; PARAMETER_METHOD_COUNT] = {
-    let mut methods = [GpuMethodId(0); PARAMETER_METHOD_COUNT];
-    let mut index = 0;
-    let mut ordinal = 0;
-    while index < METHODS.len() {
-        if METHODS[index].domains() & PARAMETERS != 0 {
-            methods[ordinal] = GpuMethodId(index as u32 * 4);
-            ordinal += 1;
-        }
-        index += 1;
-    }
-    methods
-};
-
-pub(super) const PARAMETER_ORDINALS: [u16; 4096] = {
-    let mut ordinals = [u16::MAX; 4096];
-    let mut index = 0;
-    let mut ordinal = 0;
-    while index < METHODS.len() {
-        if METHODS[index].domains() & PARAMETERS != 0 {
-            ordinals[index] = ordinal;
-            ordinal += 1;
-        }
-        index += 1;
-    }
-    ordinals
-};
-
-/// Lookup hint only; parameter reuse also compares every consumed word exactly.
-pub(super) fn normalized_parameter_hash(method: GpuMethodId, value: u32) -> u64 {
-    let mut word = (u64::from(method.0) << 32) | u64::from(value);
-    word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    word ^ (word >> 31)
-}
-
-pub(super) fn parameter_word(method: GpuMethodId, value: u32) -> u32 {
-    // BEGIN is validated synchronously. Its instance-counter transition changes
-    // draw arguments, while topology, split and primitive-ID semantics remain.
-    if method.0 == 0x1618 {
-        value & !(3 << 26)
-    } else {
-        value
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engines::tests::{program_three_d, three_d_channel};
-
-    #[test]
-    fn parameter_snapshot_compares_every_consumed_word_exactly() {
-        let mut channel = three_d_channel();
-        let words = *channel.three_d().parameter_registers();
-        for (index, info) in METHODS.iter().enumerate() {
-            if info.domains() & PARAMETERS != 0 {
-                let method = GpuMethodId(index as u32 * 4);
-                let state = channel.three_d_mut();
-                let original = state.raw_register_value(method).unwrap();
-                state.write_register(method, original ^ 0x8000_0000);
-                assert!(
-                    *state.operation_state().parameter_registers() != words,
-                    "{method:?}"
-                );
-                state.write_register(method, original);
-                assert_eq!(*state.operation_state().parameter_registers(), words);
-            }
-        }
-    }
-
-    #[test]
-    fn inactive_viewport_and_window_clip_words_do_not_invalidate_raster_preparation() {
-        let mut channel = three_d_channel();
-        program_three_d(&mut channel, 0x0d78, 3);
-        let before = channel.three_d().draw_state_identity();
-        let words = *channel.three_d().parameter_registers();
-        for method in [0x0a20, 0x0c10, 0x0e10, 0x1700] {
-            program_three_d(&mut channel, method, u32::MAX);
-            assert_eq!(
-                channel
-                    .three_d_mut()
-                    .raw_register_value(GpuMethodId(method)),
-                Some(u32::MAX)
-            );
-        }
-        program_three_d(&mut channel, 0x0d78, 3);
-        assert!(before.matches_parameters(channel.three_d()));
-        assert_eq!(*channel.three_d().parameter_registers(), words);
-    }
-
-    #[test]
-    fn passive_configuration_is_immediately_visible_without_replaying_methods() {
-        let mut channel = three_d_channel();
-        for raw in [0, 1_f32.to_bits(), 2_f32.to_bits()] {
-            program_three_d(&mut channel, 0x1518, raw);
-            assert_eq!(channel.three_d().raster().point_size().raw(), Some(raw));
-            assert_eq!(
-                channel
-                    .three_d_mut()
-                    .raw_register_value(GpuMethodId(0x1518)),
-                Some(raw)
-            );
-        }
-    }
-
-    #[test]
-    fn noop_and_wait_do_not_decode_intermediate_configuration() {
-        let mut channel = three_d_channel();
-        program_three_d(&mut channel, 0x0a1c, 0xffff_ffff);
-        program_three_d(&mut channel, 0x20c0, 0xffff_ffff);
-        let before = channel.three_d().draw_state_identity();
-        for method in [0x100, 0x110] {
-            program_three_d(&mut channel, method, 0);
-            assert!(before.matches(channel.three_d()));
-        }
-        // A later complete configuration replaces intermediate bits directly.
-        program_three_d(&mut channel, 0x0a1c, 0x0302);
-        program_three_d(&mut channel, 0x20c0, 0x31);
-        assert_eq!(
-            channel
-                .three_d()
-                .fixed_function()
-                .viewport(0)
-                .snap_grid_precision()
-                .value(),
-            Some(&[2, 3])
-        );
-        assert_eq!(
-            channel
-                .three_d()
-                .shader_bindings()
-                .pipeline(3)
-                .stage()
-                .value(),
-            Some(&MaxwellShaderStage::Tessellation)
-        );
-    }
-
-    #[test]
-    fn graphics_domains_change_at_draw_consumption_and_ignore_memory_selectors() {
-        let mut channel = three_d_channel();
-        program_three_d(&mut channel, 0x0d78, 3);
-        let before = channel.three_d().draw_state_identity();
-        program_three_d(&mut channel, 0x2380, 64);
-        program_three_d(&mut channel, 0x0d78, 3);
-        assert!(before.matches(channel.three_d()));
-        program_three_d(&mut channel, 0x1518, 2_f32.to_bits());
-        program_three_d(&mut channel, 0x0d78, 3);
-        assert!(!before.matches_parameters(channel.three_d()));
-    }
-
-    #[test]
-    fn resource_selection_tracks_consumed_roles_independently_of_binding_addresses_and_scissors() {
-        let mut channel = three_d_channel();
-        program_three_d(&mut channel, 0x0d78, 3);
-        let before = channel.three_d().resource_selection_revision();
-        for (method, raw) in [(0x0e00, 0x10000), (0x2388, 0x4000), (0x1c04, 1)] {
-            program_three_d(&mut channel, method, raw);
-            program_three_d(&mut channel, 0x0d78, 3);
-            assert_eq!(before, channel.three_d().resource_selection_revision());
-        }
-        for (method, raw) in [
-            (0x1120, 0xffff),
-            (0x1160, 1),
-            (0x121c, 0),
-            (0x12cc, 1),
-            (0x1380, 1),
-            (0x1538, 0),
-        ] {
-            let before = channel.three_d().resource_selection_revision();
-            program_three_d(&mut channel, method, raw);
-            program_three_d(&mut channel, 0x0d78, 3);
-            assert_ne!(
-                before,
-                channel.three_d().resource_selection_revision(),
-                "method={method:#x}"
-            );
-        }
-    }
 }

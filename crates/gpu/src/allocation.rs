@@ -100,7 +100,7 @@ impl std::error::Error for AllocationDescriptionError {}
 pub struct BackingView {
     allocation: GpuAllocationId,
     allocation_offset: u64,
-    mapping: Arc<crate::physical::PhysicalMapping>,
+    mapping: Arc<nixe_memory::PhysicalMapping>,
     footprint: Arc<crate::physical::Footprint>,
 }
 impl std::fmt::Debug for BackingView {
@@ -125,7 +125,7 @@ impl BackingView {
         allocation: GpuAllocationId,
         description: GpuAllocationDescription,
         allocation_offset: u64,
-        mapping: Arc<crate::physical::PhysicalMapping>,
+        mapping: Arc<nixe_memory::PhysicalMapping>,
     ) -> Result<Self, BackingViewError> {
         let bytes = mapping.bytes();
         let end = allocation_offset
@@ -159,7 +159,7 @@ impl BackingView {
     pub const fn allocation_offset(&self) -> u64 {
         self.allocation_offset
     }
-    pub fn mapping(&self) -> &Arc<crate::physical::PhysicalMapping> {
+    pub fn mapping(&self) -> &Arc<nixe_memory::PhysicalMapping> {
         &self.mapping
     }
     pub fn size(&self) -> u64 {
@@ -209,7 +209,7 @@ impl std::error::Error for BackingViewError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physical::PhysicalMapping;
+    use nixe_memory::PhysicalMapping;
     use nixe_memory::{AllocationRange, Machine, PAGE_SIZE};
     fn view(allocation: &nixe_memory::Allocation, offset: u64, bytes: u64) -> BackingView {
         let range =

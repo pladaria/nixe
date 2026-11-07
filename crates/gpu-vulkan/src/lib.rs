@@ -12,19 +12,20 @@ mod helpers;
 mod probe;
 #[cfg(feature = "binding-probe")]
 pub use probe::BindingMeasurement;
+mod image_layout;
 mod instance;
 mod memory;
 #[cfg(feature = "binding-probe")]
 pub use helpers::BufferBinding;
 mod profile;
 mod queue;
+mod render_pass;
 pub(crate) mod residency;
 mod transfer;
 pub use memory::NativeImageDescription;
 pub use residency::{
-    AccessScope, AttachmentId, AttachmentLoad, AttachmentStore, BarrierStatistics, BufferId,
-    BufferRange, ImageId, ImagePlane, ImageViewDescription, ImageViewId, ResidencyStatistics,
-    VulkanResidency,
+    AccessScope, AttachmentId, AttachmentLoad, AttachmentStore, BufferId, BufferRange, ImageId,
+    ImagePlane, ImageViewDescription, ImageViewId, Residency, ResidencyStatistics, VulkanResidency,
 };
 mod validation;
 pub use gpu_allocator::MemoryLocation;
@@ -43,8 +44,8 @@ pub use queue::{
 pub use validation::{ValidationMode, ValidationMonitor};
 
 pub use residency::execution::{
-    AttachmentSource, Binding, Dispatch, Draw, GraphicsParameters, IndexBuffer, PreparedDraw,
-    PreparedGraphics, PreparedProgram, PreparedTargets, RenderAttachment, RenderingTargets,
+    AttachmentSource, Dispatch, Draw, GraphicsParameters, HostBinding, HostBuffer, HostGraphics,
+    HostImage, HostProgram, IndexBuffer, PreparedTargets, RenderAttachment, RenderingTargets,
     VertexBuffer,
 };
 
@@ -52,7 +53,10 @@ pub mod vertex;
 
 mod native;
 pub mod presentation;
-pub use native::{NativeExecutionStatistics, NativeGpuExecution};
+pub use native::{
+    MaxwellVulkanRasterizer, NativeExecutionStatistics, NativeFrontendStatistics,
+    NativeGpuExecution,
+};
 
 #[cfg(test)]
 mod test_shaders;
@@ -65,3 +69,5 @@ mod test_device {
         "/tests/support/device.rs"
     ));
 }
+
+mod slot_vector;

@@ -1,13 +1,10 @@
 //! Immutable physical resource mappings and compact byte-exact image footprints.
 use nixe_memory::{
-    AllocationId, AllocationRange, ArenaOffset, MachineId, MemoryError, WeakAllocation,
+    AllocationRange, ArenaOffset, MemoryError, PhysicalMapping, PhysicalSpan, WeakAllocation,
 };
-use rustc_hash::FxHashMap;
-use std::{
-    fmt,
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+#[cfg(test)]
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 pub type PageSelection = Vec<(WeakAllocation, std::ops::Range<u64>)>;
 
@@ -88,555 +85,15 @@ pub(crate) fn pin_intervals(
         .collect()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhysicalSpan {
-    pub allocation: AllocationId,
-    pub start: ArenaOffset,
-    pub bytes: u64,
-    pub logical: u64,
-    allocation_index: usize,
-    allocation_offset: u64,
-}
-/// Native caches keep weak allocation identities, not guest RAM ownership.
-/// Captured operations retain their own AllocationRange values separately.
-pub struct PhysicalMapping {
-    machine: MachineId,
-    allocations: Arc<[WeakAllocation]>,
-    spans: Box<[PhysicalSpan]>,
-    bytes: u64,
-    injective: bool,
-    fingerprint: u64,
-}
-impl fmt::Debug for PhysicalMapping {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PhysicalMapping")
-            .field("machine", &self.machine)
-            .field("spans", &self.spans)
-            .field("bytes", &self.bytes)
-            .field("injective", &self.injective)
-            .finish()
-    }
-}
-impl PartialEq for PhysicalMapping {
-    fn eq(&self, other: &Self) -> bool {
-        if std::ptr::eq(self, other) {
-            return true;
-        }
-        self.fingerprint == other.fingerprint
-            && self.machine == other.machine
-            && self.bytes == other.bytes
-            && self.spans.len() == other.spans.len()
-            && self.spans.iter().zip(other.spans.iter()).all(|(a, b)| {
-                a.allocation == b.allocation
-                    && a.start == b.start
-                    && a.bytes == b.bytes
-                    && a.logical == b.logical
-                    && a.allocation_offset == b.allocation_offset
-            })
-    }
-}
-impl Eq for PhysicalMapping {}
-
-impl Hash for PhysicalMapping {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.fingerprint.hash(state);
-    }
-}
-fn mapping_fingerprint(machine: MachineId, bytes: u64, spans: &[PhysicalSpan]) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
-    machine.hash(&mut hasher);
-    bytes.hash(&mut hasher);
-    for span in spans {
-        span.allocation.hash(&mut hasher);
-        span.start.hash(&mut hasher);
-        span.bytes.hash(&mut hasher);
-        span.logical.hash(&mut hasher);
-        span.allocation_offset.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-impl PhysicalMapping {
-    pub fn new(ranges: &[AllocationRange]) -> Result<Arc<Self>, MemoryError> {
-        let first = ranges
-            .first()
-            .ok_or(MemoryError::Invalid("empty resource mapping"))?;
-        let machine = first.allocation().machine().identity();
-        let mut allocations: Vec<WeakAllocation> = Vec::new();
-        let mut indices = FxHashMap::default();
-        let mut spans: Vec<PhysicalSpan> = Vec::new();
-        let mut logical = 0u64;
-        for range in ranges {
-            let allocation = range.allocation();
-            if allocation.machine().identity() != machine {
-                return Err(MemoryError::Invalid("resource mapping crosses machines"));
-            }
-            let index = if allocations.is_empty() {
-                allocations.push(allocation.downgrade());
-                0
-            } else if allocations[0].identity() == allocation.identity() {
-                0
-            } else {
-                *indices.entry(allocation.identity()).or_insert_with(|| {
-                    let index = allocations.len();
-                    allocations.push(allocation.downgrade());
-                    index
-                })
-            };
-            let mut offset = range.offset();
-            for extent in range.physical_extents() {
-                logical
-                    .checked_add(extent.bytes)
-                    .ok_or(MemoryError::Invalid("resource mapping size overflows"))?;
-                if let Some(last) = spans.last_mut().filter(|last| {
-                    last.allocation == allocation.identity()
-                        && last.start.get() + last.bytes == extent.start.get()
-                        && last.allocation_offset + last.bytes == offset
-                }) {
-                    last.bytes += extent.bytes;
-                } else {
-                    spans.push(PhysicalSpan {
-                        allocation: allocation.identity(),
-                        start: extent.start,
-                        bytes: extent.bytes,
-                        logical,
-                        allocation_index: index,
-                        allocation_offset: offset,
-                    });
-                }
-                offset += extent.bytes;
-                logical += extent.bytes;
-            }
-        }
-        let injective = {
-            let mut ordered: Vec<_> = spans.iter().collect();
-            ordered.sort_unstable_by_key(|span| (span.allocation, span.start));
-            !ordered.windows(2).any(|pair| {
-                pair[0].allocation == pair[1].allocation
-                    && pair[0].start.get() + pair[0].bytes > pair[1].start.get()
-            })
-        };
-        Ok(Arc::new(Self {
-            machine,
-            allocations: allocations.into(),
-            fingerprint: mapping_fingerprint(machine, logical, &spans),
-            spans: spans.into_boxed_slice(),
-            bytes: logical,
-            injective,
-        }))
-    }
-    /// Assemble scatter/gather metadata without acquiring guest RAM ownership.
-    pub fn join(mappings: &[Arc<Self>]) -> Result<Arc<Self>, MemoryError> {
-        let machine = mappings
-            .first()
-            .ok_or(MemoryError::Invalid("empty resource mapping list"))?
-            .machine;
-        let mut allocations: Vec<WeakAllocation> = Vec::new();
-        let mut indices = FxHashMap::default();
-        let mut spans: Vec<PhysicalSpan> = Vec::new();
-        let mut bytes = 0u64;
-        for mapping in mappings {
-            if mapping.machine != machine {
-                return Err(MemoryError::Invalid("resource mapping crosses machines"));
-            }
-            for span in &mapping.spans {
-                let allocation_index = if allocations.is_empty() {
-                    allocations.push(mapping.allocations[span.allocation_index].clone());
-                    0
-                } else if allocations[0].identity() == span.allocation {
-                    0
-                } else {
-                    *indices.entry(span.allocation).or_insert_with(|| {
-                        let index = allocations.len();
-                        allocations.push(mapping.allocations[span.allocation_index].clone());
-                        index
-                    })
-                };
-                if let Some(last) = spans.last_mut().filter(|last| {
-                    last.allocation == span.allocation
-                        && last.start.get() + last.bytes == span.start.get()
-                        && last.allocation_offset + last.bytes == span.allocation_offset
-                }) {
-                    last.bytes += span.bytes;
-                } else {
-                    spans.push(PhysicalSpan {
-                        logical: bytes,
-                        allocation_index,
-                        ..*span
-                    });
-                }
-                bytes = bytes
-                    .checked_add(span.bytes)
-                    .ok_or(MemoryError::Invalid("resource mapping size overflows"))?;
-            }
-        }
-        let mut ordered: Vec<_> = spans.iter().collect();
-        ordered.sort_unstable_by_key(|span| (span.allocation, span.start));
-        let injective = !ordered.windows(2).any(|pair| {
-            pair[0].allocation == pair[1].allocation
-                && pair[0].start.get() + pair[0].bytes > pair[1].start.get()
-        });
-        Ok(Arc::new(Self {
-            machine,
-            allocations: allocations.into(),
-            fingerprint: mapping_fingerprint(machine, bytes, &spans),
-            spans: spans.into(),
-            bytes,
-            injective,
-        }))
-    }
-
-    /// Derive immutable view metadata without acquiring RAM ownership. Captured
-    /// native inputs pin their consumed bytes separately at the effect boundary.
-    pub fn slice(&self, start: u64, bytes: u64) -> Result<Arc<Self>, MemoryError> {
-        let end = start
-            .checked_add(bytes)
-            .filter(|&end| bytes != 0 && end <= self.bytes)
-            .ok_or(MemoryError::Invalid(
-                "resource view exceeds its physical mapping",
-            ))?;
-        let first = self
-            .spans
-            .partition_point(|span| span.logical + span.bytes <= start);
-        let mut spans = Vec::new();
-        let mut allocations = Vec::new();
-        let mut indices = FxHashMap::default();
-        for span in self.spans[first..]
-            .iter()
-            .take_while(|span| span.logical < end)
-        {
-            let begin = span.logical.max(start);
-            let stop = (span.logical + span.bytes).min(end);
-            let allocation_index = if self.allocations.len() == 1 {
-                0
-            } else {
-                *indices.entry(span.allocation_index).or_insert_with(|| {
-                    let index = allocations.len();
-                    allocations.push(self.allocations[span.allocation_index].clone());
-                    index
-                })
-            };
-            spans.push(PhysicalSpan {
-                allocation: span.allocation,
-                start: ArenaOffset::new(span.start.get() + begin - span.logical),
-                bytes: stop - begin,
-                logical: begin - start,
-                allocation_index,
-                allocation_offset: span.allocation_offset + begin - span.logical,
-            });
-        }
-        let injective = self.injective || {
-            let mut ordered: Vec<_> = spans.iter().collect();
-            ordered.sort_unstable_by_key(|span| (span.allocation, span.start));
-            !ordered.windows(2).any(|pair| {
-                pair[0].allocation == pair[1].allocation
-                    && pair[0].start.get() + pair[0].bytes > pair[1].start.get()
-            })
-        };
-        Ok(Arc::new(Self {
-            machine: self.machine,
-            allocations: if self.allocations.len() == 1 {
-                self.allocations.clone()
-            } else {
-                allocations.into()
-            },
-            fingerprint: mapping_fingerprint(self.machine, bytes, &spans),
-            spans: spans.into(),
-            bytes,
-            injective,
-        }))
-    }
-    pub fn metadata_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + std::mem::size_of_val(self.spans.as_ref())
-            + std::mem::size_of_val(self.allocations.as_ref())
-    }
-    pub fn machine(&self) -> MachineId {
-        self.machine
-    }
-    pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
-    pub fn spans(&self) -> &[PhysicalSpan] {
-        &self.spans
-    }
-    pub fn allocations(&self) -> &[WeakAllocation] {
-        &self.allocations
-    }
-    /// Native buffer coordinates of an identical physical subrange. This is a
-    /// cold cache lookup; retained bindings keep the resulting offset.
-    pub fn containing_offset(&self, other: &Self) -> Option<u64> {
-        if self.machine != other.machine {
-            return None;
-        }
-        if self == other {
-            return Some(0);
-        }
-        let first = other.spans.first()?;
-        for (index, span) in self.spans.iter().enumerate() {
-            if span.allocation != first.allocation
-                || first.start.get() < span.start.get()
-                || first.start.get() >= span.start.get() + span.bytes
-            {
-                continue;
-            }
-            let base = span.logical + first.start.get() - span.start.get();
-            if base + other.bytes > self.bytes {
-                continue;
-            }
-            let mut current = index;
-            let mut matches = true;
-            for part in &other.spans {
-                let mut cursor = 0;
-                while cursor < part.bytes {
-                    let logical = base + part.logical + cursor;
-                    while self.spans[current].logical + self.spans[current].bytes <= logical {
-                        current += 1;
-                    }
-                    let target = &self.spans[current];
-                    if target.allocation != part.allocation
-                        || target.start.get() + logical - target.logical
-                            != part.start.get() + cursor
-                    {
-                        matches = false;
-                        break;
-                    }
-                    cursor += (target.logical + target.bytes - logical).min(part.bytes - cursor);
-                }
-                if !matches {
-                    break;
-                }
-            }
-            if matches {
-                return Some(base);
-            }
-        }
-        None
-    }
-
-    /// Expand a contiguous buffer inside live allocation pages. Scatter/gather
-    /// mappings keep their original concatenation; holes are never filled by
-    /// reading the enclosing allocation envelope.
-    pub fn expanded_buffer(self: &Arc<Self>, alignment: u64) -> Result<Arc<Self>, MemoryError> {
-        if !alignment.is_power_of_two() {
-            return Err(MemoryError::Invalid(
-                "buffer expansion alignment is invalid",
-            ));
-        }
-        let [span] = self.spans.as_ref() else {
-            return Ok(Arc::clone(self));
-        };
-        let allocation = &self.allocations[span.allocation_index];
-        let pin = allocation
-            .upgrade_range(span.allocation_offset, span.bytes)
-            .ok_or(MemoryError::Invalid("buffer allocation has retired"))?;
-        let start = span.start.get() & !(alignment - 1);
-        let before = (span.start.get() - start).min(span.allocation_offset);
-        let offset = span.allocation_offset - before;
-        let end = (span.start.get() + span.bytes).div_ceil(alignment) * alignment;
-        let limit = (span.allocation_offset + end - span.start.get()).min(pin.bytes());
-        let Some(live) = allocation
-            .live_ranges(offset, limit - offset)?
-            .into_iter()
-            .find(|range| {
-                range.start <= span.allocation_offset
-                    && range.end >= span.allocation_offset + span.bytes
-            })
-        else {
-            return Err(MemoryError::Invalid("buffer allocation has retired"));
-        };
-        let expanded = allocation
-            .upgrade_range(live.start, live.end - live.start)
-            .ok_or(MemoryError::Invalid("buffer expansion has retired"))?;
-        let mapping = Self::new(&[AllocationRange::new(
-            expanded,
-            live.start,
-            live.end - live.start,
-        )?])?;
-        // An allocation can contain nonadjacent physical runs. Restrict growth
-        // to the run containing the request, preserving its native addressing.
-        let part = mapping
-            .spans
-            .iter()
-            .find(|part| {
-                part.start.get() <= span.start.get()
-                    && part.start.get() + part.bytes >= span.start.get() + span.bytes
-            })
-            .ok_or(MemoryError::Invalid(
-                "buffer expansion lost its source span",
-            ))?;
-        mapping.slice(part.logical, part.bytes)
-    }
-    pub fn is_injective(&self) -> bool {
-        self.injective
-    }
-    fn same_addressing(&self, other: &Self) -> bool {
-        if self == other {
-            return true;
-        }
-        let ([a], [b]) = (self.spans.as_ref(), other.spans.as_ref()) else {
-            return false;
-        };
-        self.machine == other.machine
-            && a.allocation == b.allocation
-            && u128::from(a.start.get()) + u128::from(b.logical)
-                == u128::from(b.start.get()) + u128::from(a.logical)
-    }
-    /// Retain only a concrete input's requested bytes. Cache entries themselves
-    /// never call this merely to remain in an LRU.
-    pub fn pin(&self, start: u64, bytes: u64) -> Result<Vec<AllocationRange>, MemoryError> {
-        let mut ranges = Vec::new();
-        self.pin_into(start, bytes, &mut ranges)?;
-        Ok(ranges)
-    }
-    /// Synchronous uniform/stream snapshots need no shared heap allocation for
-    /// each temporary physical lease. Capture each retained allocation span
-    /// directly into the caller's native upload memory.
-    pub fn capture_stream(&self, start: u64, destination: &mut [u8]) -> Result<(), MemoryError> {
-        let end = start
-            .checked_add(destination.len() as u64)
-            .filter(|&end| !destination.is_empty() && end <= self.bytes)
-            .ok_or(MemoryError::Invalid(
-                "streaming input exceeds its physical mapping",
-            ))?;
-        let first = self
-            .spans
-            .partition_point(|span| span.logical + span.bytes <= start);
-        for span in &self.spans[first..] {
-            if span.logical >= end {
-                break;
-            }
-            let begin = start.max(span.logical);
-            let stop = end.min(span.logical + span.bytes);
-            self.allocations[span.allocation_index].capture_stream(
-                span.allocation_offset + begin - span.logical,
-                &mut destination[(begin - start) as usize..(stop - start) as usize],
-            )?;
-        }
-        Ok(())
-    }
-    /// Append concrete operation inputs using caller-owned reusable storage.
-    pub fn pin_into(
-        &self,
-        start: u64,
-        bytes: u64,
-        ranges: &mut Vec<AllocationRange>,
-    ) -> Result<(), MemoryError> {
-        let end = start
-            .checked_add(bytes)
-            .filter(|&end| bytes != 0 && end <= self.bytes)
-            .ok_or(MemoryError::Invalid(
-                "resource input exceeds its physical mapping",
-            ))?;
-        let first = self
-            .spans
-            .partition_point(|span| span.logical + span.bytes <= start);
-        for span in &self.spans[first..] {
-            if span.logical >= end {
-                break;
-            }
-            let begin = start.max(span.logical);
-            let stop = end.min(span.logical + span.bytes);
-            let allocation = self.allocations[span.allocation_index]
-                .upgrade_range(span.allocation_offset + begin - span.logical, stop - begin)
-                .ok_or(MemoryError::Invalid(
-                    "resource allocation range has retired",
-                ))?;
-            ranges.push(AllocationRange::new(
-                allocation,
-                span.allocation_offset + begin - span.logical,
-                stop - begin,
-            )?);
-        }
-        Ok(())
-    }
-    pub fn pin_physical(
-        &self,
-        allocation: AllocationId,
-        start: ArenaOffset,
-        bytes: u64,
-    ) -> Result<Option<AllocationRange>, MemoryError> {
-        let end = start
-            .get()
-            .checked_add(bytes)
-            .ok_or(MemoryError::Invalid("physical resource pin overflows"))?;
-        let span = self
-            .spans
-            .iter()
-            .find(|span| {
-                span.allocation == allocation
-                    && span.start.get() <= start.get()
-                    && span.start.get() + span.bytes >= end
-            })
-            .ok_or(MemoryError::Invalid(
-                "physical resource pin is outside its allocation mapping",
-            ))?;
-        self.retain_span(span, start, bytes)
-    }
-    /// Retain bytes in an already located span without repeating translation.
-    pub fn pin_span(
-        &self,
-        index: usize,
-        start: ArenaOffset,
-        bytes: u64,
-    ) -> Result<Option<AllocationRange>, MemoryError> {
-        let span = self.checked_span(index, start, bytes)?;
-        self.retain_span(span, start, bytes)
-    }
-    /// Retain a single-owner DMA source, falling back when native producers own
-    /// its RAM. Its lifetime belongs to the command cursor, not cache metadata.
-    pub fn try_ram_span(
-        &self,
-        index: usize,
-        start: ArenaOffset,
-        bytes: u64,
-    ) -> Result<Option<nixe_memory::RamSource>, MemoryError> {
-        let span = self.checked_span(index, start, bytes)?;
-        let offset = span.allocation_offset + start.get() - span.start.get();
-        self.allocations[span.allocation_index].try_ram_source(offset, bytes)
-    }
-    fn checked_span(
-        &self,
-        index: usize,
-        start: ArenaOffset,
-        bytes: u64,
-    ) -> Result<&PhysicalSpan, MemoryError> {
-        let span = self
-            .spans
-            .get(index)
-            .ok_or(MemoryError::Invalid("resource pin span is invalid"))?;
-        if bytes == 0
-            || start.get() < span.start.get()
-            || start
-                .get()
-                .checked_add(bytes)
-                .is_none_or(|end| end > span.start.get() + span.bytes)
-        {
-            return Err(MemoryError::Invalid(
-                "resource pin exceeds its physical span",
-            ));
-        }
-        Ok(span)
-    }
-    fn retain_span(
-        &self,
-        span: &PhysicalSpan,
-        start: ArenaOffset,
-        bytes: u64,
-    ) -> Result<Option<AllocationRange>, MemoryError> {
-        let offset = span.allocation_offset + start.get() - span.start.get();
-        let Some(pin) = self.allocations[span.allocation_index].upgrade_range(offset, bytes) else {
-            return Ok(None);
-        };
-        AllocationRange::new(pin, offset, bytes).map(Some)
-    }
+impl Footprint {
     /// Select allocation coordinates; publication retains their union once.
     pub fn observed_pages(
         &self,
-        written: &Footprint,
+        mapping: &PhysicalMapping,
         selected: &mut PageSelection,
     ) -> Result<(), MemoryError> {
-        if self.machine != written.mapping.machine {
+        let written = self;
+        if mapping.machine() != written.mapping.machine() {
             return Err(MemoryError::Invalid(
                 "observed input and producer name different machines",
             ));
@@ -644,16 +101,16 @@ impl PhysicalMapping {
         // A footprint of this mapping already identifies each physical span.
         // Selecting its union is valid even when logical spans repeat RAM.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/device_memory_manager.inc
-        if std::ptr::eq(self, written.mapping.as_ref()) {
-            for (index, observed) in self.spans.iter().enumerate() {
-                self.select_observed_pages(observed, written, index, selected)?;
+        if std::ptr::eq(mapping, written.mapping.as_ref()) {
+            for (index, observed) in mapping.spans().iter().enumerate() {
+                Self::select_observed_pages(mapping, observed, written, index, selected)?;
             }
             return Ok(());
         }
-        if let [span] = written.mapping.spans.as_ref() {
-            for observed in &self.spans {
+        if let [span] = written.mapping.spans() {
+            for observed in mapping.spans() {
                 if observed.allocation == span.allocation {
-                    self.select_observed_pages(observed, written, 0, selected)?;
+                    Self::select_observed_pages(mapping, observed, written, 0, selected)?;
                 }
             }
             return Ok(());
@@ -661,7 +118,7 @@ impl PhysicalMapping {
         // Different views can reorder or repeat physical bytes. Reuse the
         // interval index for this query, without retaining another cache index.
         let mut spans = nixe_memory::IntervalIndex::default();
-        for (index, span) in written.mapping.spans.iter().enumerate() {
+        for (index, span) in written.mapping.spans().iter().enumerate() {
             let begin = span.logical.max(written.start);
             let end = (span.logical + span.bytes).min(written.end);
             if begin < end {
@@ -672,16 +129,18 @@ impl PhysicalMapping {
                 )?;
             }
         }
-        for observed in &self.spans {
+        for observed in mapping.spans() {
             let mut result = Ok(());
             spans.overlapping(
                 observed.start.get(),
                 observed.start.get() + observed.bytes,
                 |&index| {
                     if result.is_ok()
-                        && written.mapping.spans[index].allocation == observed.allocation
+                        && written.mapping.spans()[index].allocation == observed.allocation
                     {
-                        result = self.select_observed_pages(observed, written, index, selected);
+                        result = Self::select_observed_pages(
+                            mapping, observed, written, index, selected,
+                        );
                     }
                 },
             );
@@ -690,13 +149,13 @@ impl PhysicalMapping {
         Ok(())
     }
     fn select_observed_pages(
-        &self,
+        mapping: &PhysicalMapping,
         observed: &PhysicalSpan,
         written: &Footprint,
         index: usize,
         selected: &mut PageSelection,
     ) -> Result<(), MemoryError> {
-        let span = &written.mapping.spans[index];
+        let span = &written.mapping.spans()[index];
         let logical_start = span.logical.max(written.start);
         let logical_end = (span.logical + span.bytes).min(written.end);
         if logical_start >= logical_end {
@@ -724,9 +183,9 @@ impl PhysicalMapping {
             if !hit {
                 continue;
             }
-            let offset = (observed.allocation_offset + start - observed.start.get())
+            let offset = (observed.allocation_offset() + start - observed.start.get())
                 & !(nixe_memory::PAGE_SIZE - 1);
-            let source = &self.allocations[observed.allocation_index];
+            let source = mapping.allocation(observed);
             if let Some((previous, bounds)) = selected.last_mut()
                 && previous.identity() == source.identity()
                 && bounds.end == offset
@@ -791,6 +250,119 @@ pub struct ByteIntersection {
     pub start: ArenaOffset,
     pub bytes: u64,
     pub native: u64,
+}
+impl WriteDomain {
+    /// Copy encoded storage into native byte order from the selected memory reader.
+    pub fn capture(
+        self,
+        mut read: impl FnMut(u64, &mut [u8]) -> Result<(), MemoryError>,
+        native_start: u64,
+        destination: &mut [u8],
+    ) -> Result<(), MemoryError> {
+        if let WriteDomain::Image(image) = self
+            && image.has_complete_gob()
+        {
+            return image.capture_gobs(&mut read, native_start, destination);
+        }
+        self.for_each_copy(|logical, bytes, native| {
+            read(
+                logical,
+                capture_destination(destination, native_start, native, bytes)?,
+            )
+        })
+    }
+    /// Swizzle completed native bytes directly into the current guest mapping.
+    /// The caller owns RAM admission/publication and supplies the actual writer.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/textures/decoders.cpp
+    pub fn scatter(
+        self,
+        source: &[u8],
+        native_start: u64,
+        mut write: impl FnMut(u64, &[u8]) -> Result<(), MemoryError>,
+    ) -> Result<(), MemoryError> {
+        if let WriteDomain::Image(image) = self
+            && image.has_complete_gob()
+        {
+            return image.scatter_gobs(source, native_start, &mut write);
+        }
+        self.for_each_copy(|logical, bytes, native| {
+            let start = native
+                .checked_sub(native_start)
+                .ok_or(MemoryError::Invalid(
+                    "swizzle source starts after its native plane",
+                ))? as usize;
+            let end = start
+                .checked_add(bytes as usize)
+                .ok_or(MemoryError::Invalid("swizzle source range overflows"))?;
+            write(
+                logical,
+                source.get(start..end).ok_or(MemoryError::Invalid(
+                    "swizzle source does not contain its native plane",
+                ))?,
+            )
+        })
+    }
+    fn for_each_copy(
+        self,
+        mut copy: impl FnMut(u64, u64, u64) -> Result<(), MemoryError>,
+    ) -> Result<(), MemoryError> {
+        match self {
+            WriteDomain::Buffer { start, bytes } => copy(start, bytes, start),
+            WriteDomain::Image(image) => {
+                let packed = u64::from(image.packed_bytes);
+                let full_element = image.aspect_bytes == image.packed_bytes
+                    && image.native_element_bytes == image.packed_bytes;
+                let right = u64::from(image.rect.x + image.rect.width) * packed;
+                for y in image.rect.y..image.rect.y + image.rect.height {
+                    let row = image.base + image.offset(0, u64::from(y));
+                    let native_row = image.native_base + u64::from(y) * image.native_row_pitch;
+                    let address = |x: u64| match image.storage {
+                        ImageStorage::Pitch { .. } => row + x,
+                        ImageStorage::BlockLinear {
+                            block_height_log2,
+                            block_depth_log2,
+                        } => {
+                            row + (x >> 6) * (512u64 << (block_height_log2 + block_depth_log2))
+                                + ((x & 32) << 3)
+                                + ((x & 16) << 1)
+                                + (x & 15)
+                        }
+                    };
+                    let contiguous = |x: u64, bytes: u64| match image.storage {
+                        ImageStorage::Pitch { .. } => bytes,
+                        ImageStorage::BlockLinear { .. } => bytes.min(16 - (x & 15)),
+                    };
+                    if full_element {
+                        let mut x = u64::from(image.rect.x) * packed;
+                        while x < right {
+                            let count = contiguous(x, right - x);
+                            copy(address(x), count, native_row + x)?;
+                            x += count;
+                        }
+                    } else {
+                        for column in image.rect.x..image.rect.x + image.rect.width {
+                            let mut lane = u64::from(image.aspect_offset);
+                            let end = lane + u64::from(image.aspect_bytes);
+                            while lane < end {
+                                let x = u64::from(column) * packed + lane;
+                                let count = contiguous(x, end - lane);
+                                copy(
+                                    address(x),
+                                    count,
+                                    native_row
+                                        + u64::from(column) * u64::from(image.native_element_bytes)
+                                        + lane
+                                        - u64::from(image.aspect_offset),
+                                )?;
+                                lane += count;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 }
 impl ImageFootprint {
     fn has_complete_gob(self) -> bool {
@@ -865,6 +437,80 @@ impl ImageFootprint {
                                 logical,
                                 capture_destination(destination, native_start, native, bytes)?,
                             )?;
+                            at += bytes;
+                        }
+                    }
+                }
+                x += width;
+            }
+            y += lines;
+        }
+        Ok(())
+    }
+
+    fn scatter_gobs(
+        self,
+        source: &[u8],
+        native_start: u64,
+        write: &mut impl FnMut(u64, &[u8]) -> Result<(), MemoryError>,
+    ) -> Result<(), MemoryError> {
+        let ImageStorage::BlockLinear {
+            block_height_log2,
+            block_depth_log2,
+        } = self.storage
+        else {
+            unreachable!("complete GOBs require block-linear storage");
+        };
+        let read = |native: u64, bytes: usize| -> Result<&[u8], MemoryError> {
+            let offset = native
+                .checked_sub(native_start)
+                .ok_or(MemoryError::Invalid(
+                    "swizzle source begins after its plane",
+                ))? as usize;
+            source
+                .get(offset..offset + bytes)
+                .ok_or(MemoryError::Invalid(
+                    "swizzle source does not contain its plane",
+                ))
+        };
+        let stride = 512u64 << (block_height_log2 + block_depth_log2);
+        let left = u64::from(self.rect.x) * u64::from(self.packed_bytes);
+        let right = left + u64::from(self.rect.width) * u64::from(self.packed_bytes);
+        let bottom = u64::from(self.rect.y + self.rect.height);
+        let mut y = u64::from(self.rect.y);
+        let mut gob = [0; 512];
+        while y < bottom {
+            let lines = if y.is_multiple_of(8) && bottom - y >= 8 {
+                8
+            } else {
+                1
+            };
+            let mut x = left;
+            while x < right {
+                let width = (right - x).min(64 - x % 64);
+                if lines == 8 && width == 64 {
+                    for row in 0..8 {
+                        let native = self.native_base + (y + row) * self.native_row_pitch + x;
+                        let row_offset = (((row & 6) << 5) | ((row & 1) << 4)) as usize;
+                        for (column, bytes) in read(native, 64)?.chunks_exact(16).enumerate() {
+                            let at = row_offset + ((column & 2) << 7) + ((column & 1) << 5);
+                            gob[at..at + 16].copy_from_slice(bytes);
+                        }
+                    }
+                    write(self.base + self.offset(x, y), &gob)?;
+                } else {
+                    for line in 0..lines {
+                        let row = self.base + self.offset(0, y + line);
+                        let mut at = x;
+                        while at < x + width {
+                            let bytes = (x + width - at).min(16 - (at & 15));
+                            let logical = row
+                                + (at >> 6) * stride
+                                + ((at & 32) << 3)
+                                + ((at & 16) << 1)
+                                + (at & 15);
+                            let native = self.native_base + (y + line) * self.native_row_pitch + at;
+                            write(logical, read(native, bytes as usize)?)?;
                             at += bytes;
                         }
                     }
@@ -1064,14 +710,6 @@ impl ImageFootprint {
         }
     }
 }
-/// Native copies require congruent physical addressing and matching aspect lanes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ImageOverlap {
-    Disjoint,
-    Reinterpret,
-    Rect(ByteRect),
-}
-
 impl Footprint {
     pub fn new(
         mapping: Arc<PhysicalMapping>,
@@ -1116,130 +754,12 @@ impl Footprint {
     pub fn mapping(&self) -> &Arc<PhysicalMapping> {
         &self.mapping
     }
-    /// Keep the registered span indices when accepting an equivalent mapping.
-    pub(crate) fn covered_footprint(&self, other: &Arc<Self>) -> Option<Arc<Self>> {
-        if !self.covers(other) {
-            return None;
-        }
-        if Arc::ptr_eq(&self.mapping, &other.mapping) {
-            return Some(Arc::clone(other));
-        }
-        // Coverage proves the selected bytes fit, even if the source image's
-        // unselected dimensions extend beyond this registered view.
-        Some(Arc::new(Self {
-            mapping: Arc::clone(&self.mapping),
-            ..other.as_ref().clone()
-        }))
-    }
-    pub(crate) fn has_live_bytes(&self) -> Result<bool, MemoryError> {
-        for (index, span) in self.mapping.spans.iter().enumerate() {
-            let source = &self.mapping.allocations[span.allocation_index];
-            for live in source.live_ranges(span.allocation_offset, span.bytes)? {
-                let start = span.start.get() + live.start - span.allocation_offset;
-                let mut found = false;
-                self.visit(
-                    index,
-                    ArenaOffset::new(start),
-                    live.end - live.start,
-                    |_| {
-                        found = true;
-                        false
-                    },
-                )?;
-                if found {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
     pub fn domain(&self) -> WriteDomain {
         self.domain
     }
     pub fn bounds(&self) -> std::ops::Range<u64> {
         self.start..self.end
     }
-    /// Native image caches synchronize layout-compatible aliases. A reused
-    /// heap can contain unrelated image lifetimes with incompatible tilings;
-    /// their overlap still participates in physical CPU visibility.
-    /// https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/texture_cache.h
-    pub(crate) fn native_cache_compatible(&self, other: &Self) -> bool {
-        let (WriteDomain::Image(a), WriteDomain::Image(b)) = (self.domain, other.domain) else {
-            return true;
-        };
-        if a.packed_bytes != b.packed_bytes {
-            return false;
-        }
-        match (a.storage, b.storage) {
-            (ImageStorage::Pitch { row_pitch: ap }, ImageStorage::Pitch { row_pitch: bp }) => {
-                let origin = |mapping: &PhysicalMapping, base: u64| {
-                    let span = &mapping.spans()[0];
-                    span.start
-                        .get()
-                        .wrapping_sub(span.logical)
-                        .wrapping_add(base)
-                };
-                ap == bp && origin(&self.mapping, a.base) == origin(&other.mapping, b.base)
-            }
-            (
-                ImageStorage::BlockLinear {
-                    block_height_log2: ah,
-                    block_depth_log2: ad,
-                },
-                ImageStorage::BlockLinear {
-                    block_height_log2: bh,
-                    block_depth_log2: bd,
-                },
-            ) => {
-                ah == bh
-                    && ad == bd
-                    && (u64::from(a.columns) * u64::from(a.packed_bytes)).div_ceil(64)
-                        == (u64::from(b.columns) * u64::from(b.packed_bytes)).div_ceil(64)
-            }
-            _ => false,
-        }
-    }
-
-    pub(crate) fn image_overlap(&self, source: &Self) -> ImageOverlap {
-        let (WriteDomain::Image(target), WriteDomain::Image(source_image)) =
-            (self.domain, source.domain)
-        else {
-            return ImageOverlap::Reinterpret;
-        };
-        if !self.mapping.is_injective()
-            || !source.mapping.is_injective()
-            || !self.mapping.same_addressing(&source.mapping)
-            || !target.same_geometry(source_image)
-        {
-            return ImageOverlap::Reinterpret;
-        }
-        if target.aspect_offset >= source_image.aspect_offset + source_image.aspect_bytes
-            || source_image.aspect_offset >= target.aspect_offset + target.aspect_bytes
-        {
-            return ImageOverlap::Disjoint;
-        }
-        if target.aspect_offset != source_image.aspect_offset
-            || target.aspect_bytes != source_image.aspect_bytes
-        {
-            return ImageOverlap::Reinterpret;
-        }
-        let x = target.rect.x.max(source_image.rect.x);
-        let y = target.rect.y.max(source_image.rect.y);
-        let end_x =
-            (target.rect.x + target.rect.width).min(source_image.rect.x + source_image.rect.width);
-        let end_y = (target.rect.y + target.rect.height)
-            .min(source_image.rect.y + source_image.rect.height);
-        if x >= end_x || y >= end_y {
-            return ImageOverlap::Disjoint;
-        }
-        ImageOverlap::Rect(ByteRect {
-            x,
-            y,
-            width: end_x - x,
-            height: end_y - y,
-        })
-    }
-
     pub fn covers(&self, other: &Self) -> bool {
         if !self.mapping.same_addressing(&other.mapping) {
             return false;
@@ -1267,11 +787,11 @@ impl Footprint {
         }
     }
     pub fn intersects(&self, other: &Self) -> bool {
-        if self.mapping.machine != other.mapping.machine {
+        if self.mapping.machine() != other.mapping.machine() {
             return false;
         }
-        if self.mapping.injective
-            && other.mapping.injective
+        if self.mapping.is_injective()
+            && other.mapping.is_injective()
             && self.mapping.same_addressing(&other.mapping)
         {
             if self.start >= other.end || other.start >= self.end {
@@ -1309,13 +829,13 @@ impl Footprint {
                 _ => {}
             }
         }
-        for (a_index, a) in self.mapping.spans.iter().enumerate() {
+        for (a_index, a) in self.mapping.spans().iter().enumerate() {
             let a_begin = a.logical.max(self.start);
             let a_end = (a.logical + a.bytes).min(self.end);
             if a_begin >= a_end {
                 continue;
             }
-            for (b_index, b) in other.mapping.spans.iter().enumerate() {
+            for (b_index, b) in other.mapping.spans().iter().enumerate() {
                 if a.allocation != b.allocation {
                     continue;
                 }
@@ -1368,15 +888,15 @@ impl Footprint {
         native_start: u64,
         destination: &mut [u8],
     ) -> Result<(), MemoryError> {
-        if reader.machine() != self.mapping.machine {
+        if reader.machine() != self.mapping.machine() {
             return Err(MemoryError::Invalid(
                 "resource capture names another machine",
             ));
         }
         let mut region: Option<(nixe_memory::Extent, nixe_memory::ResourceRead<'_>)> = None;
-        let mut read = |mut logical: u64, mut destination: &mut [u8]| {
+        let read = |mut logical: u64, mut destination: &mut [u8]| {
             while !destination.is_empty() {
-                let spans = &self.mapping.spans;
+                let spans = &self.mapping.spans();
                 let index = if spans.len() == 1 {
                     0
                 } else {
@@ -1384,8 +904,19 @@ impl Footprint {
                 };
                 let span = spans
                     .get(index)
-                    .filter(|span| span.logical <= logical && logical < span.logical + span.bytes)
-                    .ok_or(MemoryError::Invalid("resource capture exceeds its mapping"))?;
+                    .filter(|span| logical < span.logical + span.bytes);
+                let Some(span) = span else {
+                    destination.fill(0);
+                    break;
+                };
+                if logical < span.logical {
+                    let count = destination.len().min((span.logical - logical) as usize);
+                    let (zero, rest) = destination.split_at_mut(count);
+                    zero.fill(0);
+                    logical += count as u64;
+                    destination = rest;
+                    continue;
+                }
                 let count = (destination.len() as u64).min(span.logical + span.bytes - logical);
                 let start = ArenaOffset::new(span.start.get() + logical - span.logical);
                 if region.as_ref().is_none_or(|(extent, _)| {
@@ -1406,73 +937,7 @@ impl Footprint {
             }
             Ok(())
         };
-        if let WriteDomain::Image(image) = self.domain
-            && image.has_complete_gob()
-        {
-            return image.capture_gobs(&mut read, native_start, destination);
-        }
-        let mut copy = |logical, bytes, native| {
-            read(
-                logical,
-                capture_destination(destination, native_start, native, bytes)?,
-            )
-        };
-        match self.domain {
-            WriteDomain::Buffer { start, bytes } => copy(start, bytes, start),
-            WriteDomain::Image(image) => {
-                let packed = u64::from(image.packed_bytes);
-                let full_element = image.aspect_bytes == image.packed_bytes
-                    && image.native_element_bytes == image.packed_bytes;
-                let right = u64::from(image.rect.x + image.rect.width) * packed;
-                for y in image.rect.y..image.rect.y + image.rect.height {
-                    let row = image.base + image.offset(0, u64::from(y));
-                    let native_row = image.native_base + u64::from(y) * image.native_row_pitch;
-                    let address = |x: u64| match image.storage {
-                        ImageStorage::Pitch { .. } => row + x,
-                        ImageStorage::BlockLinear {
-                            block_height_log2,
-                            block_depth_log2,
-                        } => {
-                            row + (x >> 6) * (512u64 << (block_height_log2 + block_depth_log2))
-                                + ((x & 32) << 3)
-                                + ((x & 16) << 1)
-                                + (x & 15)
-                        }
-                    };
-                    let contiguous = |x: u64, bytes: u64| match image.storage {
-                        ImageStorage::Pitch { .. } => bytes,
-                        ImageStorage::BlockLinear { .. } => bytes.min(16 - (x & 15)),
-                    };
-                    if full_element {
-                        let mut x = u64::from(image.rect.x) * packed;
-                        while x < right {
-                            let count = contiguous(x, right - x);
-                            copy(address(x), count, native_row + x)?;
-                            x += count;
-                        }
-                    } else {
-                        for column in image.rect.x..image.rect.x + image.rect.width {
-                            let mut lane = u64::from(image.aspect_offset);
-                            let end = lane + u64::from(image.aspect_bytes);
-                            while lane < end {
-                                let x = u64::from(column) * packed + lane;
-                                let count = contiguous(x, end - lane);
-                                copy(
-                                    address(x),
-                                    count,
-                                    native_row
-                                        + u64::from(column) * u64::from(image.native_element_bytes)
-                                        + lane
-                                        - u64::from(image.aspect_offset),
-                                )?;
-                                lane += count;
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-        }
+        self.domain.capture(read, native_start, destination)
     }
     /// The index supplies the candidate mapping span. This routine proves only
     /// the actual covered intersection, never the resource's bounding interval.
@@ -1485,7 +950,7 @@ impl Footprint {
     ) -> Result<(), MemoryError> {
         let span = self
             .mapping
-            .spans
+            .spans()
             .get(span_index)
             .ok_or(MemoryError::Invalid("resource footprint span is invalid"))?;
         let end = start
@@ -1670,11 +1135,11 @@ mod tests {
         )
         .unwrap();
         let mut pages = Vec::new();
-        mapping.observed_pages(&footprint, &mut pages).unwrap();
+        footprint.observed_pages(&mapping, &mut pages).unwrap();
         let inputs = pin_selected_pages(pages).unwrap();
         let mut imported = vec![0x7a; (3 * PAGE_SIZE) as usize];
         machine
-            .capture_resource(&inputs, |reader| {
+            .read_resources(&inputs, |reader| {
                 footprint.capture_resource(reader, 0, &mut imported)
             })
             .unwrap();
@@ -1702,43 +1167,6 @@ mod tests {
                 .capture_stream(PAGE_SIZE - 3, &mut snapshot)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn command_ram_source_retains_only_accepted_pages_after_mapping_ownership_retires() {
-        let machine = Machine::new(3 * PAGE_SIZE).unwrap();
-        let account = machine.account(3 * PAGE_SIZE).unwrap();
-        let allocation = account.allocate(3 * PAGE_SIZE).unwrap();
-        let input = AllocationRange::new(allocation.pin(), 0, 3 * PAGE_SIZE).unwrap();
-        machine
-            .write_resolved(
-                std::slice::from_ref(&input),
-                &vec![0x38; (3 * PAGE_SIZE) as usize],
-            )
-            .unwrap();
-        let mapping = PhysicalMapping::new(std::slice::from_ref(&input)).unwrap();
-        let base = mapping.spans()[0].start;
-        machine
-            .publish_device_write(std::slice::from_ref(&input), || Ok(()))
-            .unwrap();
-        assert!(mapping.try_ram_span(0, base, 4).unwrap().is_none());
-        machine
-            .retire_device_pages(std::slice::from_ref(&input))
-            .unwrap();
-        let source = mapping
-            .try_ram_span(0, ArenaOffset::new(base.get() + PAGE_SIZE + 17), 8)
-            .unwrap()
-            .unwrap();
-        drop((input, allocation));
-        assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
-        let recycled = account.allocate(2 * PAGE_SIZE).unwrap();
-        assert!(mapping.try_ram_span(0, base, 4).is_err());
-        // SAFETY: this input owns eight accepted RAM bytes despite VA/guest retirement.
-        assert_eq!(unsafe { source.address().read_u32(0) }, 0x3838_3838);
-        drop(source);
-        assert_eq!(machine.statistics().allocated_bytes, 2 * PAGE_SIZE);
-        drop(recycled);
-        assert_eq!(machine.statistics().allocated_bytes, 0);
     }
 
     #[test]
@@ -1874,6 +1302,57 @@ mod tests {
     }
     use nixe_memory::{Machine, PAGE_SIZE};
 
+    #[test]
+    fn swizzle_matches_storage_oracle_and_preserves_unwritten_padding() {
+        for storage in [
+            ImageStorage::Pitch { row_pitch: 112 },
+            ImageStorage::BlockLinear {
+                block_height_log2: 0,
+                block_depth_log2: 0,
+            },
+            ImageStorage::BlockLinear {
+                block_height_log2: 2,
+                block_depth_log2: 0,
+            },
+        ] {
+            let image = ImageFootprint {
+                depth_slice: 0,
+                base: 256,
+                columns: 19,
+                rows: 17,
+                packed_bytes: 4,
+                aspect_offset: 0,
+                aspect_bytes: 4,
+                storage,
+                native_base: 64,
+                native_element_bytes: 4,
+                native_row_pitch: 76,
+                rect: ByteRect {
+                    x: 0,
+                    y: 0,
+                    width: 19,
+                    height: 17,
+                },
+            };
+            let source: Vec<_> = (0..76 * 17).map(|at| (at % 251) as u8).collect();
+            let mut guest = vec![0xcc; 8192];
+            WriteDomain::Image(image)
+                .scatter(&source, 64, |offset, bytes| {
+                    guest[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+                    Ok(())
+                })
+                .unwrap();
+            let mut expected = vec![0xcc; 8192];
+            for y in 0..17u64 {
+                for x in 0..76u64 {
+                    expected[256 + storage_offset(storage, 76, x, y) as usize] =
+                        source[(y * 76 + x) as usize];
+                }
+            }
+            assert_eq!(guest, expected);
+        }
+    }
+
     fn storage_offset(storage: ImageStorage, width: u64, x: u64, y: u64) -> u64 {
         match storage {
             ImageStorage::Pitch { row_pitch } => y * row_pitch + x,
@@ -1977,11 +1456,11 @@ mod tests {
                 }
                 assert_eq!(actual, expected, "block={bh}/{bd}, slice={z}");
                 let mut selected = Vec::new();
-                mapping.observed_pages(&image, &mut selected).unwrap();
+                image.observed_pages(&mapping, &mut selected).unwrap();
                 let inputs = pin_selected_pages(selected).unwrap();
                 let mut captured = vec![0xcd; 92 * 21];
                 machine
-                    .capture_resource(&inputs, |reader| {
+                    .read_resources(&inputs, |reader| {
                         image.capture_resource(reader, 0, &mut captured)
                     })
                     .unwrap();
@@ -2189,11 +1668,11 @@ mod tests {
                         wanted[native as usize] = bytes[(physical_byte - physical) as usize];
                     }
                     let mut selected = Vec::new();
-                    mapping.observed_pages(&footprint, &mut selected).unwrap();
+                    footprint.observed_pages(&mapping, &mut selected).unwrap();
                     let inputs = pin_selected_pages(selected).unwrap();
                     let mut captured = vec![0xcd; wanted.len()];
                     machine
-                        .capture_resource(&inputs, |reader| {
+                        .read_resources(&inputs, |reader| {
                             footprint.capture_resource(reader, 0, &mut captured)
                         })
                         .unwrap();
@@ -2276,7 +1755,7 @@ mod tests {
                 .unwrap()
         };
         let iterations = 100;
-        machine.capture_resource(&inputs, |reader| {
+        machine.read_resources(&inputs, |reader| {
             footprint.capture_resource(reader, 0, &mut output)?;
             let cpu = cpu_ns();
             let start = std::time::Instant::now();
@@ -2391,11 +1870,11 @@ mod tests {
                     }
                 }
                 let mut selected = Vec::new();
-                mapping.observed_pages(&footprint, &mut selected).unwrap();
+                footprint.observed_pages(&mapping, &mut selected).unwrap();
                 let inputs = pin_selected_pages(selected).unwrap();
                 let mut output = vec![0xcd; expected.len()];
                 machine
-                    .capture_resource(&inputs, |reader| {
+                    .read_resources(&inputs, |reader| {
                         footprint.capture_resource(reader, 0, &mut output)
                     })
                     .unwrap();
@@ -2512,7 +1991,7 @@ mod submapping_tests {
             .unwrap();
         assert_eq!(right.bytes(), 2 * PAGE_SIZE);
         assert_eq!(
-            right.containing_offset(&full.slice(3 * PAGE_SIZE + 10, 5).unwrap()),
+            right.containing_offset(&full, 3 * PAGE_SIZE + 10..3 * PAGE_SIZE + 15),
             Some(PAGE_SIZE + 10)
         );
         let fragmented =
@@ -2521,10 +2000,24 @@ mod submapping_tests {
             &fragmented,
             &fragmented.expanded_buffer(1024 * 1024).unwrap()
         ));
+        let reordered = PhysicalMapping::join(&[right, left]).unwrap();
         assert_eq!(
-            fragmented.containing_offset(&PhysicalMapping::join(&[right, left]).unwrap()),
+            fragmented.containing_offset(&reordered, 0..3 * PAGE_SIZE),
             Some(PAGE_SIZE)
         );
+        assert_eq!(
+            fragmented.containing_offset(&reordered, PAGE_SIZE + 10..2 * PAGE_SIZE + 10),
+            Some(2 * PAGE_SIZE + 10)
+        );
+        assert_eq!(
+            fragmented.containing_offset(&full, PAGE_SIZE - 10..2 * PAGE_SIZE + 10),
+            None
+        );
+        assert_eq!(
+            fragmented.containing_offset(&reordered, 0..4 * PAGE_SIZE),
+            None
+        );
+        assert_eq!(fragmented.containing_offset(&reordered, 10..10), None);
         assert!(
             full.slice(PAGE_SIZE, 16)
                 .unwrap()
@@ -2690,13 +2183,13 @@ mod submapping_tests {
                         if written_bytes.contains(&byte) {
                             expected.insert((
                                 span.allocation,
-                                (span.allocation_offset + byte - span.start.get()) / PAGE_SIZE,
+                                (span.allocation_offset() + byte - span.start.get()) / PAGE_SIZE,
                             ));
                         }
                     }
                 }
                 let mut pages = Vec::new();
-                observed.observed_pages(&written, &mut pages).unwrap();
+                written.observed_pages(observed, &mut pages).unwrap();
                 let actual: BTreeSet<_> = pages
                     .iter()
                     .flat_map(|(source, range)| {
@@ -2724,7 +2217,7 @@ mod submapping_tests {
             },
         )
         .unwrap();
-        assert!(mapping.observed_pages(&written, &mut Vec::new()).is_err());
+        assert!(written.observed_pages(&mapping, &mut Vec::new()).is_err());
     }
     #[test]
     fn a_weak_submapping_preserves_exact_byte_identity_without_retaining_ram() {
