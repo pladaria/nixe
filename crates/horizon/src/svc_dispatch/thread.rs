@@ -1,5 +1,4 @@
 use super::*;
-use memory_wait::SvcCompletion;
 use nixe_scheduler::{CoreSet, IdealCore, ThreadPropertyGuard};
 use std::sync::Arc;
 
@@ -116,7 +115,10 @@ impl HorizonSvcDispatcher {
                 Some(nanoseconds as u64),
                 false,
             );
-            self.finish_wait_start(context, start, |_, _, _| resume())
+            match super::access::wait_kernel(context, start) {
+                Ok(_) => resume(),
+                Err(fault) => reject(context, fault),
+            }
         }
     }
 
@@ -200,17 +202,16 @@ impl HorizonSvcDispatcher {
                     }
                     Ok(false) => {}
                 }
-                dispatcher.start_owned_svc(context, Arc::default(), None, async move {
-                    guard.wait_quiescent(None).await.map_err(|fault| {
-                        HorizonSvcFault::Scheduling {
+                match super::access::wait_future(context, guard.wait_quiescent(None), None)
+                    .and_then(|result| {
+                        result.map_err(|fault| HorizonSvcFault::Scheduling {
                             operation: "GetThreadContext3",
                             fault,
-                        }
-                    })?;
-                    Ok(SvcCompletion::kernel(move |dispatcher, context| {
-                        dispatcher.write_thread_context(context, thread, guard, address)
-                    }))
-                })
+                        })
+                    }) {
+                    Ok(()) => dispatcher.write_thread_context(context, thread, guard, address),
+                    Err(fault) => reject(context, fault),
+                }
             },
         )
     }
@@ -277,14 +278,12 @@ impl HorizonSvcDispatcher {
         handle: u32,
         local: bool,
         operation: &'static str,
-        continuation: impl FnOnce(
+        apply: impl FnOnce(
             &std::sync::Arc<Self>,
             &mut ExceptionDispatchContext<'_>,
             Arc<ThreadObject>,
             ThreadPropertyGuard,
-        ) -> ExceptionDispatchOutcome<HorizonSvcFault>
-        + Send
-        + 'static,
+        ) -> ExceptionDispatchOutcome<HorizonSvcFault>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let Some(thread) = thread_object(context, handle) else {
             result(context, HorizonKernelResult::INVALID_HANDLE);
@@ -307,19 +306,21 @@ impl HorizonSvcDispatcher {
             }
         }
         match scheduler.try_thread_property(caller, target) {
-            Ok(Some(guard)) => continuation(self, context, thread, guard),
+            Ok(Some(guard)) => apply(self, context, thread, guard),
             Err(fault) => {
                 ExceptionDispatchOutcome::Fault(HorizonSvcFault::Scheduling { operation, fault })
             }
-            Ok(None) => self.start_owned_svc(context, Arc::default(), None, async move {
-                let guard = scheduler
-                    .lock_thread_property(caller, target)
-                    .await
-                    .map_err(|fault| HorizonSvcFault::Scheduling { operation, fault })?;
-                Ok(SvcCompletion::kernel(move |dispatcher, context| {
-                    continuation(dispatcher, context, thread, guard)
-                }))
-            }),
+            Ok(None) => match super::access::wait_future(
+                context,
+                scheduler.lock_thread_property(caller, target),
+                None,
+            )
+            .and_then(|result| {
+                result.map_err(|fault| HorizonSvcFault::Scheduling { operation, fault })
+            }) {
+                Ok(guard) => apply(self, context, thread, guard),
+                Err(fault) => reject(context, fault),
+            },
         }
     }
     fn finish_property_change(
@@ -339,15 +340,19 @@ impl HorizonSvcDispatcher {
             Err(fault) => {
                 ExceptionDispatchOutcome::Fault(HorizonSvcFault::Scheduling { operation, fault })
             }
-            Ok(false) => self.start_owned_svc(context, Arc::default(), None, async move {
-                guard
-                    .wait_quiescent(allowed)
-                    .await
-                    .map_err(|fault| HorizonSvcFault::Scheduling { operation, fault })?;
+            Ok(false) => {
+                let completed =
+                    super::access::wait_future(context, guard.wait_quiescent(allowed), None)
+                        .and_then(|result| {
+                            result.map_err(|fault| HorizonSvcFault::Scheduling { operation, fault })
+                        });
                 drop(guard);
                 drop(thread);
-                Ok(SvcCompletion::success(None))
-            }),
+                super::access::finish(
+                    context,
+                    completed.map(|()| (HorizonKernelResult::SUCCESS, None)),
+                )
+            }
         }
     }
 }
@@ -417,31 +422,38 @@ impl HorizonSvcDispatcher {
             affinity,
         };
         let process = context.process().clone();
-        self.start_owned_svc(context, Arc::default(), None, async move {
-            let code = match process.create_thread(request).await {
-                Ok(created) => return Ok(SvcCompletion::success(Some(u64::from(created.handle)))),
-                Err(ThreadCreateError::InvalidPriority(_)) => HorizonKernelResult::INVALID_PRIORITY,
-                Err(ThreadCreateError::InvalidVirtualCpu(_)) => {
-                    HorizonKernelResult::INVALID_CORE_ID
-                }
-                Err(ThreadCreateError::OutOfHandles) => HorizonKernelResult::OUT_OF_HANDLES,
-                Err(ThreadCreateError::Memory(fault)) => {
-                    return Err(HorizonSvcFault::MemoryAccess {
-                        immediate: 0x08,
-                        fault,
-                    });
-                }
-                Err(ThreadCreateError::OutOfMemory) => HorizonKernelResult::OUT_OF_MEMORY,
-                Err(ThreadCreateError::Terminating) => HorizonKernelResult::THREAD_TERMINATING,
-                Err(ThreadCreateError::IdentityExhausted | ThreadCreateError::Internal) => {
-                    return Err(runtime_fault("CreateThread"));
-                }
-            };
-            Ok(SvcCompletion::Return {
-                code,
-                output1: None,
-            })
-        })
+        {
+            let completed = (|| {
+                let code = match super::access::wait_io(context, process.create_thread(request)) {
+                    Ok(created) => {
+                        return Ok((
+                            HorizonKernelResult::SUCCESS,
+                            Some(u64::from(created.handle)),
+                        ));
+                    }
+                    Err(ThreadCreateError::InvalidPriority(_)) => {
+                        HorizonKernelResult::INVALID_PRIORITY
+                    }
+                    Err(ThreadCreateError::InvalidVirtualCpu(_)) => {
+                        HorizonKernelResult::INVALID_CORE_ID
+                    }
+                    Err(ThreadCreateError::OutOfHandles) => HorizonKernelResult::OUT_OF_HANDLES,
+                    Err(ThreadCreateError::Memory(fault)) => {
+                        return Err(HorizonSvcFault::MemoryAccess {
+                            immediate: 0x08,
+                            fault,
+                        });
+                    }
+                    Err(ThreadCreateError::OutOfMemory) => HorizonKernelResult::OUT_OF_MEMORY,
+                    Err(ThreadCreateError::Terminating) => HorizonKernelResult::THREAD_TERMINATING,
+                    Err(ThreadCreateError::IdentityExhausted | ThreadCreateError::Internal) => {
+                        return Err(runtime_fault("CreateThread"));
+                    }
+                };
+                Ok((code, None))
+            })();
+            super::access::finish(context, completed)
+        }
     }
 }
 

@@ -1,5 +1,5 @@
-//! Direct engine memory and rasterizer calls. Only unavailable native
-//! preparation has a continuation; method admission never produces commands.
+//! Direct engine memory and rasterizer calls. Each method consumes its effects
+//! before the next method; executable waits belong to native recording.
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
 use super::*;
 use crate::{
@@ -9,22 +9,6 @@ use crate::{
 };
 
 impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
-    async fn wait_native(
-        &mut self,
-        source: MaxwellMethodSource,
-        mut consume: impl FnMut(&mut Self) -> Result<bool, MaxwellSubmissionExecutionError>,
-    ) -> Result<(), MaxwellSubmissionExecutionError> {
-        let result = std::future::poll_fn(|_| {
-            self.host.preparation_pending(true)?;
-            match at_method(|| source, consume(self))? {
-                true => std::task::Poll::Ready(Ok(())),
-                false => std::task::Poll::Pending,
-            }
-        })
-        .await;
-        self.host.preparation_pending(false)?;
-        result
-    }
     pub(crate) fn notification(
         &mut self,
         address: u64,
@@ -345,131 +329,58 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
     pub(crate) fn solid(
         &mut self,
         request: &MaxwellTwoDSolidOperation,
-    ) -> Result<bool, MaxwellSubmissionExecutionError> {
-        debug_assert!(self.preparing_blit.is_none() && self.preparing_solid.is_none());
-        let result = self.solid_inner(request);
-        let ready = at_method(|| request.source, result)?;
-        if !ready {
-            self.preparing_solid = Some(*request);
-        }
-        Ok(ready)
-    }
-    fn solid_inner(
-        &mut self,
-        request: &MaxwellTwoDSolidOperation,
-    ) -> Result<bool, MaxwellSubmissionExecutionError> {
-        let [x0, y0, x1, y1] = request.rectangle;
-        if x0 < x1 && y0 < y1 {
-            if !self.cache.borrow_mut().try_solid(
-                request,
-                &self.address_space.borrow(),
-                self.frontend,
-            )? {
-                return Ok(false);
-            }
-            self.prior_work_pending = true;
-        }
-        Ok(true)
-    }
-    pub(crate) async fn wait_solid(
-        &mut self,
-        request: &MaxwellTwoDSolidOperation,
     ) -> Result<(), MaxwellSubmissionExecutionError> {
-        self.wait_native(request.source, |this| this.solid_inner(request))
-            .await
+        let result = (|| {
+            let [x0, y0, x1, y1] = request.rectangle;
+            if x0 < x1 && y0 < y1 {
+                self.cache.borrow_mut().solid(
+                    request,
+                    &self.address_space.borrow(),
+                    self.frontend,
+                )?;
+                self.prior_work_pending = true;
+            }
+            Ok(())
+        })();
+        at_method(|| request.source, result)
     }
     pub(crate) fn blit(
         &mut self,
         request: &MaxwellTwoDBlitOperation,
-    ) -> Result<bool, MaxwellSubmissionExecutionError> {
-        debug_assert!(self.preparing_blit.is_none() && self.preparing_solid.is_none());
-        let result = self.blit_inner(request);
-        let ready = at_method(|| request.source(), result)?;
-        if !ready {
-            self.preparing_blit = Some(*request);
-        }
-        Ok(ready)
-    }
-    fn blit_inner(
-        &mut self,
-        request: &MaxwellTwoDBlitOperation,
-    ) -> Result<bool, MaxwellSubmissionExecutionError> {
-        if !self.cache.borrow_mut().try_blit(
-            request,
-            &self.address_space.borrow(),
-            self.frontend,
-        )? {
-            return Ok(false);
-        }
-        self.prior_work_pending = true;
-        Ok(true)
-    }
-    pub(crate) async fn wait_blit(
-        &mut self,
-        request: &MaxwellTwoDBlitOperation,
     ) -> Result<(), MaxwellSubmissionExecutionError> {
-        self.wait_native(request.source(), |this| this.blit_inner(request))
-            .await
-    }
-    pub(crate) async fn wait_two_d(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {
-        if let Some(request) = self.preparing_blit.take() {
-            debug_assert!(self.preparing_solid.is_none());
-            self.wait_blit(&request).await
-        } else {
-            let request = self
-                .preparing_solid
-                .take()
-                .expect("unavailable native 2D preparation");
-            self.wait_solid(&request).await
-        }
+        let result =
+            self.cache
+                .borrow_mut()
+                .blit(request, &self.address_space.borrow(), self.frontend);
+        at_method(|| request.source(), result)?;
+        self.prior_work_pending = true;
+        Ok(())
     }
     pub(crate) fn draw(
         &mut self,
         three_d: &MaxwellThreeDState,
         draw: &crate::MaxwellThreeDDrawState,
         origin: impl FnOnce() -> MaxwellMethodSource,
-    ) -> Result<bool, MaxwellSubmissionExecutionError> {
-        let result = self.draw_inner(three_d, draw);
-        let ready = at_method(origin, result)?;
-        if ready {
-            self.tick_work()?;
-        }
-        Ok(ready)
-    }
-    fn draw_inner(
-        &mut self,
-        three_d: &MaxwellThreeDState,
-        draw: &crate::MaxwellThreeDDrawState,
-    ) -> Result<bool, MaxwellSubmissionExecutionError> {
-        if !self.cache.borrow().render_enabled() {
-            return Ok(true);
-        }
-        self.address_space
-            .borrow_mut()
-            .flush_caching(self.host)
-            .map_err(|e| MaxwellSubmissionExecutionError::Native(e.to_string().into()))?;
-        if !self.cache.borrow_mut().try_draw(
-            three_d,
-            draw,
-            &self.address_space.borrow(),
-            self.frontend,
-            self.host,
-        )? {
-            return Ok(false);
-        }
-        self.prior_work_pending = true;
-        Ok(true)
-    }
-    pub(crate) async fn wait_draw(
-        &mut self,
-        three_d: &MaxwellThreeDState,
-        draw: &crate::MaxwellThreeDDrawState,
-        source: MaxwellMethodSource,
     ) -> Result<(), MaxwellSubmissionExecutionError> {
-        self.wait_native(source, |this| this.draw_inner(three_d, draw))
-            .await?;
-        self.tick_work()?;
-        Ok(())
+        let result = (|| {
+            if self.cache.borrow().render_enabled() {
+                self.address_space
+                    .borrow_mut()
+                    .flush_caching(self.host)
+                    .map_err(|e| MaxwellSubmissionExecutionError::Native(e.to_string().into()))?;
+                self.cache.borrow_mut().draw(
+                    three_d,
+                    draw,
+                    &self.address_space.borrow(),
+                    self.frontend,
+                    self.host,
+                )?;
+                self.prior_work_pending = true;
+            }
+            Ok(())
+        })();
+        at_method(origin, result)?;
+        self.tick_work()
     }
     /// Clear consumes current registers directly; unlike shader preparation it
     /// has no unavailable-pipeline continuation. Eden exposes distinct Draw and
@@ -500,45 +411,28 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
         &mut self,
         launch: MaxwellComputeLaunch,
         compute: &MaxwellComputeState,
-    ) -> Result<bool, MaxwellSubmissionExecutionError> {
-        debug_assert!(self.active_compute.is_none());
+    ) -> Result<(), MaxwellSubmissionExecutionError> {
         let result = (|| {
-            self.active_compute = Some(
-                crate::engines::resolve_compute_launch(
-                    &launch,
-                    compute,
-                    &self.address_space.borrow(),
-                )
-                .map_err(MaxwellSubmissionExecutionError::ComputeLaunch)?,
-            );
-            self.launch_inner()
+            let resolved = crate::engines::resolve_compute_launch(
+                &launch,
+                compute,
+                &self.address_space.borrow(),
+            )
+            .map_err(MaxwellSubmissionExecutionError::ComputeLaunch)?;
+            self.address_space
+                .borrow_mut()
+                .flush_caching(self.host)
+                .map_err(|e| MaxwellSubmissionExecutionError::Native(e.to_string().into()))?;
+            self.cache.borrow_mut().launch(
+                &resolved,
+                &self.address_space.borrow(),
+                self.frontend,
+                self.host,
+            )?;
+            self.prior_work_pending = true;
+            Ok(())
         })();
         at_method(|| launch.source(), result)
-    }
-    fn launch_inner(&mut self) -> Result<bool, MaxwellSubmissionExecutionError> {
-        self.address_space
-            .borrow_mut()
-            .flush_caching(self.host)
-            .map_err(|e| MaxwellSubmissionExecutionError::Native(e.to_string().into()))?;
-        if !self.cache.borrow_mut().try_launch(
-            self.active_compute.as_ref().unwrap(),
-            &self.address_space.borrow(),
-            self.frontend,
-            self.host,
-        )? {
-            return Ok(false);
-        }
-        self.active_compute = None;
-        self.prior_work_pending = true;
-        Ok(true)
-    }
-    pub(crate) async fn wait_launch(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {
-        let source = self
-            .active_compute
-            .as_ref()
-            .expect("pending native dispatch")
-            .source();
-        self.wait_native(source, Self::launch_inner).await
     }
 }
 fn at_method<T>(

@@ -1,7 +1,6 @@
 //! Canonical guest observations for shader compilation. Mutable memory access
 //! ends at capture; workers receive owned environments and immutable metadata.
 
-pub mod archive;
 mod graphics;
 mod program;
 mod texture;
@@ -9,12 +8,6 @@ pub use super::memory::{ShaderCache, ShaderInfo};
 pub use graphics::graphics_request;
 pub use graphics::{GraphicsSource, graphics_source};
 pub use program::capture_program;
-
-pub const MAXWELL_SHADER_NAMESPACE: nixe_gpu::shader_identity::ShaderNamespace =
-    nixe_gpu::shader_identity::ShaderNamespace {
-        guest: *b"nixe-switch-gpu1",
-        isa: 1,
-    };
 
 use super::memory::ShaderMemory;
 use crate::{MaxwellGpuMemory, MaxwellShaderStage};
@@ -72,6 +65,7 @@ struct CaptureEnvironment<'a, 'm> {
     code: Vec<u8>,
     read_lowest: u32,
     read_highest: u32,
+    has_unbound_instructions: bool,
     textures: BTreeMap<TextureHandle, [u32; 8]>,
 }
 impl<'a, 'm> CaptureEnvironment<'a, 'm> {
@@ -95,6 +89,7 @@ impl<'a, 'm> CaptureEnvironment<'a, 'm> {
             code,
             read_lowest: u32::MAX,
             read_highest: 0,
+            has_unbound_instructions: false,
             textures: BTreeMap::new(),
         };
         if result.metadata.stage != Stage::Compute {
@@ -173,24 +168,28 @@ impl Environment for CaptureEnvironment<'_, '_> {
     }
 
     fn read_instruction(&mut self, offset: ProgramOffset) -> Result<u64> {
-        let relative = offset
-            .0
-            .checked_sub(self.metadata.start_address.0)
-            .ok_or_else(|| invalid("Instruction precedes program start"))?;
-        if relative & 7 != 0 {
+        if offset.0 & 7 != 0 {
             return Err(invalid("Unaligned shader instruction address"));
         }
         self.read_lowest = self.read_lowest.min(offset.0);
         self.read_highest = self.read_highest.max(offset.0);
-        let at = relative as usize;
-        if let Some(bytes) = self.code.get(at..at + 8) {
+        if let Some(relative) = offset.0.checked_sub(self.metadata.start_address.0)
+            && let Some(bytes) = self.code.get(relative as usize..relative as usize + 8)
+        {
             return Ok(u64::from_le_bytes(bytes.try_into().unwrap()));
         }
-        let address = self
-            .address
-            .checked_add(u64::from(relative))
-            .ok_or_else(|| invalid("Instruction address overflows"))?;
-        self.memory.instruction(address)
+        self.has_unbound_instructions = true;
+        let address = if offset.0 >= self.metadata.start_address.0 {
+            self.address
+                .checked_add(u64::from(offset.0 - self.metadata.start_address.0))
+        } else {
+            self.address
+                .checked_sub(u64::from(self.metadata.start_address.0 - offset.0))
+        }
+        .ok_or_else(|| invalid("Shader instruction address overflows"))?;
+        let mut bytes = [0; 8];
+        self.memory.read_code_into(address, &mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
     }
 
     fn read_cbuf_value(&mut self, index: CbufIndex, offset: ByteOffset) -> Result<u32> {
@@ -289,7 +288,6 @@ pub(super) fn analyze_code(
                 return Ok(ShaderInfo {
                     unique_hash: city_hash64(&code[..size]),
                     size_bytes: size + 8,
-                    header: ProgramHeader::from_bytes(code[..80].try_into().unwrap()),
                 });
             }
         }
@@ -312,6 +310,5 @@ pub(super) fn analyze_code(
     Ok(ShaderInfo {
         unique_hash: city_hash64(&code),
         size_bytes: size,
-        header: source.metadata.sph,
     })
 }

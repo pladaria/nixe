@@ -26,12 +26,12 @@ use crate::{
     HorizonSvcDescriptor, HorizonSvcReturnKind, UnsupportedHorizonSvc, decode_horizon_svc,
 };
 
+mod access;
 mod address_arbitration;
 mod address_word;
 mod debug_string;
 mod ipc;
 mod memory;
-mod memory_wait;
 mod synchronization;
 mod thread;
 use ipc::*;
@@ -538,7 +538,9 @@ impl HorizonSvcDispatcher {
     }
 }
 
-impl ExceptionDispatcher for HorizonSvcDispatcher {
+// SAFETY: SVC waits retain only Send kernel/client data. Native-core borrows and
+// thread-affine lock guards end before a guest fiber can suspend or migrate.
+unsafe impl ExceptionDispatcher for HorizonSvcDispatcher {
     type Fault = HorizonSvcFault;
 
     fn dispatch(
@@ -688,7 +690,6 @@ fn completed_svc_guest_error(
         || matches!(
             outcome,
             ExceptionDispatchOutcome::Resume(ExceptionResume::Retry)
-                | ExceptionDispatchOutcome::Suspend(_)
                 | ExceptionDispatchOutcome::Terminate { .. }
                 | ExceptionDispatchOutcome::Fault(_)
         )

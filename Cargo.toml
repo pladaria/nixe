@@ -44,6 +44,7 @@ flate2 = "1"
 egui = { version = "0.36.2", default-features = false }
 egui-winit = { version = "0.36.2", default-features = false, features = ["clipboard", "x11", "wayland"] }
 ctrlc = "3.4"
+corosensei = "=0.3.4"
 getrandom = "0.4"
 lz4_flex = "0.11"
 log = "0.4"

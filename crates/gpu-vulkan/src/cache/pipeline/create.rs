@@ -1,20 +1,12 @@
 //! Synchronous Vulkan construction on compilation workers.
 use super::*;
-// One creation implementation with explicit Vulkan subsets, rather than
-// independent renderer paths or ambiguous part/link argument combinations.
-// https://docs.vulkan.org/samples/latest/samples/extensions/graphics_pipeline_library/README.html
-pub(super) enum GraphicsCompilation<'a> {
-    Monolithic,
-    Library(vk::GraphicsPipelineLibraryFlagsEXT),
-    Link(&'a [vk::Pipeline]),
-}
-struct ShaderModules {
+pub(super) struct ShaderModules {
     owner: Arc<DeviceOwner>,
-    handles: Vec<vk::ShaderModule>,
+    handles: Vec<(ShaderStage, vk::ShaderModule)>,
 }
 impl Drop for ShaderModules {
     fn drop(&mut self) {
-        for &h in &self.handles {
+        for &(_, h) in &self.handles {
             unsafe {
                 self.owner.device.destroy_shader_module(h, None);
             }
@@ -22,44 +14,33 @@ impl Drop for ShaderModules {
     }
 }
 impl Compiler {
-    fn modules(&self, stages: &[&CompiledStage]) -> Result<ShaderModules, CompileError> {
+    pub(super) fn modules(&self, shader: &ShaderArtifact) -> Result<ShaderModules, CompileError> {
         let mut result = ShaderModules {
             owner: Arc::clone(&self.owner),
             handles: Vec::new(),
         };
-        for s in stages {
-            let h = if self.inline_modules {
-                vk::ShaderModule::null()
-            } else {
-                unsafe {
-                    self.owner.device.create_shader_module(
-                        &vk::ShaderModuleCreateInfo::default().code(&s.module.words),
-                        None,
-                    )
-                }
-                .map_err(|e| VulkanError::vk("native shader module", e))?
-            };
-            result.handles.push(h);
+        for s in &shader.stages {
+            let h = unsafe {
+                self.owner.device.create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(&s.module.words),
+                    None,
+                )
+            }
+            .map_err(|e| VulkanError::vk("native shader module", e))?;
+            result.handles.push((s.stage, h));
         }
         Ok(result)
     }
     pub(super) fn compute(
         &self,
-        worker: usize,
-        shader: &ShaderArtifact,
+        modules: &ShaderModules,
         layout: &PipelineLayout,
         metrics: &mut PipelineMetrics,
     ) -> Result<vk::Pipeline, CompileError> {
-        let stages = [shader.stages[0].as_ref()];
-        let modules = self.modules(&stages)?;
-        let mut module_info = vk::ShaderModuleCreateInfo::default().code(&stages[0].module.words);
-        let mut stage = vk::PipelineShaderStageCreateInfo::default()
+        let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(modules.handles[0])
+            .module(modules.handles[0].1)
             .name(c"main");
-        if self.inline_modules {
-            stage = stage.push_next(&mut module_info);
-        }
         let mut feedback = vk::PipelineCreationFeedback::default();
         let mut stage_feedback = [vk::PipelineCreationFeedback::default()];
         let mut feedback_info = vk::PipelineCreationFeedbackCreateInfo::default()
@@ -71,102 +52,37 @@ impl Compiler {
         if self.feedback {
             info = info.push_next(&mut feedback_info);
         }
-        let handle = self.driver.with(worker, |cache| {
-            let mut infos = [info];
-            // A driver-cache hit avoids compilation. A miss is compiled here on
-            // the worker, never dropped or moved onto the queue owner.
-            if self.cache_control {
-                infos[0].flags |= vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
-            }
-            let first = unsafe {
-                self.owner
-                    .device
-                    .create_compute_pipelines(cache, &infos, None)
-            };
-            let result = if matches!(&first, Err((_, vk::Result::PIPELINE_COMPILE_REQUIRED))) {
-                destroy_partial(&self.owner, &first);
-                infos[0].flags &= !vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
+        let handle = unsafe {
+            self.owner
+                .device
+                .create_compute_pipelines(self.driver.handle, &[info], None)
+        }
+        .map_err(|(handles, error)| {
+            for handle in handles {
                 unsafe {
-                    self.owner
-                        .device
-                        .create_compute_pipelines(cache, &infos, None)
+                    self.owner.device.destroy_pipeline(handle, None);
                 }
-            } else {
-                first
-            };
-            let handle = result.map_err(|(handles, e)| {
-                for h in handles {
-                    unsafe {
-                        self.owner.device.destroy_pipeline(h, None);
-                    }
-                }
-                CompileError::from(VulkanError::vk("native compute pipeline", e))
-            })?[0];
-            Ok(handle)
-        })?;
+            }
+            CompileError::from(VulkanError::vk("native compute pipeline", error))
+        })?[0];
         feedback_metrics(metrics, feedback);
         Ok(handle)
     }
     pub(super) fn graphics(
         &self,
-        worker: usize,
-        shader: &ShaderArtifact,
+        modules: &ShaderModules,
         layout: &PipelineLayout,
         s: &GraphicsState,
-        mode: GraphicsCompilation<'_>,
         metrics: &mut PipelineMetrics,
     ) -> Result<vk::Pipeline, CompileError> {
-        let (part, libraries) = match mode {
-            GraphicsCompilation::Monolithic => (None, &[][..]),
-            GraphicsCompilation::Library(part) => (Some(part), &[][..]),
-            GraphicsCompilation::Link(libraries) => (None, libraries),
-        };
-        let linking = !libraries.is_empty();
-        let mask = if linking {
-            vk::GraphicsPipelineLibraryFlagsEXT::empty()
-        } else {
-            part.unwrap_or(
-                vk::GraphicsPipelineLibraryFlagsEXT::VERTEX_INPUT_INTERFACE
-                    | vk::GraphicsPipelineLibraryFlagsEXT::PRE_RASTERIZATION_SHADERS
-                    | vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_SHADER
-                    | vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_OUTPUT_INTERFACE,
-            )
-        };
-        let vi = mask.contains(vk::GraphicsPipelineLibraryFlagsEXT::VERTEX_INPUT_INTERFACE);
-        let pre = mask.contains(vk::GraphicsPipelineLibraryFlagsEXT::PRE_RASTERIZATION_SHADERS);
-        let fs = mask.contains(vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_SHADER);
-        let out = mask.contains(vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_OUTPUT_INTERFACE);
-        let selected: Vec<_> = shader
-            .stages
+        let stages: Vec<_> = modules
+            .handles
             .iter()
-            .map(AsRef::as_ref)
-            .filter(|s| {
-                if s.stage == ShaderStage::Fragment {
-                    fs
-                } else {
-                    pre
-                }
-            })
-            .collect();
-        let modules = self.modules(&selected)?;
-        let mut module_infos: Vec<_> = selected
-            .iter()
-            .map(|s| vk::ShaderModuleCreateInfo::default().code(&s.module.words))
-            .collect();
-        let stages: Vec<_> = selected
-            .iter()
-            .zip(&modules.handles)
-            .zip(module_infos.iter_mut())
-            .map(|((s, &module), info)| {
-                let stage = vk::PipelineShaderStageCreateInfo::default()
-                    .stage(stage_flags(s.stage))
+            .map(|&(stage, module)| {
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(stage_flags(stage))
                     .module(module)
-                    .name(c"main");
-                if self.inline_modules {
-                    stage.push_next(info)
-                } else {
-                    stage
-                }
+                    .name(c"main")
             })
             .collect();
         let bindings: Vec<_> = s
@@ -305,8 +221,6 @@ impl Compiler {
             *slot = format;
         }
         let render_pass = self.owner.render_pass(pass_key)?;
-        let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(mask);
-        let mut linking_info = vk::PipelineLibraryCreateInfoKHR::default().libraries(libraries);
         let mut feedback = vk::PipelineCreationFeedback::default();
         let mut stage_feedback = vec![vk::PipelineCreationFeedback::default(); stages.len()];
         let mut feedback_info = vk::PipelineCreationFeedbackCreateInfo::default()
@@ -317,71 +231,34 @@ impl Compiler {
             .stages(&stages)
             .render_pass(render_pass)
             .subpass(0);
-        if vi {
-            info = info
-                .vertex_input_state(&vertex)
-                .input_assembly_state(&assembly);
-        }
-        if pre {
-            info = info.viewport_state(&viewport).rasterization_state(&raster);
-            if s.patch_points != 0 {
-                info = info.tessellation_state(&tessellation);
-            }
-        }
-        if fs {
-            info = info.depth_stencil_state(&depth);
-        }
-        if fs || out {
-            info = info.multisample_state(&multisample);
-        }
-        if out {
-            info = info.color_blend_state(&color);
-        }
-        if !linking {
-            info = info.dynamic_state(&dynamic);
-        }
-        if part.is_some() {
-            info = info
-                .flags(vk::PipelineCreateFlags::LIBRARY_KHR)
-                .push_next(&mut library);
-        }
-        if linking {
-            info = info.push_next(&mut linking_info);
+        info = info
+            .vertex_input_state(&vertex)
+            .input_assembly_state(&assembly)
+            .viewport_state(&viewport)
+            .rasterization_state(&raster)
+            .depth_stencil_state(&depth)
+            .multisample_state(&multisample)
+            .color_blend_state(&color)
+            .dynamic_state(&dynamic);
+        if s.patch_points != 0 {
+            info = info.tessellation_state(&tessellation);
         }
         if self.feedback {
             info = info.push_next(&mut feedback_info);
         }
-        let handle = self.driver.with(worker, |cache| {
-            let mut infos = [info];
-            if self.cache_control {
-                infos[0].flags |= vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
-            }
-            let first = unsafe {
-                self.owner
-                    .device
-                    .create_graphics_pipelines(cache, &infos, None)
-            };
-            let result = if matches!(&first, Err((_, vk::Result::PIPELINE_COMPILE_REQUIRED))) {
-                destroy_partial(&self.owner, &first);
-                infos[0].flags &= !vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
+        let handle = unsafe {
+            self.owner
+                .device
+                .create_graphics_pipelines(self.driver.handle, &[info], None)
+        }
+        .map_err(|(handles, error)| {
+            for handle in handles {
                 unsafe {
-                    self.owner
-                        .device
-                        .create_graphics_pipelines(cache, &infos, None)
+                    self.owner.device.destroy_pipeline(handle, None);
                 }
-            } else {
-                first
-            };
-            let handle = result.map_err(|(handles, e)| {
-                for h in handles {
-                    unsafe {
-                        self.owner.device.destroy_pipeline(h, None);
-                    }
-                }
-                CompileError::from(VulkanError::vk("native graphics pipeline", e))
-            })?[0];
-            Ok(handle)
-        })?;
+            }
+            CompileError::from(VulkanError::vk("native graphics pipeline", error))
+        })?[0];
         feedback_metrics(metrics, feedback);
         Ok(handle)
     }
@@ -396,17 +273,5 @@ fn feedback_metrics(metrics: &mut PipelineMetrics, feedback: vk::PipelineCreatio
         metrics.application_cache_hit = feedback
             .flags
             .contains(vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT);
-    }
-}
-fn destroy_partial(
-    owner: &DeviceOwner,
-    result: &Result<Vec<vk::Pipeline>, (Vec<vk::Pipeline>, vk::Result)>,
-) {
-    if let Err((handles, _)) = result {
-        for &h in handles {
-            unsafe {
-                owner.device.destroy_pipeline(h, None);
-            }
-        }
     }
 }

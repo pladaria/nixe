@@ -130,8 +130,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
         launch: &model::MaxwellResolvedComputeLaunch,
         space: &MaxwellGpuMemory,
         groups: [u32; 3],
-    ) -> Result<bool, crate::VulkanError> {
-        use crate::native::Computing;
+    ) -> Result<(), crate::VulkanError> {
         execution.flush_work()?;
         let pipeline = &self.pipeline;
         execution
@@ -139,37 +138,19 @@ impl crate::native::pipeline_cache::ComputePipeline {
             .runtime
             .device
             .realize_deferred_clear()?;
-        let previous = execution.state.context.computing.take();
-        let changed = previous
-            .as_ref()
-            .is_none_or(|old| !Arc::ptr_eq(&old.pipeline, pipeline));
-        let mut computing = previous.unwrap_or_else(|| Computing {
-            pipeline: Arc::clone(pipeline),
-            push: Vec::new(),
-        });
-        if changed {
-            crate::native::state::update_guest_push(
-                pipeline,
-                &self.resources,
-                None,
-                &mut computing.push,
-            )?;
-            computing.pipeline = Arc::clone(pipeline);
-        }
         let images = self.configure_resources(execution, launch, space)?;
         execution
             .residency
             .update_compute_buffers(&self.resources.stages[5], space)?;
-        execution.state.context.computing = Some(computing);
-        let computing = execution.state.context.computing.as_ref().unwrap();
+        let push = crate::native::state::ShaderConstants::default();
         execution.residency.dispatch_guest(
             pipeline,
             &self.resources,
             &images,
             groups,
-            &computing.push,
+            push.as_bytes(),
         )?;
         execution.state.statistics.dispatches += 1;
-        Ok(true)
+        Ok(())
     }
 }

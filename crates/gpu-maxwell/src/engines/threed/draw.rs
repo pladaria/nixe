@@ -28,7 +28,6 @@ pub struct MaxwellThreeDDrawState {
     mode: Mode,
     instances: u32,
     source: Option<MaxwellMethodSource>,
-    preparing: Option<MaxwellMethodSource>,
     pub(super) inline_indices: Vec<u8>,
     pub(super) inline_draw_pending: bool,
 }
@@ -147,14 +146,14 @@ pub(super) fn end<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     argument: u32,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
     origin: impl Fn() -> MaxwellMethodSource,
-) -> Result<bool, MaxwellEngineStreamError> {
+) -> Result<(), MaxwellEngineStreamError> {
     if argument > 1 {
         return Err(invalid_encoding(origin(), "END", "expected boolean 0 or 1").into());
     }
     state.end_primitive(argument);
     if state.draw.mode == Mode::Instance {
         state.draw.source = Some(origin());
-        return Ok(true);
+        return Ok(());
     }
     Ok(submit(state, None, execution, origin)?)
 }
@@ -163,7 +162,7 @@ pub(super) fn clear<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     argument: u32,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
     origin: impl Fn() -> MaxwellMethodSource,
-) -> Result<bool, MaxwellEngineStreamError> {
+) -> Result<(), MaxwellEngineStreamError> {
     let value = MaxwellThreeDClearSurface::parse(argument).ok_or_else(|| {
         invalid_encoding(
             origin(),
@@ -174,37 +173,16 @@ pub(super) fn clear<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     if value.depth() || value.stencil() || value.color_mask() != 0 {
         execution.clear(state.operation_state(), origin)?;
     }
-    Ok(true)
+    Ok(())
 }
 fn submit<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     state: &mut MaxwellThreeDFrontendState,
     instances: Option<u32>,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
     origin: impl Fn() -> MaxwellMethodSource,
-) -> Result<bool, crate::MaxwellSubmissionExecutionError> {
-    debug_assert!(state.draw.preparing.is_none());
-    capture(state, instances);
-    if execution.draw(state.operation_state(), &state.draw, &origin)? {
-        complete(state);
-        Ok(true)
-    } else {
-        state.draw.preparing = Some(origin());
-        Ok(false)
-    }
-}
-/// Only native preparation retries. Registers, uploads and signals are never replayed.
-pub(in crate::engines) async fn wait_preparation<
-    L: crate::MaxwellFrontend,
-    H: crate::MaxwellCommandHost,
->(
-    state: &mut MaxwellThreeDFrontendState,
-    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
 ) -> Result<(), crate::MaxwellSubmissionExecutionError> {
-    let source = state.draw.preparing.expect("unavailable native draw");
-    execution
-        .wait_draw(state.operation_state(), &state.draw, source)
-        .await?;
-    state.draw.preparing = None;
+    capture(state, instances);
+    execution.draw(state.operation_state(), &state.draw, &origin)?;
     complete(state);
     Ok(())
 }
@@ -212,34 +190,20 @@ pub(in crate::engines) async fn wait_preparation<
 pub(in crate::engines) fn flush<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     state: &mut MaxwellThreeDFrontendState,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Result<bool, crate::MaxwellSubmissionExecutionError> {
+) -> Result<(), crate::MaxwellSubmissionExecutionError> {
     if !is_pending(state) {
-        return Ok(true);
+        return Ok(());
     }
     let source = state
         .draw
         .source
         .expect("deferred instance BEGIN/END source");
-    if !submit(
+    submit(
         state,
         Some(state.draw.instances.wrapping_add(1)),
         execution,
         || source,
-    )? {
-        return Ok(false);
-    }
-    state.draw.instances = 0;
-    state.draw.indexed = false;
-    Ok(true)
-}
-pub(in crate::engines) async fn wait_flush<
-    L: crate::MaxwellFrontend,
-    H: crate::MaxwellCommandHost,
->(
-    state: &mut MaxwellThreeDFrontendState,
-    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Result<(), crate::MaxwellSubmissionExecutionError> {
-    wait_preparation(state, execution).await?;
+    )?;
     state.draw.instances = 0;
     state.draw.indexed = false;
     Ok(())

@@ -2,9 +2,11 @@
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/shader_cache.cpp
 use crate::{MaxwellGpuAccessError, MaxwellGpuMemory, MaxwellShaderStage};
 use nixe_memory::device_memory::DeviceMemory;
-use nixe_shader_recompiler::maxwell::header::ProgramHeader;
 use rustc_hash::FxHashMap as HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 const PAGE_BITS: u32 = 14;
 const PAGE_SIZE: u64 = 1 << PAGE_BITS;
@@ -15,25 +17,30 @@ const PAGE_SIZE: u64 = 1 << PAGE_BITS;
 pub struct ShaderInfo {
     pub unique_hash: u64,
     pub size_bytes: usize,
-    pub header: ProgramHeader,
 }
 struct Entry {
     address: u64,
     end: u64,
     info: Arc<ShaderInfo>,
+    memory_marked: AtomicBool,
 }
 #[derive(Default)]
 struct Invalidations {
     pages: HashMap<u64, Vec<Arc<Entry>>>,
+    pending: Vec<Arc<Entry>>,
 }
 struct Cache {
     memory: DeviceMemory,
+    counters: nixe_gpu::cache_counters::CacheCounters,
     lookup: Mutex<HashMap<u64, Arc<Entry>>>,
     invalidations: Mutex<Invalidations>,
 }
 impl Drop for Cache {
     fn drop(&mut self) {
         for entry in self.lookup.get_mut().unwrap().values() {
+            if !entry.memory_marked.load(Ordering::Relaxed) {
+                continue;
+            }
             self.memory
                 .update_pages_cached_count(entry.address, entry.end - entry.address, -1)
                 .expect("registered shader cache pages");
@@ -46,9 +53,13 @@ impl ShaderCache {
     pub fn new(memory: DeviceMemory) -> Self {
         Self(Arc::new(Cache {
             memory,
+            counters: nixe_gpu::cache_counters::CacheCounters::new(0, 0),
             lookup: Mutex::new(HashMap::default()),
             invalidations: Mutex::new(Invalidations::default()),
         }))
+    }
+    pub fn cache_counters(&self) -> nixe_gpu::cache_counters::CacheCounters {
+        self.0.counters.clone()
     }
     pub fn try_get(&self, address: u64) -> Option<Arc<ShaderInfo>> {
         self.0
@@ -74,6 +85,7 @@ impl ShaderCache {
             address,
             end,
             info: Arc::clone(&info),
+            memory_marked: AtomicBool::new(true),
         });
         // Register publishes one address entry and its page index together;
         // only these cache-owned entries mark device pages cached.
@@ -87,6 +99,8 @@ impl ShaderCache {
             .update_pages_cached_count(address, bytes, 1)
             .map_err(|e| super::recompiler::invalid(e.to_string()))?;
         lookup.insert(address, Arc::clone(&entry));
+        self.0.counters.miss();
+        self.0.counters.add_entries(1);
         for page in address >> PAGE_BITS..end.div_ceil(PAGE_SIZE) {
             invalidations
                 .pages
@@ -96,46 +110,66 @@ impl ShaderCache {
         }
         Ok(info)
     }
+    /// CPU writes remove invalidated lookups immediately. Unmaps only unmark
+    /// and detach page entries; their lookups retire at the next normal
+    /// invalidation, as ShaderCache::OnCacheInvalidation/RemovePendingShaders.
     pub fn invalidate_region(&self, address: u64, bytes: u64) {
+        let mut invalidations = self.0.invalidations.lock().unwrap();
+        self.invalidate_pages(&mut invalidations, address, bytes);
+        if invalidations.pending.is_empty() {
+            return;
+        }
+        invalidations.pending.sort_unstable_by_key(Arc::as_ptr);
+        invalidations.pending.dedup_by(|a, b| Arc::ptr_eq(a, b));
+        let mut lookup = self.0.lookup.lock().unwrap();
+        let count = invalidations.pending.len();
+        for entry in invalidations.pending.drain(..) {
+            lookup.remove(&entry.address);
+        }
+        self.0.counters.remove_entries(count);
+        self.0.counters.evict(count as u64);
+    }
+    pub fn on_cache_invalidation(&self, address: u64, bytes: u64) {
+        self.invalidate_pages(&mut self.0.invalidations.lock().unwrap(), address, bytes);
+    }
+    fn invalidate_pages(&self, invalidations: &mut Invalidations, address: u64, bytes: u64) {
         if bytes == 0 {
             return;
         }
         let end = address + bytes;
-        let mut invalidations = self.0.invalidations.lock().unwrap();
-        let mut removed = Vec::<Arc<Entry>>::new();
         for page in address >> PAGE_BITS..end.div_ceil(PAGE_SIZE) {
-            if let Some(entries) = invalidations.pages.get(&page) {
-                for entry in entries {
-                    if entry.address < end
-                        && address < entry.end
-                        && !removed.iter().any(|old| Arc::ptr_eq(old, entry))
-                    {
-                        removed.push(Arc::clone(entry));
-                    }
-                }
-            }
-        }
-        if removed.is_empty() {
-            return;
-        }
-        let mut lookup = self.0.lookup.lock().unwrap();
-        for entry in &removed {
-            lookup.remove(&entry.address);
-            for page in entry.address >> PAGE_BITS..entry.end.div_ceil(PAGE_SIZE) {
-                let empty = if let Some(entries) = invalidations.pages.get_mut(&page) {
-                    entries.retain(|old| !Arc::ptr_eq(old, entry));
-                    entries.is_empty()
-                } else {
-                    false
+            loop {
+                let entry = invalidations
+                    .pages
+                    .get(&page)
+                    .and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|entry| entry.address < end && address < entry.end)
+                    })
+                    .cloned();
+                let Some(entry) = entry else {
+                    break;
                 };
-                if empty {
-                    invalidations.pages.remove(&page);
+                if entry.memory_marked.swap(false, Ordering::Relaxed) {
+                    self.0
+                        .memory
+                        .update_pages_cached_count(entry.address, entry.end - entry.address, -1)
+                        .expect("invalidated shader cache pages");
                 }
+                for entry_page in entry.address >> PAGE_BITS..entry.end.div_ceil(PAGE_SIZE) {
+                    let entries = invalidations
+                        .pages
+                        .get_mut(&entry_page)
+                        .expect("registered shader invalidation page");
+                    let index = entries
+                        .iter()
+                        .position(|old| Arc::ptr_eq(old, &entry))
+                        .expect("registered shader page entry");
+                    entries.remove(index);
+                }
+                invalidations.pending.push(entry);
             }
-            self.0
-                .memory
-                .update_pages_cached_count(entry.address, entry.end - entry.address, -1)
-                .expect("invalidated shader cache pages");
         }
     }
     pub fn invalidate_device_write(&self, memory: &DeviceMemory, address: u64, bytes: u64) {
@@ -183,15 +217,6 @@ impl<'a, 'm> ShaderMemory<'a, 'm> {
         self.address_space
             .read_into(address, output, self.access)
             .map_err(super::recompiler::invalid)
-    }
-    pub fn instruction(&self, address: u64) -> nixe_shader_recompiler::Result<u64> {
-        let address = self
-            .address_space
-            .address(address)
-            .map_err(super::recompiler::invalid)?;
-        self.address_space
-            .read_u64(address)
-            .map_err(|e| super::recompiler::invalid(e.to_string()))
     }
     pub fn read_data(
         &self,

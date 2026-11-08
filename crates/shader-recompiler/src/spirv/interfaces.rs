@@ -439,6 +439,10 @@ impl EmitContext<'_> {
                 }
             }
             Stage::Fragment => {
+                // Preserve outputs written by the guest even in depth-only passes,
+                // as Eden's DefineOutputs does. Vulkan discards locations without
+                // a color attachment; ShaderOutputNotConsumed is expected there.
+                // https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-fragmentoutput
                 for index in 0..8 {
                     let dual = self.runtime.dual_source_blend && index <= 1;
                     if !dual

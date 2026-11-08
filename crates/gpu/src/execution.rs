@@ -75,9 +75,8 @@ pub trait GpuExecution: OwnerMemory + 'static {
     fn device_uuid(&self) -> Option<[u8; 16]> {
         None
     }
-    /// Host video conversion can wait for a compiler dependency. False leaves
-    /// the effect unconsumed and retains its inputs until a subsequent wake.
-    fn convert_nv12(&mut self, conversion: &Self::Conversion) -> Result<bool, BackendRuntimeError>;
+    /// Host conversion records directly; executable waits belong to native recording.
+    fn convert_nv12(&mut self, conversion: &Self::Conversion) -> Result<(), BackendRuntimeError>;
     /// Direct graphics-owner operations. Their arguments are consumed now;
     /// native resource retention and fence publication stay in the renderer.
     fn report_memory(

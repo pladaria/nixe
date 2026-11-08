@@ -3,10 +3,11 @@
 pub use nixe_loader_executable::RelocationState;
 
 mod address_wait;
+mod core_signal;
 mod exception_dispatch;
 mod external_event;
+mod fiber;
 mod handle;
-mod kernel_operation;
 mod launch_plan;
 mod launcher;
 mod machine;
@@ -62,4 +63,6 @@ pub use nixe_cpu_jit::ThreadState as GuestCpuState;
 
 use external_event::ExternalEventInbox;
 
-pub use kernel_operation::{DispatchFault, KernelQueue, ThreadWait, WaitCompletion};
+pub use exception_dispatch::DispatchFault;
+
+pub use process::KernelRequest;

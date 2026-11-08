@@ -3,11 +3,7 @@
 use crate::residency::Resource;
 use crate::{cache::*, *};
 use ash::vk;
-use nixe_gpu::{
-    BackendRuntimeError, FrontendSubmissionId, GpuExecution, ResidentImage,
-    native::*,
-    shader_identity::{ContentId, ShaderNamespace},
-};
+use nixe_gpu::{BackendRuntimeError, FrontendSubmissionId, GpuExecution, ResidentImage, native::*};
 use rustc_hash::FxHashMap as HashMap;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 mod completion;
@@ -25,33 +21,14 @@ use crate::residency::color_blit_pipeline;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeExecutionStatistics {
     pub draws: u64,
-    pub prepared_draws: u64,
-    pub reused_graphics: u64,
-    pub warm_draws: u64,
     pub batches: u64,
     pub submits: u64,
     pub dispatches: u64,
     pub dynamic_state_refreshes: u64,
 }
-struct Drawing {
-    pipeline: Arc<NativePipeline>,
-    push: Vec<u8>,
-    recorded: bool,
-}
-#[derive(Default)]
-struct ChannelContext {
-    drawing: Option<Drawing>,
-    computing: Option<Computing>,
-    dynamic: maxwell::dynamic_state::ChannelState,
-}
-struct Computing {
-    pipeline: Arc<NativePipeline>,
-    push: Vec<u8>,
-}
 pub struct NativeGpuExecution {
     // The fencing thread joins before the native timeline is destroyed.
     state: NativeState,
-    shaders: Arc<ShaderCompiler>,
     compiler: Arc<PipelineCompiler>,
     residency: VulkanResidency,
 }
@@ -60,7 +37,6 @@ pub struct NativeGpuExecution {
 // owners together, through preparation and command recording.
 struct NativeExecution<'a> {
     state: &'a mut NativeState,
-    shaders: &'a ShaderCompiler,
     compiler: &'a Arc<PipelineCompiler>,
     residency: crate::residency::Residency<'a>,
 }
@@ -71,17 +47,11 @@ struct NativeState {
     frames: crate::presentation::Frames,
     host: Option<crate::presentation::Host>,
     descriptors: DescriptorCache,
-    // Stable indices select compiled metadata. Current parameters and native
-    // resource selections belong to the channel, independently of pipelines.
-    // Eden ChannelSetupCaches keeps channel_storage stable and switches a
-    // channel_state reference. Move ownership handles, never the slot banks.
-    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/control/channel_state_cache.inc
-    context: Box<ChannelContext>,
+    dynamic: maxwell::dynamic_state::DynamicState,
     current_context: Option<u64>,
-    contexts: HashMap<u64, Option<Box<ChannelContext>>>,
-    blit_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
-    blit_samplers: [Arc<Sampler>; 2],
-    video_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
+    blit_pipelines: HashMap<vk::Format, NativePipeline>,
+    blit_samplers: [Sampler; 2],
+    video_pipelines: HashMap<vk::Format, NativePipeline>,
     video_inputs: Option<crate::residency::Nv12Inputs>,
     draw_counter: u32,
     pub statistics: NativeExecutionStatistics,
@@ -96,7 +66,6 @@ impl NativeGpuExecution {
     fn execution(&mut self) -> NativeExecution<'_> {
         NativeExecution {
             state: &mut self.state,
-            shaders: &self.shaders,
             compiler: &self.compiler,
             residency: self.residency.access(),
         }
@@ -111,29 +80,13 @@ impl NativeGpuExecution {
     pub fn new(
         memory: nixe_memory::device_memory::DeviceMemory,
         device: VulkanDevice,
-        namespace: ShaderNamespace,
         configuration: CacheConfiguration,
         resident_bytes: u64,
     ) -> Result<Self, VulkanError> {
         let driver_pool = Arc::new(
-            CompilePool::with_name(
-                configuration.workers,
-                configuration.pending_jobs,
-                "gpu-pipeline",
-            )
-            .map_err(|e| VulkanError::Loader(e.to_string().into()))?,
-        );
-        // Long driver jobs must never starve the short source/SSA/SPIR-V jobs
-        // that discover their dependencies. Both queues retain explicit bounds.
-        let translation_pool = Arc::new(
-            CompilePool::with_name(1, configuration.pending_jobs, "shader-source")
+            CompilePool::with_name(configuration.workers, "gpu-pipeline")
                 .map_err(|e| VulkanError::Loader(e.to_string().into()))?,
         );
-        let shaders = Arc::new(ShaderCompiler::new(
-            namespace,
-            Arc::clone(&translation_pool),
-            &configuration,
-        ));
         let pipelines = Arc::new(PipelineCompiler::new(&device, driver_pool, &configuration)?);
         let descriptors = DescriptorCache::new(&device);
         let make_sampler = |filter| {
@@ -152,16 +105,14 @@ impl NativeGpuExecution {
             let mut cache = residency.access();
             let samplers = &mut cache.texture_cache.samplers;
             [
-                Arc::clone(samplers.get(&make_sampler(vk::Filter::NEAREST))?),
-                Arc::clone(samplers.get(&make_sampler(vk::Filter::LINEAR))?),
+                (samplers.get(&make_sampler(vk::Filter::NEAREST))?).clone(),
+                (samplers.get(&make_sampler(vk::Filter::LINEAR))?).clone(),
             ]
         };
         residency
             .access()
-            .enable_sample_conversion(Arc::clone(&pipelines));
-        residency
-            .access()
-            .enable_quad_indices(Arc::clone(&pipelines));
+            .enable_sample_conversion((pipelines).clone());
+        residency.access().enable_quad_indices((pipelines).clone());
         residency
             .memory()
             .enable_cpu_write_collection()
@@ -174,9 +125,8 @@ impl NativeGpuExecution {
                 frames: crate::presentation::Frames::new(residency.device())?,
                 host: None,
                 descriptors,
-                context: Box::default(),
+                dynamic: Default::default(),
                 current_context: None,
-                contexts: HashMap::default(),
                 blit_pipelines: HashMap::default(),
                 blit_samplers,
                 video_pipelines: HashMap::default(),
@@ -184,7 +134,6 @@ impl NativeGpuExecution {
                 draw_counter: 0,
                 statistics: Default::default(),
             },
-            shaders,
             compiler: pipelines,
             residency,
         })
@@ -206,10 +155,9 @@ impl NativeGpuExecution {
     }
     pub fn cache_monitor(&self) -> CacheMonitor {
         CacheMonitor::new([
-            ("shader cache", self.shaders.cache_counters()),
-            ("shader stages", self.shaders.stage_counters()),
-            ("pipeline cache", self.compiler.cache_counters()),
-            ("pipeline libraries", self.compiler.library_counters()),
+            ("shader cache", self.shader_cache().cache_counters()),
+            ("graphics pipelines", self.compiler.graphics_counters()),
+            ("compute pipelines", self.compiler.compute_counters()),
             ("descriptor sets", self.residency.descriptor_counters()),
         ])
     }
@@ -253,34 +201,29 @@ impl NativeExecution<'_> {
         )?);
         Ok(())
     }
-    fn prepare_nv12_pipeline(&mut self, format: vk::Format) -> Result<bool, VulkanError> {
+    fn prepare_nv12_pipeline(&mut self, format: vk::Format) -> Result<(), VulkanError> {
         if !self.state.video_pipelines.contains_key(&format) {
             let pending = match crate::residency::nv12_pipeline(self.compiler, format) {
                 Ok(pending) => pending,
-                Err(CompileError::Backpressure | CompileError::Budget) => return Ok(false),
                 Err(error) => {
                     return Err(VulkanError::Compilation(error.to_string().into()));
                 }
             };
             self.state.video_pipelines.insert(format, pending);
         }
-        Ok(true)
+        Ok(())
     }
-    fn ensure_blit_pipeline(&mut self, format: vk::Format) -> Result<bool, VulkanError> {
+    fn ensure_blit_pipeline(&mut self, format: vk::Format) -> Result<(), VulkanError> {
         if !self.state.blit_pipelines.contains_key(&format) {
             let pending = match color_blit_pipeline(self.compiler, format) {
                 Ok(p) => p,
-                Err(CompileError::Backpressure | CompileError::Budget) => return Ok(false),
                 Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
             };
             self.state.blit_pipelines.insert(format, pending);
         }
-        Ok(true)
+        Ok(())
     }
-    fn record_conversion(
-        &mut self,
-        conversion: &NativeNv12Conversion,
-    ) -> Result<bool, VulkanError> {
+    fn record_conversion(&mut self, conversion: &NativeNv12Conversion) -> Result<(), VulkanError> {
         self.residency.runtime.device.realize_deferred_clear()?;
         let NativeNv12Conversion {
             destination,
@@ -288,9 +231,7 @@ impl NativeExecution<'_> {
             transform,
             ..
         } = conversion;
-        if !self.prepare_nv12_pipeline(images::format(destination.description.format()))? {
-            return Ok(false);
-        }
+        self.prepare_nv12_pipeline(images::format(destination.description.format()))?;
         let extent = crate::residency::Nv12Inputs::dimensions(source)?;
         if self
             .state
@@ -313,9 +254,8 @@ impl NativeExecution<'_> {
             .unwrap()
             .upload(&mut self.residency, source)?;
         let output = self.allocate_guest_image(destination)?;
-        let pipeline = Arc::clone(
-            &self.state.video_pipelines[&images::format(destination.description.format())],
-        );
+        let pipeline =
+            (self.state.video_pipelines[&images::format(destination.description.format())]).clone();
         let conversion = self.residency.prepare_nv12(
             pipeline,
             &mut self.state.descriptors,
@@ -325,7 +265,7 @@ impl NativeExecution<'_> {
             *transform,
         )?;
         self.residency.convert_nv12(&conversion)?;
-        Ok(true)
+        Ok(())
     }
     fn flush_work(&mut self) -> Result<(), VulkanError> {
         // Desktop Eden records eight-operation chunks and submits a bounded
@@ -345,20 +285,18 @@ impl NativeExecution<'_> {
         Ok(())
     }
 
-    fn record(
+    fn record<T>(
         &mut self,
         frontend: FrontendSubmissionId,
-        operation: impl FnOnce(&mut Self) -> Result<bool, VulkanError>,
-    ) -> Result<bool, BackendRuntimeError> {
+        operation: impl FnOnce(&mut Self) -> Result<T, VulkanError>,
+    ) -> Result<T, BackendRuntimeError> {
         self.residency
             .invalidate_device_mappings()
             .map_err(runtime)?;
         let _trace = nixe_gpu::trace::span("backend_record", frontend.get(), 0, 1);
         #[cfg(feature = "performance-counters")]
         let started = std::time::Instant::now();
-        if !operation(self).map_err(runtime)? {
-            return Ok(false);
-        }
+        let result = operation(self).map_err(runtime)?;
         let work = self.residency.device().current_work();
         nixe_gpu::trace::detail_event("backend_accept", frontend.get(), 0, work.tick());
         #[cfg(feature = "performance-counters")]
@@ -371,7 +309,7 @@ impl NativeExecution<'_> {
         }
         self.state.statistics.batches += 1;
         self.state.statistics.submits = self.residency.device().submitted_tick();
-        Ok(true)
+        Ok(result)
     }
 }
 impl NativeGpuExecution {
@@ -408,13 +346,6 @@ impl NativeGpuExecution {
             nixe_gpu_maxwell::MAXWELL_BIND_GROUP_COUNT,
             nixe_gpu_maxwell::MAXWELL_CONSTANT_BUFFER_SLOT_COUNT,
         );
-        assert!(
-            self.state
-                .contexts
-                .insert(channel, Some(Box::default()))
-                .is_none(),
-            "native channel already exists"
-        );
     }
     fn bind_channel(&mut self, context: u64) {
         self.residency.runtime.buffer_bindings.bind_channel(context);
@@ -428,21 +359,12 @@ impl NativeGpuExecution {
         if self.state.current_context == Some(context) {
             return;
         }
-        let next = self
-            .state
-            .contexts
-            .get_mut(&context)
-            .expect("registered native channel")
-            .take()
-            .expect("inactive native channel has storage");
-        let previous = std::mem::replace(&mut self.state.context, next);
-        if let Some(id) = self.state.current_context.replace(context) {
-            *self
-                .state
-                .contexts
-                .get_mut(&id)
-                .expect("registered graphics context") = Some(previous);
+        if let Some(index) = self.residency.runtime.device.submission.recording {
+            self.residency.runtime.device.submission.slots[index]
+                .graphics_state
+                .invalidate();
         }
+        self.state.current_context = Some(context);
     }
     fn close_channel(&mut self, context: u64) {
         self.residency
@@ -456,10 +378,8 @@ impl NativeGpuExecution {
             .unwrap()
             .bindings
             .close_channel(context);
-        self.state.contexts.remove(&context);
         if self.state.current_context == Some(context) {
             self.state.current_context = None;
-            *self.state.context = ChannelContext::default();
         }
     }
 }
@@ -477,8 +397,6 @@ impl NativeExecution<'_> {
         &mut self,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<(), BackendRuntimeError> {
-        self.shaders.bind_wakeup(Arc::clone(&wake));
-        self.compiler.bind_wakeup(Arc::clone(&wake));
         self.state.fences.bind_wakeup(Arc::clone(&wake));
         if let Some(host) = &self.state.host {
             host.client.bind_wakeup(wake);
@@ -688,18 +606,14 @@ impl NativeExecution<'_> {
         );
         log::info!("native Vulkan preparation: {:?}", self.state.statistics);
         log::info!(
-            "native Vulkan execution: draws={} dispatches={} prepared-draws={} batches={} submits={} descriptors={:?}",
+            "native Vulkan execution: draws={} dispatches={} batches={} submits={} descriptors={:?}",
             self.state.statistics.draws,
             self.state.statistics.dispatches,
-            self.state.statistics.prepared_draws,
             self.state.statistics.batches,
             self.state.statistics.submits,
             self.state.descriptors.statistics()
         );
         self.residency.flush().map_err(runtime)?;
-        self.compiler
-            .checkpoint()
-            .map_err(|error| runtime(VulkanError::Compilation(error.to_string().into())))?;
         self.residency
             .device()
             .validation_monitor()
@@ -731,7 +645,7 @@ impl GpuExecution for NativeGpuExecution {
     fn end_command_list(&mut self) -> Result<(), BackendRuntimeError> {
         self.execution().end_command_list()
     }
-    fn convert_nv12(&mut self, conversion: &Self::Conversion) -> Result<bool, BackendRuntimeError> {
+    fn convert_nv12(&mut self, conversion: &Self::Conversion) -> Result<(), BackendRuntimeError> {
         self.execution().record(conversion.frontend, |native| {
             native.record_conversion(conversion)
         })
@@ -747,7 +661,7 @@ impl GpuExecution for NativeGpuExecution {
         self.execution().record(frontend, |native| {
             native.residency.runtime.device.realize_deferred_clear()?;
             native.residency.report_memory(target, 0, &bytes)?;
-            Ok(true)
+            Ok(())
         })?;
         if fence {
             self.fence_caches(None).map_err(runtime)?;
@@ -759,7 +673,7 @@ impl GpuExecution for NativeGpuExecution {
             .record(frontend, |native| {
                 native.residency.runtime.device.realize_deferred_clear()?;
                 native.residency.order_device()?;
-                Ok(true)
+                Ok(())
             })
             .map(|_| ())
     }
@@ -773,7 +687,7 @@ impl GpuExecution for NativeGpuExecution {
         self.execution()
             .record(frontend, |native| {
                 native.residency.runtime.device.realize_deferred_clear()?;
-                Ok(true)
+                Ok(())
             })
             .map(|_| ())
     }

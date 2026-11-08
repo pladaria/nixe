@@ -122,6 +122,7 @@ impl Recorder {
         device: Device,
         functions: Functions,
         queue_mutex: Arc<Mutex<()>>,
+        objects: Arc<crate::cache::NativeObjects>,
     ) -> Result<Self, VulkanError> {
         let state = Arc::new(RecordingState {
             queue: Mutex::new(WorkQueue {
@@ -144,13 +145,13 @@ impl Recorder {
                     active: None,
                 };
                 let mut context = Context {
+                    objects: Arc::clone(&objects),
                     device,
                     functions,
                     command: vk::CommandBuffer::null(),
                     upload: vk::CommandBuffer::null(),
                     slot: None,
-                    descriptors: crate::cache::DescriptorAllocator::default(),
-                    descriptor_pools: Default::default(),
+                    descriptors: crate::cache::DescriptorAllocator::new(objects),
                     progress: None,
                     timeline: vk::Semaphore::null(),
                 };
@@ -445,13 +446,13 @@ impl Drop for Recorder {
     }
 }
 pub(crate) struct Context {
+    pub(super) objects: Arc<crate::cache::NativeObjects>,
     pub device: Device,
     pub(super) functions: Functions,
     pub command: vk::CommandBuffer,
     pub upload: vk::CommandBuffer,
     pub(super) slot: Option<Arc<CommandSlot>>,
     pub(super) descriptors: crate::cache::DescriptorAllocator,
-    pub(super) descriptor_pools: rustc_hash::FxHashSet<usize>,
     pub(super) progress: Option<(Arc<SubmissionProgress>, u64)>,
     pub(super) timeline: vk::Semaphore,
 }
@@ -483,7 +484,6 @@ fn record_chunk(
         context.progress = Some((begin.progress, begin.tick));
         context.timeline = begin.timeline;
         context.slot = Some(begin.slot);
-        context.descriptor_pools.clear();
         match context.slot.as_ref().unwrap().begin(&context.device) {
             Ok([command, upload]) => {
                 context.command = command;

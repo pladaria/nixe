@@ -9,7 +9,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub struct Sampler {
+pub type Sampler = super::NativeObject<SamplerData>;
+pub struct SamplerData {
     owner: Arc<DeviceOwner>,
     pub(crate) handle: vk::Sampler,
 }
@@ -17,7 +18,7 @@ impl Sampler {
     pub fn new(
         device: &VulkanDevice,
         info: &vk::SamplerCreateInfo<'_>,
-    ) -> Result<Arc<Self>, VulkanError> {
+    ) -> Result<Self, VulkanError> {
         if info.anisotropy_enable != 0
             && (device.profile().core.sampler_anisotropy == 0
                 || info.max_anisotropy > device.profile().limits.max_sampler_anisotropy)
@@ -28,13 +29,13 @@ impl Sampler {
         }
         let handle = unsafe { device.owner.device.create_sampler(info, None) }
             .map_err(|e| VulkanError::vk("native sampler", e))?;
-        Ok(Arc::new(Self {
+        Ok(device.objects.sampler(SamplerData {
             owner: Arc::clone(&device.owner),
             handle,
         }))
     }
 }
-impl Drop for Sampler {
+impl Drop for SamplerData {
     fn drop(&mut self) {
         unsafe {
             self.owner.device.destroy_sampler(self.handle, None);
@@ -63,9 +64,9 @@ pub enum DescriptorResource {
     CombinedImageSampler {
         view: Arc<AllocatedImageView>,
         layout: vk::ImageLayout,
-        sampler: Arc<Sampler>,
+        sampler: Sampler,
     },
-    Sampler(Arc<Sampler>),
+    Sampler(Sampler),
 }
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum ResourceKey {
@@ -120,8 +121,8 @@ impl DescriptorResource {
         })
     }
 }
-// A cached descriptor identity keeps weak object identities, not CPU reservations.
-// The weak control blocks prevent handle/address reuse from matching dead objects.
+// Recyclable buffers/views use weak identities to prevent address reuse matches.
+// Sampler identities are stable for the renderer lifetime.
 struct CachedResource {
     key: ResourceKey,
     references: ResourceReferences,
@@ -130,8 +131,8 @@ enum ResourceReferences {
     Null,
     Buffer(Weak<AllocatedBuffer>),
     Image(Weak<AllocatedImageView>),
-    Combined(Weak<AllocatedImageView>, Weak<Sampler>),
-    Sampler(Weak<Sampler>),
+    Combined(Weak<AllocatedImageView>, usize),
+    Sampler(usize),
 }
 impl CachedResource {
     fn new(resource: &DescriptorResource) -> Self {
@@ -145,11 +146,9 @@ impl CachedResource {
                 ResourceReferences::Image(Arc::downgrade(view))
             }
             DescriptorResource::CombinedImageSampler { view, sampler, .. } => {
-                ResourceReferences::Combined(Arc::downgrade(view), Arc::downgrade(sampler))
+                ResourceReferences::Combined(Arc::downgrade(view), sampler.identity())
             }
-            DescriptorResource::Sampler(sampler) => {
-                ResourceReferences::Sampler(Arc::downgrade(sampler))
-            }
+            DescriptorResource::Sampler(sampler) => ResourceReferences::Sampler(sampler.identity()),
         };
         Self {
             key: resource.key(),
@@ -169,14 +168,11 @@ impl CachedResource {
                     weak.as_ptr() == Arc::as_ptr(view)
                 }
                 (
-                    ResourceReferences::Combined(weak_view, weak_sampler),
+                    ResourceReferences::Combined(weak_view, sampler_id),
                     DescriptorResource::CombinedImageSampler { view, sampler, .. },
-                ) => {
-                    weak_view.as_ptr() == Arc::as_ptr(view)
-                        && weak_sampler.as_ptr() == Arc::as_ptr(sampler)
-                }
-                (ResourceReferences::Sampler(weak), DescriptorResource::Sampler(sampler)) => {
-                    weak.as_ptr() == Arc::as_ptr(sampler)
+                ) => weak_view.as_ptr() == Arc::as_ptr(view) && *sampler_id == sampler.identity(),
+                (ResourceReferences::Sampler(sampler_id), DescriptorResource::Sampler(sampler)) => {
+                    *sampler_id == sampler.identity()
                 }
                 _ => false,
             }
@@ -199,7 +195,7 @@ impl Drop for DescriptorPool {
     }
 }
 struct PageSlot {
-    page: Arc<DescriptorPool>,
+    page: super::NativeObject<DescriptorPool>,
     allocated: usize,
 }
 struct LayoutSets {
@@ -226,7 +222,6 @@ impl Bank {
 }
 pub(crate) struct NativeSet {
     pub handle: vk::DescriptorSet,
-    pub pool: Arc<DescriptorPool>,
     tick: u64,
     counters: nixe_gpu::cache_counters::CacheCounters,
 }
@@ -246,7 +241,7 @@ pub(crate) union DescriptorEntry {
 pub struct BindingRecord {
     pub layout: Arc<PipelineLayout>,
     pub(crate) resources: Vec<DescriptorResource>,
-    entries: Vec<DescriptorEntry>,
+    pub(crate) entries: Vec<DescriptorEntry>,
     metrics: Arc<NativeMetrics>,
     counters: nixe_gpu::cache_counters::CacheCounters,
 }
@@ -273,14 +268,16 @@ pub struct DescriptorCache {
 }
 /// Mutated exclusively by the Vulkan recording worker.
 pub(crate) struct DescriptorAllocator {
+    objects: Arc<super::NativeObjects>,
     layouts: HashMap<vk::DescriptorSetLayout, LayoutSets>,
     banks: Vec<Bank>,
     queue_metrics: Arc<NativeMetrics>,
     queue_counters: nixe_gpu::cache_counters::CacheCounters,
 }
-impl Default for DescriptorAllocator {
-    fn default() -> Self {
+impl DescriptorAllocator {
+    pub(crate) fn new(objects: Arc<super::NativeObjects>) -> Self {
         Self {
+            objects,
             layouts: HashMap::default(),
             banks: Vec::new(),
             queue_metrics: Arc::default(),
@@ -655,17 +652,6 @@ impl DescriptorAllocator {
     ) -> Result<usize, crate::queue::progress::NativeFailure> {
         let owner = &layout.owner;
         let sets_per_pool = layout.sets_per_pool;
-        if self
-            .layouts
-            .get(&layout.set)
-            .is_none_or(|sets| sets.layout.strong_count() == 0)
-        {
-            self.layouts
-                .retain(|_, sets| sets.layout.strong_count() != 0);
-            for bank in &mut self.banks {
-                bank.pages.retain(|page| Arc::strong_count(&page.page) > 1);
-            }
-        }
         if !self.layouts.contains_key(&layout.set) {
             let mut counts = HashMap::<vk::DescriptorType, u32>::default();
             for binding in &layout.key.bindings {
@@ -733,7 +719,7 @@ impl DescriptorAllocator {
             .last()
             .is_none_or(|page| page.allocated + SETS_GROW > sets_per_pool)
         {
-            Self::grow_pool(owner, bank, sets_per_pool)?;
+            Self::grow_pool(&self.objects, owner, bank, sets_per_pool)?;
         }
         let layouts = [layout.set; SETS_GROW];
         let allocate = |page: &DescriptorPool| unsafe {
@@ -746,7 +732,7 @@ impl DescriptorAllocator {
         let sets = match allocate(&bank.pages.last().unwrap().page) {
             Ok(sets) => sets,
             Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {
-                Self::grow_pool(owner, bank, sets_per_pool)?;
+                Self::grow_pool(&self.objects, owner, bank, sets_per_pool)?;
                 allocate(&bank.pages.last().unwrap().page).map_err(|e| {
                     crate::queue::progress::NativeFailure::Vulkan {
                         operation: "vkAllocateDescriptorSets",
@@ -767,7 +753,6 @@ impl DescriptorAllocator {
         for set in sets {
             allocator.sets.push(NativeSet {
                 handle: set,
-                pool: Arc::clone(&page.page),
                 tick: 0,
                 counters: counters.clone(),
             });
@@ -780,6 +765,7 @@ impl DescriptorAllocator {
         Ok(first)
     }
     fn grow_pool(
+        objects: &Arc<super::NativeObjects>,
         owner: &Arc<DeviceOwner>,
         bank: &mut Bank,
         count: usize,
@@ -806,7 +792,7 @@ impl DescriptorAllocator {
             result: e,
         })?;
         bank.pages.push(PageSlot {
-            page: Arc::new(DescriptorPool {
+            page: objects.descriptor_pool(DescriptorPool {
                 owner: Arc::clone(owner),
                 handle,
             }),
@@ -817,132 +803,153 @@ impl DescriptorAllocator {
 }
 
 impl VulkanDevice {
-    pub fn bind_native_pipeline(
+    /// Capture one ordered pipeline configuration, as Eden ConfigureDraw/Configure.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp#L627-L689
+    pub(crate) fn configure_pipeline(
         &mut self,
-        pipeline: &Arc<NativePipeline>,
+        pipeline: &NativePipeline,
+        push: &[u8],
+        record: Option<&Arc<BindingRecord>>,
+        dynamic_offsets: &[u32],
+        entries: Option<super::DescriptorUpdate>,
     ) -> Result<(), VulkanError> {
         if !Arc::ptr_eq(&self.owner, &pipeline.owner) {
             return Err(VulkanError::InvalidResource("foreign native pipeline"));
         }
+        let limits = self.profile().limits;
+        let layout = &pipeline.layout;
+        if push.len() < layout.key.push_bytes as usize
+            || !push.len().is_multiple_of(4)
+            || push.len() > limits.max_push_constants_size as usize
+        {
+            return Err(VulkanError::InvalidResource(
+                "push constants must cover the compiled ABI within host size/alignment limits",
+            ));
+        }
+        let entries = entries.filter(|entries| !entries.is_empty());
+        let record = record.filter(|_| entries.is_none());
         let index = self.recording_slot()?;
         let slot = &mut self.submission.slots[index];
-        let bound = if pipeline.bind_point == vk::PipelineBindPoint::COMPUTE {
+        let compute = pipeline.bind_point == vk::PipelineBindPoint::COMPUTE;
+        let bound = if compute {
             &mut slot.bound_compute
         } else {
             &mut slot.bound_graphics
         };
-        // Slot retention prevents this identity from being recycled while any
-        // queued bind or native use still refers to the pipeline object.
-        let identity = Arc::as_ptr(pipeline) as usize;
-        if *bound == identity {
-            return Ok(());
+        let identity = pipeline.identity();
+        let bind_pipeline = *bound != identity;
+        if bind_pipeline {
+            *bound = identity;
+            self.submission.statistics.pipeline_binds += 1;
         }
-        unsafe {
-            self.dispatch
-                .cmd_bind_pipeline(pipeline.bind_point, Arc::clone(pipeline));
-        }
-        self.submission.statistics.pipeline_binds += 1;
-        *bound = identity;
-        if slot.pipeline_handles.insert(identity) {
-            slot.native_pipelines.push(Arc::clone(pipeline));
-        }
-        Ok(())
-    }
-    pub fn bind_native_descriptors(
-        &mut self,
-        pipeline: &NativePipeline,
-        record: &Arc<BindingRecord>,
-        dynamic_offsets: &[u32],
-    ) -> Result<(), VulkanError> {
-        if !Arc::ptr_eq(&self.owner, &record.layout.owner)
-            || !Arc::ptr_eq(&self.owner, &pipeline.owner)
-        {
-            return Err(VulkanError::InvalidResource(
-                "foreign native descriptor/pipeline",
-            ));
-        }
-        let limits = self.profile().limits;
-        let index = self.recording_slot()?;
-        let slot = &mut self.submission.slots[index];
-        let bound = if pipeline.bind_point == vk::PipelineBindPoint::COMPUTE {
-            &mut slot.bound_compute_binding
+        let (bound, bound_layout, bound_offsets) = if compute {
+            (
+                &mut slot.bound_compute_binding,
+                &mut slot.bound_compute_layout,
+                &mut slot.bound_compute_offsets,
+            )
         } else {
-            &mut slot.bound_graphics_binding
+            (
+                &mut slot.bound_graphics_binding,
+                &mut slot.bound_graphics_layout,
+                &mut slot.bound_graphics_offsets,
+            )
         };
-        let bound_layout = if pipeline.bind_point == vk::PipelineBindPoint::COMPUTE {
-            &mut slot.bound_compute_layout
-        } else {
-            &mut slot.bound_graphics_layout
-        };
-        let bound_offsets = if pipeline.bind_point == vk::PipelineBindPoint::COMPUTE {
-            &mut slot.bound_compute_offsets
-        } else {
-            &mut slot.bound_graphics_offsets
-        };
-        let identity = Arc::as_ptr(record) as usize;
-        if !pipeline.layout.push_descriptor
-            && *bound == identity
-            && *bound_layout == pipeline.layout.handle
-            && *bound_offsets == dynamic_offsets
-        {
-            return Ok(());
-        }
-        if record.layout.key != pipeline.layout.key
-            || record.layout.push_descriptor != pipeline.layout.push_descriptor
-        {
-            return Err(VulkanError::InvalidResource(
-                "native descriptor/pipeline ABI mismatch",
-            ));
-        }
-        if dynamic_offsets.len() != record.layout.dynamic_bindings.len() {
-            return Err(VulkanError::InvalidResource(
-                "native dynamic descriptor offset count mismatch",
-            ));
-        }
-        for (&index, &dynamic) in record.layout.dynamic_bindings.iter().zip(dynamic_offsets) {
-            if matches!(record.resources[index], DescriptorResource::NullBuffer) && dynamic == 0 {
-                continue;
-            }
-            let DescriptorResource::Buffer {
-                buffer,
-                offset,
-                range,
-            } = &record.resources[index]
-            else {
-                unreachable!()
-            };
-            let alignment =
-                layout::buffer_alignment(record.layout.key.bindings[index].kind, &limits);
-            if !u64::from(dynamic).is_multiple_of(alignment)
-                || offset
-                    .checked_add(u64::from(dynamic))
-                    .and_then(|n| n.checked_add(*range))
-                    .is_none_or(|end| end > buffer.size())
+        let mut bind_record = None;
+        if entries.is_some() {
+            // A queued update can disturb a previous set's layout. Its old
+            // identity must not suppress the next captured-record binding.
+            *bound = 0;
+            self.submission.statistics.descriptor_binds += 1;
+            self.submission.statistics.descriptor_payload_captures += 1;
+        } else if let Some(record) = record {
+            let identity = Arc::as_ptr(record) as usize;
+            if layout.push_descriptor
+                || *bound != identity
+                || *bound_layout != layout.handle
+                || *bound_offsets != dynamic_offsets
             {
-                return Err(VulkanError::InvalidResource(
-                    "dynamic descriptor offset exceeds buffer bounds/alignment",
-                ));
+                if !Arc::ptr_eq(&self.owner, &record.layout.owner) {
+                    return Err(VulkanError::InvalidResource("foreign native descriptor"));
+                }
+                if record.layout.key != layout.key
+                    || record.layout.push_descriptor != layout.push_descriptor
+                {
+                    return Err(VulkanError::InvalidResource(
+                        "native descriptor/pipeline ABI mismatch",
+                    ));
+                }
+                if dynamic_offsets.len() != record.layout.dynamic_bindings.len() {
+                    return Err(VulkanError::InvalidResource(
+                        "native dynamic descriptor offset count mismatch",
+                    ));
+                }
+                for (&index, &dynamic) in record.layout.dynamic_bindings.iter().zip(dynamic_offsets)
+                {
+                    if matches!(record.resources[index], DescriptorResource::NullBuffer)
+                        && dynamic == 0
+                    {
+                        continue;
+                    }
+                    let DescriptorResource::Buffer {
+                        buffer,
+                        offset,
+                        range,
+                    } = &record.resources[index]
+                    else {
+                        unreachable!()
+                    };
+                    let alignment =
+                        layout::buffer_alignment(record.layout.key.bindings[index].kind, &limits);
+                    if !u64::from(dynamic).is_multiple_of(alignment)
+                        || offset
+                            .checked_add(u64::from(dynamic))
+                            .and_then(|n| n.checked_add(*range))
+                            .is_none_or(|end| end > buffer.size())
+                    {
+                        return Err(VulkanError::InvalidResource(
+                            "dynamic descriptor offset exceeds buffer bounds/alignment",
+                        ));
+                    }
+                }
+                *bound = identity;
+                *bound_layout = layout.handle;
+                bound_offsets.clear();
+                bound_offsets.extend_from_slice(dynamic_offsets);
+                bind_record = Some(Arc::clone(record));
+                self.submission.statistics.descriptor_binds += 1;
             }
         }
-        unsafe {
-            if pipeline.layout.push_descriptor {
-                self.dispatch
-                    .push_descriptors(&pipeline.layout, &record.entries);
-            } else {
-                self.dispatch.bind_descriptors(
-                    pipeline.bind_point,
-                    Arc::clone(record),
-                    dynamic_offsets,
+        let push = &push[..layout.key.push_bytes as usize];
+        let update_push = !push.is_empty()
+            && (slot.push_layout != layout.handle
+                || slot.push_stages != layout.key.push_stages
+                || slot.push_bytes != push);
+        if update_push {
+            slot.push_layout = layout.handle;
+            slot.push_stages = layout.key.push_stages;
+            slot.push_bytes.clear();
+            slot.push_bytes.extend_from_slice(push);
+            self.submission.statistics.push_updates += 1;
+        }
+        let update_descriptors = entries.is_some() || bind_record.is_some();
+        if bind_pipeline || update_descriptors || update_push {
+            // The slot retains native resources through GPU completion; the
+            // closure also owns everything it reads while CPU recording runs.
+            unsafe {
+                self.dispatch.configure_pipeline(
+                    pipeline.reference(),
+                    bind_pipeline,
+                    bind_record,
+                    entries,
+                    if update_descriptors {
+                        dynamic_offsets
+                    } else {
+                        &[]
+                    },
+                    if update_push { push } else { &[] },
                 );
             }
-        }
-        self.submission.statistics.descriptor_binds += 1;
-        bound_offsets.clear();
-        bound_offsets.extend_from_slice(dynamic_offsets);
-        *bound = identity;
-        *bound_layout = pipeline.layout.handle;
-        if slot.binding_handles.insert(identity) {
-            slot.native_bindings.push(Arc::clone(record));
         }
         Ok(())
     }
@@ -965,8 +972,7 @@ struct SamplerKey {
     unnormalized: bool,
     extensions: SamplerExtensions,
 }
-/// Immutable sampler objects share the same completion lifetime through binding
-/// records. Hashing/creation only occurs when sampler state changes.
+/// Explicit custom border components included in immutable sampler identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CustomBorderColor {
     /// Raw components preserve float NaNs/signed zero and integer border colors.
@@ -987,13 +993,14 @@ impl Default for SamplerExtensions {
     }
 }
 pub struct SamplerCache {
+    objects: Arc<super::NativeObjects>,
     owner: Arc<DeviceOwner>,
     features: vk::PhysicalDeviceFeatures,
     limits: vk::PhysicalDeviceLimits,
     // Eden keeps sampler objects in slot_samplers for the texture-cache lifetime.
     // Push descriptor payloads therefore need no per-draw sampler leases.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
-    entries: HashMap<SamplerKey, Arc<Sampler>>,
+    entries: HashMap<SamplerKey, Sampler>,
     custom_border: bool,
     custom_without_format: bool,
     reduction: bool,
@@ -1001,6 +1008,7 @@ pub struct SamplerCache {
 impl SamplerCache {
     pub fn new(device: &VulkanDevice) -> Self {
         Self {
+            objects: Arc::clone(&device.objects),
             owner: Arc::clone(&device.owner),
             features: device.profile().core,
             limits: device.profile().limits,
@@ -1010,14 +1018,14 @@ impl SamplerCache {
             reduction: device.profile().sampler_filter_minmax,
         }
     }
-    pub fn get(&mut self, info: &vk::SamplerCreateInfo<'_>) -> Result<&Arc<Sampler>, VulkanError> {
+    pub fn get(&mut self, info: &vk::SamplerCreateInfo<'_>) -> Result<&Sampler, VulkanError> {
         self.get_extended(info, SamplerExtensions::default())
     }
     pub fn get_extended(
         &mut self,
         info: &vk::SamplerCreateInfo<'_>,
         extensions: SamplerExtensions,
-    ) -> Result<&Arc<Sampler>, VulkanError> {
+    ) -> Result<&Sampler, VulkanError> {
         // Extension state is owned and included in the key, never pointer-hashed.
         if !info.p_next.is_null() {
             return Err(VulkanError::InvalidResource(
@@ -1136,7 +1144,7 @@ impl SamplerCache {
         }
         let handle = unsafe { self.owner.device.create_sampler(&info, None) }
             .map_err(|e| VulkanError::vk("cached native sampler", e))?;
-        let sampler = Arc::new(Sampler {
+        let sampler = self.objects.sampler(SamplerData {
             owner: Arc::clone(&self.owner),
             handle,
         });

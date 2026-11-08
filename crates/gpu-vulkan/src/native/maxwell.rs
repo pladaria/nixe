@@ -17,7 +17,7 @@ pub(in crate::native) mod registers;
 mod targets;
 pub(in crate::native) mod textures;
 pub(in crate::native) mod vertex_input;
-use super::pipeline_cache::{PipelineCache, PipelineContext};
+use super::pipeline_cache::PipelineCache;
 use identity::ImageKey;
 use model::MaxwellGpuMemory;
 use model::{MaxwellFrontend, MaxwellSubmissionExecutionError as Error};
@@ -30,7 +30,7 @@ pub struct NativeFrontendStatistics {
     pub prepared_graphics: u64,
     pub fixed_state_refreshes: u64,
 }
-/// RefreshStages owns the channel's current per-stage shader facts. Pipelines
+/// RefreshStages owns the renderer's current per-stage shader facts. Pipelines
 /// are keyed by raw bytecode hashes, not by captured binding combinations.
 #[derive(Default)]
 pub(in crate::native) struct GraphicsShaders {
@@ -38,40 +38,21 @@ pub(in crate::native) struct GraphicsShaders {
     pub(in crate::native) infos:
         [Option<Arc<model::recompiler::ShaderInfo>>; model::MAXWELL_PIPELINE_SHADER_COUNT],
     pub(in crate::native) groups: [Option<u8>; 5],
-    pub(in crate::native) pixel_depth: bool,
     pub(in crate::native) tessellation_enabled: bool,
-}
-// Canonical dirty flags and current bindings belong to the channel. Immutable content
-// caches and the compiler below belong to the command owner and survive switches.
-// ChannelSetupCaches keeps each channel at a stable address and selects it at
-// the execution boundary, before commands consume any cache state.
-// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/control/channel_state_cache.inc
-struct ChannelPreparation {
-    render_enabled: bool,
-    shaders: Option<GraphicsShaders>,
-    pipeline: PipelineContext,
 }
 pub struct MaxwellVulkanRasterizer {
     renderer: Rc<RefCell<Option<super::NativeGpuExecution>>>,
     shader_cache: model::recompiler::ShaderCache,
+    shaders: Option<GraphicsShaders>,
     pipelines: PipelineCache,
     profile: Arc<crate::DeviceProfile>,
     next: u64,
     pub statistics: NativeFrontendStatistics,
     image_views: nixe_gpu::WorkingSet<ImageKey, GuestImage>,
 
-    channel: Box<ChannelPreparation>,
+    render_enabled: bool,
     current_channel: Option<model::MaxwellChannelId>,
-    channels: std::collections::BTreeMap<model::MaxwellChannelId, Option<Box<ChannelPreparation>>>,
-}
-impl ChannelPreparation {
-    fn new() -> Self {
-        Self {
-            render_enabled: true,
-            shaders: None,
-            pipeline: PipelineContext::default(),
-        }
-    }
+    channels: std::collections::BTreeMap<model::MaxwellChannelId, Option<bool>>,
 }
 fn rendered_description(
     info: AttachmentInfo,
@@ -92,33 +73,32 @@ impl MaxwellVulkanRasterizer {
             let backend = backend.as_ref().expect("installed renderer");
             (
                 backend.shader_cache(),
-                PipelineCache::new(Arc::clone(&backend.shaders), Arc::clone(&backend.compiler)),
+                PipelineCache::new(Arc::clone(&backend.compiler)),
                 backend.residency.device().profile_handle(),
             )
         };
-        let channel = Box::new(ChannelPreparation::new());
         Self {
             renderer,
             shader_cache,
+            shaders: None,
             pipelines,
             profile,
             next: 1,
             statistics: Default::default(),
             image_views: nixe_gpu::WorkingSet::new(4096, IMAGE_VIEW_BYTES),
 
-            channel,
+            render_enabled: true,
             current_channel: None,
             channels: Default::default(),
         }
     }
-    pub fn set_capture_cache(
+    pub fn load_disk_resources(
         &mut self,
         directory: &std::path::Path,
-        namespace: nixe_gpu::shader_identity::ContentId,
-        budget: u64,
+        stop: &std::sync::atomic::AtomicBool,
     ) {
         self.pipelines
-            .set_capture_cache(directory, namespace, &self.profile, budget);
+            .load_disk_resources(directory, &self.profile, stop);
     }
     fn conversion_image(
         &mut self,
@@ -148,7 +128,7 @@ impl MaxwellVulkanRasterizer {
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<(), Error> {
         let dirty = state.graphics_dirty().take(GraphicsDirty::SHADERS) != 0;
-        if !dirty && self.channel.shaders.is_some() {
+        if !dirty && self.shaders.is_some() {
             return Ok(());
         }
         let mut shaders = GraphicsShaders::default();
@@ -156,6 +136,9 @@ impl MaxwellVulkanRasterizer {
             let binding = state.shader_bindings();
             let pipeline = binding.pipeline(index);
             if pipeline.enabled().value() != Some(&true) {
+                continue;
+            }
+            if index == 5 && state.register_words()[0x037c / 4] == 0 {
                 continue;
             }
             let source = model::recompiler::graphics_source(state, index).map_err(compilation)?;
@@ -170,10 +153,6 @@ impl MaxwellVulkanRasterizer {
                     .make_shader_info(space, device, &request, access)
                     .map_err(compilation)?
             };
-            if source.stage == nixe_shader_recompiler::Stage::Fragment {
-                shaders.pixel_depth = info.header.fragment_depth()
-                    || info.header.fragment_input_system_b().position_z();
-            }
             let stage = nixe_gpu::shader_compilation::neutral_stage(source.stage) as usize;
             shaders.tessellation_enabled |= matches!(
                 source.stage,
@@ -189,7 +168,7 @@ impl MaxwellVulkanRasterizer {
             shaders.hashes[index] = info.unique_hash;
             shaders.infos[index] = Some(info);
         }
-        self.channel.shaders = Some(shaders);
+        self.shaders = Some(shaders);
         Ok(())
     }
     fn remember_image(
@@ -242,16 +221,18 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             .expect("installed renderer")
             .create_channel(channel.get());
         assert!(
-            self.channels
-                .insert(channel, Some(Box::new(ChannelPreparation::new())),)
-                .is_none(),
+            self.channels.insert(channel, Some(true)).is_none(),
             "frontend channel already exists"
         );
     }
-    fn bind_channel(&mut self, channel: model::MaxwellChannelId) {
+    fn bind_channel(&mut self, channel: model::MaxwellChannelId, state: &MaxwellThreeDState) {
         if self.current_channel == Some(channel) {
             return;
         }
+        // Bind the canonical dirty bank without discarding global shader/key
+        // selections, as RasterizerVulkan::BindChannel/StateTracker::InvalidateState.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L2057-L2070
+        state.graphics_dirty().mark(GraphicsDirty::ALL);
         self.renderer
             .borrow_mut()
             .as_mut()
@@ -263,7 +244,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             .expect("registered frontend channel")
             .take()
             .expect("inactive frontend channel has storage");
-        let previous = std::mem::replace(&mut self.channel, next);
+        let previous = std::mem::replace(&mut self.render_enabled, next);
         if let Some(id) = self.current_channel.replace(channel) {
             *self.channels.get_mut(&id).unwrap() = Some(previous);
         }
@@ -305,25 +286,23 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
         self.channels.remove(&channel);
         if self.current_channel == Some(channel) {
             self.current_channel = None;
-            *self.channel = ChannelPreparation::new();
+            self.render_enabled = true;
         }
     }
 
-    fn try_draw(
+    fn draw(
         &mut self,
         state: &MaxwellThreeDState,
         draw: &MaxwellThreeDDrawState,
         space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
         access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<bool, Error> {
+    ) -> Result<(), Error> {
         self.refresh_shaders(state, space, access)?;
-        let shaders = self.channel.shaders.as_ref().unwrap();
-        if !self
-            .pipelines
+        let shaders = self.shaders.as_ref().unwrap();
+        self.pipelines
             .current_graphics(
                 &self.profile,
-                &mut self.channel.pipeline,
                 &mut self.statistics,
                 shaders,
                 state,
@@ -331,28 +310,23 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
                 space,
                 access,
             )
-            .map_err(compilation)?
-        {
-            return Ok(false);
-        }
+            .map_err(compilation)?;
         let slot = self
-            .channel
-            .pipeline
+            .pipelines
             .current_graphics
             .expect("selected graphics pipeline");
         let pipeline = &self.pipelines.graphics_pipelines[slot];
         let groups = shaders.groups;
-        let pixel_depth = shaders.pixel_depth;
         let mut renderer = self.renderer.borrow_mut();
         let renderer = renderer.as_mut().expect("installed renderer");
         self.statistics.draws += 1;
         let result = renderer
             .execution()
             .record(frontend, |native| {
-                pipeline.draw(native, state, draw, space, groups, pixel_depth)
+                pipeline.draw(native, state, draw, space, groups)
             })
             .map_err(compilation);
-        if matches!(result, Ok(true)) {
+        if result.is_ok() {
             state.graphics_dirty().take(GraphicsDirty::PARAMETERS);
         }
         result
@@ -378,13 +352,13 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             .map_err(compilation)
     }
 
-    fn try_launch(
+    fn launch(
         &mut self,
         launch: &model::MaxwellResolvedComputeLaunch,
         space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
         access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<bool, Error> {
+    ) -> Result<(), Error> {
         launch.validate_execution().map_err(Error::ComputeLaunch)?;
         let address = space
             .address(launch.shader_address())
@@ -397,7 +371,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
                 .make_shader_info(space, address, &launch.capture_request(), access)
                 .map_err(compilation)?
         };
-        let Some(slot) = self
+        let slot = self
             .pipelines
             .current_compute(
                 &self.profile,
@@ -407,10 +381,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
                 access,
                 &mut self.statistics,
             )
-            .map_err(compilation)?
-        else {
-            return Ok(false);
-        };
+            .map_err(compilation)?;
         let pipeline = &self.pipelines.compute_pipelines[slot];
         let mut renderer = self.renderer.borrow_mut();
         let renderer = renderer.as_mut().expect("installed renderer");
@@ -421,12 +392,12 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             })
             .map_err(compilation)
     }
-    fn try_solid(
+    fn solid(
         &mut self,
         request: &model::engines::MaxwellTwoDSolidOperation,
         space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
-    ) -> Result<bool, Error> {
+    ) -> Result<(), Error> {
         let info = solid_image_info(request, space).map_err(Error::ThreeDResource)?;
         let role = if request.zeta {
             MaxwellThreeDResourceRole::DepthStencilTarget
@@ -457,7 +428,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
                     },
                     value,
                 )?;
-                Ok(true)
+                Ok(())
             })
             .map_err(compilation)
     }
@@ -478,12 +449,12 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             })
             .map_err(compilation)
     }
-    fn try_blit(
+    fn blit(
         &mut self,
         request: &model::MaxwellTwoDBlitOperation,
         space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
-    ) -> Result<bool, Error> {
+    ) -> Result<(), Error> {
         use model::engines::twod::blit::BlitKind;
         let infos = blit_image_infos(request, space).map_err(Error::ThreeDResource)?;
         let source_description =
@@ -578,12 +549,10 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
                 } else {
                     None
                 };
-                if sampling.is_some()
-                    && !native.ensure_blit_pipeline(super::images::format(
+                if sampling.is_some() {
+                    native.ensure_blit_pipeline(super::images::format(
                         destination_description.format(),
-                    ))?
-                {
-                    return Ok(false);
+                    ))?;
                 }
                 native.residency.runtime.device.realize_deferred_clear()?;
                 let retained = native.residency.runtime.constructing.len();
@@ -618,7 +587,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
                             resolve,
                             sampling,
                         )?;
-                        Ok(true)
+                        Ok(())
                     })();
                 native.residency.runtime.constructing.truncate(retained);
                 result
@@ -626,7 +595,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             .map_err(compilation)
     }
     fn render_enabled(&self) -> bool {
-        self.channel.render_enabled
+        self.render_enabled
     }
     fn update_render_condition(
         &mut self,
@@ -644,7 +613,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
         // mode is still an evaluation; override writes and ordinary draws do
         // not reevaluate it or reread query RAM.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
-        self.channel.render_enabled = match mode {
+        self.render_enabled = match mode {
             Mode::Enabled => true,
             Mode::Disabled => false,
             _ => {

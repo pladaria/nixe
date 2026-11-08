@@ -1,10 +1,5 @@
 use super::{EmitContext, Id};
-use crate::{
-    Result,
-    artifact::{HostUniformLayout, ShaderInfo},
-    ir::Program,
-    types::Stage,
-};
+use crate::{Result, artifact::ShaderInfo, ir::Program, types::Stage};
 use spirv::{Capability as C, Decoration as D, Op, StorageClass as S};
 impl EmitContext<'_> {
     pub(super) fn global_interface(&mut self, id: Id) {
@@ -169,7 +164,15 @@ impl EmitContext<'_> {
                 }
                 let structure = self.builder.type_struct(&members)?;
                 self.builder.decorate(structure, D::Block, &[])?;
-                for (i, offset) in [0, 16, 24].into_iter().take(members.len()).enumerate() {
+                for (i, offset) in [
+                    crate::host_abi::TEXTURE_MASK_OFFSET,
+                    crate::host_abi::IMAGE_MASK_OFFSET,
+                    crate::host_abi::DOWN_FACTOR_OFFSET,
+                ]
+                .into_iter()
+                .take(members.len())
+                .enumerate()
+                {
                     self.builder
                         .member_decorate(structure, i as u32, D::Offset, &[offset])?;
                 }
@@ -177,14 +180,11 @@ impl EmitContext<'_> {
                 let id = self.builder.variable(pointer, S::PushConstant, None)?;
                 self.objects.rescaling_push_constants = id;
                 self.global_interface(id);
-                self.host_uniforms
-                    .push(HostUniformLayout::RescalingPushConstants {
-                        texture_mask_offset: 0,
-                        texture_mask_words: 4,
-                        image_mask_offset: 16,
-                        image_mask_words: 2,
-                        down_factor_offset: (self.stage != Stage::Compute).then_some(24),
-                    });
+                self.push_constant_bytes = if self.stage == Stage::Compute {
+                    crate::host_abi::RESCALING_COMPUTE_BYTES
+                } else {
+                    crate::host_abi::RESCALING_GRAPHICS_BYTES
+                };
             } else {
                 let pointer = self
                     .builder
@@ -193,8 +193,6 @@ impl EmitContext<'_> {
                 self.builder.decorate(id, D::Location, &[0])?;
                 self.objects.rescaling_uniform_constant = id;
                 self.global_interface(id);
-                self.host_uniforms
-                    .push(HostUniformLayout::RescalingUniformConstant { location: 0 });
             }
         }
         if info.uses_render_area && self.profile.unified_descriptor_binding {
@@ -206,11 +204,9 @@ impl EmitContext<'_> {
             let id = self.builder.variable(pointer, S::PushConstant, None)?;
             self.objects.render_area_push_constant = id;
             self.global_interface(id);
-            self.host_uniforms
-                .push(HostUniformLayout::RenderAreaPushConstants {
-                    offset: 0,
-                    size: 16,
-                });
+            self.push_constant_bytes = self
+                .push_constant_bytes
+                .max(crate::host_abi::RENDER_AREA_BYTES);
         }
         Ok(())
     }

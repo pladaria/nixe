@@ -36,7 +36,8 @@ pub(crate) struct StageResources {
     pub(in crate::native) images: Box<[ImageSlot]>,
 }
 pub(crate) struct PipelineResources {
-    pub(crate) host_uniforms: Box<[nixe_shader_recompiler::artifact::HostUniformLayout]>,
+    pub(crate) uses_render_area: bool,
+    pub(crate) uses_tessellation_levels: bool,
     pub(crate) stages: [StageResources; 6],
     pub(in crate::native) texture_count: usize,
 }
@@ -153,12 +154,18 @@ impl PipelineResources {
             }
         }
         Ok(Self {
-            host_uniforms: shader
+            uses_render_area: shader
                 .stages
                 .iter()
-                .filter_map(|stage| stage.guest.as_ref())
-                .flat_map(|stage| stage.host_uniforms.iter().cloned())
-                .collect(),
+                .any(|s| s.guest.as_ref().is_some_and(|g| g.info.uses_render_area)),
+            uses_tessellation_levels: shader.stages.iter().any(|s| {
+                s.guest.as_ref().is_some_and(|g| {
+                    matches!(
+                        g.execution.provenance,
+                        nixe_shader_recompiler::artifact::StageProvenance::HostTessellationControl
+                    )
+                })
+            }),
             texture_count: images.iter().map(Vec::len).sum(),
             stages: std::array::from_fn(|stage| StageResources {
                 uniforms: std::mem::take(&mut uniforms[stage]).into_boxed_slice(),

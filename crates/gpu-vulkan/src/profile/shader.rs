@@ -50,7 +50,7 @@ impl FeatureSet {
                 0x10500
             },
             unified_descriptor_binding: true,
-            support_descriptor_aliasing: true,
+            support_descriptor_aliasing: driver != vk::DriverId::QUALCOMM_PROPRIETARY,
             support_int8: self.v12.shader_int8 != 0,
             support_uniform_and_storage_buffer_8bit: self
                 .v12
@@ -82,6 +82,7 @@ impl FeatureSet {
             support_fp64_signed_zero_nan_preserve: floats
                 .shader_signed_zero_inf_nan_preserve_float64
                 != 0,
+            support_scaled_attributes: !emulates_scaled_formats(driver),
             support_explicit_workgroup_layout: self
                 .workgroup_layout
                 .workgroup_memory_explicit_layout

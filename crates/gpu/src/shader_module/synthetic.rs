@@ -19,9 +19,7 @@ pub fn default_control(
     domain: crate::TessellationDomain,
     version: u32,
 ) -> Result<StageArtifact> {
-    use nixe_shader_recompiler::{
-        CompileError, artifact::HostUniformLayout, diagnostics::FailureCategory,
-    };
+    use nixe_shader_recompiler::{CompileError, diagnostics::FailureCategory};
     if points == 0 || points > 32 || evaluation.patches.iter().any(|&used| used) {
         return Err(CompileError::new(
             FailureCategory::Unsupported,
@@ -187,10 +185,7 @@ pub fn default_control(
             ..Default::default()
         },
         bindings: Box::new([]),
-        host_uniforms: Box::new([HostUniformLayout::TessellationLevelsPushConstants {
-            offset: 32,
-            required_levels,
-        }]),
+        push_constant_bytes: nixe_shader_recompiler::host_abi::PUSH_CONSTANT_BYTES,
         interface,
         execution: ExecutionMetadata {
             output_vertices: points,

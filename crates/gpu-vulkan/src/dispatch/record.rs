@@ -115,153 +115,90 @@ impl Dispatch {
             Ok(())
         });
     }
-    pub(crate) unsafe fn push_descriptors(
+    /// Pipeline, push constants and descriptors share one scheduler record,
+    /// as GraphicsPipeline::ConfigureDraw and ComputePipeline::Configure.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp#L634-L689
+    pub(crate) unsafe fn configure_pipeline(
         &mut self,
-        layout: &crate::cache::PipelineLayout,
-        entries: &[crate::cache::DescriptorEntry],
-    ) {
-        let template = layout.update_template;
-        let layout = layout.handle;
-        unsafe {
-            self.recorder
-                .record_array(entries, move |context, entries| {
-                    (context
-                        .functions
-                        .push_descriptor
-                        .expect("enabled push descriptor layout"))(
-                        context.command,
-                        template,
-                        layout,
-                        0,
-                        entries.as_ptr().cast(),
-                    );
-                    Ok(())
-                });
-        }
-    }
-
-    pub(crate) unsafe fn push_descriptor_queue(
-        &mut self,
-        layout: &crate::cache::PipelineLayout,
-        update: crate::cache::DescriptorUpdate,
-    ) {
-        let template = layout.update_template;
-        let layout = layout.handle;
-        self.recorder.record(move |context| {
-            // SAFETY: the persistent payload is immutable through this native
-            // call. Its owner drains recording before rotation, reuse or drop.
-            unsafe {
-                (context
-                    .functions
-                    .push_descriptor
-                    .expect("enabled push descriptor layout"))(
-                    context.command,
-                    template,
-                    layout,
-                    0,
-                    update.as_slice().as_ptr().cast(),
-                );
-            }
-            Ok(())
-        });
-    }
-
-    pub unsafe fn cmd_bind_pipeline(
-        &mut self,
-        point: vk::PipelineBindPoint,
-        pipeline: std::sync::Arc<crate::cache::NativePipeline>,
-    ) {
-        self.recorder.record(move |context| {
-            let command = context.command;
-            let device = &context.device;
-            unsafe {
-                device.cmd_bind_pipeline(
-                    command,
-                    point,
-                    pipeline
-                        .handle()
-                        .map_err(crate::queue::progress::NativeFailure::Compilation)?,
-                )
-            };
-            Ok(())
-        });
-    }
-    pub(crate) unsafe fn bind_descriptors(
-        &mut self,
-        point: vk::PipelineBindPoint,
-        record: std::sync::Arc<crate::cache::BindingRecord>,
+        pipeline: crate::cache::NativeReference<crate::cache::NativePipelineData>,
+        bind_pipeline: bool,
+        record: Option<std::sync::Arc<crate::cache::BindingRecord>>,
+        update: Option<crate::cache::DescriptorUpdate>,
         offsets: &[u32],
+        push: &[u8],
     ) {
         unsafe {
             self.recorder
-                .record_array(offsets, move |context, offsets| {
-                    let (progress, tick) =
-                        context.progress.as_ref().expect("active native context");
-                    let native =
-                        context
-                            .descriptors
-                            .resolve(&record, *tick, progress, context.timeline)?;
-                    if context
-                        .descriptor_pools
-                        .insert(std::sync::Arc::as_ptr(&native.pool) as usize)
-                    {
-                        // Retain each actual pool once per command context, even
-                        // if the worker unwinds before an older GPU use finishes.
-                        context
-                            .slot
-                            .as_ref()
-                            .expect("active native context")
-                            .retain_descriptor_pool(std::sync::Arc::clone(&native.pool));
+                .record_pair(push, offsets, move |context, push, offsets| {
+                    let pipeline = pipeline.get(&context.objects);
+                    let command = context.command;
+                    let device = &context.device;
+                    let layout = &pipeline.layout;
+                    if bind_pipeline {
+                        device.cmd_bind_pipeline(
+                            command,
+                            pipeline.bind_point,
+                            pipeline
+                                .handle()
+                                .map_err(crate::queue::progress::NativeFailure::Compilation)?,
+                        );
                     }
-                    context.device.cmd_bind_descriptor_sets(
-                        context.command,
-                        point,
-                        record.layout.handle,
-                        0,
-                        &[native.handle],
-                        offsets,
-                    );
-                    Ok(())
-                });
-        }
-    }
-    pub(crate) unsafe fn bind_descriptor_queue(
-        &mut self,
-        point: vk::PipelineBindPoint,
-        layout: std::sync::Arc<crate::cache::PipelineLayout>,
-        update: crate::cache::DescriptorUpdate,
-        offsets: &[u32],
-    ) {
-        unsafe {
-            self.recorder
-                .record_array(offsets, move |context, offsets| {
-                    let (progress, tick) =
-                        context.progress.as_ref().expect("active native context");
-                    let native = context.descriptors.resolve_queue(
-                        &layout,
-                        update.as_slice(),
-                        *tick,
-                        progress,
-                        context.timeline,
-                    )?;
-                    if context
-                        .descriptor_pools
-                        .insert(std::sync::Arc::as_ptr(&native.pool) as usize)
-                    {
-                        context
-                            .slot
-                            .as_ref()
-                            .expect("active native context")
-                            .retain_descriptor_pool(std::sync::Arc::clone(&native.pool));
+                    if !push.is_empty() {
+                        device.cmd_push_constants(
+                            command,
+                            layout.handle,
+                            layout.key.push_stages,
+                            0,
+                            push,
+                        );
                     }
-                    context.device.cmd_bind_descriptor_sets(
-                        context.command,
-                        point,
-                        layout.handle,
-                        0,
-                        &[native.handle],
-                        offsets,
-                    );
+                    let entries = if let Some(update) = &update {
+                        // Its owner drains recording before rotation, reuse or drop.
+                        update.as_slice()
+                    } else if let Some(record) = &record {
+                        &record.entries
+                    } else {
+                        return Ok(());
+                    };
+                    if layout.push_descriptor {
+                        (context
+                            .functions
+                            .push_descriptor
+                            .expect("enabled push descriptor layout"))(
+                            command,
+                            layout.update_template,
+                            layout.handle,
+                            0,
+                            entries.as_ptr().cast(),
+                        );
+                    } else {
+                        let (progress, tick) =
+                            context.progress.as_ref().expect("active native context");
+                        let native = if let Some(record) = &record {
+                            context.descriptors.resolve(
+                                record,
+                                *tick,
+                                progress,
+                                context.timeline,
+                            )?
+                        } else {
+                            context.descriptors.resolve_queue(
+                                layout,
+                                entries,
+                                *tick,
+                                progress,
+                                context.timeline,
+                            )?
+                        };
+                        device.cmd_bind_descriptor_sets(
+                            command,
+                            pipeline.bind_point,
+                            layout.handle,
+                            0,
+                            &[native.handle],
+                            offsets,
+                        );
+                    }
                     Ok(())
                 });
         }
@@ -394,22 +331,6 @@ impl Dispatch {
             unsafe { device.cmd_bind_index_buffer(command, buffer, offset, kind) };
             Ok(())
         });
-    }
-    pub unsafe fn cmd_push_constants(
-        &mut self,
-        layout: vk::PipelineLayout,
-        stages: vk::ShaderStageFlags,
-        offset: u32,
-        bytes: &[u8],
-    ) {
-        unsafe {
-            self.recorder.record_array(bytes, move |context, bytes| {
-                let command = context.command;
-                let device = &context.device;
-                device.cmd_push_constants(command, layout, stages, offset, bytes);
-                Ok(())
-            });
-        }
     }
     pub unsafe fn cmd_draw(
         &mut self,

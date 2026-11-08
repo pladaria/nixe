@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 pub fn color_blit_pipeline(
     compiler: &PipelineCompiler,
     format: vk::Format,
-) -> Result<Arc<NativePipeline>, CompileError> {
+) -> Result<NativePipeline, CompileError> {
     static SHADER: OnceLock<Arc<ShaderArtifact>> = OnceLock::new();
     let shader = SHADER.get_or_init(|| {
         Arc::new(ShaderArtifact::new(Box::new([
@@ -46,7 +46,7 @@ impl Residency<'_> {
     #[allow(clippy::too_many_arguments)]
     pub fn blit_color(
         &mut self,
-        pipeline: Arc<NativePipeline>,
+        pipeline: NativePipeline,
         source: ImageViewId,
         destination_view: ImageViewId,
         plane: usize,
@@ -54,7 +54,7 @@ impl Residency<'_> {
         destination_rect: vk::Rect2D,
         first: [i64; 2],
         step: [i64; 2],
-        sampler: Arc<crate::cache::Sampler>,
+        sampler: crate::cache::Sampler,
     ) -> Result<WorkTicket, VulkanError> {
         let destination = self.texture_cache.views[destination_view].image;
         let source_image = self

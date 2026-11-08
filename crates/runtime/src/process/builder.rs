@@ -273,6 +273,8 @@ impl ProcessBuilder {
         let process = RunnableProcess {
             scheduler: self.kernel.clone(),
             generation: std::sync::atomic::AtomicU64::new(1),
+            active_requests: std::sync::atomic::AtomicUsize::new(0),
+            runtime: std::sync::OnceLock::new(),
             events: std::sync::OnceLock::new(),
             process_id: self.config.process_id,
             state: Mutex::new(ProcessState {

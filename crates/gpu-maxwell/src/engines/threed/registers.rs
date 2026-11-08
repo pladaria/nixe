@@ -187,6 +187,9 @@ const fn validation_input(method: u32) -> bool {
         | 0x0fbc..=0x0fc8 | 0x11e0..=0x11ec | 0x15e4 | 0x1948)
 }
 const fn parameter_dirty(method: u32, domains: u16) -> u128 {
+    if method >= 0x0a18 && method <= 0x0bf8 && (method - 0x0a18).is_multiple_of(0x20) {
+        return Flags::VIEWPORT_SWIZZLES | if method == 0x0a18 { VIEWPORT } else { 0 };
+    }
     if domains & (COLOR | DEPTH | TARGET_CONTROL | SAMPLE_MODE) != 0 {
         return 0;
     }

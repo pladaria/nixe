@@ -1,28 +1,11 @@
-//! The graphics owner selects and compiles pipelines before locking resource
-//! caches, as PipelineCache::CurrentGraphicsPipeline/CurrentComputePipeline.
-//! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+//! Pipeline-owned translation and native construction, with Eden's last,
+//! transition, and global table lookup order. There are no intermediate caches.
+//! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
 use super::pipeline_resources::PipelineResources;
 use super::*;
 use maxwell::fixed_state::FixedPipelineState;
-
-/// Current fixed state and pipeline transitions belong to the selected channel,
-/// outside the coherence backend borrow used by compiler memory reads.
-#[derive(Default)]
-pub(super) struct PipelineContext {
-    pub(super) current_graphics: Option<usize>,
-    pub(super) pipeline_state: Option<FixedPipelineState>,
-    pub(super) pixel_depth: Option<bool>,
-}
-enum Graphics {
-    Captured(Arc<GuestShaderCode>),
-    Shader(Pending<ShaderArtifact>),
-    Compiled {
-        shader: Arc<ShaderArtifact>,
-        graphics: GraphicsState,
-        vertex_attributes: u32,
-    },
-    Ready(usize),
-}
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 pub(super) type ConfiguredGraphics = (
     smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>,
     crate::residency::execution::DescriptorQueue,
@@ -40,8 +23,9 @@ pub(super) type ConfigureGraphics = fn(
 ) -> Result<ConfiguredGraphics, VulkanError>;
 pub(super) struct GraphicsPipeline {
     pub(super) key: FixedPipelineState,
+    transition_keys: Vec<FixedPipelineState>,
     transitions: Vec<usize>,
-    pub(super) pipeline: Arc<NativePipeline>,
+    pub(super) pipeline: NativePipeline,
     pub(super) resources: PipelineResources,
     pub(super) vertex_attributes: u32,
     pub(super) configure: ConfigureGraphics,
@@ -75,415 +59,356 @@ impl ComputeKey {
         })
     }
 }
-enum ComputePipelineState {
-    Captured(Arc<GuestShaderCode>),
-    Shader(Pending<ShaderArtifact>),
-    Compiled(Arc<ShaderArtifact>),
-    Ready(usize),
-}
+
 pub(super) struct ComputePipeline {
     key: ComputeKey,
-    pub(super) pipeline: Arc<NativePipeline>,
+    pub(super) pipeline: NativePipeline,
     pub(super) resources: PipelineResources,
 }
+// Disk jobs move complete metadata to its owner; boxing would add an allocation
+// to every loaded graphics pipeline just to shrink this temporary message.
+#[allow(clippy::large_enum_variant)]
 enum DiskPipeline {
-    Graphics(FixedPipelineState),
-    Compute(ComputeKey),
+    Graphics(GraphicsPipeline),
+    Compute(ComputePipeline),
+}
+#[derive(Default)]
+struct FlushStatus {
+    in_flight: AtomicBool,
+    bytes: AtomicUsize,
 }
 pub(super) struct PipelineCache {
-    pub(super) shaders: Arc<ShaderCompiler>,
     pub(super) compiler: Arc<PipelineCompiler>,
-    graphics: HashMap<FixedPipelineState, Graphics>,
+    graphics: HashMap<FixedPipelineState, usize>,
     pub(super) graphics_pipelines: Vec<GraphicsPipeline>,
-    compute: HashMap<ComputeKey, ComputePipelineState>,
+    compute: HashMap<ComputeKey, usize>,
     pub(super) compute_pipelines: Vec<ComputePipeline>,
-    pub(super) current_compute: Option<usize>,
-    capture_compiler: Option<nixe_shader_recompiler::Compiler>,
-    archive: Option<nixe_gpu_maxwell::recompiler::archive::EnvironmentArchive>,
+    pub(super) current_graphics: Option<usize>,
+    pub(super) pipeline_state: Option<FixedPipelineState>,
+    main_compiler: Option<nixe_shader_recompiler::Compiler>,
+    archive: Option<crate::cache::archive::EnvironmentArchive>,
+    flush: Arc<FlushStatus>,
+    pipelines_since_flush: usize,
+    last_flush: Option<Instant>,
 }
 impl PipelineCache {
-    pub(super) fn new(shaders: Arc<ShaderCompiler>, compiler: Arc<PipelineCompiler>) -> Self {
+    pub(super) fn new(compiler: Arc<PipelineCompiler>) -> Self {
         Self {
-            shaders,
             compiler,
             graphics: HashMap::default(),
             graphics_pipelines: Vec::new(),
             compute: HashMap::default(),
             compute_pipelines: Vec::new(),
-            current_compute: None,
-            capture_compiler: None,
+            current_graphics: None,
+            pipeline_state: None,
+            main_compiler: None,
             archive: None,
+            flush: Arc::default(),
+            pipelines_since_flush: 0,
+            last_flush: None,
         }
     }
-    pub(super) fn set_capture_cache(
+    pub(super) fn load_disk_resources(
         &mut self,
         directory: &std::path::Path,
-        namespace: ContentId,
-        profile: &DeviceProfile,
-        budget: u64,
+        profile: &Arc<DeviceProfile>,
+        stop: &AtomicBool,
     ) {
-        let archive = match nixe_gpu_maxwell::recompiler::archive::EnvironmentArchive::new(
+        let started = Instant::now();
+        log::info!("loading shader and pipeline cache: {}", directory.display());
+        let archive = match crate::cache::archive::EnvironmentArchive::open(
             directory,
-            namespace,
-            profile.shader_compiler.clone(),
-            budget,
+            self.compiler.serialization(),
         ) {
             Ok(archive) => archive,
             Err(error) => {
-                log::warn!("shader environment serialization: {error}");
+                log::warn!("shader environment cache load: {error}");
                 return;
             }
         };
-        let files = archive.load();
+        let mut total = 0;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        archive.load(stop, |environment| {
+            let graphics = FixedPipelineState::from_environment_key(&environment.key)
+                .filter(|key| key.matches_profile(profile));
+            let compute = ComputeKey::from_environment_key(&environment.key);
+            if graphics.is_none() && compute.is_none() {
+                return;
+            }
+            total += 1;
+            let compiler = Arc::clone(&self.compiler);
+            let profile = Arc::clone(profile);
+            let sender = sender.clone();
+            if let Err(error) = self.compiler.queue(move |worker| {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> Result<DiskPipeline, VulkanError> {
+                        let mut pools =
+                            nixe_shader_recompiler::Compiler::new().map_err(compilation)?;
+                        let programs = environment
+                            .inputs
+                            .translate(&mut pools, &profile.shader_compiler)
+                            .map_err(compilation)?;
+                        if let Some(key) = graphics {
+                            Self::build_graphics(
+                                &compiler,
+                                &mut pools,
+                                &profile,
+                                key,
+                                &programs,
+                                Some(worker),
+                            )
+                            .map(DiskPipeline::Graphics)
+                        } else {
+                            Self::build_compute(
+                                &compiler,
+                                &mut pools,
+                                &profile,
+                                compute.unwrap(),
+                                &programs,
+                                Some(worker),
+                            )
+                            .map(DiskPipeline::Compute)
+                        }
+                    },
+                ))
+                .unwrap_or_else(|_| Err(compilation("cached pipeline construction panicked")));
+                let _ = sender.send(result);
+            }) {
+                log::warn!("cached pipeline queue: {error}");
+            }
+        });
+        log::info!(
+            "read and queued {total} pipeline environments in {:?}",
+            started.elapsed()
+        );
         self.archive = Some(archive);
-        let mut remaining = Vec::new();
-        for environment in files {
-            if let Some(key) = FixedPipelineState::from_environment_key(&environment.key) {
-                if !key.matches_profile(profile) {
-                    continue;
-                }
-                self.graphics
-                    .insert(key.clone(), Graphics::Captured(environment.inputs));
-                remaining.push(DiskPipeline::Graphics(key));
-            } else if let Some(key) = ComputeKey::from_environment_key(&environment.key) {
-                self.compute
-                    .insert(key, ComputePipelineState::Captured(environment.inputs));
-                remaining.push(DiskPipeline::Compute(key));
-            }
-        }
-        let total = remaining.len();
+        drop(sender);
         let mut loaded = 0;
-        let mut building = Vec::new();
-        let mut statistics = maxwell::NativeFrontendStatistics::default();
-        let mut drained = false;
-        while !remaining.is_empty() {
-            let before = remaining.len();
-            remaining.retain(|entry| {
-                let result = match entry {
-                    DiskPipeline::Graphics(key) => {
-                        self.advance_graphics(key, profile, &mut statistics)
-                    }
-                    DiskPipeline::Compute(key) => self.advance_compute(*key, profile),
-                };
-                match result {
-                    Ok(Some(index)) => {
-                        let (entry, pipeline) = match entry {
-                            DiskPipeline::Graphics(key) => (
-                                DiskPipeline::Graphics(key.clone()),
-                                Arc::clone(&self.graphics_pipelines[index].pipeline),
-                            ),
-                            DiskPipeline::Compute(key) => (
-                                DiskPipeline::Compute(*key),
-                                Arc::clone(&self.compute_pipelines[index].pipeline),
-                            ),
-                        };
-                        building.push((entry, pipeline));
-                        false
-                    }
-                    Ok(None) => true,
-                    Err(error) => {
-                        log::warn!("cached shader pipeline: {error}");
-                        false
+        for result in receiver {
+            match result {
+                Ok(DiskPipeline::Graphics(pipeline)) => {
+                    if !self.graphics.contains_key(&pipeline.key) {
+                        let slot = self.graphics_pipelines.len();
+                        self.graphics.insert(pipeline.key, slot);
+                        self.graphics_pipelines.push(pipeline);
+                        loaded += 1;
                     }
                 }
-            });
-            if remaining.is_empty() {
-                break;
-            }
-            if remaining.len() != before {
-                drained = false;
-            }
-            let pending = remaining.iter().find_map(|entry| match entry {
-                DiskPipeline::Graphics(key) => match self.graphics.get(key) {
-                    Some(Graphics::Shader(pending)) => Some(pending.clone()),
-                    _ => None,
-                },
-                DiskPipeline::Compute(key) => match self.compute.get(key) {
-                    Some(ComputePipelineState::Shader(pending)) => Some(pending.clone()),
-                    _ => None,
-                },
-            });
-            if let Some(pending) = pending {
-                let _ = pending.wait();
-                drained = false;
-            } else if !drained {
-                loaded += self.finish_disk_pipelines(&mut building);
-                drained = true;
-            } else {
-                // Optional disk entries which cannot fit the configured cold
-                // compilation budget remain live misses, as failed cache loads.
-                log::warn!(
-                    "{} cached pipelines exceed the compilation admission budget",
-                    remaining.len()
-                );
-                break;
+                Ok(DiskPipeline::Compute(pipeline)) => {
+                    if !self.compute.contains_key(&pipeline.key) {
+                        let slot = self.compute_pipelines.len();
+                        self.compute.insert(pipeline.key, slot);
+                        self.compute_pipelines.push(pipeline);
+                        loaded += 1;
+                    }
+                }
+                Err(error) => log::warn!("cached pipeline construction: {error}"),
             }
         }
-        for entry in &remaining {
-            match entry {
-                DiskPipeline::Graphics(key) => {
-                    self.graphics.remove(key);
-                }
-                DiskPipeline::Compute(key) => {
-                    self.compute.remove(key);
-                }
+        self.compiler.wait_for_requests();
+        match self.compiler.checkpoint() {
+            Ok(size) => {
+                self.flush.bytes.store(size, Ordering::Relaxed);
+                self.last_flush = Some(Instant::now());
             }
+            Err(error) => log::warn!("Vulkan driver cache write: {error}"),
         }
-        loaded += self.finish_disk_pipelines(&mut building);
-        if total != 0 {
-            log::info!(
-                "loaded {} native pipeline environments before guest execution",
-                loaded
-            );
+        log::info!(
+            "loaded {loaded}/{total} native pipeline environments before guest execution in {:?}",
+            started.elapsed()
+        );
+    }
+    fn serialize(&mut self, key: Vec<u8>, inputs: Arc<GuestShaderCode>) {
+        let Some(archive) = &self.archive else {
+            return;
+        };
+        archive.serialize(key, inputs);
+        self.pipelines_since_flush += 1;
+        if self.pipelines_since_flush < 128 {
+            return;
+        }
+        let interval = Duration::from_secs(
+            (self.flush.bytes.load(Ordering::Relaxed) / (1024 * 1024)).max(30) as u64,
+        );
+        if self
+            .last_flush
+            .is_some_and(|time| time.elapsed() < interval)
+            || self.flush.in_flight.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.pipelines_since_flush = 0;
+        self.last_flush = Some(Instant::now());
+        let flush = Arc::clone(&self.flush);
+        if let Err(error) = self.compiler.queue_checkpoint(move |bytes| {
+            flush.bytes.store(bytes, Ordering::Relaxed);
+            flush.in_flight.store(false, Ordering::Release);
+        }) {
+            self.flush.in_flight.store(false, Ordering::Release);
+            log::warn!("Vulkan driver cache serialization: {error}");
         }
     }
-    fn finish_disk_pipelines(
-        &mut self,
-        building: &mut Vec<(DiskPipeline, Arc<NativePipeline>)>,
-    ) -> usize {
-        let mut loaded = 0;
-        for (entry, pipeline) in building.drain(..) {
-            match pipeline.handle() {
-                Ok(_) => loaded += 1,
-                Err(error) => {
-                    log::warn!("cached native pipeline construction: {error}");
-                    match entry {
-                        DiskPipeline::Graphics(key) => {
-                            self.graphics.remove(&key);
-                        }
-                        DiskPipeline::Compute(key) => {
-                            self.compute.remove(&key);
-                        }
-                    }
-                }
-            }
-        }
-        loaded
-    }
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    #[allow(clippy::type_complexity)]
     fn capture_inputs(
         &mut self,
-        key: Vec<u8>,
         profile: &DeviceProfile,
         space: &nixe_gpu_maxwell::MaxwellGpuMemory,
         access: &mut nixe_gpu::MemoryAccess<'_>,
         statistics: &mut maxwell::NativeFrontendStatistics,
-        requests: impl FnOnce() -> Result<
-            Vec<(
-                Option<u8>,
-                nixe_gpu_maxwell::recompiler::CaptureRequest,
-                usize,
-            )>,
-            VulkanError,
-        >,
-    ) -> Result<Arc<GuestShaderCode>, VulkanError> {
-        if self.capture_compiler.is_none() {
-            self.capture_compiler = Some(
-                nixe_shader_recompiler::Compiler::new()
-                    .map_err(|e| VulkanError::Compilation(e.to_string().into()))?,
-            );
+        requests: Vec<(
+            Option<u8>,
+            nixe_gpu_maxwell::recompiler::CaptureRequest,
+            usize,
+        )>,
+    ) -> Result<(Arc<GuestShaderCode>, Vec<nixe_shader_recompiler::ProgramId>), VulkanError> {
+        if self.main_compiler.is_none() {
+            self.main_compiler =
+                Some(nixe_shader_recompiler::Compiler::new().map_err(compilation)?);
         }
         let inputs = nixe_gpu_maxwell::recompiler::capture_program(
-            self.capture_compiler.as_mut().unwrap(),
+            self.main_compiler.as_mut().unwrap(),
             space,
-            requests()?,
+            requests,
             &profile.shader_compiler,
             access,
         )
-        .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
+        .map_err(compilation)?;
         statistics.shader_captures += 1;
-        if let Some(archive) = &self.archive {
-            archive.serialize(key, Arc::clone(&inputs));
-        }
         Ok(inputs)
     }
-    fn request_shader(
-        &self,
-        profile: &DeviceProfile,
-        code: &Arc<GuestShaderCode>,
-        fixed: Option<&FixedPipelineState>,
-    ) -> Result<Pending<ShaderArtifact>, CompileError> {
-        let runtime = fixed.map(FixedPipelineState::runtime).transpose()?;
-        self.shaders.request_guest_with_depth(
-            Arc::clone(code),
-            Arc::new(profile.shader_compiler.clone()),
-            runtime,
-            fixed.and_then(FixedPipelineState::fragment_depth_transform),
-        )
-    }
-    fn select_graphics(&mut self, context: &mut PipelineContext, index: usize) {
-        if let Some(previous) = context.current_graphics {
+    fn select_graphics(&mut self, index: usize) {
+        if let Some(previous) = self.current_graphics {
+            let key = self.graphics_pipelines[index].key;
+            self.graphics_pipelines[previous].transition_keys.push(key);
             self.graphics_pipelines[previous].transitions.push(index);
         }
-        context.current_graphics = Some(index);
+        self.current_graphics = Some(index);
     }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn current_graphics(
         &mut self,
         profile: &DeviceProfile,
-        context: &mut PipelineContext,
         statistics: &mut maxwell::NativeFrontendStatistics,
         shaders: &maxwell::GraphicsShaders,
         registers: &nixe_gpu_maxwell::engines::threed::MaxwellThreeDState,
         draw: &nixe_gpu_maxwell::MaxwellThreeDDrawState,
         space: &nixe_gpu_maxwell::MaxwellGpuMemory,
         access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<bool, VulkanError> {
-        context.refresh_fixed_pipeline_state(profile, shaders, registers, draw)?;
+    ) -> Result<(), VulkanError> {
+        self.refresh_fixed_pipeline_state(profile, shaders, registers, draw)?;
         statistics.fixed_state_refreshes += 1;
-        let id = context
+        let id = self
             .pipeline_state
             .as_ref()
             .expect("current pipeline state");
-        if let Some(index) = context.current_graphics {
+        if let Some(index) = self.current_graphics {
             let pipeline = &self.graphics_pipelines[index];
             let next = if pipeline.key == *id {
                 Some(index)
             } else {
                 pipeline
-                    .transitions
+                    .transition_keys
                     .iter()
-                    .copied()
-                    .find(|&next| self.graphics_pipelines[next].key == *id)
+                    .position(|key| key == id)
+                    .map(|slot| pipeline.transitions[slot])
             };
             if let Some(next) = next {
-                context.current_graphics = Some(next);
-                return Ok(true);
+                self.current_graphics = Some(next);
+                return Ok(());
             }
         }
-        if !self.graphics.contains_key(id) {
-            let inputs = self.capture_inputs(
-                id.environment_key(),
+
+        let index = if let Some(&index) = self.graphics.get(id) {
+            index
+        } else {
+            let id = *id;
+            let requests = shaders
+                .infos
+                .iter()
+                .enumerate()
+                .filter_map(|(index, info)| {
+                    info.as_ref().map(|info| {
+                        nixe_gpu_maxwell::recompiler::graphics_request(registers, index)
+                            .map(|request| {
+                                (
+                                    registers
+                                        .shader_bindings()
+                                        .pipeline(index)
+                                        .effective_group(),
+                                    request,
+                                    info.size_bytes,
+                                )
+                            })
+                            .map_err(|e| VulkanError::Compilation(e.to_string().into()))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let (inputs, programs) =
+                self.capture_inputs(profile, space, access, statistics, requests)?;
+            let pipeline = Self::build_graphics(
+                &self.compiler,
+                self.main_compiler.as_mut().unwrap(),
                 profile,
-                space,
-                access,
-                statistics,
-                || {
-                    shaders
-                        .infos
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, info)| {
-                            info.as_ref().map(|info| {
-                                nixe_gpu_maxwell::recompiler::graphics_request(registers, index)
-                                    .map(|request| {
-                                        (
-                                            registers
-                                                .shader_bindings()
-                                                .pipeline(index)
-                                                .effective_group(),
-                                            request,
-                                            info.size_bytes,
-                                        )
-                                    })
-                                    .map_err(|e| VulkanError::Compilation(e.to_string().into()))
-                            })
-                        })
-                        .collect()
-                },
+                id,
+                &programs,
+                None,
             )?;
-            self.graphics.insert(id.clone(), Graphics::Captured(inputs));
-        }
-        let Some(index) = self.advance_graphics(id, profile, statistics)? else {
-            return Ok(false);
+            let index = self.graphics_pipelines.len();
+            self.graphics_pipelines.push(pipeline);
+            self.graphics.insert(id, index);
+            statistics.prepared_graphics += 1;
+            self.serialize(id.environment_key(), inputs);
+            index
         };
-        self.select_graphics(context, index);
-        Ok(true)
+        self.select_graphics(index);
+        Ok(())
     }
-    fn advance_graphics(
-        &mut self,
-        id: &FixedPipelineState,
+    fn build_graphics(
+        compiler: &PipelineCompiler,
+        pools: &mut nixe_shader_recompiler::Compiler,
         profile: &DeviceProfile,
-        statistics: &mut maxwell::NativeFrontendStatistics,
-    ) -> Result<Option<usize>, VulkanError> {
-        let mut entry = self
-            .graphics
-            .remove(id)
-            .expect("admitted graphics pipeline");
-        loop {
-            entry = match entry {
-                Graphics::Ready(index) => {
-                    self.graphics.insert(id.clone(), Graphics::Ready(index));
-                    return Ok(Some(index));
-                }
-                Graphics::Captured(inputs) => {
-                    match self.request_shader(profile, &inputs, Some(id)) {
-                        Ok(pending) => Graphics::Shader(pending),
-                        Err(CompileError::Backpressure | CompileError::Budget) => {
-                            self.graphics.insert(id.clone(), Graphics::Captured(inputs));
-                            return Ok(None);
-                        }
-                        Err(error) => {
-                            return Err(VulkanError::Compilation(error.to_string().into()));
-                        }
-                    }
-                }
-                Graphics::Shader(pending) => {
-                    let Some(shader) = pending.poll() else {
-                        self.graphics.insert(id.clone(), Graphics::Shader(pending));
-                        return Ok(None);
-                    };
-                    let shader =
-                        shader.map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-                    let shader = Self::graphics_shader(id, profile, shader)?;
-                    let vertex_attributes = shader
-                        .stages
-                        .iter()
-                        .find(|stage| stage.stage == nixe_gpu::ShaderStage::Vertex)
-                        .and_then(|stage| stage.guest.as_ref())
-                        .map_or(0, |stage| {
-                            (0..32).fold(0, |mask, location| {
-                                mask | (u32::from(stage.info.loads.generic(location)) << location)
-                            })
-                        });
-                    Graphics::Compiled {
-                        shader,
-                        graphics: id.graphics(profile, vertex_attributes)?,
-                        vertex_attributes,
-                    }
-                }
-                Graphics::Compiled {
-                    shader,
-                    graphics,
-                    vertex_attributes,
-                } => {
-                    let pipeline = match self.compiler.request(PipelineRecipe::Graphics {
-                        shader: Arc::clone(&shader),
-                        state: graphics.clone(),
-                    }) {
-                        Ok(pipeline) => pipeline,
-                        Err(CompileError::Backpressure | CompileError::Budget) => {
-                            self.graphics.insert(
-                                id.clone(),
-                                Graphics::Compiled {
-                                    shader,
-                                    graphics,
-                                    vertex_attributes,
-                                },
-                            );
-                            return Ok(None);
-                        }
-                        Err(error) => {
-                            return Err(VulkanError::Compilation(error.to_string().into()));
-                        }
-                    };
-                    let index = self.graphics_pipelines.len();
-                    let resources = PipelineResources::new(&shader, &pipeline.layout.key)?;
-                    let configure = GraphicsPipeline::configure_func(&shader, &resources);
-                    self.graphics_pipelines.push(GraphicsPipeline {
-                        configure,
-                        key: id.clone(),
-                        transitions: Vec::new(),
-                        pipeline,
-                        vertex_attributes,
-                        resources,
-                    });
-                    self.graphics.insert(id.clone(), Graphics::Ready(index));
-                    statistics.prepared_graphics += 1;
-                    return Ok(Some(index));
-                }
-            };
+        key: FixedPipelineState,
+        programs: &[nixe_shader_recompiler::ProgramId],
+        worker: Option<usize>,
+    ) -> Result<GraphicsPipeline, VulkanError> {
+        let runtime = key.runtime().map_err(compilation)?;
+        nixe_gpu::trace::event("shader_compile", 0, 0, 0);
+        let shader =
+            crate::cache::compile_guest(pools, programs, &profile.shader_compiler, Some(&runtime))
+                .map_err(compilation)?;
+        let shader = Self::graphics_shader(&key, profile, shader)?;
+        let vertex_attributes = shader
+            .stages
+            .iter()
+            .find(|stage| stage.stage == nixe_gpu::ShaderStage::Vertex)
+            .and_then(|stage| stage.guest.as_ref())
+            .map_or(0, |stage| {
+                (0..32).fold(0, |mask, location| {
+                    mask | (u32::from(stage.info.loads.generic(location)) << location)
+                })
+            });
+        let state = key.graphics(profile, vertex_attributes)?;
+        let recipe = PipelineRecipe::Graphics {
+            shader: Arc::clone(&shader),
+            state,
+        };
+        let pipeline = match worker {
+            Some(worker) => compiler.build_immediate(recipe, worker),
+            None => compiler.request(recipe),
         }
+        .map_err(compilation)?;
+        let resources = PipelineResources::new(&shader, &pipeline.layout.key)?;
+        let configure = GraphicsPipeline::configure_func(&shader, &resources);
+        Ok(GraphicsPipeline {
+            key,
+            transition_keys: Vec::new(),
+            transitions: Vec::new(),
+            pipeline,
+            resources,
+            vertex_attributes,
+            configure,
+        })
     }
     fn graphics_shader(
         id: &FixedPipelineState,
@@ -523,6 +448,7 @@ impl PipelineCache {
         }
         Ok(shader)
     }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn current_compute(
         &mut self,
@@ -532,97 +458,63 @@ impl PipelineCache {
         space: &nixe_gpu_maxwell::MaxwellGpuMemory,
         access: &mut nixe_gpu::MemoryAccess<'_>,
         statistics: &mut maxwell::NativeFrontendStatistics,
-    ) -> Result<Option<usize>, VulkanError> {
+    ) -> Result<usize, VulkanError> {
         let key = ComputeKey {
             shader: shader.unique_hash,
             shared_memory: launch.shared_memory_size(),
             workgroup: launch.workgroup_size(),
         };
-        if let Some(slot) = self.current_compute
-            && self.compute_pipelines[slot].key == key
-        {
-            return Ok(Some(slot));
-        }
-        if !self.compute.contains_key(&key) {
-            let inputs = self.capture_inputs(
-                key.environment_key(),
+        let slot = if let Some(&slot) = self.compute.get(&key) {
+            slot
+        } else {
+            let (inputs, programs) = self.capture_inputs(
                 profile,
                 space,
                 access,
                 statistics,
-                || Ok(vec![(None, launch.capture_request(), shader.size_bytes)]),
+                vec![(None, launch.capture_request(), shader.size_bytes)],
             )?;
-            self.compute
-                .insert(key, ComputePipelineState::Captured(inputs));
-        }
-        let slot = self.advance_compute(key, profile)?;
-        if let Some(slot) = slot {
-            self.current_compute = Some(slot);
-        }
+            let pipeline = Self::build_compute(
+                &self.compiler,
+                self.main_compiler.as_mut().unwrap(),
+                profile,
+                key,
+                &programs,
+                None,
+            )?;
+            let slot = self.compute_pipelines.len();
+            self.compute_pipelines.push(pipeline);
+            self.compute.insert(key, slot);
+            self.serialize(key.environment_key(), inputs);
+            slot
+        };
         Ok(slot)
     }
-    fn advance_compute(
-        &mut self,
-        key: ComputeKey,
+    fn build_compute(
+        compiler: &PipelineCompiler,
+        pools: &mut nixe_shader_recompiler::Compiler,
         profile: &DeviceProfile,
-    ) -> Result<Option<usize>, VulkanError> {
-        let mut entry = self
-            .compute
-            .remove(&key)
-            .expect("admitted compute pipeline");
-        loop {
-            entry = match entry {
-                ComputePipelineState::Ready(slot) => {
-                    self.compute.insert(key, ComputePipelineState::Ready(slot));
-                    return Ok(Some(slot));
-                }
-                ComputePipelineState::Captured(inputs) => match self
-                    .request_shader(profile, &inputs, None)
-                {
-                    Ok(pending) => ComputePipelineState::Shader(pending),
-                    Err(CompileError::Backpressure | CompileError::Budget) => {
-                        self.compute
-                            .insert(key, ComputePipelineState::Captured(inputs));
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(VulkanError::Compilation(error.to_string().into())),
-                },
-                ComputePipelineState::Shader(pending) => {
-                    let Some(shader) = pending.poll() else {
-                        self.compute
-                            .insert(key, ComputePipelineState::Shader(pending));
-                        return Ok(None);
-                    };
-                    ComputePipelineState::Compiled(
-                        shader.map_err(|e| VulkanError::Compilation(e.to_string().into()))?,
-                    )
-                }
-                ComputePipelineState::Compiled(shader) => {
-                    let pipeline = match self
-                        .compiler
-                        .request(PipelineRecipe::Compute(Arc::clone(&shader)))
-                    {
-                        Ok(pipeline) => pipeline,
-                        Err(CompileError::Backpressure | CompileError::Budget) => {
-                            self.compute
-                                .insert(key, ComputePipelineState::Compiled(shader));
-                            return Ok(None);
-                        }
-                        Err(error) => {
-                            return Err(VulkanError::Compilation(error.to_string().into()));
-                        }
-                    };
-                    let resources = PipelineResources::new(&shader, &pipeline.layout.key)?;
-                    let slot = self.compute_pipelines.len();
-                    self.compute_pipelines.push(ComputePipeline {
-                        key,
-                        pipeline,
-                        resources,
-                    });
-                    self.compute.insert(key, ComputePipelineState::Ready(slot));
-                    return Ok(Some(slot));
-                }
-            };
+        key: ComputeKey,
+        programs: &[nixe_shader_recompiler::ProgramId],
+        worker: Option<usize>,
+    ) -> Result<ComputePipeline, VulkanError> {
+        nixe_gpu::trace::event("shader_compile", 0, 0, 0);
+        let shader = crate::cache::compile_guest(pools, programs, &profile.shader_compiler, None)
+            .map_err(compilation)?;
+        let recipe = PipelineRecipe::Compute(Arc::clone(&shader));
+        let pipeline = match worker {
+            Some(worker) => compiler.build_immediate(recipe, worker),
+            None => compiler.request(recipe),
         }
+        .map_err(compilation)?;
+        let resources = PipelineResources::new(&shader, &pipeline.layout.key)?;
+        Ok(ComputePipeline {
+            key,
+            pipeline,
+            resources,
+        })
     }
+}
+fn compilation(error: impl std::fmt::Display) -> VulkanError {
+    VulkanError::Compilation(error.to_string().into())
 }

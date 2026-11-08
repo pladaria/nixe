@@ -450,54 +450,21 @@ impl From<crate::MaxwellSubmissionExecutionError> for MaxwellEngineStreamError {
 /// Only execution effects leave ProcessCommands. There is no per-method
 /// future, command representation or secondary admission pass.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp#L114-L204
-#[derive(Clone, Copy)]
-pub(crate) enum MaxwellEngineEffect {
-    Macro,
-    DrawBoundary,
-    DrawPreparation,
-    Compute,
-    TwoD,
-}
-impl MaxwellEngineEffect {
-    fn admitted(self) -> bool {
-        !matches!(self, Self::DrawBoundary)
-    }
-    pub(crate) async fn complete<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
-        self,
-        channel: &mut MaxwellGpuChannel,
-        commands: &mut crate::pushbuffer::dma::CommandState,
-        execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-    ) -> Result<(), MaxwellEngineStreamError> {
-        match self {
-            Self::Macro => {
-                let source = commands.mme_method.take().expect("admitted macro");
-                let (profile, state) = channel.three_d_with_profile_mut();
-                threed::consume_sink(state);
-                threed::execute_mme_call(
-                    profile,
-                    source,
-                    &commands.mme_parameters,
-                    state,
-                    execution,
-                )
-                .await?;
-                commands.mme_parameters.clear();
-            }
-            Self::DrawBoundary => {
-                threed::draw::wait_flush(channel.three_d_mut(), execution).await?
-            }
-            Self::DrawPreparation => {
-                threed::draw::wait_preparation(channel.three_d_mut(), execution).await?
-            }
-            Self::Compute => execution.wait_launch().await?,
-            Self::TwoD => execution.wait_two_d().await?,
-        }
-        Ok(())
-    }
+fn execute_dma_macro<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    channel: &mut MaxwellGpuChannel,
+    commands: &mut crate::pushbuffer::dma::CommandState,
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<(), MaxwellEngineStreamError> {
+    let source = commands.mme_method.take().expect("admitted macro");
+    let (profile, state) = channel.three_d_with_profile_mut();
+    threed::consume_sink(state);
+    threed::execute_mme_call(profile, source, &commands.mme_parameters, state, execution)?;
+    commands.mme_parameters.clear();
+    Ok(())
 }
 
 /// Synchronous ProcessCommands consumes the hardware cursor and literal words.
-/// Only an execution effect returns to the existing suspendable GPU owner.
+/// Effects and macro sends execute directly before the next hardware word.
 /// The reader owns the RAM arena or gathered storage through every effect.
 /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/dma_pusher.cpp#L114-L204
 pub(crate) fn process_maxwell_commands<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
@@ -506,7 +473,7 @@ pub(crate) fn process_maxwell_commands<L: crate::MaxwellFrontend, H: crate::Maxw
     commands: &mut crate::pushbuffer::dma::CommandState,
     index: &mut usize,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Result<Option<MaxwellEngineEffect>, MaxwellEngineStreamError> {
+) -> Result<(), MaxwellEngineStreamError> {
     let mut engine = channel
         .frontend()
         .subchannel_engine(commands.dma.subchannel);
@@ -559,7 +526,7 @@ pub(crate) fn process_maxwell_commands<L: crate::MaxwellFrontend, H: crate::Maxw
                     *index += 1;
                     continue;
                 }
-                let effect = call_dma_method(
+                call_dma_method(
                     channel,
                     commands,
                     &mut engine,
@@ -577,12 +544,8 @@ pub(crate) fn process_maxwell_commands<L: crate::MaxwellFrontend, H: crate::Maxw
                     },
                     execution,
                 )?;
-                if effect.is_none_or(MaxwellEngineEffect::admitted) {
-                    *index += 1;
-                }
-                if effect.is_some() {
-                    return Ok(effect);
-                }
+
+                *index += 1;
             } else {
                 *index += 1;
             }
@@ -605,7 +568,7 @@ pub(crate) fn process_maxwell_commands<L: crate::MaxwellFrontend, H: crate::Maxw
                 commands.dma.method_count -= count as u32;
                 *index += count;
                 if last {
-                    return Ok(Some(MaxwellEngineEffect::Macro));
+                    execute_dma_macro(channel, commands, execution)?;
                 }
             } else {
                 let handled = if commands.mme_method.is_none()
@@ -631,7 +594,7 @@ pub(crate) fn process_maxwell_commands<L: crate::MaxwellFrontend, H: crate::Maxw
                 } else {
                     for offset in 0..count {
                         let argument = arguments.argument_at(offset);
-                        let effect = call_dma_method(
+                        call_dma_method(
                             channel,
                             commands,
                             &mut engine,
@@ -642,13 +605,9 @@ pub(crate) fn process_maxwell_commands<L: crate::MaxwellFrontend, H: crate::Maxw
                             || arguments.source(offset, method, subchannel),
                             execution,
                         )?;
-                        if effect.is_none_or(MaxwellEngineEffect::admitted) {
-                            commands.dma.method_count -= 1;
-                            *index += 1;
-                        }
-                        if effect.is_some() {
-                            return Ok(effect);
-                        }
+
+                        commands.dma.method_count -= 1;
+                        *index += 1;
                     }
                 }
             }
@@ -679,7 +638,7 @@ pub(crate) fn process_maxwell_commands<L: crate::MaxwellFrontend, H: crate::Maxw
             let offset = *index;
             let argument = reader.word(offset);
             let last = commands.dma.method_count == 1;
-            let effect = call_dma_method(
+            call_dma_method(
                 channel,
                 commands,
                 &mut engine,
@@ -697,18 +656,14 @@ pub(crate) fn process_maxwell_commands<L: crate::MaxwellFrontend, H: crate::Maxw
                 },
                 execution,
             )?;
-            if effect.is_none_or(MaxwellEngineEffect::admitted) {
-                commands.dma.method.0 += 4;
-                commands.dma.non_incrementing |= commands.dma.increment_once;
-                commands.dma.method_count -= 1;
-                *index += 1;
-            }
-            if effect.is_some() {
-                return Ok(effect);
-            }
+
+            commands.dma.method.0 += 4;
+            commands.dma.non_incrementing |= commands.dma.increment_once;
+            commands.dma.method_count -= 1;
+            *index += 1;
         }
     }
-    Ok(None)
+    Ok(())
 }
 
 fn admit_dma_macro(
@@ -747,7 +702,7 @@ fn call_dma_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     last: bool,
     origin: impl Fn() -> MaxwellMethodSource,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Result<Option<MaxwellEngineEffect>, MaxwellEngineStreamError> {
+) -> Result<(), MaxwellEngineStreamError> {
     if method.0 < 0x100 {
         let source = origin();
         if commands.mme_method.is_some() {
@@ -767,7 +722,7 @@ fn call_dma_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
         if method.0 == 0 {
             *engine = channel.frontend().subchannel_engine(subchannel);
         }
-        return Ok(None);
+        return Ok(());
     }
     let engine = engine.ok_or_else(|| {
         MaxwellEngineStreamError::dispatch(
@@ -782,9 +737,9 @@ fn call_dma_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
             .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
         commands.mme_parameters.push(argument);
         if last {
-            return Ok(Some(MaxwellEngineEffect::Macro));
+            execute_dma_macro(channel, commands, execution)?;
         }
-        return Ok(None);
+        return Ok(());
     }
     if commands.mme_method.is_some() {
         return Err(threed_interrupted_macro(origin()).into());
@@ -798,21 +753,16 @@ fn call_dma_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
         threed::consume_sink(channel.three_d_mut());
         if method.0 == 0x1618
             && !threed::draw::admit_method(channel.three_d_mut(), method, argument)
-            && !threed::draw::flush(channel.three_d_mut(), execution)?
         {
-            return Ok(Some(MaxwellEngineEffect::DrawBoundary));
+            threed::draw::flush(channel.three_d_mut(), execution)?;
         }
         let (profile, state) = channel.three_d_with_profile_mut();
-        if !threed::call_method(profile, method, argument, state, execution, origin)? {
-            return Ok(Some(MaxwellEngineEffect::DrawPreparation));
-        }
+        threed::call_method(profile, method, argument, state, execution, origin)?;
     } else {
         let source = origin();
         match engine {
             Engine::Compute => {
-                if !compute::call_method(source, channel.compute_mut(), execution)? {
-                    return Ok(Some(MaxwellEngineEffect::Compute));
-                }
+                compute::call_method(source, channel.compute_mut(), execution)?;
             }
             Engine::Copy => {
                 dma_copy::call_method(source, channel.dma_copy_mut(), execution)?;
@@ -821,14 +771,12 @@ fn call_dma_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
                 inline_to_memory::call_method(source, channel.inline_to_memory_mut(), execution)?;
             }
             Engine::TwoD => {
-                if !twod::call_method(source, channel.two_d_mut(), execution)? {
-                    return Ok(Some(MaxwellEngineEffect::TwoD));
-                }
+                twod::call_method(source, channel.two_d_mut(), execution)?;
             }
             Engine::ThreeD => unreachable!(),
         }
     }
-    Ok(None)
+    Ok(())
 }
 
 fn threed_interrupted_macro(source: MaxwellMethodSource) -> MaxwellEngineDispatchError {

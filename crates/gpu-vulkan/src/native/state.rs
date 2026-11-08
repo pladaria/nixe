@@ -13,95 +13,51 @@ pub(super) fn compare(value: C) -> vk::CompareOp {
     }
 }
 
-pub(super) fn update_guest_push(
-    pipeline: &NativePipeline,
-    resources: &super::pipeline_resources::PipelineResources,
-    graphics: Option<&nixe_gpu_maxwell::engines::threed::MaxwellThreeDState>,
-    bytes: &mut Vec<u8>,
-) -> Result<(), VulkanError> {
-    use nixe_shader_recompiler::artifact::HostUniformLayout as H;
-    bytes.clear();
-    bytes.resize(pipeline.layout.key.push_bytes as usize, 0);
-    let mut assigned: smallvec::SmallVec<[Option<u32>; 32]> = smallvec::SmallVec::new();
-    assigned.resize(bytes.len() / 4, None);
-    let mut put = |offset: u32, bits: u32| -> Result<(), VulkanError> {
-        if !offset.is_multiple_of(4) || offset as usize + 4 > bytes.len() {
-            return Err(VulkanError::InvalidResource(
-                "host uniform exceeds reflected push constant range",
-            ));
+/// Fixed SPIR-V host parameters. No reflected layouts are interpreted at draw time.
+/// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp#L527-L528
+pub(super) struct ShaderConstants(
+    [u32; nixe_shader_recompiler::host_abi::PUSH_CONSTANT_BYTES as usize / 4],
+);
+impl Default for ShaderConstants {
+    fn default() -> Self {
+        let mut words = [0; nixe_shader_recompiler::host_abi::PUSH_CONSTANT_BYTES as usize / 4];
+        words[nixe_shader_recompiler::host_abi::DOWN_FACTOR_OFFSET as usize / 4] = 1f32.to_bits();
+        Self(words)
+    }
+}
+impl ShaderConstants {
+    pub(super) fn graphics(
+        resources: &super::pipeline_resources::PipelineResources,
+        state: &nixe_gpu_maxwell::engines::threed::MaxwellThreeDState,
+    ) -> Result<Self, VulkanError> {
+        let mut constants = Self::default();
+        if resources.uses_render_area {
+            let extent = maxwell::registers::surface_extent(state.register_words());
+            constants.0[..4]
+                .copy_from_slice(&[extent[0] as f32, extent[1] as f32, 0., 0.].map(f32::to_bits));
         }
-        if assigned[offset as usize / 4]
-            .replace(bits)
-            .is_some_and(|old| old != bits)
-        {
-            return Err(VulkanError::InvalidResource(
-                "overlapping shader host uniforms require incompatible values",
-            ));
-        }
-        bytes[offset as usize..offset as usize + 4].copy_from_slice(&bits.to_le_bytes());
-        Ok(())
-    };
-    for uniform in &resources.host_uniforms {
-        match *uniform {
-            H::RescalingPushConstants {
-                texture_mask_offset,
-                texture_mask_words,
-                image_mask_offset,
-                image_mask_words,
-                down_factor_offset,
-            } => {
-                for i in 0..texture_mask_words {
-                    put(texture_mask_offset + i * 4, 0)?;
-                }
-                for i in 0..image_mask_words {
-                    put(image_mask_offset + i * 4, 0)?;
-                }
-                if let Some(offset) = down_factor_offset {
-                    put(offset, 1f32.to_bits())?;
-                }
-            }
-            H::TessellationLevelsPushConstants { offset, .. } => {
-                let control = graphics
-                    .map(|state| {
-                        nixe_gpu_maxwell::engines::threed::tessellation::patch_state(state)
-                    })
-                    .transpose()
-                    .map_err(|e| VulkanError::Compilation(e.to_string().into()))?
-                    .flatten()
-                    .map(|t| t.control);
-                let Some(nixe_gpu::TessellationControl::DefaultLevels { outer, inner }) = control
-                else {
-                    return Err(VulkanError::InvalidResource(
-                        "default tessellation control requires its level parameters",
-                    ));
-                };
-                for (lane, value) in outer.into_iter().chain(inner).enumerate() {
-                    put(offset + lane as u32 * 4, value)?;
-                }
-            }
-            H::RenderAreaPushConstants { offset, size } => {
-                let registers = graphics.ok_or(VulkanError::InvalidResource(
-                    "render-area uniform requires graphics parameters",
-                ))?;
-                let extent = maxwell::registers::surface_extent(registers.register_words());
-                if size != 16 {
-                    return Err(VulkanError::InvalidResource(
-                        "unexpected render-area uniform size",
-                    ));
-                }
-                for (i, value) in [extent[0] as f32, extent[1] as f32, 0., 0.]
-                    .into_iter()
-                    .enumerate()
-                {
-                    put(offset + i as u32 * 4, value.to_bits())?;
-                }
-            }
-            H::RescalingUniformConstant { .. } => {
+        if resources.uses_tessellation_levels {
+            let patch = nixe_gpu_maxwell::engines::threed::tessellation::patch_state(state)
+                .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
+            let Some(nixe_gpu::TessellationState {
+                control: nixe_gpu::TessellationControl::DefaultLevels { outer, inner },
+                ..
+            }) = patch
+            else {
                 return Err(VulkanError::InvalidResource(
-                    "Vulkan host uniforms must use push constants",
+                    "default tessellation control requires its level parameters",
                 ));
-            }
+            };
+            let start = nixe_shader_recompiler::host_abi::TESSELLATION_LEVELS_OFFSET as usize / 4;
+            constants.0[start..start + 4].copy_from_slice(&outer);
+            constants.0[start + 4..start + 6].copy_from_slice(&inner);
+        }
+        Ok(constants)
+    }
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        // SAFETY: all words are initialized and u32 contains no padding.
+        unsafe {
+            std::slice::from_raw_parts(self.0.as_ptr().cast(), std::mem::size_of_val(&self.0))
         }
     }
-    Ok(())
 }

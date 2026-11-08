@@ -3,15 +3,15 @@ use std::fmt::Write;
 
 /// Periodic host diagnostics retain counters only, never native resources.
 pub struct CacheMonitor {
-    caches: [(&'static str, CacheCounters); 5],
-    previous: [(u64, u64); 5],
+    caches: [(&'static str, CacheCounters); 4],
+    previous: [(u64, u64); 4],
 }
 
 impl CacheMonitor {
-    pub(crate) fn new(caches: [(&'static str, CacheCounters); 5]) -> Self {
+    pub(crate) fn new(caches: [(&'static str, CacheCounters); 4]) -> Self {
         Self {
             caches,
-            previous: [(0, 0); 5],
+            previous: [(0, 0); 4],
         }
     }
 

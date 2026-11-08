@@ -149,14 +149,15 @@ impl HorizonSvcDispatcher {
                 fault: std::sync::Arc::new(error),
             }),
             Ok(nixe_memory::Access::Pending(access)) => {
-                self.defer_svc_read(context, 0x26, access, move |_, _, bytes| {
-                    break_termination(
+                match super::access::wait_read(context, 0x26, access) {
+                    Ok(bytes) => break_termination(
                         reason,
                         info,
                         size,
                         nixe_runtime::GuestBreakPayload::new(&bytes),
-                    )
-                })
+                    ),
+                    Err(fault) => reject(context, fault),
+                }
             }
         }
     }

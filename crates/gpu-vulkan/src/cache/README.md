@@ -1,90 +1,39 @@
-# Native shader, descriptor and pipeline caches
+# Vulkan shader, descriptor and pipeline ownership
 
-The renderer uses captured Maxwell inputs and owned SPIR-V artifacts from
-`nixe-shader-recompiler`. Host conversion and presentation shaders use the same
-native module, pipeline and descriptor caches.
+The cache architecture follows Eden's `PipelineCache`, `ShaderCache` and
+`DescriptorLayoutBuilder` at revision
+`d85005b2b27ebdbe785316886cdf04c2894d550e`.
 
-## Identity and prepared references
+## Lookup and construction
 
-The concrete frontend selects a `ShaderNamespace` once. Captured instruction,
-constant-buffer and texture observations determine immutable source identity.
-GPU virtual addresses, CPU epochs and mapping generations prove freshness
-separately. Bit-identical inputs retain compilation identity after relocation or
-an equivalent write.
+The raw shader cache indexes immutable bytecode hashes and sizes by device address.
+Tracked writes invalidate overlapping entries. Graphics pipelines use raw bytecode
+hashes and feature-dependent fixed state; compute pipelines additionally key shared
+memory and workgroup dimensions. A graphics lookup checks the owner's current
+pipeline, its packed transition keys, and then the shared table. Feature-dependent
+key prefixes use CityHash and byte comparisons. Pipeline entries remain
+owned for the renderer's lifetime.
 
-`ShaderCompiler::request_guest` consumes owned `ShaderInputs` and the enabled
-`Configuration`. Workers retain reusable compiler scratch; published artifacts
-contain no IR IDs or arena references. Stage keys include linked runtime state,
-incoming binding counters and renderer legalization. Unchanged stages can be
-reused before SPIR-V emission. Disk hits restore complete stage metadata and
-bypass translation/emission. No callback waits for nested work on the same pool.
+Current shader facts and the fixed pipeline key belong to the renderer. Channel
+changes retain those selections and invalidate the new channel's canonical dirty
+bank, native topology and stencil state. A new command buffer invalidates emitted
+native state independently of the channel's persistent resource selections.
 
-A returned shader's **native identity** follows its final SPIR-V code. Source
-variants or namespaces which produce identical code and the same ABI therefore
-share native pipelines. Stage code IDs also let pipeline libraries reuse unchanged
-shaders when another stage changes. Source cache identities and physical descriptor
-binding identities remain separate responsibilities.
+On a guest miss, the graphics owner records the environment while translating the
+shader once into reusable compiler arenas. Those programs directly supply linkage
+and SPIR-V emission. The new pipeline owns its Vulkan shader modules, layout,
+resource metadata and executable. Construction workers build one complete Vulkan
+pipeline; native recording waits for that executable at its ordered bind. Published
+results use a lock-free read, and shader errors retain the stage and guest PC.
 
-Ready pipeline references and immutable binding leases are consumed directly.
-Unchanged native descriptor payloads reuse their last set without hashing a
-historical cache key or updating descriptors. The recorder retains each used
-reference once per command-buffer batch and emits a bind only when it changes.
-Bound-state knowledge resets at command-buffer boundaries. Content synchronization
-and hazards still belong to the residency recorder on every consumed access;
-descriptor reuse is not permission to omit those effects.
+The tables perform hit detection before translation or construction. There are no
+additional SPIR-V, stage, native-code, layout or pipeline-library lookup caches, and
+no pipeline LRU or compilation admission budget. Host utility pipelines belong to
+their presentation, conversion or readback owners.
 
-## Bounded asynchronous work
-
-Separate bounded `CompilePool` instances run source/artifact and driver jobs.
-Concurrent duplicate requests share one artifact or pipeline. Artifact entry and
-byte budgets include pending reservations and account for actual published payloads.
-Pipeline metadata has its own bounded LRU; prepared/in-flight references retain
-the executable and its linked libraries. Queue/budget pressure is explicit and retryable.
-Failed or panicking compilation publishes an error, never a successful substitute.
-Structured shader diagnostics retain stage and guest PC.
-
-Pipeline requests publish immutable resource/layout metadata before driver
-construction. The command owner consumes resources and records native parameters
-immediately; the Vulkan recording worker waits for the executable at its ordered
-bind. Published results use a lock-free read, and build errors fail the native
-submission with their original cause. Driver compiler workers do not own a Vulkan
-queue. Each has a separate `VkPipelineCache`; its mutex excludes explicit
-checkpoint merge/serialization and creation without serializing all workers.
-
-## Vulkan pipeline construction
-
-Initialization selects graphics pipeline libraries when the enabled feature and
-`graphicsPipelineLibraryFastLinking` are available. Hosts without that combination
-use the same construction implementation monolithically. Compute pipelines remain
-monolithic. The four library subsets have projected keys containing only their
-relevant shader/layout/static state, and concurrent library misses are deduplicated
-without submitting nested jobs. Libraries and layouts use bounded LRU retention.
-
-The [focused comparison](../../../../dump/vulkan-migration/task-09/README.md)
-records first-use creation, valid creation feedback, linking, warm CPU/GPU time,
-image equality and memory observations. It supports the selected fast-linking
-policy on the tested device, not a universal speedup claim. Pipeline binaries and
-background LTO replacement have no demonstrated need here and are not implemented
-as extra persistence/renderer strategies. Reevaluate if complex guest shaders show
-warm GPU regression or opaque driver-cache persistence/budget problems.
-
-Useful dynamic state is selected from enabled capabilities. Viewport/scissor,
-line width, depth bias, blend constants and stencil masks/references are dynamic;
-EDS1 also removes culling/winding and depth/stencil controls from static keys.
-Topology remains static: unrestricted dynamic topology is not assumed from
-an extension/version bit. Raster state/setters use the same normalized keys. Additional dynamic states should be selected with real
-steady-state evidence, rather than enabling an extension list indiscriminately.
-
-When GPL is enabled, stages chain `VkShaderModuleCreateInfo` directly into pipeline
-creation. Other hosts create temporary shader modules and destroy them after the
-synchronous call. No redundant shader-module object cache is retained. Creation
-feedback is consumed only with `VALID`; cache-control misses are compiled on the
-worker and never cause a draw to be skipped. Actual stage stores/atomics, workgroup,
-shared-memory, tessellation and graphics limits are checked at consumption.
-
-References: [graphics pipeline libraries](https://docs.vulkan.org/samples/latest/samples/extensions/graphics_pipeline_library/README.html),
-[creation feedback](https://docs.vulkan.org/refpages/latest/refpages/source/VkPipelineCreationFeedback.html),
-[pipeline cache control](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_pipeline_creation_cache_control.html).
+All construction workers use one internally synchronized `VkPipelineCache` for the
+title. They do not submit work to a Vulkan queue. A single serialization worker
+writes both persistent files and drains before the final driver-cache checkpoint.
 
 ## Layouts and descriptors
 
@@ -92,6 +41,13 @@ Layout keys reflect live dense set-zero bindings, stage visibility and push rang
 Constant buffers use uniform descriptors and storage buffers use storage descriptors.
 Reflection retains combined image/sampler arrays and uniform/storage texel buffers.
 Descriptor resource origins remain independent of shared Vulkan layout identity.
+Guest host parameters use the fixed SPIR-V ABI shared with the renderer; draw and
+dispatch fill stack constants directly, without interpreting reflected layouts.
+
+Pipeline binding, changed push constants and descriptor updates enter the native
+recorder as one ordered configuration. The owner selects changes and retains
+resources; the recording worker waits for the executable and emits the grouped
+calls. Graphics, compute and host utilities consume the same configuration path.
 
 The command owner captures resolved resources and compact template entries. Its
 weak lookup reuses live CPU captures without owning their storage. The Vulkan
@@ -108,13 +64,15 @@ The worker compares its last payload using weak resource identities, so unchange
 bindings reuse their set after GPU completion without pinning staging storage or
 matching a destroyed object's recycled handle. Payload metadata reuses its array.
 
-Each native command context retains the descriptor pools it actually uses until
-GPU completion, including if the worker unwinds. Retention is deduplicated once
-per pool/context; there is no per-command producer lock. Cold layout retirement
-can release metadata without destroying a pool still used by the GPU.
+Native pipelines, samplers and descriptor pools have stable renderer ownership.
+Recording jobs borrow pipeline references under that ownership instead of cloning
+pipeline handles or maintaining per-command identity sets. Object insertion locks
+only cold construction. Submission drains before renderer storage is released,
+including when recording fails.
 
-Binding captures retain actual buffers, views, samplers and layouts through their
-CPU and GPU use. Texel views belong to their buffer and are reused by offset,
+Binding captures retain resolved inputs until recording consumes them. Actual
+buffer/image retirement protects their physical GPU versions through completion;
+stable renderer ownership protects samplers, layouts and descriptor pools. Texel views belong to their buffer and are reused by offset,
 range and format. Immutable format capabilities are cached rather than queried
 again after an unrelated binding changes. There is no descriptor admission budget,
 page-reset loop, historical payload LRU or resource-free invalidation scan.
@@ -122,26 +80,38 @@ Resource contents are not a binding identity.
 Sampler keys normalize inactive compare/anisotropy fields and include explicit
 custom border components/format and reduction state with enabled feature checks.
 
-The fixed-color/compute helper renderer has been retired. Guest execution and
-NV12 use the same pipeline/layout/descriptor preparation. Alternative binding ABI
-pools exist only in the optional `binding-probe` experiment. Linked pipelines
-retain their actual library components so cache/compiler eviction cannot destroy
-their compiled dependency graph while a prepared/batch reference is live.
+## Persistence
 
-## Persistence and verification
+Each title uses its sixteen-digit lowercase ID beneath `gpu.cache_directory`:
 
-Optional storage keeps only SPIR-V words, stable reflection and explicit stage
-metadata, never raw host pointers or unversioned Rust IR. Files have length-framed
-keys and payload checksums, bounded reads/writes, atomic publication and LRU disk
-pruning. Invalid/corrupt entries are misses and are rebuilt. Driver blobs have a
-separate device/driver namespace and verified Vulkan version-one header/UUID.
-Each store is bounded; this is not a claim to bound the driver's private heap.
+- `vulkan.bin` stores the pipeline keys and recorded guest environments, including
+  the code and constant/descriptor observations required for translation.
+- `vulkan_pipelines.bin` stores the opaque Vulkan driver cache. Its version-one
+  Vulkan header, vendor/device IDs and pipeline-cache UUID must match the device.
 
-Tests cover duplicate requests, queue pressure, actual byte accounting, publication
-of failures, shader code/staged-write/relocation invalidation, QMD compute metadata,
-corrupt persistence rebuild, namespace isolation, native-code pipeline sharing,
-dynamic key normalization, library subset reuse and shader/pool/resource lifetimes.
-Gated real GPU submissions prove descriptors cannot recycle before completion.
-Vulkan 1.2/KHR and 1.3 paths are exercised on hardware. The hardware gate skips only
-when no real GPU is available; available-device initialization/validation failures
-fail. The focused strategy probe additionally verifies actual raster output bytes.
+Both files have an explicit renderer cache version. Environment records also carry
+the shader recompiler ABI version. Incompatible or truncated derived data is
+recreated. The format is Nixe-owned; it is not interchangeable with Eden's files.
+
+Startup streams records directly into reconstruction work and supports cancellation.
+It reconstructs every compatible saved pipeline in parallel, using fresh
+compiler arenas per job, and waits for completion before guest execution. It does
+not restore serialized SPIR-V or impose an entry quota. Runtime misses append their
+environments when every instruction belongs to the cached code span, as Eden's
+`CanBeSerialized` rule requires. Disk jobs consume owned environments without
+cloning instruction or constant-buffer maps. Driver checkpoints use Eden's threshold of 128 new pipelines and an
+interval of at least 30 seconds, increasing with the previous driver-cache size.
+Disk I/O failures are logged and do not change guest execution semantics.
+
+Native resources and descriptor payloads remain retained through CPU recording and
+GPU completion. A cache hit never bypasses resource coherence or hazard tracking.
+
+The device policy chooses native scaled formats or integer fetch with shader
+conversion, as Eden's `MustEmulateScaledFormats`. The proprietary Qualcomm driver
+uses the conversion path; static vertex keys preserve the original numerical
+class and emitted shaders consume the same device policy. Native Vulkan format
+mapping covers the reference's aliases and packed formats. A combination absent
+from the selected reference path fails precisely.
+
+Info logs include the driver-cache byte count and load duration, environment
+read/queue duration, and completed pipeline count with total startup duration.

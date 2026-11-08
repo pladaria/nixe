@@ -719,6 +719,3 @@ fn memory_error(error: nixe_memory::MemoryError) -> VulkanError {
 
 #[cfg(test)]
 pub(crate) mod tests;
-
-#[cfg(test)]
-mod commands_tests;

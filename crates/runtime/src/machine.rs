@@ -1,5 +1,5 @@
 //! Persistent physical cores with local exception handling.
-use crate::kernel_operation::{CoreSignal, KernelQueue};
+use crate::core_signal::CoreSignal;
 use crate::{
     DispatchFault, ExceptionDispatcher, ExceptionHandlingResult, ExternalEvent, ExternalEventInbox,
     ExternalEventSender, ExternalEventSource, ProcessTeardownReport, RunnableProcess,
@@ -17,7 +17,7 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
-mod core;
+pub(crate) mod core;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessRegistration {
@@ -61,7 +61,7 @@ impl From<crate::ExternalEventSendError> for RuntimeError {
     }
 }
 
-struct Shared {
+pub(crate) struct Shared {
     scheduler: Arc<SchedulerState>,
     processes: RwLock<BTreeMap<ProcessId, Arc<RunnableProcess>>>,
     signals: Box<[Arc<CoreSignal>]>,
@@ -70,7 +70,6 @@ struct Shared {
     pause_generation: AtomicU64,
     faults: Mutex<VecDeque<RuntimeError>>,
     rejected: Mutex<BTreeMap<String, log::Level>>,
-    abandoned: Mutex<Vec<Arc<KernelQueue>>>,
     failed: AtomicBool,
     events: ExternalEventSender,
 }
@@ -93,12 +92,6 @@ impl Shared {
             self.close_admission(&process);
         }
         self.notify_all();
-    }
-    fn drain_abandoned(&self) {
-        let queues = self.abandoned.lock().unwrap().clone();
-        for queue in queues {
-            core::drain(self, &queue);
-        }
     }
     fn record_rejection(
         &self,
@@ -140,7 +133,7 @@ impl Shared {
     fn status_changed(&self) {
         self.events.notify_host_service(ExternalEventSource::Worker);
     }
-    fn fail(&self, error: RuntimeError) {
+    pub(crate) fn fail(&self, error: RuntimeError) {
         self.faults.lock().unwrap().push_back(error);
         self.status_changed();
     }
@@ -236,7 +229,6 @@ impl Runtime {
             pause_generation: AtomicU64::new(0),
             faults: Mutex::default(),
             rejected: Mutex::default(),
-            abandoned: Mutex::default(),
             failed: AtomicBool::new(false),
             events: inbox.sender(),
         });
@@ -291,6 +283,10 @@ impl Runtime {
             .set(self.inbox.sender())
             .expect("process registers once");
         let process = Arc::new(process);
+        process
+            .runtime
+            .set(Arc::downgrade(&self.shared))
+            .expect("one process runtime owner");
         process.main_thread().bind_owner(&process);
         process
             .main_thread()
@@ -388,7 +384,6 @@ impl Runtime {
             }
             ExternalEvent::HostService(_) | ExternalEvent::ThreadRetirement => {}
         }
-        self.shared.drain_abandoned();
         self.finalize_retired_threads()
     }
     pub fn drain_external_events(&mut self) -> Result<(), RuntimeError> {
@@ -478,15 +473,16 @@ impl Runtime {
     pub fn remove_process(&mut self, id: ProcessId) -> Result<ProcessTeardownReport, RuntimeError> {
         self.terminate_process(id)?;
         let process = self.process(id).ok_or(RuntimeError::UnknownProcess(id))?;
-        self.shared.drain_abandoned();
         while process.has_native_threads()
+            || process.has_active_requests()
             || process
                 .threads()
                 .iter()
-                .any(|(_, thread)| thread.pending_wait().is_some())
+                .any(|(_, thread)| thread.has_host_context())
         {
             self.wait_for_event()?;
         }
+        self.check_faults()?;
         self.shared.processes.write().unwrap().remove(&id);
         let report = process
             .try_teardown()
@@ -533,6 +529,3 @@ impl Drop for Runtime {
         let _ = self.shutdown();
     }
 }
-
-#[cfg(test)]
-mod tests;

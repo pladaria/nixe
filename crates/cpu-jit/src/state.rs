@@ -31,19 +31,17 @@ impl Drop for NativeOwner {
     }
 }
 enum Storage {
-    Saved,
-    Native(NativeOwner),
+    Saved(Box<A64State>),
+    Native {
+        owner: NativeOwner,
+        saved: Box<A64State>,
+    },
     Unavailable,
 }
 
-/// One movable, exclusive register owner. It cannot expose saved bytes while
-/// native state is authoritative. Accessors require possession of this owner;
-/// it is absent from the runtime table throughout native execution.
+/// One movable register authority, saved in the thread or resident on its core.
 pub struct ThreadState {
     storage: Storage,
-    // Reuse the save area on switches. Its contents are inaccessible when
-    // Native or Unavailable; it is neither a snapshot nor a second authority.
-    saved: Box<A64State>,
 }
 impl Default for ThreadState {
     fn default() -> Self {
@@ -53,8 +51,7 @@ impl Default for ThreadState {
 impl From<A64State> for ThreadState {
     fn from(state: A64State) -> Self {
         Self {
-            storage: Storage::Saved,
-            saved: Box::new(state),
+            storage: Storage::Saved(Box::new(state)),
         }
     }
 }
@@ -62,7 +59,7 @@ impl ThreadState {
     #[must_use]
     #[inline]
     pub fn is_resident(&self) -> bool {
-        matches!(self.storage, Storage::Native(_))
+        matches!(self.storage, Storage::Native { .. })
     }
     #[must_use]
     #[inline]
@@ -72,33 +69,46 @@ impl ThreadState {
     pub(crate) fn discard(&mut self) {
         self.storage = Storage::Unavailable;
     }
-    /// Save on eviction/migration; repeated same-thread entries never call this.
+    /// Transfer the existing save area without allocating or cloning registers.
+    /// The suspended fiber retains an unavailable slot until its next dispatch.
+    pub fn take(&mut self) -> Self {
+        std::mem::replace(
+            self,
+            Self {
+                storage: Storage::Unavailable,
+            },
+        )
+    }
+    /// Save on eviction/migration; repeated same-thread entries keep native state.
     #[inline]
     pub fn materialize(&mut self) {
-        match &self.storage {
-            Storage::Native(owner) => unsafe {
-                record(Counter::ContextSaves, 1);
-                ffi::nixe_dynarmic_save(owner.core.pointer, self.saved.as_mut());
-            },
-            Storage::Saved => return,
-            Storage::Unavailable => panic!("architectural state is unavailable"),
+        if !self.is_resident() {
+            assert!(self.is_available(), "architectural state is unavailable");
+            return;
         }
-        self.storage = Storage::Saved;
+        let Storage::Native { owner, mut saved } =
+            std::mem::replace(&mut self.storage, Storage::Unavailable)
+        else {
+            unreachable!()
+        };
+        record(Counter::ContextSaves, 1);
+        unsafe { ffi::nixe_dynarmic_save(owner.core.pointer, saved.as_mut()) };
+        drop(owner);
+        self.storage = Storage::Saved(saved);
     }
     /// A scheduler switch/migration ends the old core's local reservation.
     #[inline]
     pub fn leave_core(&mut self) {
-        if let Storage::Native(owner) = &self.storage {
+        if let Storage::Native { owner, .. } = &self.storage {
             unsafe { ffi::nixe_dynarmic_clear_exclusive(owner.core.pointer) };
         }
         self.materialize();
     }
-    /// Owned full snapshot for an actual context consumer; leaves residency intact.
     #[must_use]
     pub fn snapshot(&self) -> A64State {
         match &self.storage {
-            Storage::Saved => self.saved.as_ref().clone(),
-            Storage::Native(owner) => {
+            Storage::Saved(saved) => saved.as_ref().clone(),
+            Storage::Native { owner, .. } => {
                 let mut state = A64State::default();
                 record(Counter::ContextSaves, 1);
                 unsafe { ffi::nixe_dynarmic_save(owner.core.pointer, &mut state) };
@@ -109,11 +119,14 @@ impl ThreadState {
     }
     pub fn saved_mut(&mut self) -> &mut A64State {
         self.materialize();
-        self.saved.as_mut()
+        let Storage::Saved(saved) = &mut self.storage else {
+            unreachable!()
+        };
+        saved.as_mut()
     }
     pub(crate) fn select(&mut self, core: &Arc<Native>) -> Result<(), JitError> {
         match &self.storage {
-            Storage::Native(owner) if Arc::ptr_eq(&owner.core, core) => return Ok(()),
+            Storage::Native { owner, .. } if Arc::ptr_eq(&owner.core, core) => return Ok(()),
             Storage::Unavailable => {
                 return Err(JitError::Failure(
                     "architectural state is unavailable".into(),
@@ -121,34 +134,38 @@ impl ThreadState {
             }
             _ => {}
         }
-        // A different destination may not replace an unexported guest. The
-        // runtime evicts its old occupant before dispatching a new lease.
-        // The unique native core is the sole claimant. Other owners can only
-        // release, after their final register access; there are no competing
-        // claimants requiring an atomic read/modify/write on every switch.
         if core.context_owned.load(Ordering::Acquire) {
             return Err(JitError::Failure(
                 "Dynarmic core still owns another guest context".into(),
             ));
         }
-        core.context_owned.store(true, Ordering::Release);
         self.leave_core();
+        let Storage::Saved(saved) = std::mem::replace(&mut self.storage, Storage::Unavailable)
+        else {
+            unreachable!()
+        };
+        core.context_owned.store(true, Ordering::Release);
         record(Counter::ContextLoads, 1);
-        unsafe { ffi::nixe_dynarmic_load(core.pointer, self.saved.as_ref()) };
-        self.storage = Storage::Native(NativeOwner { core: core.clone() });
+        unsafe { ffi::nixe_dynarmic_load(core.pointer, saved.as_ref()) };
+        self.storage = Storage::Native {
+            owner: NativeOwner { core: core.clone() },
+            saved,
+        };
         Ok(())
     }
     fn read(&self, reg: u32, saved: impl FnOnce(&A64State) -> u64) -> u64 {
         match &self.storage {
-            Storage::Saved => saved(self.saved.as_ref()),
-            Storage::Native(owner) => unsafe { ffi::nixe_dynarmic_read(owner.core.pointer, reg) },
+            Storage::Saved(state) => saved(state.as_ref()),
+            Storage::Native { owner, .. } => unsafe {
+                ffi::nixe_dynarmic_read(owner.core.pointer, reg)
+            },
             Storage::Unavailable => panic!("architectural state is unavailable"),
         }
     }
     fn write(&mut self, reg: u32, value: u64, saved: impl FnOnce(&mut A64State)) {
-        match &self.storage {
-            Storage::Saved => saved(self.saved.as_mut()),
-            Storage::Native(owner) => unsafe {
+        match &mut self.storage {
+            Storage::Saved(state) => saved(state.as_mut()),
+            Storage::Native { owner, .. } => unsafe {
                 ffi::nixe_dynarmic_write(owner.core.pointer, reg, value)
             },
             Storage::Unavailable => panic!("architectural state is unavailable"),
@@ -207,8 +224,8 @@ impl ThreadState {
             return None;
         }
         match &self.storage {
-            Storage::Saved => self.saved.vector(index),
-            Storage::Native(owner) => {
+            Storage::Saved(saved) => saved.vector(index),
+            Storage::Native { owner, .. } => {
                 let mut lanes = [0u64; 2];
                 unsafe {
                     ffi::nixe_dynarmic_read_vector(
@@ -227,9 +244,9 @@ impl ThreadState {
         if index >= 32 {
             return false;
         }
-        match &self.storage {
-            Storage::Saved => self.saved.set_vector(index, value),
-            Storage::Native(owner) => {
+        match &mut self.storage {
+            Storage::Saved(saved) => saved.set_vector(index, value),
+            Storage::Native { owner, .. } => {
                 let lanes = [value as u64, (value >> 64) as u64];
                 unsafe {
                     ffi::nixe_dynarmic_write_vector(

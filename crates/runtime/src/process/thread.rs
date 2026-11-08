@@ -65,7 +65,7 @@ pub struct ThreadObject {
     pub tls_base: GuestVirtualAddress,
     pub loader_return: Option<GuestVirtualAddress>,
     completion: EventObject,
-    wait: Mutex<Option<Arc<dyn crate::ThreadWait>>>,
+    host_context: Mutex<Option<crate::fiber::HostContext>>,
     // The process closes its handles/running references on termination; exported
     // threads retain their parent until final destruction.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_thread.cpp
@@ -166,7 +166,7 @@ impl ThreadObject {
             tls_base: allocation.address,
             loader_return,
             completion: EventObject::new(kernel),
-            wait: Mutex::new(None),
+            host_context: Mutex::new(None),
             retirement: OnceLock::new(),
             owner: OnceLock::new(),
             _allocation: allocation,
@@ -228,45 +228,30 @@ impl ThreadObject {
         self.completion.is_signalled()
     }
     pub fn signal(&self) {
-        self.cancel_wait();
+        self.cancel_host_context();
         self.completion.signal();
     }
-    pub fn set_wait(&self, wait: Arc<dyn crate::ThreadWait>) {
-        let mut current = self.wait.lock().unwrap();
-        assert!(current.is_none(), "one kernel wait per thread");
-        *current = Some(wait);
+    pub(crate) fn take_host_context(&self) -> Option<crate::fiber::HostContext> {
+        self.host_context.lock().unwrap().take()
     }
-    pub fn pending_wait(&self) -> Option<Arc<dyn crate::ThreadWait>> {
-        self.wait.lock().unwrap().clone()
+    pub(crate) fn restore_host_context(&self, context: crate::fiber::HostContext) {
+        assert!(
+            self.host_context.lock().unwrap().replace(context).is_none(),
+            "one host context per kernel thread"
+        );
     }
-    /// Retire this accepted call without removing a continuation installed by another core.
-    pub fn clear_wait(&self, expected: &Arc<dyn crate::ThreadWait>) -> bool {
-        let retired = {
-            let mut current = self.wait.lock().unwrap();
-            if !current
-                .as_ref()
-                .is_some_and(|wait| Arc::ptr_eq(wait, expected))
-            {
-                return false;
-            }
-            current.take()
-        };
-        drop(retired);
-        true
+    pub(crate) fn cancel_host_context(&self) {
+        // Drop outside the thread lock: unwinding the suspended kernel stack
+        // releases its own references and cancels its accepted service calls.
+        let context = self.host_context.lock().unwrap().take();
+        drop(context);
     }
-    pub(crate) fn take_wait(&self) -> Option<Arc<dyn crate::ThreadWait>> {
-        self.wait.lock().unwrap().take()
-    }
-    pub(crate) fn cancel_wait(&self) {
-        let wait = self.wait.lock().unwrap().as_ref().cloned();
-        if let Some(wait) = wait {
-            wait.cancel();
-        }
+    pub(crate) fn has_host_context(&self) -> bool {
+        self.host_context.lock().unwrap().is_some()
     }
     pub fn readable_event(&self) -> ReadableEventObject {
         self.completion.readable()
     }
-
     pub fn exit(&self) -> Option<ThreadExit> {
         *self.exit.lock().unwrap()
     }

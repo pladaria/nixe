@@ -102,7 +102,7 @@ impl FenceManager {
                 #[cfg(target_os = "linux")]
                 configure_fencing_thread();
                 let _scope = WorkerScope {
-                    progress: Arc::clone(&pending),
+                    progress: (pending).clone(),
                     shared: Arc::clone(&queue),
                 };
                 loop {

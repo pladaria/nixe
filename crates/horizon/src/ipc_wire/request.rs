@@ -17,9 +17,6 @@ pub(crate) struct Buffer {
     ranges: nixe_memory::CapturedMemory,
 }
 pub(crate) struct Request {
-    thread: Arc<nixe_runtime::ThreadObject>,
-    process: Arc<nixe_runtime::RunnableProcess>,
-    process_generation: u64,
     command: Buffer,
     buffers: Vec<Buffer>,
     offsets: [usize; 6],
@@ -37,7 +34,6 @@ impl Request {
         payload_budget: Arc<super::payload::PayloadBudget>,
     ) -> Result<Self, IpcWireError> {
         let process = context.process();
-        let process_generation = context.generation();
         let command = Self::capture(
             process,
             address.get(),
@@ -45,15 +41,12 @@ impl Request {
             MemoryPermissions::READ_WRITE,
         )?;
         Ok(Self {
-            thread: context.thread().object().clone(),
-            process: process.clone(),
-            process_generation,
             command,
             offsets: [0; 6],
             buffers: Vec::new(),
             copied: Vec::new(),
             returned: Vec::new(),
-            lifetime: Arc::default(),
+            lifetime: Arc::new(super::operation::CallLifetime::for_client(context)),
             payload_budget,
             payload: std::sync::OnceLock::new(),
         })
@@ -73,7 +66,7 @@ impl Request {
             .map_err(|_| IpcWireError::Internal("duplicate IPC payload admission"))
     }
     fn check_lifetime(&self) -> Result<(), IpcWireError> {
-        if self.process_generation != self.process.generation() {
+        if self.lifetime.client().generation() != self.lifetime.client().process().generation() {
             return Err(IpcWireError::Cancelled);
         }
         self.lifetime.check()
@@ -86,28 +79,33 @@ impl Request {
         self.lifetime.begin()
     }
     pub fn kernel(&self) -> &Arc<nixe_scheduler::SchedulerState> {
-        self.process.scheduler()
+        self.lifetime.client().process().scheduler()
     }
 
     pub fn thread_id(&self) -> u64 {
-        self.thread.thread_id()
+        self.lifetime.client().thread().thread_id()
     }
     pub fn process_id(&self) -> u64 {
-        self.process.process_id()
+        self.lifetime.client().process().process_id()
     }
     pub fn cpu(&self) -> nixe_cpu::profile::ProcessCpuContext {
-        self.process.cpu()
+        self.lifetime.client().process().cpu()
     }
     pub fn memory(&self) -> &Arc<nixe_runtime::memory::ProcessMemory> {
-        self.process.memory()
+        self.lifetime.client().process().memory()
     }
     pub fn mounts(&self) -> &ProcessMountNamespace {
-        self.process.mounts()
+        self.lifetime.client().process().mounts()
     }
     /// Nested service data pointers are accepted when their descriptor is
     /// consumed, before any asynchronous work reads the pointed-to bytes.
     pub fn capture_input(&self, address: u64, bytes: u64) -> Result<Buffer, IpcWireError> {
-        Self::capture(&self.process, address, bytes, MemoryPermissions::READ)
+        Self::capture(
+            self.lifetime.client().process(),
+            address,
+            bytes,
+            MemoryPermissions::READ,
+        )
     }
     pub fn command_size(&self) -> usize {
         self.command.size as usize
@@ -202,8 +200,8 @@ impl Request {
     }
     pub fn accept_descriptors(&mut self, hipc: &HipcRequest<'_>) -> Result<(), IpcWireError> {
         self.copied = super::handles::capture(
-            &self.process,
-            &self.thread,
+            self.lifetime.client().process(),
+            self.lifetime.client().thread(),
             hipc.copy_handles.iter().copied(),
             hipc.move_handles.iter().copied(),
             false,
@@ -226,7 +224,7 @@ impl Request {
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/hle_ipc.cpp#L314-L448
         for descriptor in &hipc.send_statics {
             self.buffers.push(Self::capture(
-                &self.process,
+                self.lifetime.client().process(),
                 descriptor.address,
                 u64::from(descriptor.size),
                 MemoryPermissions::READ,
@@ -246,7 +244,7 @@ impl Request {
                     return Err(IpcWireError::Malformed("invalid IPC buffer mode"));
                 }
                 self.buffers.push(Self::capture(
-                    &self.process,
+                    self.lifetime.client().process(),
                     descriptor.address,
                     descriptor.size,
                     permission,
@@ -257,7 +255,7 @@ impl Request {
         if let ReceiveStatics::Entries(descriptors) = &hipc.receive_statics {
             for descriptor in descriptors {
                 self.buffers.push(Self::capture(
-                    &self.process,
+                    self.lifetime.client().process(),
                     descriptor.address,
                     u64::from(descriptor.size),
                     MemoryPermissions::WRITE,
@@ -274,7 +272,12 @@ impl Request {
         &mut self,
         object: HandleObject,
     ) -> Result<u32, nixe_runtime::HandleError> {
-        let reservation = self.process.handles().reserve(Some(object))?;
+        let reservation = self
+            .lifetime
+            .client()
+            .process()
+            .handles()
+            .reserve(Some(object))?;
         let handle = reservation.handle();
         self.returned.push(reservation);
         Ok(handle)
@@ -294,11 +297,15 @@ impl Request {
     pub fn publish_handles(&mut self) -> Result<(), IpcWireError> {
         self.check_lifetime()?;
         self.lifetime.commit_reply()?;
-        self.process
+        self.lifetime
+            .client()
+            .process()
             .handles()
             .publish(&mut self.returned)
             .map_err(|error| {
-                if self.process_generation != self.process.generation() {
+                if self.lifetime.client().generation()
+                    != self.lifetime.client().process().generation()
+                {
                     IpcWireError::Cancelled
                 } else {
                     IpcWireError::Handle(error)
@@ -346,7 +353,9 @@ impl Request {
             .ok_or(IpcWireError::Malformed("IPC input offset overflows"))?;
         let storage = std::mem::take(output);
         let storage = match self
-            .process
+            .lifetime
+            .client()
+            .process()
             .memory()
             .account()
             .machine()
@@ -385,7 +394,9 @@ impl Request {
         self.lifetime.begin_output()?;
         let storage = std::mem::take(bytes);
         let result = match self
-            .process
+            .lifetime
+            .client()
+            .process()
             .memory()
             .account()
             .machine()

@@ -48,7 +48,7 @@ impl HorizonSvcDispatcher {
             .guest_logs_level
             .resolve(GuestLogSeverity::Info)
             .filter(|level| log::log_enabled!(target: "nixe_horizon::guest", *level));
-        self.start_owned_svc(context, std::sync::Arc::default(), None, async move {
+        let completed = (|| {
             let fault = |fault| HorizonSvcFault::MemoryAccess {
                 immediate: 0x27,
                 fault,
@@ -67,12 +67,14 @@ impl HorizonSvcDispatcher {
                     .map_err(|e| fault(std::sync::Arc::new(e)))?
                 {
                     nixe_memory::Access::Ready(()) => {}
-                    nixe_memory::Access::Pending(pending) => match pending.await.map_err(fault)? {
-                        nixe_memory::AccessResult::Read(data) if data.len() == output.len() => {
-                            output.copy_from_slice(&data)
+                    nixe_memory::Access::Pending(pending) => {
+                        match super::access::wait_access(context, 0x27, pending)? {
+                            nixe_memory::AccessResult::Read(data) if data.len() == output.len() => {
+                                output.copy_from_slice(&data)
+                            }
+                            _ => return Err(runtime_fault("debug string read completion")),
                         }
-                        _ => return Err(runtime_fault("debug string read completion")),
-                    },
+                    }
                 }
                 offset += count as u64;
                 remaining -= count as u64;
@@ -88,8 +90,9 @@ impl HorizonSvcDispatcher {
                 bytes.copy_within(emitted..filled, 0);
                 pending_utf8 = filled - emitted;
             }
-            Ok(super::memory_wait::SvcCompletion::success(None))
-        })
+            Ok((HorizonKernelResult::SUCCESS, None))
+        })();
+        super::access::finish(context, completed)
     }
 }
 

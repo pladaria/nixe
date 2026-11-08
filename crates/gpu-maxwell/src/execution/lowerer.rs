@@ -6,7 +6,7 @@ use crate::{MaxwellThreeDState, MaxwellTwoDBlitOperation};
 pub trait MaxwellFrontend: 'static {
     fn bind_gpu_memory(&mut self, memory: &crate::MaxwellGpuMemoryHandle);
     fn create_channel(&mut self, channel: crate::MaxwellChannelId);
-    fn bind_channel(&mut self, channel: crate::MaxwellChannelId);
+    fn bind_channel(&mut self, channel: crate::MaxwellChannelId, state: &MaxwellThreeDState);
     fn close_channel(&mut self, channel: crate::MaxwellChannelId);
     fn bind_graphics_uniform(
         &mut self,
@@ -15,39 +15,39 @@ pub trait MaxwellFrontend: 'static {
         binding: Option<crate::MaxwellThreeDConstantBufferBinding>,
         address_space: &MaxwellGpuMemory,
     ) -> Result<(), MaxwellSubmissionExecutionError>;
-    fn try_draw(
+    fn draw(
         &mut self,
         state: &MaxwellThreeDState,
         draw: &crate::MaxwellThreeDDrawState,
         address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
         access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<bool, MaxwellSubmissionExecutionError>;
+    ) -> Result<(), MaxwellSubmissionExecutionError>;
     fn clear(
         &mut self,
         state: &MaxwellThreeDState,
         address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
     ) -> Result<(), MaxwellSubmissionExecutionError>;
-    fn try_launch(
+    fn launch(
         &mut self,
         launch: &MaxwellResolvedComputeLaunch,
         address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
         access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<bool, MaxwellSubmissionExecutionError>;
-    fn try_solid(
+    ) -> Result<(), MaxwellSubmissionExecutionError>;
+    fn solid(
         &mut self,
         request: &MaxwellTwoDSolidOperation,
         address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
-    ) -> Result<bool, MaxwellSubmissionExecutionError>;
-    fn try_blit(
+    ) -> Result<(), MaxwellSubmissionExecutionError>;
+    fn blit(
         &mut self,
         request: &MaxwellTwoDBlitOperation,
         address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
-    ) -> Result<bool, MaxwellSubmissionExecutionError>;
+    ) -> Result<(), MaxwellSubmissionExecutionError>;
     /// True consumes the DMA through the actual buffer/texture owners. False
     /// selects the engine's safe CPU copy; it is not an asynchronous retry.
     fn accelerate_dma(

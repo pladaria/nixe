@@ -1,14 +1,8 @@
-//! Horizon's process-local address arbiter (SVC 0x34/0x35).
-//!
-//! ABI, validation and signed comparison/update semantics:
-//! https://switchbrew.org/wiki/SVC#WaitForAddress
-//! https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/svc/kern_svc_address_arbiter.cpp
-//! https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/kern_k_address_arbiter.cpp
-
+//! Horizon process-local address arbitration runs on the guest kernel stack.
 use super::address_word::{AddressWord, address_word_fault};
 use super::*;
+use nixe_memory::MemoryPermissions;
 
-// https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/include/mesosphere/kern_k_memory_layout.hpp
 const KERNEL_ADDRESS_START: u64 = 0u64.wrapping_sub(1 << 39);
 const KERNEL_ADDRESS_END: u64 = 0u64.wrapping_sub(0x20_0000);
 
@@ -38,17 +32,15 @@ impl HorizonSvcDispatcher {
         let kernel = context.process().scheduler().clone();
         let thread = context.thread().id();
         let deadline = (timeout > 0).then(|| self.virtual_time_ns().saturating_add(timeout as u64));
-        let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
-        let running = lifetime.clone();
-        self.start_owned_svc(context, lifetime, None, async move {
-            let turn = waits.address_operation(address).await;
-            if kind == 1 {
-                running.begin().map_err(|_| {
-                    runtime_fault("WaitForAddress cancelled before its word operation")
-                })?;
-            }
-            let compared: Result<bool, std::sync::Arc<nixe_memory::MemoryError>> = async {
-                let mut observed = word.read_owned().await?;
+        let completed = (|| {
+            let turn = super::access::wait_io(context, waits.address_operation(address));
+            let compared: Result<bool, HorizonSvcFault> = (|| {
+                let fault = |fault| HorizonSvcFault::MemoryAccess {
+                    immediate: 0x34,
+                    fault,
+                };
+                let mut observed =
+                    super::access::wait_io(context, word.read_owned()).map_err(fault)?;
                 loop {
                     if !(if kind == 2 {
                         observed as i32 == value
@@ -60,74 +52,51 @@ impl HorizonSvcDispatcher {
                     if kind != 1 {
                         return Ok(true);
                     }
-                    let (previous, written) = word
-                        .compare_exchange_owned(observed, observed.wrapping_sub(1))
-                        .await?;
+                    let (previous, written) = super::access::wait_io(
+                        context,
+                        word.compare_exchange_owned(observed, observed.wrapping_sub(1)),
+                    )
+                    .map_err(fault)?;
                     if written {
                         return Ok(true);
                     }
                     observed = previous;
                 }
-            }
-            .await;
+            })();
             let immediate = match compared {
                 Ok(false) => Some(HorizonKernelResult::INVALID_STATE),
                 Ok(true) if timeout == 0 => Some(HorizonKernelResult::TIMED_OUT),
                 Ok(true) => None,
-                Err(error) if error.is_access_fault() => {
+                Err(HorizonSvcFault::MemoryAccess { fault, .. }) if fault.is_access_fault() => {
                     Some(HorizonKernelResult::INVALID_CURRENT_MEMORY)
                 }
-                Err(fault) => {
-                    return Err(HorizonSvcFault::MemoryAccess {
-                        immediate: 0x34,
-                        fault,
-                    });
-                }
+                Err(fault) => return Err(fault),
             };
             if let Some(code) = immediate {
-                return Ok(memory_wait::SvcCompletion::Return {
-                    code,
-                    output1: None,
-                });
+                return Ok((code, None));
             }
-            // A cancelled accepted word update finishes, but cannot start a
-            // new wait after the caller has retired.
-            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_address_arbiter.cpp
-            if kind == 1 && running.check().is_err() {
-                return Ok(memory_wait::SvcCompletion::Return {
-                    code: HorizonKernelResult::CANCELLED,
-                    output1: None,
-                });
-            }
-            let wait = {
-                let mut state = waits.lock();
-                state
-                    .enqueue_address_wait(address, thread)
-                    .map_err(|fault| HorizonSvcFault::Scheduling {
-                        operation: "WaitForAddress",
-                        fault,
-                    })?
-            };
+            let wait = waits
+                .lock()
+                .enqueue_address_wait(address, thread)
+                .map_err(|fault| HorizonSvcFault::Scheduling {
+                    operation: "WaitForAddress",
+                    fault,
+                })?;
             if let Some(deadline) = deadline {
                 kernel.arm_deadline(&wait, deadline);
             }
             drop(turn);
-            let outcome = wait.wait().await;
+            let outcome = super::access::wait_future(context, wait.wait(), Some(wait.clone()))?;
             waits.lock().remove_address_wait(thread);
-            let code = if outcome == nixe_scheduler::WaitOutcome::TimedOut {
-                HorizonKernelResult::TIMED_OUT
-            } else if outcome == nixe_scheduler::WaitOutcome::Terminated {
-                HorizonKernelResult::CANCELLED
-            } else {
-                HorizonKernelResult::SUCCESS
+            let code = match outcome {
+                nixe_scheduler::WaitOutcome::TimedOut => HorizonKernelResult::TIMED_OUT,
+                nixe_scheduler::WaitOutcome::Terminated => HorizonKernelResult::CANCELLED,
+                _ => HorizonKernelResult::SUCCESS,
             };
-            Ok(memory_wait::SvcCompletion::Return {
-                code,
-                output1: None,
-            })
-        })
+            Ok((code, None))
+        })();
+        super::access::finish(context, completed)
     }
-
     pub(super) fn signal_to_address(
         self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
@@ -149,13 +118,8 @@ impl HorizonSvcDispatcher {
             }
         };
         let waits = context.process().address_waits().clone();
-        let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
-        let running = lifetime.clone();
-        self.start_owned_svc(context, lifetime, None, async move {
-            let turn = waits.address_operation(address).await;
-            running.begin().map_err(|_| {
-                runtime_fault("SignalToAddress cancelled before its word operation")
-            })?;
+        let completed = (|| {
+            let turn = super::access::wait_io(context, waits.address_operation(address));
             let limit = if count <= 0 {
                 usize::MAX
             } else {
@@ -165,13 +129,14 @@ impl HorizonSvcDispatcher {
             let replacement = signal_replacement(kind, value, count, targets.is_empty(), more);
             let equal = if let Some(word) = word {
                 if replacement == value {
-                    word.read_owned()
-                        .await
+                    super::access::wait_io(context, word.read_owned())
                         .map(|observed| observed == value as u32)
                 } else {
-                    word.compare_exchange_owned(value as u32, replacement as u32)
-                        .await
-                        .map(|(_, written)| written)
+                    super::access::wait_io(
+                        context,
+                        word.compare_exchange_owned(value as u32, replacement as u32),
+                    )
+                    .map(|(_, written)| written)
                 }
             } else {
                 Ok(true)
@@ -193,13 +158,9 @@ impl HorizonSvcDispatcher {
                 }
             };
             drop(turn);
-            Ok(super::memory_wait::SvcCompletion::kernel(
-                move |_, context| {
-                    result(context, code);
-                    resume()
-                },
-            ))
-        })
+            Ok((code, None))
+        })();
+        super::access::finish(context, completed)
     }
 }
 

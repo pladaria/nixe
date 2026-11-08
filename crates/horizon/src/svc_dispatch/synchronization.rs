@@ -83,18 +83,11 @@ impl HorizonSvcDispatcher {
             Ok(nixe_memory::Access::Pending(pending)) => pending,
         };
         let scheduler = scheduler.clone();
-        self.kernel_access(
-            context,
-            Ok(nixe_memory::Access::Pending(pending)),
-            move |_, _, result| match result {
-                Err(fault) => ExceptionDispatchOutcome::Fault(HorizonSvcFault::MemoryAccess {
-                    immediate: 0x36,
-                    fault,
-                }),
-                Ok(nixe_memory::AccessResult::Written(_)) => unpin(&scheduler),
-                Ok(_) => ExceptionDispatchOutcome::Fault(runtime_fault("TLS flag completion kind")),
-            },
-        )
+        match super::access::wait_access(context, 0x36, pending) {
+            Err(fault) => ExceptionDispatchOutcome::Fault(fault),
+            Ok(nixe_memory::AccessResult::Written(_)) => unpin(&scheduler),
+            Ok(_) => ExceptionDispatchOutcome::Fault(runtime_fault("TLS flag completion kind")),
+        }
     }
 
     pub(super) fn reply_and_receive(
@@ -184,21 +177,22 @@ impl HorizonSvcDispatcher {
                     );
                 }
             };
-        self.read_svc_input(
+        match self.read_svc_input(
             context,
             immediate,
             GuestVirtualAddress::new(handles_address),
             count as usize * 4,
-            move |dispatcher, context, bytes| {
-                let mut handles = [0; MAX_WAIT_HANDLES as usize];
-                for (handle, encoded) in handles.iter_mut().zip(bytes.chunks_exact(4)) {
-                    *handle = u32::from_le_bytes(encoded.try_into().unwrap());
-                }
-                let targets =
-                    context
-                        .process()
-                        .handles()
-                        .lookup_many(&handles[..count as usize], |object| {
+        ) {
+            Ok(bytes) => {
+                let dispatcher = self;
+                {
+                    let mut handles = [0; MAX_WAIT_HANDLES as usize];
+                    for (handle, encoded) in handles.iter_mut().zip(bytes.chunks_exact(4)) {
+                        *handle = u32::from_le_bytes(encoded.try_into().unwrap());
+                    }
+                    let targets = context.process().handles().lookup_many(
+                        &handles[..count as usize],
+                        |object| {
                             if let Some(port) = object.downcast::<PortObject>()
                                 && port.endpoint() == PortEndpoint::Server
                             {
@@ -211,171 +205,178 @@ impl HorizonSvcDispatcher {
                             } else {
                                 None
                             }
-                        });
-                let Ok(targets) = targets else {
-                    result(context, HorizonKernelResult::INVALID_HANDLE);
-                    return resume();
-                };
-                let wait = ReplyReceiveWait {
-                    targets,
-                    ranges,
-                    size,
-                    immediate,
-                    timeout,
-                    deadline: None,
-                };
-                if reply_target == 0 {
-                    return dispatcher.poll_reply_wait(context, wait);
-                }
-                let Some(session) = context
-                    .process()
-                    .handles()
-                    .lookup_as::<SessionObject>(reply_target)
-                else {
-                    result(context, HorizonKernelResult::INVALID_HANDLE);
-                    return resume();
-                };
-                if session.endpoint() != SessionEndpoint::Server || session.is_light() {
-                    result(context, HorizonKernelResult::INVALID_HANDLE);
-                    return resume();
-                }
-                let request = match session.reply() {
-                    Ok(request) => request,
-                    Err(error) => {
-                        write_register(context.thread_mut().state_mut(), 1, u32::MAX as u64);
-                        return session_error(context, error);
+                        },
+                    );
+                    let Ok(targets) = targets else {
+                        result(context, HorizonKernelResult::INVALID_HANDLE);
+                        return resume();
+                    };
+                    let wait = ReplyReceiveWait {
+                        targets,
+                        ranges,
+                        size,
+                        immediate,
+                        timeout,
+                        deadline: None,
+                    };
+                    if reply_target == 0 {
+                        return dispatcher.receive_request(context, wait);
                     }
-                };
-                dispatcher.read_svc_message(
-                    context,
-                    immediate,
-                    wait.ranges.clone(),
-                    move |dispatcher, context, bytes| {
-                        let reply = match bytes
-                            .and_then(|bytes| capture_message_handles(context, bytes, true))
-                        {
-                            Ok(reply) => reply,
-                            Err(code) => {
-                                if let Err(error) =
-                                    request.fail(SessionError::TransferFailed(code.raw()))
-                                {
-                                    write_register(
-                                        context.thread_mut().state_mut(),
-                                        1,
-                                        u32::MAX as u64,
-                                    );
-                                    return session_error(context, error);
-                                }
-                                return dispatcher.poll_reply_wait(context, wait);
-                            }
-                        };
-                        if let Err(error) = request.reply(reply) {
+                    let Some(session) = context
+                        .process()
+                        .handles()
+                        .lookup_as::<SessionObject>(reply_target)
+                    else {
+                        result(context, HorizonKernelResult::INVALID_HANDLE);
+                        return resume();
+                    };
+                    if session.endpoint() != SessionEndpoint::Server || session.is_light() {
+                        result(context, HorizonKernelResult::INVALID_HANDLE);
+                        return resume();
+                    }
+                    let request = match session.reply() {
+                        Ok(request) => request,
+                        Err(error) => {
                             write_register(context.thread_mut().state_mut(), 1, u32::MAX as u64);
                             return session_error(context, error);
                         }
-                        dispatcher.poll_reply_wait(context, wait)
-                    },
-                )
-            },
-        )
-    }
-
-    fn poll_reply_wait(
-        self: &std::sync::Arc<Self>,
-        context: &mut ExceptionDispatchContext<'_>,
-        wait: ReplyReceiveWait,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let immediate = wait.immediate;
-        'receive: loop {
-            for (index, target) in wait.targets.iter().enumerate() {
-                match target {
-                    ReplyWaitTarget::Port(port) if port.is_signalled() => {
-                        result(context, HorizonKernelResult::SUCCESS);
-                        write_register(context.thread_mut().state_mut(), 1, index as u64);
-                        return resume();
-                    }
-                    ReplyWaitTarget::Session(session) if session.is_signalled() => {
-                        match session.receive() {
-                            Ok(mut receive) => {
-                                let incoming = receive.take_message();
-                                let mut message = match materialize_message_handles(
-                                    context.process().handles(),
-                                    incoming,
-                                    wait.size,
-                                ) {
-                                    Ok(message) => message,
-                                    Err(code) => {
-                                        // ReceiveRequest completes the client with
-                                        // the transfer error, then returns NotFound
-                                        // so ReplyAndReceive selects the next work.
-                                        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_session.cpp#L1158-L1218
-                                        receive.fail(SessionError::TransferFailed(code.raw()));
-                                        continue 'receive;
+                    };
+                    match dispatcher.read_svc_message(context, immediate, wait.ranges.clone()) {
+                        Ok(bytes) => {
+                            let reply = match bytes
+                                .and_then(|bytes| capture_message_handles(context, bytes, true))
+                            {
+                                Ok(reply) => reply,
+                                Err(code) => {
+                                    if let Err(error) =
+                                        request.fail(SessionError::TransferFailed(code.raw()))
+                                    {
+                                        write_register(
+                                            context.thread_mut().state_mut(),
+                                            1,
+                                            u32::MAX as u64,
+                                        );
+                                        return session_error(context, error);
                                     }
-                                };
-                                message.receive = Some(receive);
-                                return self.write_received_message(
-                                    context,
-                                    immediate,
-                                    wait.ranges,
-                                    message,
-                                    Some(index as u64),
+                                    return dispatcher.receive_request(context, wait);
+                                }
+                            };
+                            if let Err(error) = request.reply(reply) {
+                                write_register(
+                                    context.thread_mut().state_mut(),
+                                    1,
+                                    u32::MAX as u64,
                                 );
-                            }
-                            Err(SessionError::NoRequest) => {}
-                            Err(error) => {
-                                write_register(context.thread_mut().state_mut(), 1, index as u64);
                                 return session_error(context, error);
                             }
+                            dispatcher.receive_request(context, wait)
                         }
+                        Err(fault) => reject(context, fault),
                     }
-                    _ => {}
                 }
             }
-            break;
+            Err(fault) => reject(context, fault),
         }
-        let mut wait = wait;
-        let timeout = if wait.timeout < 0 {
-            None
-        } else {
-            let deadline = *wait
-                .deadline
-                .get_or_insert_with(|| self.virtual_time_ns().saturating_add(wait.timeout as u64));
-            Some(deadline.saturating_sub(self.virtual_time_ns()))
-        };
-        let events: Vec<_> = wait
-            .targets
-            .iter()
-            .map(|target| match target {
-                ReplyWaitTarget::Port(port) => port.readable_event(),
-                ReplyWaitTarget::Session(session) => session.readable_event(),
-            })
-            .collect();
-        let start = context.process().scheduler().wait_on_objects(
-            context.thread().id(),
-            &events,
-            timeout,
-            true,
-        );
-        self.finish_wait_start(
-            context,
-            start,
-            move |dispatcher, context, outcome| match outcome {
-                nixe_scheduler::WaitOutcome::Signalled(_) => {
-                    dispatcher.poll_reply_wait(context, wait)
+    }
+
+    fn receive_request(
+        self: &std::sync::Arc<Self>,
+        context: &mut ExceptionDispatchContext<'_>,
+        mut wait: ReplyReceiveWait,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let immediate = wait.immediate;
+        loop {
+            'receive: loop {
+                for (index, target) in wait.targets.iter().enumerate() {
+                    match target {
+                        ReplyWaitTarget::Port(port) if port.is_signalled() => {
+                            result(context, HorizonKernelResult::SUCCESS);
+                            write_register(context.thread_mut().state_mut(), 1, index as u64);
+                            return resume();
+                        }
+                        ReplyWaitTarget::Session(session) if session.is_signalled() => {
+                            match session.receive() {
+                                Ok(mut receive) => {
+                                    let incoming = receive.take_message();
+                                    let mut message = match materialize_message_handles(
+                                        context.process().handles(),
+                                        incoming,
+                                        wait.size,
+                                    ) {
+                                        Ok(message) => message,
+                                        Err(code) => {
+                                            // ReceiveRequest completes the client with
+                                            // the transfer error, then returns NotFound
+                                            // so ReplyAndReceive selects the next work.
+                                            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_session.cpp#L1158-L1218
+                                            receive.fail(SessionError::TransferFailed(code.raw()));
+                                            continue 'receive;
+                                        }
+                                    };
+                                    message.receive = Some(receive);
+                                    return self.write_received_message(
+                                        context,
+                                        immediate,
+                                        wait.ranges,
+                                        message,
+                                        Some(index as u64),
+                                    );
+                                }
+                                Err(SessionError::NoRequest) => {}
+                                Err(error) => {
+                                    write_register(
+                                        context.thread_mut().state_mut(),
+                                        1,
+                                        index as u64,
+                                    );
+                                    return session_error(context, error);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {
-                    let code = if outcome == nixe_scheduler::WaitOutcome::TimedOut {
-                        HorizonKernelResult::TIMED_OUT
-                    } else {
-                        HorizonKernelResult::CANCELLED
-                    };
-                    result(context, code);
-                    write_register(context.thread_mut().state_mut(), 1, u32::MAX as u64);
-                    resume()
-                }
-            },
-        )
+                break;
+            }
+            let timeout = if wait.timeout < 0 {
+                None
+            } else {
+                let deadline = *wait.deadline.get_or_insert_with(|| {
+                    self.virtual_time_ns().saturating_add(wait.timeout as u64)
+                });
+                Some(deadline.saturating_sub(self.virtual_time_ns()))
+            };
+            let events: Vec<_> = wait
+                .targets
+                .iter()
+                .map(|target| match target {
+                    ReplyWaitTarget::Port(port) => port.readable_event(),
+                    ReplyWaitTarget::Session(session) => session.readable_event(),
+                })
+                .collect();
+            let start = context.process().scheduler().wait_on_objects(
+                context.thread().id(),
+                &events,
+                timeout,
+                true,
+            );
+            match super::access::wait_kernel(context, start) {
+                Ok(outcome) => match outcome {
+                    nixe_scheduler::WaitOutcome::Signalled(_) => continue,
+                    _ => {
+                        let code = if outcome == nixe_scheduler::WaitOutcome::TimedOut {
+                            HorizonKernelResult::TIMED_OUT
+                        } else {
+                            HorizonKernelResult::CANCELLED
+                        };
+                        result(context, code);
+                        write_register(context.thread_mut().state_mut(), 1, u32::MAX as u64);
+                        return resume();
+                    }
+                },
+                Err(fault) => return reject(context, fault),
+            }
+        }
     }
 }
 
@@ -415,48 +416,50 @@ impl HorizonSvcDispatcher {
             server,
             pending: false,
         };
-        self.poll_light_reply_wait(context, wait)
+        self.receive_light_request(context, wait)
     }
 
-    fn poll_light_reply_wait(
+    fn receive_light_request(
         self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         mut wait: LightReplyWait,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let event = wait.session.readable_event();
-        match wait.session.receive_light(wait.server) {
-            Ok(SessionMessage::Light(request)) => {
-                wait.pending = false;
-                for (index, word) in request.into_iter().enumerate() {
-                    write_register(
-                        context.thread_mut().state_mut(),
-                        index as u8 + 1,
-                        u64::from(word),
-                    );
-                }
-                result(context, HorizonKernelResult::SUCCESS);
-                resume()
-            }
-            Ok(SessionMessage::Buffer(_) | SessionMessage::TransportedBuffer { .. })
-            | Err(SessionError::MessageKindMismatch) => invalid_state(context),
-            Err(SessionError::NoRequest) => {
-                wait.pending = true;
-                let start = context.process().scheduler().wait_on_objects(
-                    context.thread().id(),
-                    &[event],
-                    None,
-                    true,
-                );
-                self.finish_wait_start(context, start, move |dispatcher, context, outcome| {
-                    if matches!(outcome, nixe_scheduler::WaitOutcome::Signalled(_)) {
-                        dispatcher.poll_light_reply_wait(context, wait)
-                    } else {
-                        result(context, HorizonKernelResult::CANCELLED);
-                        resume()
+        loop {
+            let event = wait.session.readable_event();
+            match wait.session.receive_light(wait.server) {
+                Ok(SessionMessage::Light(request)) => {
+                    wait.pending = false;
+                    for (index, word) in request.into_iter().enumerate() {
+                        write_register(
+                            context.thread_mut().state_mut(),
+                            index as u8 + 1,
+                            u64::from(word),
+                        );
                     }
-                })
+                    result(context, HorizonKernelResult::SUCCESS);
+                    return resume();
+                }
+                Ok(SessionMessage::Buffer(_) | SessionMessage::TransportedBuffer { .. })
+                | Err(SessionError::MessageKindMismatch) => return invalid_state(context),
+                Err(SessionError::NoRequest) => {
+                    wait.pending = true;
+                    let start = context.process().scheduler().wait_on_objects(
+                        context.thread().id(),
+                        &[event],
+                        None,
+                        true,
+                    );
+                    match super::access::wait_kernel(context, start) {
+                        Ok(nixe_scheduler::WaitOutcome::Signalled(_)) => continue,
+                        Ok(_) => {
+                            result(context, HorizonKernelResult::CANCELLED);
+                            return resume();
+                        }
+                        Err(fault) => return reject(context, fault),
+                    }
+                }
+                Err(error) => return session_error(context, error),
             }
-            Err(error) => session_error(context, error),
         }
     }
 }
@@ -546,21 +549,16 @@ impl HorizonSvcDispatcher {
             result(context, HorizonKernelResult::OUT_OF_RANGE);
             return resume();
         }
-        self.read_svc_input(
-            context,
-            0x18,
-            pointer,
-            count as usize * 4,
-            move |dispatcher, context, bytes| {
-                let mut handles = [0; MAX_WAIT_HANDLES as usize];
-                for (handle, encoded) in handles.iter_mut().zip(bytes.chunks_exact(4)) {
-                    *handle = u32::from_le_bytes(encoded.try_into().unwrap());
-                }
-                let objects =
-                    context
-                        .process()
-                        .handles()
-                        .lookup_many(&handles[..count as usize], |object| {
+        match self.read_svc_input(context, 0x18, pointer, count as usize * 4) {
+            Ok(bytes) => {
+                {
+                    let mut handles = [0; MAX_WAIT_HANDLES as usize];
+                    for (handle, encoded) in handles.iter_mut().zip(bytes.chunks_exact(4)) {
+                        *handle = u32::from_le_bytes(encoded.try_into().unwrap());
+                    }
+                    let objects = context.process().handles().lookup_many(
+                        &handles[..count as usize],
+                        |object| {
                             let event =
                                 if let Some(event) = object.downcast_ref::<ReadableEventObject>() {
                                     event.clone()
@@ -568,41 +566,49 @@ impl HorizonSvcDispatcher {
                                     object.downcast_ref::<ThreadObject>()?.readable_event()
                                 };
                             Some((object.clone(), event))
-                        });
-                let Ok(objects) = objects else {
-                    result(context, HorizonKernelResult::INVALID_HANDLE);
-                    return resume();
-                };
-                let start = context.process().scheduler().wait_on_objects(
-                    context.thread().id(),
-                    objects.iter().map(|(_, event)| event),
-                    (timeout >= 0).then_some(timeout as u64),
-                    true,
-                );
-                dispatcher.finish_wait_start(context, start, move |_, context, outcome| {
-                    // Keep every accepted object alive through terminal result publication.
-                    let _objects = objects;
-                    let (code, index) = match outcome {
-                        nixe_scheduler::WaitOutcome::Signalled(index) => {
-                            (HorizonKernelResult::SUCCESS, index)
-                        }
-                        nixe_scheduler::WaitOutcome::TimedOut => {
-                            (HorizonKernelResult::TIMED_OUT, u32::MAX)
-                        }
-                        nixe_scheduler::WaitOutcome::Cancelled
-                        | nixe_scheduler::WaitOutcome::Terminated => {
-                            (HorizonKernelResult::CANCELLED, u32::MAX)
-                        }
-                        nixe_scheduler::WaitOutcome::Ready => {
-                            unreachable!("object wait requires signal or cancellation")
-                        }
+                        },
+                    );
+                    let Ok(objects) = objects else {
+                        result(context, HorizonKernelResult::INVALID_HANDLE);
+                        return resume();
                     };
-                    result(context, code);
-                    write_register(context.thread_mut().state_mut(), 1, index as u64);
-                    resume()
-                })
-            },
-        )
+                    let start = context.process().scheduler().wait_on_objects(
+                        context.thread().id(),
+                        objects.iter().map(|(_, event)| event),
+                        (timeout >= 0).then_some(timeout as u64),
+                        true,
+                    );
+                    match super::access::wait_kernel(context, start) {
+                        Ok(outcome) => {
+                            {
+                                // Keep every accepted object alive through terminal result publication.
+                                let _objects = objects;
+                                let (code, index) = match outcome {
+                                    nixe_scheduler::WaitOutcome::Signalled(index) => {
+                                        (HorizonKernelResult::SUCCESS, index)
+                                    }
+                                    nixe_scheduler::WaitOutcome::TimedOut => {
+                                        (HorizonKernelResult::TIMED_OUT, u32::MAX)
+                                    }
+                                    nixe_scheduler::WaitOutcome::Cancelled
+                                    | nixe_scheduler::WaitOutcome::Terminated => {
+                                        (HorizonKernelResult::CANCELLED, u32::MAX)
+                                    }
+                                    nixe_scheduler::WaitOutcome::Ready => {
+                                        unreachable!("object wait requires signal or cancellation")
+                                    }
+                                };
+                                result(context, code);
+                                write_register(context.thread_mut().state_mut(), 1, index as u64);
+                                resume()
+                            }
+                        }
+                        Err(fault) => reject(context, fault),
+                    }
+                }
+            }
+            Err(fault) => reject(context, fault),
+        }
     }
 }
 
@@ -637,110 +643,105 @@ impl HorizonSvcDispatcher {
         let kernel = context.process().scheduler().clone();
         let thread = context.thread().id();
         let deadline = (timeout > 0).then(|| self.virtual_time_ns().saturating_add(timeout as u64));
-        let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
-        let running = lifetime.clone();
-        self.start_owned_svc(context, lifetime, None, async move {
-            let operation = waits.address_operation(mutex).await;
-            running.begin().expect("accepted condition release");
-            let mut registration = if timeout != 0 {
-                word.as_ref()
-                    .ok()
-                    .map(|word| {
-                        waits
-                            .lock()
-                            .enqueue_condition(key, thread, tag, mutex, word.range())
-                    })
-                    .transpose()
-                    .map_err(|fault| HorizonSvcFault::Scheduling {
-                        operation: "WaitProcessWideKeyAtomic",
+        {
+            let completed = (|| {
+                let operation = super::access::wait_io(context, waits.address_operation(mutex));
+                let mut registration = if timeout != 0 {
+                    word.as_ref()
+                        .ok()
+                        .map(|word| {
+                            waits
+                                .lock()
+                                .enqueue_condition(key, thread, tag, mutex, word.range())
+                        })
+                        .transpose()
+                        .map_err(|fault| HorizonSvcFault::Scheduling {
+                            operation: "WaitProcessWideKeyAtomic",
+                            fault,
+                        })?
+                } else {
+                    None
+                };
+                if let Some(registration) = &registration
+                    && let Some(deadline) = deadline
+                {
+                    kernel.arm_deadline(registration.registration(), deadline);
+                }
+                let handoff = waits.lock().claim_mutex(mutex, thread).map_err(|fault| {
+                    HorizonSvcFault::Scheduling {
+                        operation: "condition mutex release",
                         fault,
-                    })?
-            } else {
-                None
-            };
-            if let Some(registration) = &registration
-                && let Some(deadline) = deadline
-            {
-                kernel.arm_deadline(registration.registration(), deadline);
-            }
-            let handoff = waits.lock().claim_mutex(mutex, thread).map_err(|fault| {
-                HorizonSvcFault::Scheduling {
-                    operation: "condition mutex release",
-                    fault,
-                }
-            })?;
-            let released: Result<(), std::sync::Arc<nixe_memory::MemoryError>> = async {
-                if let Some(key_word) = key_word
-                    && let Err(error) = key_word.write(1).await
-                    && !error.is_access_fault()
-                {
-                    return Err(error);
-                }
-                complete_mutex_handoff(&waits, &handoff, &word?).await
-            }
-            .await;
-            if let Err(fault) = released {
-                waits.lock().finish_mutex_handoff(
-                    &handoff,
-                    nixe_runtime::AddressWaitCompletion::InvalidMemory,
+                    }
+                })?;
+                let released: Result<(), std::sync::Arc<nixe_memory::MemoryError>> = (|| {
+                    if let Some(key_word) = key_word
+                        && let Err(error) = super::access::wait_io(context, key_word.write(1))
+                        && !error.is_access_fault()
+                    {
+                        return Err(error);
+                    }
+                    complete_mutex_handoff(context, &waits, &handoff, &word?)
+                })(
                 );
-                {
+                if let Err(fault) = released {
+                    waits.lock().finish_mutex_handoff(
+                        &handoff,
+                        nixe_runtime::AddressWaitCompletion::InvalidMemory,
+                    );
+                    {
+                        let mut state = waits.lock();
+                        state.remove(key, thread);
+                        state.remove(mutex, thread);
+                    }
+                    drop(registration);
+                    return if fault.is_access_fault() {
+                        Ok((HorizonKernelResult::INVALID_CURRENT_MEMORY, None))
+                    } else {
+                        Err(HorizonSvcFault::MemoryAccess {
+                            immediate: 0x1c,
+                            fault,
+                        })
+                    };
+                }
+                drop(handoff);
+                let claim = registration
+                    .as_mut()
+                    .and_then(|registration| waits.lock().finish_condition_release(registration));
+                drop(operation);
+                if let Some(claim) = claim {
+                    reacquire_condition_mutex(context, &waits, &handles, claim, 0x1c, thread)?;
+                }
+                let wait = registration
+                    .as_ref()
+                    .map(|registration| registration.registration().clone());
+                drop(registration);
+                let code = if let Some(wait) = wait {
+                    let outcome =
+                        super::access::wait_future(context, wait.wait(), Some(wait.clone()))?;
                     let mut state = waits.lock();
+                    let completion = state
+                        .completion(key, thread)
+                        .or_else(|| state.completion(mutex, thread));
                     state.remove(key, thread);
                     state.remove(mutex, thread);
-                }
-                drop(registration);
-                return if fault.is_access_fault() {
-                    Ok(memory_wait::SvcCompletion::Return {
-                        code: HorizonKernelResult::INVALID_CURRENT_MEMORY,
-                        output1: None,
-                    })
+                    if matches!(
+                        outcome,
+                        nixe_scheduler::WaitOutcome::Cancelled
+                            | nixe_scheduler::WaitOutcome::Terminated
+                    ) {
+                        HorizonKernelResult::CANCELLED
+                    } else {
+                        address_wait_result(completion.ok_or_else(|| {
+                            runtime_fault("condition wait completed without its retained result")
+                        })?)
+                    }
                 } else {
-                    Err(HorizonSvcFault::MemoryAccess {
-                        immediate: 0x1c,
-                        fault,
-                    })
+                    HorizonKernelResult::TIMED_OUT
                 };
-            }
-            drop(handoff);
-            let claim = registration
-                .as_mut()
-                .and_then(|registration| waits.lock().finish_condition_release(registration));
-            drop(operation);
-            if let Some(claim) = claim {
-                reacquire_condition_mutex(&waits, &handles, claim, 0x1c, thread).await?;
-            }
-            let wait = registration
-                .as_ref()
-                .map(|registration| registration.registration().clone());
-            drop(registration);
-            let code = if let Some(wait) = wait {
-                let outcome = wait.wait().await;
-                let mut state = waits.lock();
-                let completion = state
-                    .completion(key, thread)
-                    .or_else(|| state.completion(mutex, thread));
-                state.remove(key, thread);
-                state.remove(mutex, thread);
-                if matches!(
-                    outcome,
-                    nixe_scheduler::WaitOutcome::Cancelled
-                        | nixe_scheduler::WaitOutcome::Terminated
-                ) {
-                    HorizonKernelResult::CANCELLED
-                } else {
-                    address_wait_result(completion.ok_or_else(|| {
-                        runtime_fault("condition wait completed without its retained result")
-                    })?)
-                }
-            } else {
-                HorizonKernelResult::TIMED_OUT
-            };
-            Ok(memory_wait::SvcCompletion::Return {
-                code,
-                output1: None,
-            })
-        })
+                Ok((code, None))
+            })();
+            super::access::finish(context, completed)
+        }
     }
 
     pub(super) fn signal_process_wide_key(
@@ -779,40 +780,39 @@ impl HorizonSvcDispatcher {
             None
         };
         let handles = context.process().handles().clone();
-        let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
-        lifetime
-            .begin()
-            .expect("new condition signal is not cancelled");
-        self.start_owned_svc(context, lifetime, None, async move {
-            // Publish the accepted queue's flag before yielding for any mutex.
-            // A later registering wait must publish its own flag after this one.
-            if let Some(key_word) = key_word
-                && let Err(fault) = key_word.write(0).await
-                && !fault.is_access_fault()
-            {
-                for claim in &claims {
-                    waits
-                        .lock()
-                        .finish_condition_acquire(
-                            claim,
-                            nixe_runtime::ConditionAcquire::InvalidMemory,
-                            thread,
-                        )
-                        .map_err(|fault| HorizonSvcFault::Scheduling {
-                            operation: "condition cancellation",
-                            fault,
-                        })?;
+        {
+            let completed = (|| {
+                // Publish the accepted queue's flag before yielding for any mutex.
+                // A later registering wait must publish its own flag after this one.
+                if let Some(key_word) = key_word
+                    && let Err(fault) = super::access::wait_io(context, key_word.write(0))
+                    && !fault.is_access_fault()
+                {
+                    for claim in &claims {
+                        waits
+                            .lock()
+                            .finish_condition_acquire(
+                                claim,
+                                nixe_runtime::ConditionAcquire::InvalidMemory,
+                                thread,
+                            )
+                            .map_err(|fault| HorizonSvcFault::Scheduling {
+                                operation: "condition cancellation",
+                                fault,
+                            })?;
+                    }
+                    return Err(HorizonSvcFault::MemoryAccess {
+                        immediate: 0x1d,
+                        fault,
+                    });
                 }
-                return Err(HorizonSvcFault::MemoryAccess {
-                    immediate: 0x1d,
-                    fault,
-                });
-            }
-            for claim in claims {
-                reacquire_condition_mutex(&waits, &handles, claim, 0x1d, thread).await?;
-            }
-            Ok(memory_wait::SvcCompletion::kernel(|_, _| resume()))
-        })
+                for claim in claims {
+                    reacquire_condition_mutex(context, &waits, &handles, claim, 0x1d, thread)?;
+                }
+                Ok((HorizonKernelResult::SUCCESS, None))
+            })();
+            super::access::finish(context, completed)
+        }
     }
 
     pub(super) fn arbitrate_lock(
@@ -838,63 +838,57 @@ impl HorizonSvcDispatcher {
         let waits = context.process().address_waits().clone();
         // Reading the owner has no accepted write to drain on caller exit.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_condition_variable.cpp#L152-L182
-        self.start_owned_svc(context, std::sync::Arc::default(), None, async move {
-            let operation = waits.address_operation(mutex).await;
-            let wait = match word.read_owned().await {
-                Err(error) if error.is_access_fault() => {
-                    return Ok(memory_wait::SvcCompletion::Return {
-                        code: HorizonKernelResult::INVALID_CURRENT_MEMORY,
-                        output1: None,
-                    });
-                }
-                Err(fault) => {
-                    return Err(HorizonSvcFault::MemoryAccess {
-                        immediate: 0x1a,
-                        fault,
-                    });
-                }
-                Ok(value) if value != owner_handle | MUTEX_WAITERS => {
-                    return Ok(memory_wait::SvcCompletion::success(None));
-                }
-                Ok(_) => match owner {
-                    None => {
-                        return Ok(memory_wait::SvcCompletion::Return {
-                            code: HorizonKernelResult::INVALID_HANDLE,
-                            output1: None,
+        {
+            let completed = (|| {
+                let operation = super::access::wait_io(context, waits.address_operation(mutex));
+                let wait = match super::access::wait_io(context, word.read_owned()) {
+                    Err(error) if error.is_access_fault() => {
+                        return Ok((HorizonKernelResult::INVALID_CURRENT_MEMORY, None));
+                    }
+                    Err(fault) => {
+                        return Err(HorizonSvcFault::MemoryAccess {
+                            immediate: 0x1a,
+                            fault,
                         });
                     }
-                    Some(owner) => waits
-                        .lock()
-                        .enqueue(mutex, owner.id(), thread, tag)
-                        .map_err(|fault| HorizonSvcFault::Scheduling {
-                            operation: "ArbitrateLock",
-                            fault,
-                        })?,
-                },
-            };
-            drop(operation);
-            let outcome = wait.wait().await;
-            let code = {
-                let mut state = waits.lock();
-                let completion = state.completion(mutex, thread);
-                state.remove(mutex, thread);
-                if matches!(
-                    outcome,
-                    nixe_scheduler::WaitOutcome::Cancelled
-                        | nixe_scheduler::WaitOutcome::Terminated
-                ) {
-                    HorizonKernelResult::CANCELLED
-                } else {
-                    address_wait_result(completion.ok_or_else(|| {
-                        runtime_fault("mutex wait completed without its retained result")
-                    })?)
-                }
-            };
-            Ok(memory_wait::SvcCompletion::Return {
-                code,
-                output1: None,
-            })
-        })
+                    Ok(value) if value != owner_handle | MUTEX_WAITERS => {
+                        return Ok((HorizonKernelResult::SUCCESS, None));
+                    }
+                    Ok(_) => match owner {
+                        None => {
+                            return Ok((HorizonKernelResult::INVALID_HANDLE, None));
+                        }
+                        Some(owner) => waits
+                            .lock()
+                            .enqueue(mutex, owner.id(), thread, tag)
+                            .map_err(|fault| HorizonSvcFault::Scheduling {
+                                operation: "ArbitrateLock",
+                                fault,
+                            })?,
+                    },
+                };
+                drop(operation);
+                let outcome = super::access::wait_future(context, wait.wait(), Some(wait.clone()))?;
+                let code = {
+                    let mut state = waits.lock();
+                    let completion = state.completion(mutex, thread);
+                    state.remove(mutex, thread);
+                    if matches!(
+                        outcome,
+                        nixe_scheduler::WaitOutcome::Cancelled
+                            | nixe_scheduler::WaitOutcome::Terminated
+                    ) {
+                        HorizonKernelResult::CANCELLED
+                    } else {
+                        address_wait_result(completion.ok_or_else(|| {
+                            runtime_fault("mutex wait completed without its retained result")
+                        })?)
+                    }
+                };
+                Ok((code, None))
+            })();
+            super::access::finish(context, completed)
+        }
     }
 
     pub(super) fn arbitrate_unlock(
@@ -910,46 +904,44 @@ impl HorizonSvcDispatcher {
             .map_err(std::sync::Arc::new);
         let waits = context.process().address_waits().clone();
         let thread = context.thread().id();
-        let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
-        let running = lifetime.clone();
-        self.start_owned_svc(context, lifetime, None, async move {
-            let written = {
-                let _operation = waits.address_operation(mutex).await;
-                running.begin().expect("accepted kernel handoff");
-                let handoff = waits.lock().claim_mutex(mutex, thread).map_err(|fault| {
-                    HorizonSvcFault::Scheduling {
-                        operation: "mutex handoff",
-                        fault,
+        {
+            let completed = (|| {
+                let written = {
+                    let _operation =
+                        super::access::wait_io(context, waits.address_operation(mutex));
+                    let handoff = waits.lock().claim_mutex(mutex, thread).map_err(|fault| {
+                        HorizonSvcFault::Scheduling {
+                            operation: "mutex handoff",
+                            fault,
+                        }
+                    })?;
+                    match word {
+                        Ok(word) => complete_mutex_handoff(context, &waits, &handoff, &word),
+                        Err(error) => {
+                            waits.lock().finish_mutex_handoff(
+                                &handoff,
+                                nixe_runtime::AddressWaitCompletion::InvalidMemory,
+                            );
+                            Err(error)
+                        }
                     }
-                })?;
-                match word {
-                    Ok(word) => complete_mutex_handoff(&waits, &handoff, &word).await,
-                    Err(error) => {
-                        waits.lock().finish_mutex_handoff(
-                            &handoff,
-                            nixe_runtime::AddressWaitCompletion::InvalidMemory,
-                        );
-                        Err(error)
+                };
+                let code = match written {
+                    Ok(()) => HorizonKernelResult::SUCCESS,
+                    Err(error) if error.is_access_fault() => {
+                        HorizonKernelResult::INVALID_CURRENT_MEMORY
                     }
-                }
-            };
-            let code = match written {
-                Ok(()) => HorizonKernelResult::SUCCESS,
-                Err(error) if error.is_access_fault() => {
-                    HorizonKernelResult::INVALID_CURRENT_MEMORY
-                }
-                Err(fault) => {
-                    return Err(HorizonSvcFault::MemoryAccess {
-                        immediate: 0x1b,
-                        fault,
-                    });
-                }
-            };
-            Ok(memory_wait::SvcCompletion::kernel(move |_, context| {
-                result(context, code);
-                resume()
-            }))
-        })
+                    Err(fault) => {
+                        return Err(HorizonSvcFault::MemoryAccess {
+                            immediate: 0x1b,
+                            fault,
+                        });
+                    }
+                };
+                Ok((code, None))
+            })();
+            super::access::finish(context, completed)
+        }
     }
 }
 
@@ -966,7 +958,8 @@ fn address_wait_result(result: nixe_runtime::AddressWaitCompletion) -> HorizonKe
     }
 }
 
-async fn complete_mutex_handoff(
+fn complete_mutex_handoff(
+    context: &mut ExceptionDispatchContext<'_>,
     waits: &nixe_runtime::AddressWaitRegistry,
     handoff: &nixe_runtime::MutexHandoff,
     word: &AddressWord,
@@ -978,7 +971,7 @@ async fn complete_mutex_handoff(
             0
         }
     });
-    let written = word.write(value).await;
+    let written = super::access::wait_io(context, word.write(value));
     let completion = if written.is_err() {
         nixe_runtime::AddressWaitCompletion::InvalidMemory
     } else {
@@ -988,7 +981,8 @@ async fn complete_mutex_handoff(
     written
 }
 
-async fn reacquire_condition_mutex(
+fn reacquire_condition_mutex(
+    context: &mut ExceptionDispatchContext<'_>,
     waits: &std::sync::Arc<nixe_runtime::AddressWaitRegistry>,
     handles: &HandleTable,
     claim: nixe_runtime::ConditionClaim,
@@ -996,17 +990,20 @@ async fn reacquire_condition_mutex(
     current: GuestThreadId,
 ) -> Result<(), HorizonSvcFault> {
     use nixe_runtime::ConditionAcquire;
-    let _operation = waits.address_operation(claim.mutex).await;
+    let _operation = super::access::wait_io(context, waits.address_operation(claim.mutex));
     let word = AddressWord::from_range(claim.memory.clone());
-    let outcome: Result<ConditionAcquire, std::sync::Arc<nixe_memory::MemoryError>> = async {
-        let mut previous = word.read_owned().await?;
+    let outcome: Result<ConditionAcquire, std::sync::Arc<nixe_memory::MemoryError>> = (|| {
+        let mut previous = super::access::wait_io(context, word.read_owned())?;
         loop {
             let replacement = if previous == 0 {
                 claim.tag
             } else {
                 previous | MUTEX_WAITERS
             };
-            let (observed, written) = word.compare_exchange_owned(previous, replacement).await?;
+            let (observed, written) = super::access::wait_io(
+                context,
+                word.compare_exchange_owned(previous, replacement),
+            )?;
             if written {
                 break;
             }
@@ -1022,8 +1019,7 @@ async fn reacquire_condition_mutex(
         } else {
             ConditionAcquire::InvalidOwner
         })
-    }
-    .await;
+    })();
     match outcome {
         Ok(outcome) => {
             waits

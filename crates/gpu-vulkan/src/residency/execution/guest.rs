@@ -44,7 +44,7 @@ impl Residency<'_> {
     }
     pub(crate) fn begin_guest_descriptors(
         &mut self,
-        pipeline: &Arc<NativePipeline>,
+        pipeline: &NativePipeline,
     ) -> Result<(), VulkanError> {
         self.runtime.descriptor_queue.acquire(
             &mut self.runtime.device.dispatch,
@@ -68,7 +68,7 @@ impl Residency<'_> {
     }
     pub(crate) fn configure_guest_stage<const STAGE: usize, const STORAGE: bool>(
         &mut self,
-        pipeline: &Arc<NativePipeline>,
+        pipeline: &NativePipeline,
         resources: &StageResources,
         group: Option<u8>,
         images: &[ShaderImage],
@@ -254,7 +254,7 @@ impl Residency<'_> {
     }
     pub(crate) fn finish_guest_writes(
         &mut self,
-        pipeline: &Arc<NativePipeline>,
+        pipeline: &NativePipeline,
         resources: &PipelineResources,
     ) -> Result<(), VulkanError> {
         if !pipeline.shader_writes {
@@ -306,7 +306,7 @@ impl Residency<'_> {
     }
     pub(crate) fn dispatch_guest(
         &mut self,
-        pipeline: &Arc<NativePipeline>,
+        pipeline: &NativePipeline,
         resources: &PipelineResources,
         images: &[ShaderImage],
         groups: [u32; 3],
@@ -335,7 +335,9 @@ impl Residency<'_> {
         self.configure_guest_stage::<5, true>(pipeline, &resources.stages[5], None, images)?;
         let descriptors = self.guest_descriptor_update();
         self.runtime.barriers.emit(&mut self.runtime.device)?;
-        self.bind_pipeline_descriptors(pipeline, push, None, &[], descriptors.update)?;
+        self.runtime
+            .device
+            .configure_pipeline(pipeline, push, None, &[], descriptors.update)?;
         unsafe {
             self.runtime
                 .device

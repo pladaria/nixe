@@ -93,36 +93,13 @@ pub struct ExecutionMetadata {
     pub provenance: StageProvenance,
 }
 
-/// Independently declared host uniform blocks, including overlapping byte ranges.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HostUniformLayout {
-    TessellationLevelsPushConstants {
-        offset: u32,
-        required_levels: u8,
-    },
-    RescalingPushConstants {
-        texture_mask_offset: u32,
-        texture_mask_words: u32,
-        image_mask_offset: u32,
-        image_mask_words: u32,
-        down_factor_offset: Option<u32>,
-    },
-    RenderAreaPushConstants {
-        offset: u32,
-        size: u32,
-    },
-    RescalingUniformConstant {
-        location: u32,
-    },
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageArtifact {
     pub stage: Stage,
     pub words: Box<[u32]>,
     pub info: ShaderInfo,
     pub bindings: Box<[ResourceBinding]>,
-    pub host_uniforms: Box<[HostUniformLayout]>,
+    pub push_constant_bytes: u32,
     pub interface: StageInterface,
     pub execution: ExecutionMetadata,
 }

@@ -4,7 +4,6 @@
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp
 use crate::{DeviceProfile, VulkanError};
 use ash::vk;
-use nixe_gpu::FragmentDepthTransform;
 use nixe_gpu_maxwell::engines::threed::state::GeneratedPrimitive;
 pub(super) type Regs = [u32; 0xe00];
 /// Render-pass formats decode the hardware words at native consumption, as
@@ -304,61 +303,7 @@ fn validate_raster(
     depth_bias_enabled(r, topology)?;
     Ok(())
 }
-pub(super) fn depth_range(
-    r: &Regs,
-    observed: bool,
-) -> Result<([f32; 2], Option<FragmentDepthTransform>), VulkanError> {
-    let scale = f32::from_bits(r[0x0a08 / 4]);
-    let offset = f32::from_bits(r[0x0a14 / 4]);
-    if r[0x0d7c / 4] > 1 || !scale.is_finite() || !offset.is_finite() {
-        return Err(unsupported(
-            0x0d7c,
-            r[0x0d7c / 4],
-            "invalid viewport depth mode or transform",
-        ));
-    }
-    let range = [
-        if r[0x0d7c / 4] == 0 {
-            offset - scale
-        } else {
-            offset
-        },
-        offset + scale,
-    ];
-    let min = f32::from_bits(r[0x0c08 / 4]);
-    let max = f32::from_bits(r[0x0c0c / 4]);
-    if min.is_nan() || max.is_nan() || min > range[0].min(range[1]) || max < range[0].max(range[1])
-    {
-        if r[0x193c / 4] & 0x18 != 0x18
-            || !min.is_finite()
-            || !max.is_finite()
-            || min < 0.
-            || max > 1.
-            || min > max
-        {
-            return Err(unsupported(
-                0x193c,
-                r[0x193c / 4],
-                "unsupported viewport pixel depth bounds",
-            ));
-        }
-        let transform = if observed {
-            Some(
-                FragmentDepthTransform::new(range[1] - range[0], range[0], min, max)
-                    .map_err(|error| VulkanError::Compilation(error.to_string().into()))?,
-            )
-        } else {
-            None
-        };
-        return Ok(([0., 1.], transform));
-    }
-    Ok((range, None))
-}
-pub(super) fn viewport(
-    r: &Regs,
-    observed: bool,
-    profile: &DeviceProfile,
-) -> Result<vk::Viewport, VulkanError> {
+pub(super) fn viewport(r: &Regs, profile: &DeviceProfile) -> Result<vk::Viewport, VulkanError> {
     if r[0x0a1c / 4] != 0 {
         return Err(unsupported(
             0x0a1c,
@@ -414,7 +359,22 @@ pub(super) fn viewport(
             sy = -sy;
             oy = (r[0x0ff8 / 4] >> 16) as f32 - oy;
         }
-        let (depth, _) = depth_range(r, observed)?;
+        let scale = f32::from_bits(r[0x0a08 / 4]);
+        let offset = f32::from_bits(r[0x0a14 / 4]);
+        if r[0x0d7c / 4] > 1 {
+            return Err(unsupported(
+                0x0d7c,
+                r[0x0d7c / 4],
+                "invalid viewport depth mode",
+            ));
+        }
+        let mut depth = [
+            offset - if r[0x0d7c / 4] == 0 { scale } else { 0. },
+            offset + scale,
+        ];
+        if !profile.depth_range_unrestricted {
+            depth = depth.map(|value| value.clamp(0., 1.));
+        }
         vk::Viewport {
             x: ox - sx,
             y: oy - sy,
@@ -437,8 +397,8 @@ pub(super) fn viewport(
         || v.x + v.width > limits.viewport_bounds_range[1]
         || v.y.min(v.y + v.height) < limits.viewport_bounds_range[0]
         || v.y.max(v.y + v.height) > limits.viewport_bounds_range[1]
-        || !(0. ..=1.).contains(&v.min_depth)
-        || !(0. ..=1.).contains(&v.max_depth)
+        || (!profile.depth_range_unrestricted
+            && (!(0. ..=1.).contains(&v.min_depth) || !(0. ..=1.).contains(&v.max_depth)))
     {
         return Err(unsupported(
             0x0a00,

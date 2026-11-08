@@ -11,12 +11,12 @@ use std::sync::OnceLock;
 pub(super) struct SampleConversion {
     compiler: Arc<PipelineCompiler>,
     descriptors: DescriptorCache,
-    pipelines: [Option<Arc<NativePipeline>>; 2],
+    pipelines: [Option<NativePipeline>; 2],
 }
 fn artifact(stencil: bool) -> Arc<ShaderArtifact> {
     static FLOAT: OnceLock<Arc<ShaderArtifact>> = OnceLock::new();
     static STENCIL: OnceLock<Arc<ShaderArtifact>> = OnceLock::new();
-    Arc::clone((if stencil { &STENCIL } else { &FLOAT }).get_or_init(|| {
+    ((if stencil { &STENCIL } else { &FLOAT }).get_or_init(|| {
         Arc::new(ShaderArtifact::new(Box::new([
             conversion::stage(
                 ShaderStage::Vertex,
@@ -44,6 +44,7 @@ fn artifact(stencil: bool) -> Arc<ShaderArtifact> {
             ),
         ])))
     }))
+    .clone()
 }
 impl Residency<'_> {
     pub fn enable_sample_conversion(&mut self, compiler: Arc<PipelineCompiler>) {
@@ -110,7 +111,7 @@ impl Residency<'_> {
             vk::Format::R32_UINT
         };
         let pipeline = if let Some(pipeline) = &conversion.pipelines[stencil as usize] {
-            Arc::clone(pipeline)
+            pipeline.clone()
         } else {
             let pending = conversion
                 .compiler
@@ -120,7 +121,7 @@ impl Residency<'_> {
                 })
                 .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
             let pipeline = pending;
-            conversion.pipelines[stencil as usize] = Some(Arc::clone(&pipeline));
+            conversion.pipelines[stencil as usize] = Some(pipeline.clone());
             pipeline
         };
         let source = self.image_view(

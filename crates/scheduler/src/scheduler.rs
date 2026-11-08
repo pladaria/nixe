@@ -732,6 +732,16 @@ impl SchedulerState {
             state.cores[core].lease = None;
             state.slots[index].lease = None;
             state.slots[index].last_vcpu = Some(lease.vcpu);
+            // A producer can wake a fiber after its last poll and before the
+            // physical core releases its context. Preserve that canonical ready
+            // state instead of losing the wake at the switch boundary.
+            let outcome = if outcome == Completion::Waiting
+                && state.slots[index].lifecycle == ThreadLifecycle::Ready
+            {
+                Completion::Ready
+            } else {
+                outcome
+            };
             state.slots[index].lifecycle = match outcome {
                 Completion::Ready => ThreadLifecycle::Ready,
                 Completion::Waiting => ThreadLifecycle::Waiting,
@@ -868,6 +878,40 @@ impl SchedulerState {
             }
             state.begin_wait(index, &self.profile, Arc::downgrade(self))
         })
+    }
+
+    /// Park the current kernel stack while preserving its actual wait generation.
+    pub fn park_fiber(&self, token: WakeToken) -> Result<(), SchedulerError> {
+        self.edit(|state| {
+            let index = state.slots.index(token.thread)?;
+            if state.slots[index].wait_token() != Some(token) {
+                return Err(SchedulerError::StaleWake(token));
+            }
+            state.slots[index].lifecycle = ThreadLifecycle::Waiting;
+            state.remove_queued(index, &self.profile);
+            Ok(())
+        })
+    }
+
+    /// Notify a suspended kernel stack directly. Its caller consumes the actual
+    /// result after selection; no host completion queue polls the operation.
+    pub fn wake_fiber(&self, token: WakeToken) {
+        let _ = self.edit(|state| {
+            let Ok(index) = state.slots.index(token.thread) else {
+                return Ok(());
+            };
+            if state.slots[index].wait_token() != Some(token) || state.slots[index].stopping {
+                return Ok(());
+            }
+            state.slots[index].lifecycle = ThreadLifecycle::Ready;
+            if state.slots[index].lease.is_none()
+                && !state.slots[index].suspended()
+                && !state.slots[index].queued
+            {
+                state.enqueue(index, &self.profile);
+            }
+            Ok(())
+        });
     }
 
     pub fn finish_wait(&self, token: WakeToken) -> Result<(), SchedulerError> {

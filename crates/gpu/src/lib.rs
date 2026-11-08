@@ -7,7 +7,6 @@ mod access;
 mod address;
 mod allocation;
 pub mod memory_tracker;
-pub mod persistent_cache;
 pub mod physical;
 mod working_set;
 pub use working_set::{Equivalent, WorkingSet};
@@ -44,9 +43,8 @@ pub use allocation::{
 pub use command::{
     AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore, BlitFilter,
     CacheMaintenanceOperation, ClearValue, CommandDescriptionError, DepthCompareOperation,
-    FragmentDepthTransform, ImageOrigin, PrimitiveTopology, ScissorRect, VertexAttribute,
-    VertexComponentCount, VertexComponentWidth, VertexFormat, VertexPositionTransform,
-    VertexStepMode,
+    ImageOrigin, PrimitiveTopology, ScissorRect, VertexAttribute, VertexComponentCount,
+    VertexComponentWidth, VertexFormat, VertexPositionTransform, VertexStepMode,
 };
 pub use diagnostics::{
     CpuVirtualAddress, GpfifoEntryIndex, GpuChannelId, GpuClassId, GpuMethodId,

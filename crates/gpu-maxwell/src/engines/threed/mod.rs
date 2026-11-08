@@ -1067,7 +1067,7 @@ pub(super) const fn is_mme_aperture(method: GpuMethodId) -> bool {
     method.0 >= 0x3800 && method.0 & 3 == 0
 }
 
-pub(super) async fn execute_mme_call<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+pub(super) fn execute_mme_call<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     profile: &MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
     parameters: &[u32],
@@ -1087,9 +1087,8 @@ pub(super) async fn execute_mme_call<L: crate::MaxwellFrontend, H: crate::Maxwel
             source,
             candidate,
             execution,
-            method_pending: false,
         };
-        match program.execute(parameters, &mut host).await {
+        match program.execute(parameters, &mut host) {
             Ok(()) => {}
             Err(MaxwellThreeDMmeRunError::Execution(error)) => {
                 return Err(MaxwellEngineStreamError::dispatch(
@@ -1099,12 +1098,7 @@ pub(super) async fn execute_mme_call<L: crate::MaxwellFrontend, H: crate::Maxwel
             Err(MaxwellThreeDMmeRunError::Host(error)) => return Err(error),
         }
     }
-    // Only an actual unavailable deferred draw suspends macro completion.
-    if !draw::flush(candidate, execution).map_err(MaxwellEngineStreamError::execution)? {
-        draw::wait_flush(candidate, execution)
-            .await
-            .map_err(MaxwellEngineStreamError::execution)?;
-    }
+    draw::flush(candidate, execution).map_err(MaxwellEngineStreamError::execution)?;
     Ok(())
 }
 struct MmeDispatchHost<'a, 'owner, L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost> {
@@ -1112,7 +1106,6 @@ struct MmeDispatchHost<'a, 'owner, L: crate::MaxwellFrontend, H: crate::MaxwellC
     source: crate::MaxwellMethodSource,
     candidate: &'a mut MaxwellThreeDFrontendState,
     execution: &'a mut crate::execution::ChannelExecution<'owner, L, H>,
-    method_pending: bool,
 }
 impl<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost> MaxwellThreeDMmeHost
     for MmeDispatchHost<'_, '_, L, H>
@@ -1128,14 +1121,11 @@ impl<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost> MaxwellThreeDMmeHo
         })
     }
     #[inline(always)]
-    fn try_emit_method(&mut self, method_dword: u16, argument: u32) -> Result<bool, Self::Error> {
-        debug_assert!(!self.method_pending);
+    fn emit_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error> {
         let method = GpuMethodId(u32::from(method_dword) * 4);
-        if !draw::admit_method(self.candidate, method, argument)
-            && !draw::flush(self.candidate, self.execution)
-                .map_err(MaxwellEngineStreamError::execution)?
-        {
-            return Ok(false);
+        if !draw::admit_method(self.candidate, method, argument) {
+            draw::flush(self.candidate, self.execution)
+                .map_err(MaxwellEngineStreamError::execution)?;
         }
         if is_mme_aperture(method) {
             return Err(MaxwellEngineStreamError::dispatch(
@@ -1146,31 +1136,14 @@ impl<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost> MaxwellThreeDMmeHo
             ));
         }
         let source = self.source;
-        let ready = call_method(
+        call_method(
             self.profile,
             method,
             argument,
             self.candidate,
             self.execution,
             || source.emitted_by_mme(method, argument),
-        )?;
-        self.method_pending = !ready;
-        Ok(ready)
-    }
-    async fn finish_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error> {
-        loop {
-            if self.method_pending {
-                draw::wait_preparation(self.candidate, self.execution).await?;
-                self.method_pending = false;
-                return Ok(());
-            }
-            draw::wait_flush(self.candidate, self.execution)
-                .await
-                .map_err(MaxwellEngineStreamError::execution)?;
-            if self.try_emit_method(method_dword, argument)? {
-                return Ok(());
-            }
-        }
+        )
     }
 }
 
@@ -1185,7 +1158,7 @@ pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHos
     candidate: &mut MaxwellThreeDFrontendState,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
     origin: impl Fn() -> crate::MaxwellMethodSource,
-) -> Result<bool, MaxwellEngineStreamError> {
+) -> Result<(), MaxwellEngineStreamError> {
     if method.0 & 3 != 0 || method.0 >= 0x3800 {
         return Err((MaxwellEngineDispatchError::UnknownMethod {
             source: origin(),
@@ -1212,16 +1185,16 @@ pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHos
             ))
             .into());
         }
-        return Ok(true);
+        return Ok(());
     }
     // DrawManager consumes these as raw state, with no execution or provenance
     // record. COUNT still latches indexed drawing on every repeated write.
     match method.0 {
-        0x0d74 | 0x17dc | 0x1970 => return Ok(true),
-        0x0d78 if candidate.pending_notification.is_none() => return Ok(true),
+        0x0d74 | 0x17dc | 0x1970 => return Ok(()),
+        0x0d78 if candidate.pending_notification.is_none() => return Ok(()),
         0x17e0 if candidate.pending_notification.is_none() => {
             draw::index_count(candidate);
-            return Ok(true);
+            return Ok(());
         }
         _ => {}
     }
@@ -1248,13 +1221,13 @@ pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHos
                 )
             })?;
             draw::begin(candidate, argument, value, consumed_origin);
-            return Ok(true);
+            return Ok(());
         }
         0x1614 => return draw::end(candidate, argument, execution, consumed_origin),
         0x19d0 => return draw::clear(candidate, argument, execution, consumed_origin),
         0x2400..0x2500 if (method.0 - 0x2400) % 0x20 == 0x10 => {
             bind_constant_buffer(candidate, method, argument, execution, consumed_origin)?;
-            return Ok(true);
+            return Ok(());
         }
         _ => {}
     }
@@ -1267,7 +1240,7 @@ pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHos
             execution,
             || origin().emitted_by_mme(method, argument),
         )?;
-        return Ok(true);
+        return Ok(());
     }
     let mut source = origin();
     // Shadow control executes the submitted word while its canonical register
@@ -1448,13 +1421,13 @@ fn execute_register<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     candidate: &mut MaxwellThreeDFrontendState,
     family: RegisterFamily,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Result<bool, MaxwellEngineStreamError> {
+) -> Result<(), MaxwellEngineStreamError> {
     // NVIDIA's packed inline ports append low lanes first. END consumes the
     // complete stream, as in the independently reviewed public draw managers:
     // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/draw_manager.cpp
     if matches!(source.method().0, 0x1300 | 0x15e8 | 0x15ec) {
         candidate.append_inline_indices(source)?;
-        return Ok(true);
+        return Ok(());
     }
     if family == RegisterFamily::InlineToMemory
         && let Some((write, upload)) =
@@ -1464,13 +1437,13 @@ fn execute_register<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
         if let Some(upload) = upload {
             execution.inline_to_memory(upload, None)?;
         }
-        return Ok(true);
+        return Ok(());
     }
     if family == RegisterFamily::Mme
         && let Some(write) = preflight_mme_state(source, candidate)?
     {
         candidate.mme_mut().apply(write);
-        return Ok(true);
+        return Ok(());
     }
     let Some(declaration) = (source.method().0 & 3 == 0)
         .then(|| METHODS_BY_DWORD.get((source.method().0 / 4) as usize))
@@ -1937,7 +1910,7 @@ fn execute_register<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
             .into());
         }
     };
-    Ok(true)
+    Ok(())
 }
 
 fn preflight_mme_state(

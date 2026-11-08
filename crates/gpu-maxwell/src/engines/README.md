@@ -75,14 +75,12 @@ register on demand. Method replay updates the argument in place, and preparation
 returns only effects/metadata instead of copying the complete dispatch back to
 its caller. Rewriting the same value still updates its exact write provenance.
 
-Native preparation shares immutable binding-role and consumed-role arrays across
-draws. Program binding comparison allocates a replacement only at the first
-physical binding change, retaining the previous program when all bindings match.
-Canonical access collection appends directly into one vector, without allocating
-an intermediate vector for each resource. After successful backend acceptance,
-the owner recycles the native command vector; acceptance has already retained
-native uses through GPU completion. Pending preparation keeps its segment intact,
-and ordered canonical writes and completion boundaries are unchanged.
+PFIFO entries execute directly on the graphics owner. MME interpretation emits
+methods synchronously; only real primitive instance batching remains pending.
+Split packets retain their decoder state across GPFIFO entries. Native pipeline
+construction waits belong to ordered Vulkan recording, without resumable frontend
+preparation or a second pending-effect representation. Guest memory and coherence
+remain on the graphics owner; native jobs contain captured native data only.
 
 Native shader preparation derives consumed constant-buffer extents from live
 optimized SSA. Static loads bound the byte window, while dynamic addresses retain

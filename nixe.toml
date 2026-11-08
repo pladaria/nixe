@@ -71,13 +71,8 @@ volume = 10
 vsync = true
 
 [gpu]
-# Bounded derived shader and driver caches, relative to this configuration file.
+# Per-title shader environments and Vulkan driver caches, relative to this file.
 cache_directory = "./storage/cache/gpu"
-# Nonzero limits for native shader and pipeline caches.
-shader_cache_entries = 4096
-pipeline_cache_entries = 8192
-# Maximum size of each persisted native cache.
-persistent_pipeline_cache_mib = 256
 
 # Use `cargo cli input` to get your controller's SDL gamepad information
 [input.profiles.switch-pro]

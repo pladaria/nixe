@@ -94,7 +94,7 @@ impl MaxwellTwoDBlitState {
         state: &MaxwellTwoDState,
         source: MaxwellMethodSource,
         execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-    ) -> Result<bool, crate::engines::MaxwellEngineStreamError> {
+    ) -> Result<(), crate::engines::MaxwellEngineStreamError> {
         if state.operation().value() != Some(&MaxwellTwoDOperation::SourceCopy) {
             return Err((error(
                 source,
@@ -186,7 +186,7 @@ impl MaxwellTwoDBlitState {
                 )
                 .map_err(|_| error(source, "2D copy address range overflows"))?;
                 execution.copy_memory(copy)?;
-                return Ok(true);
+                return Ok(());
             }
             return Ok(execution.blit(&MaxwellTwoDBlitOperation {
                 source,
@@ -473,7 +473,7 @@ pub(super) fn apply<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     source: MaxwellMethodSource,
     state: &mut MaxwellTwoDState,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Option<Result<bool, crate::engines::MaxwellEngineStreamError>> {
+) -> Option<Result<(), crate::engines::MaxwellEngineStreamError>> {
     let address = source.method().0;
     // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/twod/cl902d.h
     let (register, name, mask) = match address {
@@ -564,6 +564,6 @@ pub(super) fn apply<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
         }
         Some(result)
     } else {
-        Some(Ok(true))
+        Some(Ok(()))
     }
 }

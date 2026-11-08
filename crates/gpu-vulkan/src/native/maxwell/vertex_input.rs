@@ -127,7 +127,8 @@ impl VertexInput {
             if word & 64 != 0 || word & 31 >= max_bindings {
                 continue;
             }
-            let format = native_format(word, location)?;
+            reject_bgra(word, location)?;
+            let format = Attribute::from_guest(word).format(profile, location)?;
             if !profile
                 .formats
                 .get(format.as_raw() as usize)
@@ -180,10 +181,9 @@ impl VertexInput {
         Ok(())
     }
 }
-/// Shader-affecting input classes use three bits per attribute to retain Nixe's
-/// exact 32-bit scaled-to-integer SSA conversion, in addition to float/int/uint.
-/// This is the same feature-dependent key projection as Eden attribute_types.
-pub(in crate::native) fn attribute_types(state: &MaxwellThreeDState) -> Result<u128, VulkanError> {
+/// Dynamic vertex input specializes only the shader's float/int/uint class.
+/// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp#L184-L207
+pub(in crate::native) fn attribute_types(state: &MaxwellThreeDState) -> Result<u64, VulkanError> {
     let mut types = 0;
     for (location, &word) in state.register_words()[0x1160 / 4..0x1160 / 4 + 32]
         .iter()
@@ -192,15 +192,10 @@ pub(in crate::native) fn attribute_types(state: &MaxwellThreeDState) -> Result<u
         if word & 64 != 0 {
             continue;
         }
-        let width = (word >> 21) & 63;
-        let scaled32 = matches!(width, 0x12 | 0x04 | 0x02 | 0x01);
         let kind = match (word >> 27) & 7 {
-            1 | 2 | 7 => 1,
+            1 | 2 | 5 | 6 | 7 => 1,
             3 => 2,
             4 => 3,
-            5 if scaled32 => 5,
-            6 if scaled32 => 4,
-            5 | 6 => 1,
             _ => {
                 return Err(VulkanError::Compilation(
                     format!("vertex attribute {location}: unsupported numerical type {word:#x}")
@@ -208,7 +203,7 @@ pub(in crate::native) fn attribute_types(state: &MaxwellThreeDState) -> Result<u
                 ));
             }
         };
-        types |= (kind as u128) << (location * 3);
+        types |= (kind as u64) << (location * 2);
     }
     Ok(types)
 }
@@ -232,141 +227,130 @@ fn validate_divisor(
 // MaxwellToVK::VertexFormat is an ISA-to-native lookup, independent of buffer
 // contents and programs. Scaled32 uses the same native integer fetch as the
 // shader type projection above, with the exact SSA conversion in the shader.
-pub(super) fn native_format(word: u32, location: u32) -> Result<vk::Format, VulkanError> {
-    use vk::Format as F;
-    let size = (word >> 21) & 63;
-    let kind = (word >> 27) & 7;
-    if word >> 31 != 0 {
+/// The packed attribute used by Eden's fixed key. Reserved fields and BGRA do
+/// not participate in identity; unsupported BGRA is rejected when consumed.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::native) struct Attribute(pub(in crate::native) u32);
+impl Attribute {
+    pub(in crate::native) fn from_guest(word: u32) -> Self {
+        Self(
+            u32::from(word & 64 == 0)
+                | ((word & 31) << 1)
+                | (((word >> 7) & 0x3fff) << 6)
+                | (((word >> 27) & 7) << 20)
+                | (((word >> 21) & 63) << 23),
+        )
+    }
+    pub(in crate::native) fn enabled(self) -> bool {
+        self.0 & 1 != 0
+    }
+    pub(in crate::native) fn buffer(self) -> u32 {
+        (self.0 >> 1) & 31
+    }
+    pub(in crate::native) fn offset(self) -> u32 {
+        (self.0 >> 6) & 0x3fff
+    }
+    pub(in crate::native) fn kind(self) -> u32 {
+        (self.0 >> 20) & 7
+    }
+    pub(in crate::native) fn format(
+        self,
+        profile: &DeviceProfile,
+        location: u32,
+    ) -> Result<vk::Format, VulkanError> {
+        let size = (self.0 >> 23) & 63;
+        let mut kind = self.kind();
+        if profile.emulate_scaled_formats {
+            kind = match kind {
+                5 => 4,
+                6 => 3,
+                other => other,
+            };
+        }
+        let format = match (kind, size) {
+            (2, 0x1d | 0x34) => vk::Format::R8_UNORM,
+            (2, 0x18 | 0x32) => vk::Format::R8G8_UNORM,
+            (2, 0x13) => vk::Format::R8G8B8_UNORM,
+            (2, 0x0a | 0x33) => vk::Format::R8G8B8A8_UNORM,
+            (2, 0x1b) => vk::Format::R16_UNORM,
+            (2, 0x0f) => vk::Format::R16G16_UNORM,
+            (2, 0x05) => vk::Format::R16G16B16_UNORM,
+            (2, 0x03) => vk::Format::R16G16B16A16_UNORM,
+            (2, 0x30) => vk::Format::A2B10G10R10_UNORM_PACK32,
+            (1, 0x1d | 0x34) => vk::Format::R8_SNORM,
+            (1, 0x18 | 0x32) => vk::Format::R8G8_SNORM,
+            (1, 0x13) => vk::Format::R8G8B8_SNORM,
+            (1, 0x0a | 0x33) => vk::Format::R8G8B8A8_SNORM,
+            (1, 0x1b) => vk::Format::R16_SNORM,
+            (1, 0x0f) => vk::Format::R16G16_SNORM,
+            (1, 0x05) => vk::Format::R16G16B16_SNORM,
+            (1, 0x03) => vk::Format::R16G16B16A16_SNORM,
+            (1, 0x30) => vk::Format::A2B10G10R10_SNORM_PACK32,
+            (5, 0x1d | 0x34) => vk::Format::R8_USCALED,
+            (5, 0x18 | 0x32) => vk::Format::R8G8_USCALED,
+            (5, 0x13) => vk::Format::R8G8B8_USCALED,
+            (5, 0x0a | 0x33) => vk::Format::R8G8B8A8_USCALED,
+            (5, 0x1b) => vk::Format::R16_USCALED,
+            (5, 0x0f) => vk::Format::R16G16_USCALED,
+            (5, 0x05) => vk::Format::R16G16B16_USCALED,
+            (5, 0x03) => vk::Format::R16G16B16A16_USCALED,
+            (5, 0x30) => vk::Format::A2B10G10R10_USCALED_PACK32,
+            (6, 0x1d | 0x34) => vk::Format::R8_SSCALED,
+            (6, 0x18 | 0x32) => vk::Format::R8G8_SSCALED,
+            (6, 0x13) => vk::Format::R8G8B8_SSCALED,
+            (6, 0x0a | 0x33) => vk::Format::R8G8B8A8_SSCALED,
+            (6, 0x1b) => vk::Format::R16_SSCALED,
+            (6, 0x0f) => vk::Format::R16G16_SSCALED,
+            (6, 0x05) => vk::Format::R16G16B16_SSCALED,
+            (6, 0x03) => vk::Format::R16G16B16A16_SSCALED,
+            (6, 0x30) => vk::Format::A2B10G10R10_SSCALED_PACK32,
+            (4, 0x1d | 0x34) => vk::Format::R8_UINT,
+            (4, 0x18 | 0x32) => vk::Format::R8G8_UINT,
+            (4, 0x13) => vk::Format::R8G8B8_UINT,
+            (4, 0x0a | 0x33) => vk::Format::R8G8B8A8_UINT,
+            (4, 0x1b) => vk::Format::R16_UINT,
+            (4, 0x0f) => vk::Format::R16G16_UINT,
+            (4, 0x05) => vk::Format::R16G16B16_UINT,
+            (4, 0x03) => vk::Format::R16G16B16A16_UINT,
+            (4, 0x12) => vk::Format::R32_UINT,
+            (4, 0x04) => vk::Format::R32G32_UINT,
+            (4, 0x02) => vk::Format::R32G32B32_UINT,
+            (4, 0x01) => vk::Format::R32G32B32A32_UINT,
+            (4, 0x30) => vk::Format::A2B10G10R10_UINT_PACK32,
+            (3, 0x1d | 0x34) => vk::Format::R8_SINT,
+            (3, 0x18 | 0x32) => vk::Format::R8G8_SINT,
+            (3, 0x13) => vk::Format::R8G8B8_SINT,
+            (3, 0x0a | 0x33) => vk::Format::R8G8B8A8_SINT,
+            (3, 0x1b) => vk::Format::R16_SINT,
+            (3, 0x0f) => vk::Format::R16G16_SINT,
+            (3, 0x05) => vk::Format::R16G16B16_SINT,
+            (3, 0x03) => vk::Format::R16G16B16A16_SINT,
+            (3, 0x12) => vk::Format::R32_SINT,
+            (3, 0x04) => vk::Format::R32G32_SINT,
+            (3, 0x02) => vk::Format::R32G32B32_SINT,
+            (3, 0x01) => vk::Format::R32G32B32A32_SINT,
+            (3, 0x30) => vk::Format::A2B10G10R10_SINT_PACK32,
+            (7, 0x1b) => vk::Format::R16_SFLOAT,
+            (7, 0x0f) => vk::Format::R16G16_SFLOAT,
+            (7, 0x05) => vk::Format::R16G16B16_SFLOAT,
+            (7, 0x03) => vk::Format::R16G16B16A16_SFLOAT,
+            (7, 0x12) => vk::Format::R32_SFLOAT,
+            (7, 0x04) => vk::Format::R32G32_SFLOAT,
+            (7, 0x02) => vk::Format::R32G32B32_SFLOAT,
+            (7, 0x01) => vk::Format::R32G32B32A32_SFLOAT,
+            (7, 0x31) => vk::Format::B10G11R11_UFLOAT_PACK32,
+            _ => return Err(VulkanError::Compilation(format!("vertex attribute {location}: unsupported numerical type {kind} and size {size:#x}").into())),
+        };
+        Ok(format)
+    }
+}
+pub(in crate::native) fn reject_bgra(word: u32, location: u32) -> Result<(), VulkanError> {
+    if word & 64 == 0 && word >> 31 != 0 {
         return Err(VulkanError::Compilation(
             format!("vertex attribute {location}: red/blue exchange is unsupported ({word:#x})")
                 .into(),
         ));
     }
-    if size == 0x30 {
-        return match kind {
-            1 => Ok(F::A2B10G10R10_SNORM_PACK32),
-            2 => Ok(F::A2B10G10R10_UNORM_PACK32),
-            _ => Err(VulkanError::Compilation(
-                format!("vertex attribute {location}: unsupported packed numerical type {kind}")
-                    .into(),
-            )),
-        };
-    }
-    let (width, count) = match size {
-        0x1d => (8, 0),
-        0x18 => (8, 1),
-        0x13 => (8, 2),
-        0x0a => (8, 3),
-        0x1b => (16, 0),
-        0x0f => (16, 1),
-        0x05 => (16, 2),
-        0x03 => (16, 3),
-        0x12 => (32, 0),
-        0x04 => (32, 1),
-        0x02 => (32, 2),
-        0x01 => (32, 3),
-        _ => {
-            return Err(VulkanError::Compilation(
-                format!("vertex attribute {location}: unsupported component encoding {size:#x}")
-                    .into(),
-            ));
-        }
-    };
-    let formats = match (width, kind) {
-        (8, 1) => [
-            F::R8_SNORM,
-            F::R8G8_SNORM,
-            F::R8G8B8_SNORM,
-            F::R8G8B8A8_SNORM,
-        ],
-        (8, 2) => [
-            F::R8_UNORM,
-            F::R8G8_UNORM,
-            F::R8G8B8_UNORM,
-            F::R8G8B8A8_UNORM,
-        ],
-        (8, 3) => [F::R8_SINT, F::R8G8_SINT, F::R8G8B8_SINT, F::R8G8B8A8_SINT],
-        (8, 4) => [F::R8_UINT, F::R8G8_UINT, F::R8G8B8_UINT, F::R8G8B8A8_UINT],
-        (8, 5) => [
-            F::R8_USCALED,
-            F::R8G8_USCALED,
-            F::R8G8B8_USCALED,
-            F::R8G8B8A8_USCALED,
-        ],
-        (8, 6) => [
-            F::R8_SSCALED,
-            F::R8G8_SSCALED,
-            F::R8G8B8_SSCALED,
-            F::R8G8B8A8_SSCALED,
-        ],
-        (16, 1) => [
-            F::R16_SNORM,
-            F::R16G16_SNORM,
-            F::R16G16B16_SNORM,
-            F::R16G16B16A16_SNORM,
-        ],
-        (16, 2) => [
-            F::R16_UNORM,
-            F::R16G16_UNORM,
-            F::R16G16B16_UNORM,
-            F::R16G16B16A16_UNORM,
-        ],
-        (16, 3) => [
-            F::R16_SINT,
-            F::R16G16_SINT,
-            F::R16G16B16_SINT,
-            F::R16G16B16A16_SINT,
-        ],
-        (16, 4) => [
-            F::R16_UINT,
-            F::R16G16_UINT,
-            F::R16G16B16_UINT,
-            F::R16G16B16A16_UINT,
-        ],
-        (16, 5) => [
-            F::R16_USCALED,
-            F::R16G16_USCALED,
-            F::R16G16B16_USCALED,
-            F::R16G16B16A16_USCALED,
-        ],
-        (16, 6) => [
-            F::R16_SSCALED,
-            F::R16G16_SSCALED,
-            F::R16G16B16_SSCALED,
-            F::R16G16B16A16_SSCALED,
-        ],
-        (16, 7) => [
-            F::R16_SFLOAT,
-            F::R16G16_SFLOAT,
-            F::R16G16B16_SFLOAT,
-            F::R16G16B16A16_SFLOAT,
-        ],
-        (32, 3 | 6) => [
-            F::R32_SINT,
-            F::R32G32_SINT,
-            F::R32G32B32_SINT,
-            F::R32G32B32A32_SINT,
-        ],
-        (32, 4 | 5) => [
-            F::R32_UINT,
-            F::R32G32_UINT,
-            F::R32G32B32_UINT,
-            F::R32G32B32A32_UINT,
-        ],
-        (32, 7) => [
-            F::R32_SFLOAT,
-            F::R32G32_SFLOAT,
-            F::R32G32B32_SFLOAT,
-            F::R32G32B32A32_SFLOAT,
-        ],
-        _ => {
-            return Err(VulkanError::Compilation(
-                format!(
-                    "vertex attribute {location}: unsupported {width}-bit numerical type {kind}"
-                )
-                .into(),
-            ));
-        }
-    };
-    Ok(formats[count])
+    Ok(())
 }

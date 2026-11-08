@@ -151,7 +151,7 @@ pub(in crate::engines) fn call_method<L: crate::MaxwellFrontend, H: crate::Maxwe
     source: MaxwellMethodSource,
     candidate: &mut MaxwellTwoDState,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Result<bool, crate::engines::MaxwellEngineStreamError> {
+) -> Result<(), crate::engines::MaxwellEngineStreamError> {
     if let Some(result) = super::blit::apply(source, candidate, execution) {
         return result;
     }
@@ -236,7 +236,7 @@ pub(in crate::engines) fn call_method<L: crate::MaxwellFrontend, H: crate::Maxwe
     };
 
     candidate.apply(write);
-    Ok(true)
+    Ok(())
 }
 
 fn invalid_value(

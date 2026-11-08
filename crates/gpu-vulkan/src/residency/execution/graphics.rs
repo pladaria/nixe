@@ -828,7 +828,7 @@ impl Residency<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_draw_inner(
         &mut self,
-        pipeline: &Arc<NativePipeline>,
+        pipeline: &NativePipeline,
         targets: &Arc<PreparedTargets>,
         images: &[ShaderImage],
         descriptors: DescriptorQueue,
@@ -971,7 +971,7 @@ impl Residency<'_> {
         }
         if empty {
         } else {
-            self.bind_pipeline_descriptors(
+            self.runtime.device.configure_pipeline(
                 pipeline,
                 push,
                 record.as_ref(),

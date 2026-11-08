@@ -117,7 +117,7 @@ pub(super) fn apply<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     source: MaxwellMethodSource,
     state: &mut MaxwellTwoDState,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Option<Result<bool, crate::engines::MaxwellEngineStreamError>> {
+) -> Option<Result<(), crate::engines::MaxwellEngineStreamError>> {
     let address = source.method().0;
     if matches!(address, 0x0604 | 0x060c) && state.solid.mode.value() != Some(&4) {
         return Some(Err((error(
@@ -150,7 +150,7 @@ pub(super) fn apply<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
         if address == 0x060c {
             Ok(execution.solid(&launch(state, source)?)?)
         } else {
-            Ok(true)
+            Ok(())
         }
     })())
 }

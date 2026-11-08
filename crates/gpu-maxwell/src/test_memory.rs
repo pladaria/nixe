@@ -186,16 +186,3 @@ pub fn safe_read<G: FnMut(u64, u64) -> Result<(), std::sync::Arc<MemoryError>>>(
 ) -> SafeRead<G> {
     SafeRead(flush)
 }
-
-/// Run a real command future whose fixture has no external dependency.
-#[cfg(test)]
-pub(crate) fn ready<F: std::future::Future>(future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    match future
-        .as_mut()
-        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
-    {
-        std::task::Poll::Ready(value) => value,
-        std::task::Poll::Pending => panic!("fixture unexpectedly suspended"),
-    }
-}

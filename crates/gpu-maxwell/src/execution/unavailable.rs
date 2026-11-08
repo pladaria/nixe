@@ -9,7 +9,7 @@ fn unavailable<T>() -> Result<T, MaxwellSubmissionExecutionError> {
 impl MaxwellFrontend for MissingRenderer {
     fn bind_gpu_memory(&mut self, _: &crate::MaxwellGpuMemoryHandle) {}
     fn create_channel(&mut self, _: crate::MaxwellChannelId) {}
-    fn bind_channel(&mut self, _: crate::MaxwellChannelId) {}
+    fn bind_channel(&mut self, _: crate::MaxwellChannelId, _: &crate::MaxwellThreeDState) {}
     fn close_channel(&mut self, _: crate::MaxwellChannelId) {}
     fn bind_graphics_uniform(
         &mut self,
@@ -20,14 +20,14 @@ impl MaxwellFrontend for MissingRenderer {
     ) -> Result<(), MaxwellSubmissionExecutionError> {
         unavailable()
     }
-    fn try_draw(
+    fn draw(
         &mut self,
         _: &crate::MaxwellThreeDState,
         _: &crate::MaxwellThreeDDrawState,
         _: &MaxwellGpuMemory,
         _: FrontendSubmissionId,
         _: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<bool, MaxwellSubmissionExecutionError> {
+    ) -> Result<(), MaxwellSubmissionExecutionError> {
         unavailable()
     }
     fn clear(
@@ -38,29 +38,29 @@ impl MaxwellFrontend for MissingRenderer {
     ) -> Result<(), MaxwellSubmissionExecutionError> {
         unavailable()
     }
-    fn try_launch(
+    fn launch(
         &mut self,
         _: &crate::MaxwellResolvedComputeLaunch,
         _: &MaxwellGpuMemory,
         _: FrontendSubmissionId,
         _: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<bool, MaxwellSubmissionExecutionError> {
+    ) -> Result<(), MaxwellSubmissionExecutionError> {
         unavailable()
     }
-    fn try_solid(
+    fn solid(
         &mut self,
         _: &crate::MaxwellTwoDSolidOperation,
         _: &MaxwellGpuMemory,
         _: FrontendSubmissionId,
-    ) -> Result<bool, MaxwellSubmissionExecutionError> {
+    ) -> Result<(), MaxwellSubmissionExecutionError> {
         unavailable()
     }
-    fn try_blit(
+    fn blit(
         &mut self,
         _: &crate::MaxwellTwoDBlitOperation,
         _: &MaxwellGpuMemory,
         _: FrontendSubmissionId,
-    ) -> Result<bool, MaxwellSubmissionExecutionError> {
+    ) -> Result<(), MaxwellSubmissionExecutionError> {
         unavailable()
     }
     fn accelerate_dma(

@@ -88,17 +88,3 @@ pub use svc_dispatch::{
 
 #[cfg(test)]
 extern crate self as nixe_horizon;
-#[cfg(test)]
-#[path = "integration_tests/homebrew_acceptance.rs"]
-mod homebrew_integration_tests;
-#[cfg(test)]
-#[path = "integration_tests/synthetic_launch_matrix.rs"]
-mod launch_integration_tests;
-#[cfg(test)]
-#[path = "integration_tests/svc_dispatch.rs"]
-mod svc_integration_tests;
-
-#[cfg(test)]
-#[allow(dead_code)]
-#[path = "../tests/support/mod.rs"]
-mod integration_test_support;

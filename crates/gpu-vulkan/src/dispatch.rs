@@ -66,6 +66,7 @@ impl Dispatch {
         device: &Device,
         profile: &crate::DeviceProfile,
         queue_mutex: std::sync::Arc<std::sync::Mutex<()>>,
+        objects: std::sync::Arc<crate::cache::NativeObjects>,
     ) -> Result<Self, VulkanError> {
         let path = profile.api_path;
         let maintenance = profile.swapchain_maintenance;
@@ -217,6 +218,7 @@ impl Dispatch {
                 }),
             },
             queue_mutex,
+            objects,
         )?;
         Ok(Self {
             recorder,

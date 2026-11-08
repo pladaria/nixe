@@ -42,7 +42,7 @@ pub fn emit_spirv(
         words,
         info: program.info,
         bindings: ctx.resource_bindings.into_boxed_slice(),
-        host_uniforms: ctx.host_uniforms.into_boxed_slice(),
+        push_constant_bytes: ctx.push_constant_bytes,
         interface,
         execution: program.execution,
     })

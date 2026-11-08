@@ -37,7 +37,7 @@ impl CacheOwners {
             .lock()
             .unwrap()
             .write_memory(address, bytes);
-        self.shader_cache.invalidate_region(address, bytes);
+        self.shader_cache.on_cache_invalidation(address, bytes);
     }
 }
 impl nixe_gpu_maxwell::MaxwellGpuMemoryInterface for CacheOwners {

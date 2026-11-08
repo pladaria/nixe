@@ -245,11 +245,8 @@ pub(super) trait MaxwellThreeDMmeHost {
     type Error;
 
     fn read_register(&self, method_dword: u16) -> Result<u32, Self::Error>;
-    /// Apply a send synchronously when it has no observable effect. A false
-    /// result requires finish_method to flush a draw boundary or consume the
-    /// effect admitted by this send before the interpreter continues.
-    fn try_emit_method(&mut self, method_dword: u16, argument: u32) -> Result<bool, Self::Error>;
-    async fn finish_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error>;
+    /// Execute the method and any pending primitive boundary before continuing.
+    fn emit_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error>;
 }
 
 pub(super) enum MaxwellThreeDMmeRunError<E> {
@@ -298,7 +295,7 @@ impl MaxwellThreeDMmeProgram {
     /// <https://source.hodakov.me/hdkv/yuzu/src/commit/8a674958a730a36dbcc43910412521420a804c69/src/video_core/macro/macro.h>
     /// <https://source.hodakov.me/hdkv/yuzu/src/commit/8a674958a730a36dbcc43910412521420a804c69/src/video_core/macro/macro_interpreter.cpp>
     /// <https://git.axenov.dev/Museum/ryujinx/src/commit/ec3e848d7998038ce22c41acdbf81032bf47991f/Ryujinx.Graphics.Gpu/Engine/MME/MacroInterpreter.cs>
-    pub(super) async fn execute<H: MaxwellThreeDMmeHost>(
+    pub(super) fn execute<H: MaxwellThreeDMmeHost>(
         &self,
         parameters: &[u32],
         host: &mut H,
@@ -326,13 +323,7 @@ impl MaxwellThreeDMmeProgram {
             emitted_methods: 0,
         };
         interpreter.registers[1] = parameters[0];
-        while let Some((method, value)) = interpreter.run_until_effect()? {
-            interpreter
-                .host
-                .finish_method(method, value)
-                .await
-                .map_err(MaxwellThreeDMmeRunError::Host)?;
-        }
+        interpreter.run()?;
         if interpreter.next_parameter != parameters.len() {
             return Err(MaxwellThreeDMmeRunError::Execution(
                 MaxwellThreeDMmeExecutionError::UnconsumedParameters {
@@ -351,10 +342,7 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
     }
 
     // Arithmetic, branches and register-only sends stay in this synchronous loop.
-    // Only an actual engine effect returns to the suspendable caller.
-    fn run_until_effect(
-        &mut self,
-    ) -> Result<Option<(u16, u32)>, MaxwellThreeDMmeRunError<H::Error>> {
+    fn run(&mut self) -> Result<(), MaxwellThreeDMmeRunError<H::Error>> {
         while !self.finished {
             if self.instructions == MAXWELL_THREE_D_MME_EXECUTION_INSTRUCTION_LIMIT {
                 return Err(Self::execution_error(
@@ -478,16 +466,12 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
                 self.method_address = (u32::from(method)
                     .wrapping_add(u32::from(self.method_increment))
                     & MME_METHOD_DWORD_MASK) as u16;
-                if !self
-                    .host
-                    .try_emit_method(method, value)
-                    .map_err(MaxwellThreeDMmeRunError::Host)?
-                {
-                    return Ok(Some((method, value)));
-                }
+                self.host
+                    .emit_method(method, value)
+                    .map_err(MaxwellThreeDMmeRunError::Host)?;
             }
         }
-        Ok(None)
+        Ok(())
     }
 
     fn alu(

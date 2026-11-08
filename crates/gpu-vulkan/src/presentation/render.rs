@@ -52,7 +52,7 @@ fn shader(kind: u8) -> Arc<ShaderArtifact> {
         1 => &PACKED,
         _ => &UI,
     };
-    Arc::clone(cell.get_or_init(|| {
+    (cell.get_or_init(|| {
         let stage = crate::residency::helper_stage;
         let vertex: &[u8] = if kind == 2 {
             include_bytes!("../../shaders/spv/ui.vert.spv")
@@ -95,6 +95,7 @@ fn shader(kind: u8) -> Arc<ShaderArtifact> {
             ),
         ])))
     }))
+    .clone()
 }
 fn state(format: vk::Format, kind: u8) -> GraphicsState {
     let mut state = GraphicsState::color(format);
@@ -140,7 +141,7 @@ fn state(format: vk::Format, kind: u8) -> GraphicsState {
 struct Texture {
     view: Arc<AllocatedImageView>,
     size: [usize; 2],
-    sampler: Arc<Sampler>,
+    sampler: Sampler,
 }
 pub(crate) struct LayerImage {
     pub view: Arc<AllocatedImageView>,
@@ -175,9 +176,9 @@ impl LayerImage {
     }
 }
 pub(crate) struct ScreenRenderer {
-    pipelines: HashMap<(vk::Format, u8), Arc<NativePipeline>>,
-    linear: Arc<Sampler>,
-    nearest: Arc<Sampler>,
+    pipelines: HashMap<(vk::Format, u8), NativePipeline>,
+    linear: Sampler,
+    nearest: Sampler,
     textures: HashMap<egui::TextureId, Texture>,
     vertices: Vec<u8>,
     indices: Vec<u8>,
@@ -211,7 +212,7 @@ impl ScreenRenderer {
         compiler: &PipelineCompiler,
         format: vk::Format,
         kind: u8,
-    ) -> Result<Arc<NativePipeline>, VulkanError> {
+    ) -> Result<NativePipeline, VulkanError> {
         if let std::collections::hash_map::Entry::Vacant(entry) =
             self.pipelines.entry((format, kind))
         {
@@ -223,7 +224,7 @@ impl ScreenRenderer {
                 .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
             entry.insert(pending);
         }
-        Ok(Arc::clone(&self.pipelines[&(format, kind)]))
+        Ok((self.pipelines[&(format, kind)]).clone())
     }
     pub fn update_textures(
         &mut self,
@@ -254,7 +255,7 @@ impl ScreenRenderer {
                         Texture {
                             view,
                             size: image.size,
-                            sampler: Arc::clone(&self.linear),
+                            sampler: self.linear.clone(),
                         },
                     );
                 }
@@ -277,18 +278,17 @@ impl ScreenRenderer {
                         vk::SamplerAddressMode::MIRRORED_REPEAT
                     }
                 };
-                let sampler = Arc::clone(
-                    cache.texture_cache.samplers.get(
-                        &vk::SamplerCreateInfo::default()
-                            .min_filter(filter(delta.options.minification))
-                            .mag_filter(filter(delta.options.magnification))
-                            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-                            .address_mode_u(wrap)
-                            .address_mode_v(wrap)
-                            .address_mode_w(wrap)
-                            .max_lod(0.),
-                    )?,
-                );
+                let sampler = (cache.texture_cache.samplers.get(
+                    &vk::SamplerCreateInfo::default()
+                        .min_filter(filter(delta.options.minification))
+                        .mag_filter(filter(delta.options.magnification))
+                        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                        .address_mode_u(wrap)
+                        .address_mode_v(wrap)
+                        .address_mode_w(wrap)
+                        .max_lod(0.),
+                )?)
+                .clone();
                 self.textures
                     .get_mut(id)
                     .ok_or(VulkanError::InvalidResource(
@@ -383,7 +383,7 @@ impl ScreenRenderer {
         &self,
         cache: &mut crate::residency::Residency<'_>,
         descriptors: &mut DescriptorCache,
-        pipeline: Arc<NativePipeline>,
+        pipeline: NativePipeline,
         frame: &LayerImage,
         target: &Arc<crate::render_pass::Framebuffer>,
         extent: vk::Extent2D,
@@ -419,7 +419,7 @@ impl ScreenRenderer {
                     view: Arc::clone(&frame.view),
                     layout: vk::ImageLayout::GENERAL,
                 },
-                DescriptorResource::Sampler(Arc::clone(sampler)),
+                DescriptorResource::Sampler(sampler.clone()),
             ],
         )?;
         let mut parameters = GraphicsParameters::new(
@@ -507,7 +507,7 @@ impl ScreenRenderer {
         &mut self,
         cache: &mut crate::residency::Residency<'_>,
         descriptors: &mut DescriptorCache,
-        pipeline: Arc<NativePipeline>,
+        pipeline: NativePipeline,
         ui: &mut UiFrame,
         target: &Arc<crate::render_pass::Framebuffer>,
         extent: vk::Extent2D,
@@ -614,7 +614,7 @@ impl ScreenRenderer {
                             view: Arc::clone(&texture.view),
                             layout: vk::ImageLayout::GENERAL,
                         },
-                        DescriptorResource::Sampler(Arc::clone(&texture.sampler)),
+                        DescriptorResource::Sampler((texture.sampler).clone()),
                     ],
                 )?;
                 let mut parameters = GraphicsParameters::new(state(format, 2), extent);
@@ -637,8 +637,7 @@ impl ScreenRenderer {
                         height: (max.y - min.y) as u32,
                     },
                 };
-                let graphics =
-                    cache.prepare_host_graphics(Arc::clone(&pipeline), record, parameters)?;
+                let graphics = cache.prepare_host_graphics(pipeline.clone(), record, parameters)?;
                 cache.bind_host_graphics(&graphics, &push)?;
                 let device = cache.device_mut();
 

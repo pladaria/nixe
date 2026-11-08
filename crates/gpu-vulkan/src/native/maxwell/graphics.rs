@@ -1,7 +1,7 @@
 //! Vulkan descriptor updates consume current Maxwell stage slots directly.
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 use super::*;
-use crate::native::{Drawing, state};
+use crate::native::state;
 use crate::{Draw, PreparedTargets, VulkanError};
 use ash::vk;
 impl crate::native::NativeExecution<'_> {
@@ -364,12 +364,9 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
             native_index.as_ref(),
             |binding| registers.register_words()[0x1c00 / 4 + binding as usize * 4] & 0xfff,
         )?;
-        let pipeline_changed = execution
-            .state
-            .context
-            .drawing
-            .as_ref()
-            .is_none_or(|drawing| !Arc::ptr_eq(&drawing.pipeline, pipeline));
+        let device = execution.residency.device();
+        let slot = device.recording_slot()?;
+        let pipeline_changed = device.submission.slots[slot].bound_graphics != pipeline.identity();
         if geometry_changed || pipeline_changed || dirty & GraphicsDirty::VERTEX_INPUT != 0 {
             let words = registers.register_words();
             let mut attributes = vertex_attributes;
@@ -398,33 +395,6 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                     ));
                 }
             }
-        }
-        if let Some(drawing) = execution.state.context.drawing.as_mut() {
-            if pipeline_changed {
-                drawing.pipeline = Arc::clone(pipeline);
-            }
-            execution.state.statistics.reused_graphics += 1;
-        } else {
-            execution.state.context.drawing = Some(Drawing {
-                pipeline: Arc::clone(pipeline),
-                push: Vec::new(),
-                recorded: false,
-            });
-            execution.state.statistics.prepared_draws += 1;
-        }
-        let drawing = execution
-            .state
-            .context
-            .drawing
-            .as_mut()
-            .expect("current draw");
-        if pipeline_changed || dirty != 0 {
-            state::update_guest_push(
-                pipeline,
-                &self.resources,
-                Some(registers),
-                &mut drawing.push,
-            )?;
         }
         let descriptors = if arguments.is_empty() {
             crate::residency::execution::DescriptorQueue {
@@ -470,8 +440,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         draw: &nixe_gpu_maxwell::MaxwellThreeDDrawState,
         space: &nixe_gpu_maxwell::MaxwellGpuMemory,
         groups: [Option<u8>; 5],
-        pixel_depth: bool,
-    ) -> Result<bool, VulkanError> {
+    ) -> Result<(), VulkanError> {
         execution.flush_work()?;
         let arguments = registers::draw_arguments(registers, draw)?;
         let (images, descriptors, arguments) = (self.configure)(
@@ -489,7 +458,6 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
             execution,
             registers,
             draw,
-            pixel_depth,
             &targets,
             arguments,
             &images,
@@ -502,30 +470,20 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         execution: &mut crate::native::NativeExecution<'_>,
         registers: &nixe_gpu_maxwell::engines::threed::MaxwellThreeDState,
         guest_draw: &nixe_gpu_maxwell::MaxwellThreeDDrawState,
-        pixel_depth: bool,
         targets: &Arc<PreparedTargets>,
         draw: Draw,
         images: &[crate::residency::execution::ShaderImage],
         descriptors: crate::residency::execution::DescriptorQueue,
-    ) -> Result<bool, VulkanError> {
-        let Drawing {
-            pipeline,
-            push,
-            recorded,
-            ..
-        } = execution
-            .state
-            .context
-            .drawing
-            .as_mut()
-            .ok_or(VulkanError::InvalidResource("draw was not prepared"))?;
+    ) -> Result<(), VulkanError> {
+        let pipeline = &self.pipeline;
+        let push = state::ShaderConstants::graphics(&self.resources, registers)?;
         execution.residency.record_draw_inner(
             pipeline,
             targets,
             images,
             descriptors,
             draw,
-            push,
+            push.as_bytes(),
             |aspect| {
                 let r = registers.register_words();
                 Ok(if aspect == vk::ImageAspectFlags::DEPTH {
@@ -542,14 +500,9 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
             |residency| {
                 super::dynamic_state::record(
                     residency,
-                    &mut execution.state.context.dynamic,
-                    execution
-                        .state
-                        .current_context
-                        .expect("selected guest channel"),
+                    &mut execution.state.dynamic,
                     registers,
                     guest_draw,
-                    pixel_depth,
                     pipeline,
                     &mut execution.state.statistics,
                 )
@@ -561,8 +514,6 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 .finish_guest_writes(pipeline, &self.resources)?;
         }
         execution.state.statistics.draws += 1;
-        execution.state.statistics.warm_draws += u64::from(*recorded);
-        *recorded = true;
-        Ok(true)
+        Ok(())
     }
 }

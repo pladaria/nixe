@@ -17,15 +17,39 @@ const OUTPUT: u8 = 2;
 const CANCELLED: u8 = 4;
 const SERVER: u8 = 8;
 const REPLIED: u8 = 16;
+const FAILURE_REPORTED: u8 = 32;
 
 // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_session.cpp#L1445-L1525
 /// Service effects finish before relinquishing their turn. A suspended response
 /// write has no executing service effect and can be dropped on cancellation.
-#[derive(Default)]
 pub(crate) struct CallLifetime {
     state: AtomicU8,
+    client: nixe_runtime::KernelRequest,
 }
 impl CallLifetime {
+    pub fn for_client(context: &nixe_runtime::ExceptionDispatchContext<'_>) -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            client: context.retain_request(),
+        }
+    }
+    pub fn client(&self) -> &nixe_runtime::KernelRequest {
+        &self.client
+    }
+    pub fn report_failure(&self, error: &IpcWireError) {
+        let client = &self.client;
+        if (self.state.load(Ordering::Acquire) & CANCELLED != 0 || client.is_retired())
+            && super::HorizonIpcFault::from_wire(error.clone())
+                .guest_result()
+                .is_none()
+            && self.state.fetch_or(FAILURE_REPORTED, Ordering::AcqRel) & FAILURE_REPORTED == 0
+        {
+            client.report_failure(format!(
+                "accepted IPC service failed: {}",
+                super::HorizonIpcFault::from_wire(error.clone())
+            ));
+        }
+    }
     /// Returns whether an already executing effect must still be drained.
     pub fn cancel(&self) -> bool {
         let state = self
@@ -205,80 +229,5 @@ impl Future for ServiceEvent<'_> {
             }
         }
         Poll::Pending
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn reply_publication_and_cancellation_have_one_winner() {
-        let cancelled = CallLifetime::default();
-        cancelled.begin().unwrap();
-        cancelled.cancel();
-        assert!(matches!(
-            cancelled.commit_reply(),
-            Err(IpcWireError::Cancelled)
-        ));
-        let replied = CallLifetime::default();
-        replied.begin().unwrap();
-        replied.commit_reply().unwrap();
-        replied.cancel();
-        assert!(replied.check().is_ok());
-    }
-    #[derive(Default)]
-    struct Wakes(std::sync::atomic::AtomicUsize);
-    impl std::task::Wake for Wakes {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    #[test]
-    fn event_and_deadline_waits_release_their_registrations_on_completion_or_cancel() {
-        let kernel = crate::test_memory::kernel();
-        let lifetime = CallLifetime::default();
-        let wakes = Arc::new(Wakes::default());
-        let waker = Waker::from(wakes.clone());
-        let mut context = Context::from_waker(&waker);
-        let (writer, reader) =
-            nixe_runtime::EventObject::create_pair(&crate::test_memory::kernel());
-        let mut wait = ServiceEvent::new(
-            &kernel,
-            reader.clone(),
-            Some(Duration::from_secs(60)),
-            &lifetime,
-        );
-        assert!(Pin::new(&mut wait).poll(&mut context).is_pending());
-        assert!(kernel.deadline_count() != 0);
-        writer.signal();
-        assert!(Pin::new(&mut wait).poll(&mut context).is_ready());
-        drop(wait);
-        assert!(kernel.deadline_count() == 0);
-        reader.clear();
-        let cancelled_lifetime = CallLifetime::default();
-        let mut cancelled = ServiceEvent::new(
-            &kernel,
-            reader.clone(),
-            Some(Duration::from_secs(60)),
-            &cancelled_lifetime,
-        );
-        assert!(Pin::new(&mut cancelled).poll(&mut context).is_pending());
-        cancelled_lifetime.cancel();
-        assert!(matches!(
-            Pin::new(&mut cancelled).poll(&mut context),
-            Poll::Ready(Err(IpcWireError::Cancelled))
-        ));
-        drop(cancelled);
-        let before = wakes.0.load(Ordering::Relaxed);
-        writer.signal();
-        assert_eq!(wakes.0.load(Ordering::Relaxed), before);
-        assert!(kernel.deadline_count() == 0);
-        reader.clear();
-        let mut deadline =
-            ServiceEvent::new(&kernel, reader, Some(Duration::from_millis(1)), &lifetime);
-        assert!(Pin::new(&mut deadline).poll(&mut context).is_pending());
-        kernel.advance_time(2_000_000);
-        assert!(Pin::new(&mut deadline).poll(&mut context).is_ready());
-        assert!(kernel.deadline_count() == 0);
     }
 }

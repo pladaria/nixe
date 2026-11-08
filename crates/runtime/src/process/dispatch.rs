@@ -87,7 +87,7 @@ impl RunnableProcess {
         state.termination = Some(lifecycle);
         state.exit = exit;
         drop(state);
-        self.cancel_waits();
+        self.cancel_kernel_contexts();
     }
     pub(crate) fn take_termination(&self) -> Option<nixe_scheduler::ProcessLifecycle> {
         self.state.lock().unwrap().termination.take()
@@ -117,12 +117,12 @@ impl RunnableProcess {
             frames: Box::new([]),
         });
         drop(state);
-        self.cancel_waits();
+        self.cancel_kernel_contexts();
         true
     }
-    pub(crate) fn cancel_waits(&self) {
+    pub(crate) fn cancel_kernel_contexts(&self) {
         for (_, thread) in self.threads.iter() {
-            thread.cancel_wait();
+            thread.cancel_host_context();
         }
     }
 }

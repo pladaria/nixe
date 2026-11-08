@@ -5,7 +5,7 @@ use crate::{VulkanError, cache::NativePipeline};
 use ash::vk;
 
 #[derive(Default)]
-pub(crate) struct ChannelState {
+pub(crate) struct DynamicState {
     vertex_input: super::vertex_input::VertexInput,
     blending: super::blending::Blending,
 }
@@ -14,23 +14,28 @@ pub(crate) struct ChannelState {
 /// All other setters consume their individual engine flags directly.
 #[derive(Default)]
 pub(crate) struct CommandState {
-    channel: Option<u64>,
+    initialized: bool,
     topology: Option<u32>,
+    stencil_reset: bool,
     two_sided_stencil: Option<bool>,
     stencil_reference: [u32; 2],
     stencil_write_mask: [u32; 2],
     stencil_compare_mask: [u32; 2],
 }
+impl CommandState {
+    pub(crate) fn invalidate(&mut self) {
+        self.topology = None;
+        self.stencil_reset = true;
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::native) fn record(
     residency: &mut crate::residency::Residency<'_>,
-    channel_state: &mut ChannelState,
-    channel: u64,
+    channel_state: &mut DynamicState,
     state: &MaxwellThreeDState,
     draw: &MaxwellThreeDDrawState,
-    pixel_depth: bool,
-    pipeline: &std::sync::Arc<NativePipeline>,
+    pipeline: &NativePipeline,
     statistics: &mut crate::native::NativeExecutionStatistics,
 ) -> Result<(), VulkanError> {
     use GraphicsDirty as D;
@@ -39,7 +44,7 @@ pub(in crate::native) fn record(
     let index = residency.runtime.device.recording_slot()?;
     let device = &mut residency.runtime.device;
     let command = &mut device.submission.slots[index].graphics_state;
-    let first = command.channel != Some(channel);
+    let first = !command.initialized;
     let topology_changed = first || command.topology != Some(draw.topology);
     let vertex_buffers = if device.profile.dynamic_state.vertex_input {
         D::VERTEX_BUFFERS
@@ -61,7 +66,7 @@ pub(in crate::native) fn record(
     if dirty & D::VIEWPORT != 0 {
         dirty |= D::SCISSOR;
     }
-    command.channel = Some(channel);
+    command.initialized = true;
     command.topology = Some(draw.topology);
     if dirty == 0 && !topology_changed {
         return Ok(());
@@ -72,8 +77,7 @@ pub(in crate::native) fn record(
     let needs = |flag| dirty & flag != 0;
     unsafe {
         if needs(D::VIEWPORT) {
-            let observes_depth = (r[0x1538 / 4] != 0 && r[0x12cc / 4] != 0) || pixel_depth;
-            raw.cmd_set_viewport(0, &[registers::viewport(r, observes_depth, profile)?]);
+            raw.cmd_set_viewport(0, &[registers::viewport(r, profile)?]);
         }
         if needs(D::SCISSOR) {
             raw.cmd_set_scissor(0, &[registers::scissor(r)]);
@@ -121,7 +125,8 @@ pub(in crate::native) fn record(
         }
         if needs(D::STENCIL_PROPERTIES) {
             let two_sided = r[0x1594 / 4] != 0;
-            let side_changed = first || command.two_sided_stencil != Some(two_sided);
+            let reset = first || command.stencil_reset;
+            let side_changed = reset || command.two_sided_stencil != Some(two_sided);
             command.two_sided_stencil = Some(two_sided);
             for (flag, method, back_method, old) in [
                 (
@@ -147,7 +152,7 @@ pub(in crate::native) fn record(
                     continue;
                 }
                 let values = [r[method], r[if two_sided { back_method } else { method }]];
-                if !first && *old == values {
+                if !reset && *old == values {
                     continue;
                 }
                 *old = values;
@@ -167,6 +172,7 @@ pub(in crate::native) fn record(
                     emit(vk::StencilFaceFlags::BACK, values[1]);
                 }
             }
+            command.stencil_reset = false;
         }
         if needs(D::LINE_WIDTH) {
             let method = if r[0x1570 / 4] != 0 { 0x13b0 } else { 0x13b4 };

@@ -1,5 +1,7 @@
 //! Construction of a runnable CPU process from an immutable launch plan.
 
+mod request;
+pub use request::KernelRequest;
 mod builder;
 mod dispatch;
 mod exception;
@@ -66,6 +68,8 @@ pub struct RunnableProcess {
     process_id: u64,
     state: Mutex<ProcessState>,
     generation: std::sync::atomic::AtomicU64,
+    active_requests: std::sync::atomic::AtomicUsize,
+    pub(crate) runtime: std::sync::OnceLock<std::sync::Weak<crate::machine::Shared>>,
     cpu: ProcessCpuContext,
     address_space: ProcessAddressSpace,
     memory_layout: ProcessMemoryLayout,
@@ -467,7 +471,7 @@ impl RunnableProcess {
             handles_released: self.handles.len(),
             address_waiters_released: self.address_waits.lock().waiter_count(),
         };
-        self.cancel_waits();
+        self.cancel_kernel_contexts();
         self.execution.request_stop();
         // Native owners have retired; the kernel owns address-space finalization.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_process.cpp#L129-L185

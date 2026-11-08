@@ -19,7 +19,7 @@ use std::{sync::OnceLock, time::Duration};
 pub(super) struct QuadIndices {
     arrays: [Option<QuadLut>; 2],
     compiler: Option<Arc<PipelineCompiler>>,
-    pipeline: Option<Arc<NativePipeline>>,
+    pipeline: Option<NativePipeline>,
 }
 struct QuadLut {
     buffer: AllocatedBuffer,
@@ -44,7 +44,7 @@ fn stride(kind: vk::IndexType) -> u64 {
 }
 fn artifact() -> Arc<ShaderArtifact> {
     static ARTIFACT: OnceLock<Arc<ShaderArtifact>> = OnceLock::new();
-    Arc::clone(ARTIFACT.get_or_init(|| {
+    (ARTIFACT.get_or_init(|| {
         Arc::new(ShaderArtifact::new(Box::new([super::conversion::stage(
             ShaderStage::Compute,
             include_bytes!("../../shaders/spv/quad-indexed.comp.spv"),
@@ -64,6 +64,7 @@ fn artifact() -> Arc<ShaderArtifact> {
             16,
         )])))
     }))
+    .clone()
 }
 impl Residency<'_> {
     pub(crate) fn enable_quad_indices(&mut self, compiler: Arc<PipelineCompiler>) {
@@ -334,7 +335,7 @@ impl Residency<'_> {
             ));
         }
         let pipeline = match &self.runtime.quad_indices.pipeline {
-            Some(p) => Arc::clone(p),
+            Some(p) => (p).clone(),
             None => {
                 let compiler = self.runtime.quad_indices.compiler.as_ref().ok_or(
                     VulkanError::InvalidResource(
@@ -344,7 +345,7 @@ impl Residency<'_> {
                 let pipeline = compiler
                     .request(PipelineRecipe::Compute(artifact()))
                     .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-                self.runtime.quad_indices.pipeline = Some(Arc::clone(&pipeline));
+                self.runtime.quad_indices.pipeline = Some(pipeline.clone());
                 pipeline
             }
         };
@@ -401,7 +402,13 @@ impl Residency<'_> {
         self.runtime.device.realize_deferred_clear()?;
         self.runtime.barriers.emit(&mut self.runtime.device)?;
         self.runtime.device.end_rendering()?;
-        self.bind_pipeline_descriptors(&pipeline, push.as_flattened(), None, &[], Some(update))?;
+        self.runtime.device.configure_pipeline(
+            &pipeline,
+            push.as_flattened(),
+            None,
+            &[],
+            Some(update),
+        )?;
         let device = &mut self.runtime.device;
         unsafe {
             device.dispatch.cmd_dispatch(indices.div_ceil(1024), 1, 1);

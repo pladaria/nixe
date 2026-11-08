@@ -21,22 +21,16 @@ pub const CONFIG_FILE_NAME: &str = "nixe.toml";
 /// Current configuration schema version.
 pub const CONFIG_VERSION: u32 = 2;
 
-/// Bounds for derived native GPU caches; these are not hardware limits.
+/// Per-title guest environment and Vulkan driver cache location.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuConfig {
-    /// Bounded derived shader and driver data, resolved from the configuration file.
+    /// Resolved from the configuration file.
     pub cache_directory: PathBuf,
-    pub shader_entries: usize,
-    pub pipeline_entries: usize,
-    pub persistent_bytes: u64,
 }
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
             cache_directory: PathBuf::from("./storage/cache/gpu"),
-            shader_entries: 2048,
-            pipeline_entries: 8192,
-            persistent_bytes: 128 * 1024 * 1024,
         }
     }
 }
@@ -92,7 +86,9 @@ impl NixeConfig {
         let base_directory = source_path
             .parent()
             .expect("an absolute file path must have a parent");
-        let mut gpu = gpu_cache_configuration(path, raw.gpu)?;
+        let mut gpu = GpuConfig {
+            cache_directory: raw.gpu.cache_directory,
+        };
         gpu.cache_directory = resolve_path(base_directory, gpu.cache_directory);
 
         Ok(Self {
@@ -324,8 +320,6 @@ pub enum ConfigError {
     InvalidTime { path: PathBuf, reason: String },
     /// Input profiles contain ambiguous device selectors.
     InvalidInput { path: PathBuf, reason: String },
-    /// GPU cache capacities are zero or cannot be represented in bytes.
-    InvalidGpu { path: PathBuf, reason: String },
 }
 
 impl Display for ConfigError {
@@ -360,11 +354,6 @@ impl Display for ConfigError {
                 "configuration {} has invalid input settings: {reason}",
                 path.display()
             ),
-            Self::InvalidGpu { path, reason } => write!(
-                formatter,
-                "configuration {} has invalid GPU settings: {reason}",
-                path.display()
-            ),
         }
     }
 }
@@ -376,8 +365,7 @@ impl Error for ConfigError {
             Self::Parse { source, .. } => Some(source),
             Self::UnsupportedVersion { .. }
             | Self::InvalidTime { .. }
-            | Self::InvalidInput { .. }
-            | Self::InvalidGpu { .. } => None,
+            | Self::InvalidInput { .. } => None,
         }
     }
 }
@@ -451,21 +439,12 @@ struct RawConfig {
 struct RawGpuConfig {
     #[serde(default = "default_gpu_cache_directory")]
     cache_directory: PathBuf,
-    #[serde(default = "default_shader_cache_entries")]
-    shader_cache_entries: usize,
-    #[serde(default = "default_pipeline_cache_entries")]
-    pipeline_cache_entries: usize,
-    #[serde(default = "default_persistent_pipeline_cache_mib")]
-    persistent_pipeline_cache_mib: u64,
 }
 
 impl Default for RawGpuConfig {
     fn default() -> Self {
         Self {
             cache_directory: default_gpu_cache_directory(),
-            shader_cache_entries: default_shader_cache_entries(),
-            pipeline_cache_entries: default_pipeline_cache_entries(),
-            persistent_pipeline_cache_mib: default_persistent_pipeline_cache_mib(),
         }
     }
 }
@@ -579,45 +558,8 @@ fn default_sd_card_path() -> PathBuf {
     PathBuf::from("./storage/sdmc")
 }
 
-fn default_shader_cache_entries() -> usize {
-    GpuConfig::default().shader_entries
-}
-fn default_pipeline_cache_entries() -> usize {
-    GpuConfig::default().pipeline_entries
-}
-fn default_persistent_pipeline_cache_mib() -> u64 {
-    GpuConfig::default().persistent_bytes / (1024 * 1024)
-}
 fn default_gpu_cache_directory() -> PathBuf {
     GpuConfig::default().cache_directory
-}
-
-fn gpu_cache_configuration(path: &Path, raw: RawGpuConfig) -> Result<GpuConfig, ConfigError> {
-    let persistent_bytes = raw
-        .persistent_pipeline_cache_mib
-        .checked_mul(1024 * 1024)
-        .ok_or_else(|| ConfigError::InvalidGpu {
-            path: path.to_owned(),
-            reason: "persistent_pipeline_cache_mib does not fit in bytes".to_owned(),
-        })?;
-    for (name, count) in [
-        ("shader_cache_entries", raw.shader_cache_entries as u64),
-        ("pipeline_cache_entries", raw.pipeline_cache_entries as u64),
-        ("persistent_pipeline_cache_mib", persistent_bytes),
-    ] {
-        if count == 0 {
-            return Err(ConfigError::InvalidGpu {
-                path: path.to_owned(),
-                reason: format!("{name} must be nonzero"),
-            });
-        }
-    }
-    Ok(GpuConfig {
-        cache_directory: raw.cache_directory,
-        shader_entries: raw.shader_cache_entries,
-        pipeline_entries: raw.pipeline_cache_entries,
-        persistent_bytes,
-    })
 }
 
 fn validate_time_config(path: &Path, time: &RawTimeConfig) -> Result<(), ConfigError> {
@@ -1010,68 +952,6 @@ mod tests {
             config.filesystem.sd_card,
             file.path.parent().unwrap().join("./storage/sdmc")
         );
-    }
-
-    #[test]
-    fn gpu_cache_limits_are_typed_defaulted_and_validated() {
-        let explicit = TemporaryConfig::new(
-            r#"
-                version = 2
-                [library]
-                paths = []
-                [system]
-                preferred_languages = []
-                keys = "keys"
-                initial_operation_mode = "handheld"
-                [gpu]
-                shader_cache_entries = 512
-                pipeline_cache_entries = 2048
-                persistent_pipeline_cache_mib = 96
-                cache_directory = "derived/gpu"
-            "#,
-        );
-        let config = NixeConfig::load(&explicit.path).unwrap();
-        assert_eq!(config.gpu.shader_entries, 512);
-        assert_eq!(config.gpu.pipeline_entries, 2_048);
-        assert_eq!(config.gpu.persistent_bytes, 96 * 1024 * 1024);
-        assert_eq!(
-            config.gpu.cache_directory,
-            explicit.path.parent().unwrap().join("derived/gpu")
-        );
-        let default = TemporaryConfig::new(
-            &fs::read_to_string(&explicit.path)
-                .unwrap()
-                .replace("cache_directory = \"derived/gpu\"", ""),
-        );
-        let default_config = NixeConfig::load(&default.path).unwrap();
-        assert_eq!(
-            default_config.gpu.cache_directory,
-            default.path.parent().unwrap().join("./storage/cache/gpu")
-        );
-
-        for setting in [
-            "shader_cache_entries = 0",
-            "pipeline_cache_entries = 0",
-            "persistent_pipeline_cache_mib = 0",
-        ] {
-            let invalid = TemporaryConfig::new(&format!(
-                r#"
-                    version = 2
-                    [library]
-                    paths = []
-                    [system]
-                    preferred_languages = []
-                    keys = "keys"
-                    initial_operation_mode = "handheld"
-                    [gpu]
-                    {setting}
-                "#
-            ));
-            assert!(matches!(
-                NixeConfig::load(&invalid.path),
-                Err(ConfigError::InvalidGpu { .. })
-            ));
-        }
     }
 
     #[test]

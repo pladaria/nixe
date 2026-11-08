@@ -139,10 +139,6 @@ pub(crate) struct Slot {
     pub framebuffers: Vec<Arc<crate::render_pass::Framebuffer>>,
     pub framebuffer_handles: rustc_hash::FxHashSet<vk::Framebuffer>,
     pub retained_views: Vec<Arc<crate::AllocatedImageView>>,
-    pub native_pipelines: Vec<Arc<crate::cache::NativePipeline>>,
-    pub native_bindings: Vec<Arc<crate::cache::BindingRecord>>,
-    pub pipeline_handles: rustc_hash::FxHashSet<usize>,
-    pub binding_handles: rustc_hash::FxHashSet<usize>,
     pub bound_graphics_binding: usize,
     pub bound_compute_offsets: Vec<u32>,
     pub bound_graphics_offsets: Vec<u32>,
@@ -179,10 +175,6 @@ impl Slot {
             framebuffers: Vec::new(),
             framebuffer_handles: Default::default(),
             retained_views: Vec::new(),
-            native_pipelines: Vec::new(),
-            native_bindings: Vec::new(),
-            pipeline_handles: Default::default(),
-            binding_handles: Default::default(),
             bound_graphics_binding: 0,
             bound_compute_offsets: Vec::new(),
             bound_graphics_offsets: Vec::new(),
@@ -482,11 +474,6 @@ impl QueueState {
                 slot.retained_views.clear();
                 slot.graphics_state = Default::default();
                 slot.feedback_aspects = None;
-                slot.native_bindings.clear();
-                slot.native.retire_descriptor_pools();
-                slot.native_pipelines.clear();
-                slot.pipeline_handles.clear();
-                slot.binding_handles.clear();
                 #[cfg(feature = "binding-probe")]
                 slot.probe_queries.clear();
             }

@@ -5,10 +5,11 @@ The recorder consumes prepared Vulkan objects, not `OperationSubmission`,
 integration and steady-state grouping use this same API, independently executable
 and tested offscreen.
 
-Prepare a pipeline on the compilation pool, then prepare its program, graphics
-parameters, attachments and vertex/index streams when those inputs change.
-`prepare_program` resolves resident IDs and access metadata. Consumption resolves
-native descriptor payloads through the growing layout banks.
+Guest draws consume persistent Maxwell resource slots and canonical dirty flags.
+The pipeline cache selects immutable shader/resource metadata before compilation;
+construction workers build executable pipelines. Host utilities prepare explicit
+programs, parameters and attachments. Consumption resolves native descriptor
+payloads through the layout-owned descriptor allocators.
 SPIR-V reflection determines buffer/image read and write scopes, including actual
 shader stages. Simultaneous overlapping bindings are unioned before recording.
 A caller cannot omit shader writes from native hazards or canonical publication.
@@ -16,14 +17,14 @@ Storage windows are conservatively preserved and published in full, including
 bytes a conditional store leaves unchanged. The frontend can supply proven bounded
 windows; recording never scans shader code to discover accesses.
 
-`draw` and `dispatch` consume those references directly. They use the same ordered
-buffer/image access tracker, canonical producer index, queue and completion leases
-as transfers. Dynamic state aliases resolve once at device initialization. Changed
-graphics parameters emit setters; repeated parameters compare an Arc identity.
-Pipelines and immutable descriptor records remain leased through GPU completion.
-Linked executable pipelines also retain their library components, independently
-of compiler/cache lifetime. Vertex/index and attachment preparation pins resident
-objects; eviction cannot invalidate a live prepared reference.
+`draw` and `dispatch` consume those references directly. Transfers and rendering
+use the same buffer/texture owners, ordered native queue and completion leases.
+Dynamic state aliases resolve once at device initialization; guest setters consume
+their individual dirty flags. Pipeline binding, descriptor updates and changed
+push constants share one native recording operation. The recording worker waits
+for executable construction before binding it. Native pipelines, samplers and descriptor pools live in stable renderer storage.
+Recording jobs borrow pipelines and consume descriptor captures. Actual
+buffers/views retain their physical retirement lifetimes through GPU completion.
 
 Read-only draws with compatible LOAD/STORE targets retain a native render-pass
 instance across frontend deliveries, including changed pipeline parameters,
@@ -93,7 +94,7 @@ continued rendering reuses the existing exact coverage and rasterization orderin
 | --- | --- |
 | Draw/indexed/instanced | Native counts, first vertex/index, signed base vertex, first instance and vertex/instance fetch. |
 | Indirect draw/dispatch | Resident command buffers with actual `DRAW_INDIRECT` visibility; multi-draw/first-instance and host bounds checked when consumed. Compute-to-indirect execution stays on GPU. |
-| Vertex formats | Native integer, normalized, half/float and 8/16-bit scaled fetch. `vertex::VertexFetchFormat` identifies 32-bit scaled integer inputs; the shared SSA conversion preserves their floating-point interpretation and has a distinct portable shader variant identity. Unsupported native format support is an error, not an approximate conversion. |
+| Vertex formats | Native integer, normalized, half/float and 8/16-bit scaled fetch. Dynamic shader input classes follow float/int/uint; static layouts retain the guest numerical class. Device policy selects native scaled fetch or integer fetch with shader conversion, including 32-bit components on the emulation path. Combinations absent from the selected native format table fail when consumed. |
 | Triangle fan | Native `TRIANGLE_FAN`, with exact selected provoking vertex; portability restrictions are errors requiring a frontend index lowering. No WebGPU fan index rotation. |
 | Quads | `ssa::spirv::emit_quad_geometry` consumes four original vertices through `LINE_LIST_WITH_ADJACENCY`, emits `(0,1,2)` and `(0,2,3)`, and forwards flat outputs from the selected first/last corner. Guest VS effects execute on the original corners, without shader re-evaluation. Requires host geometry support; this does not enable guest geometry instructions. Point size is irrelevant to the emitted triangles. |
 | Fill rectangle | Verified `VK_NV_fill_rectangle`, selected as a host capability at initialization. Other hosts get an explicit request for an exact lowering. No vendor/device/title checks. |
@@ -101,7 +102,7 @@ continued rendering reuses the existing exact coverage and rasterization orderin
 | Depth/stencil | Native compares, writes, bounds, bias, clamp, separate front/back operations, masks and references. Combined depth/stencil attachments use one actual view. D24 publication excludes the unused high transfer byte. |
 | Viewport/scissor/winding | Native viewport/scissor arrays, negative-height viewport, front face and front/back/both culling; bounded finite coordinates, no silent clamping. |
 | Lines/wireframe | Native polygon and line modes, dynamic width, enabled fill/wide-line/mode/range checks. No replacement of guest width. |
-| Tessellation | Native patch lists and compiled TCS/TES, including dynamic default levels and zero-level patch culling. Unconsumed trailing parameter words are not pushed outside the reflected ABI. |
+| Tessellation | Native patch lists and compiled TCS/TES, including dynamic default levels and zero-level patch culling. Unconsumed trailing parameter words are not pushed outside the fixed stage ABI. |
 | Multisample | Canonical native sample ownership with a frontend-defined sample grid, sample mask/alpha-to-coverage and native color resolve. CPU visibility extracts individual samples on demand; sRGB uses a bit-preserving UNORM view. Host-only intermediate attachments share the same recorder. |
 | Empty draw | Attachment loads/clears/stores still execute; there are no shader accesses or writes. Empty direct dispatch has no shader effects. |
 

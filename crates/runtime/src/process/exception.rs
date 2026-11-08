@@ -14,10 +14,6 @@ impl RunnableProcess {
                 state.set_pc(supervisor_call_pc(source, continuation));
                 ExceptionHandlingResult::Resumed
             }
-            ExceptionDispatchOutcome::Suspend(continuation) => {
-                state.set_pc(supervisor_call_pc(source, continuation));
-                ExceptionHandlingResult::Suspended
-            }
             ExceptionDispatchOutcome::Reject { diagnostic, .. } => {
                 state.set_pc(supervisor_call_pc(source, ExceptionResume::Next));
                 ExceptionHandlingResult::Rejected(diagnostic)

@@ -35,10 +35,7 @@ impl GpuExecution for MissingGpuExecution {
     fn end_command_list(&mut self) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
-    fn convert_nv12(
-        &mut self,
-        _conversion: &Self::Conversion,
-    ) -> Result<bool, BackendRuntimeError> {
+    fn convert_nv12(&mut self, _conversion: &Self::Conversion) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
 

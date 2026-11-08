@@ -182,7 +182,7 @@ pub(crate) struct PreparedNv12 {
 pub(crate) fn nv12_pipeline(
     compiler: &PipelineCompiler,
     format: vk::Format,
-) -> Result<Arc<NativePipeline>, CompileError> {
+) -> Result<NativePipeline, CompileError> {
     if !matches!(
         format,
         vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM
@@ -226,7 +226,7 @@ pub(crate) fn nv12_pipeline(
 impl Residency<'_> {
     pub(crate) fn prepare_nv12(
         &mut self,
-        pipeline: Arc<NativePipeline>,
+        pipeline: NativePipeline,
         descriptors: &mut DescriptorCache,
         sources: &Nv12Inputs,
         destination: ImageId,

@@ -157,10 +157,6 @@ pub trait MaxwellCommandHost: nixe_gpu::OwnerMemory + Sized {
         frontend: FrontendSubmissionId,
         operation: CacheMaintenanceOperation,
     ) -> Result<(), MaxwellSubmissionExecutionError>;
-    /// Actual unavailable preparation retains the channel's live state and
-    /// excludes competing CPU-memory requests until it is consumed or fails.
-    fn preparation_pending(&mut self, pending: bool)
-    -> Result<(), MaxwellSubmissionExecutionError>;
     /// DispatchCalls checks shutdown once per GPFIFO entry. This does not poll
     /// the owner inbox or advance CPU coherence requests.
     fn is_stopped(&self) -> bool;
@@ -170,7 +166,7 @@ pub trait MaxwellCommandHost: nixe_gpu::OwnerMemory + Sized {
     fn timestamp(&self) -> u64;
 }
 /// The current channel executes directly against its graphics and memory owner.
-/// There is no event callback, conversion queue or future for ready operations.
+/// Methods consume effects directly without a continuation or command conversion queue.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
 pub(crate) struct ChannelExecution<'a, L: MaxwellFrontend, H: MaxwellCommandHost> {
     pub(crate) address_space: &'a std::cell::RefCell<MaxwellGpuMemory>,
@@ -178,11 +174,6 @@ pub(crate) struct ChannelExecution<'a, L: MaxwellFrontend, H: MaxwellCommandHost
     completion: Option<&'a ReservedTimelinePoint>,
     cache: &'a std::cell::RefCell<L>,
     pub(crate) host: &'a mut H,
-    active_compute: Option<crate::MaxwellResolvedComputeLaunch>,
-    // Typed inputs are retained only when native compilation is unavailable.
-    // Ready method calls never construct an intermediate engine operation.
-    preparing_blit: Option<crate::MaxwellTwoDBlitOperation>,
-    preparing_solid: Option<crate::MaxwellTwoDSolidOperation>,
     prior_work_pending: bool,
     completion_signal_count: u32,
     driver_completion_increments: u32,
@@ -203,9 +194,6 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'a, L, H> {
             completion,
             cache,
             host,
-            active_compute: None,
-            preparing_blit: None,
-            preparing_solid: None,
             prior_work_pending: false,
             completion_signal_count: 0,
             driver_completion_increments: 0,

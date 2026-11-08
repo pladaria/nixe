@@ -97,6 +97,7 @@ impl GraphicsDirty {
     /// Aggregate vertex-buffer changes consumed by dynamic vertex input. The
     /// buffer cache independently consumes the individual VERTICES slots.
     pub const VERTEX_BUFFERS: u128 = 1 << 76;
+    pub const VIEWPORT_SWIZZLES: u128 = 1 << 77;
     pub const NATIVE_STATE: u128 = Self::VERTEX_INPUT
         | Self::COLOR_OUTPUT
         | Self::VIEWPORT
@@ -120,7 +121,8 @@ impl GraphicsDirty {
         | Self::RASTERIZER_DISCARD
         | Self::DEPTH_BIAS_ENABLE
         | Self::DEPTH_BOUNDS_ENABLE;
-    pub const PARAMETERS: u128 = Self::NATIVE_STATE
+    pub const PARAMETERS: u128 = Self::VIEWPORT_SWIZZLES
+        | Self::NATIVE_STATE
         | Self::VERTEX_BUFFERS
         | Self::PIPELINE_STATE
         | Self::ALPHA_TEST

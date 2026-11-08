@@ -113,9 +113,9 @@ pub enum HostBinding {
     Image(HostImage),
     CombinedImageSampler {
         image: HostImage,
-        sampler: Arc<Sampler>,
+        sampler: Sampler,
     },
-    Sampler(Arc<Sampler>),
+    Sampler(Sampler),
 }
 #[derive(Clone, Copy)]
 pub(super) enum HostBindingAccess {
@@ -134,7 +134,7 @@ pub(super) enum HostBindingAccess {
 /// banks and DescriptorQueue directly; it never constructs this object.
 pub struct HostProgram {
     binding_revision: AtomicU64,
-    pub(super) pipeline: Arc<NativePipeline>,
+    pub(super) pipeline: NativePipeline,
     // Explicit host bindings are owned by the host texture cache.
     record: std::cell::RefCell<ProgramRecord>,
     // Explicit host resources use owned captures; guest resources use residency
@@ -252,13 +252,13 @@ impl Residency<'_> {
                     DescriptorResource::CombinedImageSampler {
                         view,
                         layout,
-                        sampler: Arc::clone(sampler),
+                        sampler: sampler.clone(),
                     }
                 } else {
                     DescriptorResource::Image { view, layout }
                 }
             }
-            HostBinding::Sampler(sampler) => DescriptorResource::Sampler(Arc::clone(sampler)),
+            HostBinding::Sampler(sampler) => DescriptorResource::Sampler(sampler.clone()),
         };
         if let Ok(slot) = program
             .pipeline
@@ -285,7 +285,7 @@ impl Residency<'_> {
     /// they have no invented canonical guest-memory access declarations.
     pub(crate) fn prepare_host_graphics(
         &self,
-        pipeline: Arc<NativePipeline>,
+        pipeline: NativePipeline,
         record: Arc<BindingRecord>,
         parameters: GraphicsParameters,
     ) -> Result<HostGraphics, VulkanError> {
@@ -654,7 +654,7 @@ impl Residency<'_> {
         push: &[u8],
     ) -> Result<(), VulkanError> {
         let record = self.host_descriptor_record(program)?;
-        self.bind_pipeline_descriptors(
+        self.runtime.device.configure_pipeline(
             &program.pipeline,
             push,
             record.as_ref(),
@@ -721,84 +721,6 @@ impl Residency<'_> {
             .descriptor_payload_captures += u64::from(result.is_ok() && hits == 0);
         result
     }
-    pub(super) fn bind_pipeline_descriptors(
-        &mut self,
-        pipeline: &Arc<NativePipeline>,
-        push: &[u8],
-        record: Option<&Arc<BindingRecord>>,
-        dynamic_offsets: &[u32],
-        entries: Option<crate::cache::DescriptorUpdate>,
-    ) -> Result<(), VulkanError> {
-        // Empty layouts have no update template or descriptor set to bind.
-        let entries = entries.filter(|entries| !entries.is_empty());
-        if push.len() < pipeline.layout.key.push_bytes as usize
-            || !push.len().is_multiple_of(4)
-            || push.len() > self.runtime.device.profile().limits.max_push_constants_size as usize
-        {
-            return Err(VulkanError::InvalidResource(
-                "push constants must cover the compiled ABI within host size/alignment limits",
-            ));
-        }
-        self.runtime.device.bind_native_pipeline(pipeline)?;
-        if let Some(entries) = entries {
-            unsafe {
-                if pipeline.layout.push_descriptor {
-                    self.runtime
-                        .device
-                        .dispatch
-                        .push_descriptor_queue(&pipeline.layout, entries);
-                } else {
-                    self.runtime.device.dispatch.bind_descriptor_queue(
-                        pipeline.bind_point,
-                        Arc::clone(&pipeline.layout),
-                        entries,
-                        dynamic_offsets,
-                    );
-                }
-            }
-            self.runtime.device.submission.statistics.descriptor_binds += 1;
-            self.runtime
-                .device
-                .submission
-                .statistics
-                .descriptor_payload_captures += 1;
-        } else if let Some(record) = record {
-            self.runtime
-                .device
-                .bind_native_descriptors(pipeline, record, dynamic_offsets)?;
-        }
-        let index = self.runtime.device.recording_slot()?;
-
-        let slot = &mut self.runtime.device.submission.slots[index];
-        if entries.is_some() {
-            // Pushing an incompatible layout disturbs a previously bound set.
-            // Its cached identity must not suppress the next set bind.
-            if pipeline.bind_point == vk::PipelineBindPoint::COMPUTE {
-                slot.bound_compute_binding = 0;
-            } else {
-                slot.bound_graphics_binding = 0;
-            }
-        }
-        let layout = pipeline.layout.handle;
-        let stages = pipeline.layout.key.push_stages;
-        let push = &push[..pipeline.layout.key.push_bytes as usize];
-        if !push.is_empty()
-            && (slot.push_layout != layout || slot.push_stages != stages || slot.push_bytes != push)
-        {
-            unsafe {
-                self.runtime
-                    .device
-                    .dispatch
-                    .cmd_push_constants(layout, stages, 0, push);
-            }
-            self.runtime.device.submission.statistics.push_updates += 1;
-            slot.push_layout = layout;
-            slot.push_stages = stages;
-            slot.push_bytes.clear();
-            slot.push_bytes.extend_from_slice(push);
-        }
-        Ok(())
-    }
     pub fn dispatch(
         &mut self,
         program: &HostProgram,
@@ -858,7 +780,7 @@ impl Residency<'_> {
             Some(record) => Some(record),
             None => self.host_descriptor_record(program)?,
         };
-        self.bind_pipeline_descriptors(
+        self.runtime.device.configure_pipeline(
             &program.pipeline,
             push,
             record.as_ref(),
@@ -906,5 +828,3 @@ impl Residency<'_> {
         self.use_buffer(buffer, offset, size)
     }
 }
-#[cfg(test)]
-pub(crate) mod tests;

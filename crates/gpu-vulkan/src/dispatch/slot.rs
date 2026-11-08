@@ -2,12 +2,11 @@
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_command_pool.cpp
 use crate::{device::DeviceOwner, queue::progress::NativeFailure};
 use ash::vk;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 pub(crate) struct CommandSlot {
     pool: Arc<CommandPool>,
     first: usize,
-    descriptor_pools: Mutex<Vec<Arc<crate::cache::DescriptorPool>>>,
 }
 struct CommandPool {
     owner: Arc<DeviceOwner>,
@@ -20,18 +19,6 @@ struct Pool {
     commands: [vk::CommandBuffer; 4],
 }
 impl CommandSlot {
-    pub(super) fn retain_descriptor_pool(&self, pool: Arc<crate::cache::DescriptorPool>) {
-        self.descriptor_pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(pool);
-    }
-    pub(crate) fn retire_descriptor_pools(&self) {
-        self.descriptor_pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-    }
     pub fn owner(&self) -> &Arc<DeviceOwner> {
         &self.pool.owner
     }
@@ -48,7 +35,6 @@ impl CommandSlot {
             Arc::new(Self {
                 pool: Arc::clone(&pool),
                 first: index * 2,
-                descriptor_pools: Mutex::new(Vec::new()),
             })
         })
     }

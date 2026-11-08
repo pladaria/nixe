@@ -49,8 +49,6 @@ pub use residency::execution::{
     VertexBuffer,
 };
 
-pub mod vertex;
-
 mod native;
 pub mod presentation;
 pub use native::{

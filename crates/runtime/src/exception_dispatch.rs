@@ -11,6 +11,7 @@ use nixe_scheduler::{GuestThreadId, VirtualCpuId};
 use std::sync::Arc;
 
 use crate::ThreadObject;
+pub type DispatchFault = Box<dyn std::error::Error + Send + Sync>;
 
 /// Maximum number of guest bytes retained from a fatal break payload.
 pub const MAX_GUEST_BREAK_PAYLOAD_BYTES: usize = 32;
@@ -104,8 +105,6 @@ pub enum ExceptionTerminationReason {
 pub enum ExceptionDispatchOutcome<F> {
     /// Handling completed and guest execution may continue immediately.
     Resume(ExceptionResume),
-    /// The thread is suspended and retains an explicit eventual continuation.
-    Suspend(ExceptionResume),
     /// The guest-visible operation was rejected, but execution may continue.
     ///
     /// Platform policy must install its stable guest ABI result before
@@ -113,7 +112,7 @@ pub enum ExceptionDispatchOutcome<F> {
     /// reporting and is never copied into guest state by the generic runtime.
     /// The platform selects the host log level for the retained diagnostic.
     /// Rejection always continues after the exception-raising instruction;
-    /// operations that can retry must use [`Self::Suspend`] explicitly.
+    /// operations that retry retain their stack while the kernel waits.
     Reject { diagnostic: F, level: log::Level },
     /// The selected runtime object requested deterministic termination.
     Terminate {
@@ -129,7 +128,6 @@ impl<F> ExceptionDispatchOutcome<F> {
     pub fn map_fault<G>(self, map: impl FnOnce(F) -> G) -> ExceptionDispatchOutcome<G> {
         match self {
             Self::Resume(resume) => ExceptionDispatchOutcome::Resume(resume),
-            Self::Suspend(resume) => ExceptionDispatchOutcome::Suspend(resume),
             Self::Reject { diagnostic, level } => ExceptionDispatchOutcome::Reject {
                 diagnostic: map(diagnostic),
                 level,
@@ -156,8 +154,6 @@ impl<F> ExceptionDispatchOutcome<F> {
 pub enum ExceptionHandlingResult<F> {
     /// The continuation was installed and the process is runnable.
     Resumed,
-    /// The continuation was installed but an explicit later wakeup is needed.
-    Suspended,
     /// A stable result was returned through the guest ABI and execution may
     /// continue; the richer diagnostic remains available to the host.
     Rejected(F),
@@ -236,7 +232,6 @@ pub struct ExceptionDispatchContext<'a> {
     source: LocationDescriptor,
     process: &'a Arc<crate::RunnableProcess>,
     thread: ExceptionThreadContext<'a>,
-    completions: &'a Arc<crate::KernelQueue>,
     generation: u64,
 }
 
@@ -245,24 +240,18 @@ impl<'a> ExceptionDispatchContext<'a> {
         source: LocationDescriptor,
         process: &'a Arc<crate::RunnableProcess>,
         thread: ExceptionThreadContext<'a>,
-        completions: &'a Arc<crate::KernelQueue>,
         generation: u64,
     ) -> Self {
         Self {
             source,
             process,
             thread,
-            completions,
             generation,
         }
     }
 
     pub const fn generation(&self) -> u64 {
         self.generation
-    }
-
-    pub fn completion_queue(&self) -> &Arc<crate::KernelQueue> {
-        self.completions
     }
 
     /// Original instruction location, retained across owned kernel phases.
@@ -286,12 +275,130 @@ impl<'a> ExceptionDispatchContext<'a> {
     }
 }
 
+/// A producer makes the actual kernel thread runnable. Its suspended stack
+/// consumes the result on whichever physical core next selects it.
+struct FiberWake {
+    scheduler: std::sync::Weak<nixe_scheduler::SchedulerState>,
+    token: nixe_scheduler::WakeToken,
+    notified: std::sync::atomic::AtomicBool,
+}
+impl std::task::Wake for FiberWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notified
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            scheduler.wake_fiber(self.token);
+        }
+    }
+}
+impl ExceptionDispatchContext<'_> {
+    pub fn retain_request(&self) -> crate::KernelRequest {
+        crate::KernelRequest::new(self)
+    }
+    fn check_admission(&self) {
+        if self.process.generation() != self.generation {
+            crate::fiber::cancel_current();
+        }
+    }
+    /// Wait on real asynchronous backend work from the current kernel stack.
+    /// A ready operation returns inline. A pending operation parks the guest
+    /// fiber directly; there is no future/continuation owned by the core loop.
+    pub fn wait_future<F: std::future::Future + Send>(
+        &mut self,
+        future: F,
+        wait: Option<Arc<nixe_scheduler::KernelWait>>,
+    ) -> Result<F::Output, nixe_scheduler::SchedulerError> {
+        use std::sync::atomic::Ordering;
+        use std::task::{Context, Poll, Waker};
+        self.check_admission();
+        let mut future = std::pin::pin!(future);
+        if let Poll::Ready(result) = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            if wait.is_some() {
+                self.process
+                    .scheduler()
+                    .resume_kernel(crate::machine::core::current_lease())?;
+            }
+            self.check_admission();
+            return Ok(result);
+        }
+        let scheduler = self.process.scheduler().clone();
+        let wait = match wait {
+            Some(wait) => wait,
+            None => scheduler.register_wait(self.thread.id())?,
+        };
+        wait.commit();
+        let notified = Arc::new(FiberWake {
+            scheduler: Arc::downgrade(&scheduler),
+            token: wait.token(),
+            notified: std::sync::atomic::AtomicBool::new(false),
+        });
+        let waker = Waker::from(notified.clone());
+        loop {
+            self.check_admission();
+            notified.notified.store(false, Ordering::Release);
+            match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+                Poll::Ready(result) => {
+                    scheduler.resume_kernel(crate::machine::core::current_lease())?;
+                    self.check_admission();
+                    return Ok(result);
+                }
+                Poll::Pending => {
+                    scheduler.park_fiber(wait.token())?;
+                    if notified.notified.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    crate::fiber::suspend(
+                        self.thread.object,
+                        self.thread.state,
+                        nixe_scheduler::Completion::Waiting,
+                    );
+                    self.thread.vcpu = crate::machine::core::current_lease().vcpu;
+                }
+            }
+        }
+    }
+    pub fn wait_io<F: std::future::Future>(&mut self, future: F) -> F::Output {
+        crate::machine::core::wait_io(future)
+    }
+    pub fn wait_access(
+        &mut self,
+        mut access: nixe_memory::PendingAccess,
+    ) -> nixe_memory::AccessResultValue {
+        let mut observed: Option<std::task::Waker> = None;
+        self.wait_io(std::future::poll_fn(move |context| {
+            if observed
+                .as_ref()
+                .is_none_or(|old| !old.will_wake(context.waker()))
+            {
+                let waker = context.waker().clone();
+                observed = Some(waker.clone());
+                access.set_waker(Arc::new(move || waker.wake_by_ref()));
+            }
+            access
+                .poll()
+                .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+        }))
+    }
+}
+
 /// Runtime-owned architectural exception router.
 ///
 /// The borrowed context and associated fault type keep process/thread services
 /// and platform error policy explicit. A CPU backend only constructs the
 /// request and applies the returned control decision.
-pub trait ExceptionDispatcher: Send + Sync + 'static {
+///
+/// # Safety
+/// Dispatch runs on a guest fiber which can resume on another host thread after
+/// a kernel wait. All values retained on that stack across suspension must be
+/// `Send`. In particular, no thread-local borrow, native-core reference, or
+/// thread-affine lock guard may span a call that can suspend the guest fiber.
+pub unsafe trait ExceptionDispatcher: Send + Sync + 'static {
     type Fault: std::error::Error + Send + Sync + 'static;
 
     fn dispatch(

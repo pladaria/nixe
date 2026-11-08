@@ -122,35 +122,6 @@ impl VertexPositionTransform {
     }
 }
 
-/// Window-depth reconstruction for hosts whose viewport depth is limited to [0,1].
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct FragmentDepthTransform([u32; 4]);
-
-impl FragmentDepthTransform {
-    pub fn new(
-        scale: f32,
-        offset: f32,
-        minimum: f32,
-        maximum: f32,
-    ) -> Result<Self, CommandDescriptionError> {
-        if ![scale, offset, minimum, maximum]
-            .into_iter()
-            .all(f32::is_finite)
-            || minimum < 0.0
-            || maximum > 1.0
-            || minimum > maximum
-        {
-            return Err(CommandDescriptionError::InvalidFragmentDepthTransform);
-        }
-        Ok(Self([scale, offset, minimum, maximum].map(f32::to_bits)))
-    }
-
-    #[must_use]
-    pub fn coefficients(self) -> [f32; 4] {
-        self.0.map(f32::from_bits)
-    }
-}
-
 /// One fully specified direct draw dependency set.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum VertexStepMode {
@@ -396,7 +367,6 @@ pub enum CommandDescriptionError {
     CopySizeMismatch,
     ClearValueMismatch,
     NonFiniteClearValue,
-    InvalidFragmentDepthTransform,
     EmptyViewport,
     EmptyDraw,
     IndexBufferMismatch,
@@ -429,7 +399,6 @@ impl Display for CommandDescriptionError {
                 formatter.write_str("clear value does not match its resource kind")
             }
             Self::NonFiniteClearValue => formatter.write_str("clear value is not finite"),
-            Self::InvalidFragmentDepthTransform => formatter.write_str("fragment depth transform requires finite coefficients and ordered bounds inside [0,1]"),
 
             Self::EmptyViewport => formatter.write_str("viewport transform has an empty axis"),
             Self::EmptyDraw => formatter.write_str("draw has no vertices, indices, or instances"),

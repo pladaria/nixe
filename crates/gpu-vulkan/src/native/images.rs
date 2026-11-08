@@ -413,12 +413,11 @@ impl NativeExecution<'_> {
                     .runtime
                     .constructing
                     .push(Resource::Image(destination));
-                let pipeline = Arc::clone(
-                    &self.state.blit_pipelines[&self
-                        .residency
-                        .image_view_description(destination_view)?
-                        .format],
-                );
+                let pipeline = (self.state.blit_pipelines[&self
+                    .residency
+                    .image_view_description(destination_view)?
+                    .format])
+                    .clone();
                 self.residency.blit_color(
                     pipeline,
                     view,
@@ -428,7 +427,7 @@ impl NativeExecution<'_> {
                     rect(dst),
                     first,
                     step,
-                    Arc::clone(&self.state.blit_samplers[usize::from(linear)]),
+                    (self.state.blit_samplers[usize::from(linear)]).clone(),
                 )?;
                 return Ok(());
             }
@@ -518,104 +517,5 @@ fn sampler_border(
                 format: vk::Format::UNDEFINED,
             }),
         ),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::native::tests::support;
-    use crate::residency::tests::backing_allocation;
-
-    #[test]
-    fn cubemap_array_views_share_faces_with_single_cube_views() {
-        let Some(device) = support::device_for_test(ApiPreference::Auto) else {
-            return;
-        };
-        let validation = device.validation_monitor();
-        let mut execution = NativeGpuExecution::new(
-            nixe_memory::device_memory::DeviceMemory::new(
-                nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
-                34,
-            ),
-            device,
-            ShaderNamespace {
-                guest: *b"nixe-native-test",
-                isa: 1,
-            },
-            CacheConfiguration::default(),
-            8 * 1024 * 1024,
-        )
-        .unwrap();
-        let (_allocation, backing) =
-            backing_allocation(execution.residency.device_memory(), 4096, 0);
-        let guest = GuestImage {
-            description: nixe_gpu::ImageDescription::new(
-                ImageDimension::Cube,
-                nixe_gpu::ImageExtent::new(1, 1, 1).unwrap(),
-                F::Rgba8Unorm,
-                nixe_gpu::ImageKind::Color,
-                1,
-                12,
-                SampleCount::One,
-            )
-            .unwrap(),
-            swizzle: nixe_gpu::Swizzle::IDENTITY,
-
-            sample_grid: [1, 1],
-            planes: (0..12)
-                .map(|layer| GuestImagePlane {
-                    depth_slice: 0,
-                    mip_level: 0,
-                    array_layer: layer,
-                    aspect: nixe_gpu::native::GuestImageAspect::Color,
-                    footprint: crate::residency::tests::plane_geometry(
-                        backing.slice(u64::from(layer) * 4, 4).unwrap(),
-                        [1, 1],
-                        4,
-                        4,
-                    ),
-                    row_pitch: 4,
-                    bytes_per_block: 4,
-                })
-                .collect(),
-        };
-        let native = execution.execution().allocate_guest_image(&guest).unwrap();
-        let array = execution
-            .execution()
-            .sampled_view(native, guest.description, guest.swizzle, [0, 0], true)
-            .unwrap();
-        let cube = execution
-            .execution()
-            .sampled_view(native, guest.description, guest.swizzle, [0, 0], false)
-            .unwrap();
-        assert_ne!(array, cube);
-        assert_eq!(array.image, cube.image);
-        let before = execution.residency.statistics();
-        assert_eq!(
-            execution
-                .execution()
-                .sampled_view(native, guest.description, guest.swizzle, [0, 0], true)
-                .unwrap(),
-            array
-        );
-        assert_eq!(
-            execution
-                .execution()
-                .sampled_view(native, guest.description, guest.swizzle, [0, 0], false)
-                .unwrap(),
-            cube
-        );
-        assert_eq!(
-            execution.residency.statistics().image_allocations,
-            before.image_allocations
-        );
-        assert_eq!(
-            execution.residency.statistics().image_view_allocations,
-            before.image_view_allocations
-        );
-        execution.teardown().unwrap();
-        drop(execution);
-        validation.check().unwrap();
     }
 }

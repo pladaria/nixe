@@ -1,12 +1,9 @@
-//! Reflected set-zero ABI. Shared layouts are created on changed-state/miss paths.
+//! Pipeline-owned set-zero ABI. Each admitted pipeline constructs its layout,
+//! as DescriptorLayoutBuilder; there is no separate layout lookup or LRU.
 use super::*;
 use crate::{VulkanDevice, VulkanError, device::DeviceOwner};
 use ash::vk;
-use rustc_hash::FxHashMap as HashMap;
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::Arc};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct LayoutBinding {
     pub binding: u32,
@@ -263,20 +260,14 @@ impl Drop for PipelineLayout {
         }
     }
 }
-struct LayoutState {
-    entries: HashMap<(LayoutKey, vk::PipelineBindPoint), (Arc<PipelineLayout>, u64)>,
-    clock: u64,
-}
-pub(super) struct LayoutCache {
+pub(super) struct LayoutBuilder {
     owner: Arc<DeviceOwner>,
     limits: vk::PhysicalDeviceLimits,
     max_push_descriptors: u32,
     sets_per_pool: usize,
-    entries: usize,
-    state: Mutex<LayoutState>,
 }
-impl LayoutCache {
-    pub fn new(device: &VulkanDevice, entries: usize) -> Self {
+impl LayoutBuilder {
+    pub fn new(device: &VulkanDevice) -> Self {
         Self {
             owner: Arc::clone(&device.owner),
             limits: device.profile().limits,
@@ -292,24 +283,19 @@ impl LayoutCache {
             } else {
                 0
             },
-            entries,
-            state: Mutex::new(LayoutState {
-                entries: HashMap::default(),
-                clock: 0,
-            }),
         }
     }
-    pub fn get(&self, key: LayoutKey) -> Result<Arc<PipelineLayout>, VulkanError> {
-        self.get_layout(key, None)
+    pub fn create(&self, key: LayoutKey) -> Result<Arc<PipelineLayout>, VulkanError> {
+        self.create_layout(key, None)
     }
-    pub fn get_guest(
+    pub fn create_guest(
         &self,
         key: LayoutKey,
         point: vk::PipelineBindPoint,
     ) -> Result<Arc<PipelineLayout>, VulkanError> {
-        self.get_layout(key, Some(point))
+        self.create_layout(key, Some(point))
     }
-    fn get_layout(
+    fn create_layout(
         &self,
         mut key: LayoutKey,
         point: Option<vk::PipelineBindPoint>,
@@ -335,15 +321,6 @@ impl LayoutCache {
                 self.limits.max_descriptor_set_uniform_buffers_dynamic,
             )?;
         }
-        let mut state = self.state.lock().unwrap();
-        state.clock = state.clock.wrapping_add(1);
-        let clock = state.clock;
-        let cache_key = (key, point);
-        if let Some((layout, touched)) = state.entries.get_mut(&cache_key) {
-            *touched = clock;
-            return Ok(Arc::clone(layout));
-        }
-        let key = cache_key.0;
         if key.push_bytes > self.limits.max_push_constants_size || !key.push_bytes.is_multiple_of(4)
         {
             return Err(VulkanError::InvalidResource(
@@ -508,23 +485,7 @@ impl LayoutCache {
             }
             .map_err(|e| VulkanError::vk("native descriptor update template", e))?;
         }
-        // Eviction drops only cache ownership; actual pipelines/batches retain
-        // their layouts. One LRU victim avoids whole-cache churn under pressure.
         let layout = Arc::new(layout);
-        if self.entries != 0 {
-            if state.entries.len() >= self.entries {
-                let key = state
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, (_, tick))| *tick)
-                    .map(|(key, _)| key.clone())
-                    .unwrap();
-                state.entries.remove(&key);
-            }
-            state
-                .entries
-                .insert((layout.key.clone(), point), (Arc::clone(&layout), clock));
-        }
         Ok(layout)
     }
 }

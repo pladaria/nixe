@@ -15,7 +15,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
             native_memory,
             device,
-            nixe_gpu_maxwell::MAXWELL_SHADER_NAMESPACE,
             nixe_gpu_vulkan::cache::CacheConfiguration::default(),
             128 * 1024 * 1024,
         )

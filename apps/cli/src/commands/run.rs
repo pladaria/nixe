@@ -293,24 +293,20 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         );
         let device_memory =
             nixe_gpu_maxwell::MaxwellDeviceMemory::new(process.memory().space().machine().clone());
+        let cache_directory = config
+            .gpu
+            .cache_directory
+            .join(title.identifier.to_string().to_ascii_lowercase());
         let cache_configuration = nixe_gpu_vulkan::cache::CacheConfiguration {
-            directory: Some(config.gpu.cache_directory.clone()),
-            shader_entries: config.gpu.shader_entries,
-            pipeline_entries: config.gpu.pipeline_entries,
-            persistent_bytes: config.gpu.persistent_bytes,
+            directory: Some(cache_directory.clone()),
             ..Default::default()
         };
-        let capture_directory = config.gpu.cache_directory.clone();
-        let pipeline_namespace = nixe_gpu::shader_identity::ContentId::of(
-            b"nixe-application-pipelines",
-            &[title.identifier.to_string().as_bytes()],
-        );
-        let persistent_bytes = config.gpu.persistent_bytes;
+        let cache_load_stop = Arc::clone(&frontend_stop_requested);
         let maxwell = move |renderer: std::rc::Rc<
             std::cell::RefCell<Option<nixe_gpu_vulkan::NativeGpuExecution>>,
         >| {
             let mut frontend = nixe_gpu_vulkan::MaxwellVulkanRasterizer::new(renderer);
-            frontend.set_capture_cache(&capture_directory, pipeline_namespace, persistent_bytes);
+            frontend.load_disk_resources(&cache_directory, &cache_load_stop);
             frontend
         };
         let native_memory = device_memory.device().clone();
@@ -319,7 +315,6 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
             let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
                 native_memory,
                 device,
-                nixe_gpu_maxwell::MAXWELL_SHADER_NAMESPACE,
                 cache_configuration,
                 u64::MAX, // Residency derives headroom from the device heap budget.
             )

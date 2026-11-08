@@ -158,7 +158,7 @@ impl Residency<'_> {
     }
     pub(crate) fn graphics_state(
         &mut self,
-        pipeline: &Arc<NativePipeline>,
+        pipeline: &NativePipeline,
         p: &GraphicsParameters,
     ) -> Result<(), VulkanError> {
         let index = self.runtime.device.recording_slot()?;

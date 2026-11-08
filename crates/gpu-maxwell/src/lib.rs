@@ -18,7 +18,6 @@ mod pushbuffer;
 mod scheduler;
 mod shader;
 mod shader_stage;
-pub use shader::recompiler::MAXWELL_SHADER_NAMESPACE;
 
 pub use address_space::{
     MAX_MAPPING_DUMP_ENTRIES, MaxwellAddressSpaceError, MaxwellAddressSpaceId,

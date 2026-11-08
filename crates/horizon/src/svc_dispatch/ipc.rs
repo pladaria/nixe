@@ -1,185 +1,72 @@
 use super::*;
 
-#[derive(Clone, Copy)]
-enum MessagePart {
-    Header,
-    Special,
-    Data,
-}
-
-// Capture the emitted message, as MessageBuffer's raw-data extent does.
-// Receive lists belong to the destination and are not emitted source data.
-// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_session.cpp#L584-L615
-struct MessageRead {
-    machine: nixe_memory::Machine,
-    ranges: nixe_memory::CapturedMemory,
-    header: [u8; 12],
-    bytes: Vec<u8>,
-    part: MessagePart,
-    pending: Option<nixe_memory::PendingAccess>,
-    immediate: u32,
-}
-impl MessageRead {
-    fn prefix(&self) -> usize {
-        if u32::from_le_bytes(self.header[4..8].try_into().unwrap()) >> 31 != 0 {
-            12
-        } else {
-            8
-        }
-    }
-    fn read(&mut self) -> Result<nixe_memory::Access<()>, nixe_memory::MemoryError> {
-        match self.part {
-            MessagePart::Header => {
-                self.machine
-                    .read_captured_into(&self.ranges, 0, &mut self.header[..8])
-            }
-            MessagePart::Special => {
-                self.machine
-                    .read_captured_into(&self.ranges, 8, &mut self.header[8..])
-            }
-            MessagePart::Data => {
-                let prefix = self.prefix();
-                self.machine.read_captured_into(
-                    &self.ranges,
-                    prefix as u64,
-                    &mut self.bytes[prefix..],
-                )
-            }
-        }
-    }
-    fn accept(&mut self, bytes: &[u8]) {
-        match self.part {
-            MessagePart::Header => self.header[..8].copy_from_slice(bytes),
-            MessagePart::Special => self.header[8..].copy_from_slice(bytes),
-            MessagePart::Data => {
-                let prefix = self.prefix();
-                self.bytes[prefix..].copy_from_slice(bytes);
-            }
-        }
-    }
-    fn advance(&mut self) -> Result<bool, HorizonKernelResult> {
-        match self.part {
-            MessagePart::Header if self.prefix() == 12 => {
-                self.part = MessagePart::Special;
-                Ok(false)
-            }
-            MessagePart::Header | MessagePart::Special => {
-                let prefix = self.prefix();
-                let size = HipcHeader::decode(&self.header[..prefix])
-                    .and_then(|header| header.message_size(self.ranges.bytes() as usize))
-                    .map_err(|_| HorizonKernelResult::INVALID_COMBINATION)?;
-                self.bytes = vec![0; size];
-                self.bytes[..prefix].copy_from_slice(&self.header[..prefix]);
-                self.part = MessagePart::Data;
-                Ok(size == prefix)
-            }
-            MessagePart::Data => Ok(true),
-        }
-    }
-}
-
-impl std::future::Future for MessageRead {
-    type Output = Result<Result<Vec<u8>, HorizonKernelResult>, HorizonSvcFault>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        use std::{future::Future, pin::Pin, task::Poll};
-        let message = self.get_mut();
-        loop {
-            if let Some(pending) = message.pending.as_mut() {
-                let result = match Future::poll(Pin::new(pending), context) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => result,
-                };
-                message.pending = None;
-                match result {
-                    Ok(nixe_memory::AccessResult::Read(bytes)) => message.accept(&bytes),
-                    Ok(_) => return Poll::Ready(Err(runtime_fault("IPC input read completion"))),
-                    Err(fault) => {
-                        return Poll::Ready(Err(HorizonSvcFault::MemoryAccess {
-                            immediate: message.immediate,
-                            fault,
-                        }));
-                    }
-                }
-            } else {
-                match message.read() {
-                    Ok(nixe_memory::Access::Ready(())) => {}
-                    Ok(nixe_memory::Access::Pending(pending)) => {
-                        message.pending = Some(pending);
-                        continue;
-                    }
-                    Err(fault) => {
-                        return Poll::Ready(Err(HorizonSvcFault::MemoryAccess {
-                            immediate: message.immediate,
-                            fault: std::sync::Arc::new(fault),
-                        }));
-                    }
-                }
-            }
-            match message.advance() {
-                Ok(true) => {
-                    return Poll::Ready(Ok(Ok(std::mem::take(&mut message.bytes))));
-                }
-                Ok(false) => {}
-                Err(code) => return Poll::Ready(Ok(Err(code))),
-            }
-        }
-    }
-}
-
+// Capture exactly the emitted HIPC extent, excluding destination receive lists.
+// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/kernel/k_server_session.cpp
 impl HorizonSvcDispatcher {
     pub(super) fn read_svc_message(
-        self: &std::sync::Arc<Self>,
+        &self,
         context: &mut ExceptionDispatchContext<'_>,
         immediate: u32,
         ranges: Vec<nixe_memory::AllocationRange>,
-        continuation: impl FnOnce(
-            &std::sync::Arc<Self>,
-            &mut ExceptionDispatchContext<'_>,
-            Result<Vec<u8>, HorizonKernelResult>,
-        ) -> ExceptionDispatchOutcome<HorizonSvcFault>
-        + Send
-        + 'static,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let ranges = match nixe_memory::CapturedMemory::new(ranges) {
-            Ok(ranges) => ranges,
-            Err(error) => {
-                return reject(
-                    context,
-                    HorizonSvcFault::MemoryAccess {
-                        immediate,
-                        fault: std::sync::Arc::new(error),
-                    },
-                );
+    ) -> Result<Result<Vec<u8>, HorizonKernelResult>, HorizonSvcFault> {
+        let ranges = nixe_memory::CapturedMemory::new(ranges).map_err(|fault| {
+            HorizonSvcFault::MemoryAccess {
+                immediate,
+                fault: std::sync::Arc::new(fault),
             }
+        })?;
+        let machine = context.process().memory().account().machine().clone();
+        let mut header = [0; 12];
+        read_message_bytes(context, immediate, &machine, &ranges, 0, &mut header[..8])?;
+        let prefix = if u32::from_le_bytes(header[4..8].try_into().unwrap()) >> 31 != 0 {
+            read_message_bytes(context, immediate, &machine, &ranges, 8, &mut header[8..])?;
+            12
+        } else {
+            8
         };
-        let mut message = MessageRead {
-            machine: context.process().memory().account().machine().clone(),
-            ranges,
-            header: [0; 12],
-            bytes: Vec::new(),
-            part: MessagePart::Header,
-            pending: None,
+        let size = match HipcHeader::decode(&header[..prefix])
+            .and_then(|header| header.message_size(ranges.bytes() as usize))
+        {
+            Ok(size) => size,
+            Err(_) => return Ok(Err(HorizonKernelResult::INVALID_COMBINATION)),
+        };
+        let mut bytes = vec![0; size];
+        bytes[..prefix].copy_from_slice(&header[..prefix]);
+        if size != prefix {
+            read_message_bytes(
+                context,
+                immediate,
+                &machine,
+                &ranges,
+                prefix as u64,
+                &mut bytes[prefix..],
+            )?;
+        }
+        Ok(Ok(bytes))
+    }
+}
+fn read_message_bytes(
+    context: &mut ExceptionDispatchContext<'_>,
+    immediate: u32,
+    machine: &nixe_memory::Machine,
+    ranges: &nixe_memory::CapturedMemory,
+    offset: u64,
+    bytes: &mut [u8],
+) -> Result<(), HorizonSvcFault> {
+    match machine
+        .read_captured_into(ranges, offset, bytes)
+        .map_err(|fault| HorizonSvcFault::MemoryAccess {
             immediate,
-        };
-        // MessageRead is Unpin: ready RAM completes on this stack, and an
-        // actual dependency moves the same owned operation into the kernel wait.
-        match std::future::Future::poll(
-            std::pin::Pin::new(&mut message),
-            &mut std::task::Context::from_waker(std::task::Waker::noop()),
-        ) {
-            std::task::Poll::Ready(Ok(bytes)) => continuation(self, context, bytes),
-            std::task::Poll::Ready(Err(fault)) => reject(context, fault),
-            std::task::Poll::Pending => {
-                self.start_owned_svc(context, std::sync::Arc::default(), None, async move {
-                    let bytes = message.await?;
-                    Ok(memory_wait::SvcCompletion::kernel(
-                        move |dispatcher, context| continuation(dispatcher, context, bytes),
-                    ))
-                })
+            fault: std::sync::Arc::new(fault),
+        })? {
+        nixe_memory::Access::Ready(()) => Ok(()),
+        nixe_memory::Access::Pending(access) => {
+            match super::access::wait_access(context, immediate, access)? {
+                nixe_memory::AccessResult::Read(data) if data.len() == bytes.len() => {
+                    bytes.copy_from_slice(&data);
+                    Ok(())
+                }
+                _ => Err(runtime_fault("IPC input read completion")),
             }
         }
     }
@@ -248,32 +135,34 @@ impl HorizonSvcDispatcher {
         mut name: Vec<u8>,
         operation: NamedPortOperation,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        self.read_svc_input(
-            context,
-            operation.immediate(),
-            address,
-            1,
-            move |dispatcher, context, bytes| {
-                if bytes[0] == 0 {
-                    return match operation {
-                        NamedPortOperation::Connect => dispatcher.connect_named_port(context, name),
-                        NamedPortOperation::Manage(maximum) => {
-                            dispatcher.manage_port(context, name, maximum)
-                        }
+        match self.read_svc_input(context, operation.immediate(), address, 1) {
+            Ok(bytes) => {
+                let dispatcher = self;
+                {
+                    if bytes[0] == 0 {
+                        return match operation {
+                            NamedPortOperation::Connect => {
+                                dispatcher.connect_named_port(context, name)
+                            }
+                            NamedPortOperation::Manage(maximum) => {
+                                dispatcher.manage_port(context, name, maximum)
+                            }
+                        };
+                    }
+                    name.push(bytes[0]);
+                    if name.len() == crate::ipc_wire::NAMED_PORT_NAME_SIZE {
+                        result(context, HorizonKernelResult::OUT_OF_RANGE);
+                        return resume();
+                    }
+                    let Some(address) = address.checked_add(1) else {
+                        result(context, HorizonKernelResult::INVALID_ADDRESS);
+                        return resume();
                     };
+                    dispatcher.read_named_port_name(context, address, name, operation)
                 }
-                name.push(bytes[0]);
-                if name.len() == crate::ipc_wire::NAMED_PORT_NAME_SIZE {
-                    result(context, HorizonKernelResult::OUT_OF_RANGE);
-                    return resume();
-                }
-                let Some(address) = address.checked_add(1) else {
-                    result(context, HorizonKernelResult::INVALID_ADDRESS);
-                    return resume();
-                };
-                dispatcher.read_named_port_name(context, address, name, operation)
-            },
-        )
+            }
+            Err(fault) => reject(context, fault),
+        }
     }
     fn connect_named_port(
         self: &std::sync::Arc<Self>,
@@ -456,8 +345,12 @@ impl HorizonSvcDispatcher {
             Err(error) => return ipc_fault(immediate, error),
         };
         let resources = self.resources.clone();
-        self.start_owned_svc(context, request.lifetime().clone(), None, async move {
-            let result = async move {
+        {
+            let completed = (|| {
+                let fault = |error| HorizonSvcFault::Ipc {
+                    immediate,
+                    fault: Box::new(HorizonIpcFault::from_wire(error)),
+                };
                 let capture = nixe_memory::trace::span(
                     "ipc_capture",
                     request.thread_id(),
@@ -474,51 +367,56 @@ impl HorizonSvcDispatcher {
                         Ok::<_, IpcWireError>(command)
                     };
                     let mut prepare = std::pin::pin!(prepare);
-                    std::future::poll_fn(|cx| {
-                        use std::{future::Future, task::Poll};
-                        // Consume a completed capture failure before cancellation.
-                        if let Poll::Ready(prepared) = prepare.as_mut().poll(cx) {
-                            return Poll::Ready(Ok(prepared));
-                        }
-                        std::pin::Pin::new(&mut response).poll(cx).map(Err)
-                    })
-                    .await
+                    super::access::wait_future(
+                        context,
+                        std::future::poll_fn(|cx| {
+                            use std::{future::Future, task::Poll};
+                            if let Poll::Ready(prepared) = prepare.as_mut().poll(cx) {
+                                return Poll::Ready(Ok(prepared));
+                            }
+                            std::pin::Pin::new(&mut response).poll(cx).map(Err)
+                        }),
+                        None,
+                    )?
                 };
                 let command = match preparation {
-                    Ok(command) => command?,
-                    Err(reply) => return reply,
+                    Ok(command) => command.map_err(fault)?,
+                    Err(reply) => return reply.map_err(fault),
                 };
                 drop(capture);
                 let owner = session.clone();
-                response.start(async move {
-                    let result = crate::ipc_wire::execute_request(
-                        &mut request,
-                        handle,
-                        &resources,
-                        &command,
-                        owner.object(),
-                    )
-                    .await;
-                    owner.recycle_command(command.into_bytes());
-                    result
-                })?;
-                response.await
-            }
-            .await
-            .map_err(|error| HorizonSvcFault::Ipc {
-                immediate,
-                fault: Box::new(HorizonIpcFault::from_wire(error)),
-            })?;
-            match result {
-                SyncRequestResult::Success => Ok(super::memory_wait::SvcCompletion::success(None)),
-                SyncRequestResult::AppletExitRequested => {
-                    Ok(super::memory_wait::SvcCompletion::ExitProcess)
+                // The actual service owner retains and drains its accepted work,
+                // independently of the suspended caller's kernel stack.
+                response
+                    .start(async move {
+                        let result = crate::ipc_wire::execute_request(
+                            &mut request,
+                            handle,
+                            &resources,
+                            &command,
+                            owner.object(),
+                        )
+                        .await;
+                        owner.recycle_command(command.into_bytes());
+                        result
+                    })
+                    .map_err(fault)?;
+                super::access::wait_future(context, response, None)?.map_err(fault)
+            })();
+            match completed {
+                Ok(SyncRequestResult::Success) => {
+                    result(context, HorizonKernelResult::SUCCESS);
+                    resume()
                 }
-                SyncRequestResult::SessionClosed => Err(runtime_fault(
-                    "service close result was not consumed by its server",
-                )),
+                Ok(SyncRequestResult::AppletExitRequested) => {
+                    terminate(ExceptionTerminationScope::Process)
+                }
+                Ok(SyncRequestResult::SessionClosed) => ExceptionDispatchOutcome::Fault(
+                    runtime_fault("service close result was not consumed by its server"),
+                ),
+                Err(fault) => reject(context, fault),
             }
-        })
+        }
     }
 }
 
@@ -555,7 +453,7 @@ impl HorizonSvcDispatcher {
             .session
             .request(request.owner, SessionMessage::Light(words))
         {
-            Ok(()) => self.poll_session_request(context, request),
+            Ok(()) => self.receive_session_response(context, request),
             Err(error) => session_error(context, error),
         }
     }
@@ -595,46 +493,43 @@ impl HorizonSvcDispatcher {
             size,
             immediate,
         };
-        self.read_svc_message(
-            context,
-            immediate,
-            ranges,
-            move |dispatcher, context, bytes| {
-                let bytes = match bytes {
-                    Ok(bytes) => bytes,
-                    Err(code) => {
-                        result(context, code);
-                        return resume();
+        match self.read_svc_message(context, immediate, ranges) {
+            Ok(bytes) => {
+                let dispatcher = self;
+                {
+                    let bytes = match bytes {
+                        Ok(bytes) => bytes,
+                        Err(code) => {
+                            result(context, code);
+                            return resume();
+                        }
+                    };
+                    let message = match capture_message_handles(context, bytes, false) {
+                        Ok(message) => message,
+                        Err(code) => {
+                            result(context, code);
+                            return resume();
+                        }
+                    };
+                    match request.session.request(request.owner, message) {
+                        Ok(()) => dispatcher.receive_session_response(context, request),
+                        Err(error) => session_error(context, error),
                     }
-                };
-                let message = match capture_message_handles(context, bytes, false) {
-                    Ok(message) => message,
-                    Err(code) => {
-                        result(context, code);
-                        return resume();
-                    }
-                };
-                match request.session.request(request.owner, message) {
-                    Ok(()) => dispatcher.poll_session_request(context, request),
-                    Err(error) => session_error(context, error),
                 }
-            },
-        )
+            }
+            Err(fault) => reject(context, fault),
+        }
     }
-    fn poll_session_request(
+    fn receive_session_response(
         self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         request: KernelSessionRequest,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        self.start_owned_svc(context, std::sync::Arc::default(), None, async move {
-            let response = request.session.response(request.owner).await;
-            Ok(memory_wait::SvcCompletion::kernel(
-                move |dispatcher, context| match response {
-                    Ok(response) => dispatcher.finish_session_response(context, request, response),
-                    Err(error) => session_error(context, error),
-                },
-            ))
-        })
+        match super::access::wait_future(context, request.session.response(request.owner), None) {
+            Ok(Ok(response)) => self.finish_session_response(context, request, response),
+            Ok(Err(error)) => session_error(context, error),
+            Err(fault) => reject(context, fault),
+        }
     }
 
     fn finish_session_response(
@@ -695,7 +590,7 @@ pub(super) fn capture_message_handles(
     mut bytes: Vec<u8>,
     allow_move_handles: bool,
 ) -> Result<SessionMessage, HorizonKernelResult> {
-    // MessageRead already validated and captured the emitted extent. Plain
+    // The source read already validated and captured the emitted extent. Plain
     // messages need no further header decoding before queueing or delivery.
     if bytes[7] & 0x80 == 0 {
         return Ok(SessionMessage::Buffer(bytes));
@@ -842,11 +737,8 @@ impl HorizonSvcDispatcher {
                 resume()
             }
             Ok(nixe_memory::Access::Pending(access)) => {
-                self.start_owned_svc(context, std::sync::Arc::default(), None, async move {
-                    match access
-                        .await
-                        .map_err(|fault| HorizonSvcFault::MemoryAccess { immediate, fault })?
-                    {
+                let completed = (|| {
+                    match super::access::wait_access(context, immediate, access)? {
                         nixe_memory::AccessResult::Written(_) => {}
                         _ => return Err(runtime_fault("received IPC write completion")),
                     }
@@ -859,8 +751,9 @@ impl HorizonSvcDispatcher {
                             ))),
                         })?;
                     message.complete_receive();
-                    Ok(super::memory_wait::SvcCompletion::success(output1))
-                })
+                    Ok((HorizonKernelResult::SUCCESS, output1))
+                })();
+                super::access::finish(context, completed)
             }
         }
     }

@@ -22,6 +22,12 @@ pub enum SwapchainMaintenance {
     Ext,
 }
 
+// Eden Device selects the shader conversion path for the proprietary Qualcomm driver.
+// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/vulkan_common/vulkan_device.cpp#L522-L526
+const fn emulates_scaled_formats(driver: vk::DriverId) -> bool {
+    driver.as_raw() == vk::DriverId::QUALCOMM_PROPRIETARY.as_raw()
+}
+
 #[derive(Debug)]
 pub struct DeviceProfile {
     pub shader_compiler: nixe_gpu::shader_compilation::Configuration,
@@ -30,12 +36,13 @@ pub struct DeviceProfile {
     pub api_version: u32,
     pub api_path: ApiPath,
     pub driver_version: u32,
+    pub driver_id: vk::DriverId,
     pub vendor_id: u32,
     pub device_id: u32,
     pub device_uuid: [u8; 16],
     pub pipeline_cache_uuid: [u8; 16],
     pub pipeline_creation_feedback: bool,
-    pub pipeline_creation_cache_control: bool,
+    pub emulate_scaled_formats: bool,
     pub limits: vk::PhysicalDeviceLimits,
     pub core: vk::PhysicalDeviceFeatures,
     pub formats: [vk::FormatProperties; 185],
@@ -43,9 +50,6 @@ pub struct DeviceProfile {
     pub float_controls: FloatControls,
     pub subgroup: SubgroupSupport,
     pub dynamic_state: DynamicStateSupport,
-    pub graphics_pipeline_library: bool,
-    pub graphics_pipeline_library_fast_linking: bool,
-    pub graphics_pipeline_library_independent_interpolation: bool,
     pub descriptor_indexing: bool,
     pub runtime_descriptor_array: bool,
     pub buffer_device_address: bool,
@@ -62,6 +66,7 @@ pub struct DeviceProfile {
     pub index_uint8: bool,
     pub primitive_restart: [bool; 2], // list, patch list
     pub fill_rectangle: bool,
+    pub depth_range_unrestricted: bool,
     pub custom_border_color: bool,
     pub custom_border_color_without_format: bool,
     pub sampler_filter_minmax: bool,
@@ -212,7 +217,7 @@ pub(crate) fn baseline_missing(
 macro_rules! optional_features {
     ($($field:ident: $ty:ty => $name:expr),+ $(,)?) => {
         #[derive(Default)]
-        struct FeatureChains { subgroup: bool, cache_control:bool, $($field: bool,)+ }
+        struct FeatureChains { subgroup: bool, $($field: bool,)+ }
         #[derive(Default)]
         pub(crate) struct FeatureSet {
             chains: FeatureChains,
@@ -221,7 +226,6 @@ macro_rules! optional_features {
             pub v12: vk::PhysicalDeviceVulkan12Features<'static>,
             pub sync: vk::PhysicalDeviceSynchronization2Features<'static>,
             pub subgroup: vk::PhysicalDeviceSubgroupSizeControlFeatures<'static>,
-            pub cache_control:vk::PhysicalDevicePipelineCreationCacheControlFeatures<'static>,
             $(pub $field: $ty,)+
             pub names: Vec<&'static CStr>,
         }
@@ -241,13 +245,6 @@ macro_rules! optional_features {
                     result.chains.$field = true;
                     query = query.push_next(&mut result.$field);
                 })+
-                // The optional feature was promoted into Vulkan 1.3. A driver
-                // need not advertise the old extension to expose/enable it.
-                if version >= vk::API_VERSION_1_3 || ext.contains(ash::ext::pipeline_creation_cache_control::NAME) {
-                    if version < vk::API_VERSION_1_3 {result.names.push(ash::ext::pipeline_creation_cache_control::NAME);}
-                    result.chains.cache_control = true;
-                    query = query.push_next(&mut result.cache_control);
-                }
                 // SAFETY: all structures live until this synchronous query returns;
                 // each is defined by the supported API version or queried extension.
                 unsafe { instance.get_physical_device_features2(physical, &mut query); }
@@ -256,7 +253,6 @@ macro_rules! optional_features {
                 result.v11.p_next = std::ptr::null_mut();
                 result.sync.p_next = std::ptr::null_mut();
                 result.subgroup.p_next = std::ptr::null_mut();
-                result.cache_control.p_next=std::ptr::null_mut();
                 $(result.$field.p_next = std::ptr::null_mut();)+
                 result
             }
@@ -264,7 +260,6 @@ macro_rules! optional_features {
                 let mut info = vk::DeviceCreateInfo::default().enabled_features(&self.core)
                     .push_next(&mut self.v11).push_next(&mut self.v12).push_next(&mut self.sync);
                 if self.chains.subgroup { info = info.push_next(&mut self.subgroup); }
-                if self.chains.cache_control {info=info.push_next(&mut self.cache_control);}
                 $(if self.chains.$field { info = info.push_next(&mut self.$field); })+
                 info
             }
@@ -291,7 +286,6 @@ optional_features! {
     state3: vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT<'static> => fixed!(ash::ext::extended_dynamic_state3::NAME),
     vertex_divisor: vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT<'static> => fixed!(ash::ext::vertex_attribute_divisor::NAME),
     vertex_input: vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT<'static> => fixed!(ash::ext::vertex_input_dynamic_state::NAME),
-    gpl: vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT<'static> => fixed!(ash::ext::graphics_pipeline_library::NAME),
     descriptors: vk::PhysicalDeviceDescriptorBufferFeaturesEXT<'static> => fixed!(ash::ext::descriptor_buffer::NAME),
     objects: vk::PhysicalDeviceShaderObjectFeaturesEXT<'static> => fixed!(ash::ext::shader_object::NAME),
     feedback: vk::PhysicalDeviceTransformFeedbackFeaturesEXT<'static> => fixed!(ash::ext::transform_feedback::NAME),
@@ -317,24 +311,14 @@ impl FeatureSet {
         if version < vk::API_VERSION_1_3 {
             self.names.push(ash::khr::synchronization2::NAME);
         }
-        if self
-            .names
-            .contains(&ash::ext::graphics_pipeline_library::NAME)
-        {
-            if ext.contains(ash::khr::pipeline_library::NAME) {
-                self.names.push(ash::khr::pipeline_library::NAME);
-            } else {
-                self.names
-                    .retain(|n| *n != ash::ext::graphics_pipeline_library::NAME);
-                self.gpl.graphics_pipeline_library = vk::FALSE;
-                self.chains.gpl = false;
-            }
-        }
         if self.v12.buffer_device_address == vk::FALSE {
             self.names
                 .retain(|n| *n != ash::ext::descriptor_buffer::NAME);
             self.descriptors = Default::default();
             self.chains.descriptors = false;
+        }
+        if ext.contains(ash::ext::depth_range_unrestricted::NAME) {
+            self.names.push(ash::ext::depth_range_unrestricted::NAME);
         }
         if ext.contains(ash::nv::fill_rectangle::NAME) {
             self.names.push(ash::nv::fill_rectangle::NAME);
@@ -453,7 +437,6 @@ impl FeatureSet {
         let mut id = vk::PhysicalDeviceIDProperties::default();
         let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
         let mut subgroup_control = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
-        let mut gpl = vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
         let mut descriptors = vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
         let mut push = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
         let mut vertex_divisor = vk::PhysicalDeviceVertexAttributeDivisorPropertiesEXT::default();
@@ -464,12 +447,6 @@ impl FeatureSet {
             .push_next(&mut subgroup);
         if self.chains.subgroup {
             props = props.push_next(&mut subgroup_control);
-        }
-        if self
-            .names
-            .contains(&ash::ext::graphics_pipeline_library::NAME)
-        {
-            props = props.push_next(&mut gpl);
         }
         if self.names.contains(&ash::ext::descriptor_buffer::NAME) {
             props = props.push_next(&mut descriptors);
@@ -506,6 +483,8 @@ impl FeatureSet {
             } else {
                 ApiPath::Khr12
             },
+            emulate_scaled_formats: emulates_scaled_formats(driver.driver_id),
+            driver_id: driver.driver_id,
             driver_version: properties.driver_version,
             vendor_id: properties.vendor_id,
             device_id: properties.device_id,
@@ -515,8 +494,6 @@ impl FeatureSet {
                 || self
                     .names
                     .contains(&ash::ext::pipeline_creation_feedback::NAME),
-            pipeline_creation_cache_control: self.cache_control.pipeline_creation_cache_control
-                != 0,
             limits: properties.limits,
             core: self.core,
             // Eden Device owns immutable native format capabilities. Query
@@ -610,11 +587,6 @@ impl FeatureSet {
                 color_blend_equation: self.state3.extended_dynamic_state3_color_blend_equation != 0,
                 color_write_mask: self.state3.extended_dynamic_state3_color_write_mask != 0,
             },
-            graphics_pipeline_library: self.gpl.graphics_pipeline_library != 0,
-            graphics_pipeline_library_fast_linking: gpl.graphics_pipeline_library_fast_linking != 0,
-            graphics_pipeline_library_independent_interpolation: gpl
-                .graphics_pipeline_library_independent_interpolation_decoration
-                != 0,
             descriptor_indexing: self.v12.descriptor_indexing != 0,
             runtime_descriptor_array: self.v12.runtime_descriptor_array != 0,
             buffer_device_address: self.v12.buffer_device_address != 0,
@@ -637,6 +609,9 @@ impl FeatureSet {
                 self.list_restart.primitive_topology_patch_list_restart != 0,
             ],
             fill_rectangle: self.names.contains(&ash::nv::fill_rectangle::NAME),
+            depth_range_unrestricted: self
+                .names
+                .contains(&ash::ext::depth_range_unrestricted::NAME),
             custom_border_color: self.custom_border.custom_border_colors != 0,
             custom_border_color_without_format: self
                 .custom_border

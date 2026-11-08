@@ -1,115 +1,106 @@
-//! Per-worker VkPipelineCache objects: compilation never shares an unsynchronized
-//! cache or serializes all workers on one driver lock. Checkpoint is explicit.
-use super::{CacheConfiguration, CompileError, persistent};
+//! One driver pipeline cache shared by all construction workers for this title.
+//! Vulkan internally synchronizes caches created without EXTERNALLY_SYNCHRONIZED.
+//! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp#L1047-L1138
 use crate::{VulkanDevice, VulkanError, device::DeviceOwner};
 use ash::vk;
-use nixe_gpu::shader_identity::ContentId;
-use std::sync::{Arc, Mutex};
-struct Cache {
+use std::{
+    io::{BufWriter, Write},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
+const MAGIC: &[u8; 8] = b"NXVKDRV1";
+pub(super) struct DriverCache {
     owner: Arc<DeviceOwner>,
-    handle: vk::PipelineCache,
+    pub(super) handle: vk::PipelineCache,
+    path: Option<PathBuf>,
 }
-impl Drop for Cache {
+impl DriverCache {
+    pub fn new(
+        device: &VulkanDevice,
+        directory: Option<&std::path::Path>,
+    ) -> Result<Self, VulkanError> {
+        let started = Instant::now();
+        let path = directory.map(|dir| dir.join("vulkan_pipelines.bin"));
+        let initial = path
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| {
+                let profile = device.profile();
+                let valid = bytes.len() >= 44
+                    && &bytes[..8] == MAGIC
+                    && bytes[8..12] == super::PERSISTENCE_VERSION.to_le_bytes()
+                    && bytes[12..16] == 32u32.to_le_bytes()
+                    && bytes[16..20] == 1u32.to_le_bytes()
+                    && bytes[20..24] == profile.vendor_id.to_le_bytes()
+                    && bytes[24..28] == profile.device_id.to_le_bytes()
+                    && bytes[28..44] == profile.pipeline_cache_uuid;
+                if valid {
+                    Some(bytes)
+                } else {
+                    if let Some(path) = &path {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    log::info!("discarded incompatible Vulkan driver pipeline cache");
+                    None
+                }
+            });
+        let handle = unsafe {
+            device.owner.device.create_pipeline_cache(
+                &vk::PipelineCacheCreateInfo::default()
+                    .initial_data(initial.as_deref().map_or(&[], |data| &data[12..])),
+                None,
+            )
+        }
+        .map_err(|error| VulkanError::vk("vkCreatePipelineCache", error))?;
+        if let Some(data) = &initial {
+            log::info!(
+                "loaded Vulkan driver pipeline cache: {} bytes in {:?} ({})",
+                data.len() - 12,
+                started.elapsed(),
+                path.as_ref().unwrap().display()
+            );
+        } else if let Some(path) = &path {
+            log::info!(
+                "initialized empty Vulkan driver pipeline cache in {:?} ({})",
+                started.elapsed(),
+                path.display()
+            );
+        }
+        Ok(Self {
+            owner: Arc::clone(&device.owner),
+            handle,
+            path,
+        })
+    }
+    pub fn checkpoint(&self) -> Result<usize, VulkanError> {
+        let Some(path) = &self.path else {
+            return Ok(0);
+        };
+        let bytes = unsafe { self.owner.device.get_pipeline_cache_data(self.handle) }
+            .map_err(|error| VulkanError::vk("vkGetPipelineCacheData", error))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
+        }
+        let write = || -> std::io::Result<()> {
+            let mut file = BufWriter::new(std::fs::File::create(path)?);
+            file.write_all(MAGIC)?;
+            file.write_all(&super::PERSISTENCE_VERSION.to_le_bytes())?;
+            file.write_all(&bytes)?;
+            file.flush()
+        };
+        if let Err(error) = write() {
+            let _ = std::fs::remove_file(path);
+            return Err(VulkanError::Compilation(error.to_string().into()));
+        }
+        Ok(bytes.len())
+    }
+}
+impl Drop for DriverCache {
     fn drop(&mut self) {
         unsafe {
             self.owner.device.destroy_pipeline_cache(self.handle, None);
         }
     }
-}
-pub(super) struct DriverCaches {
-    caches: Vec<Mutex<Cache>>,
-    store: Option<persistent::Store>,
-    key: ContentId,
-    header: [u8; 32],
-    maximum: u64,
-}
-impl DriverCaches {
-    pub fn new(device: &VulkanDevice, config: &CacheConfiguration) -> Result<Self, VulkanError> {
-        let profile = device.profile();
-        let mut header = [0; 32];
-        header[..4].copy_from_slice(&32u32.to_le_bytes());
-        header[4..8].copy_from_slice(&1u32.to_le_bytes());
-        header[8..12].copy_from_slice(&profile.vendor_id.to_le_bytes());
-        header[12..16].copy_from_slice(&profile.device_id.to_le_bytes());
-        header[16..].copy_from_slice(&profile.pipeline_cache_uuid);
-        let key = ContentId::of(
-            b"nixe-vulkan-driver-cache-v1",
-            &[&header, &profile.driver_version.to_le_bytes()],
-        );
-        let store = persistent::store(
-            config.directory.as_deref(),
-            "driver-v1",
-            config.persistent_bytes,
-        );
-        let initial = store
-            .as_ref()
-            .and_then(|s| s.read(key))
-            .filter(|bytes| valid_header(bytes, &header));
-        let mut result = Self {
-            caches: Vec::new(),
-            store,
-            key,
-            header,
-            maximum: config.persistent_bytes,
-        };
-        for _ in 0..config.workers {
-            let handle = unsafe {
-                device.owner.device.create_pipeline_cache(
-                    &vk::PipelineCacheCreateInfo::default()
-                        .initial_data(initial.as_deref().unwrap_or(&[])),
-                    None,
-                )
-            }
-            .map_err(|e| VulkanError::vk("worker pipeline cache", e))?;
-            result.caches.push(Mutex::new(Cache {
-                owner: Arc::clone(&device.owner),
-                handle,
-            }));
-        }
-        Ok(result)
-    }
-    pub fn with<T>(
-        &self,
-        worker: usize,
-        create: impl FnOnce(vk::PipelineCache) -> Result<T, CompileError>,
-    ) -> Result<T, CompileError> {
-        let cache = self.caches[worker].lock().unwrap();
-        create(cache.handle)
-    }
-    /// Called outside recording/control servicing. Locks also exclude worker
-    /// creation while Vulkan merges/serializes its externally synchronized cache.
-    pub fn checkpoint(&self) -> Result<(), CompileError> {
-        let Some(store) = &self.store else {
-            return Ok(());
-        };
-        let caches: Vec<_> = self
-            .caches
-            .iter()
-            .map(|cache| cache.lock().unwrap())
-            .collect();
-        let first = &caches[0];
-        let sources: Vec<_> = caches.iter().skip(1).map(|cache| cache.handle).collect();
-        if !sources.is_empty() {
-            unsafe {
-                first
-                    .owner
-                    .device
-                    .merge_pipeline_caches(first.handle, &sources)
-            }
-            .map_err(|e| VulkanError::vk("merge worker pipeline caches", e))?;
-        }
-        let bytes = unsafe { first.owner.device.get_pipeline_cache_data(first.handle) }
-            .map_err(|e| VulkanError::vk("serialize driver cache", e))?;
-        if bytes.len() as u64 <= self.maximum && valid_header(&bytes, &self.header) {
-            store
-                .write(self.key, &bytes)
-                .map_err(|e| CompileError::Failed(e.to_string().into()))?;
-        }
-        Ok(())
-    }
-}
-fn valid_header(bytes: &[u8], expected: &[u8; 32]) -> bool {
-    // Vulkan specifies little-endian version-one fields independent of the host.
-    // https://docs.vulkan.org/spec/latest/chapters/pipelines.html#pipelines-cache-header
-    bytes.len() >= 32 && bytes[..32] == *expected
 }

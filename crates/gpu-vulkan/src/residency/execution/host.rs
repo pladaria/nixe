@@ -2,7 +2,7 @@
 //! queues do not pass through this capture API.
 use super::*;
 impl Residency<'_> {
-    fn new_host_program(&self, pipeline: Arc<NativePipeline>) -> Result<HostProgram, VulkanError> {
+    fn new_host_program(&self, pipeline: NativePipeline) -> Result<HostProgram, VulkanError> {
         if !Arc::ptr_eq(&pipeline.owner, &self.runtime.device.owner) {
             return Err(VulkanError::InvalidResource(
                 "program pipeline belongs to another device",
@@ -19,7 +19,7 @@ impl Residency<'_> {
     }
     pub fn prepare_host_program(
         &self,
-        pipeline: Arc<NativePipeline>,
+        pipeline: NativePipeline,
         bindings: &[HostBinding],
     ) -> Result<HostProgram, VulkanError> {
         let mut program = self.new_host_program(pipeline)?;

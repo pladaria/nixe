@@ -125,9 +125,6 @@ pub struct MaxwellResolvedComputeLaunch {
 }
 
 impl MaxwellResolvedComputeLaunch {
-    pub(crate) fn source(&self) -> MaxwellMethodSource {
-        self.source
-    }
     pub fn constant_buffer(&self, slot: u8) -> Result<(u64, u64), &'static str> {
         self.qmd.constant_buffer(slot)
     }

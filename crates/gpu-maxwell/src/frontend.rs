@@ -37,8 +37,8 @@ impl std::error::Error for MaxwellFrontendDispatchError {}
 /// survives entry fetches; entries check shutdown without servicing CPU work.
 /// CPU requests run after native draws or at the outer GPU inbox boundary.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp#L34-L45
-/// The executor selects the frontend channel before each poll of this future.
-pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellCommandHost>(
+/// The executor binds the channel before entering DispatchCalls.
+pub fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellCommandHost>(
     dispatch: &MaxwellFrontendDispatch,
     channel: &mut MaxwellGpuChannel,
     address_space: &std::cell::RefCell<MaxwellGpuMemory>,
@@ -63,7 +63,7 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
     let mut commands = std::mem::take(&mut channel.commands);
     let mut stream = CommandReader::new(address_space.borrow().machine().clone());
     let execution_error = |error| MaxwellFrontendDispatchError::Execution(Box::new(error));
-    let result = async {
+    let result = (|| {
         loop {
             if effects.host.is_stopped() {
                 return Err(execution_error(MaxwellSubmissionExecutionError::Native(
@@ -85,19 +85,11 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
                 }
             };
             let mut index = 0;
-            while let Some(effect) =
-                process_maxwell_commands(channel, &stream, &mut commands, &mut index, &mut effects)
-                    .map_err(engine_error)?
-            {
-                effect
-                    .complete(channel, &mut commands, &mut effects)
-                    .await
-                    .map_err(engine_error)?;
-            }
+            process_maxwell_commands(channel, &stream, &mut commands, &mut index, &mut effects)
+                .map_err(engine_error)?;
         }
         Ok(())
-    }
-    .await;
+    })();
     stream.finish(sources);
     channel.commands = commands;
     result?;

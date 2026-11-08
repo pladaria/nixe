@@ -39,6 +39,7 @@ pub struct VulkanDevice {
     pub(crate) owner: Arc<DeviceOwner>,
     pub(crate) submission: QueueState,
     pub(crate) dispatch: Dispatch,
+    pub(crate) objects: Arc<crate::cache::NativeObjects>,
     pub(crate) queue: vk::Queue,
     pub(crate) profile: Arc<DeviceProfile>,
     queues: QueueSelection,
@@ -233,11 +234,13 @@ impl VulkanDevice {
         });
         // The owner exists before any subsequent fallible creation, so failures
         // destroy the independent device and instance without a resource rollback layer.
+        let objects = Arc::new(crate::cache::NativeObjects::default());
         let mut dispatch = Dispatch::new(
             &owner.instance.instance,
             &owner.device,
             &selected.profile,
             Arc::clone(&owner.queue_mutex),
+            Arc::clone(&objects),
         )?;
         debug_assert_eq!(
             dispatch.release_swapchain_images.is_some(),
@@ -277,6 +280,7 @@ impl VulkanDevice {
         Ok(Self {
             owner,
             dispatch,
+            objects,
             queue,
             submission,
             profile: Arc::new(selected.profile),

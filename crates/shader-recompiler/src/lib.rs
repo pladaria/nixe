@@ -30,3 +30,5 @@ pub struct CompilationInputs<'a, E: Environment> {
 mod compiler;
 pub mod spirv;
 pub use compiler::{Compiler, PreparedStage};
+
+pub mod host_abi;

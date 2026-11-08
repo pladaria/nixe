@@ -170,7 +170,7 @@ pub(in crate::engines) fn call_method<L: crate::MaxwellFrontend, H: crate::Maxwe
     source: MaxwellMethodSource,
     candidate: &mut MaxwellComputeState,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Result<bool, crate::engines::MaxwellEngineStreamError> {
+) -> Result<(), crate::engines::MaxwellEngineStreamError> {
     let declaration = METHODS
         .iter()
         .find(|declaration| declaration.metadata.method() == source.method())
@@ -244,12 +244,12 @@ pub(in crate::engines) fn call_method<L: crate::MaxwellFrontend, H: crate::Maxwe
     };
     if let Some(trigger) = trigger {
         execution.compute_synchronization(trigger)?;
-        return Ok(true);
+        return Ok(());
     }
     if matches!(declaration.action, MethodAction::InlineToMemoryData) {
         let upload = process_data(source, candidate)?;
         execution.compute_inline(upload, None)?;
-        return Ok(true);
+        return Ok(());
     }
     let write = match declaration.action {
         MethodAction::AddressUpper => MaxwellComputeStateWrite::AddressUpper {
@@ -443,7 +443,7 @@ pub(in crate::engines) fn call_method<L: crate::MaxwellFrontend, H: crate::Maxwe
         }
     };
     candidate.apply(write);
-    Ok(true)
+    Ok(())
 }
 
 fn invalid_encoding(
