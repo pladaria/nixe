@@ -336,6 +336,7 @@ impl HorizonSvcDispatcher {
                     archives: std::sync::Arc::new(crate::SystemArchives::default()),
                 },
                 system: crate::ipc_wire::resources::SystemServices {
+                    profiles: std::sync::Arc::new(crate::user::ProfileManager::default()),
                     operation_mode: initial_operation_mode,
                     time: time_environment,
                     hid: hid_system,
@@ -343,6 +344,7 @@ impl HorizonSvcDispatcher {
                     settings: settings_environment,
                     application_language: None,
                     application_display_version: None,
+                    application_pseudo_device_seed: None,
                     user_account_switch_locked: None,
                     diagnostics: crate::HorizonDiagnostics::default(),
                 },
@@ -404,6 +406,20 @@ impl HorizonSvcDispatcher {
             .resources_mut()
             .system
             .application_display_version = Some(display_version);
+        self
+    }
+
+    /// Installs the NACP seed consumed by AM's GetPseudoDeviceId.
+    #[must_use]
+    pub fn with_application_pseudo_device_seed(
+        mut self: std::sync::Arc<Self>,
+        seed: u64,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::get_mut(&mut self)
+            .expect("configure before starting cores")
+            .resources_mut()
+            .system
+            .application_pseudo_device_seed = Some(seed);
         self
     }
 
@@ -600,6 +616,8 @@ unsafe impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x26 => self.break_process(context),
             0x27 => self.output_debug_string(context),
             0x29 => get_info(context),
+            0x2c => physical_memory(context, false),
+            0x2d => physical_memory(context, true),
             0x32 => self.set_thread_activity(context),
             0x33 => self.get_thread_context(context),
             0x34 => self.wait_for_address(context),

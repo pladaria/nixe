@@ -49,6 +49,18 @@ pub(super) async fn dispatch_control(
     };
 
     match (control_command, target) {
+        (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Ngc(session)) => {
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
+        }
+        (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Nfp(session)) => {
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
+        }
+        (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Bcat(session)) => {
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
+        }
+        (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Friends(session)) => {
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
+        }
         (
             CmifControlCommand::ConvertCurrentObjectToDomain,
             HorizonIpcObject::PlayReport(session),
@@ -246,6 +258,10 @@ pub(super) async fn dispatch_control(
             | HorizonIpcObject::OpusManager(_)
             | HorizonIpcObject::OpusDecoder(_)
             | HorizonIpcObject::PlayReport(_)
+            | HorizonIpcObject::Friends(_)
+            | HorizonIpcObject::Bcat(_)
+            | HorizonIpcObject::Nfp(_)
+            | HorizonIpcObject::Ngc(_)
             | HorizonIpcObject::AudioDevice(_),
         ) => {
             install_clone(process, request.token, target.clone()).await?;
@@ -266,6 +282,10 @@ pub(super) async fn dispatch_control(
                 HorizonIpcObject::Hid(_) | HorizonIpcObject::Account(_) => 0x100,
                 HorizonIpcObject::OpusManager(_) => 0x120,
                 HorizonIpcObject::PlayReport(_) => 0x1000,
+                HorizonIpcObject::Friends(_) => 0x1000,
+                HorizonIpcObject::Bcat(_) => 0x1000,
+                HorizonIpcObject::Nfp(_) => 0x1000,
+                HorizonIpcObject::Ngc(_) => 0x1000,
                 HorizonIpcObject::SemanticService(session)
                     if session.service() == crate::IpcService::FileSystem =>
                 {

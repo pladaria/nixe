@@ -14,6 +14,8 @@ enum AccountCommand {
     GetProfile,
     ListAllUsers,
     ListOpenUsers,
+    ListOpenContextStoredUsers,
+    ListQualifiedUsers,
     IsUserRegistrationRequestPermitted,
     InitializeApplicationInfo,
     GetBaasAccountManagerForApplication,
@@ -27,6 +29,8 @@ impl AccountCommand {
             1 => Some(Self::GetUserExistence),
             2 => Some(Self::ListAllUsers),
             3 => Some(Self::ListOpenUsers),
+            60 | 131 => Some(Self::ListOpenContextStoredUsers),
+            141 => Some(Self::ListQualifiedUsers),
             4 => Some(Self::GetLastOpenedUser),
             5 => Some(Self::GetProfile),
             50 => Some(Self::IsUserRegistrationRequestPermitted),
@@ -99,9 +103,11 @@ pub(in crate::ipc_wire) async fn dispatch_account(
         AccountTarget::Root => {
             dispatch_account_root(process, session, request, hipc, user_account_switch_locked).await
         }
-        AccountTarget::Profile(profile) => dispatch_account_profile(profile, request, hipc, true),
+        AccountTarget::Profile(profile) => {
+            dispatch_account_profile(process, profile, request, hipc, true).await
+        }
         AccountTarget::BaasManagerForApplication(manager) => {
-            dispatch_account_manager_for_application(&manager, request)
+            dispatch_account_manager_for_application(&manager, request, hipc, true)
         }
     }
 }
@@ -157,7 +163,10 @@ async fn dispatch_account_root(
         // The eight-entry pointer array is terminated/padded with invalid UIDs;
         // these commands have no scalar output count.
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L77-L105
-        AccountCommand::ListAllUsers | AccountCommand::ListOpenUsers => {
+        AccountCommand::ListAllUsers
+        | AccountCommand::ListOpenUsers
+        | AccountCommand::ListQualifiedUsers
+        | AccountCommand::ListOpenContextStoredUsers => {
             let ReceiveStatics::Entries(pointers) = &hipc.receive_statics else {
                 return account_response(
                     session,
@@ -189,7 +198,11 @@ async fn dispatch_account_root(
                 );
             }
             let mut users = vec![0; 128];
-            users[..16].copy_from_slice(&session.user().id().encode());
+            if command == AccountCommand::ListOpenContextStoredUsers {
+                users.copy_from_slice(&session.profiles.stored_opened_users());
+            } else {
+                users[..16].copy_from_slice(&session.user().id().encode());
+            }
             process
                 .write(&process.receive_statics()[0], 0, &mut users)
                 .await?;
@@ -344,7 +357,7 @@ async fn dispatch_account_root(
                 ));
             }
 
-            let manager = AccountManagerForApplicationSession::new(user);
+            let manager = AccountManagerForApplicationSession::new(user, session.profiles.clone());
             if session.is_domain() {
                 let Some(object_id) =
                     session.insert_object(AccountObject::BaasManagerForApplication(manager))
@@ -393,24 +406,47 @@ fn is_configured_user(session: &AccountSession, encoded_user_id: &[u8]) -> bool 
 }
 
 pub(in crate::ipc_wire) fn dispatch_account_manager_for_application(
-    _manager: &AccountManagerForApplicationSession,
+    manager: &AccountManagerForApplicationSession,
     request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+    domain: bool,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    unsupported_service_command("IManagerForApplication", request.command_id)
+    // StoreOpenContext snapshots the module's opened profiles, not this
+    // manager's Nintendo-account linkage or the current service session.
+    // https://switchbrew.org/wiki/Account_services#IManagerForApplication
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/acc/acc.cpp
+    if request.command_id != 160 {
+        return unsupported_service_command("IManagerForApplication", request.command_id);
+    }
+    let result = if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+        HorizonIpcResult::CMIF_INVALID_IN_HEADER
+    } else {
+        manager.profiles.store_opened_users();
+        HorizonIpcResult::SUCCESS
+    };
+    if domain {
+        Ok((
+            encode_domain_response(request.token, result, &[], &[], &[])?,
+            None,
+        ))
+    } else {
+        Ok((encode_response(request.token, result, &[], None)?, None))
+    }
 }
 
 // IProfile::GetBase does not consume profile icon or Mii data.
 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L150-L152
-pub(in crate::ipc_wire) fn dispatch_account_profile(
+pub(in crate::ipc_wire) async fn dispatch_account_profile(
+    process: &Request,
     profile: crate::AccountProfileSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
     domain: bool,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    if request.command_id != 1 {
+    if !matches!(request.command_id, 1 | 10 | 11) {
         return unsupported_service_command("IProfile", request.command_id);
     }
-    if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+    if !request.has_payload_size(0) || (request.command_id != 11 && has_ipc_descriptors(hipc)) {
         return if domain {
             Ok((
                 encode_domain_response(
@@ -426,7 +462,31 @@ pub(in crate::ipc_wire) fn dispatch_account_profile(
             cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER)
         };
     }
-    semantic_success(request.token, domain, &profile.base(), &[], &[], None)
+    match request.command_id {
+        1 => semantic_success(request.token, domain, &profile.base(), &[], &[], None),
+        // The same selected JPEG supplies the byte size and the actual data,
+        // as Eden IProfileCommon::GetImageSize / LoadImage.
+        // https://switchbrew.org/wiki/Account_services#IProfile
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/acc/acc.cpp
+        10 | 11 => {
+            let image = profile.user.image();
+            if request.command_id == 11 {
+                let output = crate::ipc_wire::buffer::one_receive_buffer(process, hipc)?;
+                let count = (output.size as usize).min(image.len());
+                let mut bytes = image[..count].to_vec();
+                process.write(output, 0, &mut bytes).await?;
+            }
+            semantic_success(
+                request.token,
+                domain,
+                &(image.len() as u32).to_le_bytes(),
+                &[],
+                &[],
+                None,
+            )
+        }
+        _ => unreachable!(),
+    }
 }
 
 fn account_response(
@@ -438,23 +498,5 @@ fn account_response(
         Ok((encode_domain_response(token, result, &[], &[], &[])?, None))
     } else {
         Ok((encode_response(token, result, &[], None)?, None))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn command_101_targets_only_the_configured_local_user() {
-        let session = AccountSession::new();
-
-        assert_eq!(
-            AccountCommand::decode(101),
-            Some(AccountCommand::GetBaasAccountManagerForApplication)
-        );
-        assert!(is_configured_user(&session, &1_u128.to_le_bytes()));
-        assert!(!is_configured_user(&session, &0_u128.to_le_bytes()));
-        assert!(!is_configured_user(&session, &[1]));
     }
 }

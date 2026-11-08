@@ -58,7 +58,7 @@ pub use resource::{
     AddressMode, BufferDescription, BufferId, DescriptorTableId, FilterMode, ImageDescription,
     ImageDimension, ImageExtent, ImageFormat, ImageId, ImageKind, PipelineId, QueryKind,
     QueryPoolId, RenderPassId, ResourceDescriptionError, SampleCount, SamplerDescription,
-    SamplerId, ShaderId, ShaderStage,
+    SamplerId, SamplerReduction, ShaderId, ShaderStage,
 };
 pub use runtime::BackendRuntimeError;
 pub use submission::{BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId};

@@ -2,6 +2,35 @@ use super::*;
 use nixe_gpu::{ComponentSwizzle, ImageDimension, ImageFormat as F, SampleCount};
 pub(crate) fn format(value: F) -> vk::Format {
     match value {
+        F::R8Uint => vk::Format::R8_UINT,
+        F::R8Sint => vk::Format::R8_SINT,
+        F::Rg8Uint => vk::Format::R8G8_UINT,
+        F::Rg8Sint => vk::Format::R8G8_SINT,
+        F::Rgba8Uint => vk::Format::R8G8B8A8_UINT,
+        F::Rgba8Sint => vk::Format::R8G8B8A8_SINT,
+        F::R16Uint => vk::Format::R16_UINT,
+        F::R16Sint => vk::Format::R16_SINT,
+        F::Rg16Uint => vk::Format::R16G16_UINT,
+        F::Rg16Sint => vk::Format::R16G16_SINT,
+        F::Rgba16Uint => vk::Format::R16G16B16A16_UINT,
+        F::Rgba16Sint => vk::Format::R16G16B16A16_SINT,
+        F::R32Uint => vk::Format::R32_UINT,
+        F::R32Sint => vk::Format::R32_SINT,
+        F::Rg32Uint => vk::Format::R32G32_UINT,
+        F::Rg32Sint => vk::Format::R32G32_SINT,
+        F::Rgba32Uint => vk::Format::R32G32B32A32_UINT,
+        F::Rgba32Sint => vk::Format::R32G32B32A32_SINT,
+        F::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
+        F::Rgba16Snorm => vk::Format::R16G16B16A16_SNORM,
+        F::Rgba8Snorm => vk::Format::R8G8B8A8_SNORM,
+        F::Rg16Unorm => vk::Format::R16G16_UNORM,
+        F::Rg16Snorm => vk::Format::R16G16_SNORM,
+        F::Bgr10a2Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
+        F::A1Rgb5Unorm => vk::Format::A1R5G5B5_UNORM_PACK16,
+        F::Rg8Snorm => vk::Format::R8G8_SNORM,
+        F::R16Unorm => vk::Format::R16_UNORM,
+        F::R16Snorm => vk::Format::R16_SNORM,
+        F::R8Snorm => vk::Format::R8_SNORM,
         F::Rgb565Unorm => vk::Format::R5G6B5_UNORM_PACK16,
         F::R8Unorm => vk::Format::R8_UNORM,
         F::Rg8Unorm => vk::Format::R8G8_UNORM,
@@ -201,8 +230,13 @@ impl NativeExecution<'_> {
                 "multisample sampling requires a multisample shader image binding",
             ));
         }
+        // Depth/stencil aspects expose their channel as R in Vulkan. Preserve
+        // the TIC's selectors and constants, converting G as Eden ImageView does.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L2563-L2571
+        let depth_stencil = description.format().is_depth_stencil();
         let swizzle = components.0.map(|c| match c {
             ComponentSwizzle::Red => vk::ComponentSwizzle::R,
+            ComponentSwizzle::Green if depth_stencil => vk::ComponentSwizzle::R,
             ComponentSwizzle::Green => vk::ComponentSwizzle::G,
             ComponentSwizzle::Blue => vk::ComponentSwizzle::B,
             ComponentSwizzle::Alpha => vk::ComponentSwizzle::A,
@@ -225,7 +259,13 @@ impl NativeExecution<'_> {
                     .texture_cache
                     .get(native)
                     .view_format(requested_format),
-                view_type: if description.dimension() == ImageDimension::Cube {
+                view_type: if description.dimension() == ImageDimension::One {
+                    if arrayed {
+                        vk::ImageViewType::TYPE_1D_ARRAY
+                    } else {
+                        vk::ImageViewType::TYPE_1D
+                    }
+                } else if description.dimension() == ImageDimension::Cube {
                     if arrayed {
                         if self.residency.device().profile().core.image_cube_array == 0 {
                             return Err(VulkanError::InvalidResource(
@@ -304,7 +344,13 @@ impl NativeExecution<'_> {
             &info,
             SamplerExtensions {
                 custom_border,
-                ..Default::default()
+                reduction: match s.reduction {
+                    nixe_gpu::SamplerReduction::WeightedAverage => {
+                        vk::SamplerReductionMode::WEIGHTED_AVERAGE
+                    }
+                    nixe_gpu::SamplerReduction::Min => vk::SamplerReductionMode::MIN,
+                    nixe_gpu::SamplerReduction::Max => vk::SamplerReductionMode::MAX,
+                },
             },
         )?;
         Ok(sampler.handle)

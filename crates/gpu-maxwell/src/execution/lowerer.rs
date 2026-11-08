@@ -8,6 +8,14 @@ pub trait MaxwellFrontend: 'static {
     fn create_channel(&mut self, channel: crate::MaxwellChannelId);
     fn bind_channel(&mut self, channel: crate::MaxwellChannelId, state: &MaxwellThreeDState);
     fn close_channel(&mut self, channel: crate::MaxwellChannelId);
+    fn reset_samples_passed(&mut self) -> Result<(), MaxwellSubmissionExecutionError>;
+    fn report_samples_passed(
+        &mut self,
+        target: Vec<nixe_memory::AllocationRange>,
+        short: bool,
+        timestamp: u64,
+        frontend: FrontendSubmissionId,
+    ) -> Result<(), MaxwellSubmissionExecutionError>;
     fn bind_graphics_uniform(
         &mut self,
         group: u8,

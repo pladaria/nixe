@@ -8,6 +8,7 @@ pub(crate) mod progress;
 pub(crate) mod staging;
 pub(crate) use staging::Slice;
 mod frame_metrics;
+mod queries;
 mod timing;
 use nixe_gpu::{BackendInstanceId, BackendSubmissionToken};
 use std::{
@@ -223,6 +224,7 @@ pub struct RecordingStatistics {
     pub draw_calls: u64,
 }
 pub(crate) struct QueueState {
+    pub(crate) samples: queries::Samples,
     pub frame_metrics: frame_metrics::Recorder,
     calibration: Option<timing::Calibration>,
     recording_handle: crate::dispatch::RecordingHandle,
@@ -246,6 +248,7 @@ pub(crate) struct QueueState {
 }
 impl QueueState {
     pub(crate) fn end_rendering(&mut self, dispatch: &mut crate::dispatch::Dispatch) {
+        self.samples.pause(dispatch);
         if let Some(index) = self.recording
             && let Some(active) = self.slots[index].active_render_pass.take()
         {
@@ -270,6 +273,7 @@ impl QueueState {
         let timeline = unsafe { owner.device.create_semaphore(&info, None) }
             .map_err(|e| VulkanError::vk("vkCreateSemaphore(owner timeline)", e))?;
         let mut state = Self {
+            samples: Default::default(),
             frame_metrics: frame_metrics::Recorder::new(),
             calibration,
             recording_handle: dispatch.recording_handle(),

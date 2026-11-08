@@ -22,8 +22,6 @@ use crate::{
 /// Largest path accepted by the semantic filesystem boundary.
 pub const MAX_IPC_PATH_BYTES: usize = 0x300;
 const MAX_HOST_NAME_BYTES: usize = 255;
-/// Largest file payload returned by one request.
-pub const MAX_IPC_READ_BYTES: usize = 1024 * 1024;
 /// Largest number of directory or add-on entries returned by one request.
 pub const MAX_IPC_LIST_ENTRIES: usize = 1024;
 // Guest-visible file and directory mode bits follow libnx's pinned FsOpenMode
@@ -372,9 +370,6 @@ fn dispatch_file(file: &ReadOnlyFile, request: IpcRequest) -> Result<IpcResponse
     match request {
         IpcRequest::GetFileSize => Ok(IpcResponse::Size(file.size())),
         IpcRequest::ReadFile { offset, size } => {
-            if size > MAX_IPC_READ_BYTES {
-                return Err(IpcResultCode::RESOURCE_LIMIT);
-            }
             if offset >= file.size() {
                 return Ok(IpcResponse::Data(Vec::new()));
             }
@@ -649,9 +644,6 @@ fn dispatch_host_file(
             if !file.readable() {
                 return Err(IpcResultCode::ACCESS_DENIED);
             }
-            if size > MAX_IPC_READ_BYTES {
-                return Err(IpcResultCode::RESOURCE_LIMIT);
-            }
             let mut file = file
                 .file()
                 .lock()
@@ -675,9 +667,6 @@ fn dispatch_host_file(
         } => {
             if !file.writable() {
                 return Err(IpcResultCode::ACCESS_DENIED);
-            }
-            if data.len() > MAX_IPC_READ_BYTES {
-                return Err(IpcResultCode::RESOURCE_LIMIT);
             }
             let allow_append = file.allows_append();
             let path = file.path();

@@ -1,6 +1,6 @@
 //! Application play-report IPC and local persistence.
 //! https://switchbrew.org/wiki/BCAT_services#prepo:a,_prepo:a2,_prepo:m,_prepo:u,_prepo:s
-//! https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/prepo/prepo.cpp
+//! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/prepo/prepo.cpp
 use super::prelude::*;
 use crate::PlayReportSession;
 
@@ -45,16 +45,47 @@ pub(in crate::ipc_wire) async fn dispatch_play_report(
         }
         None => {}
     }
-    if request.command_id == 10400 {
-        if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
-            return reply(HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+    match request.command_id {
+        10200 | 10300 | 10400 => {
+            if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+                return reply(HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            match request.command_id {
+                // Match Eden's RequestImmediateTransmission: acknowledge the
+                // request without uploading reports. SaveReport persists locally.
+                10200 => {
+                    log::debug!("play-report transmission requested (local storage only)");
+                    return reply(HorizonIpcResult::SUCCESS);
+                }
+                // Eden GetTransmissionStatus returns an s32 status of zero;
+                // requesting transmission does not create a pending upload.
+                10300 => {
+                    return semantic_success(
+                        request.token,
+                        domain,
+                        &0_i32.to_le_bytes(),
+                        &[],
+                        &[],
+                        None,
+                    );
+                }
+                10400 => {
+                    let id = PlayReportSession::system_session_id()
+                        .map_err(|e| IpcWireError::PlayReport(e.to_string().into()))?;
+                    return semantic_success(
+                        request.token,
+                        domain,
+                        &id.to_le_bytes(),
+                        &[],
+                        &[],
+                        None,
+                    );
+                }
+                _ => unreachable!(),
+            }
         }
-        let id = PlayReportSession::system_session_id()
-            .map_err(|e| IpcWireError::PlayReport(e.to_string().into()))?;
-        return semantic_success(request.token, domain, &id.to_le_bytes(), &[], &[], None);
-    }
-    if !(10100..=10107).contains(&request.command_id) {
-        return unsupported_service_command("prepo:u", request.command_id);
+        10100..=10107 => {}
+        _ => return unsupported_service_command("prepo:u", request.command_id),
     }
     let inline = if request.command_id % 2 == 1 { 24 } else { 8 };
     if !request.has_payload_size(inline)

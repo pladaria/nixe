@@ -110,13 +110,12 @@ impl crate::native::NativeExecution<'_> {
     pub(in crate::native) fn find_or_insert_image(
         &mut self,
         info: &model::engines::threed::ImageInfo,
-        role: MaxwellThreeDResourceRole,
         space: &MaxwellGpuMemory,
     ) -> Result<(crate::ImageId, [u32; 2]), crate::VulkanError> {
         if let Some(found) = self.residency.find_image(info, space)? {
             return Ok(found);
         }
-        let image = self.residency.insert_guest_image(info, role, space)?;
+        let image = self.residency.insert_guest_image(info, space)?;
         Ok((image, [0, 0]))
     }
     pub(in crate::native) fn render_target_view(
@@ -128,7 +127,7 @@ impl crate::native::NativeExecution<'_> {
         let info = attachment
             .image_info(role)
             .map_err(|e| crate::VulkanError::Compilation(e.to_string().into()))?;
-        let (image, [base_mip, base_layer]) = self.find_or_insert_image(&info, role, space)?;
+        let (image, [base_mip, base_layer]) = self.find_or_insert_image(&info, space)?;
         let aspects = self
             .residency
             .texture_cache

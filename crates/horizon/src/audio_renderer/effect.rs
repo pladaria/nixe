@@ -1,6 +1,7 @@
 //! Stateful renderer effects. Parameter updates are separate from DSP execution.
 mod aux;
 mod biquad;
+mod delay;
 mod fixed;
 mod i3dl2;
 mod limiter;
@@ -19,6 +20,7 @@ pub(super) enum Effect {
     Biquad(Box<biquad::Biquad>),
     Aux(Box<aux::Aux>),
     Limiter(Box<limiter::Limiter>),
+    Delay(Box<delay::Delay>),
 }
 #[derive(Debug)]
 pub(super) struct Reverb {
@@ -55,6 +57,7 @@ impl Effect {
             Self::Biquad(_) => false,
             Self::Aux(effect) => effect.uses_pool(pool),
             Self::Limiter(effect) => effect.uses_pool(pool),
+            Self::Delay(effect) => effect.uses_pool(pool),
         }
     }
     pub(super) fn routing(&self) -> Option<(usize, usize)> {
@@ -65,6 +68,7 @@ impl Effect {
             Self::Biquad(e) => Some((e.mix, e.order)),
             Self::Aux(e) => Some((e.mix, e.order)),
             Self::Limiter(e) => Some((e.mix, e.order)),
+            Self::Delay(e) => Some((e.mix, e.order)),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -82,6 +86,17 @@ impl Effect {
         if raw[0] == 0 {
             *self = Self::Invalid;
             return Ok(4);
+        }
+        if raw[0] == 3 {
+            if raw[1] != 0 || !matches!(self, Self::Delay(_)) {
+                let work = attach(wide(raw, 8), wide(raw, 16), pools, force, translate)?
+                    .ok_or(UpdateError::Invalid)?;
+                *self = Self::Delay(Box::new(delay::Delay::new(work, revision)));
+            }
+            let Self::Delay(effect) = self else {
+                unreachable!()
+            };
+            return effect.update(raw, started);
         }
         if raw[0] == 7 {
             if raw[1] != 0 || !matches!(self, Self::Limiter(_)) {
@@ -212,6 +227,9 @@ impl Effect {
         samples: usize,
         count: usize,
     ) -> Result<(), RenderError> {
+        if let Self::Delay(effect) = self {
+            return effect.process(buffers, samples, count).map_err(Into::into);
+        }
         if let Self::Limiter(effect) = self {
             return effect.process(buffers, samples, count).map_err(Into::into);
         }

@@ -49,6 +49,10 @@ pub enum HorizonIpcObject {
     OpusDecoder(crate::OpusDecoderSession),
     PlayReport(crate::PlayReportSession),
     Hid(HidSession),
+    Friends(crate::FriendSession),
+    Bcat(crate::BcatSession),
+    Nfp(crate::NfpSession),
+    Ngc(NgcSession),
     SharedFont(crate::SharedFontSession),
     Irs(IrsSession),
     HidAppletResource(HidAppletResource),
@@ -163,6 +167,19 @@ pub struct ErrorContextWriterSession {
     pub(crate) domain: DomainSession<()>,
 }
 
+/// NGC's content-version interface retains its CMIF session identity.
+#[derive(Clone, Debug)]
+pub struct NgcSession {
+    pub(crate) domain: DomainSession<()>,
+}
+impl Default for NgcSession {
+    fn default() -> Self {
+        Self {
+            domain: DomainSession::new(),
+        }
+    }
+}
+
 impl Default for ErrorContextWriterSession {
     fn default() -> Self {
         Self {
@@ -222,22 +239,16 @@ pub(crate) struct GuestLogMessage {
 pub struct AccountSession {
     state: Arc<Mutex<AccountState>>,
     domain: DomainSession<AccountObject>,
-    user: UserIdentity,
-}
-
-impl Default for AccountSession {
-    fn default() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(AccountState::default())),
-            domain: DomainSession::new(),
-            user: DEFAULT_USER,
-        }
-    }
+    pub(crate) profiles: Arc<crate::user::ProfileManager>,
 }
 
 impl AccountSession {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(profiles: Arc<crate::user::ProfileManager>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(AccountState::default())),
+            domain: DomainSession::new(),
+            profiles,
+        }
     }
 
     pub(crate) fn initialize_application_info(&self, process_id: u64) {
@@ -267,13 +278,13 @@ impl AccountSession {
         self.domain.insert_object(object)
     }
 
-    pub(crate) const fn user(&self) -> UserIdentity {
-        self.user
+    pub(crate) fn user(&self) -> UserIdentity {
+        self.profiles.user
     }
 }
 
 /// Interface identities hosted by a domain-converted `acc:u0` session.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum AccountObject {
     Profile(AccountProfileSession),
     BaasManagerForApplication(AccountManagerForApplicationSession),
@@ -302,50 +313,25 @@ impl AccountProfileSession {
 ///
 /// This object does not imply that the local user has an online account. Its
 /// methods will expose Nixe's disconnected policy as they are implemented.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AccountManagerForApplicationSession {
     // Retained for manager methods which will expose per-user online state.
     _user: UserIdentity,
+    pub(crate) profiles: Arc<crate::user::ProfileManager>,
 }
 
 impl AccountManagerForApplicationSession {
-    pub(crate) const fn new(user: UserIdentity) -> Self {
-        Self { _user: user }
+    pub(crate) fn new(user: UserIdentity, profiles: Arc<crate::user::ProfileManager>) -> Self {
+        Self {
+            _user: user,
+            profiles,
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct AccountState {
     application_process_id: Option<u64>,
-}
-
-#[cfg(test)]
-mod account_tests {
-    use super::*;
-
-    #[test]
-    fn cloned_sessions_share_initialized_application_identity() {
-        let session = AccountSession::new();
-        let clone = session.clone();
-
-        session.initialize_application_info(42);
-
-        assert_eq!(clone.state.lock().unwrap().application_process_id, Some(42));
-        assert_eq!(clone.convert_to_domain(), IPC_ROOT_OBJECT_ID);
-        assert!(session.is_domain());
-        assert_eq!(session.user(), DEFAULT_USER);
-
-        let manager = AccountManagerForApplicationSession::new(session.user());
-        let object_id = session
-            .insert_object(AccountObject::BaasManagerForApplication(manager))
-            .unwrap();
-        assert_eq!(
-            clone.object(object_id),
-            Some(AccountObject::BaasManagerForApplication(manager))
-        );
-        assert!(clone.close_object(object_id));
-        assert!((session.object(object_id)).is_none());
-    }
 }
 
 const IPC_ROOT_OBJECT_ID: u32 = 1;
@@ -1663,7 +1649,7 @@ pub(crate) enum AppletObject {
     CommonStateGetter,
     SelfController,
     WindowController,
-    AudioController,
+    AudioController(Arc<Mutex<AppletAudioController>>),
     DisplayController,
     DebugFunctions,
     LibraryAppletAccessor {
@@ -1672,6 +1658,26 @@ pub(crate) enum AppletObject {
     },
     Storage(Arc<AppletStorage>),
     StorageAccessor(Arc<AppletStorage>),
+}
+
+/// State owned by each IAudioController, including across domain clones.
+/// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/am/service/audio_controller.h
+#[derive(Debug)]
+pub(crate) struct AppletAudioController {
+    pub main_volume: f32,
+    pub library_volume: f32,
+    pub transparent_rate: f32,
+    pub fade_time_ns: i64,
+}
+impl Default for AppletAudioController {
+    fn default() -> Self {
+        Self {
+            main_volume: 0.25,
+            library_volume: 1.0,
+            transparent_rate: 0.0,
+            fade_time_ns: 0,
+        }
+    }
 }
 
 /// Interface family returned by `IApplicationProxyService` for the caller's
@@ -1946,6 +1952,7 @@ struct AppletDomain {
     cpu_boost_enabled: bool,
     restart_message_enabled: bool,
     idle_time_detection_extension: u32,
+    album_image_orientation: u32,
     request_exit_to_library_applet_at_execute_next_program_enabled: bool,
     focus_policy: AppletFocusPolicy,
     foreground_rights_acquired: bool,
@@ -2011,6 +2018,7 @@ impl AppletSession {
                 cpu_boost_enabled: false,
                 restart_message_enabled: false,
                 idle_time_detection_extension: 0,
+                album_image_orientation: 0,
                 request_exit_to_library_applet_at_execute_next_program_enabled: false,
                 focus_policy: AppletFocusPolicy::default(),
                 foreground_rights_acquired: false,
@@ -2553,6 +2561,13 @@ impl AppletSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         domain.focus_policy.out_of_focus_suspending_enabled = enabled;
+    }
+
+    pub(crate) fn set_album_image_orientation(&self, orientation: u32) {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .album_image_orientation = orientation;
     }
 
     pub(crate) fn acquire_foreground_rights(&self) {

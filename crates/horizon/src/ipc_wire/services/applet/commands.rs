@@ -62,12 +62,14 @@ impl ProxyCommand {
         }
     }
 
-    pub(super) const fn child(self, kind: AppletProxyKind) -> AppletObject {
+    pub(super) fn child(self, kind: AppletProxyKind) -> AppletObject {
         match self {
             Self::CommonStateGetter => AppletObject::CommonStateGetter,
             Self::SelfController => AppletObject::SelfController,
             Self::WindowController => AppletObject::WindowController,
-            Self::AudioController => AppletObject::AudioController,
+            Self::AudioController => AppletObject::AudioController(std::sync::Arc::new(
+                std::sync::Mutex::new(crate::object::AppletAudioController::default()),
+            )),
             Self::DisplayController => AppletObject::DisplayController,
             Self::LibraryAppletCreator => AppletObject::LibraryAppletCreator,
             Self::DebugFunctions => AppletObject::DebugFunctions,
@@ -122,6 +124,7 @@ command_enum!(SelfControllerCommand {
     13 => SetFocusHandlingMode,
     14 => SetRestartMessageEnabled,
     16 => SetOutOfFocusSuspendingEnabled,
+    19 => SetAlbumImageOrientation,
     40 => CreateManagedDisplayLayer,
     44 => CreateManagedDisplaySeparableLayer,
     62 => SetIdleTimeDetectionExtension,
@@ -135,6 +138,14 @@ command_enum!(WindowControllerCommand {
     10 => AcquireForegroundRights,
 });
 
+command_enum!(AudioControllerCommand {
+    0 => SetExpectedMasterVolume,
+    1 => GetMainAppletExpectedMasterVolume,
+    2 => GetLibraryAppletExpectedMasterVolume,
+    3 => ChangeMainAppletMasterVolume,
+    4 => SetTransparentVolumeRate,
+});
+
 command_enum!(ApplicationFunctionsCommand {
     20 => EnsureSaveData,
     1 => PopLaunchParameter,
@@ -142,6 +153,7 @@ command_enum!(ApplicationFunctionsCommand {
     22 => SetTerminateResult,
     23 => GetDisplayVersion,
     40 => NotifyRunning,
+    50 => GetPseudoDeviceId,
     130 => GetGpuErrorDetectedSystemEvent,
 });
 

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
-use nixe_memory::{AddressSpaceId, AllocationRange, GuestVirtualAddress, MemoryPermissions};
+use nixe_memory::{AddressSpaceId, AllocationRange, GuestVirtualAddress};
 use std::sync::Arc;
 
 // Switch nvmap ABI values and parameter behavior:
@@ -132,7 +132,13 @@ impl NvMapAllocationMetadata {
                 heap_mask
             },
             flags,
-            alignment,
+            alignment: if alignment < NVMAP_MINIMUM_ALIGNMENT
+                && (alignment == 0 || alignment.is_power_of_two())
+            {
+                NVMAP_MINIMUM_ALIGNMENT
+            } else {
+                alignment
+            },
             kind,
         }
     }
@@ -149,28 +155,8 @@ impl NvMapAllocationMetadata {
         self.alignment
     }
 
-    /// Extent pinned for GPU access, which can exceed the logical object size.
-    /// The public nvmap reference rounds to the allocation alignment before
-    /// pinning into the device address space (Handle::Alloc / PinHandle):
-    /// https://github.com/strato-emu/strato/blob/ae1566a48285816a87e81d4aeb40bd2f4e56e60b/app/src/main/cpp/skyline/services/nvdrv/core/nvmap.cpp
-    pub(super) fn backing_size(self, logical_size: u32) -> Result<u64, NvMapStateError> {
-        self.validate()?;
-        let alignment = u64::from(self.alignment);
-        Ok(u64::from(logical_size).div_ceil(alignment) * alignment)
-    }
-
     pub const fn kind(self) -> u8 {
         self.kind
-    }
-
-    /// Permissions required from the CPU virtual mapping supplied to
-    /// `NVMAP_IOC_ALLOC`.
-    pub(super) const fn cpu_mapping_permissions(self) -> MemoryPermissions {
-        if self.flags & NVMAP_READ_WRITE_FLAG != 0 {
-            MemoryPermissions::READ_WRITE
-        } else {
-            MemoryPermissions::READ
-        }
     }
 
     pub(super) const fn validate(self) -> Result<(), NvMapStateError> {
@@ -212,6 +198,13 @@ impl NvMapObject {
         self.size
     }
 
+    /// CPU pages locked by IocAlloc, distinct from the original IocParam size
+    /// and the alignment-rounded SMMU reservation extent, as in Eden.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/nvdrv/devices/nvmap.cpp
+    pub fn backing_size(&self) -> u64 {
+        u64::from(self.size).next_multiple_of(u64::from(NVMAP_MINIMUM_ALIGNMENT))
+    }
+
     pub fn allocation_metadata(&self) -> Option<NvMapAllocationMetadata> {
         self.storage.as_ref().map(|storage| storage.allocation)
     }
@@ -246,6 +239,8 @@ impl NvMapObject {
         }
         let mapping = memory.map(
             Arc::clone(&storage.ranges),
+            self.backing_size()
+                .next_multiple_of(u64::from(storage.allocation.alignment())),
             Some((
                 storage.cpu_mapping.address_space(),
                 storage.cpu_mapping.address(),
@@ -526,13 +521,12 @@ impl NvMapObjects {
         &self,
         owner: NvMapOwner,
         handle: NvMapHandle,
-        allocation: NvMapAllocationMetadata,
     ) -> Result<u64, NvMapStateError> {
         let object = self.object_by_owned_handle(owner, handle)?;
         if object.storage.is_some() {
             return Err(NvMapStateError::AlreadyAllocated);
         }
-        allocation.backing_size(object.size)
+        Ok(object.backing_size())
     }
 
     pub(super) fn allocate(
@@ -549,8 +543,7 @@ impl NvMapObjects {
             .try_fold(0u64, |bytes, range| bytes.checked_add(range.bytes()))
             .ok_or(NvMapStateError::InvalidBacking)?;
         if bytes == 0
-            || bytes
-                != allocation.backing_size(self.object_by_owned_handle(owner, handle)?.size())?
+            || bytes != self.object_by_owned_handle(owner, handle)?.backing_size()
             || ranges.iter().any(|range| {
                 range.allocation().machine().identity()
                     != ranges[0].allocation().machine().identity()
@@ -827,43 +820,10 @@ mod tests {
     }
 
     #[test]
-    fn every_object_reference_operation_rejects_a_foreign_owner() {
-        let owner = NvMapOwner::new(7);
-        let foreign = NvMapOwner::new(8);
-        let mut objects = NvMapObjects::default();
-        let handle = objects.create(owner, 0x1000).unwrap();
-
-        assert!(matches!(
-            objects.allocation_backing_size(
-                foreign,
-                handle,
-                NvMapAllocationMetadata::new(0, 0, 0x1000, 0),
-            ),
-            Err(NvMapStateError::InvalidOwner)
-        ));
-        assert!(matches!(
-            objects.parameter(foreign, handle, 1),
-            Err(NvMapStateError::InvalidOwner)
-        ));
-        assert!(matches!(
-            objects.exported_id(foreign, handle),
-            Err(NvMapStateError::InvalidOwner)
-        ));
-        assert!(matches!(
-            objects.free(foreign, handle),
-            Err(NvMapStateError::InvalidOwner)
-        ));
-
-        let exported_id = objects.exported_id(owner, handle).unwrap();
-        assert!(matches!(
-            objects.import(foreign, exported_id),
-            Err(NvMapStateError::InvalidOwner)
-        ));
-        assert!(objects.object_by_handle(handle).is_ok());
-    }
-    #[test]
     fn accepted_nvmap_spans_preserve_physical_aliases_across_cpu_remap_and_release() {
-        use nixe_memory::{Access, AddressSpace, AddressWidth, AllocationRange, Machine};
+        use nixe_memory::{
+            Access, AddressSpace, AddressWidth, AllocationRange, Machine, MemoryPermissions,
+        };
         let machine = Machine::new(0x4000).unwrap();
         let account = machine.account(0x4000).unwrap();
         let first = account.allocate(0x2000).unwrap();

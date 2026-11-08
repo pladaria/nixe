@@ -1,6 +1,41 @@
 //! Stable identities for users exposed by Horizon account-facing services.
 
 use std::fmt::{Display, Formatter};
+use std::sync::Mutex;
+
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+// JPEG exposed by the built-in local account, following Eden's backup-profile path.
+// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/constants.cpp
+const PROFILE_IMAGE: &[u8] = include_bytes!("../../../assets/account-profile.jpg");
+
+/// Account-module state shared by service sessions and per-user managers.
+/// Stored context starts empty and changes only through StoreOpenContext.
+/// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/acc/profile_manager.cpp
+#[derive(Debug)]
+pub(crate) struct ProfileManager {
+    pub user: UserIdentity,
+    stored_opened_users: Mutex<[u8; 128]>,
+}
+impl Default for ProfileManager {
+    fn default() -> Self {
+        Self {
+            user: DEFAULT_USER,
+            stored_opened_users: Mutex::new([0; 128]),
+        }
+    }
+}
+impl ProfileManager {
+    pub fn stored_opened_users(&self) -> [u8; 128] {
+        *self.stored_opened_users.lock().unwrap()
+    }
+    pub fn store_opened_users(&self) {
+        let mut users = self.stored_opened_users.lock().unwrap();
+        users.fill(0);
+        users[..16].copy_from_slice(&self.user.id().encode());
+    }
+}
 
 /// The single user available while Nixe has no configurable account database.
 ///
@@ -45,6 +80,9 @@ pub(crate) struct UserIdentity {
 }
 
 impl UserIdentity {
+    pub(crate) const fn image(self) -> &'static [u8] {
+        PROFILE_IMAGE
+    }
     pub(crate) const fn id(self) -> UserId {
         self.id
     }

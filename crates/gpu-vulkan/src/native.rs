@@ -114,6 +114,10 @@ impl NativeGpuExecution {
             .enable_sample_conversion((pipelines).clone());
         residency.access().enable_quad_indices((pipelines).clone());
         residency
+            .access()
+            .device_mut()
+            .enable_sample_queries(Arc::clone(&pipelines))?;
+        residency
             .memory()
             .enable_cpu_write_collection()
             .map_err(VulkanError::from)?;

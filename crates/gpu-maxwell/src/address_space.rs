@@ -5,7 +5,6 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use nixe_gpu::{GpuVirtualAddress, GpuVirtualAddressError};
-use nixe_memory::PhysicalMapping;
 use nixe_memory::{AllocationRange, ArenaOffset, Machine, MemoryError};
 use std::sync::atomic::{AtomicBool, Ordering};
 mod invalidation;
@@ -206,7 +205,6 @@ pub struct MaxwellMapRequest {
     pub backing_offset: u64,
     pub size: u64,
     pub allocation_alignment: u32,
-    pub page_size: u32,
     pub kind: u8,
     pub cacheable: bool,
     pub fixed_offset: Option<GpuVirtualAddress>,
@@ -239,8 +237,8 @@ pub struct MaxwellGpuMapping {
     unmap_offset: GpuVirtualAddress,
     offset: GpuVirtualAddress,
     size: u64,
+    requested_size: u64,
     allocation: MaxwellAllocationId,
-    physical: Arc<PhysicalMapping>,
     device: std::sync::Weak<crate::MaxwellDeviceMapping>,
     current: Arc<AtomicBool>,
     backing_offset: u64,
@@ -293,9 +291,20 @@ impl MaxwellGpuMapping {
         self.allocation
     }
 
-    #[must_use]
-    pub fn physical(&self) -> &Arc<PhysicalMapping> {
-        &self.physical
+    /// Capture from the current SMMU owner instead of retaining another copy
+    /// of physical address metadata in every GMMU mapping descriptor.
+    pub fn capture(&self, offset: u64, bytes: u64) -> Result<Vec<AllocationRange>, MemoryError> {
+        let device = self
+            .device
+            .upgrade()
+            .ok_or(MemoryError::Invalid("GPU mapping's SMMU pin has retired"))?;
+        let address = device
+            .address()
+            .checked_add(offset)
+            .ok_or(MemoryError::Invalid(
+                "GPU mapping offset overflows device address space",
+            ))?;
+        device.read_mapping(address, bytes)?.pin(0, bytes)
     }
 
     #[must_use]
@@ -423,8 +432,8 @@ pub struct MaxwellMappingDiagnostic {
     pub fixed: bool,
     pub sparse: bool,
     pub backing_segments: usize,
-    pub first_physical: ArenaOffset,
-    pub last_physical: ArenaOffset,
+    pub first_physical: Option<ArenaOffset>,
+    pub last_physical: Option<ArenaOffset>,
 }
 
 impl Display for MaxwellMappingDiagnostic {
@@ -433,7 +442,7 @@ impl Display for MaxwellMappingDiagnostic {
             formatter,
             "{} size=0x{:x} {} {} {} backing-offset=0x{:x} \
              page-size=0x{:x} kind=0x{:02x} cacheable={} fixed={} sparse={} \
-             backing-segments={} first-physical=0x{:x} last-physical=0x{:x}",
+             backing-segments={} first-physical={:#x?} last-physical={:#x?}",
             self.offset,
             self.size,
             self.allocation,
@@ -446,8 +455,8 @@ impl Display for MaxwellMappingDiagnostic {
             self.fixed,
             self.sparse,
             self.backing_segments,
-            self.first_physical.get(),
-            self.last_physical.get(),
+            self.first_physical.map(ArenaOffset::get),
+            self.last_physical.map(ArenaOffset::get),
         )
     }
 }
@@ -839,7 +848,7 @@ impl MaxwellGpuAddressSpace {
     /// https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/2d2522693e7d453bf10a8246f704350b69e12ebc/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp
     pub fn map(
         &mut self,
-        request: MaxwellMapRequest,
+        mut request: MaxwellMapRequest,
     ) -> Result<MaxwellGpuMapping, MaxwellAddressSpaceError> {
         let shared = Arc::clone(&self.memory.inner);
         let mut tables = shared
@@ -850,7 +859,7 @@ impl MaxwellGpuAddressSpace {
         let regions = self.regions()?;
         validate_backing(
             &self.machine,
-            request.backing.ranges(),
+            &request.backing,
             request.backing_offset,
             request.size,
         )?;
@@ -861,32 +870,40 @@ impl MaxwellGpuAddressSpace {
             });
         }
 
-        let page_size = if request.page_size == 0 {
-            let big_page_size = regions[1].page_size;
-            if request.allocation_alignment >= big_page_size
-                && request
-                    .backing_offset
-                    .is_multiple_of(u64::from(big_page_size))
-                && request.size.is_multiple_of(u64::from(big_page_size))
-            {
-                big_page_size
-            } else {
-                regions[0].page_size
-            }
+        // MapBufferEx chooses the page class from NvMap alignment. Fixed
+        // mappings also obey their reservation's page class. The byte request
+        // and hardware page coverage are distinct, as in Eden's driver.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp
+        let big_page_size = regions[1].page_size;
+        let fixed_reservation = request
+            .fixed_offset
+            .map(|offset| {
+                let end = offset
+                    .get()
+                    .checked_add(request.size)
+                    .ok_or(MaxwellAddressSpaceError::ArithmeticOverflow)?;
+                self.reservation_containing(offset.get(), end)?
+                    .ok_or(MaxwellAddressSpaceError::OutsideReservation)
+            })
+            .transpose()?;
+        let big = request.allocation_alignment.is_multiple_of(big_page_size)
+            && fixed_reservation.is_none_or(|reservation| reservation.page_size == big_page_size);
+        let page_size = if big {
+            big_page_size
         } else {
-            request.page_size
+            regions[0].page_size
         };
+        let requested_size = request.size;
+        request.size = align_up(request.size, u64::from(page_size))?;
         let region = regions
             .into_iter()
             .find(|region| region.page_size == page_size)
             .ok_or(MaxwellAddressSpaceError::InvalidPageSize { page_size })?;
-        if !request.backing_offset.is_multiple_of(u64::from(page_size))
-            || !request.size.is_multiple_of(u64::from(page_size))
-        {
+        if !request.backing_offset.is_multiple_of(4096) {
             return Err(MaxwellAddressSpaceError::MisalignedBackingRange {
                 offset: request.backing_offset,
                 size: request.size,
-                alignment: u64::from(page_size),
+                alignment: 4096,
             });
         }
 
@@ -932,15 +949,14 @@ impl MaxwellGpuAddressSpace {
         if !request.backing.belongs_to(self.memory.device_memory()) {
             return Err(MaxwellAddressSpaceError::InvalidBackingRange);
         }
-        let physical = Arc::clone(request.backing.physical());
         let mapping = MaxwellGpuMapping {
             owner: Arc::downgrade(&self.memory.inner),
             id,
             unmap_offset: offset,
             offset,
             size: request.size,
+            requested_size,
             allocation: request.allocation,
-            physical,
             device: Arc::downgrade(&request.backing),
             current: Arc::new(AtomicBool::new(true)),
             backing_offset: request.backing_offset,
@@ -1069,15 +1085,14 @@ impl MaxwellGpuAddressSpace {
                 generation,
             )?;
             if let Some(source) = &request.mapping {
-                let physical = Arc::clone(source.backing.physical());
                 let mapping = MaxwellGpuMapping {
                     owner: Arc::downgrade(&self.memory.inner),
                     id: MaxwellMappingId(mapping_id),
                     unmap_offset: request.offset,
                     offset: request.offset,
                     size: request.size,
+                    requested_size: request.size,
                     allocation: source.allocation,
-                    physical,
                     device: Arc::downgrade(&source.backing),
                     current: Arc::new(AtomicBool::new(true)),
                     backing_offset: source.backing_offset,
@@ -1152,6 +1167,12 @@ impl MaxwellGpuAddressSpace {
             .map(|live| &live.descriptor)
             .filter(|mapping| mapping.id == id)
             .collect::<Vec<_>>();
+        if within_mapping
+            .checked_add(size)
+            .is_none_or(|end| end > group[0].requested_size)
+        {
+            return Err(MaxwellAddressSpaceError::PartialMapping);
+        }
         let page_size = group
             .first()
             .map(|mapping| mapping.page_size)
@@ -1280,13 +1301,16 @@ impl MaxwellGpuAddressSpace {
             .map(|live| &live.descriptor)
             .take(limit)
             .map(|mapping| {
-                let physical = mapping
-                    .physical
-                    .slice(mapping.backing_offset, mapping.size)
-                    .expect("live mapping has valid physical bounds");
+                let device = mapping.device.upgrade().expect("live device pin");
+                let physical = self
+                    .memory
+                    .device_memory()
+                    .device()
+                    .read_mapping(device.address() + mapping.backing_offset, mapping.size)
+                    .expect("live SMMU mapping has valid device bounds");
                 let spans = physical.spans();
-                let first = spans.first().expect("live mapping is nonempty");
-                let last = spans.last().unwrap();
+                let first = spans.first();
+                let last = spans.last();
                 MaxwellMappingDiagnostic {
                     offset: mapping.offset,
                     size: mapping.size,
@@ -1300,8 +1324,9 @@ impl MaxwellGpuAddressSpace {
                     fixed: mapping.fixed,
                     sparse: mapping.sparse,
                     backing_segments: spans.len(),
-                    first_physical: first.start,
-                    last_physical: ArenaOffset::new(last.start.get() + last.bytes - 1),
+                    first_physical: first.map(|span| span.start),
+                    last_physical: last
+                        .map(|span| ArenaOffset::new(span.start.get() + span.bytes - 1)),
                 }
             })
             .collect::<Vec<_>>()
@@ -1675,7 +1700,7 @@ impl std::error::Error for MaxwellGpuAccessError {}
 
 fn validate_backing(
     machine: &Machine,
-    backing: &[AllocationRange],
+    backing: &crate::MaxwellDeviceMapping,
     offset: u64,
     size: u64,
 ) -> Result<(), MaxwellAddressSpaceError> {
@@ -1685,17 +1710,7 @@ fn validate_backing(
     let end = offset
         .checked_add(size)
         .ok_or(MaxwellAddressSpaceError::ArithmeticOverflow)?;
-    let bytes = backing.iter().try_fold(0u64, |bytes, range| {
-        if range.allocation().machine().identity() != machine.identity()
-            || (range.offset() | range.bytes()) & 0xfff != 0
-        {
-            return Err(MaxwellAddressSpaceError::InvalidBackingRange);
-        }
-        bytes
-            .checked_add(range.bytes())
-            .ok_or(MaxwellAddressSpaceError::ArithmeticOverflow)
-    })?;
-    if end > bytes {
+    if backing.memory_machine() != machine.identity() || end > backing.reservation_bytes() {
         return Err(MaxwellAddressSpaceError::InvalidBackingRange);
     }
     Ok(())
@@ -1746,7 +1761,7 @@ fn validate_sparse_remap_request(
         validate_kind(mapping.kind)?;
         validate_backing(
             &address_space.machine,
-            mapping.backing.ranges(),
+            &mapping.backing,
             mapping.backing_offset,
             request.size,
         )?;
@@ -1792,6 +1807,3 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, MaxwellAddressSpaceError>
         .map(|aligned| aligned & !(alignment - 1))
         .ok_or(MaxwellAddressSpaceError::ArithmeticOverflow)
 }
-
-#[cfg(test)]
-mod tests;

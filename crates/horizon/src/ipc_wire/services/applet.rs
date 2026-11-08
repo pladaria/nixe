@@ -1,5 +1,6 @@
 use super::prelude::*;
 
+mod audio;
 mod commands;
 mod controller;
 mod player_select;
@@ -438,6 +439,29 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                     session.set_out_of_focus_suspending_enabled(enabled);
                     applet_data(request.token, &[])
                 }
+                // https://switchbrew.org/wiki/AM_services#SetAlbumImageOrientation
+                // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/am/service/self_controller.cpp#L228-L236
+                SelfControllerCommand::SetAlbumImageOrientation => {
+                    let Some(bytes) = request.data.get(..4) else {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    };
+                    let orientation =
+                        u32::from_le_bytes(bytes.try_into().expect("four-byte slice"));
+                    if orientation > 3
+                        || request.data[4..].iter().any(|byte| *byte != 0)
+                        || has_ipc_descriptors(hipc)
+                    {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    session.set_album_image_orientation(orientation);
+                    applet_data(request.token, &[])
+                }
             }
         }
         AppletObject::WindowController => {
@@ -637,6 +661,33 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                         );
                     }
                     applet_data(request.token, &[1])
+                }
+                ApplicationFunctionsCommand::GetPseudoDeviceId => {
+                    if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    let seed = system.application_pseudo_device_seed.ok_or(
+                        IpcWireError::UnsupportedService(UnsupportedServiceOperation::CommandVariant {
+                            service: "IApplicationFunctions",
+                            command_id: request.command_id,
+                            detail: "pseudo-device seed is unavailable: supply control.nacp metadata",
+                        }),
+                    )?;
+                    // Eden hashes only the title's real NACP seed, then sets
+                    // RFC 4122 variant/version bits. Hardware also hashes a
+                    // system seed; do not invent one for this implementation.
+                    // https://switchbrew.org/wiki/AM_services#GetPseudoDeviceId
+                    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/am/service/application_functions.cpp
+                    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/common/uuid.cpp
+                    use sha1::Digest;
+                    let hash = sha1::Sha1::digest(seed.to_le_bytes());
+                    let mut id: [u8; 16] = hash[..16].try_into().unwrap();
+                    id[6] = (id[6] & 0x0f) | 0x50;
+                    id[8] = (id[8] & 0x3f) | 0x80;
+                    applet_data(request.token, &id)
                 }
                 // Copied, manual-clear system event, with no input payload.
                 // https://github.com/switchbrew/libnx/blob/master/nx/source/services/applet.c
@@ -1212,11 +1263,11 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 }
             }
         }
+        AppletObject::AudioController(controller) => audio::dispatch(&controller, request, hipc),
         AppletObject::HomeMenuFunctions
         | AppletObject::GlobalStateController
         | AppletObject::ApplicationCreator
         | AppletObject::AppletCommonFunctions
-        | AppletObject::AudioController
         | AppletObject::DisplayController
         | AppletObject::DebugFunctions => {
             unsupported_service_command(applet_object_name(&object), request.command_id)
@@ -1274,7 +1325,7 @@ pub(in crate::ipc_wire) fn applet_object_name(object: &AppletObject) -> &'static
         AppletObject::CommonStateGetter => "ICommonStateGetter",
         AppletObject::SelfController => "ISelfController",
         AppletObject::WindowController => "IWindowController",
-        AppletObject::AudioController => "IAudioController",
+        AppletObject::AudioController(_) => "IAudioController",
         AppletObject::DisplayController => "IDisplayController",
         AppletObject::DebugFunctions => "IDebugFunctions",
         AppletObject::LibraryAppletAccessor { .. } => "ILibraryAppletAccessor",

@@ -251,6 +251,18 @@ impl MaxwellThreeDReportSemaphoreControl {
             MaxwellThreeDReportSemaphorePipelineLocation::All
         ) && self.raw & !0x1000_f013 == 0
     }
+
+    /// Z-pass REPORT_ONLY uses the same query cache as CLEAR_REPORT_VALUE.
+    pub const fn is_samples_passed(self) -> bool {
+        matches!(
+            self.operation,
+            MaxwellThreeDReportSemaphoreOperation::ReportOnly
+        ) && matches!(
+            self.pipeline_location,
+            MaxwellThreeDReportSemaphorePipelineLocation::All
+        ) && (self.raw >> 23) & 31 == 21
+            && self.raw & !0x1a80_f003 == 0
+    }
 }
 
 /// One ordered payload report or release to guest-visible GPU memory.
@@ -262,9 +274,13 @@ pub struct MaxwellThreeDReportSemaphoreWrite {
     fence: bool,
     source: MaxwellMethodSource,
     prior_work_pending: bool,
+    samples_passed: bool,
 }
 
 impl MaxwellThreeDReportSemaphoreWrite {
+    pub const fn samples_passed(self) -> bool {
+        self.samples_passed
+    }
     #[must_use]
     pub const fn address(self) -> MaxwellThreeDUnresolvedAddress {
         self.address
@@ -822,7 +838,7 @@ pub fn lower_maxwell_three_d_synchronization(
             ),
         },
         MaxwellThreeDSynchronizationTrigger::ReportSemaphore { control, source } => {
-            if !control.is_payload_write() {
+            if !control.is_payload_write() && !control.is_samples_passed() {
                 return Err(
                     MaxwellThreeDSynchronizationError::UnsupportedReportSemaphoreControl {
                         source,
@@ -848,6 +864,7 @@ pub fn lower_maxwell_three_d_synchronization(
                             == MaxwellThreeDReportSemaphoreStructureSize::OneWord,
                     source,
                     prior_work_pending,
+                    samples_passed: control.is_samples_passed(),
                 },
             ))
         }

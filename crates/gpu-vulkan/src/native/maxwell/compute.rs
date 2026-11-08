@@ -29,10 +29,8 @@ impl crate::native::pipeline_cache::ComputePipeline {
         execution: &mut crate::native::NativeExecution<'_>,
         launch: &model::MaxwellResolvedComputeLaunch,
         space: &MaxwellGpuMemory,
-    ) -> Result<
-        smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>,
-        crate::VulkanError,
-    > {
+        images: &mut smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>,
+    ) -> Result<(), crate::VulkanError> {
         use crate::VulkanError as V;
         let via_header = launch.texture_pool.is_some_and(|p| p.via_header_index);
         let sampler_pool = launch.sampler_pool.map(|mut sampler| {
@@ -122,7 +120,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
                 sampler,
             });
         }
-        execution.fill_shader_images(true, space, &textures)
+        execution.fill_shader_images(true, space, &textures, images)
     }
     pub(in crate::native) fn dispatch(
         &self,
@@ -138,7 +136,8 @@ impl crate::native::pipeline_cache::ComputePipeline {
             .runtime
             .device
             .realize_deferred_clear()?;
-        let images = self.configure_resources(execution, launch, space)?;
+        let mut images = smallvec::SmallVec::new();
+        self.configure_resources(execution, launch, space, &mut images)?;
         execution
             .residency
             .update_compute_buffers(&self.resources.stages[5], space)?;

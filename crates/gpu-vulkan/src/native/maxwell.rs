@@ -204,6 +204,36 @@ fn plane_metadata_bytes(image: &GuestImage) -> usize {
 }
 
 impl MaxwellFrontend for MaxwellVulkanRasterizer {
+    fn report_samples_passed(
+        &mut self,
+        target: Vec<nixe_memory::AllocationRange>,
+        short: bool,
+        timestamp: u64,
+        frontend: FrontendSubmissionId,
+    ) -> Result<(), Error> {
+        let mut renderer = self.renderer.borrow_mut();
+        renderer
+            .as_mut()
+            .expect("installed renderer")
+            .execution()
+            .record(frontend, |native| {
+                native
+                    .residency
+                    .report_samples_passed(&target, short, timestamp)
+            })
+            .map_err(compilation)
+    }
+    fn reset_samples_passed(&mut self) -> Result<(), Error> {
+        let mut renderer = self.renderer.borrow_mut();
+        renderer
+            .as_mut()
+            .expect("installed renderer")
+            .residency
+            .access()
+            .device_mut()
+            .reset_samples_passed()
+            .map_err(compilation)
+    }
     fn bind_gpu_memory(&mut self, memory: &model::MaxwellGpuMemoryHandle) {
         let renderer = self.renderer.borrow();
         let caches: Arc<dyn model::MaxwellGpuMemoryInterface> = renderer

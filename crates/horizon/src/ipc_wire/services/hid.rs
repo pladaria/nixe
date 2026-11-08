@@ -3,9 +3,19 @@ use super::prelude::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HidCommand {
     CreateAppletResource,
+    ActivateDebugPad,
     ActivateTouchScreen,
     ActivateMouse,
     ActivateKeyboard,
+    ActivateConsoleSixAxisSensor,
+    StartConsoleSixAxisSensor,
+    StopConsoleSixAxisSensor,
+    ActivateSevenSixAxisSensor,
+    StartSevenSixAxisSensor,
+    StopSevenSixAxisSensor,
+    InitializeSevenSixAxisSensor,
+    FinalizeSevenSixAxisSensor,
+    ResetSevenSixAxisSensorTimestamp,
     StartSixAxisSensor,
     StopSixAxisSensor,
     SetSupportedNpadStyleSet,
@@ -18,6 +28,8 @@ enum HidCommand {
     SetNpadJoyHoldType,
     GetNpadJoyHoldType,
     SetNpadJoyAssignmentModeDual,
+    StartLrAssignmentMode,
+    StopLrAssignmentMode,
     GetVibrationDeviceInfo,
     SendVibrationValue,
     SendVibrationValues,
@@ -28,9 +40,19 @@ impl HidCommand {
     const fn decode(command_id: u32) -> Option<Self> {
         match command_id {
             0 => Some(Self::CreateAppletResource),
+            1 => Some(Self::ActivateDebugPad),
             11 => Some(Self::ActivateTouchScreen),
             21 => Some(Self::ActivateMouse),
             31 => Some(Self::ActivateKeyboard),
+            300 => Some(Self::ActivateConsoleSixAxisSensor),
+            301 => Some(Self::StartConsoleSixAxisSensor),
+            302 => Some(Self::StopConsoleSixAxisSensor),
+            303 => Some(Self::ActivateSevenSixAxisSensor),
+            304 => Some(Self::StartSevenSixAxisSensor),
+            305 => Some(Self::StopSevenSixAxisSensor),
+            306 => Some(Self::InitializeSevenSixAxisSensor),
+            307 => Some(Self::FinalizeSevenSixAxisSensor),
+            310 => Some(Self::ResetSevenSixAxisSensorTimestamp),
             66 => Some(Self::StartSixAxisSensor),
             67 => Some(Self::StopSixAxisSensor),
             100 => Some(Self::SetSupportedNpadStyleSet),
@@ -43,6 +65,8 @@ impl HidCommand {
             120 => Some(Self::SetNpadJoyHoldType),
             121 => Some(Self::GetNpadJoyHoldType),
             124 => Some(Self::SetNpadJoyAssignmentModeDual),
+            126 => Some(Self::StartLrAssignmentMode),
+            127 => Some(Self::StopLrAssignmentMode),
             200 => Some(Self::GetVibrationDeviceInfo),
             201 => Some(Self::SendVibrationValue),
             203 => Some(Self::CreateActiveVibrationDeviceList),
@@ -211,9 +235,12 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L734-L735
         // Mouse/keyboard use the same PID + ARUID activation ABI.
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L734-L744
-        command @ (HidCommand::ActivateTouchScreen
+        command @ (HidCommand::ActivateDebugPad
+        | HidCommand::ActivateTouchScreen
         | HidCommand::ActivateMouse
-        | HidCommand::ActivateKeyboard) => {
+        | HidCommand::ActivateKeyboard
+        | HidCommand::ActivateConsoleSixAxisSensor
+        | HidCommand::ActivateSevenSixAxisSensor) => {
             // Plain CMIF carries alignment slack after this u64. libnx writes
             // only the semantic payload, so those trailing bytes retain prior
             // TLS contents and are not command input:
@@ -225,10 +252,80 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             match command {
+                HidCommand::ActivateDebugPad => hid_system.activate_debug_pad(),
                 HidCommand::ActivateTouchScreen => hid_system.activate_touch_screen(),
                 HidCommand::ActivateMouse => hid_system.activate_mouse(),
                 HidCommand::ActivateKeyboard => hid_system.activate_keyboard(),
+                HidCommand::ActivateConsoleSixAxisSensor => {
+                    hid_system.activate_console_six_axis_sensor();
+                }
+                HidCommand::ActivateSevenSixAxisSensor => {
+                    hid_system.activate_seven_six_axis_sensor();
+                }
                 _ => unreachable!(),
+            }
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        HidCommand::StartConsoleSixAxisSensor | HidCommand::StopConsoleSixAxisSensor => {
+            if !request.has_payload_size(16)
+                || hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            // Eden accepts these commands without changing activation: only
+            // ActivateConsoleSixAxisSensor controls shared-memory publication.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/hid/hid_server.cpp
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        HidCommand::InitializeSevenSixAxisSensor => {
+            // ARUID, two sizes, caller PID, and two transfer-memory handles.
+            // https://switchbrew.org/wiki/HID_services#InitializeSevenSixAxisSensor
+            if !request.has_payload_size(24)
+                || hipc.pid.is_none()
+                || hipc.copy_handles.len() != 2
+                || !hipc.move_handles.is_empty()
+                || !hipc.send_statics.is_empty()
+                || !hipc.send_buffers.is_empty()
+                || !hipc.receive_buffers.is_empty()
+                || !hipc.exchange_buffers.is_empty()
+                || hipc.receive_statics != ReceiveStatics::None
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let (Some(samples), Some(work)) = (
+                process.copy_handle::<TransferMemoryObject>(0),
+                process.copy_handle::<TransferMemoryObject>(1),
+            ) else {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            };
+            if request_u64(request.data, 8) != Some(0x1000)
+                || request_u64(request.data, 16) != Some(0x7f000)
+                || samples.size() != 0x1000
+                || work.size() != 0x7f000
+                || samples.permissions() != nixe_memory::MemoryPermissions::READ
+                || work.permissions() != nixe_memory::MemoryPermissions::NONE
+            {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            }
+            hid_system.initialize_seven_six_axis_sensor(samples);
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        command @ (HidCommand::StartSevenSixAxisSensor
+        | HidCommand::StopSevenSixAxisSensor
+        | HidCommand::FinalizeSevenSixAxisSensor
+        | HidCommand::ResetSevenSixAxisSensorTimestamp) => {
+            if request_u64(request.data, 0).is_none()
+                || hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            // Eden keeps sampling independent of Start/Stop/Finalize. Reset
+            // changes the timestamp origin to the last published sample time.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/hid/hid_server.cpp
+            if command == HidCommand::ResetSevenSixAxisSensorTimestamp {
+                hid_system.reset_seven_six_axis_sensor_timestamp();
             }
             semantic_success(request.token, false, &[], &[], &[], None)
         }
@@ -327,6 +424,18 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
                     None,
                 )
             }
+        }
+        // ClientAppletResourceUserId: ARUID placeholder and PID, no buffers.
+        // https://switchbrew.org/wiki/HID_services#StartLrAssignmentMode
+        command @ (HidCommand::StartLrAssignmentMode | HidCommand::StopLrAssignmentMode) => {
+            if hipc.pid.is_none()
+                || !request.has_payload_size(8)
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            hid_system.set_npad_lr_assignment_mode(command == HidCommand::StartLrAssignmentMode);
+            semantic_success(request.token, false, &[], &[], &[], None)
         }
         // u32 Npad ID followed by aligned u64 ARUID, with PID and no buffers.
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c

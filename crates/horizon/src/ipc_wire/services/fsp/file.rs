@@ -1,12 +1,14 @@
 //! `IFile` wire command decoding.
+//! Transfer length comes from the request and its IPC buffer, as in Eden IFile.
+//! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/filesystem/fsp/fs_i_file.cpp
 
 use crate::ipc_wire::request::Request;
 
+use crate::ipc_wire::IpcWireError;
 use crate::ipc_wire::buffer::{one_receive_buffer, one_send_buffer};
 use crate::ipc_wire::io::{request_u32, request_u64};
 use crate::ipc_wire::message::{CmifRequest, HipcRequest};
-use crate::ipc_wire::{IpcWireError, UnsupportedServiceOperation};
-use crate::{IpcRequest, MAX_IPC_READ_BYTES, SemanticIpcObject};
+use crate::{IpcRequest, SemanticIpcObject};
 
 use super::commands::FileCommand;
 
@@ -34,7 +36,7 @@ pub(super) async fn decode(
             let descriptor = one_receive_buffer(process, hipc)?;
             let capacity = usize::try_from(descriptor.size)
                 .map_err(|_| IpcWireError::Malformed("file output buffer is too large"))?;
-            let size = requested.min(capacity).min(MAX_IPC_READ_BYTES);
+            let size = requested.min(capacity);
             process.reserve_payload(size).await?;
             Ok(Some(IpcRequest::ReadFile { offset, size }))
         }
@@ -53,17 +55,6 @@ pub(super) async fn decode(
             ))?;
             let requested = request_u64(request.data, 16)
                 .ok_or(IpcWireError::Malformed("file write request omits its size"))?;
-            if requested > MAX_IPC_READ_BYTES as u64 {
-                return Err(IpcWireError::UnsupportedService(
-                    UnsupportedServiceOperation::CommandSizeLimitExceeded {
-                        service: "IFile",
-                        command_id: request.command_id,
-                        operation: "write",
-                        requested,
-                        limit: MAX_IPC_READ_BYTES as u64,
-                    },
-                ));
-            }
             let requested = usize::try_from(requested)
                 .map_err(|_| IpcWireError::Malformed("file write request size is out of range"))?;
             let descriptor = one_send_buffer(process, hipc)?;

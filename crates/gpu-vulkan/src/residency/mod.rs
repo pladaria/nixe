@@ -62,6 +62,7 @@ pub(crate) struct ImageView {
     pub(crate) image: ImageId,
     pub(crate) description: ImageViewDescription,
     pub(crate) native: Arc<crate::AllocatedImageView>,
+    pub(crate) supports_minmax_filter: bool,
     downloaded: bool,
 }
 mod attachment;
@@ -644,6 +645,39 @@ impl Residency<'_> {
         Ok(self.runtime.device.current_work())
     }
 
+    pub(crate) fn report_samples_passed(
+        &mut self,
+        target: &[nixe_memory::AllocationRange],
+        short: bool,
+        timestamp: u64,
+    ) -> Result<(), VulkanError> {
+        let mapping = PhysicalMapping::new(target)?;
+        let range = self.buffer_for_deferred_import(
+            mapping,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+        )?;
+        let size = if short { 4 } else { 16 };
+        self.ensure_buffer_range(range.buffer, range.offset, size)?;
+        self.prepare_write(Resource::Buffer(range.buffer), range.offset, size)?;
+        let output = self.use_buffer(range.buffer, range.offset, size)?;
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        let source = self.runtime.device.sample_report_buffer()?;
+        unsafe {
+            self.runtime.device.dispatch.cmd_copy_buffer(
+                source.handle,
+                output,
+                &[vk::BufferCopy::default()
+                    .dst_offset(range.offset)
+                    .size(if short { 4 } else { 8 })],
+                true,
+            )
+        };
+        self.finish_buffer_write(range.buffer, range.offset, size)?;
+        if !short {
+            self.write_buffer(range.buffer, range.offset + 8, &timestamp.to_le_bytes())?;
+        }
+        Ok(())
+    }
     pub(crate) fn report_memory(
         &mut self,
         target: Vec<nixe_memory::AllocationRange>,

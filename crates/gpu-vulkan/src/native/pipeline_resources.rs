@@ -136,12 +136,18 @@ impl PipelineResources {
                             })
                             .transpose()?,
                         dimension: match d.texture_type {
+                            T::Color1D => D::One,
+                            T::ColorArray1D => D::OneArray,
                             T::Color2D | T::Color2DRect => D::Two,
                             T::ColorArray2D => D::TwoArray,
                             T::Color3D => D::Three,
                             T::ColorCube => D::Cube,
                             T::ColorArrayCube => D::CubeArray,
-                            _ => return Err(fail("unsupported guest texture dimension")),
+                            kind => {
+                                return Err(VulkanError::Compilation(
+                                    format!("unsupported guest texture dimension: {kind:?}").into(),
+                                ));
+                            }
                         },
                         sampler: origin.sampler.is_some(),
                     });

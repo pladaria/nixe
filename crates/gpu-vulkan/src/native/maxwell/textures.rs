@@ -17,7 +17,7 @@ pub(in crate::native) struct ShaderTexture {
     pub(in crate::native) reference: MaxwellThreeDTextureReference,
     pub(in crate::native) dimension: Dimension,
     pub(in crate::native) descriptor: usize,
-    pub(in crate::native) sampler: Option<vk::Sampler>,
+    pub(in crate::native) sampler: Option<u32>,
 }
 
 fn failed(error: impl Display) -> VulkanError {
@@ -86,9 +86,10 @@ impl super::super::NativeExecution<'_> {
         compute: bool,
         space: &MaxwellGpuMemory,
         textures: &[ShaderTexture],
-    ) -> Result<smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>, VulkanError>
-    {
-        let mut images = smallvec::SmallVec::with_capacity(textures.len());
+        images: &mut smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>,
+    ) -> Result<(), VulkanError> {
+        images.clear();
+        images.reserve(textures.len());
         loop {
             self.residency.texture_cache.bindings.has_deleted_images = false;
             images.clear();
@@ -100,14 +101,18 @@ impl super::super::NativeExecution<'_> {
                     texture.dimension,
                     texture.index,
                 )?;
+                let sampler = texture
+                    .sampler
+                    .map(|index| self.sampler_for_view(compute, index, view))
+                    .transpose()?;
                 images.push(crate::residency::execution::ShaderImage {
                     view,
                     descriptor: texture.descriptor,
-                    sampler: texture.sampler,
+                    sampler,
                 });
             }
             if !self.residency.texture_cache.bindings.has_deleted_images {
-                return Ok(images);
+                return Ok(());
             }
         }
     }
@@ -150,6 +155,8 @@ impl super::super::NativeExecution<'_> {
         let words4 = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
         let kind = (words4 >> 23) & 15;
         let dimension = match kind {
+            0 => Dimension::One,
+            4 => Dimension::OneArray,
             1 | 7 => Dimension::Two,
             2 => Dimension::Three,
             3 => Dimension::Cube,
@@ -161,17 +168,28 @@ impl super::super::NativeExecution<'_> {
                 )));
             }
         };
+        // Eden ImageView creates both array and non-array views for each 2D
+        // or cube image. Shader dimensionality selects the view, not storage.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L2636-L2658
         let compatible = dimension == required
             || matches!(
                 (dimension, required),
-                (Dimension::Two, Dimension::TwoArray) | (Dimension::Cube, Dimension::CubeArray)
+                (Dimension::One, Dimension::OneArray)
+                    | (Dimension::OneArray, Dimension::One)
+                    | (Dimension::Two, Dimension::TwoArray)
+                    | (Dimension::TwoArray, Dimension::Two)
+                    | (Dimension::Cube, Dimension::CubeArray)
+                    | (Dimension::CubeArray, Dimension::Cube)
             );
         if !compatible {
             return Err(failed(format_args!(
                 "TIC index {index}: storage {dimension:?} incompatible with shader {required:?}"
             )));
         }
-        let arrayed = matches!(required, Dimension::TwoArray | Dimension::CubeArray);
+        let arrayed = matches!(
+            required,
+            Dimension::OneArray | Dimension::TwoArray | Dimension::CubeArray
+        );
         let view_kind = usize::from(arrayed);
         let current = self
             .residency
@@ -229,12 +247,7 @@ impl super::super::NativeExecution<'_> {
             .raw
             .info
             .clone();
-        let role = MaxwellThreeDResourceRole::SampledImage {
-            texture: reference,
-            dimension,
-            with_sampler: true,
-        };
-        let (image, base) = self.find_or_insert_image(&info, role, space)?;
+        let (image, base) = self.find_or_insert_image(&info, space)?;
         let view = self.sampled_view(image, info.description, info.swizzle, base, arrayed)?;
         self.residency
             .texture_cache
@@ -253,7 +266,7 @@ impl super::super::NativeExecution<'_> {
         space: &MaxwellGpuMemory,
         reference: MaxwellThreeDTextureReference,
         index: u32,
-    ) -> Result<vk::Sampler, VulkanError> {
+    ) -> Result<u32, VulkanError> {
         let bank = usize::from(compute);
         let table = &self
             .residency
@@ -285,7 +298,6 @@ impl super::super::NativeExecution<'_> {
             let description = model::engines::threed::decode_sampler(reference, index, bytes)
                 .and_then(|v| v.description())
                 .map_err(failed)?;
-            let native = self.guest_sampler(&description)?;
             let table = &mut self
                 .residency
                 .texture_cache
@@ -295,8 +307,25 @@ impl super::super::NativeExecution<'_> {
             if table.entries.len() <= index as usize {
                 table.entries.resize_with(index as usize + 1, || None);
             }
-            table.entries[index as usize] = Some(SamplerDescriptor { native, bytes });
+            table.entries[index as usize] = Some(SamplerDescriptor {
+                description,
+                variants: [None; 2],
+                bytes,
+            });
         }
+        Ok(index)
+    }
+    fn sampler_for_view(
+        &mut self,
+        compute: bool,
+        index: u32,
+        view: ImageViewId,
+    ) -> Result<vk::Sampler, VulkanError> {
+        // Sampler::MakeKey / HandleFor in Eden drops min/max reduction for
+        // views whose native format cannot filter it. Keep both variants in
+        // the current TSC slot, and retain native samplers in SamplerCache.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+        let bank = usize::from(compute);
         let entry = self
             .residency
             .texture_cache
@@ -306,6 +335,27 @@ impl super::super::NativeExecution<'_> {
             .entries[index as usize]
             .as_ref()
             .unwrap();
-        Ok(entry.native)
+        let mut description = entry.description;
+        let drop_reduction = description.reduction != nixe_gpu::SamplerReduction::WeightedAverage
+            && (!self.residency.device().profile().sampler_filter_minmax
+                || !self.residency.texture_cache.views[view].supports_minmax_filter);
+        let variant = usize::from(drop_reduction);
+        if let Some(native) = entry.variants[variant] {
+            return Ok(native);
+        }
+        if drop_reduction {
+            description.reduction = nixe_gpu::SamplerReduction::WeightedAverage;
+        }
+        let native = self.guest_sampler(&description)?;
+        self.residency
+            .texture_cache
+            .bindings
+            .channel
+            .sampler_descriptors[bank]
+            .entries[index as usize]
+            .as_mut()
+            .unwrap()
+            .variants[variant] = Some(native);
+        Ok(native)
     }
 }

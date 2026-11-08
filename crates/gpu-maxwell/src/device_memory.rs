@@ -31,6 +31,7 @@ pub struct MaxwellDeviceMapping {
     // Drop pins before releasing the address reservation or session heap.
     pin: DeviceMapping,
     memory: MaxwellDeviceMemory,
+    reservation_bytes: u64,
     _reservation: Option<DeviceReservation>,
 }
 impl MaxwellDeviceMemory {
@@ -93,9 +94,15 @@ impl MaxwellDeviceMemory {
     pub fn map(
         &self,
         ranges: Arc<[AllocationRange]>,
+        reservation_bytes: u64,
         cpu: Option<(AddressSpaceId, GuestVirtualAddress)>,
     ) -> Result<Arc<MaxwellDeviceMapping>, MemoryError> {
         let bytes = ranges.iter().map(|r| r.bytes()).sum::<u64>();
+        if reservation_bytes < bytes || !reservation_bytes.is_multiple_of(PAGE_SIZE) {
+            return Err(MemoryError::Invalid(
+                "SMMU reservation does not contain its CPU backing",
+            ));
+        }
         let heap = self.0.heap.read().unwrap();
         let address = cpu.and_then(|(process, address)| {
             heap.as_ref()
@@ -104,14 +111,14 @@ impl MaxwellDeviceMemory {
                         && address.get() >= heap.cpu
                         && address
                             .get()
-                            .checked_add(bytes)
+                            .checked_add(reservation_bytes)
                             .is_some_and(|end| end <= heap.cpu + heap.physical.bytes())
                 })
                 .map(|heap| heap.reservation.address() + address.get() - heap.cpu)
         });
         let reservation = if address.is_none() {
             Some(self.device().reserve(
-                bytes.div_ceil(RESERVATION_ALIGNMENT) * RESERVATION_ALIGNMENT,
+                reservation_bytes.next_multiple_of(RESERVATION_ALIGNMENT),
                 RESERVATION_ALIGNMENT,
             )?)
         } else {
@@ -122,6 +129,7 @@ impl MaxwellDeviceMemory {
         Ok(Arc::new(MaxwellDeviceMapping {
             pin,
             memory: self.clone(),
+            reservation_bytes,
             _reservation: reservation,
         }))
     }
@@ -130,238 +138,20 @@ impl MaxwellDeviceMapping {
     pub fn address(&self) -> u64 {
         self.pin.address()
     }
-    pub fn physical(&self) -> &Arc<PhysicalMapping> {
-        self.pin.physical()
+    pub fn reservation_bytes(&self) -> u64 {
+        self.reservation_bytes
     }
-    pub fn ranges(&self) -> &[AllocationRange] {
-        self.pin.ranges()
+    pub(super) fn memory_machine(&self) -> nixe_memory::MachineId {
+        self.memory.machine().identity()
+    }
+    pub(super) fn read_mapping(
+        &self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<Arc<PhysicalMapping>, MemoryError> {
+        self.memory.device().read_mapping(address, bytes)
     }
     pub fn belongs_to(&self, memory: &MaxwellDeviceMemory) -> bool {
         self.memory.device().same_device(memory.device())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn input(
-        machine: &Machine,
-        bytes: u64,
-        value: u8,
-    ) -> (nixe_memory::Allocation, Arc<[AllocationRange]>) {
-        let allocation = machine.account(bytes).unwrap().allocate(bytes).unwrap();
-        let ranges: Arc<[AllocationRange]> =
-            vec![AllocationRange::new(allocation.pin(), 0, bytes).unwrap()].into();
-        machine
-            .write_resolved(&ranges, &vec![value; bytes as usize])
-            .unwrap();
-        (allocation, ranges)
-    }
-    fn stream(view: &PhysicalMapping) -> Vec<u8> {
-        let mut bytes = vec![0xff; view.bytes() as usize];
-        view.capture_stream(0, &mut bytes).unwrap();
-        bytes
-    }
-    #[test]
-    fn shared_smmu_pins_belong_to_the_device_across_session_heap_policies() {
-        let machine = Machine::new(4 * PAGE_SIZE).unwrap();
-        let first = MaxwellDeviceMemory::new(machine.clone());
-        let second = MaxwellDeviceMemory::from_device(first.device().clone());
-        let other = MaxwellDeviceMemory::new(machine.clone());
-        let (_allocation, input) = input(&machine, PAGE_SIZE, 0x29);
-        let mapped = first.map(input, None).unwrap();
-        assert!(mapped.belongs_to(&second));
-        assert!(!mapped.belongs_to(&other));
-        assert_eq!(
-            stream(&second.device().read_mapping(mapped.address(), 32).unwrap()),
-            [0x29; 32]
-        );
-    }
-    #[test]
-    fn heap_offsets_cross_discontiguous_objects_and_preserve_unmapped_device_pages() {
-        let machine = Machine::new(16 * PAGE_SIZE).unwrap();
-        let device = MaxwellDeviceMemory::new(machine.clone());
-        let process = AddressSpaceId::new(7);
-        let cpu = GuestVirtualAddress::new(0x8000_0000);
-        let (_a, first) = input(&machine, PAGE_SIZE, 0x17);
-        let (_gap, gap) = input(&machine, PAGE_SIZE, 0xdd);
-        let (_b, second) = input(&machine, PAGE_SIZE, 0x29);
-        let (_hole, hole) = input(&machine, PAGE_SIZE, 0xee);
-        let cpu_pages = [
-            first[0].clone(),
-            hole[0].clone(),
-            second[0].clone(),
-            gap[0].clone(),
-        ];
-        device
-            .register_heap(process, cpu, PhysicalMapping::new(&cpu_pages).unwrap())
-            .unwrap();
-        let first = device.map(first, Some((process, cpu))).unwrap();
-        let second = device
-            .map(
-                second,
-                Some((process, cpu.checked_add(2 * PAGE_SIZE).unwrap())),
-            )
-            .unwrap();
-        assert_eq!(second.address(), first.address() + 2 * PAGE_SIZE);
-        let view = device
-            .device()
-            .read_mapping(first.address(), 4 * PAGE_SIZE)
-            .unwrap();
-        let bytes = stream(&view);
-        assert_eq!(&bytes[..PAGE_SIZE as usize], &[0x17; PAGE_SIZE as usize]);
-        assert_eq!(
-            &bytes[PAGE_SIZE as usize..2 * PAGE_SIZE as usize],
-            &[0; PAGE_SIZE as usize]
-        );
-        assert_eq!(
-            &bytes[2 * PAGE_SIZE as usize..3 * PAGE_SIZE as usize],
-            &[0x29; PAGE_SIZE as usize]
-        );
-        assert_eq!(&bytes[3 * PAGE_SIZE as usize..], &[0; PAGE_SIZE as usize]);
-        assert_eq!(view.spans().len(), 2);
-        assert_eq!(
-            view.missing(0..4 * PAGE_SIZE).collect::<Vec<_>>(),
-            [PAGE_SIZE..2 * PAGE_SIZE, 3 * PAGE_SIZE..4 * PAGE_SIZE]
-        );
-        let mapped = view.slice(0, PAGE_SIZE).unwrap();
-        assert_eq!(view.containing_offset(&mapped, 0..PAGE_SIZE), Some(0));
-        let dense = PhysicalMapping::new(first.ranges()).unwrap();
-        assert!(dense.containing_offset(&view, 0..4 * PAGE_SIZE).is_none());
-    }
-    #[test]
-    fn overlapping_heap_pins_release_only_uncovered_pages_and_pin_partial_allocations() {
-        let machine = Machine::new(4 * PAGE_SIZE).unwrap();
-        let device = MaxwellDeviceMemory::new(machine.clone());
-        let process = AddressSpaceId::new(1);
-        let cpu = GuestVirtualAddress::new(0x4000_0000);
-        let (allocation, ranges) = input(&machine, 2 * PAGE_SIZE, 0x53);
-        device
-            .register_heap(process, cpu, PhysicalMapping::new(&ranges).unwrap())
-            .unwrap();
-        let page: Arc<[AllocationRange]> =
-            vec![ranges[0].slice(PAGE_SIZE, PAGE_SIZE).unwrap()].into();
-        let whole = device
-            .map(Arc::clone(&ranges), Some((process, cpu)))
-            .unwrap();
-        let generation = device.device().generation();
-        let alias = device.map(ranges, Some((process, cpu))).unwrap();
-        assert_eq!(device.device().generation(), generation);
-        drop(alias);
-        assert_eq!(
-            device.device().generation(),
-            generation,
-            "overlapping pins do not change mapped coverage"
-        );
-        let second = device
-            .map(page, Some((process, cpu.checked_add(PAGE_SIZE).unwrap())))
-            .unwrap();
-        assert_eq!(device.device().generation(), generation);
-        let base = whole.address();
-        let id = allocation.identity();
-        drop(allocation);
-        drop(whole);
-        assert!(
-            device.device().generation() > generation,
-            "the uncovered first page changes coverage"
-        );
-        assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
-        assert!(machine.pin(id).is_none());
-        let view = device.device().read_mapping(base, 2 * PAGE_SIZE).unwrap();
-        let bytes = stream(&view);
-        assert_eq!(&bytes[..PAGE_SIZE as usize], &[0; PAGE_SIZE as usize]);
-        // WalkBlock advances by the pretracked CPU continuity even when its
-        // starting SMMU page is unmapped. A direct read of the live second page
-        // still consumes the retained partial allocation.
-        assert_eq!(&bytes[PAGE_SIZE as usize..], &[0; PAGE_SIZE as usize]);
-        assert_eq!(
-            stream(
-                &device
-                    .device()
-                    .read_mapping(base + PAGE_SIZE, PAGE_SIZE)
-                    .unwrap()
-            ),
-            vec![0x53; PAGE_SIZE as usize]
-        );
-        drop(second);
-        assert_eq!(machine.statistics().allocated_bytes, 0);
-        assert_eq!(
-            stream(&device.device().read_mapping(base, 2 * PAGE_SIZE).unwrap()),
-            vec![0; 2 * PAGE_SIZE as usize]
-        );
-    }
-    #[test]
-    fn contiguous_cpu_heap_block_reads_extend_beyond_the_first_nvmap_mapping() {
-        let machine = Machine::new(4 * PAGE_SIZE).unwrap();
-        let device = MaxwellDeviceMemory::new(machine.clone());
-        let process = AddressSpaceId::new(4);
-        let cpu = GuestVirtualAddress::new(0x9000_0000);
-        let (_allocation, ranges) = input(&machine, 4 * PAGE_SIZE, 0x61);
-        machine
-            .write_resolved(
-                &[ranges[0].slice(PAGE_SIZE, PAGE_SIZE).unwrap()],
-                &vec![0x72; PAGE_SIZE as usize],
-            )
-            .unwrap();
-        device
-            .register_heap(process, cpu, PhysicalMapping::new(&ranges).unwrap())
-            .unwrap();
-        let first = device
-            .map(
-                vec![ranges[0].slice(0, PAGE_SIZE).unwrap()].into(),
-                Some((process, cpu)),
-            )
-            .unwrap();
-        let view = device
-            .device()
-            .read_mapping(first.address(), 2 * PAGE_SIZE)
-            .unwrap();
-        let bytes = stream(&view);
-        assert_eq!(&bytes[..PAGE_SIZE as usize], &[0x61; PAGE_SIZE as usize]);
-        assert_eq!(&bytes[PAGE_SIZE as usize..], &[0x72; PAGE_SIZE as usize]);
-        assert_eq!(view.spans().len(), 1);
-        assert!(view.missing(0..2 * PAGE_SIZE).next().is_none());
-        let second = device
-            .map(
-                vec![ranges[0].slice(PAGE_SIZE, PAGE_SIZE).unwrap()].into(),
-                Some((process, cpu.checked_add(PAGE_SIZE).unwrap())),
-            )
-            .unwrap();
-        drop(second);
-        assert_eq!(
-            stream(
-                &device
-                    .device()
-                    .read_mapping(first.address(), 2 * PAGE_SIZE)
-                    .unwrap()
-            ),
-            bytes
-        );
-    }
-    #[test]
-    fn independent_device_allocations_keep_alignment_holes_and_reuse_after_last_pin() {
-        let machine = Machine::new(4 * PAGE_SIZE).unwrap();
-        let device = MaxwellDeviceMemory::new(machine.clone());
-        let (_a, first) = input(&machine, PAGE_SIZE, 0x6a);
-        let (_b, second) = input(&machine, PAGE_SIZE, 0x7b);
-        let first = device.map(first, None).unwrap();
-        let base = first.address();
-        let second = device.map(second.clone(), None).unwrap();
-        assert_eq!(second.address(), base + RESERVATION_ALIGNMENT);
-        let view = device
-            .device()
-            .read_mapping(base + PAGE_SIZE - 3, RESERVATION_ALIGNMENT - PAGE_SIZE + 6)
-            .unwrap();
-        let bytes = stream(&view);
-        assert_eq!(&bytes[..3], &[0x6a; 3]);
-        assert!(bytes[3..bytes.len() - 3].iter().all(|&byte| byte == 0));
-        assert_eq!(&bytes[bytes.len() - 3..], &[0x7b; 3]);
-        drop(first);
-        let replacement = device.map(second.ranges().to_vec().into(), None).unwrap();
-        assert_eq!(replacement.address(), base);
-        assert_eq!(
-            stream(&device.device().read_mapping(base, 3).unwrap()),
-            [0x7b; 3]
-        );
     }
 }

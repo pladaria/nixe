@@ -31,7 +31,8 @@ pub(super) fn copy_block(
             | vk::Format::R8_UINT
             | vk::Format::R8_SINT
             | vk::Format::R8_SRGB => (1, 1, 1),
-            vk::Format::R5G6B5_UNORM_PACK16
+            vk::Format::A1R5G5B5_UNORM_PACK16
+            | vk::Format::R5G6B5_UNORM_PACK16
             | vk::Format::B5G6R5_UNORM_PACK16
             | vk::Format::R4G4B4A4_UNORM_PACK16
             | vk::Format::B4G4R4A4_UNORM_PACK16
@@ -61,6 +62,7 @@ pub(super) fn copy_block(
             | vk::Format::R32_SINT
             | vk::Format::R32_SFLOAT
             | vk::Format::B10G11R11_UFLOAT_PACK32
+            | vk::Format::A2R10G10B10_UNORM_PACK32
             | vk::Format::A2B10G10R10_UNORM_PACK32
             | vk::Format::E5B9G9R9_UFLOAT_PACK32 => (1, 1, 4),
             vk::Format::R16G16B16A16_UNORM

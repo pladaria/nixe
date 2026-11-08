@@ -25,6 +25,19 @@ pub struct HorizonIpcResult(u32);
 
 impl HorizonIpcResult {
     pub const SUCCESS: Self = Self(0);
+    // Eden uses the account module's empty-notification result in friends.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/acc/errors.h
+    pub(crate) const ACCOUNT_NO_NOTIFICATIONS: Self = Self::new(124, 15);
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/bcat/bcat_result.h
+    pub(crate) const BCAT_INVALID_ARGUMENT: Self = Self::new(122, 1);
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/nfp/nfp_result.h
+    pub(crate) const NFP_DEVICE_NOT_FOUND: Self = Self::new(115, 64);
+    pub(crate) const NFP_INVALID_ARGUMENT: Self = Self::new(115, 65);
+    pub(crate) const NFP_WRONG_DEVICE_STATE: Self = Self::new(115, 73);
+    pub(crate) const NFP_DISABLED: Self = Self::new(115, 80);
+    pub(crate) const BCAT_FAILED_OPEN_ENTITY: Self = Self::new(122, 2);
+    pub(crate) const BCAT_ENTITY_ALREADY_OPEN: Self = Self::new(122, 6);
+    pub(crate) const BCAT_NO_OPEN_ENTRY: Self = Self::new(122, 7);
     // NIFM request results used by the public client and offline service.
     // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/nifm.c
     // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/nifm/nifm.cpp

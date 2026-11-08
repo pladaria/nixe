@@ -210,8 +210,10 @@ impl PreparedTargets {
             attachment_operations |= a.description.load != vk::AttachmentLoadOp::LOAD
                 || a.description.store != vk::AttachmentStoreOp::STORE;
             let image = a.view.image.handle;
-            let range =
-                commands::plane_range(a.plane).aspect_mask(sync::native_image_aspects(a.format));
+            let range = a
+                .view
+                .range
+                .aspect_mask(sync::native_image_aspects(a.format));
             if !images
                 .iter()
                 .any(|(old, r): &(vk::Image, vk::ImageSubresourceRange)| {
@@ -812,6 +814,7 @@ impl Residency<'_> {
                 descriptors,
                 draw,
                 push,
+                false,
                 |aspect| Ok(read_only_state(aspect, &graphics.parameters.state)),
                 |residency| {
                     residency.graphics_state(&graphics.program.pipeline, &graphics.parameters)
@@ -834,6 +837,7 @@ impl Residency<'_> {
         descriptors: DescriptorQueue,
         draw: Draw,
         push: &[u8],
+        count_samples: bool,
         read_only: impl Fn(vk::ImageAspectFlags) -> Result<bool, VulkanError>,
         record_state: impl FnOnce(&mut Self) -> Result<(), VulkanError>,
     ) -> Result<WorkTicket, VulkanError> {
@@ -988,7 +992,11 @@ impl Residency<'_> {
         if let Some(offsets) = dynamic_offsets {
             self.runtime.descriptor_offsets = offsets;
         }
+        self.runtime.device.set_samples_enabled(count_samples)?;
         self.runtime.device.request_render_pass(targets)?;
+        if !empty {
+            self.runtime.device.begin_samples(count_samples);
+        }
         {
             let device = &mut self.runtime.device;
             {

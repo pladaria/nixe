@@ -11,14 +11,31 @@ pub(super) type Regs = [u32; 0xe00];
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 pub(super) fn color_attachment_format(raw: u8, index: usize) -> Result<vk::Format, VulkanError> {
     Ok(match raw {
+        0xc6 => vk::Format::R16G16B16A16_UNORM,
+        0xc7 => vk::Format::R16G16B16A16_SNORM,
+        0xd7 => vk::Format::R8G8B8A8_SNORM,
+        0xda => vk::Format::R16G16_UNORM,
+        0xdb => vk::Format::R16G16_SNORM,
+        0xdf => vk::Format::A2R10G10B10_UNORM_PACK32,
+        0xe9 | 0xf8 => vk::Format::A1R5G5B5_UNORM_PACK16,
+        0xeb => vk::Format::R8G8_SNORM,
+        0xee => vk::Format::R16_UNORM,
+        0xef => vk::Format::R16_SNORM,
+        0xf4 => vk::Format::R8_SNORM,
         0 => vk::Format::UNDEFINED,
-        0xca => vk::Format::R16G16B16A16_SFLOAT,
-        0xcf => vk::Format::B8G8R8A8_UNORM,
-        0xd0 => vk::Format::B8G8R8A8_SRGB,
+        0xc0 | 0xc3 => vk::Format::R32G32B32A32_SFLOAT,
+        0xca | 0xce => vk::Format::R16G16B16A16_SFLOAT,
+        0xcb => vk::Format::R32G32_SFLOAT,
+        0xcf | 0xe6 => vk::Format::B8G8R8A8_UNORM,
+        0xd0 | 0xe7 => vk::Format::B8G8R8A8_SRGB,
         0xd1 => vk::Format::A2B10G10R10_UNORM_PACK32,
-        0xd5 => vk::Format::R8G8B8A8_UNORM,
-        0xd6 => vk::Format::R8G8B8A8_SRGB,
+        0xd5 | 0xf9 => vk::Format::R8G8B8A8_UNORM,
+        0xd6 | 0xfa => vk::Format::R8G8B8A8_SRGB,
+        0xde => vk::Format::R16G16_SFLOAT,
         0xe0 => vk::Format::B10G11R11_UFLOAT_PACK32,
+        0xe5 => vk::Format::R32_SFLOAT,
+        0xe8 => vk::Format::R5G6B5_UNORM_PACK16,
+        0xea => vk::Format::R8G8_UNORM,
         0xf2 => vk::Format::R16_SFLOAT,
         0xf3 => vk::Format::R8_UNORM,
         value => {
@@ -500,23 +517,13 @@ pub(super) fn clear_rect(r: &Regs, area: vk::Rect2D) -> Result<vk::Rect2D, Vulka
 
 /// Unsupported effects are checked at consumption; ordinary register admission
 /// stays a raw store. These checks do not build another draw description.
-pub(super) fn validate_draw(
-    state: &super::MaxwellThreeDState,
-    draw: &super::MaxwellThreeDDrawState,
-) -> Result<(), VulkanError> {
+pub(super) fn validate_draw(state: &super::MaxwellThreeDState) -> Result<(), VulkanError> {
     let r = state.register_words();
     if r[0x1618 / 4] & ((1 << 24) | (3 << 29)) != 0 {
         return Err(unsupported(
             0x1618,
             r[0x1618 / 4],
             "primitive-ID continuation and split modes are unsupported",
-        ));
-    }
-    if state.generated_primitive(draw.topology) == Some(GeneratedPrimitive::Points) {
-        return Err(unsupported(
-            0x165c,
-            r[0x165c / 4],
-            "point-center rasterization is unsupported",
         ));
     }
     Ok(())

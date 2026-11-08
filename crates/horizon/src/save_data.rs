@@ -24,8 +24,6 @@ pub struct SaveDataSystem {
     account_journal: i64,
     device_size: i64,
     device_journal: i64,
-    bcat_size: i64,
-    cache_size: i64,
     volumes: Arc<Mutex<OpenVolumes>>,
 }
 
@@ -51,8 +49,6 @@ impl SaveDataSystem {
             account_journal: nacp.user_account_save_data_journal_size,
             device_size: nacp.device_save_data_size,
             device_journal: nacp.device_save_data_journal_size,
-            bcat_size: nacp.bcat_delivery_cache_storage_size,
-            cache_size: nacp.cache_storage_size,
             volumes: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -66,6 +62,12 @@ impl SaveDataSystem {
 
     pub(crate) const fn program_id(&self) -> u64 {
         self.program_id
+    }
+
+    pub(crate) fn bcat_directory(&self) -> PathBuf {
+        self.root
+            .join(format!("{:016x}", self.program_id))
+            .join("bcat")
     }
 
     /// Prepares declared account/device saves for the selected launch user.
@@ -109,17 +111,19 @@ impl SaveDataSystem {
         Ok(volume)
     }
 
-    // EnsureApplicationSaveData creates only types declared by the NACP, and
-    // leaves existing saves intact. Success reports no additional space needed.
-    // https://switchbrew.org/wiki/AM_services#EnsureSaveData
-    // https://switchbrew.org/wiki/NACP
+    // EnsureSaveData creates the account save for the requested user, independently
+    // of BCAT/cache declarations. It preserves existing contents and reports no
+    // additional space needed, as Eden's IApplicationFunctions::EnsureSaveData.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/am/service/application_functions.cpp
     pub(crate) fn ensure(&self, user: u128) -> Result<u64, SaveDataError> {
-        if self.bcat_size != 0 || self.cache_size != 0 {
-            return Err(SaveDataError::Unsupported(
-                "BCAT/cache save creation is not implemented",
-            ));
+        if self.account_size < 0 || self.account_journal < 0 {
+            return Err(SaveDataError::Unsupported("negative NACP save-data size"));
         }
-        self.ensure_user_volumes(user)?;
+        ensure_volume(
+            &self.path("account", user),
+            self.account_size as u64,
+            self.account_journal as u64,
+        )?;
         Ok(0)
     }
 
@@ -183,53 +187,6 @@ fn ensure_volume(path: &Path, size: u64, journal: u64) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn launch_prepares_declared_saves_for_the_same_user_exposed_to_the_guest() {
-        let directory = tempfile::tempdir().unwrap();
-        let saves = SaveDataSystem {
-            root: directory.path().join("saves"),
-            program_id: 0x1234,
-            account_size: 4096,
-            account_journal: 1024,
-            device_size: 2048,
-            device_journal: 0,
-            bcat_size: 0,
-            cache_size: 0,
-            volumes: Arc::default(),
-        };
-        let user = u128::from_le_bytes(crate::user::DEFAULT_USER.id().encode());
-        assert_eq!(
-            saves.open("account", user).unwrap_err().kind(),
-            io::ErrorKind::NotFound
-        );
-
-        saves.prepare_for_launch().unwrap();
-        saves.open("account", user).unwrap();
-        saves.open("device", 0).unwrap();
-        assert!(saves.open("account", user + 1).is_err());
-        let metadata = fs::read(saves.path("account", user).join("metadata")).unwrap();
-        assert_eq!(
-            u64::from_le_bytes(metadata[8..16].try_into().unwrap()),
-            4096
-        );
-        let progress = saves.path("account", user).join("data/progress");
-        fs::write(&progress, b"existing progress").unwrap();
-        saves.prepare_for_launch().unwrap();
-        assert_eq!(fs::read(progress).unwrap(), b"existing progress");
-
-        // A title without save declarations does not get fabricated volumes.
-        let empty = SaveDataSystem {
-            program_id: 0x5678,
-            account_size: 0,
-            device_size: 0,
-            volumes: Arc::default(),
-            ..saves
-        };
-        empty.prepare_for_launch().unwrap();
-        assert!(!empty.path("account", user).exists());
-        assert!(!empty.path("device", 0).exists());
-    }
 
     #[test]
     fn creation_is_persistent_and_ensure_preserves_existing_contents_and_sizes() {

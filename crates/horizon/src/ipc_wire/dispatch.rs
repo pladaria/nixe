@@ -37,6 +37,10 @@ impl HorizonIpcObject {
             Self::OpusManager(session) => session.domain.is_domain(),
             Self::OpusDecoder(session) => session.domain.is_domain(),
             Self::PlayReport(session) => session.domain.is_domain(),
+            Self::Friends(session) => session.domain.is_domain(),
+            Self::Bcat(session) => session.domain.is_domain(),
+            Self::Nfp(session) => session.domain.is_domain(),
+            Self::Ngc(session) => session.domain.is_domain(),
             _ => false,
         }
     }
@@ -93,6 +97,16 @@ impl HorizonIpcObject {
             }
             Self::OpusDecoder(_) => "IHardwareOpusDecoder",
             Self::Hid(_) => "hid",
+            Self::Ngc(_) => "ngc:u",
+            Self::Nfp(session) => session
+                .target(domain_object)
+                .map_or("nfp:user", |object| object.name()),
+            Self::Bcat(session) => session
+                .target(domain_object)
+                .map_or("bcat:u", |object| object.name()),
+            Self::Friends(session) => session
+                .target(domain_object)
+                .map_or("friend:u", |object| object.name()),
             Self::SharedFont(_) => "pl:u",
             Self::Irs(_) => "irs",
             Self::HidAppletResource(_) => "IAppletResource",
@@ -280,6 +294,13 @@ pub(crate) async fn execute_request(
             )
             .await?
         }
+        HorizonIpcObject::Bcat(session) => {
+            services::dispatch_bcat(process, session, request, hipc).await?
+        }
+        HorizonIpcObject::Ngc(session) => services::dispatch_ngc(session, request, hipc)?,
+        HorizonIpcObject::Nfp(session) => {
+            services::dispatch_nfp(process, session, &resources.system.hid, request, hipc).await?
+        }
         HorizonIpcObject::SystemSettings(_) => {
             services::dispatch_system_settings(process, request, &hipc.receive_statics).await?
         }
@@ -318,10 +339,10 @@ pub(crate) async fn execute_request(
             .await?
         }
         HorizonIpcObject::AccountProfile(profile) => {
-            services::dispatch_account_profile(*profile, request, hipc, false)?
+            services::dispatch_account_profile(process, *profile, request, hipc, false).await?
         }
         HorizonIpcObject::AccountManagerForApplication(manager) => {
-            services::dispatch_account_manager_for_application(manager, request)?
+            services::dispatch_account_manager_for_application(manager, request, hipc, false)?
         }
         HorizonIpcObject::Bsd(session) => services::dispatch_bsd(process, session, request, hipc)?,
         HorizonIpcObject::Ssl(session) => services::dispatch_ssl(session, request, hipc)?,
@@ -368,6 +389,9 @@ pub(crate) async fn execute_request(
         }
         HorizonIpcObject::Hid(hid) => {
             services::dispatch_hid(process, hid, &resources.system.hid, request, hipc).await?
+        }
+        HorizonIpcObject::Friends(session) => {
+            services::dispatch_friends(process, session, request, hipc)?
         }
         HorizonIpcObject::SharedFont(session) => {
             services::dispatch_shared_font(process, session, request, hipc)?

@@ -79,7 +79,7 @@ impl crate::native::pipeline_cache::PipelineCache {
             dirty |= GraphicsDirty::PARAMETERS;
         }
         let r = registers.register_words();
-        registers::validate_draw(registers, draw)?;
+        registers::validate_draw(registers)?;
         let f = &profile.dynamic_state;
         let topology = if f.base && f.base2 {
             match draw.topology {

@@ -262,10 +262,8 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         state: &MaxwellThreeDState,
         space: &MaxwellGpuMemory,
         groups: [Option<u8>; 5],
-    ) -> Result<
-        smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>,
-        crate::VulkanError,
-    > {
+        images: &mut smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>,
+    ) -> Result<(), crate::VulkanError> {
         let bindings = state.shader_bindings();
         let via_header = bindings.sampler_binding().value()
             == Some(&model::engines::threed::MaxwellThreeDSamplerBindingMode::ViaTextureHeader);
@@ -302,7 +300,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 &mut textures,
             )?;
         });
-        execution.fill_shader_images(false, space, &textures)
+        execution.fill_shader_images(false, space, &textures, images)
     }
     #[allow(clippy::too_many_arguments)]
     fn configure_impl<const STAGES: u8, const STORAGE: bool>(
@@ -314,11 +312,20 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         groups: [Option<u8>; 5],
         arguments: Draw,
         dirty: u128,
-    ) -> Result<crate::native::pipeline_cache::ConfiguredGraphics, VulkanError> {
+    ) -> Result<(), VulkanError> {
         let pipeline = &self.pipeline;
         let vertex_attributes = self.vertex_attributes;
-        let images =
-            self.configure_resources::<STAGES, STORAGE>(execution, registers, space, groups)?;
+        // ConfigureImpl owns and consumes the draw-local views, as Eden does.
+        // Keep the inline payload in this frame instead of moving it through
+        // large Result values between preparation and recording.
+        let mut images = smallvec::SmallVec::new();
+        self.configure_resources::<STAGES, STORAGE>(
+            execution,
+            registers,
+            space,
+            groups,
+            &mut images,
+        )?;
         let mut geometry_changed = false;
         loop {
             execution
@@ -429,7 +436,16 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
             execution.residency.guest_descriptor_update()
         };
         execution.update_render_targets(registers, space)?;
-        Ok((images, descriptors, arguments))
+        let targets = execution.current_framebuffer(registers)?;
+        self.record(
+            execution,
+            registers,
+            draw,
+            &targets,
+            arguments,
+            &images,
+            descriptors,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -443,7 +459,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
     ) -> Result<(), VulkanError> {
         execution.flush_work()?;
         let arguments = registers::draw_arguments(registers, draw)?;
-        let (images, descriptors, arguments) = (self.configure)(
+        (self.configure)(
             self,
             execution,
             registers,
@@ -452,16 +468,6 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
             groups,
             arguments,
             registers.graphics_dirty().bits(GraphicsDirty::PARAMETERS),
-        )?;
-        let targets = execution.current_framebuffer(registers)?;
-        self.record(
-            execution,
-            registers,
-            draw,
-            &targets,
-            arguments,
-            &images,
-            descriptors,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -484,6 +490,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
             descriptors,
             draw,
             push.as_bytes(),
+            registers.register_words()[0x1514 / 4] != 0,
             |aspect| {
                 let r = registers.register_words();
                 Ok(if aspect == vk::ImageAspectFlags::DEPTH {

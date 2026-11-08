@@ -31,30 +31,23 @@ pub fn sampled_image_info(
             field: "format/component/swizzle",
             value: format_word,
         })?;
-    let sample_swizzle =
-        if !matches!(
-            format,
-            ImageFormat::Bgra8Unorm
-                | ImageFormat::Bgra8Srgb
-                | ImageFormat::Rgb565Unorm
-                | ImageFormat::Depth24UnormStencil8Uint
-                | ImageFormat::Depth32Float
-        ) && !(matches!(format, ImageFormat::R8Unorm | ImageFormat::Depth16Unorm)
-            && swizzle == [2, 0, 0, 7])
-        {
-            Swizzle(swizzle.map(|component| match component {
-                0 => ComponentSwizzle::Zero,
-                2 => ComponentSwizzle::Red,
-                3 => ComponentSwizzle::Green,
-                4 => ComponentSwizzle::Blue,
-                5 => ComponentSwizzle::Alpha,
-                7 => ComponentSwizzle::One,
-                _ => unreachable!("validated TIC component mapping"),
-            }))
-        } else {
-            // Existing format tuples include their native component mapping.
-            Swizzle::IDENTITY
-        };
+    let sample_swizzle = if !matches!(
+        format,
+        ImageFormat::Bgra8Unorm | ImageFormat::Bgra8Srgb | ImageFormat::Rgb565Unorm
+    ) {
+        Swizzle(swizzle.map(|component| match component {
+            0 => ComponentSwizzle::Zero,
+            2 => ComponentSwizzle::Red,
+            3 => ComponentSwizzle::Green,
+            4 => ComponentSwizzle::Blue,
+            5 => ComponentSwizzle::Alpha,
+            6 | 7 => ComponentSwizzle::One,
+            _ => unreachable!("validated TIC component mapping"),
+        }))
+    } else {
+        // These packed color formats already include their native mapping.
+        Swizzle::IDENTITY
+    };
     let header_version = ((words[2] >> 21) & 7) as u8;
     let texture_type = ((words[4] >> 23) & 0xf) as u8;
     let width = (words[4] & 0xffff) + 1;
@@ -72,6 +65,17 @@ pub fn sampled_image_info(
     let layer_base =
         ((words[4] >> 16) & 7) | (((words[2] >> 16) & 0x1f) << 3) | (((words[2] >> 29) & 7) << 8);
     let (required_texture_type, layers) = match required_dimension {
+        MaxwellThreeDTextureDimension::One => (0, 1),
+        MaxwellThreeDTextureDimension::OneArray => (
+            4,
+            u16::try_from(depth).map_err(|_| {
+                MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
+                    descriptor: descriptor_index,
+                    field: "1D-array layer count",
+                    value: depth,
+                }
+            })?,
+        ),
         MaxwellThreeDTextureDimension::Two => (1, 1_u16),
         MaxwellThreeDTextureDimension::Three => (2, 1),
         // A single TIC cubemap has depth one and six independent faces.
@@ -110,6 +114,7 @@ pub fn sampled_image_info(
                 MaxwellThreeDTextureDimension::Two | MaxwellThreeDTextureDimension::TwoArray
             ))
         || (required_dimension == MaxwellThreeDTextureDimension::CubeArray && texture_type == 3)
+        || (required_dimension == MaxwellThreeDTextureDimension::OneArray && texture_type == 0)
         || (required_dimension == MaxwellThreeDTextureDimension::TwoArray && texture_type == 1);
     // TEX's array coordinate does not require multiple storage layers. A
     // non-array TIC can be sampled through a one-layer array view, retaining
@@ -120,7 +125,11 @@ pub fn sampled_image_info(
         || !texture_type_matches
         || (cube && (pitch_linear || width != height))
         || (pitch_linear && depth != 1)
-        || (!matches!(texture_type, 2 | 5 | 8) && depth != 1)
+        || (!matches!(texture_type, 2 | 4 | 5 | 8) && depth != 1)
+        || (matches!(
+            required_dimension,
+            MaxwellThreeDTextureDimension::One | MaxwellThreeDTextureDimension::OneArray
+        ) && (height != 1 || pitch_linear))
         || (required_dimension == MaxwellThreeDTextureDimension::Two && depth != 1)
         || (!pitch_linear
             && (block_width_log2 != 0 || block_depth_log2 > 5 || block_height_log2 > 5))
@@ -128,7 +137,9 @@ pub fn sampled_image_info(
         || view_mip_min != 0
         || view_mip_max != mip_max
         || msaa != 0
-        || !normalized
+        // Only non-array 2D TICs select rectangle-coordinate semantics with
+        // this bit. Eden leaves 1D, array, cube and 3D view types unchanged.
+        || (!normalized && matches!(texture_type, 1 | 7))
         || layer_base != 0
     {
         log::debug!(
@@ -150,7 +161,12 @@ pub fn sampled_image_info(
         });
     }
     let description = ImageDescription::new(
-        if cube {
+        if matches!(
+            required_dimension,
+            MaxwellThreeDTextureDimension::One | MaxwellThreeDTextureDimension::OneArray
+        ) {
+            ImageDimension::One
+        } else if cube {
             ImageDimension::Cube
         } else if required_dimension == MaxwellThreeDTextureDimension::Three {
             ImageDimension::Three
@@ -235,18 +251,6 @@ pub fn sampled_image_info(
             .checked_mul(u64::from(layers))
             .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?
     };
-    let compressed_kind = match format {
-        ImageFormat::Depth16Unorm => Some(MAXWELL_Z16_2Z_KIND),
-        ImageFormat::Depth24UnormStencil8Uint => Some(MAXWELL_Z24S8_2CZ_KIND),
-        _ => (!format.is_depth_stencil() && block_width == 1 && block_height == 1)
-            .then(|| single_sample_compressed_color_kind(u64::from(bytes_per_block)))
-            .flatten(),
-    };
-    let expected_kind = if pitch_linear {
-        MAXWELL_PITCH_KIND
-    } else {
-        MAXWELL_GENERIC_BLOCK_LINEAR_KIND
-    };
     Ok(ImageInfo {
         address,
         description,
@@ -256,9 +260,6 @@ pub fn sampled_image_info(
         layer_stride,
         maybe_unaligned_layer_stride: layer_size,
         size,
-        expected_kind,
-        compressed_kind,
-        generic_kind_allowed: !pitch_linear,
         guest_format: if format == ImageFormat::Depth24UnormStencil8Uint {
             // TIC Z24S8 and SET_ZT_FORMAT describe the same packed texels.
             // Keep the storage encoding independent of texture selectors.

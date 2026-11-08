@@ -465,6 +465,11 @@ impl Residency<'_> {
             }
         }
         match d.view_type {
+            vk::ImageViewType::TYPE_1D
+                if entry.description.image_type == vk::ImageType::TYPE_1D && d.layer_count == 1 => {
+            }
+            vk::ImageViewType::TYPE_1D_ARRAY
+                if entry.description.image_type == vk::ImageType::TYPE_1D => {}
             vk::ImageViewType::TYPE_2D if d.layer_count == 1 => {}
             vk::ImageViewType::TYPE_2D_ARRAY => {}
             vk::ImageViewType::TYPE_3D
@@ -548,7 +553,7 @@ impl Residency<'_> {
             if entry.description.image_type == vk::ImageType::TYPE_3D {
                 vk::ImageSubresourceRange {
                     base_array_layer: 0,
-                    layer_count: 1,
+                    layer_count: vk::REMAINING_ARRAY_LAYERS,
                     ..info.subresource_range
                 }
             } else {
@@ -556,10 +561,20 @@ impl Residency<'_> {
             },
         ));
         let downloaded = entry.forced_flushed;
+        // Eden records format capabilities once in ImageView, then selects a
+        // persistent sampler variant when that view is consumed.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+        let supports_minmax_filter = self
+            .runtime
+            .device
+            .format_properties(description.format)
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_MINMAX);
         let view = self.texture_cache.views.insert(ImageView {
             image,
             description,
             native,
+            supports_minmax_filter,
             downloaded,
         });
         self.texture_cache.images[image].views.push(view);
@@ -581,7 +596,7 @@ fn validate_planes(
     }
     if !matches!(
         description.image_type,
-        vk::ImageType::TYPE_2D | vk::ImageType::TYPE_3D
+        vk::ImageType::TYPE_1D | vk::ImageType::TYPE_2D | vk::ImageType::TYPE_3D
     ) || sample_grid[0] == 0
         || sample_grid[1] == 0
         || sample_grid[0].checked_mul(sample_grid[1]) != Some(description.samples.as_raw())
@@ -589,7 +604,7 @@ fn validate_planes(
         || description.samples != vk::SampleCountFlags::TYPE_1 && description.mip_levels != 1
     {
         return Err(VulkanError::InvalidResource(
-            "image residency requires 2D planes and a valid frontend sample grid",
+            "image residency requires valid dimensions and a frontend sample grid",
         ));
     }
     let mut prior = 0;

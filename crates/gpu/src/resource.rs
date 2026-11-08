@@ -208,6 +208,40 @@ pub enum ImageFormat {
     Bc7RgbaSrgb,
     /// Packed UNORM: R in bits 9:0, G in 19:10, B in 29:20, A in 31:30.
     Rgb10a2Unorm,
+    R8Snorm,
+    Rg8Snorm,
+    Rgba8Snorm,
+    R16Unorm,
+    R16Snorm,
+    Rg16Unorm,
+    Rg16Snorm,
+    Rgba16Unorm,
+    Rgba16Snorm,
+    /// Packed UNORM: B in bits 9:0, G in 19:10, R in 29:20, A in 31:30.
+    Bgr10a2Unorm,
+    /// Packed UNORM: B in bits 4:0, G in 9:5, R in 14:10, A in bit 15.
+    A1Rgb5Unorm,
+    // Integer sampled images retain their component type through the native
+    // format, as Eden's R/RG/RGBA integer pixel formats.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/format_lookup_table.cpp
+    R8Uint,
+    R8Sint,
+    Rg8Uint,
+    Rg8Sint,
+    Rgba8Uint,
+    Rgba8Sint,
+    R16Uint,
+    R16Sint,
+    Rg16Uint,
+    Rg16Sint,
+    Rgba16Uint,
+    Rgba16Sint,
+    R32Uint,
+    R32Sint,
+    Rg32Uint,
+    Rg32Sint,
+    Rgba32Uint,
+    Rgba32Sint,
 }
 
 impl ImageFormat {
@@ -394,9 +428,24 @@ impl ImageFormat {
             | Self::Astc12x12Srgb => {
                 return None;
             }
-            Self::R8Unorm => 1,
-            Self::Rgb565Unorm | Self::Rg8Unorm | Self::R16Float | Self::Depth16Unorm => 2,
+            Self::R8Unorm | Self::R8Snorm | Self::R8Uint | Self::R8Sint => 1,
+            Self::Rgb565Unorm
+            | Self::A1Rgb5Unorm
+            | Self::Rg8Unorm
+            | Self::Rg8Snorm
+            | Self::R16Unorm
+            | Self::R16Snorm
+            | Self::R16Float
+            | Self::R16Uint
+            | Self::R16Sint
+            | Self::Rg8Uint
+            | Self::Rg8Sint
+            | Self::Depth16Unorm => 2,
             Self::Rgba8Unorm
+            | Self::Rgba8Snorm
+            | Self::Rg16Unorm
+            | Self::Rg16Snorm
+            | Self::Bgr10a2Unorm
             | Self::Rgba8Srgb
             | Self::Bgra8Unorm
             | Self::Bgra8Srgb
@@ -405,9 +454,23 @@ impl ImageFormat {
             | Self::Rgb10a2Unorm
             | Self::R32Float
             | Self::Depth24UnormStencil8Uint
-            | Self::Depth32Float => 4,
-            Self::Rgba16Float | Self::Rg32Float | Self::Depth32FloatStencil8Uint => 8,
-            Self::Rgba32Float => 16,
+            | Self::Depth32Float
+            | Self::Rgba8Uint
+            | Self::Rgba8Sint
+            | Self::Rg16Uint
+            | Self::Rg16Sint
+            | Self::R32Uint
+            | Self::R32Sint => 4,
+            Self::Rgba16Float
+            | Self::Rgba16Unorm
+            | Self::Rgba16Snorm
+            | Self::Rg32Float
+            | Self::Depth32FloatStencil8Uint
+            | Self::Rgba16Uint
+            | Self::Rgba16Sint
+            | Self::Rg32Uint
+            | Self::Rg32Sint => 8,
+            Self::Rgba32Float | Self::Rgba32Uint | Self::Rgba32Sint => 16,
         })
     }
 }
@@ -562,6 +625,14 @@ pub enum FilterMode {
     Linear,
 }
 
+/// How a sampler combines the texels selected by its filters.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SamplerReduction {
+    WeightedAverage,
+    Min,
+    Max,
+}
+
 /// Addressing behavior outside normalized texture coordinates.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AddressMode {
@@ -575,6 +646,7 @@ pub enum AddressMode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SamplerDescription {
     pub compare: Option<crate::DepthCompareOperation>,
+    pub reduction: SamplerReduction,
     pub min_filter: FilterMode,
     pub mag_filter: FilterMode,
     pub mip_filter: FilterMode,
@@ -606,6 +678,7 @@ impl SamplerDescription {
         }
         Ok(Self {
             compare: None,
+            reduction: SamplerReduction::WeightedAverage,
             min_filter,
             mag_filter,
             mip_filter,

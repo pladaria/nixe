@@ -237,6 +237,9 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         application_display_version: plan
             .control_metadata()
             .map(|control| control.nacp.display_version.clone()),
+        application_pseudo_device_seed: plan
+            .control_metadata()
+            .map(|control| control.nacp.seed_for_pseudo_device_id),
         save_data: plan.packaged_identity().zip(plan.control_metadata()).map(
             |(identity, control)| {
                 SaveDataSystem::new(
@@ -552,6 +555,7 @@ struct HorizonEnvironment {
     system_archives: nixe_horizon::SystemArchives,
     application_language: Option<SystemLanguage>,
     application_display_version: Option<String>,
+    application_pseudo_device_seed: Option<u64>,
     user_account_switch_locked: Option<bool>,
     save_data: Option<SaveDataSystem>,
     diagnostics: HorizonDiagnostics,
@@ -743,6 +747,9 @@ fn execute(
     }
     if let Some(version) = horizon_environment.application_display_version {
         dispatcher = dispatcher.with_application_display_version(&version);
+    }
+    if let Some(seed) = horizon_environment.application_pseudo_device_seed {
+        dispatcher = dispatcher.with_application_pseudo_device_seed(seed);
     }
     runtime
         .start(dispatcher.clone())

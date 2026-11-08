@@ -625,14 +625,13 @@ impl Host1x {
                 } else {
                     // Host1x has a 32-bit IOVA, separate from Maxwell's GPU VA.
                     // Reuse unmapped holes; keep the object pinned while any channel owns it.
-                    let size = u64::from(object.size()).next_multiple_of(4096);
+                    let size = object.backing_size();
                     let mut address = 4096_u64;
                     for (&base, mapping) in self.mappings.iter() {
                         if address + size <= u64::from(base) {
                             break;
                         }
-                        address = u64::from(base)
-                            + u64::from(mapping.object.size()).next_multiple_of(4096);
+                        address = u64::from(base) + mapping.object.backing_size();
                     }
                     if address + size > 1_u64 << 32 {
                         return Err(super::NV_INSUFFICIENT_MEMORY.into());

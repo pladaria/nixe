@@ -22,6 +22,7 @@ pub(crate) struct FileServices {
 
 #[derive(Debug)]
 pub(crate) struct SystemServices {
+    pub profiles: Arc<crate::user::ProfileManager>,
     pub operation_mode: crate::OperationMode,
     pub time: crate::TimeEnvironment,
     pub hid: crate::HidSystem,
@@ -29,6 +30,7 @@ pub(crate) struct SystemServices {
     pub settings: crate::SettingsEnvironment,
     pub application_language: Option<crate::SystemLanguage>,
     pub application_display_version: Option<[u8; 16]>,
+    pub application_pseudo_device_seed: Option<u64>,
     pub user_account_switch_locked: Option<bool>,
     pub diagnostics: crate::HorizonDiagnostics,
 }

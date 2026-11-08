@@ -28,7 +28,9 @@ pub(crate) struct SamplerDescriptors {
     pub(crate) entries: Vec<Option<SamplerDescriptor>>,
 }
 pub(crate) struct SamplerDescriptor {
-    pub(crate) native: vk::Sampler,
+    pub(crate) description: nixe_gpu::SamplerDescription,
+    /// Original reduction and the variant for views without min/max filtering.
+    pub(crate) variants: [Option<vk::Sampler>; 2],
     pub(crate) bytes: [u8; 32],
 }
 /// Channel selections and texture contents share the actual texture-cache

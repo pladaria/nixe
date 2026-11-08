@@ -177,11 +177,6 @@ pub(super) fn ioctl_nvhost_as_gpu(
                     backing_offset: buffer_offset,
                     size: mapping_size,
                     allocation_alignment: metadata.alignment(),
-                    // This field is reserved by the versioned Switch ABI.
-                    // libnx names it page_size but the public driver behavior
-                    // leaves it unused; frontend page size is derived from the
-                    // retained allocation alignment and address-space profile.
-                    page_size: 0,
                     kind: decode_kind(kind, metadata.kind())?,
                     cacheable: flags & MAP_CACHEABLE != 0,
 

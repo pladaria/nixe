@@ -104,8 +104,6 @@ impl Residency<'_> {
             self.runtime.barriers.queue_image(sync::initialize_image(
                 entry.view.image.handle,
                 entry.aspects,
-                1,
-                1,
             ));
             entry.initialized = true;
         }

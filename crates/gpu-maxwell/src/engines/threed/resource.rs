@@ -35,38 +35,17 @@ use super::{
     MaxwellThreeDUnresolvedAddress,
 };
 
-// Public Switch NVIDIA memory kinds. Only the verified compression families
-// listed below are accepted; accepting a kind does not make compressed guest
-// bytes directly importable as generic block-linear storage.
-// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/nvidia/types.h#L18-L250
-const MAXWELL_PITCH_KIND: u8 = 0x00;
-const MAXWELL_PITCH_NO_SWIZZLE_KIND: u8 = 0xfd;
-const MAXWELL_GENERIC_BLOCK_LINEAR_KIND: u8 = 0xfe;
-// Deko3d's verified single-sample compressed color kinds. These retain the
-// same block-linear address equation as the corresponding generic surface,
-// but identify the color-compression family selected for each texel width.
-// https://github.com/devkitPro/deko3d/blob/6ee80db52aac0168303fc2f6417232997e464999/source/maxwell/image_formats.cpp#L95-L128
-// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/nvidia/types.h#L210-L243
-const MAXWELL_C32_2CRA_KIND: u8 = 0xdb;
-const MAXWELL_C64_2CRA_KIND: u8 = 0xe9;
-const MAXWELL_C128_2CR_KIND: u8 = 0xf5;
 // Single-sample 2CZ depth kinds preserve distinct guest depth/stencil packing.
 // They require materialization, not a generic block-linear byte import.
 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/nvidia/types.h#L35-L100
 // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/image_formats.cpp#L35-L73
 const MAXWELL_S8Z24_2CZ_KIND: u8 = 0x17;
 const MAXWELL_Z24S8_2CZ_KIND: u8 = 0x51;
-// Single-sample Z16 depth compression. Render-target descriptors still define
-// its block-linear geometry; native depth clears/draws materialize the pixels.
-// https://github.com/NVIDIA/open-gpu-doc/blob/master/manuals/volta/gv100/dev_mmu.ref.txt
-const MAXWELL_Z16_2Z_KIND: u8 = 0x07;
 // Four-sample kinds selected by deko3d. Their bytes are never imported as
 // single-sample texels, even when compression of subsequent writes is off.
 // https://github.com/devkitPro/deko3d/blob/master/source/maxwell/image_formats.cpp
 // https://github.com/switchbrew/libnx/blob/master/nx/include/switch/nvidia/types.h
 const MAXWELL_C32_MS4_2CBR_KIND: u8 = 0xe0;
-const MAXWELL_S8Z24_MS4_2CZ_KIND: u8 = 0x19;
-const MAXWELL_Z24S8_MS4_2CZ_KIND: u8 = 0x53;
 
 /// Frontend role of one completely resolved resource.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -91,6 +70,8 @@ pub enum MaxwellThreeDTextureDimension {
     TwoArray,
     Cube,
     CubeArray,
+    One,
+    OneArray,
 }
 
 /// Draw-local location of a raw Maxwell TIC/TSC handle.
@@ -154,6 +135,7 @@ pub enum MaxwellThreeDGuestImageFormat {
 pub struct MaxwellThreeDResolvedSampler {
     role: MaxwellThreeDResourceRole,
     compare: Option<nixe_gpu::DepthCompareOperation>,
+    reduction: nixe_gpu::SamplerReduction,
     min_filter: FilterMode,
     mag_filter: FilterMode,
     mip_filter: FilterMode,
@@ -184,6 +166,7 @@ impl MaxwellThreeDResolvedSampler {
         .map(|mut description| {
             description.border_color = self.border_color;
             description.compare = self.compare;
+            description.reduction = self.reduction;
             description.lod_bias = f32::from(self.lod_bias_fixed) / 256.0;
             description
         })
@@ -215,16 +198,39 @@ fn color_image_format(
     format: u8,
     role: MaxwellThreeDResourceRole,
 ) -> Result<ImageFormat, MaxwellThreeDResourceError> {
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/surface.cpp
     match format {
+        0xc6 => Ok(ImageFormat::Rgba16Unorm),
+        0xc7 => Ok(ImageFormat::Rgba16Snorm),
+        0xd7 => Ok(ImageFormat::Rgba8Snorm),
+        0xda => Ok(ImageFormat::Rg16Unorm),
+        0xdb => Ok(ImageFormat::Rg16Snorm),
+        0xdf => Ok(ImageFormat::Bgr10a2Unorm),
+        0xe9 | 0xf8 => Ok(ImageFormat::A1Rgb5Unorm),
+        0xeb => Ok(ImageFormat::Rg8Snorm),
+        0xee => Ok(ImageFormat::R16Unorm),
+        0xef => Ok(ImageFormat::R16Snorm),
+        0xf4 => Ok(ImageFormat::R8Snorm),
+        0xc0 | 0xc3 => Ok(ImageFormat::Rgba32Float),
         0xca => Ok(ImageFormat::Rgba16Float),
+        0xcb => Ok(ImageFormat::Rg32Float),
+        0xce => Ok(ImageFormat::Rgba16Float),
         0xcf => Ok(ImageFormat::Bgra8Unorm),
         0xd0 => Ok(ImageFormat::Bgra8Srgb),
         0xd1 => Ok(ImageFormat::Rgb10a2Unorm),
         0xd5 => Ok(ImageFormat::Rgba8Unorm),
         0xd6 => Ok(ImageFormat::Rgba8Srgb),
+        0xde => Ok(ImageFormat::Rg16Float),
         0xe0 => Ok(ImageFormat::Rg11b10Ufloat),
+        0xe5 => Ok(ImageFormat::R32Float),
+        0xe6 => Ok(ImageFormat::Bgra8Unorm),
+        0xe7 => Ok(ImageFormat::Bgra8Srgb),
+        0xe8 => Ok(ImageFormat::Rgb565Unorm),
+        0xea => Ok(ImageFormat::Rg8Unorm),
         0xf2 => Ok(ImageFormat::R16Float),
         0xf3 => Ok(ImageFormat::R8Unorm),
+        0xf9 => Ok(ImageFormat::Rgba8Unorm),
+        0xfa => Ok(ImageFormat::Rgba8Srgb),
         _ => Err(MaxwellThreeDResourceError::UnsupportedColorFormat { role, format }),
     }
 }
@@ -240,7 +246,7 @@ fn decode_sampled_texture_format(
     srgb: bool,
     reserved: u32,
 ) -> Option<ImageFormat> {
-    if reserved != 0 || !swizzle.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) {
+    if reserved != 0 || !swizzle.iter().all(|c| matches!(c, 0 | 2..=7)) {
         return None;
     }
     if components == [2; 4] {
@@ -280,6 +286,36 @@ fn decode_sampled_texture_format(
         }
     }
     match (image_format, components, swizzle, srgb) {
+        // Component type 4 is UINT, type 3 is SINT; selectors do not
+        // change the integer storage or its shader-visible component type.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/format_lookup_table.cpp
+        (0x1d, [4, 4, 4, 4], _, false) => Some(ImageFormat::R8Uint),
+        (0x1d, [3, 3, 3, 3], _, false) => Some(ImageFormat::R8Sint),
+        (0x18, [4, 4, 4, 4], _, false) => Some(ImageFormat::Rg8Uint),
+        (0x18, [3, 3, 3, 3], _, false) => Some(ImageFormat::Rg8Sint),
+        (0x08, [4, 4, 4, 4], _, false) => Some(ImageFormat::Rgba8Uint),
+        (0x08, [3, 3, 3, 3], _, false) => Some(ImageFormat::Rgba8Sint),
+        (0x1b, [4, 4, 4, 4], _, false) => Some(ImageFormat::R16Uint),
+        (0x1b, [3, 3, 3, 3], _, false) => Some(ImageFormat::R16Sint),
+        (0x0c, [4, 4, 4, 4], _, false) => Some(ImageFormat::Rg16Uint),
+        (0x0c, [3, 3, 3, 3], _, false) => Some(ImageFormat::Rg16Sint),
+        (0x03, [4, 4, 4, 4], _, false) => Some(ImageFormat::Rgba16Uint),
+        (0x03, [3, 3, 3, 3], _, false) => Some(ImageFormat::Rgba16Sint),
+        (0x0f, [4, 4, 4, 4], _, false) => Some(ImageFormat::R32Uint),
+        (0x0f, [3, 3, 3, 3], _, false) => Some(ImageFormat::R32Sint),
+        (0x04, [4, 4, 4, 4], _, false) => Some(ImageFormat::Rg32Uint),
+        (0x04, [3, 3, 3, 3], _, false) => Some(ImageFormat::Rg32Sint),
+        (0x01, [4, 4, 4, 4], _, false) => Some(ImageFormat::Rgba32Uint),
+        (0x01, [3, 3, 3, 3], _, false) => Some(ImageFormat::Rgba32Sint),
+        (0x1d, [1, 1, 1, 1], _, false) => Some(ImageFormat::R8Snorm),
+        (0x18, [1, 1, 1, 1], _, false) => Some(ImageFormat::Rg8Snorm),
+        (0x08, [1, 1, 1, 1], _, false) => Some(ImageFormat::Rgba8Snorm),
+        (0x1b, [2, 2, 2, 2], _, false) => Some(ImageFormat::R16Unorm),
+        (0x1b, [1, 1, 1, 1], _, false) => Some(ImageFormat::R16Snorm),
+        (0x0c, [2, 2, 2, 2], _, false) => Some(ImageFormat::Rg16Unorm),
+        (0x0c, [1, 1, 1, 1], _, false) => Some(ImageFormat::Rg16Snorm),
+        (0x03, [2, 2, 2, 2], _, false) => Some(ImageFormat::Rgba16Unorm),
+        (0x03, [1, 1, 1, 1], _, false) => Some(ImageFormat::Rgba16Snorm),
         // B5G6R5 stores R in the low bits. The B,G,R swizzle makes the high
         // five bits the observable red channel (packed RGB565).
         // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/format_traits.inc
@@ -291,7 +327,9 @@ fn decode_sampled_texture_format(
         (0x3a, [2, 2, 2, 2] | [2, 4, 4, 4], _, false) => Some(ImageFormat::Depth16Unorm),
         // ZF32 uses a float depth channel, replicated to RGB by its TIC mapping.
         // https://github.com/devkitPro/deko3d/blob/master/source/maxwell/image_formats.h
-        (0x2f, [7, 2, 2, 2], [2, 2, 2, 7], false) => Some(ImageFormat::Depth32Float),
+        (0x2f, [7, 7, 7, 7] | [7, 4, 4, 4] | [7, 2, 2, 2], _, false) => {
+            Some(ImageFormat::Depth32Float)
+        }
         (0x27, [2, 2, 2, 2], _, false) => Some(ImageFormat::Bc4RUnorm),
         (0x28, [2, 2, 2, 2], _, false) => Some(ImageFormat::Bc5RgUnorm),
         // Component type 1 is SNORM; signed RGTC endpoints are not UNORM.
@@ -354,15 +392,6 @@ fn align_up(
         .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })
 }
 
-const fn single_sample_compressed_color_kind(bytes_per_texel: u64) -> Option<u8> {
-    match bytes_per_texel {
-        4 => Some(MAXWELL_C32_2CRA_KIND),
-        8 => Some(MAXWELL_C64_2CRA_KIND),
-        16 => Some(MAXWELL_C128_2CR_KIND),
-        _ => None,
-    }
-}
-
 fn image_description(
     request: MaxwellImageDescriptionRequest,
 ) -> Result<ImageDescription, MaxwellThreeDResourceError> {
@@ -401,13 +430,20 @@ pub fn decode_sampler(
     // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/tsc_generate.cpp
     let words = descriptor_words(bytes);
     let role = MaxwellThreeDResourceRole::Sampler(texture_reference);
-    if ((words[1] >> 10) & 3) != 0 {
-        return Err(MaxwellThreeDResourceError::UnsupportedSamplerDescriptor {
-            descriptor,
-            field: "reduction filter",
-            value: words[0] ^ words[1],
-        });
-    }
+    // Eden TSCEntry::reduction_filter, word 1 bits 10..11.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/textures/texture.h
+    let reduction = match (words[1] >> 10) & 3 {
+        0 => nixe_gpu::SamplerReduction::WeightedAverage,
+        1 => nixe_gpu::SamplerReduction::Min,
+        2 => nixe_gpu::SamplerReduction::Max,
+        value => {
+            return Err(MaxwellThreeDResourceError::UnsupportedSamplerDescriptor {
+                descriptor,
+                field: "reduction filter",
+                value,
+            });
+        }
+    };
     let compare = (words[0] & (1 << 9) != 0).then(|| {
         use nixe_gpu::DepthCompareOperation as C;
         [
@@ -493,6 +529,7 @@ pub fn decode_sampler(
     Ok(MaxwellThreeDResolvedSampler {
         role,
         compare,
+        reduction,
         min_filter: filter((words[1] >> 4) & 3, "minification filter")?,
         mag_filter: filter(words[1] & 3, "magnification filter")?,
         mip_filter,

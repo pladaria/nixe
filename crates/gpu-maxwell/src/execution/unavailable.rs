@@ -11,6 +11,18 @@ impl MaxwellFrontend for MissingRenderer {
     fn create_channel(&mut self, _: crate::MaxwellChannelId) {}
     fn bind_channel(&mut self, _: crate::MaxwellChannelId, _: &crate::MaxwellThreeDState) {}
     fn close_channel(&mut self, _: crate::MaxwellChannelId) {}
+    fn reset_samples_passed(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {
+        unavailable()
+    }
+    fn report_samples_passed(
+        &mut self,
+        _: Vec<nixe_memory::AllocationRange>,
+        _: bool,
+        _: u64,
+        _: FrontendSubmissionId,
+    ) -> Result<(), MaxwellSubmissionExecutionError> {
+        unavailable()
+    }
     fn bind_graphics_uniform(
         &mut self,
         _: u8,

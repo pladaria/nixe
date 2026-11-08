@@ -6,6 +6,22 @@ pub(super) fn get_info(
     let info_type = read_register(context.thread().state(), 1) as u32;
     let handle = read_register(context.thread().state(), 2) as u32;
     let subtype = read_register(context.thread().state(), 3);
+    log::trace!("GetInfo: type={info_type:#x} handle={handle:#x} subtype={subtype:#x}");
+    // DebuggerAttached takes a zero handle rather than a process handle.
+    // No guest debugger can attach to this runtime; Eden reports the same zero.
+    // https://switchbrew.org/wiki/SVC#InfoType
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/kernel/svc/svc_info.cpp
+    if info_type == 8 {
+        if handle != INVALID_HANDLE {
+            result(context, HorizonKernelResult::INVALID_HANDLE);
+        } else if subtype != 0 {
+            result(context, HorizonKernelResult::INVALID_COMBINATION);
+        } else {
+            result(context, HorizonKernelResult::SUCCESS);
+            write_u64(context.thread_mut().state_mut(), 1, 0);
+        }
+        return resume();
+    }
     // RandomEntropy validation and its four process-owned values follow the
     // public kernel implementation:
     // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/svc/kern_svc_info.cpp#L230-L240
@@ -208,6 +224,48 @@ fn mapping_result(
             },
         ),
     }
+}
+// Both SVCs operate on process-owned normal pages in the Alias reservation.
+// https://switchbrew.org/wiki/SVC#MapPhysicalMemory
+// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/kernel/svc/svc_physical_memory.cpp
+pub(super) fn physical_memory(
+    context: &mut ExceptionDispatchContext<'_>,
+    unmap: bool,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    let start = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
+    let size = read_register(context.thread().state(), 1);
+    if !start.is_aligned_to(nixe_memory::PAGE_SIZE) {
+        result(context, HorizonKernelResult::INVALID_ADDRESS);
+        return resume();
+    }
+    if size == 0 || !size.is_multiple_of(nixe_memory::PAGE_SIZE) {
+        result(context, HorizonKernelResult::INVALID_SIZE);
+        return resume();
+    }
+    let Some(end) = start.get().checked_add(size) else {
+        result(context, HorizonKernelResult::INVALID_MEMORY_REGION);
+        return resume();
+    };
+    if context.process().total_system_resource_size() == 0 {
+        result(context, HorizonKernelResult::INVALID_STATE);
+        return resume();
+    }
+    let alias = context.process().memory_layout().alias();
+    if start.get() < alias.base().get()
+        || end > alias.base().get() + alias.size()
+        || end > context.process().memory().space().width().bytes()
+    {
+        result(context, HorizonKernelResult::INVALID_MEMORY_REGION);
+        return resume();
+    }
+    let process = context.process().clone();
+    let memory = process.memory();
+    let completed = if unmap {
+        super::access::wait_io(context, memory.unmap_physical(start, size))
+    } else {
+        super::access::wait_io(context, memory.map_physical(start, size))
+    };
+    mapping_result(context, completed)
 }
 pub(super) fn set_memory_permission(
     context: &mut ExceptionDispatchContext<'_>,

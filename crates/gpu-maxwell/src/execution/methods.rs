@@ -9,6 +9,9 @@ use crate::{
 };
 
 impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
+    pub(crate) fn reset_samples_passed(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {
+        self.cache.borrow_mut().reset_samples_passed()
+    }
     pub(crate) fn notification(
         &mut self,
         address: u64,
@@ -306,21 +309,37 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                         source: report.source(),
                         error,
                     })?;
-                self.report(
-                    report.source(),
-                    &target,
-                    report.payload(),
-                    short,
-                    report.is_fence(),
-                    false,
-                )?;
+                if report.samples_passed() {
+                    let target = physical_subrange(&target, 0, if short { 4 } else { 16 })
+                        .map_err(|e| {
+                            canonical(MaxwellCanonicalExecutionError::InlineWrite {
+                                source: report.source(),
+                                error: e,
+                            })
+                        })?;
+                    self.cache.borrow_mut().report_samples_passed(
+                        target,
+                        short,
+                        self.host.timestamp(),
+                        self.frontend,
+                    )?;
+                } else {
+                    self.report(
+                        report.source(),
+                        &target,
+                        report.payload(),
+                        short,
+                        report.is_fence(),
+                        false,
+                    )?;
+                }
             } else if matches!(plan, MaxwellThreeDSynchronizationPlan::WaitForIdle { .. }) {
                 self.host.order_device(self.frontend)?;
             } else if let Some(operation) = three_d_synchronization_operation(plan) {
                 self.host.cache_maintenance(self.frontend, operation)?;
             }
             if drains_prior_work {
-                self.prior_work_pending = false;
+                self.prior_work_pending = matches!(plan, MaxwellThreeDSynchronizationPlan::ReportSemaphoreWrite(report) if report.samples_passed());
             }
             Ok(())
         })();

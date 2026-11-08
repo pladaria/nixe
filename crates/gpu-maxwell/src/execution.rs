@@ -467,8 +467,7 @@ fn physical_subrange(
         ranges.extend(
             segment
                 .mapping()
-                .physical()
-                .pin(backing_offset, indices.len() as u64)
+                .capture(backing_offset, indices.len() as u64)
                 .map_err(Arc::new)?,
         );
     }

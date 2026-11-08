@@ -56,6 +56,10 @@ enum ServiceKind {
     Multimedia,
     Applet,
     Hid,
+    Friends,
+    Bcat,
+    Nfp,
+    Ngc,
     SharedFont,
     Irs,
     Time,
@@ -84,6 +88,10 @@ impl ServiceKind {
             b"mm:u" => Some(Self::Multimedia),
             b"appletOE" => Some(Self::Applet),
             b"hid" => Some(Self::Hid),
+            b"friend:u" => Some(Self::Friends),
+            b"bcat:u" => Some(Self::Bcat),
+            b"nfp:user" => Some(Self::Nfp),
+            b"ngc:u" => Some(Self::Ngc),
             b"pl:u" => Some(Self::SharedFont),
             b"irs" => Some(Self::Irs),
             b"time:u" => Some(Self::Time),
@@ -224,6 +232,9 @@ fn connect_service(
         ServiceKind::Hid => process.return_service(HorizonIpcObject::Hid(HidSession::new(
             resources.system.hid.shared_memory(),
         ))),
+        ServiceKind::Friends => {
+            process.return_service(HorizonIpcObject::Friends(crate::FriendSession::new()))
+        }
         ServiceKind::SharedFont => process.return_service(HorizonIpcObject::SharedFont(
             resources.files.shared_fonts.clone(),
         )),
@@ -235,11 +246,32 @@ fn connect_service(
         }
         // libnx opens acc:u0 for application account sessions. Retain the
         // real session identity while unsupported commands remain fail-fast.
-        ServiceKind::Account => {
-            process.return_service(HorizonIpcObject::Account(AccountSession::new()))
-        }
+        ServiceKind::Account => process.return_service(HorizonIpcObject::Account(
+            AccountSession::new(resources.system.profiles.clone()),
+        )),
         ServiceKind::Bsd => process.return_service(HorizonIpcObject::Bsd(manager.bsd_session())),
         ServiceKind::Ssl => process.return_service(HorizonIpcObject::Ssl(SslSession::new())),
+        ServiceKind::Nfp => process.return_service(HorizonIpcObject::Nfp(crate::NfpSession::new())),
+        ServiceKind::Ngc => {
+            process.return_service(HorizonIpcObject::Ngc(crate::object::NgcSession::default()))
+        }
+        ServiceKind::Bcat => {
+            let saves =
+                resources
+                    .files
+                    .save_data
+                    .as_ref()
+                    .ok_or(IpcWireError::UnsupportedService(
+                        UnsupportedServiceOperation::CommandVariant {
+                            service: "bcat:u",
+                            command_id: 0,
+                            detail: "application save-data namespace is unavailable",
+                        },
+                    ))?;
+            process.return_service(HorizonIpcObject::Bcat(crate::BcatSession::new(
+                saves.bcat_directory(),
+            )))
+        }
         ServiceKind::AudioOut => process.return_service(HorizonIpcObject::AudioOutManager(
             crate::AudioOutManagerSession {
                 backend: resources.audio.backend.clone(),

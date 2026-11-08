@@ -13,13 +13,19 @@ mod hwopus;
 pub use hwopus::{OpusDecoderSession, OpusManagerSession};
 mod play_report;
 pub use play_report::PlayReportSession;
+mod bcat;
+mod nfp;
+pub use nfp::NfpSession;
 mod bsd;
+pub use bcat::BcatSession;
 mod diagnostics;
 pub use audio::{AudioOutManagerSession, AudioOutSession};
 mod error_applet;
+mod friends;
 mod graphics;
 mod graphics_event;
 mod hid;
+pub use friends::FriendSession;
 mod ipc;
 mod system_archive;
 pub use system_archive::SystemArchives;
@@ -50,7 +56,6 @@ pub use graphics_event::GraphicsEventSource;
 pub use hid::{HidInputError, HidSystem};
 pub use ipc::{
     IpcRequest, IpcResponse, IpcResultCode, IpcService, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES,
-    MAX_IPC_READ_BYTES,
 };
 pub use ipc_result::HorizonIpcResult;
 pub use ipc_wire::ServiceSession;

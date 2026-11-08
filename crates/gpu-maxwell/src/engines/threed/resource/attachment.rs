@@ -10,7 +10,6 @@ pub struct AttachmentInfo {
     pub array_pitch_dwords: Option<u32>,
     pub selected_layer: u16,
     pub guest_format: MaxwellThreeDGuestImageFormat,
-    pub compression_enabled: bool,
     pub row_pitch_bytes: Option<u32>,
     pub sample_mode: Option<MaxwellThreeDSampleMode>,
 }
@@ -26,7 +25,6 @@ impl AttachmentInfo {
             array_pitch_dwords,
             selected_layer,
             guest_format,
-            compression_enabled,
             row_pitch_bytes,
             sample_mode,
         } = self;
@@ -53,10 +51,10 @@ impl AttachmentInfo {
         // image layout remains byte-addressed.
         // https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/texture_cache/image_info.cpp#L126-L177
         let array_pitch = array_pitch_dwords.map(|pitch| u64::from(pitch) * 4);
-        let (neutral_layout, layer_stride, expected_kind, generic_kind_allowed) = match layout {
+        let (neutral_layout, layer_stride) = match layout {
             MaxwellThreeDImageLayout::PitchLinear => {
                 let row_pitch = row_pitch_bytes.map(u64::from).unwrap_or(compact_row);
-                if row_pitch < compact_row || compression_enabled {
+                if row_pitch < compact_row {
                     return Err(MaxwellThreeDResourceError::ContradictoryState { role });
                 }
                 let stride = array_pitch
@@ -68,8 +66,6 @@ impl AttachmentInfo {
                         layer_stride: stride,
                     },
                     stride,
-                    MAXWELL_PITCH_KIND,
-                    false,
                 )
             }
             MaxwellThreeDImageLayout::BlockLinear {
@@ -87,38 +83,6 @@ impl AttachmentInfo {
                 if samples == SampleCount::Four && stride < minimum {
                     return Err(MaxwellThreeDResourceError::ContradictoryState { role });
                 }
-                let compressed_color_kind = match guest_format {
-                    MaxwellThreeDGuestImageFormat::Color(_) if samples == SampleCount::Four => {
-                        Some(MAXWELL_C32_MS4_2CBR_KIND)
-                    }
-                    MaxwellThreeDGuestImageFormat::Color(_) => {
-                        single_sample_compressed_color_kind(bpp)
-                    }
-                    _ => None,
-                };
-                let compressed_depth_kind = match guest_format {
-                    MaxwellThreeDGuestImageFormat::DepthStencil(
-                        MaxwellThreeDDepthStencilFormat::Z16,
-                    ) if samples == SampleCount::One => Some(MAXWELL_Z16_2Z_KIND),
-                    MaxwellThreeDGuestImageFormat::DepthStencil(
-                        MaxwellThreeDDepthStencilFormat::Stencil8Z24,
-                    ) => Some(if samples == SampleCount::Four {
-                        MAXWELL_S8Z24_MS4_2CZ_KIND
-                    } else {
-                        MAXWELL_S8Z24_2CZ_KIND
-                    }),
-                    MaxwellThreeDGuestImageFormat::DepthStencil(
-                        MaxwellThreeDDepthStencilFormat::Z24Stencil8,
-                    ) => Some(if samples == SampleCount::Four {
-                        MAXWELL_Z24S8_MS4_2CZ_KIND
-                    } else {
-                        MAXWELL_Z24S8_2CZ_KIND
-                    }),
-                    _ => None,
-                };
-                let expected_kind = compressed_color_kind
-                    .or(compressed_depth_kind)
-                    .unwrap_or(MAXWELL_GENERIC_BLOCK_LINEAR_KIND);
                 (
                     ImageMemoryLayout::BlockLinear(BlockLinearLayout {
                         block_width_log2: 0,
@@ -127,10 +91,6 @@ impl AttachmentInfo {
                         layer_stride: stride,
                     }),
                     stride,
-                    expected_kind,
-                    samples == SampleCount::One
-                        && (compressed_color_kind.is_some()
-                            || (compressed_depth_kind.is_some() && !compression_enabled)),
                 )
             }
         };
@@ -151,9 +111,6 @@ impl AttachmentInfo {
             size,
             selected_layer,
             guest_format,
-            expected_kind,
-            compressed_kind: None,
-            generic_kind_allowed,
         })
     }
 }
@@ -162,57 +119,46 @@ pub fn render_target_info(
     state: &MaxwellThreeDState,
     role: MaxwellThreeDResourceRole,
 ) -> Result<Option<AttachmentInfo>, MaxwellThreeDResourceError> {
-    let (
-        address,
-        description,
-        selected_layer,
-        guest_format,
-        layout,
-        array_pitch_dwords,
-        compression_enabled,
-    ) = match role {
-        MaxwellThreeDResourceRole::ColorTarget(index) => {
-            let target = state.render_targets().color(index as usize);
-            match target.readiness(true) {
-                MaxwellThreeDAttachmentReadiness::Unprogrammed
-                | MaxwellThreeDAttachmentReadiness::Disabled => return Ok(None),
-                MaxwellThreeDAttachmentReadiness::Ready => (),
-                _ => return Err(MaxwellThreeDResourceError::IncompleteState { role }),
+    let (address, description, selected_layer, guest_format, layout, array_pitch_dwords) =
+        match role {
+            MaxwellThreeDResourceRole::ColorTarget(index) => {
+                let target = state.render_targets().color(index as usize);
+                match target.readiness(true) {
+                    MaxwellThreeDAttachmentReadiness::Unprogrammed
+                    | MaxwellThreeDAttachmentReadiness::Disabled => return Ok(None),
+                    MaxwellThreeDAttachmentReadiness::Ready => (),
+                    _ => return Err(MaxwellThreeDResourceError::IncompleteState { role }),
+                }
+                let (description, selected_layer, guest_format) = targets::color(index, &target)?;
+                (
+                    unresolved(
+                        target.address_upper().value(),
+                        target.address_lower().value(),
+                    ),
+                    description,
+                    selected_layer,
+                    guest_format,
+                    target.layout().value().copied(),
+                    target.array_pitch().value().copied(),
+                )
             }
-            let (description, selected_layer, guest_format) = targets::color(index, &target)?;
-            (
-                unresolved(
-                    target.address_upper().value(),
-                    target.address_lower().value(),
-                ),
-                description,
-                selected_layer,
-                guest_format,
-                target.layout().value().copied(),
-                target.array_pitch().value().copied(),
-                target.compression().value()
-                    == Some(&super::super::MaxwellThreeDColorCompressionMode::Enabled),
-            )
-        }
-        MaxwellThreeDResourceRole::DepthStencilTarget => {
-            let target = state.render_targets().depth_stencil();
-            let (description, selected_layer, guest_format) = targets::depth(&target)?;
-            (
-                unresolved(
-                    target.address_upper().value(),
-                    target.address_lower().value(),
-                ),
-                description,
-                selected_layer,
-                guest_format,
-                target.layout().value().copied(),
-                target.array_pitch().value().copied(),
-                target.compression().value()
-                    == Some(&super::super::MaxwellThreeDZCompressionMode::Enabled),
-            )
-        }
-        _ => return Err(MaxwellThreeDResourceError::IncompleteState { role }),
-    };
+            MaxwellThreeDResourceRole::DepthStencilTarget => {
+                let target = state.render_targets().depth_stencil();
+                let (description, selected_layer, guest_format) = targets::depth(&target)?;
+                (
+                    unresolved(
+                        target.address_upper().value(),
+                        target.address_lower().value(),
+                    ),
+                    description,
+                    selected_layer,
+                    guest_format,
+                    target.layout().value().copied(),
+                    target.array_pitch().value().copied(),
+                )
+            }
+            _ => return Err(MaxwellThreeDResourceError::IncompleteState { role }),
+        };
     let sample_mode = state
         .fixed_function()
         .register(MaxwellThreeDFixedFunctionRegister::SampleMode)
@@ -228,7 +174,6 @@ pub fn render_target_info(
         guest_format,
         layout: layout.ok_or(MaxwellThreeDResourceError::IncompleteState { role })?,
         array_pitch_dwords,
-        compression_enabled,
         row_pitch_bytes: None,
         sample_mode,
     }))
@@ -249,7 +194,6 @@ pub fn solid_image_info(
         role,
         request.zeta,
         request.zeta,
-        request.compression,
         false,
     )
 }
@@ -268,10 +212,6 @@ pub fn blit_image_infos(
             MaxwellThreeDResourceRole::BlitSource,
             false,
             true,
-            matches!(
-                request.images[0].layout,
-                crate::engines::twod::blit::BlitSurfaceLayout::BlockLinear(_)
-            ),
             resolve,
         )?,
         surface_info(
@@ -280,7 +220,6 @@ pub fn blit_image_infos(
             MaxwellThreeDResourceRole::BlitDestination,
             false,
             true,
-            request.destination_compression,
             false,
         )?,
     ])
@@ -291,7 +230,6 @@ fn surface_info(
     role: MaxwellThreeDResourceRole,
     zeta: bool,
     packed_copy: bool,
-    compression_enabled: bool,
     resolve: bool,
 ) -> Result<AttachmentInfo, MaxwellThreeDResourceError> {
     use crate::engines::twod::blit::BlitSurfaceLayout;
@@ -359,7 +297,6 @@ fn surface_info(
         array_pitch_dwords: None,
         selected_layer: 0,
         guest_format,
-        compression_enabled,
         row_pitch_bytes: match surface.layout {
             BlitSurfaceLayout::Pitch(pitch) => Some(pitch),
             _ => None,

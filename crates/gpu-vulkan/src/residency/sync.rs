@@ -196,8 +196,6 @@ impl Residency<'_> {
             self.runtime.barriers.queue_image(initialize_image(
                 entry.native.handle,
                 native_image_aspects(entry.description.format),
-                entry.description.mip_levels,
-                entry.description.array_layers,
             ));
             entry.initialized = true;
         }
@@ -246,6 +244,12 @@ impl Residency<'_> {
         {
             range.aspect_mask = aspects;
         }
+        if description.image_type == vk::ImageType::TYPE_3D {
+            // Without maintenance9, a 3D image barrier always covers all depth
+            // slices in the mip. REMAINING_ARRAY_LAYERS preserves that scope
+            // across the maintenance9 rule change, as in Eden's barriers.
+            range.layer_count = vk::REMAINING_ARRAY_LAYERS;
+        }
         Ok((self.use_image(id)?, range))
     }
 }
@@ -267,8 +271,6 @@ pub(super) fn native_image_aspects(format: vk::Format) -> vk::ImageAspectFlags {
 pub(super) fn initialize_image(
     image: vk::Image,
     aspects: vk::ImageAspectFlags,
-    mips: u32,
-    layers: u32,
 ) -> vk::ImageMemoryBarrier2<'static> {
     vk::ImageMemoryBarrier2::default()
         .old_layout(vk::ImageLayout::UNDEFINED)
@@ -286,8 +288,8 @@ pub(super) fn initialize_image(
         .subresource_range(
             vk::ImageSubresourceRange::default()
                 .aspect_mask(aspects)
-                .level_count(mips)
-                .layer_count(layers),
+                .level_count(vk::REMAINING_MIP_LEVELS)
+                .layer_count(vk::REMAINING_ARRAY_LAYERS),
         )
 }
 

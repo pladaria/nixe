@@ -456,37 +456,20 @@ impl Residency<'_> {
     pub(crate) fn insert_guest_image(
         &mut self,
         info: &ImageInfo,
-        role: nixe_gpu_maxwell::engines::threed::MaxwellThreeDResourceRole,
         space: &MaxwellGpuMemory,
     ) -> Result<ImageId, VulkanError> {
         let start = space.address(info.address).map_err(failure)?;
         let mut parts = Vec::new();
         let mut maps = RangeSet::default();
         let mut first_cpu = None;
-        let mut first_kind = None;
         for (gpu, bytes) in space
             .get_submapped_range(start, info.size)
             .map_err(failure)?
         {
-            let mut at = gpu;
-            let end = gpu.get() + bytes;
-            // Kinds belong to actual GPU mappings; absent pages have no kind to validate.
-            while at.get() < end {
-                let segment = space.resolve_maximal(at).map_err(failure)?;
-                let kind = segment.mapping().kind();
-                if let Some(expected) = first_kind
-                    && expected != kind
-                {
-                    return Err(failure(nixe_gpu_maxwell::engines::threed::MaxwellThreeDResourceError::UnsupportedKind {role,expected,actual:kind}));
-                }
-                first_kind = Some(kind);
-                info.validate_kind(kind, role).map_err(failure)?;
-                let size = segment.size().min(end - at.get());
-                if size == end - at.get() {
-                    break;
-                }
-                at = space.checked_add(at, size).map_err(failure)?;
-            }
+            // Like Eden InsertImage, resolve residency independently of the
+            // image format and tiling, which come from ImageInfo's registers/TIC.
+            // Compression PTE kinds do not select a different image layout here.
+            // https://github.com/eden-emulator/mirror/blob/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/image_info.cpp
             let cpu = space.device_address(gpu).map_err(failure)?;
             first_cpu.get_or_insert(cpu);
             let physical = self.runtime.device_memory.read_mapping(cpu, bytes)?;

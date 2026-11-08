@@ -20,6 +20,7 @@ pub(crate) enum IpcWireError {
     AudioBackend(Box<str>),
     AudioRenderer(Box<str>),
     PlayReport(Box<str>),
+    Bcat(Box<str>),
     InputBackend(Box<str>),
     SharedFont(Box<str>),
     SystemArchive(Box<str>),
@@ -109,6 +110,7 @@ impl std::fmt::Display for HorizonIpcFault {
             IpcWireError::PlayReport(reason) => {
                 write!(formatter, "play-report storage failed: {reason}")
             }
+            IpcWireError::Bcat(reason) => write!(formatter, "BCAT storage failed: {reason}"),
             IpcWireError::InputBackend(reason) => {
                 write!(formatter, "controller output failed: {reason}")
             }
@@ -159,13 +161,6 @@ pub enum UnsupportedServiceOperation {
         command_id: u32,
         detail: &'static str,
     },
-    CommandSizeLimitExceeded {
-        service: &'static str,
-        command_id: u32,
-        operation: &'static str,
-        requested: u64,
-        limit: u64,
-    },
 }
 
 impl std::fmt::Display for UnsupportedServiceOperation {
@@ -197,16 +192,6 @@ impl std::fmt::Display for UnsupportedServiceOperation {
             } => write!(
                 formatter,
                 "Horizon service command variant is not implemented: service={service} command={command_id} detail={detail}"
-            ),
-            Self::CommandSizeLimitExceeded {
-                service,
-                command_id,
-                operation,
-                requested,
-                limit,
-            } => write!(
-                formatter,
-                "Horizon service command exceeds Nixe's implemented size bound: service={service} command={command_id} operation={operation} requested={requested} ({requested:#x}) limit={limit} ({limit:#x})"
             ),
         }
     }
@@ -257,21 +242,6 @@ mod tests {
         assert_eq!(
             operation.to_string(),
             "Horizon service command variant is not implemented: service=IGraphicBufferProducer command=99 detail=unsupported transaction"
-        );
-    }
-
-    #[test]
-    fn command_size_limits_report_requested_and_supported_sizes() {
-        let operation = UnsupportedServiceOperation::CommandSizeLimitExceeded {
-            service: "IStorage",
-            command_id: 0,
-            operation: "read",
-            requested: 0x20_0000,
-            limit: 0x10_0000,
-        };
-        assert_eq!(
-            operation.to_string(),
-            "Horizon service command exceeds Nixe's implemented size bound: service=IStorage command=0 operation=read requested=2097152 (0x200000) limit=1048576 (0x100000)"
         );
     }
 }

@@ -1628,20 +1628,23 @@ fn execute_register<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
             // replacement value: https://registry.khronos.org/OpenGL/specs/gl/glspec43.core.pdf section 17.4.4.
         }
         MethodAction::ClearReportValue => {
-            // Type 2 resets the hierarchical Z-cull statistics. We do not
-            // run that guest cache, so there is no accumulated cache work
-            // to reset. Counter reporting remains explicitly unsupported;
-            // resetting this cache must not clear depth or other counters.
-            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2722-L2741
-            if source.argument() != 2 {
-                return Err((MaxwellEngineDispatchError::InvalidMethodEncoding {
-                    source,
-                    method_name: "CLEAR_REPORT_VALUE",
-                    reason: "resetting non-Z-cull performance counters is not implemented",
-                })
-                .into());
+            // Eden ProcessCounterReset dispatches Z-pass reset to the query
+            // cache. Hierarchical Z-cull statistics have no host counterpart.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/engines/maxwell_3d.cpp#L569-L585
+            match source.argument() {
+                1 => execution.reset_samples_passed()?,
+                2 => (),
+                _ => {
+                    return Err((MaxwellEngineDispatchError::InvalidMethodEncoding {
+                        source,
+                        method_name: "CLEAR_REPORT_VALUE",
+                        reason: "resetting this performance counter is not implemented",
+                    })
+                    .into());
+                }
             }
         }
+
         MethodAction::ZCullMaintenance => {
             // These commands maintain only Maxwell's hierarchical Z-cull
             // metadata, never the depth/stencil attachment. We retain no

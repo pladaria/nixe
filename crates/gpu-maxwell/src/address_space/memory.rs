@@ -703,8 +703,7 @@ impl MaxwellGpuMemory {
             ranges.extend(
                 segment
                     .mapping
-                    .physical
-                    .pin(segment.backing_offset, segment.size)
+                    .capture(segment.backing_offset, segment.size)
                     .map_err(|error| MaxwellGpuAccessError::Backing(Arc::new(error)))?,
             );
         }

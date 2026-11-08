@@ -37,6 +37,112 @@ unsafe fn copy_barrier(context: &worker::Context, after: bool) {
     }
 }
 impl Dispatch {
+    pub(crate) fn reset_occlusion_pool(&mut self, pool: vk::QueryPool, count: u32) {
+        self.recorder.record(move |context| {
+            unsafe {
+                context
+                    .device
+                    .cmd_reset_query_pool(context.upload, pool, 0, count)
+            };
+            Ok(())
+        });
+    }
+    pub(crate) fn begin_occlusion(&mut self, pool: vk::QueryPool, index: u32, precise: bool) {
+        self.recorder.record(move |context| {
+            let flags = if precise {
+                vk::QueryControlFlags::PRECISE
+            } else {
+                vk::QueryControlFlags::empty()
+            };
+            unsafe {
+                context
+                    .device
+                    .cmd_begin_query(context.command, pool, index, flags)
+            };
+            Ok(())
+        });
+    }
+    pub(crate) fn end_occlusion(&mut self, pool: vk::QueryPool, index: u32) {
+        self.recorder.record(move |context| {
+            unsafe { context.device.cmd_end_query(context.command, pool, index) };
+            Ok(())
+        });
+    }
+    pub(crate) fn prepare_occlusion_results(
+        &mut self,
+        pool: vk::QueryPool,
+        first: u32,
+        count: u32,
+        buffer: vk::Buffer,
+        bytes: u64,
+    ) {
+        self.recorder.record(move |context| {
+            unsafe {
+                let before = vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .src_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
+                (context.functions.barrier)(
+                    context.command,
+                    &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&before)),
+                );
+                let used = u64::from(count) * 8;
+                if used < bytes {
+                    context
+                        .device
+                        .cmd_fill_buffer(context.command, buffer, used, bytes - used, 0);
+                }
+                context.device.cmd_copy_query_pool_results(
+                    context.command,
+                    pool,
+                    first,
+                    count,
+                    buffer,
+                    0,
+                    8,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                );
+                let after = vk::MemoryBarrier2::default()
+                    .src_stage_mask(
+                        vk::PipelineStageFlags2::ALL_TRANSFER
+                            | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    )
+                    .src_access_mask(
+                        vk::AccessFlags2::TRANSFER_READ
+                            | vk::AccessFlags2::TRANSFER_WRITE
+                            | vk::AccessFlags2::SHADER_WRITE,
+                    )
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                    );
+                (context.functions.barrier)(
+                    context.command,
+                    &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&after)),
+                );
+            }
+            Ok(())
+        });
+    }
+    pub(crate) fn complete_query_scan(&mut self) {
+        self.recorder.record(move |context| {
+            unsafe {
+                let barrier = vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .dst_access_mask(
+                        vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                    );
+                (context.functions.barrier)(
+                    context.command,
+                    &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&barrier)),
+                );
+            }
+            Ok(())
+        });
+    }
     /// The event is owned by the queue and remains live through GPU completion.
     /// Set and wait stay together in the native stream, with no memory scopes.
     /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L955-L975

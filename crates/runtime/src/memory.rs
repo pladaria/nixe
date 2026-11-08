@@ -1,8 +1,8 @@
 //! Process/kernel mapping state. Guest bytes and native translations live in AddressSpace.
 mod heap;
+mod physical;
 #[cfg(test)]
 mod tests;
-pub use heap::HeapResize;
 use nixe_memory::{
     AddressSpace, AddressWidth, Allocation, AllocationFuture, AllocationRange, GuestVirtualAddress,
     MemoryAccount, MemoryError, MemoryPermissions, PAGE_SIZE,
@@ -117,7 +117,7 @@ pub struct ProcessMemory {
     closed: AtomicBool,
     heap_region: crate::ProcessVirtualRegion,
     heap_bytes: AtomicU64,
-    heap_requests: Mutex<heap::HeapRequests>,
+    physical_requests: Mutex<physical::PhysicalRequests>,
     system_reservation: u64,
 }
 impl ProcessMemory {
@@ -158,7 +158,7 @@ impl ProcessMemory {
             closed: AtomicBool::new(false),
             heap_region,
             heap_bytes: AtomicU64::new(0),
-            heap_requests: Mutex::new(heap::HeapRequests::default()),
+            physical_requests: Mutex::new(physical::PhysicalRequests::default()),
             system_reservation,
         })
     }
@@ -230,7 +230,7 @@ impl ProcessMemory {
     }
     pub fn close(&self) -> Result<(), MappingError> {
         self.closed.store(true, Ordering::Release);
-        let wake = self.heap_requests.lock().unwrap().wakers();
+        let wake = self.physical_requests.lock().unwrap().wakers();
         for waker in wake {
             waker.wake_by_ref();
         }

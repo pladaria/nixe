@@ -6,11 +6,6 @@ use super::*;
 use maxwell::fixed_state::FixedPipelineState;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
-pub(super) type ConfiguredGraphics = (
-    smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>,
-    crate::residency::execution::DescriptorQueue,
-    Draw,
-);
 pub(super) type ConfigureGraphics = fn(
     &GraphicsPipeline,
     &mut NativeExecution<'_>,
@@ -20,7 +15,7 @@ pub(super) type ConfigureGraphics = fn(
     [Option<u8>; 5],
     Draw,
     u128,
-) -> Result<ConfiguredGraphics, VulkanError>;
+) -> Result<(), VulkanError>;
 pub(super) struct GraphicsPipeline {
     pub(super) key: FixedPipelineState,
     transition_keys: Vec<FixedPipelineState>,

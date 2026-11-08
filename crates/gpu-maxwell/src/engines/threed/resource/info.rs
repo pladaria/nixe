@@ -13,32 +13,5 @@ pub struct ImageInfo {
     pub maybe_unaligned_layer_stride: u64,
     pub size: u64,
     pub selected_layer: u16,
-    pub(super) expected_kind: u8,
-    pub(super) compressed_kind: Option<u8>,
-    pub(super) generic_kind_allowed: bool,
     pub guest_format: MaxwellThreeDGuestImageFormat,
-}
-impl ImageInfo {
-    /// Validate mapped PTE kinds when the texture cache consumes a new image.
-    /// Missing mappings are residency, not an invalid hardware image description.
-    pub fn validate_kind(
-        &self,
-        actual: u8,
-        role: MaxwellThreeDResourceRole,
-    ) -> Result<(), MaxwellThreeDResourceError> {
-        if actual == self.expected_kind
-            || Some(actual) == self.compressed_kind
-            || self.generic_kind_allowed && actual == MAXWELL_GENERIC_BLOCK_LINEAR_KIND
-            || matches!(self.layout, ImageMemoryLayout::PitchLinear { .. })
-                && actual == MAXWELL_PITCH_NO_SWIZZLE_KIND
-        {
-            Ok(())
-        } else {
-            Err(MaxwellThreeDResourceError::UnsupportedKind {
-                role,
-                expected: self.expected_kind,
-                actual,
-            })
-        }
-    }
 }
