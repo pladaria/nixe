@@ -19,10 +19,7 @@ pub use npdm::{
 };
 pub use nro::{NroAssets, NroImage, NroLoader, NroMetadata, NroRange};
 pub use nso::{Mod0Metadata, NsoImage, NsoLoader, NsoMetadata, NsoRange, NsoSegmentCompression};
-pub use preparation::{
-    ExternalSymbol, MappingRegion, NsoBatchModule, PreparationConfig, PrepareError, PreparedModule,
-    RelocationState, RuntimeExport, SymbolResolution, SymbolResolver, prepare_nso_batch,
-};
+pub use preparation::{MappingRegion, PreparationConfig, PrepareError, PreparedModule};
 
 /// Identifies the source executable format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

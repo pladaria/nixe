@@ -13,7 +13,8 @@ use crate::{
 pub use lowerer::MaxwellFrontend;
 use nixe_gpu::native::NativeNv12Conversion;
 use nixe_gpu::{
-    CacheMaintenanceOperation, FrontendSubmissionId, GuestTimelinePoint, ReservedTimelinePoint,
+    CacheMaintenanceOperation, FrontendSubmissionId, GuestSyncpointId, GuestTimelinePoint,
+    ReservedTimelinePoint,
 };
 use nixe_memory::{AllocationRange, MemoryError};
 use std::{
@@ -83,6 +84,15 @@ pub enum MaxwellSubmissionExecutionError {
     Native(Box<str>),
     Canonical(Box<MaxwellCanonicalExecutionError>),
     ThreeDSynchronization(MaxwellThreeDSynchronizationError),
+    MissingCompletionReservation {
+        source: MaxwellMethodSource,
+        requested: GuestSyncpointId,
+    },
+    WrongCompletionSyncpoint {
+        source: MaxwellMethodSource,
+        requested: GuestSyncpointId,
+        reserved: GuestSyncpointId,
+    },
     MissingCompletionSignal {
         reserved: GuestTimelinePoint,
         expected: u32,
@@ -115,6 +125,18 @@ impl Display for MaxwellSubmissionExecutionError {
             Self::Native(error) => Display::fmt(error, formatter),
             Self::Canonical(error) => Display::fmt(error, formatter),
             Self::ThreeDSynchronization(error) => Display::fmt(error, formatter),
+            Self::MissingCompletionReservation { source, requested } => write!(
+                formatter,
+                "syncpoint increment has no completion reservation: source=[{source}] requested={requested}"
+            ),
+            Self::WrongCompletionSyncpoint {
+                source,
+                requested,
+                reserved,
+            } => write!(
+                formatter,
+                "syncpoint reservation mismatch: source=[{source}] requested={requested} reserved={reserved}"
+            ),
             Self::MissingCompletionSignal {
                 reserved,
                 expected,
@@ -141,6 +163,7 @@ impl std::error::Error for MaxwellSubmissionExecutionError {}
 /// Implemented directly by the GPU owner, which also services control/wakeup work.
 pub trait MaxwellCommandHost: nixe_gpu::OwnerMemory + Sized {
     fn signal_syncpoint(&mut self) -> Result<(), MaxwellSubmissionExecutionError>;
+    fn release_fences(&mut self) -> Result<(), MaxwellSubmissionExecutionError>;
     fn report_memory(
         &mut self,
         frontend: FrontendSubmissionId,
@@ -364,6 +387,34 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'a, L, H> {
         }
         Ok(())
     }
+    fn increment_syncpoint(
+        &mut self,
+        source: MaxwellMethodSource,
+        requested: GuestSyncpointId,
+    ) -> Result<(), MaxwellSubmissionExecutionError> {
+        let completion = self.completion.ok_or(
+            MaxwellSubmissionExecutionError::MissingCompletionReservation { source, requested },
+        )?;
+        let reserved = completion.point();
+        if reserved.syncpoint() != requested {
+            return Err(MaxwellSubmissionExecutionError::WrongCompletionSyncpoint {
+                source,
+                requested,
+                reserved: reserved.syncpoint(),
+            });
+        }
+        self.completion_signal_count = self.completion_signal_count.saturating_add(1);
+        let expected = completion.increments() - self.driver_completion_increments;
+        if self.completion_signal_count > expected {
+            return Err(MaxwellSubmissionExecutionError::DuplicateCompletionSignal {
+                reserved,
+                expected,
+                observed: self.completion_signal_count,
+            });
+        }
+        self.host.signal_syncpoint()
+    }
+
     pub(crate) fn set_driver_completion_increments(&mut self, increments: u32) {
         self.driver_completion_increments = increments;
     }

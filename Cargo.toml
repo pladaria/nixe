@@ -87,6 +87,7 @@ nixe-video = { path = "crates/video" }
 nixe-video-winit = { path = "crates/video-winit" }
 winit = "0.30"
 toml = "0.8"
+trash = "5.2.9"
 zstd = { version = "0.13", default-features = false }
 
 [profile.release]

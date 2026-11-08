@@ -67,6 +67,10 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                     }
                     Ok(())
                 }
+                MaxwellHostSynchronizationKind::ReleaseFences => self.host.release_fences(),
+                MaxwellHostSynchronizationKind::IncrementSyncpoint { syncpoint } => {
+                    self.increment_syncpoint(source, syncpoint)
+                }
                 MaxwellHostSynchronizationKind::WaitForIdle { .. } => {
                     // All engine work on this channel shares the ordered
                     // backend stream. Both scopes therefore drain its prior
@@ -251,28 +255,11 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
     ) -> Result<(), MaxwellSubmissionExecutionError> {
         let source = trigger.source();
         let result = (|| {
-            let plan = lower_maxwell_three_d_synchronization(
-                trigger,
-                three_d,
-                self.completion,
-                self.prior_work_pending,
-            )
-            .map_err(MaxwellSubmissionExecutionError::ThreeDSynchronization)?;
-            if let MaxwellThreeDSynchronizationPlan::IncrementSyncpoint {
-                completion: reserved,
-                ..
-            } = plan
-            {
-                self.completion_signal_count = self.completion_signal_count.saturating_add(1);
-                let expected = self.completion.map_or(0, ReservedTimelinePoint::increments);
-                if self.completion_signal_count > expected {
-                    return Err(MaxwellSubmissionExecutionError::DuplicateCompletionSignal {
-                        reserved,
-                        expected,
-                        observed: self.completion_signal_count,
-                    });
-                }
-                self.host.signal_syncpoint()?;
+            let plan =
+                lower_maxwell_three_d_synchronization(trigger, three_d, self.prior_work_pending)
+                    .map_err(MaxwellSubmissionExecutionError::ThreeDSynchronization)?;
+            if let MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { request } = plan {
+                self.increment_syncpoint(source, request.syncpoint())?;
             }
             let drains_prior_work = matches!(
                 plan,

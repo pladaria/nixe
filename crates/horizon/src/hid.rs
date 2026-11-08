@@ -30,6 +30,7 @@ const KEYBOARD_ENTRY_SIZE: usize = 0x38;
 const NPAD_OFFSET: usize = 0x9a00;
 const NPAD_ENTRY_SIZE: usize = 0x5000;
 const FULL_KEY_LIFO_OFFSET: usize = 0x28;
+const SYSTEM_EXT_LIFO_OFFSET: usize = 0x1408;
 const FULL_KEY_SIX_AXIS_LIFO_OFFSET: usize = 0x1758;
 const HOME_BUTTON_LIFO_OFFSET: usize = 0x4c00;
 const CAPTURE_BUTTON_LIFO_OFFSET: usize = 0x5000;
@@ -45,6 +46,7 @@ const SYSTEM_BUTTON_ENTRY_SIZE: usize = 0x18;
 const NPAD_STYLE_FULL_KEY: u32 = 1;
 const NPAD_DEVICE_TYPE_FULL_KEY: u32 = 1;
 const NPAD_ATTRIBUTE_CONNECTED: u32 = 1;
+const NPAD_ATTRIBUTE_WIRED: u32 = 1 << 1;
 const NPAD_JOY_ASSIGNMENT_DUAL: u32 = 0;
 const SIX_AXIS_ATTRIBUTE_CONNECTED: u32 = 1;
 const APPLET_FOOTER_SWITCH_PRO_CONTROLLER: u8 = 12;
@@ -117,6 +119,7 @@ struct HidProducer {
     keyboard: Lifo,
     peripheral_sampling_number: u64,
     full_key: Lifo,
+    system_ext: Lifo,
     six_axis: Lifo,
     home: Lifo,
     capture: Lifo,
@@ -234,6 +237,7 @@ struct HidConfiguration {
     supported_style_set: u32,
     supported_ids: BTreeSet<u32>,
     npad_joy_hold_type: u64,
+    npad_handheld_activation_mode: u64,
     npad_lr_assignment_mode: bool,
     active_six_axis_handles: BTreeSet<u32>,
     gyroscope_drift_modes: std::collections::BTreeMap<(u8, u8, u8), u32>,
@@ -302,6 +306,7 @@ impl HidSystem {
                 keyboard: Lifo::default(),
                 peripheral_sampling_number: 0,
                 full_key: Lifo::default(),
+                system_ext: Lifo::default(),
                 six_axis: Lifo::default(),
                 home: Lifo::default(),
                 capture: Lifo::default(),
@@ -670,6 +675,29 @@ impl HidSystem {
             .npad_joy_hold_type
     }
 
+    // Dual = 0, Single = 1, None = 2. Like NpadResource, retain the
+    // application's setting independently of its connected FullKey controller.
+    // https://switchbrew.org/wiki/HID_services#NpadHandheldActivationMode
+    pub(crate) fn set_npad_handheld_activation_mode(&self, mode: u64) -> bool {
+        if mode > 2 {
+            return false;
+        }
+        self.state
+            .configuration
+            .lock()
+            .unwrap()
+            .npad_handheld_activation_mode = mode;
+        true
+    }
+
+    pub(crate) fn npad_handheld_activation_mode(&self) -> u64 {
+        self.state
+            .configuration
+            .lock()
+            .unwrap()
+            .npad_handheld_activation_mode
+    }
+
     /// Eden stores the LR assignment mode in the caller's Npad resource;
     /// it does not change an already assigned Pro Controller's input stream.
     /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/hid_core/resources/npad/npad.cpp
@@ -873,6 +901,7 @@ impl HidProducer {
                 writes.write_u32(NPAD_OFFSET, 0);
                 writes.write(NPAD_OFFSET + 8, &[0; NPAD_ENTRY_SIZE - 8]);
                 self.full_key = Lifo::default();
+                self.system_ext = Lifo::default();
                 self.six_axis = Lifo::default();
                 self.publish_system_button(writes, HOME_BUTTON_LIFO_OFFSET, false, true);
                 self.publish_system_button(writes, CAPTURE_BUTTON_LIFO_OFFSET, false, false);
@@ -909,9 +938,18 @@ impl HidProducer {
         put_i32(&mut common, 28, i32::from(state.left_stick.y));
         put_i32(&mut common, 32, i32::from(state.right_stick.x));
         put_i32(&mut common, 36, i32::from(state.right_stick.y));
-        put_u32(&mut common, 40, NPAD_ATTRIBUTE_CONNECTED);
+        put_u32(
+            &mut common,
+            40,
+            NPAD_ATTRIBUTE_CONNECTED | NPAD_ATTRIBUTE_WIRED,
+        );
         self.full_key
             .publish(writes, NPAD_OFFSET + FULL_KEY_LIFO_OFFSET, &common);
+        // The common SystemExt ring mirrors the active controller's buttons,
+        // sticks and connection attributes, as in Npad::OnUpdate.
+        // https://switchbrew.org/wiki/HID_services#NpadInternalState
+        self.system_ext
+            .publish(writes, NPAD_OFFSET + SYSTEM_EXT_LIFO_OFFSET, &common);
 
         if publish_six_axis {
             let mut sensor = [0_u8; SIX_AXIS_ENTRY_SIZE];

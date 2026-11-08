@@ -462,18 +462,13 @@ fn prepare_modules(
     placements: &[PreparationConfig],
     address_space: ProcessAddressSpace,
 ) -> Result<Vec<PreparedModule>, ProcessBuildError> {
-    let unresolved = |_: ExternalSymbol<'_>| SymbolResolution::Unresolved;
     plan.modules()
         .iter()
         .zip(placements)
         .map(|(module, config)| {
             let prepared = match module.image() {
-                LaunchModuleImage::Nso(image) => {
-                    image.prepare_for_guest_relocation(*config, &unresolved)
-                }
-                LaunchModuleImage::Nro(image) => {
-                    image.prepare_for_guest_relocation(*config, &unresolved)
-                }
+                LaunchModuleImage::Nso(image) => image.prepare(*config),
+                LaunchModuleImage::Nro(image) => image.prepare(*config),
             }
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Preparation, error))?;
             validate_range(

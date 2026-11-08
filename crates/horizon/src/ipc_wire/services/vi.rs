@@ -13,6 +13,7 @@ enum ApplicationDisplayCommand {
     CreateStrayLayer,
     DestroyStrayLayer,
     SetLayerScalingMode,
+    ConvertScalingMode,
     GetDisplayVsyncEvent,
 }
 
@@ -30,6 +31,7 @@ impl ApplicationDisplayCommand {
             2030 => Some(Self::CreateStrayLayer),
             2031 => Some(Self::DestroyStrayLayer),
             2101 => Some(Self::SetLayerScalingMode),
+            2102 => Some(Self::ConvertScalingMode),
             5202 => Some(Self::GetDisplayVsyncEvent),
             _ => None,
         }
@@ -288,6 +290,37 @@ pub(in crate::ipc_wire) async fn dispatch_vi(
                         HorizonIpcResult::SF_PRECONDITION_VIOLATION
                     };
                     cmif_error(request.token, result)
+                }
+                ApplicationDisplayCommand::ConvertScalingMode => {
+                    // VI's SDK enum is u32; its converted compositor enum is u64.
+                    // https://switchbrew.org/wiki/VI_services#IApplicationDisplayService
+                    // The conversion values follow Eden's ConvertScalingMode:
+                    // dev-tools/eden/src/core/hle/service/vi/vi_types.h
+                    if !request.has_payload_size(4) || has_ipc_descriptors(hipc) {
+                        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+                    }
+                    let converted: u64 = match request_u32(request.data, 0).unwrap() {
+                        0 => 3,
+                        1 => 0,
+                        2 => 1,
+                        3 => 2,
+                        4 => 4,
+                        _ => {
+                            return cmif_error(
+                                request.token,
+                                HorizonIpcResult::VI_OPERATION_FAILED,
+                            );
+                        }
+                    };
+                    Ok((
+                        encode_response(
+                            request.token,
+                            HorizonIpcResult::SUCCESS,
+                            &converted.to_le_bytes(),
+                            None,
+                        )?,
+                        None,
+                    ))
                 }
                 ApplicationDisplayCommand::GetDisplayVsyncEvent => {
                     let Some(display_id) = request_u64(request.data, 0) else {

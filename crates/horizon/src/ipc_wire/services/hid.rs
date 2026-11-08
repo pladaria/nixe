@@ -33,6 +33,8 @@ enum HidCommand {
     SetNpadJoyAssignmentModeDual,
     StartLrAssignmentMode,
     StopLrAssignmentMode,
+    SetNpadHandheldActivationMode,
+    GetNpadHandheldActivationMode,
     GetVibrationDeviceInfo,
     SendVibrationValue,
     SendVibrationValues,
@@ -73,6 +75,8 @@ impl HidCommand {
             124 => Some(Self::SetNpadJoyAssignmentModeDual),
             126 => Some(Self::StartLrAssignmentMode),
             127 => Some(Self::StopLrAssignmentMode),
+            128 => Some(Self::SetNpadHandheldActivationMode),
+            129 => Some(Self::GetNpadHandheldActivationMode),
             200 => Some(Self::GetVibrationDeviceInfo),
             201 => Some(Self::SendVibrationValue),
             203 => Some(Self::CreateActiveVibrationDeviceList),
@@ -456,6 +460,36 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
                     request.token,
                     false,
                     &hid_system.npad_joy_hold_type().to_le_bytes(),
+                    &[],
+                    &[],
+                    None,
+                )
+            }
+        }
+        // PID and ARUID, followed by the signed 64-bit mode for Set.
+        // https://switchbrew.org/wiki/HID_services#SetNpadHandheldActivationMode
+        // https://switchbrew.org/wiki/HID_services#GetNpadHandheldActivationMode
+        command @ (HidCommand::SetNpadHandheldActivationMode
+        | HidCommand::GetNpadHandheldActivationMode) => {
+            let setting = command == HidCommand::SetNpadHandheldActivationMode;
+            if hipc.pid.is_none()
+                || !request.has_payload_size(if setting { 16 } else { 8 })
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            if setting {
+                if !hid_system
+                    .set_npad_handheld_activation_mode(request_u64(request.data, 8).unwrap())
+                {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                }
+                semantic_success(request.token, false, &[], &[], &[], None)
+            } else {
+                semantic_success(
+                    request.token,
+                    false,
+                    &hid_system.npad_handheld_activation_mode().to_le_bytes(),
                     &[],
                     &[],
                     None,

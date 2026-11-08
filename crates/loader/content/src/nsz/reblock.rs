@@ -12,20 +12,40 @@ use crate::{NczCompressionKind, NszLoader};
 
 const COPY_BUFFER_SIZE: usize = 1024 * 1024;
 
+/// Disposition of the original package after a verified NSZ conversion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SolidBackup {
+    /// Keep the original beside the converted package with a `.solid` suffix.
+    Rename,
+    /// Move the original to the system trash; retain `.solid` if that fails.
+    #[default]
+    Trash,
+    /// Replace the original without retaining a backup.
+    Discard,
+}
+
 /// Converts solid NCZ entries in an NSZ to independent 1 MiB blocks.
 ///
-/// Returns `false` for an already suitable package. With `keep_backup`, the
-/// original is kept at `<path>.solid`; existing backups are never overwritten. Listing titles does
-/// not call this function. Anonymous, on-demand NCA caches remain unchanged.
+/// Returns `false` for an already suitable package. Retained originals are
+/// linked to `<path>.solid` before atomic replacement. Trash is attempted only
+/// after publishing the verified conversion; failure leaves that backup intact.
+/// Existing backups are never overwritten. Listing titles does not convert them.
 pub fn prepare_nsz_for_random_access(
     path: impl AsRef<Path>,
-    keep_backup: bool,
+    backup_policy: SolidBackup,
 ) -> Result<bool, LoadError> {
+    let keep_backup = backup_policy != SolidBackup::Discard;
     let path = fs::canonicalize(path.as_ref()).map_err(StorageError::from)?;
     // The lock is released on every exit, including errors and process death.
     // Reopen the path after acquiring it: a previous converter may have already
     // replaced the file whose inode we just locked.
-    let source_lock = File::open(&path).map_err(StorageError::from)?;
+    // NFS implements an exclusive flock with a write lock on the whole file.
+    // https://man7.org/linux/man-pages/man2/flock.2.html#VERSIONS
+    let source_lock = File::options()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(StorageError::from)?;
     source_lock.lock().map_err(StorageError::from)?;
     let source: StorageRef = Arc::new(FileStorage::open(&path)?);
     let archive = NszLoader::load(source)?;
@@ -154,6 +174,22 @@ pub fn prepare_nsz_for_random_access(
         .persist(&path)
         .map_err(|error| StorageError::from(error.error))?;
     sync_directory(directory)?;
+    if backup_policy == SolidBackup::Trash {
+        match trash::delete(&backup) {
+            Ok(()) => {
+                log::info!(
+                    "NSZ conversion finished in {:.1}s; original moved to the system trash: {}",
+                    started.elapsed().as_secs_f64(),
+                    backup.display()
+                );
+                return Ok(true);
+            }
+            Err(error) => log::warn!(
+                "cannot move original NSZ to the system trash: {error}; original preserved at {}",
+                backup.display()
+            ),
+        }
+    }
     if keep_backup {
         log::info!(
             "NSZ conversion finished in {:.1}s; original preserved at {}",

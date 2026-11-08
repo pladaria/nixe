@@ -2,9 +2,7 @@
 
 use std::fmt::{Display, Formatter};
 
-use nixe_gpu::{
-    CacheMaintenanceOperation, GuestSyncpointId, GuestTimelinePoint, ReservedTimelinePoint,
-};
+use nixe_gpu::{CacheMaintenanceOperation, GuestSyncpointId};
 
 use super::{
     MaxwellThreeDColorCompressionMode, MaxwellThreeDRegister, MaxwellThreeDState,
@@ -623,11 +621,10 @@ pub enum MaxwellThreeDSynchronizationPlan {
     ReportSemaphoreWrite(MaxwellThreeDReportSemaphoreWrite),
     IncrementSyncpoint {
         request: MaxwellThreeDSyncpointIncrement,
-        completion: GuestTimelinePoint,
     },
 }
 
-/// Inconsistent completion ownership at the 3D synchronization boundary.
+/// Invalid or unsupported state at the 3D synchronization boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDSynchronizationError {
     IncompleteDecompressSurfaceState {
@@ -654,15 +651,6 @@ pub enum MaxwellThreeDSynchronizationError {
     UnsupportedReportSemaphoreControl {
         source: MaxwellMethodSource,
         control: MaxwellThreeDReportSemaphoreControl,
-    },
-    MissingCompletionReservation {
-        source: MaxwellMethodSource,
-        requested: GuestSyncpointId,
-    },
-    WrongCompletionSyncpoint {
-        source: MaxwellMethodSource,
-        requested: GuestSyncpointId,
-        reserved: GuestSyncpointId,
     },
 }
 
@@ -702,34 +690,21 @@ impl Display for MaxwellThreeDSynchronizationError {
                 "MAXWELL_B report semaphore control is not implemented: source=[{source}] control=0x{:08x}",
                 control.raw()
             ),
-            Self::MissingCompletionReservation { source, requested } => write!(
-                formatter,
-                "MAXWELL_B syncpoint increment has no completion reservation: source=[{source}] requested={requested:?}"
-            ),
-            Self::WrongCompletionSyncpoint {
-                source,
-                requested,
-                reserved,
-            } => write!(
-                formatter,
-                "MAXWELL_B syncpoint reservation mismatch: source=[{source}] requested={requested:?} reserved={reserved:?}"
-            ),
         }
     }
 }
 
-/// Produces an ordering plan without publishing or consuming the reservation.
+/// Checks the 3D state consumed by an ordering operation.
 ///
-/// The completion owner remains responsible for publishing the reservation
-/// only after the requested condition, cache maintenance, and preceding work
-/// have completed.
+/// Channel execution validates syncpoint ownership and consumes increments in
+/// the shared PFIFO/3D path. The completion owner publishes them after prior
+/// memory updates and GPU work have completed.
 ///
 /// NVIDIA exposes `WAIT_FOR_IDLE` as a full-width channel-ordering method:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L51-L52>
 pub fn lower_maxwell_three_d_synchronization(
     trigger: MaxwellThreeDSynchronizationTrigger,
     state: &MaxwellThreeDState,
-    completion: Option<&ReservedTimelinePoint>,
     prior_work_pending: bool,
 ) -> Result<MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationError> {
     match trigger {
@@ -868,29 +843,8 @@ pub fn lower_maxwell_three_d_synchronization(
                 },
             ))
         }
-        MaxwellThreeDSynchronizationTrigger::IncrementSyncpoint { request, source } => {
-            let Some(completion) = completion else {
-                return Err(
-                    MaxwellThreeDSynchronizationError::MissingCompletionReservation {
-                        source,
-                        requested: request.syncpoint(),
-                    },
-                );
-            };
-            let point = completion.point();
-            if point.syncpoint() != request.syncpoint() {
-                return Err(
-                    MaxwellThreeDSynchronizationError::WrongCompletionSyncpoint {
-                        source,
-                        requested: request.syncpoint(),
-                        reserved: point.syncpoint(),
-                    },
-                );
-            }
-            Ok(MaxwellThreeDSynchronizationPlan::IncrementSyncpoint {
-                request,
-                completion: point,
-            })
+        MaxwellThreeDSynchronizationTrigger::IncrementSyncpoint { request, .. } => {
+            Ok(MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { request })
         }
     }
 }

@@ -622,6 +622,12 @@ impl<
             })
     }
 
+    fn release_fences(&mut self) -> Result<(), nixe_gpu_maxwell::MaxwellSubmissionExecutionError> {
+        self.owner.poll().map_err(|error| {
+            nixe_gpu_maxwell::MaxwellSubmissionExecutionError::Native(error.to_string().into())
+        })
+    }
+
     fn report_memory(
         &mut self,
         frontend: FrontendSubmissionId,

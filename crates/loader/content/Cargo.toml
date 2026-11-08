@@ -11,4 +11,5 @@ log.workspace = true
 sha2.workspace = true
 nixe-loader-storage.workspace = true
 tempfile.workspace = true
+trash.workspace = true
 zstd.workspace = true

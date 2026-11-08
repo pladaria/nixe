@@ -39,9 +39,7 @@ use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::a64::A64Register;
-use nixe_loader_executable::{
-    AddressSpaceType, ExternalSymbol, PreparationConfig, PreparedModule, SymbolResolution,
-};
+use nixe_loader_executable::{AddressSpaceType, PreparationConfig, PreparedModule};
 use nixe_memory::GuestVirtualAddress;
 use nixe_memory::{MemoryPermissions, PAGE_SIZE};
 

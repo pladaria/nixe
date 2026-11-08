@@ -203,6 +203,7 @@ pub struct MaxwellChannelFrontendState {
     legacy_mem_op_a: Option<u32>,
     host_semaphore: [u32; 3],
     reference_count: u32,
+    syncpoint_payload: u32,
     subchannel_bindings: [Option<crate::engines::Engine>; 8],
 }
 
@@ -250,6 +251,10 @@ impl MaxwellChannelFrontendState {
 
     pub(crate) const fn host_semaphore(&self) -> [u32; 3] {
         self.host_semaphore
+    }
+
+    pub(crate) fn set_syncpoint_payload(&mut self, value: u32) {
+        self.syncpoint_payload = value;
     }
 
     pub(crate) fn set_reference_count(&mut self, value: u32) {

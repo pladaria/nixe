@@ -57,20 +57,20 @@ const DMA_REGISTER_COUNT: usize = MaxwellDmaCopyRegisterName::Launch as usize + 
 /// One source-preserving register in the DMA copy engine.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellDmaCopyRegister {
-    raw: Option<u32>,
+    raw: u32,
     source: Option<MaxwellMethodSource>,
 }
 
 impl MaxwellDmaCopyRegister {
     const fn programmed(raw: u32, source: MaxwellMethodSource) -> Self {
         Self {
-            raw: Some(raw),
+            raw,
             source: Some(source),
         }
     }
 
     #[must_use]
-    pub const fn raw(self) -> Option<u32> {
+    pub const fn raw(self) -> u32 {
         self.raw
     }
 
@@ -88,21 +88,11 @@ pub struct MaxwellDmaCopyState {
 
 impl Default for MaxwellDmaCopyState {
     fn default() -> Self {
-        let mut registers = [MaxwellDmaCopyRegister::default(); DMA_REGISTER_COUNT];
-        // Slice selectors start at zero in the copy engine. A 2D transfer need
-        // not program SET_SRC_LAYER/SET_DST_LAYER before its first launch.
-        // Keep reset state distinct from a guest write (no source location).
-        // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/maxwell_dma.h
-        for name in [
-            MaxwellDmaCopyRegisterName::SourcePositionZ,
-            MaxwellDmaCopyRegisterName::DestinationPositionZ,
-        ] {
-            registers[name as usize] = MaxwellDmaCopyRegister {
-                raw: Some(0),
-                source: None,
-            };
+        // DMA register reset state matches Eden's zero-initialized Regs bank.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/engines/maxwell_dma.h
+        Self {
+            registers: [MaxwellDmaCopyRegister::default(); DMA_REGISTER_COUNT],
         }
-        Self { registers }
     }
 }
 
@@ -270,16 +260,6 @@ fn build_operation(
             "interrupts, physical addressing, L2 bypass, and reductions are not implemented",
         ));
     }
-    if state
-        .register(MaxwellDmaCopyRegisterName::RenderEnableControl)
-        .raw()
-        .is_some_and(|mode| mode != 1)
-    {
-        return Err(invalid_encoding(
-            source,
-            "conditional or disabled DMA execution is not implemented",
-        ));
-    }
     let semaphore_release = match (raw >> 3) & 3 {
         0 => None,
         1 => {
@@ -287,8 +267,7 @@ fn build_operation(
                 state,
                 MaxwellDmaCopyRegisterName::SemaphoreAddressUpper,
                 MaxwellDmaCopyRegisterName::SemaphoreAddressLower,
-                source,
-            )?;
+            );
             if address & 3 != 0 {
                 return Err(invalid_encoding(
                     source,
@@ -297,7 +276,9 @@ fn build_operation(
             }
             Some((
                 address,
-                required(state, MaxwellDmaCopyRegisterName::SemaphorePayload, source)?,
+                state
+                    .register(MaxwellDmaCopyRegisterName::SemaphorePayload)
+                    .raw(),
             ))
         }
         _ => {
@@ -309,30 +290,26 @@ fn build_operation(
     };
     let multi_line = raw & (1 << 9) != 0;
     let remap_enabled = raw & (1 << 10) != 0;
-    let width = required(state, MaxwellDmaCopyRegisterName::LineLength, source)?;
-    let height = required(state, MaxwellDmaCopyRegisterName::LineCount, source)?;
+    let width = state.register(MaxwellDmaCopyRegisterName::LineLength).raw();
+    let height = if multi_line {
+        state.register(MaxwellDmaCopyRegisterName::LineCount).raw()
+    } else {
+        1
+    };
     if width == 0 || height == 0 {
         return Err(invalid_encoding(source, "DMA dimensions must be nonzero"));
-    }
-    if !multi_line && height != 1 {
-        return Err(invalid_encoding(
-            source,
-            "LINE_COUNT must be one when multi-line mode is disabled",
-        ));
     }
 
     let source_address = address(
         state,
         MaxwellDmaCopyRegisterName::SourceAddressUpper,
         MaxwellDmaCopyRegisterName::SourceAddressLower,
-        source,
-    )?;
+    );
     let destination_address = address(
         state,
         MaxwellDmaCopyRegisterName::DestinationAddressUpper,
         MaxwellDmaCopyRegisterName::DestinationAddressLower,
-        source,
-    )?;
+    );
     let remap = remap_enabled
         .then(|| parse_remap(state, source))
         .transpose()?;
@@ -342,24 +319,42 @@ fn build_operation(
             u32::from(remap.component_bytes) * u32::from(remap.destination_components),
         )
     });
-    let source_layout = layout(
-        state,
-        raw & (1 << 7) != 0,
-        true,
-        width,
-        height,
-        source_element_bytes,
-        source,
-    )?;
-    let destination_layout = layout(
-        state,
-        raw & (1 << 8) != 0,
-        false,
-        width,
-        height,
-        destination_element_bytes,
-        source,
-    )?;
+    // Like Eden MaxwellDMA::Launch, single-line transfers are contiguous;
+    // line count, pitch and surface-geometry registers belong to multi-line mode.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/engines/maxwell_dma.cpp
+    let (source_layout, destination_layout) = if multi_line {
+        (
+            layout(
+                state,
+                raw & (1 << 7) != 0,
+                true,
+                width,
+                height,
+                source_element_bytes,
+                source,
+            )?,
+            layout(
+                state,
+                raw & (1 << 8) != 0,
+                false,
+                width,
+                height,
+                destination_element_bytes,
+                source,
+            )?,
+        )
+    } else {
+        let contiguous = |element_bytes| {
+            width
+                .checked_mul(element_bytes)
+                .map(|pitch| MaxwellMemoryCopyLayout::Pitch { pitch })
+                .ok_or_else(|| invalid_encoding(source, "DMA row size overflows"))
+        };
+        (
+            contiguous(source_element_bytes)?,
+            contiguous(destination_element_bytes)?,
+        )
+    };
     let source_range_size =
         required_range_size(source_layout, width, height, source_element_bytes)?;
     let destination_range_size =
@@ -389,32 +384,21 @@ fn build_operation(
     })
 }
 
-fn required(
-    state: &MaxwellDmaCopyState,
-    register: MaxwellDmaCopyRegisterName,
-    source: MaxwellMethodSource,
-) -> Result<u32, MaxwellEngineDispatchError> {
-    state
-        .register(register)
-        .raw()
-        .ok_or_else(|| invalid_encoding(source, "LAUNCH_DMA requires complete copy state"))
-}
-
 fn address(
     state: &MaxwellDmaCopyState,
     upper: MaxwellDmaCopyRegisterName,
     lower: MaxwellDmaCopyRegisterName,
-    source: MaxwellMethodSource,
-) -> Result<u64, MaxwellEngineDispatchError> {
-    Ok((u64::from(required(state, upper, source)?) << 32)
-        | u64::from(required(state, lower, source)?))
+) -> u64 {
+    (u64::from(state.register(upper).raw()) << 32) | u64::from(state.register(lower).raw())
 }
 
 fn parse_remap(
     state: &MaxwellDmaCopyState,
     source: MaxwellMethodSource,
 ) -> Result<MaxwellMemoryCopyRemap, MaxwellEngineDispatchError> {
-    let raw = required(state, MaxwellDmaCopyRegisterName::RemapComponents, source)?;
+    let raw = state
+        .register(MaxwellDmaCopyRegisterName::RemapComponents)
+        .raw();
     let mut components = [MaxwellMemoryCopyComponentSource::NoWrite; 4];
     for (index, component) in components.iter_mut().enumerate() {
         *component = match (raw >> (index * 4)) & 0x7 {
@@ -432,12 +416,10 @@ fn parse_remap(
         destination_components: ((raw >> 24) & 0x3) as u8 + 1,
         constant_a: state
             .register(MaxwellDmaCopyRegisterName::RemapConstantA)
-            .raw()
-            .unwrap_or(0),
+            .raw(),
         constant_b: state
             .register(MaxwellDmaCopyRegisterName::RemapConstantB)
-            .raw()
-            .unwrap_or(0),
+            .raw(),
     };
     if remap.components[..remap.destination_components as usize]
         .iter()
@@ -484,7 +466,7 @@ fn layout(
         )
     };
     if pitch {
-        let pitch = required(state, pitch_register, source)?;
+        let pitch = state.register(pitch_register).raw();
         let row_bytes = width
             .checked_mul(element_bytes)
             .ok_or_else(|| invalid_encoding(source, "DMA row size overflows"))?;
@@ -497,7 +479,7 @@ fn layout(
         return Ok(MaxwellMemoryCopyLayout::Pitch { pitch });
     }
 
-    let dimensions = required(state, block, source)?;
+    let dimensions = state.register(block).raw();
     let gob_height = (dimensions >> 12) & 0xf;
     let block_depth_log2 = (dimensions >> 8) & 0xf;
     let block_height_log2 = ((dimensions >> 4) & 0xf) as u8;
@@ -508,15 +490,15 @@ fn layout(
             "only 16Bx2 GOBs with unit block width/depth are implemented",
         ));
     }
-    let surface_width = required(state, size_x, source)?;
-    let surface_height = required(state, size_y, source)?;
-    if required(state, size_z, source)? != 1 || required(state, position_z, source)? != 0 {
+    let surface_width = state.register(size_x).raw();
+    let surface_height = state.register(size_y).raw();
+    if state.register(size_z).raw() != 1 || state.register(position_z).raw() != 0 {
         return Err(invalid_encoding(
             source,
             "three-dimensional block-linear DMA is not implemented",
         ));
     }
-    let position = required(state, position_xy, source)?;
+    let position = state.register(position_xy).raw();
     let x = position & 0xffff;
     let y = position >> 16;
     if x.checked_add(width).is_none_or(|end| end > surface_width)

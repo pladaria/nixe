@@ -114,6 +114,11 @@ impl Display for MaxwellMethodSource {
 pub enum MaxwellHostSynchronizationKind {
     /// Drain prior engine work before processing subsequent channel methods.
     WaitForIdle { all: bool },
+    /// Service completed fences without stalling the asynchronous channel.
+    ReleaseFences,
+    IncrementSyncpoint {
+        syncpoint: nixe_gpu::GuestSyncpointId,
+    },
     SemaphoreRelease {
         address: u64,
         payload: u32,
@@ -323,6 +328,21 @@ pub(crate) fn call_puller_method(
             frontend.set_reference_count(source.argument);
             Ok(Some(Effect::WaitForIdle { all: true }))
         }
+        // Puller::ProcessFenceActionMethod uses ReleaseFences for Acquire and
+        // the same SignalSyncPoint as Maxwell3D for Increment. The asynchronous
+        // backend releases completed fences without waiting for the payload.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/engines/puller.cpp
+        0x70 => {
+            frontend.set_syncpoint_payload(source.argument);
+            Ok(None)
+        }
+        0x74 => Ok(Some(if source.argument & 1 == 0 {
+            Effect::ReleaseFences
+        } else {
+            Effect::IncrementSyncpoint {
+                syncpoint: nixe_gpu::GuestSyncpointId::new(source.argument >> 8),
+            }
+        })),
         0x78 => {
             if source.argument & !1 != 0 {
                 return Err(MaxwellMethodDispatchError::InvalidHostMethodValue {

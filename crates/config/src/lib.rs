@@ -11,6 +11,7 @@ use nixe_loader_title::{DirectoryScanOptions, NacpLanguage};
 use serde::Deserialize;
 
 pub use nixe_input::GamepadProfile;
+pub use nixe_loader_content::SolidBackup;
 
 mod window_state;
 pub use window_state::WindowState;
@@ -182,8 +183,8 @@ pub struct LibraryConfig {
     pub follow_symlinks: bool,
     /// Convert solid NCZ entries in the selected title's NSZ packages before launch.
     pub convert_solid_to_blocks: bool,
-    /// Preserve converted packages' original files with a `.solid` suffix.
-    pub keep_solid_backup: bool,
+    /// Rename, trash, or discard the original after a verified NSZ conversion.
+    pub keep_solid_backup: SolidBackup,
 }
 
 impl LibraryConfig {
@@ -459,8 +460,41 @@ struct RawLibraryConfig {
     follow_symlinks: bool,
     #[serde(default = "default_true")]
     convert_solid_to_blocks: bool,
-    #[serde(default = "default_true")]
-    keep_solid_backup: bool,
+    #[serde(default, deserialize_with = "deserialize_solid_backup")]
+    keep_solid_backup: SolidBackup,
+}
+
+fn deserialize_solid_backup<'de, D>(deserializer: D) -> Result<SolidBackup, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct SolidBackupVisitor;
+
+    impl serde::de::Visitor<'_> for SolidBackupVisitor {
+        type Value = SolidBackup;
+
+        fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("true, false, or \"trash\"")
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+            Ok(if value {
+                SolidBackup::Rename
+            } else {
+                SolidBackup::Discard
+            })
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            if value == "trash" {
+                Ok(SolidBackup::Trash)
+            } else {
+                Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+            }
+        }
+    }
+
+    deserializer.deserialize_any(SolidBackupVisitor)
 }
 
 #[derive(Deserialize)]
@@ -780,7 +814,6 @@ mod tests {
         assert!(!config.library.scan_options().recursive);
         assert!(!config.library.scan_options().follow_symlinks);
         assert!(!config.library.convert_solid_to_blocks);
-        assert!(!config.library.keep_solid_backup);
         assert_eq!(config.filesystem.sd_card, base.join("./custom-sd"));
         assert_eq!(config.filesystem.save_data, base.join("./custom-save"));
         assert_eq!(
@@ -943,7 +976,6 @@ mod tests {
         assert!(config.library.follow_symlinks);
         assert!(config.library.scan_options().follow_symlinks);
         assert!(config.library.convert_solid_to_blocks);
-        assert!(config.library.keep_solid_backup);
         assert_eq!(
             config.filesystem.screenshots,
             file.path.parent().unwrap().join("./storage/screenshots")
