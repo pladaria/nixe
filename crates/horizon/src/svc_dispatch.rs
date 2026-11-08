@@ -501,6 +501,15 @@ impl HorizonSvcDispatcher {
         self
     }
 
+    /// Configures the existing input worker's emulated controller motion filter.
+    pub fn with_motion_settings(
+        self: std::sync::Arc<Self>,
+        settings: nixe_input::MotionSettings,
+    ) -> std::sync::Arc<Self> {
+        self.resources.system.hid.set_motion_settings(settings);
+        self
+    }
+
     #[must_use]
     pub fn video_system(self: &std::sync::Arc<Self>) -> crate::VideoSystem {
         self.resources.graphics.video.clone()

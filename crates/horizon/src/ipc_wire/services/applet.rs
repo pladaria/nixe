@@ -138,10 +138,10 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
             let Some(command) = CommonStateGetterCommand::decode(request.command_id) else {
                 return unsupported_service_command("ICommonStateGetter", request.command_id);
             };
-            let payload_size = if command == CommonStateGetterCommand::SetCpuBoostMode {
-                4
-            } else {
-                0
+            let payload_size = match command {
+                CommonStateGetterCommand::SetCpuBoostMode => 4,
+                CommonStateGetterCommand::SetVrModeEnabled => 1,
+                _ => 0,
             };
             if (payload_size == 0 && !request.data.is_empty())
                 || !request.has_payload_size(payload_size)
@@ -150,6 +150,17 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             match command {
+                CommonStateGetterCommand::IsVrModeEnabled => {
+                    applet_data(request.token, &[u8::from(session.vr_mode_enabled())])
+                }
+                CommonStateGetterCommand::SetVrModeEnabled => {
+                    session.set_vr_mode_enabled(request.data[0] != 0);
+                    applet_data(request.token, &[])
+                }
+                CommonStateGetterCommand::BeginVrModeEx | CommonStateGetterCommand::EndVrModeEx => {
+                    session.set_vr_mode_enabled(command == CommonStateGetterCommand::BeginVrModeEx);
+                    applet_data(request.token, &[])
+                }
                 // AM accepts Normal (0) and FastLoad (1), with one u32 input.
                 // Boost changes hardware clock policy, not the architectural
                 // timer frequency. Host CPU/GPU execution is already unthrottled.
@@ -652,6 +663,16 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                         ),
                     )?;
                     applet_data(request.token, version)
+                }
+                ApplicationFunctionsCommand::SetGamePlayRecordingState => {
+                    if !request.has_payload_size(4) || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    session.set_game_play_recording_state(request_u32(request.data, 0).unwrap());
+                    applet_data(request.token, &[])
                 }
                 ApplicationFunctionsCommand::NotifyRunning => {
                     if !request.data.is_empty() || has_ipc_descriptors(hipc) {

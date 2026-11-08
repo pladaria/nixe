@@ -8,7 +8,6 @@ pub struct AttachmentInfo {
     pub description: ImageDescription,
     pub layout: MaxwellThreeDImageLayout,
     pub array_pitch_dwords: Option<u32>,
-    pub selected_layer: u16,
     pub guest_format: MaxwellThreeDGuestImageFormat,
     pub row_pitch_bytes: Option<u32>,
     pub sample_mode: Option<MaxwellThreeDSampleMode>,
@@ -23,7 +22,6 @@ impl AttachmentInfo {
             description,
             layout,
             array_pitch_dwords,
-            selected_layer,
             guest_format,
             row_pitch_bytes,
             sample_mode,
@@ -50,7 +48,11 @@ impl AttachmentInfo {
         // Keep the conversion at the guest/neutral boundary so the neutral
         // image layout remains byte-addressed.
         // https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/texture_cache/image_info.cpp#L126-L177
-        let array_pitch = array_pitch_dwords.map(|pitch| u64::from(pitch) * 4);
+        let array_pitch = if layout == MaxwellThreeDImageLayout::PitchLinear {
+            None
+        } else {
+            array_pitch_dwords.map(|pitch| u64::from(pitch) * 4)
+        };
         let (neutral_layout, layer_stride) = match layout {
             MaxwellThreeDImageLayout::PitchLinear => {
                 let row_pitch = row_pitch_bytes.map(u64::from).unwrap_or(compact_row);
@@ -109,7 +111,6 @@ impl AttachmentInfo {
             layer_stride: array_pitch.unwrap_or(0),
             maybe_unaligned_layer_stride: array_pitch.unwrap_or(0),
             size,
-            selected_layer,
             guest_format,
         })
     }
@@ -119,46 +120,43 @@ pub fn render_target_info(
     state: &MaxwellThreeDState,
     role: MaxwellThreeDResourceRole,
 ) -> Result<Option<AttachmentInfo>, MaxwellThreeDResourceError> {
-    let (address, description, selected_layer, guest_format, layout, array_pitch_dwords) =
-        match role {
-            MaxwellThreeDResourceRole::ColorTarget(index) => {
-                let target = state.render_targets().color(index as usize);
-                match target.readiness(true) {
-                    MaxwellThreeDAttachmentReadiness::Unprogrammed
-                    | MaxwellThreeDAttachmentReadiness::Disabled => return Ok(None),
-                    MaxwellThreeDAttachmentReadiness::Ready => (),
-                    _ => return Err(MaxwellThreeDResourceError::IncompleteState { role }),
-                }
-                let (description, selected_layer, guest_format) = targets::color(index, &target)?;
-                (
-                    unresolved(
-                        target.address_upper().value(),
-                        target.address_lower().value(),
-                    ),
-                    description,
-                    selected_layer,
-                    guest_format,
-                    target.layout().value().copied(),
-                    target.array_pitch().value().copied(),
-                )
+    let (address, description, guest_format, layout, array_pitch_dwords) = match role {
+        MaxwellThreeDResourceRole::ColorTarget(index) => {
+            let target = state.render_targets().color(index as usize);
+            match target.readiness(true) {
+                MaxwellThreeDAttachmentReadiness::Unprogrammed
+                | MaxwellThreeDAttachmentReadiness::Disabled => return Ok(None),
+                MaxwellThreeDAttachmentReadiness::Ready => (),
+                _ => return Err(MaxwellThreeDResourceError::IncompleteState { role }),
             }
-            MaxwellThreeDResourceRole::DepthStencilTarget => {
-                let target = state.render_targets().depth_stencil();
-                let (description, selected_layer, guest_format) = targets::depth(&target)?;
-                (
-                    unresolved(
-                        target.address_upper().value(),
-                        target.address_lower().value(),
-                    ),
-                    description,
-                    selected_layer,
-                    guest_format,
-                    target.layout().value().copied(),
-                    target.array_pitch().value().copied(),
-                )
-            }
-            _ => return Err(MaxwellThreeDResourceError::IncompleteState { role }),
-        };
+            let (description, guest_format) = targets::color(index, &target)?;
+            (
+                unresolved(
+                    target.address_upper().value(),
+                    target.address_lower().value(),
+                ),
+                description,
+                guest_format,
+                target.layout().value().copied(),
+                target.array_pitch().value().copied(),
+            )
+        }
+        MaxwellThreeDResourceRole::DepthStencilTarget => {
+            let target = state.render_targets().depth_stencil();
+            let (description, guest_format) = targets::depth(&target)?;
+            (
+                unresolved(
+                    target.address_upper().value(),
+                    target.address_lower().value(),
+                ),
+                description,
+                guest_format,
+                target.layout().value().copied(),
+                target.array_pitch().value().copied(),
+            )
+        }
+        _ => return Err(MaxwellThreeDResourceError::IncompleteState { role }),
+    };
     let sample_mode = state
         .fixed_function()
         .register(MaxwellThreeDFixedFunctionRegister::SampleMode)
@@ -167,14 +165,25 @@ pub fn render_target_info(
             MaxwellThreeDFixedFunctionValue::SampleMode(mode) => Some(*mode),
             _ => None,
         });
+    let row_pitch_bytes = match (role, layout) {
+        (
+            MaxwellThreeDResourceRole::ColorTarget(index),
+            Some(MaxwellThreeDImageLayout::PitchLinear),
+        ) => state
+            .render_targets()
+            .color(index as usize)
+            .width()
+            .value()
+            .copied(),
+        _ => None,
+    };
     Ok(Some(AttachmentInfo {
         address: address.ok_or(MaxwellThreeDResourceError::IncompleteState { role })?,
         description,
-        selected_layer,
         guest_format,
         layout: layout.ok_or(MaxwellThreeDResourceError::IncompleteState { role })?,
         array_pitch_dwords,
-        row_pitch_bytes: None,
+        row_pitch_bytes,
         sample_mode,
     }))
 }
@@ -295,7 +304,6 @@ fn surface_info(
             }
         },
         array_pitch_dwords: None,
-        selected_layer: 0,
         guest_format,
         row_pitch_bytes: match surface.layout {
             BlitSurfaceLayout::Pitch(pitch) => Some(pitch),

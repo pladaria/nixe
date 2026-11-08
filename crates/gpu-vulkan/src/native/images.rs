@@ -557,7 +557,10 @@ fn sampler_border(
             (vk::BorderColor::FLOAT_OPAQUE_WHITE, None)
         }
         Some(components) => (
-            core,
+            // The extension payload and Vulkan border enum must describe
+            // the same sampler, as Eden Sampler::Emplace does.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+            vk::BorderColor::FLOAT_CUSTOM_EXT,
             Some(CustomBorderColor {
                 components,
                 format: vk::Format::UNDEFINED,

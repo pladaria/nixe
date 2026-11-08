@@ -550,15 +550,7 @@ impl Residency<'_> {
         let native = Arc::new(crate::AllocatedImageView::from_handle(
             Arc::clone(&entry.native),
             handle,
-            if entry.description.image_type == vk::ImageType::TYPE_3D {
-                vk::ImageSubresourceRange {
-                    base_array_layer: 0,
-                    layer_count: vk::REMAINING_ARRAY_LAYERS,
-                    ..info.subresource_range
-                }
-            } else {
-                info.subresource_range
-            },
+            info.subresource_range,
         ));
         let downloaded = entry.forced_flushed;
         // Eden records format capabilities once in ImageView, then selects a

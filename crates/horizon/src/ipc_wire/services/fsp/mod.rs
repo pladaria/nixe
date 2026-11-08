@@ -2,14 +2,14 @@
 
 pub(super) mod abi;
 mod commands;
+mod data_storage;
 mod directory;
 mod file;
 mod filesystem;
 mod save;
 mod storage;
-mod system_data;
+pub(super) use data_storage::open_data_storage;
 pub(super) use save::open_save_data;
-pub(super) use system_data::open_system_data;
 
 use crate::ipc_wire::request::Request;
 

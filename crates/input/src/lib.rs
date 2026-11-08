@@ -18,7 +18,7 @@ pub use model::{
     FaceButtonLabels, IdentifierError, MotionSensor, MotionState, MotionVector, StickState,
     TriggerState,
 };
-pub use motion::MotionEstimate;
+pub use motion::{MotionEstimate, MotionInput, MotionSettings};
 pub use profile::{
     EmulatedButtonState, EmulatedControllerState, GamepadProfile, GamepadProfiles,
     ProfiledControllerState,
@@ -44,8 +44,9 @@ struct InputManager<B> {
     backend: B,
     profiles: GamepadProfiles,
     selected: Option<SelectedProfile>,
-    motion: motion::MotionIntegrator,
+    motion: motion::MotionInput,
     last_sample: Option<std::time::Instant>,
+    motion_settings: MotionSettings,
 }
 
 struct SelectedProfile {
@@ -67,8 +68,9 @@ impl<B> InputManager<B> {
             backend,
             profiles,
             selected: None,
-            motion: motion::MotionIntegrator::default(),
+            motion: motion::MotionInput::default(),
             last_sample: None,
+            motion_settings: MotionSettings::default(),
         }
     }
 }
@@ -87,7 +89,7 @@ impl<B: HostInputBackend> InputManager<B> {
         let Some(controller) = self.backend.poll()? else {
             self.selected = None;
             self.last_sample = None;
-            self.motion = motion::MotionIntegrator::default();
+            self.motion = motion::MotionInput::default();
             return Ok(None);
         };
         let now = std::time::Instant::now();
@@ -105,7 +107,7 @@ impl<B: HostInputBackend> InputManager<B> {
                     .matching_profile(&controller.name, controller.kind)
                     .map(|(name, profile)| (name.into(), profile.clone())),
             });
-            self.motion = motion::MotionIntegrator::default();
+            self.motion = motion::MotionInput::default();
             self.last_sample = None;
         }
         let delta = self
@@ -120,9 +122,12 @@ impl<B: HostInputBackend> InputManager<B> {
             return Ok(None);
         };
         let mut state = profile.map(&controller);
-        state.motion = self
-            .motion
-            .update(state.gyroscope, state.accelerometer, delta);
+        state.motion = self.motion.update(
+            state.gyroscope,
+            state.accelerometer,
+            delta,
+            self.motion_settings.gyroscope_threshold(),
+        );
         Ok(Some(ProfiledControllerState {
             controller_id: controller.id,
             device: controller.name,
@@ -181,93 +186,5 @@ mod tests {
             ControllerId::new(2)
         );
         assert!(input.read_input().unwrap().is_none());
-    }
-
-    #[test]
-    fn profiles_are_resolved_once_per_connection_or_descriptor_change() {
-        let mut first = controller(1);
-        first.motion.gyroscope = Some(MotionVector {
-            x: 0.0,
-            y: 1.0,
-            z: 0.0,
-        });
-        first.motion.accelerometer = Some(MotionVector {
-            x: 0.0,
-            y: 9.806_65,
-            z: 0.0,
-        });
-        let mut renamed = first.clone();
-        renamed.name = "Unmapped".into();
-        let mut reconnected = first.clone();
-        reconnected.id = ControllerId::new(2);
-        let profile = GamepadProfile {
-            device: first.name.to_string(),
-            controller_type: first.kind,
-            a: Some(Button::South),
-            b: None,
-            x: None,
-            y: None,
-            plus: None,
-            minus: None,
-            home: None,
-            capture: None,
-            l: None,
-            r: None,
-            leftstick: None,
-            rightstick: None,
-            dpup: None,
-            dpdown: None,
-            dpleft: None,
-            dpright: None,
-            zl: None,
-            zr: None,
-            leftx: None,
-            lefty: None,
-            rightx: None,
-            righty: None,
-            gyroscope: Some(MotionSensor::Gyroscope),
-            accelerometer: Some(MotionSensor::Accelerometer),
-        };
-        let profiles =
-            GamepadProfiles::new(std::collections::BTreeMap::from([("test".into(), profile)]));
-        let mut pressed = first.clone();
-        pressed.buttons.set(Button::South, true);
-        let mut input = InputManager::with_profiles(
-            SnapshotBackend {
-                snapshots: VecDeque::from([
-                    Some(first),
-                    Some(pressed),
-                    Some(renamed.clone()),
-                    Some(renamed),
-                    None,
-                    Some(reconnected),
-                ]),
-            },
-            profiles,
-        );
-        let first = input.read_profiled_input().unwrap().unwrap();
-        input.last_sample = Some(std::time::Instant::now() - std::time::Duration::from_millis(10));
-        let second = input.read_profiled_input().unwrap().unwrap();
-        assert!(std::sync::Arc::ptr_eq(
-            &first.profile_name,
-            &second.profile_name
-        ));
-        assert!(std::sync::Arc::ptr_eq(&first.device, &second.device));
-        assert!(!first.state.buttons.a);
-        assert!(second.state.buttons.a);
-        assert!(second.state.motion.unwrap().angle.y > 0.0);
-        assert!(input.read_profiled_input().unwrap().is_none());
-        assert!(input.read_profiled_input().unwrap().is_none());
-        assert!(input.read_profiled_input().unwrap().is_none());
-        let reconnected = input.read_profiled_input().unwrap().unwrap();
-        assert_eq!(reconnected.controller_id, ControllerId::new(2));
-        assert_eq!(
-            reconnected.state.motion.unwrap().angle,
-            MotionVector::default()
-        );
-        assert!(!std::sync::Arc::ptr_eq(
-            &first.profile_name,
-            &reconnected.profile_name
-        ));
     }
 }

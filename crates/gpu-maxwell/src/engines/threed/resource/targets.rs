@@ -5,7 +5,7 @@ use super::*;
 pub(super) fn color(
     index: u8,
     target: &MaxwellThreeDColorTargetState,
-) -> Result<(ImageDescription, u16, MaxwellThreeDGuestImageFormat), MaxwellThreeDResourceError> {
+) -> Result<(ImageDescription, MaxwellThreeDGuestImageFormat), MaxwellThreeDResourceError> {
     let role = MaxwellThreeDResourceRole::ColorTarget(index);
     let width = *target
         .width()
@@ -34,20 +34,26 @@ pub(super) fn color(
     // the latter's zero reset must not strip the attachment's transfer function.
     // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/format_traits.inc#L46-L47
     // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_base.cpp#L50-L55
-    let (dimension, depth, layers, selected_layer) = match kind {
-        MaxwellThreeDImageKind::Array => {
-            let layers = u16::try_from(third)
-                .map_err(|_| MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
-            let layer = *target
-                .layer()
-                .value()
-                .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-            if layer >= layers {
-                return Err(MaxwellThreeDResourceError::ContradictoryState { role });
+    // Linear color WIDTH is a byte pitch, while block-linear WIDTH counts
+    // texels. Eden ImageInfo also gives linear surfaces one layer.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/image_info.cpp
+    let linear = target.layout().value() == Some(&MaxwellThreeDImageLayout::PitchLinear);
+    let width = if linear {
+        width / u32::from(format.plane_bytes_per_texel(0).unwrap())
+    } else {
+        width
+    };
+    let (dimension, depth, layers) = if linear {
+        (ImageDimension::Two, 1, 1)
+    } else {
+        match kind {
+            MaxwellThreeDImageKind::Array => {
+                let layers = u16::try_from(third)
+                    .map_err(|_| MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+                (ImageDimension::Two, 1, layers)
             }
-            (ImageDimension::Two, 1, layers, layer)
+            MaxwellThreeDImageKind::ThreeDimensional => (ImageDimension::Three, third, 1),
         }
-        MaxwellThreeDImageKind::ThreeDimensional => (ImageDimension::Three, third, 1, 0),
     };
     let description = image_description(MaxwellImageDescriptionRequest {
         dimension,
@@ -63,13 +69,12 @@ pub(super) fn color(
     })?;
     Ok((
         description,
-        selected_layer,
         MaxwellThreeDGuestImageFormat::Color(guest_format),
     ))
 }
 pub(super) fn depth(
     target: &MaxwellThreeDDepthStencilTargetState,
-) -> Result<(ImageDescription, u16, MaxwellThreeDGuestImageFormat), MaxwellThreeDResourceError> {
+) -> Result<(ImageDescription, MaxwellThreeDGuestImageFormat), MaxwellThreeDResourceError> {
     let role = MaxwellThreeDResourceRole::DepthStencilTarget;
     if target.sparse().value().is_some_and(|value| value & 1 != 0) {
         return Err(MaxwellThreeDResourceError::UnsupportedSparseDepth {
@@ -107,20 +112,17 @@ pub(super) fn depth(
         .array_control()
         .value()
         .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-    let layers = match control {
-        MaxwellThreeDDepthArrayControl::ThirdDimensionDefinesArraySize => *target
-            .third_dimension()
-            .value()
-            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?,
-        MaxwellThreeDDepthArrayControl::ArraySizeIsOne => 1,
+    let layers = if target.layout().value() == Some(&MaxwellThreeDImageLayout::PitchLinear) {
+        1
+    } else {
+        match control {
+            MaxwellThreeDDepthArrayControl::ThirdDimensionDefinesArraySize => *target
+                .third_dimension()
+                .value()
+                .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?,
+            MaxwellThreeDDepthArrayControl::ArraySizeIsOne => 1,
+        }
     };
-    let selected_layer = *target
-        .layer()
-        .value()
-        .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-    if selected_layer >= layers {
-        return Err(MaxwellThreeDResourceError::ContradictoryState { role });
-    }
     let description = image_description(MaxwellImageDescriptionRequest {
         dimension: ImageDimension::Two,
         extent: ImageExtent {
@@ -135,7 +137,6 @@ pub(super) fn depth(
     })?;
     Ok((
         description,
-        selected_layer,
         MaxwellThreeDGuestImageFormat::DepthStencil(guest_format),
     ))
 }

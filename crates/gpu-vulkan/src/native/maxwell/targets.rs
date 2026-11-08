@@ -18,11 +18,6 @@ impl crate::native::NativeExecution<'_> {
             .last_surface()
             .value()
             .ok_or_else(|| compilation("CLEAR_SURFACE state is incomplete"))?;
-        if surface.array_layer() != 0 {
-            return Err(compilation(
-                "native clear array-layer selection requires a selected attachment layer",
-            ));
-        }
         if surface.color_mask() == 0 && !surface.depth() && !surface.stencil() {
             return Ok(());
         }
@@ -62,13 +57,35 @@ impl crate::native::NativeExecution<'_> {
                         .get(),
                 );
             }
+            // Eden converts normalized clear registers for integer targets;
+            // float and normalized targets consume the registers directly.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+            let format = state.register_words()
+                [(0x0810 + usize::from(surface.color_target()) * 0x40) / 4]
+                as u8;
+            let integer = match format {
+                0xc2 | 0xc5 | 0xcd | 0xe4 => Some((32, false)),
+                0xc1 | 0xc4 | 0xcc | 0xe3 => Some((32, true)),
+                0xc9 | 0xdd | 0xf1 => Some((16, false)),
+                0xc8 | 0xdc | 0xf0 => Some((16, true)),
+                0xd9 | 0xed | 0xf6 => Some((8, false)),
+                0xd8 | 0xec | 0xf5 => Some((8, true)),
+                _ => None,
+            };
+            let color = match integer {
+                Some((bits, false)) => vk::ClearColorValue {
+                    uint32: color.map(|value| ((bits << 1) as f32 * value) as u32),
+                },
+                Some((bits, true)) => vk::ClearColorValue {
+                    int32: color.map(|value| (((bits - 1) << 1) as f32 * (value - 0.5)) as i32),
+                },
+                None => vk::ClearColorValue { float32: color },
+            };
             native.push(
                 vk::ClearAttachment::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
                     .color_attachment(u32::from(surface.color_target()))
-                    .clear_value(vk::ClearValue {
-                        color: vk::ClearColorValue { float32: color },
-                    }),
+                    .clear_value(vk::ClearValue { color }),
             );
         }
         let mut aspects = vk::ImageAspectFlags::empty();
@@ -102,7 +119,14 @@ impl crate::native::NativeExecution<'_> {
             );
         }
         self.residency
-            .clear_framebuffer(&targets, rect, &native)
+            .clear_framebuffer(
+                &targets,
+                vk::ClearRect::default()
+                    .rect(rect)
+                    .base_array_layer(u32::from(surface.array_layer()))
+                    .layer_count(1),
+                &native,
+            )
             .map_err(compilation)?;
         Ok(())
     }
@@ -147,12 +171,25 @@ impl crate::native::NativeExecution<'_> {
                     }
                 },
                 format: super::super::images::format(info.description.format()),
-                view_type: vk::ImageViewType::TYPE_2D,
+                // Eden RenderTargetImageViewType exposes all array layers or
+                // volume slices; CLEAR_SURFACE selects the layer at execution.
+                // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h
+                view_type: if info.description.dimension() == nixe_gpu::ImageDimension::Three
+                    || info.description.array_layers() > 1
+                {
+                    vk::ImageViewType::TYPE_2D_ARRAY
+                } else {
+                    vk::ImageViewType::TYPE_2D
+                },
                 aspects,
                 base_mip,
                 mip_count: 1,
-                base_layer: base_layer + u32::from(info.selected_layer),
-                layer_count: 1,
+                base_layer,
+                layer_count: if info.description.dimension() == nixe_gpu::ImageDimension::Three {
+                    info.description.extent().depth
+                } else {
+                    u32::from(info.description.array_layers())
+                },
                 swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
             },
         )

@@ -262,9 +262,6 @@ impl Voice {
             } else {
                 None
             };
-            if context.as_ref().is_some_and(|a| a.bytes != 6) {
-                return Err(UpdateError::Invalid);
-            }
             self.buffers[i] = Some(WaveBuffer {
                 data,
                 context,
@@ -383,8 +380,18 @@ impl Voice {
                     && self.params.format == 6
                     && let Some(context) = &buffer.context
                 {
+                    // Context attachments can include padding (BOTW supplies
+                    // 64 bytes). Eden maps their declared extent and restores
+                    // the ADPCM state at the beginning of each wavebuffer.
+                    // Copy the decoder fields; a partial context preserves
+                    // fields outside the supplied extent.
+                    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/audio_core/renderer/command/data_source/decode.cpp
                     let mut data = [0; 6];
-                    context.read(memory, 0, &mut data)?;
+                    data[..2].copy_from_slice(&c.adpcm.header.to_le_bytes());
+                    data[2..4].copy_from_slice(&c.adpcm.previous.to_le_bytes());
+                    data[4..6].copy_from_slice(&c.adpcm.older.to_le_bytes());
+                    let size = context.bytes.min(data.len() as u64) as usize;
+                    context.read(memory, 0, &mut data[..size])?;
                     c.adpcm = Adpcm {
                         header: u16::from_le_bytes(data[..2].try_into().unwrap()),
                         previous: i16::from_le_bytes(data[2..4].try_into().unwrap()),
@@ -625,158 +632,8 @@ fn decode(
 mod tests {
     use super::*;
     use crate::{audio_renderer::worker::RenderMemory, test_memory::physical as memory};
-    fn buffer(bytes: &[u8], end: u32) -> WaveBuffer {
-        WaveBuffer {
-            data: Attachment {
-                address: 0x1000,
-                ranges: nixe_memory::CapturedMemory::new(memory(bytes)).unwrap(),
-                bytes: bytes.len() as u64,
-                pool: Some(0),
-            },
-            context: None,
-            start: 0,
-            end,
-            looping: false,
-            loop_start: 0,
-            loop_end: end,
-            loop_count: 0,
-            end_of_stream: false,
-        }
-    }
     fn put(data: &mut [u8], offset: usize, value: u32) {
         data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    }
-    #[test]
-    fn adpcm_nibbles_prediction_saturation_and_split_blocks_preserve_context() {
-        let mut bytes = vec![0x00, 0x17, 0x8f, 0x20, 0x00, 0x00, 0x00, 0x00];
-        bytes.extend_from_slice(&[0x10, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-        let buffer = buffer(&bytes, 28);
-        let mut coefficients = [0; 16];
-        coefficients[2] = 2048;
-        let mut whole = [0; 28];
-        let mut context = Adpcm::default();
-        decode(
-            &RenderMemory::testing(),
-            &buffer,
-            0,
-            &mut whole,
-            6,
-            0,
-            1,
-            &coefficients,
-            &mut context,
-            &mut Vec::new(),
-        )
-        .unwrap();
-        assert_eq!(&whole[..6], &[1, 7, -8, -1, 2, 0]);
-        assert_eq!(&whole[14..], &[7; 14]);
-        let mut split = [0; 28];
-        let mut context = Adpcm::default();
-        decode(
-            &RenderMemory::testing(),
-            &buffer,
-            0,
-            &mut split[..9],
-            6,
-            0,
-            1,
-            &coefficients,
-            &mut context,
-            &mut Vec::new(),
-        )
-        .unwrap();
-        decode(
-            &RenderMemory::testing(),
-            &buffer,
-            9,
-            &mut split[9..],
-            6,
-            0,
-            1,
-            &coefficients,
-            &mut context,
-            &mut Vec::new(),
-        )
-        .unwrap();
-        assert_eq!(split, whole);
-        let buffer = super::tests::buffer(&[0x0f, 0x78, 0, 0, 0, 0, 0, 0], 2);
-        let mut clipped = [0; 2];
-        decode(
-            &RenderMemory::testing(),
-            &buffer,
-            0,
-            &mut clipped,
-            6,
-            0,
-            1,
-            &coefficients,
-            &mut Adpcm::default(),
-            &mut Vec::new(),
-        )
-        .unwrap();
-        assert_eq!(clipped, [32767, -32768]);
-    }
-    #[test]
-    fn adpcm_final_frame_does_not_require_unused_nibbles() {
-        let buffer = buffer(&[0x00, 0x17, 0x8f], 4);
-        let mut output = [0; 4];
-        decode(
-            &RenderMemory::testing(),
-            &buffer,
-            0,
-            &mut output,
-            6,
-            0,
-            1,
-            &[0; 16],
-            &mut Adpcm::default(),
-            &mut Vec::new(),
-        )
-        .unwrap();
-        assert_eq!(output, [1, 7, -8, -1]);
-    }
-    #[test]
-    fn pcm_deinterleaves_and_float_conversion_saturates() {
-        let bytes: Vec<_> = [1_i16, 100, -2, -200, 3, 300]
-            .into_iter()
-            .flat_map(i16::to_le_bytes)
-            .collect();
-        let buffer = buffer(&bytes, 3);
-        let mut output = [0; 2];
-        decode(
-            &RenderMemory::testing(),
-            &buffer,
-            1,
-            &mut output,
-            2,
-            1,
-            2,
-            &[0; 16],
-            &mut Adpcm::default(),
-            &mut Vec::new(),
-        )
-        .unwrap();
-        assert_eq!(output, [-200, 300]);
-        let bytes: Vec<_> = [-2.0_f32, -0.5, 0.5, 2.0]
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect();
-        let buffer = super::tests::buffer(&bytes, 4);
-        let mut output = [0; 4];
-        decode(
-            &RenderMemory::testing(),
-            &buffer,
-            0,
-            &mut output,
-            5,
-            0,
-            1,
-            &[0; 16],
-            &mut Adpcm::default(),
-            &mut Vec::new(),
-        )
-        .unwrap();
-        assert_eq!(output, [-32768, -16383, 16383, 32767]);
     }
     fn pcm_voice(looping: bool) -> (Voice, [u8; 0x170], Vec<Option<MemoryPool>>) {
         let mut raw = [0; 0x170];

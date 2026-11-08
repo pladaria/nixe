@@ -1950,6 +1950,8 @@ struct AppletDomain {
     operation_mode_changed_notification: bool,
     performance_mode_changed_notification: bool,
     cpu_boost_enabled: bool,
+    vr_mode_enabled: bool,
+    game_play_recording_state: u32,
     restart_message_enabled: bool,
     idle_time_detection_extension: u32,
     album_image_orientation: u32,
@@ -2016,6 +2018,8 @@ impl AppletSession {
                 operation_mode_changed_notification: false,
                 performance_mode_changed_notification: false,
                 cpu_boost_enabled: false,
+                vr_mode_enabled: false,
+                game_play_recording_state: 0,
                 restart_message_enabled: false,
                 idle_time_detection_extension: 0,
                 album_image_orientation: 0,
@@ -2508,6 +2512,31 @@ impl AppletSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         domain.restart_message_enabled = enabled;
+    }
+
+    /// CommonStateGetter VR operations share the applet's state, as in Eden.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/am/service/common_state_getter.cpp
+    pub(crate) fn set_vr_mode_enabled(&self, enabled: bool) {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .vr_mode_enabled = enabled;
+    }
+
+    pub(crate) fn vr_mode_enabled(&self) -> bool {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .vr_mode_enabled
+    }
+
+    /// AM records the application's capture policy independently of host capture.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/am/service/application_functions.cpp
+    pub(crate) fn set_game_play_recording_state(&self, state: u32) {
+        self.domain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .game_play_recording_state = state;
     }
 
     pub(crate) fn set_cpu_boost_enabled(&self, enabled: bool) {

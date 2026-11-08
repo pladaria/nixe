@@ -273,7 +273,6 @@ pub fn sampled_image_info(
         } else {
             MaxwellThreeDGuestImageFormat::Texture(format_word)
         },
-        selected_layer: 0,
     })
 }
 

@@ -14,7 +14,7 @@ use nixe_runtime::{
 };
 
 mod console;
-use console::{ConsoleMotion, SevenSixAxis};
+use console::SevenSixAxis;
 
 const HID_SHARED_MEMORY_SIZE: usize = 0x40000;
 const TOUCH_SCREEN_OFFSET: usize = 0x400;
@@ -48,7 +48,6 @@ const NPAD_ATTRIBUTE_CONNECTED: u32 = 1;
 const NPAD_JOY_ASSIGNMENT_DUAL: u32 = 0;
 const SIX_AXIS_ATTRIBUTE_CONNECTED: u32 = 1;
 const APPLET_FOOTER_SWITCH_PRO_CONTROLLER: u8 = 12;
-const STANDARD_GRAVITY: f32 = 9.806_65;
 
 /// Position of a modeled LRA actuator: left (1) or right (2).
 pub(crate) fn vibration_device_position(handle: u32) -> Option<u32> {
@@ -91,6 +90,7 @@ struct HidState {
     configuration: Mutex<HidConfiguration>,
     vibration_output: Mutex<Option<nixe_input::VibrationOutput>>,
     completion_events: Mutex<Option<nixe_runtime::ExternalEventSender>>,
+    motion_settings: OnceLock<nixe_input::MotionSettings>,
 }
 
 impl Drop for HidState {
@@ -107,7 +107,7 @@ impl Drop for HidState {
 struct HidProducer {
     sampling_number: u64,
     console_six_axis_sampling_number: u64,
-    console_motion: ConsoleMotion,
+    console_motion: nixe_input::MotionInput,
     seven_six_axis: SevenSixAxis,
     touch_screen_sampling_number: u64,
     debug_pad_sampling_number: u64,
@@ -236,6 +236,7 @@ struct HidConfiguration {
     npad_joy_hold_type: u64,
     npad_lr_assignment_mode: bool,
     active_six_axis_handles: BTreeSet<u32>,
+    gyroscope_drift_modes: std::collections::BTreeMap<(u8, u8, u8), u32>,
 }
 
 #[derive(Debug, Default)]
@@ -286,11 +287,12 @@ impl HidSystem {
                 configuration: Mutex::new(HidConfiguration::default()),
                 vibration_output: Mutex::new(None),
                 completion_events: Mutex::new(None),
+                motion_settings: OnceLock::new(),
             }),
             producer: Arc::new(Mutex::new(HidProducer {
                 sampling_number: 0,
                 console_six_axis_sampling_number: 0,
-                console_motion: ConsoleMotion::default(),
+                console_motion: nixe_input::MotionInput::default(),
                 seven_six_axis: SevenSixAxis::default(),
                 touch_screen_sampling_number: 0,
                 debug_pad_sampling_number: 0,
@@ -316,6 +318,52 @@ impl HidSystem {
     }
     pub(crate) fn set_vibration_output(&self, output: nixe_input::VibrationOutput) {
         *self.state.vibration_output.lock().unwrap() = Some(output);
+    }
+
+    pub(crate) fn set_motion_settings(&self, settings: nixe_input::MotionSettings) {
+        self.state
+            .motion_settings
+            .set(settings)
+            .expect("motion settings are supplied once before execution");
+    }
+
+    /// Store per-sensor state and change the emulated controller's real filter,
+    /// like Eden SixAxis::SetGyroscopeZeroDriftMode and EmulatedController.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/hid_core/resources/six_axis/six_axis.cpp
+    pub(crate) fn set_gyroscope_drift_mode(
+        &self,
+        handle: u32,
+        mode: u32,
+    ) -> Result<(), crate::HorizonIpcResult> {
+        let key = six_axis_key(handle)?;
+        self.state
+            .configuration
+            .lock()
+            .unwrap()
+            .gyroscope_drift_modes
+            .insert(key, mode);
+        if key.0 == 0
+            && let Some(settings) = self.state.motion_settings.get()
+        {
+            settings.set_gyroscope_threshold(match mode {
+                0 => 0.01,
+                2 => 0.002,
+                _ => 0.007,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn gyroscope_drift_mode(&self, handle: u32) -> Result<u32, crate::HorizonIpcResult> {
+        let key = six_axis_key(handle)?;
+        Ok(*self
+            .state
+            .configuration
+            .lock()
+            .unwrap()
+            .gyroscope_drift_modes
+            .get(&key)
+            .unwrap_or(&1))
     }
     pub(crate) fn send_vibration_values(
         &self,
@@ -767,7 +815,12 @@ impl HidProducer {
             self.debug_pad.publish(writes, 0, &entry);
         }
         if console_six_axis_active || self.seven_six_axis.active {
-            self.console_motion.update(state, delta);
+            self.console_motion.update(
+                state.and_then(|state| state.gyroscope),
+                state.and_then(|state| state.accelerometer),
+                delta,
+                0.0,
+            );
         }
         if console_six_axis_active {
             // Console motion uses player one's source independently of Npad
@@ -869,27 +922,24 @@ impl HidProducer {
                 u64::try_from(delta.as_nanos()).unwrap_or(u64::MAX),
             );
             put_u64(&mut sensor, 16, self.sampling_number);
-            if let Some(acceleration) = state.accelerometer {
-                // Horizon uses g, turns/s and accumulated turns. Its motion
-                // frame is (SDL X, -SDL Z, SDL Y), with acceleration negated.
-                // https://github.com/eden-emulator/mirror/blob/master/src/input_common/drivers/sdl_driver.cpp
-                // https://github.com/nintendoswitchemulators/ryujinx/blob/master/src/Ryujinx.Input/HLE/NpadController.cs
-                put_f32(&mut sensor, 24, -acceleration.x / STANDARD_GRAVITY);
-                put_f32(&mut sensor, 28, acceleration.z / STANDARD_GRAVITY);
-                put_f32(&mut sensor, 32, -acceleration.y / STANDARD_GRAVITY);
-            }
-            if let Some(gyroscope) = state.gyroscope {
-                put_turns(&mut sensor, 36, gyroscope);
-            }
             if let Some(motion) = state.motion {
-                put_turns(&mut sensor, 48, motion.angle);
-                let axes = [(0, 1.0), (2, -1.0), (1, 1.0)];
-                for (row, &(source_row, row_sign)) in axes.iter().enumerate() {
-                    for (column, &(source_column, column_sign)) in axes.iter().enumerate() {
+                // The sampling owner integrates every host sample with Eden's
+                // MotionInput and publishes the same sensor frame directly.
+                for (offset, values) in [
+                    (24, motion.acceleration),
+                    (36, motion.gyroscope),
+                    (48, motion.rotation),
+                ] {
+                    for (i, value) in values.into_iter().enumerate() {
+                        put_f32(&mut sensor, offset + i * 4, value);
+                    }
+                }
+                for row in 0..3 {
+                    for column in 0..3 {
                         put_f32(
                             &mut sensor,
                             60 + (row * 3 + column) * 4,
-                            motion.orientation[source_row][source_column] * row_sign * column_sign,
+                            motion.orientation[row][column],
                         );
                     }
                 }
@@ -933,10 +983,24 @@ impl HidProducer {
     }
 }
 
-fn put_turns(bytes: &mut [u8], offset: usize, radians: nixe_input::MotionVector) {
-    put_f32(bytes, offset, radians.x / std::f32::consts::TAU);
-    put_f32(bytes, offset + 4, -radians.z / std::f32::consts::TAU);
-    put_f32(bytes, offset + 8, radians.y / std::f32::consts::TAU);
+// Eden selects a sensor state by Npad ID, style and side. FullKey/Pokeball
+// share a state; dual Joy-Con select left only for device index zero.
+// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/hid_core/resources/six_axis/six_axis.cpp
+fn six_axis_key(handle: u32) -> Result<(u8, u8, u8), crate::HorizonIpcResult> {
+    let [style, npad, device, _] = handle.to_le_bytes();
+    if npad_index(u32::from(npad)).is_none() {
+        return Err(crate::HorizonIpcResult::HID_INVALID_NPAD_ID);
+    }
+    if device >= 3 {
+        return Err(crate::HorizonIpcResult::HID_NPAD_DEVICE_INDEX_OUT_OF_RANGE);
+    }
+    let (style, device) = match style {
+        3 | 9 => (3, 0),
+        4 | 6 | 7 => (style, 0),
+        5 => (5, u8::from(device != 0)),
+        _ => (0, 0),
+    };
+    Ok((npad, style, device))
 }
 
 fn npad_index(id: u32) -> Option<usize> {

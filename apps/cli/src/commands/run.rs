@@ -358,6 +358,9 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         vibration: input_owner
             .vibration_output()
             .expect("SDL input owns actuator output"),
+        motion_settings: input_owner
+            .motion_settings()
+            .expect("profiled input owns motion configuration"),
     };
     let audio_backend = audio.backend();
 
@@ -566,6 +569,7 @@ struct HostInputReaders {
     controller: InputReader<Option<ProfiledControllerState>>,
     touch_screen: Option<TouchScreenReader>,
     vibration: nixe_input::VibrationOutput,
+    motion_settings: nixe_input::MotionSettings,
 }
 
 fn supervise_process(
@@ -729,7 +733,8 @@ fn execute(
     .with_system_archives(horizon_environment.system_archives)
     .with_diagnostics(horizon_environment.diagnostics)
     .with_audio_backend(audio_backend.clone())
-    .with_vibration_output(host_input.vibration.clone());
+    .with_vibration_output(host_input.vibration.clone())
+    .with_motion_settings(host_input.motion_settings.clone());
     if let Some(host) = &host_input.keyboard {
         dispatcher = dispatcher.with_keyboard_host(host.clone());
     }

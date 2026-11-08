@@ -1,4 +1,4 @@
-//! OpenDataStorageByDataId for host-generated system PublicData archives.
+//! OpenDataStorageByDataId for installed add-ons and system PublicData archives.
 use super::super::response::{encode_semantic_response, semantic_error};
 use crate::ipc_wire::io::has_ipc_descriptors;
 use crate::ipc_wire::message::{CmifRequest, HipcRequest};
@@ -8,7 +8,7 @@ use crate::{
     HorizonIpcResult, IpcResponse, IpcSession, ReadOnlyStorage, SemanticIpcObject, SystemArchives,
 };
 
-pub(in crate::ipc_wire::services) async fn open_system_data(
+pub(in crate::ipc_wire::services) async fn open_data_storage(
     process: &mut Request,
     session: &IpcSession,
     request: CmifRequest<'_>,
@@ -37,10 +37,28 @@ pub(in crate::ipc_wire::services) async fn open_system_data(
     if !matches!(storage_id, 0 | 3) {
         return Err(unsupported());
     }
-    let storage = archives
-        .open(data_id)
-        .map_err(|e| IpcWireError::SystemArchive(e.into_boxed_str()))?
-        .ok_or_else(unsupported)?;
+    // Resolve actual Data content before synthesizing a system archive, as in
+    // Eden's FSP_SRV::OpenDataStorageByDataId. The loader has already resolved
+    // these add-on RomFS views and retains their physical source for the caller.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/filesystem/fsp/fsp_srv.cpp
+    let installed = (storage_id == 0)
+        .then(|| {
+            process
+                .mounts()
+                .add_ons()
+                .iter()
+                .find(|content| content.title_id().get() == data_id)
+                .and_then(|content| content.mounts().first())
+                .map(|mount| mount.romfs().storage())
+        })
+        .flatten();
+    let storage = match installed {
+        Some(storage) => storage,
+        None => archives
+            .open(data_id)
+            .map_err(|e| IpcWireError::SystemArchive(e.into_boxed_str()))?
+            .ok_or_else(unsupported)?,
+    };
     let response = IpcResponse::Object(SemanticIpcObject::ReadOnlyStorage(ReadOnlyStorage::new(
         storage,
     )));

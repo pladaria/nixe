@@ -150,6 +150,7 @@ pub enum IpcRequest {
         max_entries: usize,
     },
     GetIndexedAddOnContentCount,
+    GetAddOnContentBaseId,
     ListIndexedAddOnContent {
         offset: usize,
         max_entries: usize,
@@ -269,6 +270,9 @@ pub(crate) fn dispatch_session(
             Ok(IpcResponse::Object(
                 SemanticIpcObject::HostDirectoryFileSystem(HostDirectoryFileSystem::new(root)),
             ))
+        }
+        (IpcService::AddOnContent, IpcRequest::GetAddOnContentBaseId) => {
+            Ok(IpcResponse::Size(mounts.add_on_content_base_id()))
         }
         (IpcService::AddOnContent, IpcRequest::GetIndexedAddOnContentCount) => {
             let count = mounts

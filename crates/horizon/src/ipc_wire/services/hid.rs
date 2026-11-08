@@ -18,6 +18,9 @@ enum HidCommand {
     ResetSevenSixAxisSensorTimestamp,
     StartSixAxisSensor,
     StopSixAxisSensor,
+    SetGyroscopeZeroDriftMode,
+    GetGyroscopeZeroDriftMode,
+    ResetGyroscopeZeroDriftMode,
     SetSupportedNpadStyleSet,
     GetSupportedNpadStyleSet,
     SetSupportedNpadIdType,
@@ -55,6 +58,9 @@ impl HidCommand {
             310 => Some(Self::ResetSevenSixAxisSensorTimestamp),
             66 => Some(Self::StartSixAxisSensor),
             67 => Some(Self::StopSixAxisSensor),
+            79 => Some(Self::SetGyroscopeZeroDriftMode),
+            80 => Some(Self::GetGyroscopeZeroDriftMode),
+            81 => Some(Self::ResetGyroscopeZeroDriftMode),
             100 => Some(Self::SetSupportedNpadStyleSet),
             101 => Some(Self::GetSupportedNpadStyleSet),
             102 => Some(Self::SetSupportedNpadIdType),
@@ -337,6 +343,37 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
             hid_system
                 .set_six_axis_sensor_active(handle, command == HidCommand::StartSixAxisSensor);
             semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        // SixAxisSensorHandle, mode/padding, ARUID, and the caller PID.
+        // Reset selects Standard; Get returns the sensor's stored mode.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/hid/hid_server.cpp
+        command @ (HidCommand::SetGyroscopeZeroDriftMode
+        | HidCommand::GetGyroscopeZeroDriftMode
+        | HidCommand::ResetGyroscopeZeroDriftMode) => {
+            if hipc.pid.is_none()
+                || !request.has_payload_size(16)
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let handle = request_u32(request.data, 0).unwrap();
+            if command == HidCommand::GetGyroscopeZeroDriftMode {
+                return match hid_system.gyroscope_drift_mode(handle) {
+                    Ok(mode) => {
+                        semantic_success(request.token, false, &mode.to_le_bytes(), &[], &[], None)
+                    }
+                    Err(error) => cmif_error(request.token, error),
+                };
+            }
+            let mode = if command == HidCommand::ResetGyroscopeZeroDriftMode {
+                1
+            } else {
+                request_u32(request.data, 4).unwrap()
+            };
+            match hid_system.set_gyroscope_drift_mode(handle, mode) {
+                Ok(()) => semantic_success(request.token, false, &[], &[], &[], None),
+                Err(error) => cmif_error(request.token, error),
+            }
         }
         HidCommand::SetSupportedNpadStyleSet => {
             if hipc.pid.is_none() || request.data.len() < 16 {

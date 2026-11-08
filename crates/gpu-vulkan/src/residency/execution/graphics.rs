@@ -109,6 +109,7 @@ struct Attachment {
     plane: ImagePlane,
     view: Arc<crate::AllocatedImageView>,
     format: vk::Format,
+    image_type: vk::ImageType,
     samples: vk::SampleCountFlags,
     size: vk::Extent3D,
 }
@@ -210,10 +211,17 @@ impl PreparedTargets {
             attachment_operations |= a.description.load != vk::AttachmentLoadOp::LOAD
                 || a.description.store != vk::AttachmentStoreOp::STORE;
             let image = a.view.image.handle;
-            let range = a
+            let mut range = a
                 .view
                 .range
                 .aspect_mask(sync::native_image_aspects(a.format));
+            // A 2D array view of volume slices still addresses one 3D mip
+            // for synchronization, as Eden MakeSubresourceRange does.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+            if a.image_type == vk::ImageType::TYPE_3D {
+                range.base_array_layer = 0;
+                range.layer_count = 1;
+            }
             if !images
                 .iter()
                 .any(|(old, r): &(vk::Image, vk::ImageSubresourceRange)| {
@@ -592,6 +600,7 @@ impl Residency<'_> {
             plane: p,
             view,
             format: description.format,
+            image_type: description.image_type,
             samples: description.samples,
             size,
         })
@@ -659,11 +668,15 @@ impl Residency<'_> {
         let mut feedback_aspects = vk::ImageAspectFlags::empty();
         {
             let overlaps = |a: &Attachment| {
+                let attachment = a.view.range;
                 matches!(a.description.source,AttachmentSource::Canonical {view,..} if self.texture_cache.views[view].image==id)
-                    && (range.base_mip_level..range.base_mip_level + range.level_count)
-                        .contains(&a.plane.mip_level)
-                    && (range.base_array_layer..range.base_array_layer + range.layer_count)
-                        .contains(&a.plane.array_layer)
+                    && range.base_mip_level < attachment.base_mip_level + attachment.level_count
+                    && attachment.base_mip_level < range.base_mip_level + range.level_count
+                    && (a.image_type == vk::ImageType::TYPE_3D
+                        || (range.base_array_layer
+                            < attachment.base_array_layer + attachment.layer_count
+                            && attachment.base_array_layer
+                                < range.base_array_layer + range.layer_count))
             };
             for a in targets.attachments().filter(|a| overlaps(a)) {
                 // Load/store operations can touch adjacent depth/stencil

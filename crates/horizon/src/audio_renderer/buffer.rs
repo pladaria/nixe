@@ -10,6 +10,7 @@ use std::sync::Arc;
 pub(super) struct Attachment {
     pub(super) address: u64,
     pub(super) ranges: nixe_memory::CapturedMemory,
+    pool_offset: u64,
     pub(super) bytes: u64,
     pub(super) pool: Option<usize>,
 }
@@ -25,7 +26,7 @@ impl Attachment {
         }
         let machine = self.ranges[0].allocation().machine();
         match machine
-            .write_captured(&self.ranges, offset, bytes)
+            .write_captured(&self.ranges, self.pool_offset + offset, bytes)
             .map_err(Arc::new)?
         {
             Access::Ready(()) => Ok(()),
@@ -46,7 +47,7 @@ impl Attachment {
         }
         let machine = self.ranges[0].allocation().machine();
         match machine
-            .read_captured_into(&self.ranges, offset, bytes)
+            .read_captured_into(&self.ranges, self.pool_offset + offset, bytes)
             .map_err(Arc::new)?
         {
             Access::Ready(()) => Ok(()),
@@ -77,13 +78,14 @@ pub(super) fn attach(
     for (i, pool) in pools.iter().enumerate() {
         let Some(pool) = pool else { continue };
         if address >= pool.address && end <= pool.address.saturating_add(pool.bytes) {
-            let ranges = pool
-                .ranges
-                .capture(address - pool.address, size)
-                .map_err(UpdateError::Mapping)?;
+            // Eden AddressInfo retains a pool and derives its DSP address from
+            // the buffer's offset. Declared size validates attachment; actual
+            // DSP reads/writes consume the retained pool mapping.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/audio_core/renderer/memory/address_info.h
             return Ok(Some(Attachment {
                 address,
-                ranges: nixe_memory::CapturedMemory::new(ranges).map_err(UpdateError::Mapping)?,
+                ranges: pool.ranges.clone(),
+                pool_offset: address - pool.address,
                 bytes: size,
                 pool: Some(i),
             }));
@@ -92,6 +94,7 @@ pub(super) fn attach(
     if force {
         return Ok(Some(Attachment {
             address,
+            pool_offset: 0,
             ranges: nixe_memory::CapturedMemory::new(
                 translate(address, size).map_err(UpdateError::Mapping)?,
             )

@@ -127,17 +127,14 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
                 .map(|descriptor| descriptor.size)
                 .map_or(Ok(0), usize::try_from)
                 .map_err(|_| IpcWireError::Malformed("nvdrv ioctl input is too large"))?;
-            if input_size > 0x1000 {
-                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
-            }
             let additional_input_size = buffers
                 .additional_input
                 .map(|descriptor| descriptor.size)
                 .map_or(Ok(0), usize::try_from)
                 .map_err(|_| IpcWireError::Malformed("nvdrv Ioctl2 input is too large"))?;
-            if additional_input_size > 0x1_0000 {
-                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
-            }
+            // Like Eden's NVDRV::Ioctl2, consume the entire inline descriptor.
+            // GPFIFO submissions can contain more than 64 KiB of entries.
+            // dev-tools/eden/src/core/hle/service/nvdrv/nvdrv_interface.cpp
             let output_size = buffers.output.map_or(0, |buffer| buffer.size)
                 + buffers.additional_output.map_or(0, |buffer| buffer.size);
             let output_size = usize::try_from(output_size)
@@ -152,7 +149,7 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
                     .await?;
             }
             log::trace!(
-                "nvdrv ioctl input: fd={fd:#010x} request={ioctl:#010x} input-size={} input-prefix={:02x?}",
+                "nvdrv ioctl input: fd={fd:#010x} request={ioctl:#010x} input-size={} inline-size={additional_input_size} input-prefix={:02x?}",
                 input.len(),
                 &input[..input.len().min(64)],
             );
@@ -618,10 +615,7 @@ fn nv_ioctl3_buffers(hipc: &HipcRequest<'_>, request: u32) -> Result<NvIoctlBuff
             "nvdrv Ioctl3 requires two output pointers",
         ));
     };
-    if inline_pointer.size != 0
-        || inline.size > 0x10000
-        || (inline.size != 0 && inline.address == 0)
-    {
+    if inline_pointer.size != 0 || (inline.size != 0 && inline.address == 0) {
         return Err(IpcWireError::Malformed(
             "nvdrv Ioctl3 inline output buffer is invalid",
         ));

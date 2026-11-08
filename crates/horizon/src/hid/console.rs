@@ -3,9 +3,6 @@
 //! https://switchbrew.org/wiki/HID_services#InitializeSevenSixAxisSensor
 use super::*;
 
-mod motion;
-pub(super) use motion::ConsoleMotion;
-
 const CAPACITY: usize = 0x21;
 const ENTRY_SIZE: usize = 0x50;
 
@@ -62,7 +59,7 @@ impl SevenSixAxis {
     pub fn publish(
         &mut self,
         state: &HidState,
-        motion: &ConsoleMotion,
+        motion: &nixe_input::MotionInput,
     ) -> Result<(), HidInputError> {
         if !self.active || self.memory.is_none() {
             self.count = 0;

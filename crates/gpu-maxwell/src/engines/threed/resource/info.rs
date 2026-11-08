@@ -12,6 +12,5 @@ pub struct ImageInfo {
     pub layer_stride: u64,
     pub maybe_unaligned_layer_stride: u64,
     pub size: u64,
-    pub selected_layer: u16,
     pub guest_format: MaxwellThreeDGuestImageFormat,
 }

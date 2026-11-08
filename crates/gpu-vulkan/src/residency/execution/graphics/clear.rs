@@ -149,10 +149,17 @@ impl Residency<'_> {
     pub(crate) fn clear_framebuffer(
         &mut self,
         targets: &Arc<PreparedTargets>,
-        rect: vk::Rect2D,
+        clear_rect: vk::ClearRect,
         clears: &[vk::ClearAttachment],
     ) -> Result<WorkTicket, VulkanError> {
-        if !contains_rect(targets.area, rect) {
+        let rect = clear_rect.rect;
+        if !contains_rect(targets.area, rect)
+            || clear_rect.layer_count == 0
+            || clear_rect
+                .base_array_layer
+                .checked_add(clear_rect.layer_count)
+                .is_none_or(|end| end > targets.framebuffer.layers)
+        {
             return Err(VulkanError::InvalidResource(
                 "clear exceeds framebuffer render area",
             ));
@@ -252,6 +259,8 @@ impl Residency<'_> {
                     .is_some()
             });
             let can_defer = !active
+                && clear_rect.base_array_layer == 0
+                && clear_rect.layer_count == targets.framebuffer.layers
                 && rect == targets.area
                 && rect.offset == vk::Offset2D::default()
                 && actual.iter().all(|clear| {
@@ -286,13 +295,10 @@ impl Residency<'_> {
             } else {
                 self.runtime.device.request_render_pass(targets)?;
                 unsafe {
-                    self.runtime.device.dispatch.cmd_clear_attachments(
-                        &actual,
-                        &[vk::ClearRect::default()
-                            .rect(rect)
-                            .base_array_layer(0)
-                            .layer_count(1)],
-                    );
+                    self.runtime
+                        .device
+                        .dispatch
+                        .cmd_clear_attachments(&actual, &[clear_rect]);
                 }
             }
             Ok(self.runtime.device.current_work())

@@ -11,6 +11,7 @@ enum AddOnContentCommand {
     ListLegacy,
     Count,
     List,
+    GetBaseId,
     PrepareLegacy,
     Prepare,
     GetListChangedEvent,
@@ -24,6 +25,7 @@ impl AddOnContentCommand {
             1 => Some(Self::ListLegacy),
             2 => Some(Self::Count),
             3 => Some(Self::List),
+            5 => Some(Self::GetBaseId),
             6 => Some(Self::PrepareLegacy),
             7 => Some(Self::Prepare),
             8 => Some(Self::GetListChangedEvent),
@@ -43,6 +45,19 @@ pub(in crate::ipc_wire) fn decode_root_request(
     // Versioned command IDs follow the documented aoc:u ABI:
     // https://switchbrew.org/w/index.php?title=NS_services&oldid=14328#aoc:u
     match command {
+        AddOnContentCommand::GetBaseId => {
+            // GetAddOnContentBaseId(Out<u64>, ClientProcessId): the retained
+            // namespace belongs to the actual IPC caller, independently of
+            // the process-ID placeholder in the request data.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/aoc/addon_content_manager.cpp
+            if hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+                || !request.has_payload_size(8)
+            {
+                return Ok(None);
+            }
+            Ok(Some(IpcRequest::GetAddOnContentBaseId))
+        }
         AddOnContentCommand::CheckMountStatus => {
             // PID descriptor plus zero u64 placeholder; no output data.
             // https://github.com/alula/Ryujinx/blob/master/src/Ryujinx.HLE/HOS/Services/Ns/Aoc/IAddOnContentManager.cs

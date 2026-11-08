@@ -59,6 +59,7 @@ pub struct InputWorker<T> {
     thread: Option<JoinHandle<Result<(), String>>>,
     _subsystems: Option<crate::sdl::InputSubsystems>,
     vibration: Option<crate::VibrationOutput>,
+    motion_settings: Option<crate::MotionSettings>,
 }
 
 impl InputWorker<Option<ProfiledControllerState>> {
@@ -73,10 +74,13 @@ impl InputWorker<Option<ProfiledControllerState>> {
         let owner = crate::sdl::InputSubsystems::new(sdl).map_err(io::Error::other)?;
         let subsystems = WorkerSubsystems(owner.clone());
         let (vibration, receiver) = crate::vibration::vibration_channel();
+        let motion_settings = crate::MotionSettings::default();
+        let worker_motion_settings = motion_settings.clone();
         let mut worker = Self::spawn(
             move || {
                 let backend = SdlInputBackend::new(subsystems.take());
                 let mut input = InputManager::with_profiles(backend, profiles);
+                input.motion_settings = worker_motion_settings;
                 Ok::<_, crate::sdl::SdlInputError>(move || {
                     let state = input.read_profiled_input()?;
                     input.backend.apply_vibration(&receiver)?;
@@ -87,6 +91,7 @@ impl InputWorker<Option<ProfiledControllerState>> {
         )?;
         worker._subsystems = Some(owner);
         worker.vibration = Some(vibration);
+        worker.motion_settings = Some(motion_settings);
         Ok(worker)
     }
 }
@@ -179,6 +184,7 @@ impl<T: Send + 'static> InputWorker<T> {
             thread: Some(thread),
             _subsystems: None,
             vibration: None,
+            motion_settings: None,
         })
     }
 }
@@ -189,6 +195,10 @@ pub struct InputReader<T> {
 }
 
 impl<T> InputWorker<T> {
+    pub fn motion_settings(&self) -> Option<crate::MotionSettings> {
+        self.motion_settings.clone()
+    }
+
     /// SDL device output belongs to the same worker as controller sampling.
     pub fn vibration_output(&self) -> Option<crate::VibrationOutput> {
         self.vibration.clone()

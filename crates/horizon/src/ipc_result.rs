@@ -63,6 +63,7 @@ impl HorizonIpcResult {
     pub const SF_PRECONDITION_VIOLATION: Self = Self::new(MODULE_SF, 3);
     // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/hid_core/hid_result.h
     pub const HID_INVALID_NPAD_ID: Self = Self::new(202, 709);
+    pub const HID_NPAD_DEVICE_INDEX_OUT_OF_RANGE: Self = Self::new(202, 107);
     pub const CMIF_INVALID_IN_HEADER: Self = Self::new(MODULE_SF, 211);
     pub const CMIF_UNKNOWN_COMMAND_ID: Self = Self::new(MODULE_SF, 221);
     pub const CMIF_TARGET_NOT_FOUND: Self = Self::new(MODULE_SF, 261);

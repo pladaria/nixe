@@ -34,7 +34,10 @@ impl Residency<'_> {
         let targets = self.framebuffer_for_view(view)?;
         self.clear_framebuffer(
             &targets,
-            rect,
+            vk::ClearRect::default()
+                .rect(rect)
+                .base_array_layer(0)
+                .layer_count(1),
             &[vk::ClearAttachment::default()
                 .aspect_mask(p.aspect)
                 .color_attachment(0)

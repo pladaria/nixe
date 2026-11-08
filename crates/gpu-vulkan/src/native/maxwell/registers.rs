@@ -11,6 +11,26 @@ pub(super) type Regs = [u32; 0xe00];
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 pub(super) fn color_attachment_format(raw: u8, index: usize) -> Result<vk::Format, VulkanError> {
     Ok(match raw {
+        0xc1 => vk::Format::R32G32B32A32_SINT,
+        0xc2 => vk::Format::R32G32B32A32_UINT,
+        0xc4 => vk::Format::R32G32B32A32_SINT,
+        0xc5 => vk::Format::R32G32B32A32_UINT,
+        0xc8 => vk::Format::R16G16B16A16_SINT,
+        0xc9 => vk::Format::R16G16B16A16_UINT,
+        0xcc => vk::Format::R32G32_SINT,
+        0xcd => vk::Format::R32G32_UINT,
+        0xd8 => vk::Format::R8G8B8A8_SINT,
+        0xd9 => vk::Format::R8G8B8A8_UINT,
+        0xdc => vk::Format::R16G16_SINT,
+        0xdd => vk::Format::R16G16_UINT,
+        0xe3 => vk::Format::R32_SINT,
+        0xe4 => vk::Format::R32_UINT,
+        0xec => vk::Format::R8G8_SINT,
+        0xed => vk::Format::R8G8_UINT,
+        0xf0 => vk::Format::R16_SINT,
+        0xf1 => vk::Format::R16_UINT,
+        0xf5 => vk::Format::R8_SINT,
+        0xf6 => vk::Format::R8_UINT,
         0xc6 => vk::Format::R16G16B16A16_UNORM,
         0xc7 => vk::Format::R16G16B16A16_SNORM,
         0xd7 => vk::Format::R8G8B8A8_SNORM,
@@ -301,21 +321,12 @@ fn validate_raster(
             value => return Err(unsupported(0x0dac, value, "unsupported polygon mode")),
         }
     }
-    if primitive == Some(GeneratedPrimitive::Lines) {
-        if r[0x166c / 4] != 0 {
-            return Err(unsupported(
-                0x166c,
-                r[0x166c / 4],
-                "line stipple is unsupported",
-            ));
-        }
-        if r[0x1570 / 4] != 1 && r[0x020c / 4] != 0 {
-            return Err(unsupported(
-                0x020c,
-                r[0x020c / 4],
-                "aliased line width selection is unsupported",
-            ));
-        }
+    if primitive == Some(GeneratedPrimitive::Lines) && r[0x166c / 4] != 0 {
+        return Err(unsupported(
+            0x166c,
+            r[0x166c / 4],
+            "line stipple is unsupported",
+        ));
     }
     depth_bias_enabled(r, topology)?;
     Ok(())

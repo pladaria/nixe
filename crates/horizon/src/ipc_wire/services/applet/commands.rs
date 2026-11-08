@@ -108,6 +108,10 @@ command_enum!(CommonStateGetterCommand {
     5 => GetOperationMode,
     6 => GetPerformanceMode,
     9 => GetCurrentFocusState,
+    50 => IsVrModeEnabled,
+    51 => SetVrModeEnabled,
+    53 => BeginVrModeEx,
+    54 => EndVrModeEx,
     60 => GetDefaultDisplayResolution,
     66 => SetCpuBoostMode,
     67 => CancelCpuBoostMode,
@@ -154,6 +158,7 @@ command_enum!(ApplicationFunctionsCommand {
     23 => GetDisplayVersion,
     40 => NotifyRunning,
     50 => GetPseudoDeviceId,
+    67 => SetGamePlayRecordingState,
     130 => GetGpuErrorDetectedSystemEvent,
 });
 

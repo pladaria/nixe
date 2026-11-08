@@ -158,6 +158,7 @@ pub(crate) struct Framebuffer {
     pub handle: vk::Framebuffer,
     pub render_pass: vk::RenderPass,
     pub key: Key,
+    pub layers: u32,
     // Guest/owned host images stay alive through the native framebuffer. WSI
     // destroys its framebuffer before destroying its externally owned views.
     _views: Vec<Arc<AllocatedImageView>>,
@@ -172,6 +173,13 @@ impl Framebuffer {
         retained: Vec<Arc<AllocatedImageView>>,
     ) -> Result<Arc<Self>, VulkanError> {
         let pass = owner.render_pass(key)?;
+        // Eden Framebuffer retains the layer extent of its attachment views.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+        let layers = retained
+            .iter()
+            .map(|view| view.range.layer_count)
+            .max()
+            .unwrap_or(1);
         let handle = unsafe {
             owner.device.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
@@ -179,7 +187,7 @@ impl Framebuffer {
                     .attachments(views)
                     .width(extent.width.max(1))
                     .height(extent.height.max(1))
-                    .layers(1),
+                    .layers(layers),
                 None,
             )
         }
@@ -189,6 +197,7 @@ impl Framebuffer {
             handle,
             render_pass: pass,
             key,
+            layers,
             _views: retained,
         }))
     }

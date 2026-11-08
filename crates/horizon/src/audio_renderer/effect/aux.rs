@@ -56,10 +56,10 @@ impl Aux {
         let p = &raw[0x20..];
         let channels = word(p, 0x30) as usize;
         let capacity = word(p, 0x38) as usize;
-        if channels > 24
-            || 0x80 + capacity as u64 * 4 > self.send.bytes
-            || 0x80 + capacity as u64 * 4 > self.receive.bytes
-        {
+        // Eden updates the ring parameters independently of its retained
+        // workbuffer addresses. Memory accesses consume the actual pool.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/audio_core/renderer/effect/aux_.cpp
+        if channels > 24 {
             return Err(UpdateError::Invalid);
         }
         self.mix = word(raw, 4) as usize;

@@ -87,7 +87,7 @@ pub(in crate::ipc_wire) async fn dispatch_service(
         && session.service() == IpcService::FileSystem
         && request.command_id == 202
     {
-        return fsp::open_system_data(process, session, request, hipc, system_archives).await;
+        return fsp::open_data_storage(process, session, request, hipc, system_archives).await;
     }
 
     dispatch_command(
