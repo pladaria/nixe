@@ -951,9 +951,11 @@ fn report_input_change(
             controller.device
         ),
         None if previously_observed && active.is_some() => {
-            log::info!("mapped gamepad disconnected; player one is now disconnected");
+            log::info!("mapped gamepad disconnected; virtual player one receives neutral input");
         }
-        None => log::warn!("no matching first-gamepad input profile; player one is disconnected"),
+        None => log::warn!(
+            "no matching first-gamepad input profile; virtual player one receives neutral input"
+        ),
     }
     *active = next;
 }

@@ -1,22 +1,16 @@
-//! Mix-buffer biquad effects use the same DSP primitive as voice filters.
+//! Mix-buffer biquad effects retain their wire parameters until command generation.
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/effect/biquad_filter.h
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/command/command_buffer.cpp
-use super::super::{
-    biquad,
-    update::{UpdateError, word},
-};
+//! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/audio_core/renderer/command/command_generator.cpp
+use super::super::{biquad, update::word};
 
 #[derive(Debug)]
 pub(in crate::audio_renderer) struct Biquad {
     pub(super) mix: usize,
     pub(super) order: usize,
-    inputs: [usize; 6],
-    outputs: [usize; 6],
-    channels: usize,
-    parameters: biquad::Parameters,
+    parameters: [u8; 0x28],
     states: [biquad::State; 6],
     revision: u32,
-    pending: u8,
     enabled: bool,
     new: bool,
     was_enabled: Option<bool>,
@@ -26,58 +20,25 @@ impl Biquad {
         Self {
             mix: 0,
             order: 0,
-            inputs: [0; 6],
-            outputs: [0; 6],
-            channels: 0,
-            parameters: Default::default(),
+            parameters: [0; 0x28],
             states: std::array::from_fn(|_| Default::default()),
             revision,
-            pending: 0,
             enabled: false,
             new: true,
             was_enabled: None,
         }
     }
-    pub(super) fn update(&mut self, raw: &[u8], started: bool) -> Result<u8, UpdateError> {
-        let p = &raw[0x20..];
-        let modern = self.revision >= 9;
-        let channels = p[if modern { 0x24 } else { 0x16 }] as usize;
-        let pending = p[if modern { 0x25 } else { 0x17 }];
-        if channels > 6 || pending > 2 {
-            return Err(UpdateError::Invalid);
-        }
-        let mut coeff = [0_i16; 5];
-        for (i, coeff) in coeff.iter_mut().enumerate() {
-            *coeff = if modern {
-                let f = f32::from_bits(word(p, 0x10 + i * 4));
-                if !f.is_finite() {
-                    return Err(UpdateError::Invalid);
-                }
-                // Effect ABI v2 supplies floats, but command generation still
-                // quantizes and clamps to Q14 before the shared filter runs.
-                (f * 16384.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
-            } else {
-                i16::from_le_bytes(p[12 + i * 2..14 + i * 2].try_into().unwrap())
-            };
-        }
+    pub(super) fn update(&mut self, raw: &[u8], started: bool) -> u8 {
         self.mix = word(raw, 4) as usize;
         self.order = word(raw, 24) as usize;
-        self.inputs = std::array::from_fn(|i| p[i] as usize);
-        self.outputs = std::array::from_fn(|i| p[6 + i] as usize);
-        self.channels = channels;
-        self.pending = pending;
         self.enabled = raw[2] != 0;
-        self.parameters = biquad::Parameters::q14(
-            coeff[..3].try_into().unwrap(),
-            coeff[3..].try_into().unwrap(),
-        );
-        Ok(
-            if self.new || (started && self.was_enabled != Some(false)) {
-                3
-            } else {
-                4
-            },
-        )
+        let size = if self.revision >= 9 { 0x28 } else { 0x18 };
+        self.parameters[..size].copy_from_slice(&raw[0x20..0x20 + size]);
+        if self.new || (started && self.was_enabled != Some(false)) {
+            3
+        } else {
+            4
+        }
     }
     pub(super) fn process(
         &mut self,
@@ -85,36 +46,79 @@ impl Biquad {
         samples: usize,
         count: usize,
     ) -> Result<(), Box<str>> {
-        if self.inputs[..self.channels]
-            .iter()
-            .chain(&self.outputs[..self.channels])
-            .any(|i| *i >= count)
-        {
-            return Err(format!(
-                "rendering: Biquad input/output exceeds its mix's {count} buffers"
-            )
-            .into());
-        }
-        for c in 0..self.channels {
-            let src = self.inputs[c] * samples;
-            let dst = self.outputs[c] * samples;
-            if src != dst {
-                buffers.copy_within(src..src + samples, dst);
+        let p = &self.parameters;
+        let modern = self.revision >= 9;
+        let channels = p[if modern { 0x24 } else { 0x16 }] as i8;
+        let pending = p[if modern { 0x25 } else { 0x17 }];
+        // Match GenerateBiquadFilterEffectCommand: parameters without an active
+        // command do not reject the renderer's entire RequestUpdate. In
+        // particular, channel_count is signed and the state gates generation.
+        if channels > 0 && pending <= 2 {
+            let channels = channels as usize;
+            if channels > self.states.len() {
+                return Err("rendering: Biquad channel count exceeds six channels".into());
             }
+            if p[..channels]
+                .iter()
+                .chain(&p[6..6 + channels])
+                .any(|&i| usize::from(i) >= count)
+            {
+                return Err(format!(
+                    "rendering: Biquad input/output exceeds its mix's {count} buffers"
+                )
+                .into());
+            }
+            let mut coeff = [0_i16; 5];
             if self.enabled {
-                if self.pending == 0 || (self.pending == 1 && self.revision < 6) {
-                    self.states[c] = Default::default();
+                for (i, coeff) in coeff.iter_mut().enumerate() {
+                    *coeff = if modern {
+                        let f = f32::from_bits(word(p, 0x10 + i * 4));
+                        if !f.is_finite() {
+                            return Err("rendering: Biquad coefficient is not finite".into());
+                        }
+                        // Eden quantizes effect v2 coefficients to Q14 when
+                        // generating its command, even for float processing.
+                        (f * 16384.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
+                    } else {
+                        i16::from_le_bytes(p[12 + i * 2..14 + i * 2].try_into().unwrap())
+                    };
                 }
-                self.states[c].process(
-                    self.parameters,
-                    self.revision,
-                    &mut buffers[dst..dst + samples],
-                );
+            }
+            let parameters = biquad::Parameters::q14(
+                coeff[..3].try_into().unwrap(),
+                coeff[3..].try_into().unwrap(),
+            );
+            for c in 0..channels {
+                let src = usize::from(p[c]) * samples;
+                let dst = usize::from(p[6 + c]) * samples;
+                if src != dst {
+                    buffers.copy_within(src..src + samples, dst);
+                }
+                if self.enabled {
+                    if pending == 0 || (pending == 1 && self.revision < 6) {
+                        self.states[c] = Default::default();
+                    }
+                    self.states[c].process(
+                        parameters,
+                        self.revision,
+                        &mut buffers[dst..dst + samples],
+                    );
+                }
             }
         }
         self.was_enabled = Some(self.enabled);
         self.new = false;
-        self.pending = 2;
+        // BiquadFilterInfo::UpdateForCommandGeneration updates the first valid
+        // state field; when neither layout has one, it updates both fields.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/audio_core/renderer/effect/biquad_filter.cpp
+        if self.parameters[0x17] <= 2 {
+            self.parameters[0x17] = 2;
+        } else if self.parameters[0x25] <= 2 {
+            self.parameters[0x25] = 2;
+        } else {
+            self.parameters[0x17] = 2;
+            self.parameters[0x25] = 2;
+        }
         Ok(())
     }
 }
@@ -122,7 +126,6 @@ impl Biquad {
 #[cfg(test)]
 mod tests {
     use super::super::Effect;
-    use super::*;
 
     fn packet(revision: u32) -> [u8; 0xc0] {
         let mut raw = [0; 0xc0];
@@ -229,23 +232,5 @@ mod tests {
                 4
             );
         }
-    }
-
-    #[test]
-    fn coefficient_clamping_reset_and_bad_routes_are_handled_before_filtering() {
-        let mut raw = packet(11);
-        raw[0x30..0x34].copy_from_slice(&10_f32.to_le_bytes());
-        raw[0x3c..0x40].copy_from_slice(&0_f32.to_le_bytes());
-        let mut b = Biquad::new(11);
-        b.update(&raw, true).unwrap();
-        let mut data = [16384, 0];
-        assert!(b.process(&mut data, 1, 1).is_err());
-        b.process(&mut data, 1, 2).unwrap();
-        assert_eq!(data[1], 32767);
-        raw[0x30..0x34].copy_from_slice(&f32::NAN.to_le_bytes());
-        assert!(b.update(&raw, true).is_err());
-        let mut raw = packet(11);
-        raw[0x44] = 7;
-        assert!(b.update(&raw, true).is_err());
     }
 }

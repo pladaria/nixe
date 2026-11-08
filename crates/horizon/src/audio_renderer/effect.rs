@@ -162,7 +162,7 @@ impl Effect {
             let Self::Biquad(effect) = self else {
                 unreachable!()
             };
-            return effect.update(raw, started);
+            return Ok(effect.update(raw, started));
         }
         if raw[0] != 4 {
             const NAMES: [&str; 10] = [

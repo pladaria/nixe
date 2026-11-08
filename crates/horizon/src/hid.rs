@@ -121,7 +121,9 @@ struct HidProducer {
     home: Lifo,
     capture: Lifo,
     connected: bool,
-    disconnected_by_guest: bool,
+    // The configured virtual controller is independent of its host input source.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/hid_core/frontend/emulated_controller.cpp
+    full_key_connected: bool,
     publication: Publication,
     latest_controller: Option<(Option<EmulatedControllerState>, Duration)>,
     latest_touch: Option<(EmulatedTouchScreenState, Duration)>,
@@ -302,7 +304,7 @@ impl HidSystem {
                 home: Lifo::default(),
                 capture: Lifo::default(),
                 connected: false,
-                disconnected_by_guest: false,
+                full_key_connected: true,
                 publication: Publication::default(),
                 latest_controller: None,
                 latest_touch: None,
@@ -333,8 +335,29 @@ impl HidSystem {
             output.send_values(actuators)
         })
     }
-    pub(crate) fn connected_full_key_id(&self) -> Option<u32> {
-        self.state.connected.load(Ordering::Acquire).then_some(0)
+    /// Eden's default controller applet retains valid virtual players and fills
+    /// the requested slots independently of attached physical input devices.
+    /// Nixe currently models one FullKey player; the caller checks that range.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/frontend/applets/controller.cpp
+    pub(crate) fn configure_full_key_controller(
+        &self,
+        keep_connected: bool,
+    ) -> Result<u32, HidInputError> {
+        if !keep_connected {
+            self.disconnect_npad(0)?;
+        }
+        {
+            let mut producer = self.producer.lock().unwrap();
+            if !producer.full_key_connected {
+                producer.full_key_connected = true;
+                producer
+                    .latest_controller
+                    .get_or_insert((None, Duration::ZERO));
+            }
+        }
+        self.update_nfc_connection(true);
+        self.poll_publication()?;
+        Ok(0)
     }
     pub(crate) fn infrared_session(&self) -> crate::object::IrsSession {
         self.state.infrared.clone()
@@ -387,13 +410,8 @@ impl HidSystem {
     ) -> Result<(), HidInputError> {
         let connected = {
             let mut producer = self.producer.lock().unwrap();
-            // A software disconnect lasts until a host disconnect/reconnect;
-            // ordinary input samples must not immediately reconnect the pad.
-            if state.is_none() {
-                producer.disconnected_by_guest = false;
-            }
             producer.latest_controller = Some((state.copied(), delta));
-            state.is_some() && !producer.disconnected_by_guest
+            producer.full_key_connected
         };
         self.update_nfc_connection(connected);
         self.poll_publication()
@@ -456,14 +474,14 @@ impl HidSystem {
         let Some(index) = npad_index(id) else {
             return Ok(false);
         };
-        // Disconnect the modeled host device and publish through the existing
+        // Disconnect the virtual controller and publish through the existing
         // producer, so an in-flight memory write cannot restore its old style.
         // Other slots have no attached device; their style event still fires.
         // https://github.com/eden-emulator/mirror/blob/master/src/hid_core/resources/npad/npad.cpp
         if index == 0 {
             {
                 let mut producer = self.producer.lock().unwrap();
-                producer.disconnected_by_guest = true;
+                producer.full_key_connected = false;
                 producer.latest_controller = Some((None, Duration::ZERO));
             }
             self.update_nfc_connection(false);
@@ -697,8 +715,8 @@ impl HidProducer {
 
     /// Publishes one player-one Pro Controller sample.
     ///
-    /// `None` transitions the shared state to a disconnected NPad. Repeated
-    /// disconnected updates are ignored.
+    /// A missing host source supplies neutral input to the configured virtual
+    /// controller. Only controller configuration or HID requests disconnect it.
     fn prepare_controller(
         &mut self,
         system: &HidState,
@@ -720,7 +738,7 @@ impl HidProducer {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (
                 configuration.npad_active
-                    && !self.disconnected_by_guest
+                    && self.full_key_connected
                     && configuration.supported_style_set & NPAD_STYLE_FULL_KEY != 0
                     && configuration.supported_ids.contains(&0),
                 // FullKey, Player 1, device index 2. The packed handle layout
@@ -792,7 +810,7 @@ impl HidProducer {
                 self.keyboard.publish(writes, KEYBOARD_OFFSET, &entry);
             }
         }
-        let Some(state) = state.filter(|_| publish_player_one) else {
+        if !publish_player_one {
             if self.connected {
                 if let Some(output) = system.vibration_output.lock().unwrap().clone() {
                     output.stop()?;
@@ -810,7 +828,9 @@ impl HidProducer {
                 writes.connected = Some(self.connected);
             }
             return Ok(());
-        };
+        }
+        let neutral = EmulatedControllerState::default();
+        let state = state.unwrap_or(&neutral);
 
         self.sampling_number = self.sampling_number.saturating_add(1);
         let style_changed = !self.connected;

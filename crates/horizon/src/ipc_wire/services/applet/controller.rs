@@ -1,6 +1,8 @@
-//! Controller-support completion when the existing HID connection satisfies
-//! the request. Cases requiring pairing, firmware changes or UI remain explicit.
-//! The ABI and automatic application-mode completion are documented by libnx:
+//! Controller-support configuration through the virtual HID controller owner,
+//! following Eden's default frontend, independently of host-device attachment.
+//! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/frontend/applets/controller.cpp
+//! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/am/frontend/applet_controller.cpp
+//! Wire ABI:
 //! https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/applets/hid_la.h
 //! https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/applets/hid_la.c
 use super::super::prelude::*;
@@ -21,11 +23,25 @@ pub(super) fn run(
     if launch.mode != LibraryAppletMode::AllForeground {
         return Err(unsupported("ControllerSupport requires AllForeground mode"));
     }
-    let selected = hid.connected_full_key_id();
-    complete(&launch.input_storages, selected)
+    let keep_connected = decode(&launch.input_storages)?;
+    let selected =
+        hid.configure_full_key_controller(keep_connected)
+            .map_err(|error| match error {
+                crate::HidInputError::Memory(error) => IpcWireError::SystemMemory(error),
+                crate::HidInputError::Vibration(error) => {
+                    IpcWireError::InputBackend(error.to_string().into_boxed_str())
+                }
+            })?;
+    let mut output = vec![0; 12];
+    output[0] = 1;
+    output[4..8].copy_from_slice(&selected.to_le_bytes());
+    log::debug!(
+        "controller applet configured virtual FullKey player: id={selected:#x} keep-connected={keep_connected}"
+    );
+    Ok(output)
 }
 
-fn complete(inputs: &[Vec<u8>], selected: Option<u32>) -> Result<Vec<u8>, IpcWireError> {
+fn decode(inputs: &[Vec<u8>]) -> Result<bool, IpcWireError> {
     let [common, private, arg] = inputs else {
         return Err(IpcWireError::Malformed(
             "ControllerSupport requires common, private and argument storages",
@@ -45,7 +61,7 @@ fn complete(inputs: &[Vec<u8>], selected: Option<u32>) -> Result<Vec<u8>, IpcWir
     let version = request_u32(common, 8).unwrap();
     let (arg_size, players) = match version {
         3..=5 => (0x21c, 4),
-        7 | 8 => (0x430, 8),
+        7..=9 => (0x430, 8),
         _ => return Err(unsupported("unsupported ControllerSupport API version")),
     };
     if arg.len() != arg_size {
@@ -60,7 +76,7 @@ fn complete(inputs: &[Vec<u8>], selected: Option<u32>) -> Result<Vec<u8>, IpcWir
     }
     if request_u32(private, 12).unwrap() & 1 == 0 {
         return Err(unsupported(
-            "requested controller styles exclude the connected FullKey controller",
+            "requested controller styles exclude the supported FullKey controller",
         ));
     }
     let single = arg[5] != 0;
@@ -71,51 +87,8 @@ fn complete(inputs: &[Vec<u8>], selected: Option<u32>) -> Result<Vec<u8>, IpcWir
             "invalid ControllerSupport player count range",
         ));
     }
-    if arg[2] == 0 {
-        return Err(unsupported(
-            "controller disconnection and reconnection UI is required",
-        ));
-    }
-    let selected = selected
-        .ok_or_else(|| unsupported("no controller is connected; connection UI is required"))?;
     if !single && min > 1 {
         return Err(unsupported("additional player connections are required"));
     }
-    // One published FullKey controller, selected by its real NPad ID. Do not
-    // invent a connection or report a count that does not exist in shared HID.
-    let mut output = vec![0; 12];
-    output[0] = 1;
-    output[4..8].copy_from_slice(&selected.to_le_bytes());
-    Ok(output)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn inputs(version: u32, size: usize) -> Vec<Vec<u8>> {
-        let mut common = vec![0; 32];
-        common[0..4].copy_from_slice(&1u32.to_le_bytes());
-        common[4..8].copy_from_slice(&32u32.to_le_bytes());
-        common[8..12].copy_from_slice(&version.to_le_bytes());
-        let mut private = vec![0; 20];
-        private[..4].copy_from_slice(&20u32.to_le_bytes());
-        private[4..8].copy_from_slice(&(size as u32).to_le_bytes());
-        private[12..16].copy_from_slice(&1u32.to_le_bytes());
-        let mut arg = vec![0; size];
-        arg[..7].copy_from_slice(&[1, 4, 1, 1, 1, 0, 0]);
-        vec![common, private, arg]
-    }
-    #[test]
-    fn completion_reports_the_connected_id_and_requires_actual_connections() {
-        for (version, size) in [(3, 0x21c), (5, 0x21c), (7, 0x430), (8, 0x430)] {
-            let mut input = inputs(version, size);
-            assert_eq!(
-                complete(&input, Some(0)).unwrap(),
-                [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-            );
-            assert!(complete(&input, None).is_err());
-            input[2][0] = 2;
-            assert!(complete(&input, Some(0)).is_err());
-        }
-    }
+    Ok(arg[2] != 0)
 }
