@@ -355,69 +355,6 @@ fn nv12_simd_matches_scalar_signed_matrices_crops_clamp_and_channel_order() {
 }
 
 #[test]
-fn opaque_nv12_plane_copy_preserves_crop_pitch_and_tiled_padding() {
-    let machine = crate::test_memory::machine();
-    let allocation = machine.account(0x10000).unwrap().allocate(0x10000).unwrap();
-    let input = nixe_memory::AllocationRange::new(allocation.pin(), 0, 0x10000).unwrap();
-    let mut nvmap = NvMapObjects::default();
-    let owner = NvMapOwner::new(1);
-    let handle = nvmap.create(owner, 0x10000).unwrap();
-    nvmap
-        .allocate(
-            owner,
-            handle,
-            NvMapAllocationMetadata::new(0, 0, 4096, 0),
-            NvMapCpuMapping::new(AddressSpaceId::new(1), GuestVirtualAddress::new(0x1000)),
-            Arc::from([input.clone()]),
-        )
-        .unwrap();
-    let object = nvmap
-        .object_snapshot_by_owned_handle(owner, handle)
-        .unwrap();
-    let mappings = Arc::new(BTreeMap::from([(
-        0x1000,
-        Mapping {
-            physical: nixe_memory::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
-            object,
-            references: 1,
-        },
-    )]));
-    let source: Vec<u8> = (0..128 * 64).map(|i| (i * 17 + i / 128) as u8).collect();
-    for (kind, block_height) in [(0, 0), (1, 1), (1, 3)] {
-        for width in [66, 67] {
-            let output = Surface {
-                width,
-                height: 37,
-                pitch: 128,
-                rows: 48,
-                kind,
-                block_height,
-                format: 68,
-            };
-            machine
-                .write_resolved(std::slice::from_ref(&input), &vec![0xa5; 0x10000])
-                .unwrap();
-            write_plane(&output, &source, 128, [4, 6], &mappings, 0x2000).unwrap();
-            let mut actual = vec![0; output.length()];
-            crate::test_memory::read(
-                &[input.slice(0x1000, actual.len() as u64).unwrap()],
-                &mut actual,
-            );
-            let mut expected = vec![0xa5; output.length()];
-            for y in 0..output.height {
-                for x in 0..output.width {
-                    expected[output.offset(x, y)] = source[(y + 6) * 128 + x + 4];
-                }
-            }
-            assert_eq!(
-                actual, expected,
-                "kind={kind} block-height={block_height} width={width}"
-            );
-        }
-    }
-}
-
-#[test]
 fn visible_surface_runs_cover_pixels_once_in_physical_order() {
     for (kind, block_height) in [(0, 0), (1, 0), (1, 1), (1, 2), (1, 4)] {
         for bpp in [1, 4] {

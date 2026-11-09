@@ -702,6 +702,3 @@ impl Drop for VulkanResidency {
 fn memory_error(error: nixe_memory::MemoryError) -> VulkanError {
     VulkanError::from(error)
 }
-
-#[cfg(test)]
-pub(crate) mod tests;

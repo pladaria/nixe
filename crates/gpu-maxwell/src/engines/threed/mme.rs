@@ -792,12 +792,6 @@ impl MaxwellThreeDMmeState {
         &self.mutable_method_control
     }
 
-    #[cfg(test)]
-    #[must_use]
-    pub(in crate::engines) fn shadow_value(&self, method: GpuMethodId) -> Option<u32> {
-        self.shadow_registers.raw(method)
-    }
-
     #[inline]
     pub(super) fn shadow_word(&self, method: GpuMethodId) -> u32 {
         self.shadow_registers.word(method)

@@ -2,8 +2,6 @@
 //! native slots. There are no frontend resolved-resource roles or view lists.
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L462-L536
 use super::*;
-#[cfg(test)]
-use crate::native::NativeGpuExecution;
 use crate::residency::Resource;
 use ash::vk;
 impl crate::native::NativeExecution<'_> {

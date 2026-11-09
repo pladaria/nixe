@@ -1120,28 +1120,6 @@ impl NvDrvSession {
             .is_some()
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_test_timeline(&self, id: nixe_gpu::GuestSyncpointId) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .nvhost_control
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .install_test_timeline(id);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn advance_test_timeline(&self, id: nixe_gpu::GuestSyncpointId) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .nvhost_control
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .advance_test_timeline(id);
-    }
-
     pub(crate) fn teardown(&self) -> NvDrvTeardownReport {
         // Stop producers and join the command owner before removing the GPU
         // mappings still consumed by accepted work. Joins hold no service lock.
@@ -1691,7 +1669,7 @@ mod tests {
         assert_eq!(clone.status(), session.status());
     }
 
-    use nixe_gpu::{GraphicsGapKind, GuestSyncpointId, GuestSyncpointValue, GuestTimelinePoint};
+    use nixe_gpu::GraphicsGapKind;
     use nixe_memory::MemoryPermissions;
     use nixe_memory::{AllocationRange, MemoryError};
     use nixe_runtime::memory::{Mapping, MemoryKind};

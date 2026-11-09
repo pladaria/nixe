@@ -1081,7 +1081,6 @@ mod tests {
 mod reader_tests {
     use super::*;
     use std::sync::mpsc;
-    use std::time::Duration;
 
     #[test]
     fn retracked_cpu_holes_do_not_keep_previous_backing_continuity() {

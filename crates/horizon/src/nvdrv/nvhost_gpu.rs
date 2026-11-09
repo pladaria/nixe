@@ -411,11 +411,6 @@ impl NvHostGpu {
     }
 
     #[cfg(test)]
-    pub(super) fn pending_submission_count(&self) -> usize {
-        self.scheduler.pending_count()
-    }
-
-    #[cfg(test)]
     pub(super) fn accepted_submission_count(&self) -> u64 {
         self.next_frontend_submission - 1
     }

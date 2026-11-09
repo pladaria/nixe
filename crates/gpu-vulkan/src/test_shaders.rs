@@ -1,5 +1,5 @@
 //! Small shaders for native resource and execution tests.
-use crate::cache::{CompiledStage, ShaderArtifact};
+use crate::cache::CompiledStage;
 use nixe_shader_recompiler::{
     Profile, RuntimeInfo, Stage,
     arena::BlockId,
@@ -7,7 +7,6 @@ use nixe_shader_recompiler::{
     ir::{Attribute, Ir, Opcode as O, Program, SyntaxNode, TextureInstInfo, Type, Value as V},
     types::{AttributeType, ByteOffset, CbufIndex, Interpolation, TextureType},
 };
-use std::sync::Arc;
 
 pub(crate) struct Shader {
     pub ir: Ir,
@@ -73,18 +72,6 @@ impl Shader {
         .unwrap();
         CompiledStage::from_guest(artifact).unwrap()
     }
-}
-pub(crate) fn compile(
-    profile: &Profile,
-    shaders: impl IntoIterator<Item = Shader>,
-) -> Arc<ShaderArtifact> {
-    let mut bindings = Bindings::default();
-    Arc::new(ShaderArtifact::new(
-        shaders
-            .into_iter()
-            .map(|s| s.compile(profile, &mut bindings))
-            .collect(),
-    ))
 }
 pub(crate) fn increment(amount: u32, destination: u32) -> Shader {
     let mut s = Shader::new(Stage::Compute);

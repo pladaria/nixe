@@ -432,29 +432,6 @@ impl NvHostControl {
         Ok(self.take_guest_actions(point.syncpoint()))
     }
 
-    #[cfg(test)]
-    pub(super) fn install_test_timeline(&mut self, id: GuestSyncpointId) {
-        self.guest_actions.remove(&id);
-        self.timelines.insert(
-            id,
-            GuestTimeline::new(
-                id,
-                TimelineInstanceId::new(1),
-                TimelineOwnerId::new(1),
-                GuestSyncpointValue::new(0),
-            ),
-        );
-    }
-
-    #[cfg(test)]
-    pub(super) fn advance_test_timeline(&mut self, id: GuestSyncpointId) {
-        self.timelines
-            .get_mut(&id)
-            .expect("test timeline must exist")
-            .increment_immediate(TimelineOwnerId::new(1))
-            .expect("test timeline increment must be valid");
-    }
-
     /// Reserves channel completion without publishing guest-visible progress.
     pub(super) fn reserve_channel_submission(
         &mut self,
@@ -514,11 +491,6 @@ impl NvHostControl {
             })?;
         self.signal_reached(point.syncpoint(), point.value());
         Ok(point)
-    }
-
-    #[cfg(test)]
-    pub(super) fn has_timeline(&self, id: GuestSyncpointId) -> bool {
-        self.timelines.contains_key(&id)
     }
 
     #[cfg(test)]

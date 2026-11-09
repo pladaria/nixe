@@ -563,45 +563,6 @@ mod tests {
             Some(false)
         );
     }
-    use crate::nvdrv::nvmap::{NvMapAllocationMetadata, NvMapCpuMapping, NvMapObjects, NvMapOwner};
-    use nixe_memory::{
-        AddressSpaceId, AllocationRange, DeviceAccessEndpoint, DeviceAccessRequest,
-        GuestVirtualAddress,
-    };
-    struct Endpoint(mpsc::Sender<DeviceAccessRequest>);
-    impl DeviceAccessEndpoint for Endpoint {
-        fn submit(&self, r: DeviceAccessRequest) {
-            self.0.send(r).unwrap();
-        }
-        fn cancel(&self, _: nixe_memory::AccessRequestId) {}
-        fn allocation_released(&self, _: nixe_memory::MachineId, _: nixe_memory::AllocationId) {}
-        fn physical_retired(
-            &self,
-            _: nixe_memory::MachineId,
-            _: nixe_memory::AllocationId,
-            _: Box<[nixe_memory::Extent]>,
-        ) {
-        }
-        fn allocation_pressure(&self, _: nixe_memory::MachineId, _: u64) {}
-    }
-    fn job(mappings: video::Mappings) -> Job {
-        let words = [
-            0x5du32 << 6,
-            (4 << 28) | (0x10 << 16) | 0x1c2,
-            (4 << 28) | (0x11 << 16) | 0x10,
-            (4 << 28) | (0x10 << 16) | 0xc0,
-            (4 << 28) | (0x11 << 16) | 1,
-        ];
-        Job {
-            descriptor: descriptor(2),
-            request: 0x123,
-            commands: vec![words.into_iter().flat_map(u32::to_le_bytes).collect()],
-            completion: None,
-            mappings,
-            timeout: 0,
-        }
-    }
-
     #[test]
     fn in_stream_increments_satisfy_intermediate_waits_before_the_job_finishes() {
         let d = descriptor(2);

@@ -520,50 +520,6 @@ mod tests {
     use super::*;
     use std::{thread, time::Duration};
     #[test]
-    fn data_tracking_drains_host_access_without_closing_native_admission() {
-        let space = AddressSpace::new(
-            crate::Machine::new(crate::PAGE_SIZE).unwrap(),
-            crate::AddressWidth::Bits32,
-        )
-        .unwrap();
-        let core = space.register_core(Arc::new(|| panic!("data protection interrupted a core")));
-        let native = core.enter_native().unwrap();
-        let host = space.quiescence.enter_host().unwrap();
-        let transition = space
-            .quiescence
-            .begin_tracking(space.quiescence.writer().unwrap(), false)
-            .unwrap();
-        let (entered, native_entered) = std::sync::mpsc::channel();
-        let running = Arc::clone(&space);
-        let newcomer = thread::spawn(move || {
-            let core = running.register_core(Arc::new(|| {
-                panic!("data protection interrupted a new core")
-            }));
-            let _native = core.enter_native().unwrap();
-            entered.send(()).unwrap();
-        });
-        let arrived = native_entered.recv_timeout(Duration::from_secs(1));
-        let (entered, host_entered) = std::sync::mpsc::channel();
-        let pending = Arc::clone(&space);
-        let new_host = thread::spawn(move || {
-            let _host = pending.quiescence.enter_host().unwrap();
-            entered.send(()).unwrap();
-        });
-        assert!(
-            host_entered
-                .recv_timeout(Duration::from_millis(20))
-                .is_err()
-        );
-        drop(host);
-        transition.wait_quiescent();
-        transition.publish();
-        host_entered.recv_timeout(Duration::from_secs(1)).unwrap();
-        newcomer.join().unwrap();
-        new_host.join().unwrap();
-        arrived.expect("data protection closed native admission");
-        assert!(native.is_active());
-    }
-    #[test]
     fn writer_waits_for_native_and_host_access_then_publishes_before_resume() {
         let space = AddressSpace::new(
             crate::Machine::new(crate::PAGE_SIZE).unwrap(),

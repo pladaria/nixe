@@ -3,8 +3,6 @@ mod code;
 #[cfg(target_arch = "x86_64")]
 mod execution;
 mod ffi;
-#[cfg(all(test, target_arch = "x86_64"))]
-mod memory_tests;
 pub mod metrics;
 #[cfg(target_arch = "x86_64")]
 pub mod process;

@@ -1,5 +1,4 @@
 use super::*;
-use std::sync::{Barrier, atomic::AtomicUsize};
 
 #[test]
 fn alias_validation_never_changes_a_prefix_or_unmaps_an_unrelated_replacement() {

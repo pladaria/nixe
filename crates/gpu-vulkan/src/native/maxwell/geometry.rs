@@ -2,8 +2,6 @@
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L1279-L1419
 use super::*;
 use crate::VulkanError as V;
-#[cfg(test)]
-use crate::residency::VulkanResidency;
 use crate::residency::execution::{IndexBuffer, VertexBuffer};
 use crate::residency::{BufferRange, Residency};
 use ash::vk;

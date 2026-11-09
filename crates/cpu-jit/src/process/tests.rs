@@ -187,23 +187,6 @@ fn canonical_process_prepares_code_and_retains_registers_across_svc_and_migratio
     worker.finish().unwrap();
 }
 
-struct Endpoint(mpsc::Sender<nixe_memory::DeviceAccessRequest>);
-impl nixe_memory::DeviceAccessEndpoint for Endpoint {
-    fn submit(&self, request: nixe_memory::DeviceAccessRequest) {
-        self.0.send(request).unwrap();
-    }
-    fn cancel(&self, _: nixe_memory::AccessRequestId) {}
-    fn allocation_released(&self, _: nixe_memory::MachineId, _: nixe_memory::AllocationId) {}
-    fn physical_retired(
-        &self,
-        _: nixe_memory::MachineId,
-        _: nixe_memory::AllocationId,
-        _: Box<[nixe_memory::Extent]>,
-    ) {
-    }
-    fn allocation_pressure(&self, _: nixe_memory::MachineId, _: u64) {}
-}
-
 #[test]
 fn canonical_process_reports_fetch_faults_and_relaxes_invalid_guest_data() {
     for fetch in [true, false] {
