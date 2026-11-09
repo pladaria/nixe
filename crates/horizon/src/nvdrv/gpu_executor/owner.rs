@@ -19,6 +19,7 @@ pub(super) fn run<L, E>(
     budget: &GpuWorkBudget,
     endpoint: &GpuMemoryEndpoint,
     control: Arc<Mutex<NvHostControl>>,
+    mme_jit: bool,
 ) -> Result<(), GpuExecutorFailure>
 where
     L: MaxwellFrontend,
@@ -34,6 +35,7 @@ where
         frontend,
         endpoint.sender.clone(),
         control,
+        mme_jit,
     );
     let mut result = owner.drive();
     let shutting_down = budget.is_stopped();
@@ -66,6 +68,7 @@ struct Owner<
     receiver: &'a mpsc::Receiver<GpuMessage>,
     composite_sender: mpsc::Sender<GpuMessage>,
     control: Arc<Mutex<NvHostControl>>,
+    mme_jit: bool,
     backend: Rc<RefCell<Option<E>>>,
     budget: &'a GpuWorkBudget,
     deferred: VecDeque<GpuMessage>,
@@ -95,8 +98,10 @@ where
         frontend: L,
         composite_sender: mpsc::Sender<GpuMessage>,
         control: Arc<Mutex<NvHostControl>>,
+        mme_jit: bool,
     ) -> Self {
         Self {
+            mme_jit,
             receiver,
             composite_sender,
             control,
@@ -290,7 +295,10 @@ where
                         .insert(
                             channel.id(),
                             Some(Box::new(
-                                nixe_gpu_maxwell::MaxwellGpuChannel::from_configuration(channel)
+                                nixe_gpu_maxwell::MaxwellGpuChannel::from_configuration(
+                                    channel,
+                                    self.mme_jit
+                                )
                             ))
                         )
                         .is_none(),

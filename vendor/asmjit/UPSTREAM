@@ -1,0 +1,4 @@
+Source: https://github.com/asmjit/asmjit
+Commit: 677a10bac2c24f7e068cf1f9e675bf51c7b534ea
+License: Zlib (LICENSE.md)
+Local changes: lower the CMake minimum to 3.16 for the existing native build toolchain.

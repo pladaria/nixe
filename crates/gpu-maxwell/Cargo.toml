@@ -17,3 +17,6 @@ nixe-gpu.workspace = true
 nixe-shader-recompiler.workspace = true
 
 [dev-dependencies]
+
+[build-dependencies]
+cmake = "0.1"

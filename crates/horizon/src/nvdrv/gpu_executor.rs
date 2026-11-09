@@ -380,6 +380,7 @@ impl NvDrvGpuExecutor {
             machine,
             kernel,
             control,
+            true,
             || Ok((None::<nixe_gpu_maxwell::MissingGpuExecution>, ())),
             |_| nixe_gpu_maxwell::MissingRenderer,
         )
@@ -390,6 +391,7 @@ impl NvDrvGpuExecutor {
         machine: Machine,
         kernel: &Arc<nixe_scheduler::SchedulerState>,
         control: Arc<Mutex<NvHostControl>>,
+        mme_jit: bool,
         initialize: impl FnOnce() -> Result<(Option<E>, R), nixe_gpu::BackendRuntimeError>
         + Send
         + 'static,
@@ -477,6 +479,7 @@ impl NvDrvGpuExecutor {
                         &worker_budget,
                         &owner_endpoint,
                         control,
+                        mme_jit,
                     )
                 } else {
                     Ok(())

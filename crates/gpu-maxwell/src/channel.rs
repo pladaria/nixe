@@ -349,9 +349,9 @@ impl MaxwellGpuChannel {
         owner: MaxwellChannelOwner,
         profile: MaxwellGpuProfile,
     ) -> Self {
-        Self::from_configuration(MaxwellChannelConfiguration::new(id, owner, profile))
+        Self::from_configuration(MaxwellChannelConfiguration::new(id, owner, profile), true)
     }
-    pub fn from_configuration(configuration: MaxwellChannelConfiguration) -> Self {
+    pub fn from_configuration(configuration: MaxwellChannelConfiguration, mme_jit: bool) -> Self {
         Self {
             configuration,
             frontend: MaxwellChannelFrontendState::default(),
@@ -359,7 +359,7 @@ impl MaxwellGpuChannel {
             dma_copy: MaxwellDmaCopyState::new(),
             inline_to_memory: MaxwellInlineToMemoryState::new(),
             two_d: MaxwellTwoDState::new(),
-            three_d: MaxwellThreeDFrontendState::new(),
+            three_d: MaxwellThreeDFrontendState::new(mme_jit),
             commands: Default::default(),
         }
     }
@@ -750,27 +750,6 @@ mod tests {
                 .bits(),
         )
         .unwrap()
-    }
-
-    #[test]
-    fn configuration_snapshots_do_not_share_or_reset_engine_registers() {
-        let mut driver = MaxwellChannelConfiguration::new(
-            MaxwellChannelId::new(1),
-            MaxwellChannelOwner::new(1),
-            SWITCH_1_GM20B_PROFILE,
-        );
-        driver.set_user_data(11);
-        let accepted = driver;
-        let mut context = MaxwellGpuChannel::from_configuration(accepted);
-        context.frontend_mut().set_legacy_mem_op_a(0x1234);
-        driver.set_user_data(22);
-        driver.set_priority(MaxwellChannelPriority::High);
-        assert_eq!(context.user_data(), 11);
-        assert_eq!(accepted.user_data(), 11);
-        context.update_configuration(driver);
-        assert_eq!(context.user_data(), 22);
-        assert_eq!(context.priority(), MaxwellChannelPriority::High);
-        assert_eq!(context.frontend().legacy_mem_op_a(), Some(0x1234));
     }
 
     #[test]

@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device_memory,
         &kernel,
         Some(window.mailbox()),
+        true,
         initialize,
         frontend,
     )?;

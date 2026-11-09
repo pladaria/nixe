@@ -72,6 +72,8 @@ volume = 10
 vsync = true
 
 [gpu]
+# Compile MME macros to native AMD64 code; selected once per channel. Defaults to true.
+mme_jit = true
 # Per-title shader environments and Vulkan driver caches, relative to this file.
 cache_directory = "./storage/cache/gpu"
 

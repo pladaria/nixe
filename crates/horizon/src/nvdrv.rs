@@ -150,6 +150,7 @@ impl NvDrvSession {
     pub fn with_gpu_frontend<E, L, R>(
         device_memory: nixe_gpu_maxwell::MaxwellDeviceMemory,
         kernel: &Arc<nixe_scheduler::SchedulerState>,
+        mme_jit: bool,
         initialize: impl FnOnce() -> Result<(E, R), nixe_gpu::BackendRuntimeError> + Send + 'static,
         frontend: impl FnOnce(std::rc::Rc<std::cell::RefCell<Option<E>>>) -> L + Send + 'static,
     ) -> Result<(Self, R), nixe_gpu::BackendRuntimeError>
@@ -167,6 +168,7 @@ impl NvDrvSession {
             machine,
             kernel,
             Arc::clone(&control),
+            mme_jit,
             move || initialize().map(|(execution, report)| (Some(execution), report)),
             frontend,
         )?;

@@ -332,8 +332,23 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
             let diagnostics = (renderer.cache_monitor(), renderer.frame_metrics());
             Ok((renderer, diagnostics))
         };
-        VideoSystem::with_gpu_frontend(device_memory, &kernel, presenter, initialize, maxwell)
-            .map_err(|error| error.to_string())?
+        log::info!(
+            "MME execution: {}",
+            if config.gpu.mme_jit && cfg!(target_arch = "x86_64") {
+                "AMD64 JIT (AsmJit)"
+            } else {
+                "interpreter"
+            }
+        );
+        VideoSystem::with_gpu_frontend(
+            device_memory,
+            &kernel,
+            presenter,
+            config.gpu.mme_jit,
+            initialize,
+            maxwell,
+        )
+        .map_err(|error| error.to_string())?
     };
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     // SDL initialization and final subsystem shutdown remain on the main thread.

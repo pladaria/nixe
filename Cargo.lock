@@ -1404,6 +1404,7 @@ dependencies = [
 name = "nixe-gpu-maxwell"
 version = "0.1.0"
 dependencies = [
+ "cmake",
  "log",
  "nixe-gpu",
  "nixe-memory",

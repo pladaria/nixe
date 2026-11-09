@@ -294,6 +294,7 @@ impl VideoSystem {
         device_memory: nixe_gpu_maxwell::MaxwellDeviceMemory,
         kernel: &Arc<nixe_scheduler::SchedulerState>,
         presenter: Option<FrameMailbox>,
+        mme_jit: bool,
         initialize: impl FnOnce() -> Result<(E, R), nixe_gpu::BackendRuntimeError> + Send + 'static,
         frontend: impl FnOnce(std::rc::Rc<std::cell::RefCell<Option<E>>>) -> L + Send + 'static,
     ) -> Result<(Self, R), nixe_gpu::BackendRuntimeError>
@@ -306,7 +307,7 @@ impl VideoSystem {
             >,
     {
         let (nvdrv, report) =
-            NvDrvSession::with_gpu_frontend(device_memory, kernel, initialize, frontend)?;
+            NvDrvSession::with_gpu_frontend(device_memory, kernel, mme_jit, initialize, frontend)?;
         Ok((Self::with_nvdrv(kernel, presenter, nvdrv), report))
     }
 

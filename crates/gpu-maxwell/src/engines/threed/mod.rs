@@ -1112,6 +1112,10 @@ impl<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost> MaxwellThreeDMmeHo
     for MmeDispatchHost<'_, '_, L, H>
 {
     type Error = MaxwellEngineStreamError;
+    #[cfg(target_arch = "x86_64")]
+    fn register_words_ptr(&mut self) -> *mut u32 {
+        self.candidate.register_words_ptr()
+    }
     fn read_register(&self, method_dword: u16) -> Result<u32, Self::Error> {
         let method = GpuMethodId(u32::from(method_dword) * 4);
         self.candidate.raw_register_value(method).ok_or_else(|| {

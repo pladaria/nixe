@@ -970,8 +970,11 @@ impl MaxwellThreeDFrontendState {
         }
     }
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(mme_jit: bool) -> Self {
+        Self {
+            mme: MaxwellThreeDMmeState::new(mme_jit),
+            ..Self::default()
+        }
     }
 
     #[must_use]
@@ -1004,6 +1007,11 @@ impl MaxwellThreeDFrontendState {
     #[must_use]
     pub(in crate::engines) fn raw_register_value(&self, method: GpuMethodId) -> Option<u32> {
         self.operation.registers.raw(method)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn register_words_ptr(&mut self) -> *mut u32 {
+        self.operation.registers.values.as_mut_ptr()
     }
 
     pub(super) fn record_raw_register(&mut self, source: MaxwellMethodSource) {

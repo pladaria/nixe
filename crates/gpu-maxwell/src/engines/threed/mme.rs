@@ -1,4 +1,7 @@
-//! Uploaded macro bodies and the selected contiguous MME interpreter program.
+//! Uploaded macro bodies and per-channel interpreted or compiled MME programs.
+
+#[cfg(target_arch = "x86_64")]
+mod jit;
 
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
@@ -196,8 +199,12 @@ pub enum MaxwellThreeDMmeLoadError {
 }
 
 /// Why one captured MME program cannot be executed faithfully.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum MaxwellThreeDMmeExecutionError {
+    Compilation {
+        address: MaxwellThreeDMmeRamAddress,
+        diagnostic: Arc<str>,
+    },
     DataWithoutCall,
     MissingStartAddress {
         macro_index: u8,
@@ -245,6 +252,8 @@ pub(super) trait MaxwellThreeDMmeHost {
     type Error;
 
     fn read_register(&self, method_dword: u16) -> Result<u32, Self::Error>;
+    #[cfg(target_arch = "x86_64")]
+    fn register_words_ptr(&mut self) -> *mut u32;
     /// Execute the method and any pending primitive boundary before continuing.
     fn emit_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error>;
 }
@@ -255,7 +264,8 @@ pub(super) enum MaxwellThreeDMmeRunError<E> {
 }
 
 struct MaxwellThreeDMmeInterpreter<'a, H> {
-    program: &'a MaxwellThreeDMmeProgram,
+    program: &'a [MaxwellThreeDMmeInstruction],
+    start: u32,
     host: &'a mut H,
     parameters: &'a [u32],
     registers: [u32; MME_REGISTER_COUNT],
@@ -275,13 +285,17 @@ struct MaxwellThreeDMmeInterpreter<'a, H> {
 /// A selected macro owns only its contiguous uploaded body. An invocation may
 /// suspend while an emitted engine effect completes, so it retains that body.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/macro.cpp#L1340-L1434
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct MaxwellThreeDMmeProgram {
-    instructions: Arc<[MaxwellThreeDMmeInstruction]>,
-    start: u32,
+#[derive(Clone, Debug)]
+pub(super) enum MaxwellThreeDMmeProgram {
+    Interpreted {
+        instructions: Arc<[MaxwellThreeDMmeInstruction]>,
+        start: u32,
+    },
+    #[cfg(target_arch = "x86_64")]
+    Compiled(std::rc::Rc<jit::Program>),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct CachedMmeProgram {
     upload_address: u32,
     program: MaxwellThreeDMmeProgram,
@@ -300,13 +314,22 @@ impl MaxwellThreeDMmeProgram {
         parameters: &[u32],
         host: &mut H,
     ) -> Result<(), MaxwellThreeDMmeRunError<H::Error>> {
+        let (instructions, start) = match self {
+            Self::Interpreted {
+                instructions,
+                start,
+            } => (instructions, *start),
+            #[cfg(target_arch = "x86_64")]
+            Self::Compiled(program) => return program.execute(parameters, host),
+        };
         if parameters.is_empty() {
             return Err(MaxwellThreeDMmeRunError::Execution(
                 MaxwellThreeDMmeExecutionError::ParameterUnavailable { index: 0 },
             ));
         }
         let mut interpreter = MaxwellThreeDMmeInterpreter {
-            program: self,
+            program: instructions,
+            start,
             host,
             parameters,
             registers: [0; MME_REGISTER_COUNT],
@@ -351,17 +374,12 @@ impl<H: MaxwellThreeDMmeHost> MaxwellThreeDMmeInterpreter<'_, H> {
                     },
                 ));
             }
-            let address = MaxwellThreeDMmeRamAddress::new(self.program.start.wrapping_add(self.pc));
-            let instruction = self
-                .program
-                .instructions
-                .get(self.pc as usize)
-                .copied()
-                .ok_or_else(|| {
-                    Self::execution_error(MaxwellThreeDMmeExecutionError::MissingInstruction {
-                        address,
-                    })
-                })?;
+            let address = MaxwellThreeDMmeRamAddress::new(self.start.wrapping_add(self.pc));
+            let instruction = self.program.get(self.pc as usize).copied().ok_or_else(|| {
+                Self::execution_error(MaxwellThreeDMmeExecutionError::MissingInstruction {
+                    address,
+                })
+            })?;
             self.instructions += 1;
             let base = self.pc;
             self.pc = self.pc.checked_add(1).ok_or_else(|| {
@@ -611,8 +629,12 @@ const fn bitfield_mask(raw: u32) -> u32 {
 /// The four load methods and their 32-bit fields are pinned to NVIDIA's public
 /// class header:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L55-L65>
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct MaxwellThreeDMmeState {
+    #[cfg(target_arch = "x86_64")]
+    interpreted: bool,
+    #[cfg(target_arch = "x86_64")]
+    runtime: Option<std::rc::Rc<jit::Runtime>>,
     instruction_pointer: MaxwellThreeDRegister<MaxwellThreeDMmeRamAddress>,
     next_instruction_address: Option<MaxwellThreeDMmeRamAddress>,
     uploaded_code: HashMap<u32, Vec<MaxwellThreeDMmeInstruction>>,
@@ -637,6 +659,10 @@ impl Default for MaxwellThreeDMmeState {
         // Register/shadow initialization:
         // https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/engines/maxwell_3d.cpp#L34-L104
         Self {
+            #[cfg(target_arch = "x86_64")]
+            interpreted: false,
+            #[cfg(target_arch = "x86_64")]
+            runtime: None,
             instruction_pointer: MaxwellThreeDRegister::default(),
             next_instruction_address: None,
             uploaded_code: HashMap::default(),
@@ -651,6 +677,15 @@ impl Default for MaxwellThreeDMmeState {
 }
 
 impl MaxwellThreeDMmeState {
+    pub(super) fn new(mme_jit: bool) -> Self {
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = mme_jit;
+        Self {
+            #[cfg(target_arch = "x86_64")]
+            interpreted: !mme_jit,
+            ..Self::default()
+        }
+    }
     pub(super) fn program(
         &mut self,
         macro_index: u8,
@@ -679,7 +714,25 @@ impl MaxwellThreeDMmeState {
                 address: MaxwellThreeDMmeRamAddress::new(start),
             })?;
         let offset = (start - upload_address) as usize;
-        let program = MaxwellThreeDMmeProgram {
+        #[cfg(target_arch = "x86_64")]
+        let program = if self.interpreted {
+            MaxwellThreeDMmeProgram::Interpreted {
+                start,
+                instructions: Arc::from(&code[offset..]),
+            }
+        } else {
+            if self.runtime.is_none() {
+                self.runtime = Some(jit::Runtime::new()?);
+            }
+            MaxwellThreeDMmeProgram::Compiled(
+                self.runtime
+                    .as_ref()
+                    .unwrap()
+                    .compile(&code[offset..], start)?,
+            )
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let program = MaxwellThreeDMmeProgram::Interpreted {
             start,
             instructions: Arc::from(&code[offset..]),
         };

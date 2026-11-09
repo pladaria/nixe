@@ -27,11 +27,14 @@ pub const CONFIG_VERSION: u32 = 2;
 pub struct GpuConfig {
     /// Resolved from the configuration file.
     pub cache_directory: PathBuf,
+    /// Compile uploaded MME macros on supported host architectures.
+    pub mme_jit: bool,
 }
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
             cache_directory: PathBuf::from("./storage/cache/gpu"),
+            mme_jit: true,
         }
     }
 }
@@ -89,6 +92,7 @@ impl NixeConfig {
             .expect("an absolute file path must have a parent");
         let mut gpu = GpuConfig {
             cache_directory: raw.gpu.cache_directory,
+            mme_jit: raw.gpu.mme_jit,
         };
         gpu.cache_directory = resolve_path(base_directory, gpu.cache_directory);
 
@@ -440,12 +444,15 @@ struct RawConfig {
 struct RawGpuConfig {
     #[serde(default = "default_gpu_cache_directory")]
     cache_directory: PathBuf,
+    #[serde(default = "default_true")]
+    mme_jit: bool,
 }
 
 impl Default for RawGpuConfig {
     fn default() -> Self {
         Self {
             cache_directory: default_gpu_cache_directory(),
+            mme_jit: true,
         }
     }
 }

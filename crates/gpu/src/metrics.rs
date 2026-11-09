@@ -42,6 +42,7 @@ pub enum Counter {
     NativeQueuedChunks,
     NativeChunkCommands,
     NativeChunkHandoffNanoseconds,
+    MmeJitCompilations,
     NativeChunkEnqueueNanoseconds,
 }
 
@@ -102,6 +103,7 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         "NativeQueuedChunks",
         "NativeChunkCommands",
         "NativeChunkHandoffNanoseconds",
+        "MmeJitCompilations",
         "NativeChunkEnqueueNanoseconds",
     ];
     NAMES
