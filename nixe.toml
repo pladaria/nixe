@@ -13,7 +13,7 @@ follow_symlinks = true
 # Before launch, convert solid NCZ entries in the selected title's NSZ packages
 # to independent 1 MiB blocks. The first conversion can take some time.
 convert_solid_to_blocks = true
-# After a verified conversion: true keeps <filename>.nsz.solid; false discards
+# After a verified conversion: "rename" keeps <filename>.nsz.solid; "remove" discards
 # the original; "trash" (default) moves it to the system trash. If trash fails, retain
 # the .solid backup and log a warning.
 keep_solid_backup = "trash"
@@ -39,8 +39,8 @@ keys = "./keys/"
 # TTF supplied to applications requesting a system font; relative to this file.
 font = "./assets/DejaVuSans.ttf"
 # font = "./assets/NotoSans-Regular.ttf"
-# Initial mode reported to applications: "handheld" or "docked".
-initial_operation_mode = "docked"
+# Start in docked mode when true, or handheld mode when false.
+is_docked = true
 
 [system.time]
 # "realtime" anchors to the host clock at launch and advances monotonically.

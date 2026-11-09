@@ -126,7 +126,7 @@ impl NixeConfig {
                     .system
                     .dictionary
                     .map(|path| resolve_path(base_directory, path)),
-                initial_operation_mode: raw.system.initial_operation_mode,
+                is_docked: raw.system.is_docked,
                 time: TimeConfig {
                     mode: raw.system.time.mode,
                     timezone: raw.system.time.timezone,
@@ -222,8 +222,8 @@ pub struct SystemConfig {
     pub font: Option<PathBuf>,
     /// Word lists used to generate the system profanity-filter archive.
     pub dictionary: Option<PathBuf>,
-    /// Operation mode reported to titles when the emulated system starts.
-    pub initial_operation_mode: InitialOperationMode,
+    /// Whether the emulated console starts connected to its dock.
+    pub is_docked: bool,
     /// Initial virtual-time policy.
     pub time: TimeConfig,
 }
@@ -248,16 +248,6 @@ pub enum TimeMode {
     Realtime,
     /// Freeze wall and monotonic time at `fixed_unix_timestamp`.
     Fixed,
-}
-
-/// Initial physical presentation selected for the emulated console.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum InitialOperationMode {
-    /// The console starts outside its dock.
-    Handheld,
-    /// The console starts connected to its dock.
-    Docked,
 }
 
 /// Minimum severity emitted by application loggers.
@@ -486,27 +476,20 @@ where
         type Value = SolidBackup;
 
         fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("true, false, or \"trash\"")
-        }
-
-        fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
-            Ok(if value {
-                SolidBackup::Rename
-            } else {
-                SolidBackup::Discard
-            })
+            formatter.write_str("\"trash\", \"remove\", or \"rename\"")
         }
 
         fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-            if value == "trash" {
-                Ok(SolidBackup::Trash)
-            } else {
-                Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+            match value {
+                "trash" => Ok(SolidBackup::Trash),
+                "remove" => Ok(SolidBackup::Remove),
+                "rename" => Ok(SolidBackup::Rename),
+                _ => Err(E::unknown_variant(value, &["trash", "remove", "rename"])),
             }
         }
     }
 
-    deserializer.deserialize_any(SolidBackupVisitor)
+    deserializer.deserialize_str(SolidBackupVisitor)
 }
 
 #[derive(Deserialize)]
@@ -540,7 +523,7 @@ struct RawSystemConfig {
     font: Option<PathBuf>,
     #[serde(default)]
     dictionary: Option<PathBuf>,
-    initial_operation_mode: InitialOperationMode,
+    is_docked: bool,
     #[serde(default)]
     time: RawTimeConfig,
 }
@@ -803,7 +786,7 @@ mod tests {
                 recursive_scan = false
                 follow_symlinks = false
                 convert_solid_to_blocks = false
-                keep_solid_backup = false
+                keep_solid_backup = "remove"
                 [filesystem]
                 sd_card = "./custom-sd"
                 save_data = "./custom-save"
@@ -813,7 +796,7 @@ mod tests {
                 keys = "./keys"
                 font = "./assets/Roboto-Regular.ttf"
                 dictionary = "./assets/dict.toml"
-                initial_operation_mode = "docked"
+                is_docked = true
             "#,
         );
 
@@ -845,10 +828,7 @@ mod tests {
             config.system.dictionary,
             Some(base.join("./assets/dict.toml"))
         );
-        assert_eq!(
-            config.system.initial_operation_mode,
-            InitialOperationMode::Docked
-        );
+        assert!(config.system.is_docked);
         assert_eq!(config.system.time.mode, TimeMode::Realtime);
         assert_eq!(config.system.time.timezone, "UTC");
         assert_eq!(config.system.time.fixed_unix_timestamp, None);
@@ -874,7 +854,7 @@ mod tests {
             [system]
             preferred_languages = []
             keys = "keys"
-            initial_operation_mode = "handheld"
+            is_docked = false
         "#;
         for suffix in ["", "\n[audio]\noutput = \"stereo\"\n"] {
             let file = TemporaryConfig::new(&format!("{base}{suffix}"));
@@ -913,7 +893,7 @@ mod tests {
                 [system]
                 preferred_languages = []
                 keys = "keys"
-                initial_operation_mode = "handheld"
+                is_docked = false
                 [diagnostics]
                 guest_logs_level = "warn"
                 file_system_access_log = true
@@ -932,7 +912,7 @@ mod tests {
                     [system]
                     preferred_languages = []
                     keys = "keys"
-                    initial_operation_mode = "handheld"
+                    is_docked = false
                     [diagnostics]
                     guest_logs_level = "{level}"
                 "#
@@ -950,7 +930,7 @@ mod tests {
             [system]
             preferred_languages = []
             keys = "keys"
-            initial_operation_mode = "handheld"
+            is_docked = false
         "#;
         for (section, expected) in [
             ("", true),
@@ -978,7 +958,7 @@ mod tests {
                 [system]
                 preferred_languages = []
                 keys = "keys"
-                initial_operation_mode = "handheld"
+                is_docked = false
             "#,
         );
 
@@ -1008,7 +988,7 @@ mod tests {
                 [system]
                 preferred_languages = []
                 keys = "keys"
-                initial_operation_mode = "handheld"
+                is_docked = false
                 [input.profiles.switch-pro]
                 device = "Nintendo Switch Pro Controller"
                 type = "switch-pro"
@@ -1041,7 +1021,7 @@ mod tests {
                 [system]
                 preferred_languages = []
                 keys = "keys"
-                initial_operation_mode = "handheld"
+                is_docked = false
                 [input.profiles.invalid]
                 device = "Controller"
                 type = "switch-pro"
@@ -1061,7 +1041,7 @@ mod tests {
                 [system]
                 preferred_languages = []
                 keys = "keys"
-                initial_operation_mode = "handheld"
+                is_docked = false
                 [input.profiles.one]
                 device = "Controller"
                 type = "standard"
@@ -1086,7 +1066,7 @@ mod tests {
                 [system]
                 preferred_languages = []
                 keys = "keys"
-                initial_operation_mode = "handheld"
+                is_docked = false
                 [system.time]
                 mode = "fixed"
                 timezone = "Europe/Madrid"
@@ -1112,7 +1092,7 @@ mod tests {
                     [system]
                     preferred_languages = []
                     keys = "keys"
-                    initial_operation_mode = "handheld"
+                    is_docked = false
                     [system.time]
                     {invalid_time}
                 "#
@@ -1135,7 +1115,7 @@ mod tests {
                 [system]
                 preferred_languages = []
                 keys = "keys"
-                initial_operation_mode = "handheld"
+                is_docked = false
             "#,
             r#"
                 version = 2
@@ -1144,7 +1124,7 @@ mod tests {
                 [system]
                 preferred_languages = ["Klingon"]
                 keys = "keys"
-                initial_operation_mode = "handheld"
+                is_docked = false
             "#,
             r#"
                 version = 2
@@ -1153,16 +1133,7 @@ mod tests {
                 [system]
                 preferred_languages = []
                 keys = "keys"
-                initial_operation_mode = "tabletop"
-            "#,
-            r#"
-                version = 2
-                [library]
-                paths = []
-                [system]
-                preferred_languages = []
-                keys = "keys"
-                initial_operation_mode = "handheld"
+                is_docked = false
                 [diagnostics]
                 log_level = "verbose"
             "#,
@@ -1182,7 +1153,7 @@ mod tests {
                 [system]
                 preferred_languages = []
                 keys = "keys"
-                initial_operation_mode = "handheld"
+                is_docked = false
             "#,
         );
         assert!(matches!(

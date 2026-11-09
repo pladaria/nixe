@@ -21,7 +21,7 @@ pub enum SolidBackup {
     #[default]
     Trash,
     /// Replace the original without retaining a backup.
-    Discard,
+    Remove,
 }
 
 /// Converts solid NCZ entries in an NSZ to independent 1 MiB blocks.
@@ -34,7 +34,7 @@ pub fn prepare_nsz_for_random_access(
     path: impl AsRef<Path>,
     backup_policy: SolidBackup,
 ) -> Result<bool, LoadError> {
-    let keep_backup = backup_policy != SolidBackup::Discard;
+    let keep_backup = backup_policy != SolidBackup::Remove;
     let path = fs::canonicalize(path.as_ref()).map_err(StorageError::from)?;
     // The lock is released on every exit, including errors and process death.
     // Reopen the path after acquiring it: a previous converter may have already

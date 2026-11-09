@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
-use nixe_config::{DiagnosticsConfig, GuestLogsLevel, InitialOperationMode, TimeMode, WindowState};
+use nixe_config::{DiagnosticsConfig, GuestLogsLevel, TimeMode, WindowState};
 use nixe_gpu::frame_metrics::FrameMetrics;
 use nixe_gpu_vulkan::cache::CacheMonitor;
 use nixe_horizon::{
@@ -207,9 +207,10 @@ fn run_with_memory(
     );
     log::info!("starting JIT CPU execution");
 
-    let initial_operation_mode = match config.system.initial_operation_mode {
-        InitialOperationMode::Handheld => OperationMode::Handheld,
-        InitialOperationMode::Docked => OperationMode::Console,
+    let initial_operation_mode = if config.system.is_docked {
+        OperationMode::Console
+    } else {
+        OperationMode::Handheld
     };
     log::debug!("initial operation mode: {initial_operation_mode:?}");
     let time_environment = TimeEnvironment::new(
