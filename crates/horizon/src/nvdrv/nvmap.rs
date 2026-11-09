@@ -611,6 +611,7 @@ impl NvMapObjects {
         if record.handle_references > 1 {
             record.handle_references -= 1;
             return Ok(NvMapFreeResult {
+                retired: None,
                 address: 0,
                 size,
                 flags: 0,
@@ -634,6 +635,7 @@ impl NvMapObjects {
             self.exported_ids.remove(&exported_id);
         }
         Ok(NvMapFreeResult {
+            retired: Some(object_id),
             address,
             size,
             flags,
@@ -773,6 +775,7 @@ impl NvMapObjects {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct NvMapFreeResult {
+    pub retired: Option<NvMapObjectId>,
     pub address: u64,
     pub size: u32,
     pub flags: u32,

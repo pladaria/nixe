@@ -371,7 +371,6 @@ pub(super) struct NvDec {
     h264_initialized: bool,
     next_origin: u64,
     outputs: BTreeMap<u64, Output>,
-    surfaces: BTreeMap<[SurfaceIdentity; 2], u64>,
     frames: Arc<FrameQueue>,
     fd: super::super::NvDrvFileDescriptor,
 }
@@ -394,7 +393,6 @@ impl NvDec {
             h264_initialized: false,
             next_origin: 1,
             outputs: BTreeMap::new(),
-            surfaces: BTreeMap::new(),
             frames,
             fd,
         }
@@ -411,7 +409,6 @@ impl NvDec {
         self.codec = 0;
         self.h264_initialized = false;
         self.outputs.clear();
-        self.surfaces.clear();
         self.frames.clear(self.fd);
         let name = if codec == 3 { "H.264" } else { "VP9" };
         let device = match self.device {
@@ -505,17 +502,6 @@ impl NvDec {
         }
         let tiles = read(mappings, u64::from(registers[0x102]) << 8, length)?;
         let offsets = std::array::from_fn::<_, 4, _>(|i| u64::from(registers[0x10c + i]) << 8);
-        // IOVAs are routinely unmapped, reused and reassigned. The software DPB
-        // follows canonical physical surface identity rather than transient device VAs.
-        let mut references = [0; 4];
-        for (index, address) in offsets.iter().enumerate() {
-            let key = [
-                surface_identity(mappings, *address)?,
-                surface_identity(mappings, u64::from(registers[0x11d + index]) << 8)?,
-            ];
-            let next = self.surfaces.len() as u64 + 1;
-            references[index] = *self.surfaces.entry(key).or_insert(next);
-        }
         let origin = self.next_origin;
         self.next_origin = self
             .next_origin
@@ -539,7 +525,7 @@ impl NvDec {
                 entropy.as_ptr(),
                 tiles.as_ptr(),
                 tiles.len(),
-                references.as_ptr(),
+                offsets.as_ptr(),
                 origin,
             )
         };
@@ -549,12 +535,11 @@ impl NvDec {
                 self.error()
             ));
         }
-        self.receive()?;
-        if self.outputs.contains_key(&origin) {
-            return Err(
-                "NVDEC visible VP9 frame did not produce a surface before completion".into(),
-            );
+        if result == 0 {
+            // A hidden frame updates references but produces no presentation.
+            self.outputs.remove(&origin);
         }
+        self.receive()?;
         Ok(())
     }
     fn execute_h264(&mut self, registers: &[u32], mappings: &Mappings) -> Result<(), String> {

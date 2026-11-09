@@ -31,7 +31,16 @@ public:
         if (target<0 || size_t(target)>data.size()) throw std::runtime_error("VP9 range encoder seek outside stream");
         position=size_t(target);
     }
-    void WriteByte(u8 byte) { if(position==data.size()) data.push_back(byte); else data[position]=byte; ++position; }
+    // VP9's carry writer uses the reference stream's insertion/cursor semantics.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/common/stream.cpp
+    void WriteByte(u8 byte) {
+        if (position == data.size()) {
+            data.push_back(byte);
+            ++position;
+        } else {
+            data.insert(data.begin() + position, byte);
+        }
+    }
     u8 ReadByte() { if(position>=data.size()) throw std::runtime_error("VP9 range encoder read outside stream"); return data[position++]; }
 };
 }
@@ -146,6 +155,14 @@ struct Vp9PictureInfo {
     bool allow_high_precision_mv;
     bool segment_enabled;
     bool mode_ref_delta_enabled;
+    Segmentation segmentation;
+    std::array<u8, 7> seg_tree_probs;
+    std::array<u8, 3> seg_pred_probs;
+};
+
+struct Vp9FrameContainer {
+    Vp9PictureInfo info{};
+    std::vector<u8> bit_stream;
 };
 
 struct PictureInfo {
@@ -206,6 +223,9 @@ struct PictureInfo {
             .allow_high_precision_mv = allow_high_precision_mv != 0,
             .segment_enabled = segmentation.enabled != 0,
             .mode_ref_delta_enabled = loop_filter.mode_ref_delta_enabled != 0,
+            .segmentation = segmentation,
+            .seg_tree_probs{},
+            .seg_pred_probs{},
         };
     }
 };
@@ -252,7 +272,7 @@ struct EntropyProbs {
     INSERT_PADDING_BYTES_NOINIT(17);                   ///< 0x058F
     std::array<u8, 2304> coef_probs;                   ///< 0x05A0
 
-    void Convert(Vp9EntropyProbs& fc) {
+    void Convert(Vp9EntropyProbs& fc) const {
         fc.inter_mode_prob = inter_mode_prob;
         fc.intra_inter_prob = intra_inter_prob;
         fc.tx_8x8_prob = tx_8x8_prob;

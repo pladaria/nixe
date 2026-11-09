@@ -50,6 +50,8 @@ pub(crate) fn format(value: F) -> vk::Format {
         F::Bc3RgbaSrgb => vk::Format::BC3_SRGB_BLOCK,
         F::Bc7RgbaUnorm => vk::Format::BC7_UNORM_BLOCK,
         F::Bc7RgbaSrgb => vk::Format::BC7_SRGB_BLOCK,
+        F::Bc6hRgbUfloat => vk::Format::BC6H_UFLOAT_BLOCK,
+        F::Bc6hRgbSfloat => vk::Format::BC6H_SFLOAT_BLOCK,
         F::R16Float => vk::Format::R16_SFLOAT,
         F::Rg16Float => vk::Format::R16G16_SFLOAT,
         F::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,

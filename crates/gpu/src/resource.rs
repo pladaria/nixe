@@ -242,6 +242,10 @@ pub enum ImageFormat {
     Rg32Sint,
     Rgba32Uint,
     Rgba32Sint,
+    /// BC6H/BPTC RGB half-float blocks: 16 bytes for 4x4 texels.
+    /// https://registry.khronos.org/OpenGL/extensions/ARB/ARB_texture_compression_bptc.txt
+    Bc6hRgbUfloat,
+    Bc6hRgbSfloat,
 }
 
 impl ImageFormat {
@@ -275,7 +279,9 @@ impl ImageFormat {
             | Self::Bc3RgbaUnorm
             | Self::Bc3RgbaSrgb
             | Self::Bc7RgbaUnorm
-            | Self::Bc7RgbaSrgb => [4, 4],
+            | Self::Bc7RgbaSrgb
+            | Self::Bc6hRgbUfloat
+            | Self::Bc6hRgbSfloat => [4, 4],
             Self::Astc4x4Unorm | Self::Astc4x4Srgb => [4, 4],
             Self::Astc5x4Unorm | Self::Astc5x4Srgb => [5, 4],
             Self::Astc5x5Unorm | Self::Astc5x5Srgb => [5, 5],
@@ -312,7 +318,9 @@ impl ImageFormat {
             | Self::Bc3RgbaUnorm
             | Self::Bc3RgbaSrgb
             | Self::Bc7RgbaUnorm
-            | Self::Bc7RgbaSrgb => Some(16),
+            | Self::Bc7RgbaSrgb
+            | Self::Bc6hRgbUfloat
+            | Self::Bc6hRgbSfloat => Some(16),
             format if format.astc_profile().is_some() => Some(16),
             _ => self.plane_bytes_per_texel(plane),
         }
@@ -398,6 +406,8 @@ impl ImageFormat {
             | Self::Bc3RgbaSrgb
             | Self::Bc7RgbaUnorm
             | Self::Bc7RgbaSrgb
+            | Self::Bc6hRgbUfloat
+            | Self::Bc6hRgbSfloat
             | Self::Astc4x4Unorm
             | Self::Astc4x4Srgb
             | Self::Astc5x4Unorm

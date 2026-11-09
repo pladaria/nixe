@@ -31,17 +31,6 @@ impl Residency<'_> {
             .as_ref()
             .and_then(|s| s.native.clone())
     }
-    fn access_guest_buffer(
-        &mut self,
-        range: BufferRange,
-        scope: AccessScope,
-    ) -> Result<(), VulkanError> {
-        if scope.writes() {
-            self.prepare_write(Resource::Buffer(range.buffer), range.offset, range.size)?;
-        }
-        self.use_buffer(range.buffer, range.offset, range.size)?;
-        Ok(())
-    }
     pub(crate) fn begin_guest_descriptors(
         &mut self,
         pipeline: &NativePipeline,
@@ -166,7 +155,6 @@ impl Residency<'_> {
         }
         if STORAGE {
             for slot in &resources.storage {
-                let scope = pipeline.resources[slot.descriptor];
                 match self.guest_storage(STAGE, slot) {
                     Some(StorageBufferBinding::Buffer(range)) => {
                         let limits = &self.runtime.device.profile().limits;
@@ -180,7 +168,7 @@ impl Residency<'_> {
                                 "guest storage descriptor exceeds host size/alignment support",
                             ));
                         }
-                        self.access_guest_buffer(range, scope)?;
+                        self.use_buffer(range.buffer, range.offset, range.size)?;
                         self.runtime.descriptor_queue.write(
                             slot.descriptor,
                             DescriptorEntry {
@@ -194,7 +182,7 @@ impl Residency<'_> {
                     Some(StorageBufferBinding::MultiRange(binding)) => {
                         if binding.sparse {
                             for &source in binding.sources.iter() {
-                                self.access_guest_buffer(source, scope)?;
+                                self.use_buffer(source.buffer, source.offset, source.size)?;
                             }
                         }
                         self.runtime.descriptor_queue.write(
@@ -223,22 +211,27 @@ impl Residency<'_> {
             }
         }
         for image in images {
-            let id = self.texture_cache.views[image.view].image;
-            let scope = pipeline.resources[image.descriptor];
-            let layout = vk::ImageLayout::GENERAL;
-            if scope.writes() {
-                // Eden marks a written image descriptor once, independently of
-                // the view's number of native planes.
-                // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/pipeline_helper.h#L381-L390
-                self.mark_image_modified(id)?;
-            }
-            self.shader_image(id)?;
+            let native = if let Some(view) = image.view {
+                let id = self.texture_cache.views[view].image;
+                let scope = pipeline.resources[image.descriptor];
+                if scope.writes() {
+                    self.mark_image_modified(id)?;
+                }
+                self.shader_image(id)?;
+                self.texture_cache.views[view].native.handle
+            } else if self.runtime.device.profile().null_descriptor {
+                vk::ImageView::null()
+            } else {
+                return Err(VulkanError::InvalidResource(
+                    "null guest image requires nullDescriptor support",
+                ));
+            };
             self.runtime.descriptor_queue.write(
                 image.descriptor,
                 DescriptorEntry {
                     image: vk::DescriptorImageInfo::default()
-                        .image_view(self.texture_cache.views[image.view].native.handle)
-                        .image_layout(layout)
+                        .image_view(native)
+                        .image_layout(vk::ImageLayout::GENERAL)
                         .sampler(image.sampler.unwrap_or(vk::Sampler::null())),
                 },
             );

@@ -14,6 +14,8 @@ pub use hwopus::{OpusDecoderSession, OpusManagerSession};
 mod play_report;
 pub use play_report::PlayReportSession;
 mod bcat;
+mod nim;
+pub use nim::NimSession;
 mod nfp;
 pub use nfp::NfpSession;
 mod bsd;

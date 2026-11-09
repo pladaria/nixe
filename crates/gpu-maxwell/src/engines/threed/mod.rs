@@ -14,6 +14,7 @@ pub(in crate::engines) mod registers;
 mod render_enable;
 mod render_targets;
 mod resource;
+pub use resource::texture::texture_address;
 mod shader_execution;
 pub mod state;
 pub(super) use registers::embedded_words;

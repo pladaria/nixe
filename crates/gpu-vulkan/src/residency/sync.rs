@@ -116,6 +116,7 @@ impl Residency<'_> {
     /// Pixel output is excluded, while fragment storage writes remain ordered.
     /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L955-L975
     pub(crate) fn order_device(&mut self) -> Result<(), VulkanError> {
+        self.sync_query_values()?;
         self.runtime.barriers.emit(&mut self.runtime.device)?;
         let mut stages = vk::PipelineStageFlags::DRAW_INDIRECT
             | vk::PipelineStageFlags::VERTEX_INPUT
@@ -138,36 +139,6 @@ impl Residency<'_> {
         self.buffer_cache.accumulate_flushes();
         Ok(())
     }
-    pub(super) fn materialize_buffer_literals(
-        &mut self,
-        id: BufferId,
-        offset: u64,
-        size: u64,
-    ) -> Result<(), VulkanError> {
-        // Logical completion effects retain an exact literal and producer
-        // ticket. First physical use materializes the literal in queue order;
-        // subsequent partial writers therefore preserve the remaining bytes.
-        // Clear the flag before upload_buffer re-enters use_buffer.
-        let pending: Vec<_> = self.buffer_cache.buffers[id]
-            .known
-            .iter_mut()
-            .filter_map(|known| {
-                if !known.pending_upload
-                    || known.offset >= offset + size
-                    || known.offset + known.bytes.len() as u64 <= offset
-                {
-                    return None;
-                }
-                known.pending_upload = false;
-                Some((known.offset, Arc::clone(&known.bytes)))
-            })
-            .collect();
-        for (offset, bytes) in pending {
-            self.upload_buffer(id, offset, &bytes)?;
-        }
-        Ok(())
-    }
-
     pub(super) fn use_buffer(
         &mut self,
         id: BufferId,
@@ -175,7 +146,6 @@ impl Residency<'_> {
         size: u64,
     ) -> Result<vk::Buffer, VulkanError> {
         self.check_buffer_range(id, offset, size)?;
-        self.materialize_buffer_literals(id, offset, size)?;
         let work = self.runtime.device.current_work();
         let entry = &mut self.buffer_cache.buffers[id];
         let handle = entry.native.handle;

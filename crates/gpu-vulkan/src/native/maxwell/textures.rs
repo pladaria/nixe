@@ -18,6 +18,7 @@ pub(in crate::native) struct ShaderTexture {
     pub(in crate::native) dimension: Dimension,
     pub(in crate::native) descriptor: usize,
     pub(in crate::native) sampler: Option<u32>,
+    pub(in crate::native) storage_format: Option<nixe_shader_recompiler::types::ImageFormat>,
 }
 
 fn failed(error: impl Display) -> VulkanError {
@@ -101,6 +102,12 @@ impl super::super::NativeExecution<'_> {
                     texture.dimension,
                     texture.index,
                 )?;
+                let view = if let Some(format) = texture.storage_format {
+                    view.map(|view| self.residency.storage_image_view(view, format))
+                        .transpose()?
+                } else {
+                    view
+                };
                 let sampler = texture
                     .sampler
                     .map(|index| self.sampler_for_view(compute, index, view))
@@ -134,7 +141,7 @@ impl super::super::NativeExecution<'_> {
         reference: MaxwellThreeDTextureReference,
         required: Dimension,
         index: u32,
-    ) -> Result<ImageViewId, VulkanError> {
+    ) -> Result<Option<ImageViewId>, VulkanError> {
         let bank = usize::from(compute);
         let table = &self
             .residency
@@ -146,13 +153,38 @@ impl super::super::NativeExecution<'_> {
             "shader consumes an unprogrammed TIC table",
         ))?;
         if index > table.maximum {
-            return Err(failed(format_args!(
-                "TIC index {index} exceeds programmed maximum {}",
-                table.maximum
-            )));
+            return Ok(None);
         }
         let bytes = Self::read_texture_descriptor(space, base + u64::from(index) * 32)?;
-        let words4 = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        let words = std::array::from_fn(|i| {
+            u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+        });
+        let address = model::engines::threed::texture_address(words);
+        // VisitImageView tests IsValidEntry before interpreting image geometry.
+        // Null selections still retain their descriptor bytes in the channel.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L540-L569
+        if address == 0 || address >= 1 << 40 {
+            let table = &mut self
+                .residency
+                .texture_cache
+                .bindings
+                .channel
+                .image_descriptors[bank];
+            if table.entries.len() <= index as usize {
+                table.entries.resize_with(index as usize + 1, || None);
+            }
+            if table.entries[index as usize]
+                .as_ref()
+                .is_none_or(|entry| entry.raw.bytes != bytes)
+            {
+                table.entries[index as usize] = Some(ImageDescriptor {
+                    views: [None; 2],
+                    raw: TextureEntry { bytes, info: None },
+                });
+            }
+            return Ok(None);
+        }
+        let words4 = words[4];
         let kind = (words4 >> 23) & 15;
         let dimension = match kind {
             0 => Dimension::One,
@@ -182,9 +214,11 @@ impl super::super::NativeExecution<'_> {
                     | (Dimension::CubeArray, Dimension::Cube)
             );
         if !compatible {
-            return Err(failed(format_args!(
-                "TIC index {index}: storage {dimension:?} incompatible with shader {required:?}"
-            )));
+            // ImageView::Handle selects the shader's dimension. A TIC has
+            // native views only for its own dimensional family; other slots
+            // remain null, including a 3D TIC selected by a 2D shader binding.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.h#L457-L459
+            return Ok(None);
         }
         let arrayed = matches!(
             required,
@@ -213,7 +247,7 @@ impl super::super::NativeExecution<'_> {
                 .as_mut()
                 .unwrap();
             if let Some(view) = entry.views[view_kind] {
-                return self.prepare_shader_texture_view(view);
+                return self.prepare_shader_texture_view(view).map(Some);
             }
         }
         if !current {
@@ -232,7 +266,10 @@ impl super::super::NativeExecution<'_> {
             }
             table.entries[index as usize] = Some(ImageDescriptor {
                 views: [None; 2],
-                raw: TextureEntry { bytes, info },
+                raw: TextureEntry {
+                    bytes,
+                    info: Some(info),
+                },
             });
         }
         let info = self
@@ -246,6 +283,8 @@ impl super::super::NativeExecution<'_> {
             .unwrap()
             .raw
             .info
+            .as_ref()
+            .unwrap()
             .clone();
         let (image, base) = self.find_or_insert_image(&info, space)?;
         let view = self.sampled_view(image, info.description, info.swizzle, base, arrayed)?;
@@ -258,7 +297,7 @@ impl super::super::NativeExecution<'_> {
             .as_mut()
             .unwrap()
             .views[view_kind] = Some(view);
-        self.prepare_shader_texture_view(view)
+        self.prepare_shader_texture_view(view).map(Some)
     }
     pub(in crate::native) fn shader_sampler(
         &mut self,
@@ -319,7 +358,7 @@ impl super::super::NativeExecution<'_> {
         &mut self,
         compute: bool,
         index: u32,
-        view: ImageViewId,
+        view: Option<ImageViewId>,
     ) -> Result<vk::Sampler, VulkanError> {
         // Sampler::MakeKey / HandleFor in Eden drops min/max reduction for
         // views whose native format cannot filter it. Keep both variants in
@@ -338,7 +377,9 @@ impl super::super::NativeExecution<'_> {
         let mut description = entry.description;
         let drop_reduction = description.reduction != nixe_gpu::SamplerReduction::WeightedAverage
             && (!self.residency.device().profile().sampler_filter_minmax
-                || !self.residency.texture_cache.views[view].supports_minmax_filter);
+                || view.is_none_or(|view| {
+                    !self.residency.texture_cache.views[view].supports_minmax_filter
+                }));
         let variant = usize::from(drop_reduction);
         if let Some(native) = entry.variants[variant] {
             return Ok(native);

@@ -3,6 +3,12 @@
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/image_info.cpp
 use super::*;
 
+/// Raw TIC addresses have sixteen high bits; the GPU VA space uses forty.
+/// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/util.cpp#L830-L846
+pub fn texture_address(words: [u32; 8]) -> u64 {
+    u64::from(words[1]) | (u64::from(words[2] & 0xffff) << 32)
+}
+
 pub fn sampled_image_info(
     texture_reference: MaxwellThreeDTextureReference,
     required_dimension: MaxwellThreeDTextureDimension,
@@ -193,7 +199,7 @@ pub fn sampled_image_info(
         SampleCount::One,
     )
     .map_err(|_| MaxwellThreeDResourceError::ContradictoryState { role })?;
-    let address = u64::from(words[1]) | (u64::from(words[2] & 0xffff) << 32);
+    let address = texture_address(words);
     let [block_width, block_height] = format.block_extent();
     let bytes_per_block = format
         .plane_bytes_per_block(0)

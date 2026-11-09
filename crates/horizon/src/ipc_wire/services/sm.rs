@@ -59,6 +59,7 @@ enum ServiceKind {
     Friends,
     Bcat,
     Nfp,
+    Nim,
     Ngc,
     SharedFont,
     Irs,
@@ -91,6 +92,7 @@ impl ServiceKind {
             b"friend:u" => Some(Self::Friends),
             b"bcat:u" => Some(Self::Bcat),
             b"nfp:user" => Some(Self::Nfp),
+            b"nim:eca" => Some(Self::Nim),
             b"ngc:u" => Some(Self::Ngc),
             b"pl:u" => Some(Self::SharedFont),
             b"irs" => Some(Self::Irs),
@@ -251,6 +253,7 @@ fn connect_service(
         )),
         ServiceKind::Bsd => process.return_service(HorizonIpcObject::Bsd(manager.bsd_session())),
         ServiceKind::Ssl => process.return_service(HorizonIpcObject::Ssl(SslSession::new())),
+        ServiceKind::Nim => process.return_service(HorizonIpcObject::Nim(crate::NimSession::new())),
         ServiceKind::Nfp => process.return_service(HorizonIpcObject::Nfp(crate::NfpSession::new())),
         ServiceKind::Ngc => {
             process.return_service(HorizonIpcObject::Ngc(crate::object::NgcSession::default()))

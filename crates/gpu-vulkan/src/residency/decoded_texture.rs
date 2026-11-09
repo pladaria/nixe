@@ -22,6 +22,8 @@ fn codec(format: vk::Format) -> Option<ImageFormat> {
         vk::Format::BC5_SNORM_BLOCK => Bc5RgSnorm,
         vk::Format::BC7_UNORM_BLOCK => Bc7RgbaUnorm,
         vk::Format::BC7_SRGB_BLOCK => Bc7RgbaSrgb,
+        vk::Format::BC6H_UFLOAT_BLOCK => Bc6hRgbUfloat,
+        vk::Format::BC6H_SFLOAT_BLOCK => Bc6hRgbSfloat,
         vk::Format::ASTC_4X4_UNORM_BLOCK => Astc4x4Unorm,
         vk::Format::ASTC_4X4_SRGB_BLOCK => Astc4x4Srgb,
         vk::Format::ASTC_5X4_UNORM_BLOCK => Astc5x4Unorm,
@@ -62,6 +64,9 @@ fn decoded_format(format: ImageFormat) -> (vk::Format, u32) {
         };
     }
     match format {
+        ImageFormat::Bc6hRgbUfloat | ImageFormat::Bc6hRgbSfloat => {
+            (vk::Format::R16G16B16A16_SFLOAT, 8)
+        }
         ImageFormat::Bc4RUnorm | ImageFormat::Bc4RSnorm => (vk::Format::R16_SFLOAT, 2),
         ImageFormat::Bc5RgUnorm | ImageFormat::Bc5RgSnorm => (vk::Format::R16G16_SFLOAT, 4),
         ImageFormat::Bc1RgbSrgb

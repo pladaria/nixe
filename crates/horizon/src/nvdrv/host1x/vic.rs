@@ -277,6 +277,7 @@ unsafe fn rgba4(
 unsafe fn convert_opaque_nv12_sse41(
     bytes: &mut [u8],
     output: &Surface,
+    extent: [usize; 2],
     input: &Surface,
     chroma: &Surface,
     luma: &[u8],
@@ -293,12 +294,12 @@ unsafe fn convert_opaque_nv12_sse41(
     // Keep the complete raster loop inside the feature-enabled function. Calling
     // a target_feature function separately for every four pixels prevents normal
     // inlining/loop-invariant hoisting across the target-feature boundary.
-    for y in 0..output.height {
+    for y in 0..extent[1] {
         let sy = top + y;
         let luma = &luma[sy * input.pitch..];
         let uv = &uv[(sy / 2) * chroma.pitch..];
-        for x0 in (0..output.width).step_by(4) {
-            let count = (output.width - x0).min(4);
+        for x0 in (0..extent[0]).step_by(4) {
+            let count = (extent[0] - x0).min(4);
             let mut packed = [0; 16];
             if count == 4 {
                 // SAFETY: this whole function requires SSE4.1; validated surface
@@ -329,6 +330,7 @@ unsafe fn convert_opaque_nv12_sse41(
 #[allow(clippy::too_many_arguments)]
 fn write_opaque_nv12(
     output: &Surface,
+    extent: [usize; 2],
     input: &Surface,
     chroma: &Surface,
     luma: &[u8],
@@ -337,6 +339,7 @@ fn write_opaque_nv12(
     minimum: i64,
     maximum: i64,
     alpha: u8,
+    background: [u8; 4],
     left: usize,
     top: usize,
     mappings: &Mappings,
@@ -347,24 +350,31 @@ fn write_opaque_nv12(
     let simd = std::is_x86_feature_detected!("sse4.1");
     let (backing, offset) = region(mappings, address, output.length())?;
     let mut bytes = vec![0; output.length()];
+    for y in 0..output.height {
+        let start = if y < extent[1] { extent[0] } else { 0 };
+        for x in start..output.width {
+            let at = output.offset(x * 4, y);
+            bytes[at..at + 4].copy_from_slice(&background);
+        }
+    }
 
     #[cfg(target_arch = "x86_64")]
     if simd {
         // SAFETY: the runtime feature check covers the complete raster loop.
         unsafe {
             convert_opaque_nv12_sse41(
-                &mut bytes, output, input, chroma, luma, uv, color, minimum, maximum, alpha, left,
-                top,
+                &mut bytes, output, extent, input, chroma, luma, uv, color, minimum, maximum,
+                alpha, left, top,
             );
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
     let simd = false;
     if !simd {
-        for y in 0..output.height {
+        for y in 0..extent[1] {
             let sy = top + y;
-            for x0 in (0..output.width).step_by(4) {
-                let count = (output.width - x0).min(4);
+            for x0 in (0..extent[0]).step_by(4) {
+                let count = (extent[0] - x0).min(4);
                 let mut packed = [0; 16];
                 for i in 0..count {
                     let sx = left + x0 + i;
@@ -415,8 +425,11 @@ fn source_planes<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_plane(
     output: &Surface,
+    extent: [usize; 2],
+    background: [u8; 2],
     source: &[u8],
     pitch: usize,
     origin: [usize; 2],
@@ -426,15 +439,26 @@ fn write_plane(
     let (backing, offset) = region(mappings, address, output.length())?;
     let mut bytes = vec![0; output.length()];
     for y in 0..output.height {
-        let start = (origin[1] + y) * pitch + origin[0];
-        let row = source
-            .get(start..start + output.width)
-            .ok_or("VIC copy exceeds decoded plane")?;
+        let visible = if y < extent[1] { extent[0] } else { 0 };
+        let source_row = if visible != 0 {
+            let start = (origin[1] + y) * pitch + origin[0];
+            source
+                .get(start..start + visible)
+                .ok_or("VIC copy exceeds decoded plane")?
+        } else {
+            &[]
+        };
         let run = if output.kind == 0 { output.width } else { 16 };
         for x in (0..output.width).step_by(run) {
             let count = (output.width - x).min(run);
             let target = output.offset(x, y);
-            bytes[target..target + count].copy_from_slice(&row[x..x + count]);
+            let copied = visible.saturating_sub(x).min(count);
+            if copied != 0 {
+                bytes[target..target + copied].copy_from_slice(&source_row[x..x + copied]);
+            }
+            for i in copied..count {
+                bytes[target + i] = background[(x + i) % 2];
+            }
         }
     }
     write_spans(backing, offset, &bytes, output.written_spans(1))
@@ -572,14 +596,6 @@ impl Vic {
             {
                 return Err("VIC scaling/subpixel rectangles are not implemented".into());
             }
-            if right / 65536 >= input.width || bottom / 65536 >= input.height {
-                return Err("VIC source rectangle exceeds surface".into());
-            }
-            if let Some(frame) = &frame
-                && (right / 65536 >= frame.width || bottom / 65536 >= frame.height)
-            {
-                return Err("VIC source rectangle exceeds decoded frame".into());
-            }
             let color = Matrix::decode(&state[0x60..0x80]);
             let gamut = Matrix::decode(&state[0x80..0xa0]);
             let minimum = bits(controls, 0, 10) as i64;
@@ -603,14 +619,33 @@ impl Vic {
                 factors >> 8 & 7,
                 factors >> 12 & 7,
             ];
+            // ReadProgressive clips the decoded frame to the configured slot;
+            // Blend then clips the consumed work to the output rectangle.
+            // Coded surfaces can include padding beyond the visible frame.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/host1x/vic.cpp#L172-L180
+            let source_width = frame
+                .as_ref()
+                .map_or(input.width, |f| input.width.min(f.width));
+            let source_height = frame
+                .as_ref()
+                .map_or(input.height, |f| input.height.min(f.height));
+            if left / 65536 >= source_width || top / 65536 >= source_height {
+                continue;
+            }
             let x0 = dl.max(target_left);
-            let x1 = dr.min(target_right).min(output.width - 1);
+            let x1 = dr
+                .min(target_right)
+                .min(output.width - 1)
+                .min(dl + source_width - 1 - left / 65536);
             let y0 = dt.max(target_top);
-            let y1 = db.min(target_bottom).min(output.height - 1);
+            let y1 = db
+                .min(target_bottom)
+                .min(output.height - 1)
+                .min(dt + source_height - 1 - top / 65536);
             if x0 > x1 || y0 > y1 {
                 continue;
             }
-            // A single full-surface opaque NV12 slot does not need a compositor
+            // A single opaque NV12 slot does not need a compositor
             // framebuffer, alpha array, blend divides or a second full-pixel pass.
             // Select this from actual VIC state; matrices, clamp, format, source
             // crop and alpha still have their exact guest-defined semantics.
@@ -620,11 +655,11 @@ impl Vic {
                 && !final_matrix.enabled
                 && x0 == 0
                 && y0 == 0
-                && x1 + 1 == output.width
-                && y1 + 1 == output.height
                 && factor(selectors[0], k1, k2, source_alpha, background[3], 0)? == 1023
                 && dst_factor(selectors[1], k1, k2, source_alpha, background[3], 0)? == 0
             {
+                let extent = [x1 + 1, y1 + 1];
+                let full_surface = extent == [output.width, output.height];
                 if nv12_output
                     && color.is_identity()
                     && minimum == 0
@@ -656,7 +691,27 @@ impl Vic {
                         } else {
                             [x / 2 * 2, y / 2]
                         };
-                        write_plane(plane, source, pitch, origin, mappings, address)?;
+                        let plane_extent = if index == 0 {
+                            extent
+                        } else {
+                            [extent[0].div_ceil(2) * 2, extent[1].div_ceil(2)]
+                        };
+                        let background = if index == 0 {
+                            [background[0]; 2]
+                        } else {
+                            [background[1], background[2]]
+                        }
+                        .map(|v| (v.clamp(0, 1023) >> 2) as u8);
+                        write_plane(
+                            plane,
+                            plane_extent,
+                            background,
+                            source,
+                            pitch,
+                            origin,
+                            mappings,
+                            address,
+                        )?;
                     }
                     return Ok(());
                 }
@@ -681,7 +736,10 @@ impl Vic {
                         _ => unreachable!(),
                     }
                 };
-                if !nv12_output && let (Some(gpu), Some(frame)) = (gpu, frame) {
+                if !nv12_output
+                    && full_surface
+                    && let (Some(gpu), Some(frame)) = (gpu, frame)
+                {
                     let format = if matches!(output.format, 32 | 36) {
                         nixe_gpu::ImageFormat::Bgra8Unorm
                     } else {
@@ -710,8 +768,22 @@ impl Vic {
                 if !nv12_output {
                     let [luma, uv] =
                         source_planes(frame, &mut input, &mut chroma, mappings, source_address)?;
+                    let mut uncovered = background.map(|v| (v.clamp(0, 1023) >> 2) as u8);
+                    uncovered[3] = match alpha_mode {
+                        0 => 255,
+                        1 | 2 | 4 => uncovered[3],
+                        3 | 5 => 0,
+                        _ => unreachable!(),
+                    };
+                    if matches!(output.format, 35 | 36) {
+                        uncovered[3] = 255;
+                    }
+                    if matches!(output.format, 32 | 36) {
+                        uncovered.swap(0, 2);
+                    }
                     write_opaque_nv12(
                         &output,
+                        extent,
                         &input,
                         &chroma,
                         &luma,
@@ -720,6 +792,7 @@ impl Vic {
                         minimum,
                         maximum,
                         (final_alpha.clamp(0, 1023) >> 2) as u8,
+                        uncovered,
                         left / 65536 + x0 - dl,
                         top / 65536 + y0 - dt,
                         mappings,

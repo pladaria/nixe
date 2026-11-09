@@ -7,6 +7,7 @@ mod buffer_download;
 pub(crate) mod cache_owners;
 mod multi_range;
 mod quad_indices;
+pub(crate) mod query;
 mod virtual_range_cache;
 use cache_owners::{BufferCache, CacheOwners, TextureCache};
 pub(crate) mod commands;
@@ -63,6 +64,7 @@ pub(crate) struct ImageView {
     pub(crate) description: ImageViewDescription,
     pub(crate) native: Arc<crate::AllocatedImageView>,
     pub(crate) supports_minmax_filter: bool,
+    storage_views: [Option<ImageViewId>; 8],
     downloaded: bool,
 }
 mod attachment;
@@ -78,18 +80,8 @@ struct Contents {
     last_use: Option<WorkTicket>,
     touched: u64,
 }
-struct KnownBufferBytes {
-    offset: u64,
-    bytes: Arc<[u8]>,
-    /// A completion effect needs no physical transfer until a GPU access.
-    pending_upload: bool,
-}
 struct BufferEntry {
     invalid: RangeSet,
-    /// Immutable host-authored payload, valid until another native producer.
-    /// CPU publication follows the committed CPU-copy prefix independently
-    /// from GPU-only resource use and its physical queue tick.
-    known: Vec<KnownBufferBytes>,
     growth: u32,
     sparse_compatible: bool,
     write_tick: u64,
@@ -236,6 +228,7 @@ pub struct VulkanResidency {
 /// stay locked while preparation selects resources and records their native use.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L236-L258
 pub struct Residency<'a> {
+    caches: &'a Arc<CacheOwners>,
     pub(crate) shader_cache: &'a nixe_gpu_maxwell::recompiler::ShaderCache,
     pub(crate) buffer_cache: std::sync::MutexGuard<'a, BufferCache>,
     pub(crate) texture_cache: std::sync::MutexGuard<'a, TextureCache>,
@@ -277,6 +270,7 @@ impl VulkanResidency {
 
     pub fn access(&mut self) -> Residency<'_> {
         Residency {
+            caches: &self.caches,
             shader_cache: &self.caches.shader_cache,
             buffer_cache: self.caches.buffer_cache.lock().unwrap(),
             texture_cache: self.caches.texture_cache.lock().unwrap(),
@@ -367,8 +361,14 @@ impl VulkanResidency {
         let mut statistics = self.runtime.statistics;
         statistics.native_readback_bytes +=
             buffer.native_readback_bytes + texture.native_readback_bytes;
-        statistics.canonical_readback_bytes +=
-            buffer.canonical_readback_bytes + texture.canonical_readback_bytes;
+        statistics.canonical_readback_bytes += buffer.canonical_readback_bytes
+            + texture.canonical_readback_bytes
+            + self
+                .caches
+                .query_cache
+                .lock()
+                .unwrap()
+                .canonical_readback_bytes;
         statistics
     }
 }
@@ -383,6 +383,11 @@ impl Residency<'_> {
                 self.buffer_cache.write_memory(range.address, range.size);
             }
             self.texture_cache.write_memory(range.address, range.size);
+            self.caches
+                .query_cache
+                .lock()
+                .unwrap()
+                .invalidate_region(range.address, range.size);
         }
         Ok(())
     }
@@ -400,7 +405,13 @@ impl Residency<'_> {
         statistics.native_readback_bytes +=
             self.buffer_cache.native_readback_bytes + self.texture_cache.native_readback_bytes;
         statistics.canonical_readback_bytes += self.buffer_cache.canonical_readback_bytes
-            + self.texture_cache.canonical_readback_bytes;
+            + self.texture_cache.canonical_readback_bytes
+            + self
+                .caches
+                .query_cache
+                .lock()
+                .unwrap()
+                .canonical_readback_bytes;
         statistics
     }
     pub fn allocated_bytes(&self) -> u64 {
@@ -574,36 +585,6 @@ impl Residency<'_> {
             |bytes| self.charge(bytes),
         )
     }
-    fn prepare_write(
-        &mut self,
-        resource: Resource,
-        offset: u64,
-        bytes: u64,
-    ) -> Result<(), VulkanError> {
-        let Resource::Buffer(id) = resource else {
-            return Err(VulkanError::InvalidResource(
-                "linear write requires a buffer",
-            ));
-        };
-        self.check_buffer_range(id, offset, bytes)?;
-        // Whole literal overwrites can discard their pending upload. Partial
-        // overwrites first preserve the untouched bytes in native storage.
-        let partial = self.buffer_cache.get(id).known.iter().any(|literal| {
-            let end = literal.offset + literal.bytes.len() as u64;
-            literal.pending_upload
-                && literal.offset < offset + bytes
-                && offset < end
-                && !(offset <= literal.offset && offset + bytes >= end)
-        });
-        if partial {
-            self.use_buffer(id, offset, bytes)?;
-        }
-        self.buffer_cache.buffers[id].known.retain(|literal| {
-            literal.offset >= offset + bytes
-                || literal.offset + literal.bytes.len() as u64 <= offset
-        });
-        Ok(())
-    }
     fn finish_buffer_write(
         &mut self,
         id: BufferId,
@@ -630,7 +611,6 @@ impl Residency<'_> {
         if self.buffer_cache.get(id).device_address.is_some() {
             self.ensure_buffer_range(id, offset, size)?;
         }
-        self.prepare_write(Resource::Buffer(id), offset, size)?;
         let slice = self
             .runtime
             .device
@@ -658,7 +638,6 @@ impl Residency<'_> {
         )?;
         let size = if short { 4 } else { 16 };
         self.ensure_buffer_range(range.buffer, range.offset, size)?;
-        self.prepare_write(Resource::Buffer(range.buffer), range.offset, size)?;
         let output = self.use_buffer(range.buffer, range.offset, size)?;
         self.runtime.barriers.emit(&mut self.runtime.device)?;
         let source = self.runtime.device.sample_report_buffer()?;
@@ -676,33 +655,6 @@ impl Residency<'_> {
         if !short {
             self.write_buffer(range.buffer, range.offset + 8, &timestamp.to_le_bytes())?;
         }
-        Ok(())
-    }
-    pub(crate) fn report_memory(
-        &mut self,
-        target: Vec<nixe_memory::AllocationRange>,
-        offset: u64,
-        bytes: &Arc<[u8]>,
-    ) -> Result<(), VulkanError> {
-        let target = nixe_memory::capture_subrange(&target, offset, bytes.len() as u64)?;
-        let mapping = PhysicalMapping::new(&target)?;
-        let id = self.buffer_for_deferred_import(
-            mapping,
-            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-        )?;
-        self.ensure_buffer_range(id.buffer, id.offset, id.size)?;
-        self.prepare_write(Resource::Buffer(id.buffer), id.offset, id.size)?;
-        self.finish_buffer_write(id.buffer, id.offset, id.size)?;
-        self.buffer_cache.buffers[id.buffer]
-            .known
-            .push(KnownBufferBytes {
-                offset: id.offset,
-                bytes: Arc::clone(bytes),
-                pending_upload: true,
-            });
-        // Query reports accumulate until a real fence commits the producing
-        // prefix. They must not create a submission/completion per timestamp.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/fence_manager.h
         Ok(())
     }
     pub fn flush(&mut self) -> Result<WorkTicket, VulkanError> {

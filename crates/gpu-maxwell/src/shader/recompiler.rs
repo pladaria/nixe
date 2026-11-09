@@ -227,12 +227,16 @@ impl Environment for CaptureEnvironment<'_, '_> {
         texture::texture_type(self.texture(handle)?)
     }
     fn read_texture_pixel_format(&mut self, handle: TextureHandle) -> Result<TexturePixelFormat> {
-        texture::pixel_format(self.texture(handle)?)
+        let words = self.texture(handle)?;
+        texture::pixel_format(words).map_err(|error| {
+            invalid(format!(
+                "{error}; handle={:#x}, pool={:?}, TIC={words:08x?}",
+                handle.0, self.bindings.texture_pool
+            ))
+        })
     }
     fn is_texture_pixel_format_integer(&mut self, handle: TextureHandle) -> Result<bool> {
-        Ok(texture::is_integer(texture::pixel_format(
-            self.texture(handle)?,
-        )?))
+        Ok(texture::is_integer(self.read_texture_pixel_format(handle)?))
     }
     fn read_viewport_transform_state(&mut self) -> Result<u32> {
         if self.metadata.stage == Stage::Compute {

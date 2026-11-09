@@ -118,6 +118,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
                 dimension: slot.dimension,
                 descriptor: slot.descriptor,
                 sampler,
+                storage_format: slot.storage_format,
             });
         }
         execution.fill_shader_images(true, space, &textures, images)

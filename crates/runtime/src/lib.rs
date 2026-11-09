@@ -42,7 +42,7 @@ pub use launch_plan::{
     PackagedIdentity, ReadOnlyMount,
 };
 pub use launcher::{LaunchError, LaunchStage, Launcher, LauncherInput};
-pub use machine::{ProcessRegistration, Runtime, RuntimeError};
+pub use machine::{Runtime, RuntimeError};
 pub use module_memory::{InstallStage, ModuleInstallError, install_prepared_module};
 pub use nixe_scheduler::{ProcessLifecycle, ThreadLifecycle};
 pub use nixe_scheduler::{VirtualClock, VirtualClockMode};

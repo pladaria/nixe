@@ -350,6 +350,10 @@ fn decode_sampled_texture_format(
         (0x2f, [7, 7, 7, 7] | [7, 4, 4, 4] | [7, 2, 2, 2], _, false) => {
             Some(ImageFormat::Depth32Float)
         }
+        // BC6H floating-point component types follow Maxwell's TIC table.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/format_lookup_table.cpp#L190-L193
+        (0x10, [7, 7, 7, 7], _, false) => Some(ImageFormat::Bc6hRgbSfloat),
+        (0x11, [7, 7, 7, 7], _, false) => Some(ImageFormat::Bc6hRgbUfloat),
         (0x27, [2, 2, 2, 2], _, false) => Some(ImageFormat::Bc4RUnorm),
         (0x28, [2, 2, 2, 2], _, false) => Some(ImageFormat::Bc5RgUnorm),
         // Component type 1 is SNORM; signed RGTC endpoints are not UNORM.

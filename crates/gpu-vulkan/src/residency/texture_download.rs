@@ -36,7 +36,7 @@ impl Download {
                     .iter()
                     .filter_map(|publication| match publication {
                         Publication::Image(_) => None,
-                        Publication::Buffer(buffer) => buffer.work(),
+                        Publication::Buffer(buffer) => Some(buffer.work()),
                     }),
             )
             .max_by_key(|work| work.tick())

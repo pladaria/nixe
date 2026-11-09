@@ -52,6 +52,7 @@ pub enum HorizonIpcObject {
     Friends(crate::FriendSession),
     Bcat(crate::BcatSession),
     Nfp(crate::NfpSession),
+    Nim(crate::NimSession),
     Ngc(NgcSession),
     SharedFont(crate::SharedFontSession),
     Irs(IrsSession),

@@ -68,6 +68,7 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                     Ok(())
                 }
                 MaxwellHostSynchronizationKind::ReleaseFences => self.host.release_fences(),
+                MaxwellHostSynchronizationKind::SignalReference => self.host.signal_reference(),
                 MaxwellHostSynchronizationKind::IncrementSyncpoint { syncpoint } => {
                     self.increment_syncpoint(source, syncpoint)
                 }

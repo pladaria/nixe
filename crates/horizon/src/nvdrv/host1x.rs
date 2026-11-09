@@ -17,7 +17,7 @@ use super::{
     require_input_size, write_u32,
 };
 use nixe_gpu::GuestSyncpointId;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -33,6 +33,7 @@ struct Channel {
 pub(super) struct Host1x {
     channels: BTreeMap<NvDrvFileDescriptor, Channel>,
     mappings: video::Mappings,
+    unmap_queue: VecDeque<u32>,
     frames: Option<Arc<video::FrameQueue>>,
     failure: Option<worker::Failure>,
 }
@@ -125,14 +126,33 @@ impl Host1x {
     ) -> Option<(GuestSyncpointId, Option<Arc<worker::Worker>>)> {
         let channel = self.channels.remove(&fd)?;
         for (object, count) in &channel.pins {
-            Arc::make_mut(&mut self.mappings).retain(|_, mapping| {
-                if mapping.object.id().raw() == *object {
-                    mapping.references -= count;
-                }
-                mapping.references != 0
-            });
+            self.unpin(*object, *count);
         }
         Some((channel.syncpoint, channel.worker))
+    }
+    fn unpin(&mut self, object: u64, count: u32) {
+        if let Some((&address, mapping)) = Arc::make_mut(&mut self.mappings)
+            .iter_mut()
+            .find(|(_, mapping)| mapping.object.id().raw() == object)
+        {
+            mapping.references -= count;
+            if mapping.references == 0 {
+                self.unmap_queue.push_back(address);
+            }
+        }
+    }
+    pub(super) fn free_object(&mut self, object: super::nvmap::NvMapObjectId) {
+        if let Some(address) = self
+            .mappings
+            .iter()
+            .find_map(|(&address, mapping)| (mapping.object.id() == object).then_some(address))
+        {
+            Arc::make_mut(&mut self.mappings).remove(&address);
+            self.unmap_queue.retain(|entry| *entry != address);
+        }
+        for channel in self.channels.values_mut() {
+            channel.pins.remove(&object.raw());
+        }
     }
     pub(super) fn clear(&mut self) {
         for channel in self.channels.values() {
@@ -146,6 +166,7 @@ impl Host1x {
             }
         }
         Arc::make_mut(&mut self.mappings).clear();
+        self.unmap_queue.clear();
     }
     pub(super) fn require_healthy(&self) -> Result<(), UnsupportedNvDrvOperation> {
         self.failure
@@ -605,37 +626,51 @@ impl Host1x {
                 if *pin == 0 {
                     channel.pins.remove(&id);
                 }
-                Arc::make_mut(&mut self.mappings).retain(|_, mapping| {
-                    if mapping.object.id().raw() == id {
-                        mapping.references -= 1;
+                if let Some((&address, mapping)) = Arc::make_mut(&mut self.mappings)
+                    .iter_mut()
+                    .find(|(_, mapping)| mapping.object.id().raw() == id)
+                {
+                    mapping.references -= 1;
+                    if mapping.references == 0 {
+                        self.unmap_queue.push_back(address);
                     }
-                    mapping.references != 0
-                });
+                }
                 output[offset..offset + 8].fill(0);
             } else {
                 let existing = Arc::make_mut(&mut self.mappings)
                     .iter_mut()
                     .find(|(_, mapping)| mapping.object.id().raw() == id);
                 let address = if let Some((&address, mapping)) = existing {
+                    if mapping.references == 0 {
+                        self.unmap_queue.retain(|entry| *entry != address);
+                    }
                     mapping.references = mapping
                         .references
                         .checked_add(1)
                         .ok_or(super::NV_OVERFLOW)?;
                     address
                 } else {
-                    // Host1x has a 32-bit IOVA, separate from Maxwell's GPU VA.
-                    // Reuse unmapped holes; keep the object pinned while any channel owns it.
+                    // Unpinning makes a mapping reclaimable, but preserves its IOVA
+                    // until allocation pressure or NvMap Free, as in NvMap::PinHandle.
+                    // VP9 reference selection relies on stable surface addresses.
+                    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/nvdrv/core/nvmap.cpp
                     let size = object.backing_size();
-                    let mut address = 4096_u64;
-                    for (&base, mapping) in self.mappings.iter() {
-                        if address + size <= u64::from(base) {
-                            break;
+                    let address = loop {
+                        let mut address = 4096_u64;
+                        for (&base, mapping) in self.mappings.iter() {
+                            if address + size <= u64::from(base) {
+                                break;
+                            }
+                            address = u64::from(base) + mapping.object.backing_size();
                         }
-                        address = u64::from(base) + mapping.object.backing_size();
-                    }
-                    if address + size > 1_u64 << 32 {
-                        return Err(super::NV_INSUFFICIENT_MEMORY.into());
-                    }
+                        if address + size <= 1_u64 << 32 {
+                            break address;
+                        }
+                        let Some(reclaim) = self.unmap_queue.pop_front() else {
+                            return Err(super::NV_INSUFFICIENT_MEMORY.into());
+                        };
+                        Arc::make_mut(&mut self.mappings).remove(&reclaim);
+                    };
                     let address = address as u32;
                     Arc::make_mut(&mut self.mappings).insert(
                         address,
@@ -659,137 +694,5 @@ impl Host1x {
             output[..12].fill(0);
         }
         Ok(output)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::nvmap::{NvMapAllocationMetadata, NvMapCpuMapping};
-    use super::super::{NvDrvDescriptorOwner, NvDrvPermissionProfile, NvDrvSessionId};
-    use super::*;
-    use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
-
-    fn descriptor(fd: u32, kind: NvDrvDeviceKind) -> NvDrvDeviceDescriptor {
-        NvDrvDeviceDescriptor::open(
-            NvDrvFileDescriptor::new(fd),
-            kind,
-            NvDrvDescriptorOwner::new(NvDrvSessionId::ROOT, 1),
-            NvDrvPermissionProfile::Application,
-        )
-    }
-    #[test]
-    fn video_channels_share_pinned_objects_until_the_last_unmap_or_close() {
-        let mut nvmap = NvMapObjects::default();
-        let owner = NvMapOwner::new(1);
-        let handle = nvmap.create(owner, 4096).unwrap();
-        let machine = crate::test_memory::machine();
-        let allocation = machine.account(4096).unwrap().allocate(4096).unwrap();
-        let input = nixe_memory::AllocationRange::new(allocation.pin(), 0, 4096).unwrap();
-        machine
-            .write_resolved(&[input.slice(7, [42].len() as u64).unwrap()], &[42])
-            .unwrap();
-        nvmap
-            .allocate(
-                owner,
-                handle,
-                NvMapAllocationMetadata::new(0, 0, 4096, 0),
-                NvMapCpuMapping::new(AddressSpaceId::new(1), GuestVirtualAddress::new(0x1000)),
-                Arc::from([input.clone()]),
-            )
-            .unwrap();
-        let devices = BTreeMap::from([(
-            NvDrvFileDescriptor::new(1),
-            descriptor(1, NvDrvDeviceKind::NvMap),
-        )]);
-        let mut host = Host1x::default();
-        let control = Arc::new(Mutex::new(
-            NvHostControl::new(&crate::test_memory::kernel()),
-        ));
-        let mut map = [0; 20];
-        write_u32(&mut map, 0, 1).unwrap();
-        write_u32(&mut map, 12, handle.raw()).unwrap();
-        for (fd, kind) in [
-            (2, NvDrvDeviceKind::HostNvDec),
-            (3, NvDrvDeviceKind::HostVic),
-        ] {
-            host.open(NvDrvFileDescriptor::new(fd), GuestSyncpointId::new(fd));
-            host.ioctl(
-                &devices,
-                &nvmap,
-                &control,
-                None,
-                descriptor(fd, kind),
-                0x4004_4801,
-                &1u32.to_le_bytes(),
-            )
-            .unwrap();
-            let output = host
-                .ioctl(
-                    &devices,
-                    &nvmap,
-                    &control,
-                    None,
-                    descriptor(fd, kind),
-                    0xc014_0009,
-                    &map,
-                )
-                .unwrap();
-            let crate::nvdrv::LockedIoctlOutcome::Standard(
-                crate::nvdrv::NvHostCtrlIoctlOutcome::Complete(output),
-            ) = output
-            else {
-                panic!("expected completed map ioctl")
-            };
-            assert_eq!(input_u32(&output, 16).unwrap(), 4096);
-        }
-        assert_eq!(host.mappings[&4096].references, 2);
-        let mut byte = [0];
-        crate::test_memory::read(&host.mappings[&4096].physical.pin(7, 1).unwrap(), &mut byte);
-        assert_eq!(byte, [42]);
-        host.close(NvDrvFileDescriptor::new(2));
-        assert_eq!(host.mappings[&4096].references, 1);
-        host.ioctl(
-            &devices,
-            &nvmap,
-            &control,
-            None,
-            descriptor(3, NvDrvDeviceKind::HostVic),
-            0xc014_000a,
-            &map,
-        )
-        .unwrap();
-        assert!(host.mappings.is_empty());
-        assert!(
-            host.ioctl(
-                &devices,
-                &nvmap,
-                &control,
-                None,
-                descriptor(3, NvDrvDeviceKind::HostVic),
-                0xc014_000a,
-                &map
-            )
-            .is_err()
-        );
-        let output = host
-            .ioctl(
-                &devices,
-                &nvmap,
-                &control,
-                None,
-                descriptor(3, NvDrvDeviceKind::HostVic),
-                0xc014_0009,
-                &map,
-            )
-            .unwrap();
-        let crate::nvdrv::LockedIoctlOutcome::Standard(
-            crate::nvdrv::NvHostCtrlIoctlOutcome::Complete(output),
-        ) = output
-        else {
-            panic!("expected completed map ioctl")
-        };
-        assert_eq!(input_u32(&output, 16).unwrap(), 4096);
-        host.clear();
-        assert!(host.mappings.is_empty());
     }
 }

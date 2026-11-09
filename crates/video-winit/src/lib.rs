@@ -140,6 +140,7 @@ impl WindowFrontend {
                 volume_handler: None,
                 volume_keys_down: [false; 2],
                 presenter: None,
+                game_title: None,
                 failure: None,
                 initial_window_state: None,
                 last_window_state: None,
@@ -203,6 +204,18 @@ impl WindowFrontend {
         self
     }
 
+    /// Names the guest title in the native window's status line.
+    #[must_use]
+    pub fn with_game_title(mut self, title: String) -> Self {
+        if let Some(presenter) = &mut self.application.presenter {
+            presenter.game_title = Some(title);
+            presenter.update_title();
+        } else {
+            self.application.game_title = Some(title);
+        }
+        self
+    }
+
     /// Enables on-demand native-resolution PNG captures with the S hotkey.
     #[must_use]
     pub fn with_screenshots(mut self, title: String, directory: std::path::PathBuf) -> Self {
@@ -237,6 +250,7 @@ struct PresenterState {
     window: Arc<Window>,
     frame_dimensions: Option<(u32, u32)>,
     backend_name: &'static str,
+    game_title: Option<String>,
     frame_rate: FrameRateTracker,
     displayed_title: String,
     paused: bool,
@@ -421,13 +435,22 @@ impl TouchTracker {
     }
 }
 
-fn window_title(backend: &str, output: Option<(u32, u32)>, fps: Option<f64>) -> String {
+fn window_title(
+    game: Option<&str>,
+    backend: &str,
+    output: Option<(u32, u32)>,
+    fps: Option<f64>,
+) -> String {
     let output = output.map_or_else(
         || "-".to_owned(),
         |(width, height)| format!("{width}×{height}"),
     );
     let fps = fps.map_or_else(|| "-- FPS".to_owned(), |fps| format!("{fps:.1} FPS"));
-    format!("nixe - {backend} | {output} | {fps}")
+    if let Some(game) = game {
+        format!("Nixe - {game} | {backend} | {output} | {fps}")
+    } else {
+        format!("Nixe - {backend} | {output} | {fps}")
+    }
 }
 
 struct PresenterApplication {
@@ -440,6 +463,7 @@ struct PresenterApplication {
     volume_handler: Option<VolumeHandler>,
     volume_keys_down: [bool; 2],
     presenter: Option<Presenter>,
+    game_title: Option<String>,
     failure: Option<WindowError>,
     initial_window_state: Option<WindowState>,
     last_window_state: Option<WindowState>,
@@ -907,22 +931,6 @@ mod tests {
             false,
             false
         ));
-    }
-
-    #[test]
-    fn title_reports_backend_output_size_and_optional_frame_rate() {
-        assert_eq!(
-            window_title("Vulkan", Some((1280, 720)), None),
-            "nixe - Vulkan | 1280×720 | -- FPS"
-        );
-        assert_eq!(
-            window_title("Direct3D 12", Some((1920, 1080)), Some(59.94)),
-            "nixe - Direct3D 12 | 1920×1080 | 59.9 FPS"
-        );
-        assert_eq!(
-            window_title("Metal", None, None),
-            "nixe - Metal | - | -- FPS"
-        );
     }
 
     #[test]

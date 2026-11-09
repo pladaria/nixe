@@ -85,7 +85,6 @@ impl Residency<'_> {
     ) -> Result<WorkTicket, VulkanError> {
         let size = u64::from(count) * 4;
         self.ensure_buffer_range(id, offset, size)?;
-        self.check_buffer_range(id, offset, size)?;
         if !offset.is_multiple_of(4) {
             return Err(VulkanError::InvalidResource(
                 "word conversion requires a word-aligned interval",
@@ -389,7 +388,6 @@ impl Residency<'_> {
                 Ok(())
             })
         };
-        self.prepare_write(Resource::Buffer(id), offset, size)?;
         {
             let device = &mut self.runtime.device;
             unsafe {

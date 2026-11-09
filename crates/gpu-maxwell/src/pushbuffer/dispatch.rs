@@ -116,6 +116,8 @@ pub enum MaxwellHostSynchronizationKind {
     WaitForIdle { all: bool },
     /// Service completed fences without stalling the asynchronous channel.
     ReleaseFences,
+    /// Commit pending cache publications at the puller's reference boundary.
+    SignalReference,
     IncrementSyncpoint {
         syncpoint: nixe_gpu::GuestSyncpointId,
     },
@@ -326,7 +328,10 @@ pub(crate) fn call_puller_method(
         }
         0x50 => {
             frontend.set_reference_count(source.argument);
-            Ok(Some(Effect::WaitForIdle { all: true }))
+            // RefCnt calls SignalReference, committing pending async flushes
+            // through SignalFence without incrementing a guest syncpoint.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/fence_manager.h
+            Ok(Some(Effect::SignalReference))
         }
         // Puller::ProcessFenceActionMethod uses ReleaseFences for Acquire and
         // the same SignalSyncPoint as Maxwell3D for Increment. The asynchronous

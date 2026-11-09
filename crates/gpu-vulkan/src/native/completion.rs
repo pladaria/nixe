@@ -10,7 +10,7 @@ use std::time::Instant;
 struct Fence {
     work: Option<WorkTicket>,
     flushes: bool,
-    action: Option<nixe_gpu::FenceAction>,
+    operations: Vec<nixe_gpu::FenceAction>,
 }
 #[derive(Default)]
 struct Queue {
@@ -29,6 +29,7 @@ pub(super) struct FenceManager {
     shared: Arc<Shared>,
     progress: Arc<SubmissionProgress>,
     worker: Option<JoinHandle<()>>,
+    uncommitted_operations: Vec<nixe_gpu::FenceAction>,
 }
 struct WorkerScope {
     progress: Arc<SubmissionProgress>,
@@ -51,7 +52,7 @@ impl Drop for WorkerScope {
             self.progress
                 .fail(self.progress.completed() + 1, NativeFailure::Panicked);
             for mut fence in cancelled {
-                if let Some(action) = fence.action.take() {
+                for action in fence.operations.drain(..) {
                     let _ = action(Err(failure("GPU fencing thread panicked")));
                 }
             }
@@ -187,12 +188,11 @@ impl FenceManager {
                         }
                         Ok(())
                     })();
-                    let result = if let Some(action) = fence.action.take() {
+                    let mut result = result;
+                    for action in fence.operations.drain(..) {
                         let action_result = action(result.clone());
-                        result.and(action_result)
-                    } else {
-                        result
-                    };
+                        result = result.and(action_result);
+                    }
                     let (wake, cancelled) = {
                         let mut state = queue.queue.lock().unwrap();
                         state.active = false;
@@ -207,7 +207,7 @@ impl FenceManager {
                         (wake, cancelled)
                     };
                     for mut fence in cancelled {
-                        if let Some(action) = fence.action.take() {
+                        for action in fence.operations.drain(..) {
                             let _ = action(Err(failure("preceding GPU fence failed")));
                         }
                     }
@@ -221,6 +221,7 @@ impl FenceManager {
             shared,
             progress,
             worker: Some(worker),
+            uncommitted_operations: Vec::new(),
         })
     }
     pub fn bind_wakeup(&self, wake: Arc<dyn Fn() + Send + Sync>) {
@@ -234,8 +235,11 @@ impl FenceManager {
             wake();
         }
     }
+    pub fn sync_operation(&mut self, action: nixe_gpu::FenceAction) {
+        self.uncommitted_operations.push(action);
+    }
     pub fn queue(
-        &self,
+        &mut self,
         work: Option<WorkTicket>,
         flushes: bool,
         action: Option<nixe_gpu::FenceAction>,
@@ -247,10 +251,13 @@ impl FenceManager {
         if self.shared.stopping.load(Ordering::Acquire) {
             return Err(VulkanError::QueueStopped);
         }
+        if let Some(action) = action {
+            self.uncommitted_operations.push(action);
+        }
         state.pending.push_back(Fence {
             work,
             flushes,
-            action,
+            operations: std::mem::take(&mut self.uncommitted_operations),
         });
         self.shared.changed.notify_one();
         Ok(())
@@ -283,9 +290,12 @@ impl Drop for FenceManager {
             std::mem::take(&mut state.pending)
         };
         for mut fence in pending {
-            if let Some(action) = fence.action.take() {
+            for action in fence.operations.drain(..) {
                 let _ = action(Err(failure("GPU fencing thread stopped")));
             }
+        }
+        for action in self.uncommitted_operations.drain(..) {
+            let _ = action(Err(failure("GPU fencing thread stopped")));
         }
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()

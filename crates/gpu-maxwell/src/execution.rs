@@ -164,6 +164,7 @@ impl std::error::Error for MaxwellSubmissionExecutionError {}
 pub trait MaxwellCommandHost: nixe_gpu::OwnerMemory + Sized {
     fn signal_syncpoint(&mut self) -> Result<(), MaxwellSubmissionExecutionError>;
     fn release_fences(&mut self) -> Result<(), MaxwellSubmissionExecutionError>;
+    fn signal_reference(&mut self) -> Result<(), MaxwellSubmissionExecutionError>;
     fn report_memory(
         &mut self,
         frontend: FrontendSubmissionId,

@@ -410,7 +410,6 @@ impl Residency<'_> {
             0
         };
         let id = self.buffer_cache.buffers.insert(BufferEntry {
-            known: Vec::new(),
             growth: 0,
             sparse_compatible,
             write_tick: 0,
@@ -715,7 +714,6 @@ impl Residency<'_> {
             true,
             false,
         )?;
-        self.prepare_write(Resource::Buffer(range.buffer), range.offset, range.size)?;
         let slice = self.runtime.device.submission.reserve_slice(
             bytes,
             crate::queue::staging::Usage::Upload,

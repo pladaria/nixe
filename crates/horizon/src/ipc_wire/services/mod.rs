@@ -17,6 +17,8 @@ mod auddev;
 mod audout;
 mod audren;
 mod bcat;
+mod nim;
+pub(super) use nim::dispatch_nim;
 mod nfp;
 mod ngc;
 pub(super) use nfp::dispatch_nfp;

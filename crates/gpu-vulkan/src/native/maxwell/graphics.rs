@@ -228,6 +228,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 dimension: slot.dimension,
                 descriptor: slot.descriptor,
                 sampler,
+                storage_format: slot.storage_format,
             });
         }
         Ok(())

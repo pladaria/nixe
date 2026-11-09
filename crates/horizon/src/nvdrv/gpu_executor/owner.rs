@@ -628,6 +628,20 @@ impl<
         })
     }
 
+    fn signal_reference(
+        &mut self,
+    ) -> Result<(), nixe_gpu_maxwell::MaxwellSubmissionExecutionError> {
+        self.owner
+            .backend
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .signal_fence(None)
+            .map_err(|error| {
+                nixe_gpu_maxwell::MaxwellSubmissionExecutionError::Native(error.to_string().into())
+            })
+    }
+
     fn report_memory(
         &mut self,
         frontend: FrontendSubmissionId,

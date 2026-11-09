@@ -184,11 +184,19 @@ pub(super) fn pixel_format(words: [u32; 8]) -> Result<F> {
         (0x2f, 7, false) => Some(F::D32_FLOAT),
         _ => None,
     };
-    compressed.ok_or_else(|| {
-        invalid(format!(
-            "Unsupported TIC pixel format {format:#x}, component {component}, sRGB {srgb}"
-        ))
-    })
+    if let Some(format) = compressed {
+        return Ok(format);
+    }
+    // Eden's format lookup classifies invalid/uninitialized entries as RGBA8;
+    // VisitImageView resolves their out-of-range address to a null binding.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/format_lookup_table.cpp#L274-L277
+    let address = crate::engines::threed::texture_address(words);
+    if address == 0 || address >= 1 << 40 {
+        return Ok(F::A8B8G8R8_UNORM);
+    }
+    Err(invalid(format!(
+        "Unsupported TIC pixel format {format:#x}, component {component}, sRGB {srgb}"
+    )))
 }
 
 pub(super) fn is_integer(format: F) -> bool {

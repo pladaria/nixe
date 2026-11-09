@@ -61,9 +61,51 @@ impl Residency<'_> {
         guest_source: Option<texture_cache::ImageRegistration>,
     ) -> Result<ImageId, VulkanError> {
         description.usage |= vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        // MakeImage enables storage whenever the native format or a compatible
+        // mutable view supports it. Sampled and storage bindings share the image.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L218-L248
+        if description.usage.contains(vk::ImageUsageFlags::SAMPLED)
+            && (description.samples == vk::SampleCountFlags::TYPE_1
+                || self
+                    .runtime
+                    .device
+                    .profile()
+                    .core
+                    .shader_storage_image_multisample
+                    != 0)
+            && let Some((block, bytes)) =
+                format::copy_block(description.format, vk::ImageAspectFlags::COLOR)
+            && block.width == 1
+            && block.height == 1
+        {
+            let storage_format = match bytes {
+                1 => vk::Format::R8_UINT,
+                2 => vk::Format::R16_UINT,
+                4 => vk::Format::R32_UINT,
+                8 => vk::Format::R32G32_UINT,
+                16 => vk::Format::R32G32B32A32_UINT,
+                _ => vk::Format::UNDEFINED,
+            };
+            let supports_storage = |format| {
+                self.runtime
+                    .device
+                    .format_properties(format)
+                    .optimal_tiling_features
+                    .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+            };
+            if supports_storage(description.format)
+                || description
+                    .flags
+                    .contains(vk::ImageCreateFlags::MUTABLE_FORMAT)
+                    && storage_format != vk::Format::UNDEFINED
+                    && supports_storage(storage_format)
+            {
+                description.usage |= vk::ImageUsageFlags::STORAGE;
+                description.flags |= vk::ImageCreateFlags::EXTENDED_USAGE;
+            }
+        }
         if self.runtime.device.profile().attachment_feedback_loop
             && description.usage.contains(vk::ImageUsageFlags::SAMPLED)
-            && !description.usage.contains(vk::ImageUsageFlags::STORAGE)
             && description.usage.intersects(
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
                     | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
@@ -375,6 +417,62 @@ impl Residency<'_> {
         self.runtime.statistics.cpu_uploaded_bytes += bytes;
         Ok(())
     }
+    /// StorageView keeps format variants in the existing image-view owner.
+    /// Shader images use identity components, independently of the TIC swizzle.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L2730-L2788
+    pub(crate) fn storage_image_view(
+        &mut self,
+        view: ImageViewId,
+        format: nixe_shader_recompiler::types::ImageFormat,
+    ) -> Result<ImageViewId, VulkanError> {
+        use nixe_shader_recompiler::types::ImageFormat as F;
+        let parent = &self.texture_cache.views[view];
+        if let Some(view) = parent.storage_views[format as usize] {
+            return Ok(view);
+        }
+        let image = parent.image;
+        let mut description = parent.description;
+        description.format = match format {
+            F::Typeless => match description.format {
+                vk::Format::R8G8B8A8_SRGB => vk::Format::R8G8B8A8_UNORM,
+                vk::Format::B8G8R8A8_SRGB => vk::Format::B8G8R8A8_UNORM,
+                value => value,
+            },
+            F::R8_UINT => vk::Format::R8_UINT,
+            F::R8_SINT => vk::Format::R8_SINT,
+            F::R16_UINT => vk::Format::R16_UINT,
+            F::R16_SINT => vk::Format::R16_SINT,
+            F::R32_UINT => vk::Format::R32_UINT,
+            F::R32G32_UINT => vk::Format::R32G32_UINT,
+            F::R32G32B32A32_UINT => vk::Format::R32G32B32A32_UINT,
+        };
+        if description.aspects != vk::ImageAspectFlags::COLOR
+            || !self
+                .texture_cache
+                .get(image)
+                .description
+                .usage
+                .contains(vk::ImageUsageFlags::STORAGE)
+            || !self
+                .runtime
+                .device
+                .format_properties(description.format)
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+        {
+            return Err(VulkanError::Compilation(
+                format!(
+                    "unsupported storage image view format: {:?}",
+                    description.format
+                )
+                .into(),
+            ));
+        }
+        description.swizzle = [vk::ComponentSwizzle::IDENTITY; 4];
+        let storage = self.image_view(image, description)?;
+        self.texture_cache.views[view].storage_views[format as usize] = Some(storage);
+        Ok(storage)
+    }
     pub fn image_view(
         &mut self,
         image: ImageId,
@@ -502,7 +600,48 @@ impl Residency<'_> {
                 "component swizzle requires imageViewFormatSwizzle on this portability device",
             ));
         }
+        // Extended-usage images allow each compatible view to select only the
+        // usages supported by its own format, including sRGB sampled views.
+        // https://docs.vulkan.org/refpages/latest/refpages/source/VkImageViewUsageCreateInfo.html
+        let properties = self
+            .runtime
+            .device
+            .format_properties(d.format)
+            .optimal_tiling_features;
+        let mut usage = entry.description.usage;
+        for (required, feature) in [
+            (
+                vk::ImageUsageFlags::STORAGE,
+                vk::FormatFeatureFlags::STORAGE_IMAGE,
+            ),
+            (
+                vk::ImageUsageFlags::SAMPLED,
+                vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            ),
+            (
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                vk::FormatFeatureFlags::COLOR_ATTACHMENT,
+            ),
+            (
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT,
+            ),
+        ] {
+            if !properties.contains(feature) {
+                usage &= !required;
+            }
+        }
+        if !usage.contains(vk::ImageUsageFlags::SAMPLED)
+            || !usage.intersects(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            )
+        {
+            usage &= !vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
+        }
+        let mut view_usage = vk::ImageViewUsageCreateInfo::default().usage(usage);
         let info = vk::ImageViewCreateInfo::default()
+            .push_next(&mut view_usage)
             .image(entry.native.handle)
             .view_type(d.view_type)
             .format(d.format)
@@ -533,7 +672,7 @@ impl Residency<'_> {
                     d.format,
                     entry.description.image_type,
                     vk::ImageTiling::OPTIMAL,
-                    entry.description.usage,
+                    usage,
                     entry.description.flags,
                 )
         }
@@ -567,6 +706,7 @@ impl Residency<'_> {
             description,
             native,
             supports_minmax_filter,
+            storage_views: [None; 8],
             downloaded,
         });
         self.texture_cache.images[image].views.push(view);

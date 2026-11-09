@@ -7,7 +7,12 @@ impl Residency<'_> {
     pub(crate) fn flush_region(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
         self.runtime.device.realize_deferred_clear()?;
         self.download_texture_memory(address, bytes)?;
-        self.download_buffer_memory(address, bytes)
+        self.download_buffer_memory(address, bytes)?;
+        self.caches
+            .query_cache
+            .lock()
+            .unwrap()
+            .flush_region(address, bytes)
     }
 
     pub(crate) fn progress_native_work(&mut self) -> Result<(), VulkanError> {
@@ -69,6 +74,11 @@ impl Residency<'_> {
                 for (address, bytes) in self.runtime.device_memory.device_ranges(extent) {
                     self.download_buffer_memory(address, bytes)?;
                     self.download_texture_memory(address, bytes)?;
+                    self.caches
+                        .query_cache
+                        .lock()
+                        .unwrap()
+                        .flush_region(address, bytes)?;
                 }
             }
         }
@@ -83,6 +93,11 @@ impl Residency<'_> {
         if writes {
             for extent in ranges.iter().flat_map(AllocationRange::physical_extents) {
                 for (address, bytes) in self.runtime.device_memory.device_ranges(extent) {
+                    self.caches
+                        .query_cache
+                        .lock()
+                        .unwrap()
+                        .invalidate_region(address, bytes);
                     self.shader_cache.invalidate_region(address, bytes);
                     self.buffer_cache.write_memory(address, bytes);
                     self.texture_cache.write_memory(address, bytes);

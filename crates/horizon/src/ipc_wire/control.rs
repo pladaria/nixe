@@ -49,6 +49,9 @@ pub(super) async fn dispatch_control(
     };
 
     match (control_command, target) {
+        (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Nim(session)) => {
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
+        }
         (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Ngc(session)) => {
             write_domain_conversion(process, request.token, session.domain.convert()).await?;
         }
@@ -260,6 +263,7 @@ pub(super) async fn dispatch_control(
             | HorizonIpcObject::PlayReport(_)
             | HorizonIpcObject::Friends(_)
             | HorizonIpcObject::Bcat(_)
+            | HorizonIpcObject::Nim(_)
             | HorizonIpcObject::Nfp(_)
             | HorizonIpcObject::Ngc(_)
             | HorizonIpcObject::AudioDevice(_),
@@ -285,6 +289,7 @@ pub(super) async fn dispatch_control(
                 HorizonIpcObject::Friends(_) => 0x1000,
                 HorizonIpcObject::Bcat(_) => 0x1000,
                 HorizonIpcObject::Nfp(_) => 0x1000,
+                HorizonIpcObject::Nim(_) => 0x1000,
                 HorizonIpcObject::Ngc(_) => 0x1000,
                 HorizonIpcObject::SemanticService(session)
                     if session.service() == crate::IpcService::FileSystem =>

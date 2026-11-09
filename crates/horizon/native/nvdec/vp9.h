@@ -123,9 +123,15 @@ public:
     VP9& operator=(VP9&&) = delete;
 
     [[nodiscard]] int ComposeFrame(const PictureInfo& picture, const EntropyProbs& entropy,
-        std::span<const u8> tiles, const std::array<u64,4>& offsets, u64 origin, AVPacket* packet);
+        std::span<const u8> tiles, const std::array<u64,4>& offsets, AVPacket* packet);
+
+    [[nodiscard]] bool IsFrameVisible() const { return current_frame_info.show_frame; }
 
 private:
+    [[nodiscard]] Vp9FrameContainer GetCurrentFrame(const PictureInfo& picture,
+        const EntropyProbs& entropy, std::span<const u8> tiles,
+        const std::array<u64, 4>& offsets);
+
     /// Generates compressed header probability updates in the bitstream writer
     template <typename T, std::size_t N>
     void WriteProbabilityUpdate(VpxRangeEncoder& writer, const std::array<T, N>& new_prob,
@@ -166,11 +172,11 @@ private:
     std::array<s8, 4> loop_filter_ref_deltas{};
     std::array<s8, 2> loop_filter_mode_deltas{};
 
-    EntropyProbs current_entropy{};
-    std::array<u64,8> reference_offsets{};
+    Vp9FrameContainer next_frame{};
+    std::array<Vp9EntropyProbs, 4> frame_ctxs{};
+    bool swap_ref_indices{};
 
     Segmentation last_segmentation{};
-    PictureInfo current_picture_info{};
     Vp9PictureInfo current_frame_info{};
     Vp9EntropyProbs prev_frame_probs{};
 };

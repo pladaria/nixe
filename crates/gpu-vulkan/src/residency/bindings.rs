@@ -334,9 +334,6 @@ impl Residency<'_> {
                 .ok_or(VulkanError::InvalidResource("active vertex slot is null"))?;
             self.touch(Resource::Buffer(vertex.buffer));
             self.ensure_buffer_range(vertex.buffer, vertex.offset, vertex.size)?;
-            // A report can update contents without changing the selected slot.
-            // Materialize it even when this draw reuses its native binding.
-            self.materialize_buffer_literals(vertex.buffer, vertex.offset, vertex.size)?;
             let dirty = self.runtime.buffer_bindings.channel.dirty_vertex_buffers;
             if dirty & (1 << index) == 0 {
                 self.emit_vertex_buffers(first, &buffers, &offsets, &sizes, &strides);

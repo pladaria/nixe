@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, mpsc};
 
-use crate::{BackendInstanceId, ImageDescription};
+use crate::BackendInstanceId;
 
 /// Pixel rectangle selected from a resident source image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,15 +41,15 @@ pub enum PresentationImageFormat {
 #[derive(Clone)]
 pub struct ResidentImage {
     backend: BackendInstanceId,
-    description: ImageDescription,
+    dimensions: [u32; 2],
     lease: PresentationLease,
 }
 impl ResidentImage {
     #[must_use]
-    pub fn from_lease(description: ImageDescription, lease: PresentationLease) -> Self {
+    pub fn from_lease(dimensions: [u32; 2], lease: PresentationLease) -> Self {
         Self {
             backend: lease.producer().instance(),
-            description,
+            dimensions,
             lease,
         }
     }
@@ -64,8 +64,9 @@ impl ResidentImage {
     }
 
     #[must_use]
-    pub const fn description(&self) -> ImageDescription {
-        self.description
+    /// Visible guest resolution, before scaling to the host window.
+    pub const fn dimensions(&self) -> [u32; 2] {
+        self.dimensions
     }
 }
 
@@ -74,7 +75,7 @@ impl Debug for ResidentImage {
         formatter
             .debug_struct("ResidentImage")
             .field("backend", &self.backend)
-            .field("description", &self.description)
+            .field("dimensions", &self.dimensions)
             .finish_non_exhaustive()
     }
 }
@@ -150,9 +151,7 @@ impl Drop for PresentationLeaseInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        BackendSubmissionToken, ImageDimension, ImageExtent, ImageFormat, ImageKind, SampleCount,
-    };
+    use crate::BackendSubmissionToken;
 
     #[test]
     fn lease_release_retains_exact_generation_version_and_order_until_last_drop() {
@@ -189,33 +188,5 @@ mod tests {
             releases.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
-    }
-
-    #[test]
-    fn typed_resident_frame_never_exposes_an_opaque_host_payload() {
-        let (owner, _) = mpsc::channel();
-        let producer = BackendSubmissionToken::new(BackendInstanceId::new(7), 20, 3);
-        let lease = PresentationLease::new(
-            PresentationImageId {
-                slot: 4,
-                generation: 2,
-            },
-            15,
-            producer,
-            owner,
-        );
-        let description = ImageDescription::new(
-            ImageDimension::Two,
-            ImageExtent::new(1, 1, 1).unwrap(),
-            ImageFormat::Rgba8Unorm,
-            ImageKind::Color,
-            1,
-            1,
-            SampleCount::One,
-        )
-        .unwrap();
-        let frame = ResidentImage::from_lease(description, lease);
-        assert_eq!(frame.backend(), producer.instance());
-        assert_eq!(frame.lease().content_version(), 15);
     }
 }

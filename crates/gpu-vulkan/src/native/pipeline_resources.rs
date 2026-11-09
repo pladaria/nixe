@@ -28,6 +28,7 @@ pub(super) struct ImageSlot {
     pub(super) secondary: Option<ImageHandle>,
     pub(super) dimension: MaxwellThreeDTextureDimension,
     pub(super) sampler: bool,
+    pub(super) storage_format: Option<nixe_shader_recompiler::types::ImageFormat>,
 }
 #[derive(Default)]
 pub(crate) struct StageResources {
@@ -150,11 +151,45 @@ impl PipelineResources {
                             }
                         },
                         sampler: origin.sampler.is_some(),
+                        storage_format: None,
                     });
                 }
-                _ => {
-                    return Err(fail(
-                        "guest shader descriptor class requires unsupported image, texel-buffer or separate-sampler cache bindings",
+                S::Image(d) => {
+                    let offset = origin
+                        .element
+                        .checked_shl(d.size_shift)
+                        .and_then(|offset| d.cbuf_offset.0.checked_add(offset))
+                        .ok_or(fail("storage image descriptor array offset overflow"))?;
+                    images[stage].push(ImageSlot {
+                        descriptor,
+                        primary: ImageHandle {
+                            cbuf: d.cbuf_index.0,
+                            offset,
+                            shift: 0,
+                        },
+                        secondary: None,
+                        dimension: match d.texture_type {
+                            T::Color1D => D::One,
+                            T::ColorArray1D => D::OneArray,
+                            T::Color2D | T::Color2DRect => D::Two,
+                            T::ColorArray2D => D::TwoArray,
+                            T::Color3D => D::Three,
+                            T::ColorCube => D::Cube,
+                            T::ColorArrayCube => D::CubeArray,
+                            kind => {
+                                return Err(VulkanError::Compilation(
+                                    format!("unsupported guest storage image dimension: {kind:?}")
+                                        .into(),
+                                ));
+                            }
+                        },
+                        sampler: false,
+                        storage_format: Some(d.format),
+                    });
+                }
+                source => {
+                    return Err(VulkanError::Compilation(
+                        format!("unsupported guest shader resource binding: {source:?}").into(),
                     ));
                 }
             }

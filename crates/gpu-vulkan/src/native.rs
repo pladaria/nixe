@@ -662,13 +662,14 @@ impl GpuExecution for NativeGpuExecution {
         bytes: Arc<[u8]>,
         fence: bool,
     ) -> Result<(), BackendRuntimeError> {
-        self.execution().record(frontend, |native| {
+        let action = self.execution().record(frontend, |native| {
             native.residency.runtime.device.realize_deferred_clear()?;
-            native.residency.report_memory(target, 0, &bytes)?;
-            Ok(())
+            native.residency.report_query(target, bytes)
         })?;
         if fence {
-            self.fence_caches(None).map_err(runtime)?;
+            self.fence_caches(Some(action)).map_err(runtime)?;
+        } else {
+            self.state.fences.sync_operation(action);
         }
         Ok(())
     }

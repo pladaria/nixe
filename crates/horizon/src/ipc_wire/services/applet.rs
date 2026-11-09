@@ -664,6 +664,31 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                     )?;
                     applet_data(request.token, version)
                 }
+                // Both queries return an s32 entry count. Like Eden, expose
+                // no stored play-history records; the output array has no
+                // valid entries to write when that count is zero.
+                // https://switchbrew.org/wiki/AM_services#QueryApplicationPlayStatisticsByUid
+                command @ (ApplicationFunctionsCommand::QueryApplicationPlayStatistics
+                | ApplicationFunctionsCommand::QueryApplicationPlayStatisticsByUid) => {
+                    let by_uid =
+                        command == ApplicationFunctionsCommand::QueryApplicationPlayStatisticsByUid;
+                    if !request.has_payload_size(if by_uid { 16 } else { 0 })
+                        || hipc.pid.is_some()
+                        || !hipc.copy_handles.is_empty()
+                        || !hipc.move_handles.is_empty()
+                        || !hipc.send_statics.is_empty()
+                        || hipc.send_buffers.len() != 1
+                        || hipc.receive_buffers.len() != 1
+                        || !hipc.exchange_buffers.is_empty()
+                        || hipc.receive_statics != ReceiveStatics::None
+                    {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    applet_data(request.token, &0_i32.to_le_bytes())
+                }
                 ApplicationFunctionsCommand::SetGamePlayRecordingState => {
                     if !request.has_payload_size(4) || has_ipc_descriptors(hipc) {
                         return applet_error(

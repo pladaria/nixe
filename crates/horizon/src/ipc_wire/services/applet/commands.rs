@@ -159,6 +159,8 @@ command_enum!(ApplicationFunctionsCommand {
     40 => NotifyRunning,
     50 => GetPseudoDeviceId,
     67 => SetGamePlayRecordingState,
+    110 => QueryApplicationPlayStatistics,
+    111 => QueryApplicationPlayStatisticsByUid,
     130 => GetGpuErrorDetectedSystemEvent,
 });
 

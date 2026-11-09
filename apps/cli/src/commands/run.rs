@@ -18,8 +18,8 @@ use nixe_input::{
 };
 use nixe_loader_title::{NacpLanguage, SupportedLanguages, UserAccountSwitchLock};
 use nixe_runtime::{
-    Launcher, LauncherInput, ProcessBuilder, ProcessExit, ProcessExitCause, ProcessRegistration,
-    ProcessTeardownReport, RunnableProcess, Runtime, VirtualClock, VirtualClockMode,
+    Launcher, LauncherInput, ProcessBuilder, ProcessExit, ProcessExitCause, ProcessTeardownReport,
+    RunnableProcess, Runtime, VirtualClock, VirtualClockMode,
 };
 use nixe_scheduler::ProcessId;
 use nixe_video_winit::{FrontendControl, WindowFrontend};
@@ -378,6 +378,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
     let volume_backend = Arc::clone(&audio_backend);
     let mut volume = config.audio.volume;
     let frontend = frontend
+        .with_game_title(title.name.clone())
         .with_screenshots(title.name.clone(), config.filesystem.screenshots.clone())
         .with_volume_handler(move |delta| {
             volume = volume.saturating_add_signed(delta).min(100);
@@ -582,13 +583,8 @@ fn supervise_process(
     gpu_diagnostics: (CacheMonitor, FrameMetrics),
 ) -> RunOutcome {
     let (mut gpu_caches, frame_metrics) = gpu_diagnostics;
-    let registration = ProcessRegistration {
-        priority: process.initial_thread_priority(),
-        ideal_vcpu: Some(process.initial_ideal_vcpu()),
-        affinity: runtime.scheduler().profile().all_cores(),
-    };
     let process_id = runtime
-        .register_process(process, registration)
+        .register_process(process)
         .expect("CLI process and verified Switch 1 scheduler profile are compatible");
     let execution_started = Instant::now();
     let execution_video = video_system.clone();

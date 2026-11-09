@@ -40,6 +40,7 @@ impl HorizonIpcObject {
             Self::Friends(session) => session.domain.is_domain(),
             Self::Bcat(session) => session.domain.is_domain(),
             Self::Nfp(session) => session.domain.is_domain(),
+            Self::Nim(session) => session.domain.is_domain(),
             Self::Ngc(session) => session.domain.is_domain(),
             _ => false,
         }
@@ -98,6 +99,9 @@ impl HorizonIpcObject {
             Self::OpusDecoder(_) => "IHardwareOpusDecoder",
             Self::Hid(_) => "hid",
             Self::Ngc(_) => "ngc:u",
+            Self::Nim(session) => session
+                .target(domain_object)
+                .map_or("nim:eca", |object| object.name()),
             Self::Nfp(session) => session
                 .target(domain_object)
                 .map_or("nfp:user", |object| object.name()),
@@ -297,6 +301,7 @@ pub(crate) async fn execute_request(
         HorizonIpcObject::Bcat(session) => {
             services::dispatch_bcat(process, session, request, hipc).await?
         }
+        HorizonIpcObject::Nim(session) => services::dispatch_nim(process, session, request, hipc)?,
         HorizonIpcObject::Ngc(session) => services::dispatch_ngc(session, request, hipc)?,
         HorizonIpcObject::Nfp(session) => {
             services::dispatch_nfp(process, session, &resources.system.hid, request, hipc).await?

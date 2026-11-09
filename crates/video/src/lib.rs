@@ -9,20 +9,13 @@ use nixe_gpu::ResidentImage;
 #[derive(Clone, Debug)]
 pub struct PresentationFrame {
     image: ResidentImage,
-    dimensions: (u32, u32),
     sequence: u64,
 }
 
 impl PresentationFrame {
     #[must_use]
     pub fn new(image: ResidentImage, sequence: u64) -> Self {
-        let extent = image.description().extent();
-        let dimensions = (extent.width, extent.height);
-        Self {
-            image,
-            dimensions,
-            sequence,
-        }
+        Self { image, sequence }
     }
 
     #[must_use]
@@ -32,12 +25,12 @@ impl PresentationFrame {
 
     #[must_use]
     pub const fn width(&self) -> u32 {
-        self.dimensions.0
+        self.image.dimensions()[0]
     }
 
     #[must_use]
     pub const fn height(&self) -> u32 {
-        self.dimensions.1
+        self.image.dimensions()[1]
     }
 
     #[must_use]

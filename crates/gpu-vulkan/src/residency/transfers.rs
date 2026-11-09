@@ -63,7 +63,6 @@ impl Residency<'_> {
         size: u64,
         value: u32,
     ) -> Result<WorkTicket, VulkanError> {
-        self.check_buffer_range(id, offset, size)?;
         let pattern = value.to_le_bytes();
         let prefix = ((4 - offset % 4) % 4).min(size);
         if prefix != 0 {
@@ -94,7 +93,6 @@ impl Residency<'_> {
         size: u64,
         value: u32,
     ) -> Result<WorkTicket, VulkanError> {
-        self.check_buffer_range(id, offset, size)?;
         if !offset.is_multiple_of(4) || !size.is_multiple_of(4) {
             return Err(VulkanError::InvalidResource(
                 "native fill requires a four-byte aligned interval; byte masks require a conversion helper",
@@ -103,7 +101,6 @@ impl Residency<'_> {
         if self.buffer_cache.get(id).device_address.is_some() {
             self.ensure_buffer_range(id, offset, size)?;
         }
-        self.prepare_write(Resource::Buffer(id), offset, size)?;
         let buffer = self.use_buffer(id, offset, size)?;
         self.runtime.barriers.emit(&mut self.runtime.device)?;
         {

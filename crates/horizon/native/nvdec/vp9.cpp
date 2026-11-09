@@ -330,19 +330,16 @@ void VP9::WriteMvProbabilityUpdate(VpxRangeEncoder& writer, u8 new_prob, u8 old_
 }
 
 void VP9::WriteSegmentation(VpxBitStreamWriter& writer) {
-    bool enabled = current_picture_info.segmentation.enabled != 0;
+    bool enabled = current_frame_info.segmentation.enabled != 0;
     writer.WriteBit(enabled);
     if (!enabled) {
         return;
     }
 
-    auto update_map = current_picture_info.segmentation.update_map != 0;
+    auto update_map = current_frame_info.segmentation.update_map != 0;
     writer.WriteBit(update_map);
 
     if (update_map) {
-        EntropyProbs entropy_probs{};
-        entropy_probs = current_entropy;
-
         auto WriteProb = [&](u8 prob) {
             bool coded = prob != 255;
             writer.WriteBit(coded);
@@ -351,55 +348,55 @@ void VP9::WriteSegmentation(VpxBitStreamWriter& writer) {
             }
         };
 
-        for (size_t i = 0; i < entropy_probs.mb_segment_tree_probs.size(); i++) {
-            WriteProb(entropy_probs.mb_segment_tree_probs[i]);
+        for (size_t i = 0; i < current_frame_info.seg_tree_probs.size(); i++) {
+            WriteProb(current_frame_info.seg_tree_probs[i]);
         }
 
-        auto temporal_update = current_picture_info.segmentation.temporal_update != 0;
+        auto temporal_update = current_frame_info.segmentation.temporal_update != 0;
         writer.WriteBit(temporal_update);
 
         if (temporal_update) {
             for (s32 i = 0; i < 3; i++) {
-                WriteProb(entropy_probs.segment_pred_probs[i]);
+                WriteProb(current_frame_info.seg_pred_probs[i]);
             }
         }
     }
 
-    if (last_segmentation == current_picture_info.segmentation) {
+    if (last_segmentation == current_frame_info.segmentation) {
         writer.WriteBit(false);
         return;
     }
 
-    last_segmentation = current_picture_info.segmentation;
+    last_segmentation = current_frame_info.segmentation;
     writer.WriteBit(true);
-    writer.WriteBit(current_picture_info.segmentation.abs_delta != 0);
+    writer.WriteBit(current_frame_info.segmentation.abs_delta != 0);
 
     constexpr s32 MAX_SEGMENTS = 8;
     constexpr std::array SegmentationFeatureBits = {8, 6, 2, 0};
 
     for (s32 i = 0; i < MAX_SEGMENTS; i++) {
-        auto q_enabled = current_picture_info.segmentation.feature_enabled[i][0] != 0;
+        auto q_enabled = current_frame_info.segmentation.feature_enabled[i][0] != 0;
         writer.WriteBit(q_enabled);
         if (q_enabled) {
-            writer.WriteS(current_picture_info.segmentation.feature_data[i][0],
+            writer.WriteS(current_frame_info.segmentation.feature_data[i][0],
                           SegmentationFeatureBits[0]);
         }
 
-        auto lf_enabled = current_picture_info.segmentation.feature_enabled[i][1] != 0;
+        auto lf_enabled = current_frame_info.segmentation.feature_enabled[i][1] != 0;
         writer.WriteBit(lf_enabled);
         if (lf_enabled) {
-            writer.WriteS(current_picture_info.segmentation.feature_data[i][1],
+            writer.WriteS(current_frame_info.segmentation.feature_data[i][1],
                           SegmentationFeatureBits[1]);
         }
 
-        auto ref_enabled = current_picture_info.segmentation.feature_enabled[i][2] != 0;
+        auto ref_enabled = current_frame_info.segmentation.feature_enabled[i][2] != 0;
         writer.WriteBit(ref_enabled);
         if (ref_enabled) {
-            writer.WriteU(current_picture_info.segmentation.feature_data[i][2],
+            writer.WriteU(current_frame_info.segmentation.feature_data[i][2],
                           SegmentationFeatureBits[2]);
         }
 
-        auto skip_enabled = current_picture_info.segmentation.feature_enabled[i][3] != 0;
+        auto skip_enabled = current_frame_info.segmentation.feature_enabled[i][3] != 0;
         writer.WriteBit(skip_enabled);
     }
 }
@@ -602,10 +599,10 @@ VpxBitStreamWriter VP9::ComposeUncompressedHeader() {
 
         // Reset context
         prev_frame_probs = default_probs;
-        reference_offsets.fill(current_frame_info.frame_offsets[3]);
+        swap_ref_indices = false;
         loop_filter_ref_deltas.fill(0);
         loop_filter_mode_deltas.fill(0);
-
+        frame_ctxs.fill(default_probs);
 
         // intra only, meaning the frame can be recreated with no other references
         current_frame_info.intra_only = true;
@@ -618,25 +615,26 @@ VpxBitStreamWriter VP9::ComposeUncompressedHeader() {
         if (!current_frame_info.error_resilient_mode) {
             uncomp_writer.WriteU(0, 2); // Reset frame context.
         }
-        // NVDEC supplies the physical last/golden/altref surfaces, not VP9's
-        // bitstream reference indices. Map those surfaces to the software DPB directly;
-        // this avoids delaying decode until another submission supplies future references.
-        const auto& offsets = current_frame_info.frame_offsets;
-        std::array<u32,3> ref_frame_index{};
-        for (size_t i=0; i<3; ++i) {
-            auto found=std::find(reference_offsets.begin(),reference_offsets.end(),offsets[i]);
-            if (found==reference_offsets.end()) throw std::runtime_error("VP9 reference surface is not in the decoded picture buffer");
-            ref_frame_index[i]=static_cast<u32>(found-reference_offsets.begin());
+        const auto& curr_offsets = current_frame_info.frame_offsets;
+        const auto& next_offsets = next_frame.info.frame_offsets;
+        const bool ref_frames_different = curr_offsets[1] != curr_offsets[2];
+        const bool next_references_swap =
+            (next_offsets[1] == curr_offsets[2]) || (next_offsets[2] == curr_offsets[1]);
+        const bool needs_ref_swap = ref_frames_different && next_references_swap;
+        if (needs_ref_swap) {
+            swap_ref_indices = !swap_ref_indices;
         }
-        u32 destination=0;
-        for (; destination<reference_offsets.size(); ++destination) {
-            if (std::find(ref_frame_index.begin(),ref_frame_index.end(),destination)==ref_frame_index.end()) break;
+        u32 refresh_frame_flags = 0;
+        for (u32 index = 0; index < 3; ++index) {
+            // Refresh indices that use the current frame as an index
+            if (curr_offsets[3] == next_offsets[index]) {
+                refresh_frame_flags |= 1u << index;
+            }
         }
-        if (destination==reference_offsets.size()) throw std::runtime_error("VP9 DPB has no output slot");
-        u32 refresh_frame_flags=1u<<destination;
-        for (u32 i=0;i<reference_offsets.size();++i) {
-            if (reference_offsets[i]==offsets[3]) refresh_frame_flags|=1u<<i;
-            if ((refresh_frame_flags>>i)&1) reference_offsets[i]=offsets[3];
+        if (swap_ref_indices) {
+            const u32 golden = (refresh_frame_flags >> 1) & 1;
+            const u32 alt = (refresh_frame_flags >> 2) & 1;
+            refresh_frame_flags = (refresh_frame_flags & ~6u) | (alt << 1) | (golden << 2);
         }
         if (current_frame_info.intra_only) {
             uncomp_writer.WriteU(frame_sync_code, 24);
@@ -645,15 +643,14 @@ VpxBitStreamWriter VP9::ComposeUncompressedHeader() {
             uncomp_writer.WriteU(current_frame_info.frame_size.height - 1, 16);
             uncomp_writer.WriteBit(false); // Render and frame size different.
         } else {
+            const bool swap_indices = needs_ref_swap ^ swap_ref_indices;
+            const auto ref_frame_index = swap_indices ? std::array{0, 2, 1} : std::array{0, 1, 2};
             uncomp_writer.WriteU(refresh_frame_flags, 8);
             for (size_t index = 1; index < 4; index++) {
                 uncomp_writer.WriteU(ref_frame_index[index - 1], 3);
                 uncomp_writer.WriteU(current_frame_info.ref_frame_sign_bias[index], 1);
             }
-            // Emit dimensions explicitly; the first reference need not have the same size.
-            for (int i=0;i<3;++i) uncomp_writer.WriteBit(false);
-            uncomp_writer.WriteU(current_frame_info.frame_size.width-1,16);
-            uncomp_writer.WriteU(current_frame_info.frame_size.height-1,16);
+            uncomp_writer.WriteBit(true);  // Frame size with refs.
             uncomp_writer.WriteBit(false); // Render and frame size different.
             uncomp_writer.WriteBit(current_frame_info.allow_high_precision_mv);
             uncomp_writer.WriteBit(current_frame_info.interp_filter == 4);
@@ -665,12 +662,18 @@ VpxBitStreamWriter VP9::ComposeUncompressedHeader() {
     }
 
     if (!current_frame_info.error_resilient_mode) {
-        uncomp_writer.WriteBit(false); // Entropy is supplied completely by NVDEC for each frame.
+        uncomp_writer.WriteBit(true); // Refresh frame context. where do i get this info from?
         uncomp_writer.WriteBit(true); // Frame parallel decoding mode.
     }
 
-    uncomp_writer.WriteU(0, 2); // Keep the software context at its default probabilities.
-    prev_frame_probs = default_probs;
+    int frame_ctx_idx = 0;
+    if (!current_frame_info.show_frame) {
+        frame_ctx_idx = 1;
+    }
+
+    uncomp_writer.WriteU(frame_ctx_idx, 2);       // Frame context index.
+    prev_frame_probs = frame_ctxs[frame_ctx_idx]; // reference probabilities for compressed header
+    frame_ctxs[frame_ctx_idx] = current_frame_info.entropy;
 
     uncomp_writer.WriteU(current_frame_info.first_level, 6);
     uncomp_writer.WriteU(current_frame_info.sharpness_level, 3);
@@ -736,11 +739,6 @@ VpxBitStreamWriter VP9::ComposeUncompressedHeader() {
     const s32 min_tile_cols_log2 = CalcMinLog2TileCols(current_frame_info.frame_size.width);
     const s32 max_tile_cols_log2 = CalcMaxLog2TileCols(current_frame_info.frame_size.width);
 
-    if (current_frame_info.log2_tile_cols < min_tile_cols_log2 ||
-        current_frame_info.log2_tile_cols > max_tile_cols_log2 ||
-        current_frame_info.log2_tile_rows > 2)
-        throw std::runtime_error("invalid NVDEC VP9 tile configuration");
-
     const s32 tile_cols_log2_diff = current_frame_info.log2_tile_cols - min_tile_cols_log2;
     const s32 tile_cols_log2_inc_mask = (1 << tile_cols_log2_diff) - 1;
 
@@ -763,20 +761,35 @@ VpxBitStreamWriter VP9::ComposeUncompressedHeader() {
     return uncomp_writer;
 }
 
+// NVDEC supplies the previous frame's show flag. Keep the same one-frame
+// lookahead and reference/context selection as the reference decoder.
+// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/host1x/codecs/vp9.cpp#L434-L455
+Vp9FrameContainer VP9::GetCurrentFrame(const PictureInfo& picture,
+    const EntropyProbs& entropy, std::span<const u8> tiles,
+    const std::array<u64, 4>& offsets) {
+    Vp9FrameContainer current{};
+    current.info = picture.Convert();
+    entropy.Convert(current.info.entropy);
+    current.info.seg_tree_probs = entropy.mb_segment_tree_probs;
+    current.info.seg_pred_probs = entropy.segment_pred_probs;
+    current.info.frame_offsets = offsets;
+    current.bit_stream.assign(tiles.begin(), tiles.end());
+    if (!next_frame.bit_stream.empty()) {
+        Vp9FrameContainer incoming = std::move(current);
+        next_frame.info.show_frame = incoming.info.last_frame_shown;
+        current = std::move(next_frame);
+        next_frame = std::move(incoming);
+    } else {
+        next_frame = current;
+    }
+    return current;
+}
+
 int VP9::ComposeFrame(const PictureInfo& picture, const EntropyProbs& entropy,
-    std::span<const u8> tiles, const std::array<u64,4>& offsets, u64 origin, AVPacket* packet) {
-    current_picture_info=picture;
-    current_entropy=entropy;
-    current_frame_info=picture.Convert();
-    current_entropy.Convert(current_frame_info.entropy);
-    current_frame_info.frame_offsets=offsets;
-    // NVDEC has no current show_frame bit. Ordinary visible progressive frames can
-    // be decoded immediately; hidden/intra-only streams require an output-capable decoder.
-    if (current_frame_info.intra_only && !current_frame_info.is_key_frame)
-        throw std::runtime_error("VP9 hidden intra-only frame output is not implemented");
-    if (origin>1 && !current_frame_info.last_frame_shown)
-        throw std::runtime_error("VP9 hidden reference frame output is not implemented");
-    const auto bitstream=tiles;
+    std::span<const u8> tiles, const std::array<u64,4>& offsets, AVPacket* packet) {
+    auto frame = GetCurrentFrame(picture, entropy, tiles, offsets);
+    current_frame_info = frame.info;
+    const auto& bitstream = frame.bit_stream;
     // The uncompressed header routine sets PrevProb parameters needed for the compressed header
     auto uncomp_writer = ComposeUncompressedHeader();
     std::vector<u8> compressed_header = ComposeCompressedHeader();

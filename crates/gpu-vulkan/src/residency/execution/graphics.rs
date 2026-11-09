@@ -299,7 +299,7 @@ fn read_only_state(aspect: vk::ImageAspectFlags, state: &GraphicsState) -> bool 
 /// Image selections consumed by ConfigureDraw. Buffer selections stay in
 /// BufferCache; this span follows Eden's FillImageViews/CheckFeedbackLoop.
 pub(crate) struct ShaderImage {
-    pub(crate) view: ImageViewId,
+    pub(crate) view: Option<ImageViewId>,
     pub(crate) descriptor: usize,
     // The texture cache owns guest samplers; HostProgram owns utility samplers.
     // Configure captures native handles after those actual owners retain them.
@@ -805,13 +805,13 @@ impl Residency<'_> {
                 if let Some(binding) = graphics.program.bindings.get(descriptor) {
                     match binding {
                         HostBinding::Image(view) => images.push(ShaderImage {
-                            view: view.id,
+                            view: Some(view.id),
                             descriptor,
                             sampler: None,
                         }),
                         HostBinding::CombinedImageSampler { image, sampler } => {
                             images.push(ShaderImage {
-                                view: image.id,
+                                view: Some(image.id),
                                 descriptor,
                                 sampler: Some(sampler.handle),
                             })
@@ -859,10 +859,13 @@ impl Residency<'_> {
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
         let mut feedback_aspects = vk::ImageAspectFlags::empty();
         for image in images {
-            let range = self.texture_cache.views[image.view].native.range;
+            let Some(view) = image.view else {
+                continue;
+            };
+            let range = self.texture_cache.views[view].native.range;
             let scope = pipeline.resources[image.descriptor];
             let aspects = self.draw_feedback(
-                self.texture_cache.views[image.view].image,
+                self.texture_cache.views[view].image,
                 range,
                 scope,
                 targets,

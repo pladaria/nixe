@@ -5,6 +5,7 @@ use super::*;
 pub(crate) struct CacheOwners {
     pub(crate) shader_cache: nixe_gpu_maxwell::recompiler::ShaderCache,
     device_memory: nixe_memory::device_memory::DeviceMemory,
+    pub(crate) query_cache: std::sync::Mutex<query::QueryCache>,
     pub(crate) buffer_cache: std::sync::Mutex<BufferCache>,
     pub(crate) texture_cache: std::sync::Mutex<TextureCache>,
     gpu_invalidations: Arc<virtual_range_cache::Invalidations>,
@@ -20,6 +21,7 @@ impl CacheOwners {
         Self {
             shader_cache: nixe_gpu_maxwell::recompiler::ShaderCache::new(device.clone()),
             device_memory: device.clone(),
+            query_cache: Default::default(),
             buffer_cache: std::sync::Mutex::new(buffer_cache),
             texture_cache: std::sync::Mutex::new(TextureCache::new(device, progress, samplers)),
             gpu_invalidations,
@@ -37,6 +39,10 @@ impl CacheOwners {
             .lock()
             .unwrap()
             .write_memory(address, bytes);
+        self.query_cache
+            .lock()
+            .unwrap()
+            .invalidate_region(address, bytes);
         self.shader_cache.on_cache_invalidation(address, bytes);
     }
 }
@@ -112,11 +118,19 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
             .lock()
             .unwrap()
             .write_memory(address, bytes);
+        self.query_cache
+            .lock()
+            .unwrap()
+            .invalidate_region(address, bytes);
         self.shader_cache.invalidate_region(address, bytes);
         false
     }
 
     fn invalidate_region(&self, address: u64, bytes: u64) {
+        self.query_cache
+            .lock()
+            .unwrap()
+            .invalidate_region(address, bytes);
         self.shader_cache.invalidate_region(address, bytes);
         self.texture_cache
             .lock()
@@ -287,6 +301,10 @@ impl CacheOwners {
             }
         }
         for range in regions {
+            self.query_cache
+                .lock()
+                .unwrap()
+                .invalidate_region(range.address, range.size);
             self.shader_cache.invalidate_device_write(
                 &self.device_memory,
                 range.address,

@@ -1569,6 +1569,9 @@ fn ioctl_nvmap(
                 .nvmap
                 .free(owner, handle)
                 .map_err(nvmap_driver_result)?;
+            if let Some(object) = freed.retired {
+                state.host1x.free_object(object);
+            }
             let mut output = sized_output(input, 24);
             output[8..16].copy_from_slice(&freed.address.to_le_bytes());
             output[16..20].copy_from_slice(&freed.size.to_le_bytes());

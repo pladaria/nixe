@@ -95,11 +95,6 @@ impl Residency<'_> {
             .push(Resource::Buffer(destination.buffer));
         self.ensure_buffer_range(source.buffer, source.offset, bytes)?;
         self.ensure_buffer_range(destination.buffer, destination.offset, bytes)?;
-        self.prepare_write(
-            Resource::Buffer(destination.buffer),
-            destination.offset,
-            bytes,
-        )?;
         // Save source intervals before subtracting an overlapping destination.
         let modified: smallvec::SmallVec<[(u64, u64); 4]> = self
             .buffer_cache
@@ -373,7 +368,6 @@ impl Residency<'_> {
             } else {
                 self.image_planes_transfer(image, [plane])?
             };
-            self.prepare_write(Resource::Buffer(buffer.buffer), buffer.offset, buffer_size)?;
             let destination = self.use_buffer(buffer.buffer, buffer.offset, buffer_size)?;
             let (slice, ticket) = self
                 .runtime

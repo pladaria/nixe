@@ -601,14 +601,8 @@ impl Residency<'_> {
             };
             match resource {
                 HostBindingAccess::Buffer {
-                    id,
-                    offset,
-                    size,
-                    scope,
+                    id, offset, size, ..
                 } => {
-                    if scope.writes() {
-                        self.prepare_write(Resource::Buffer(id), offset, size)?;
-                    }
                     self.use_buffer(id, offset, size)?;
                 }
                 HostBindingAccess::Image { id, scope, .. } => {

@@ -5,9 +5,8 @@ use super::*;
 use crate::cache::{DescriptorCache, PipelineCompiler};
 use ash::vk;
 use nixe_gpu::{
-    ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageKind,
     PresentationImageFormat as F, PresentationImageId, PresentationLease, PresentationRelease,
-    ResidentImage, SampleCount, native::NativePresentationImage,
+    ResidentImage, native::NativePresentationImage,
 };
 use std::time::Duration;
 
@@ -459,19 +458,8 @@ impl Frames {
         }
         let frame = self.frames[layer].as_mut().unwrap();
         frame.leases = 1;
-        let description = ImageDescription::new(
-            ImageDimension::Two,
-            ImageExtent::new(extent[0], extent[1], 1)
-                .map_err(|_| VulkanError::InvalidResource("invalid composition extent"))?,
-            ImageFormat::Rgba8Unorm,
-            ImageKind::Color,
-            1,
-            1,
-            SampleCount::One,
-        )
-        .map_err(|_| VulkanError::InvalidResource("invalid composition description"))?;
         let image = ResidentImage::from_lease(
-            description,
+            frame.display_extent,
             PresentationLease::new(
                 PresentationImageId {
                     slot: layer as u64,

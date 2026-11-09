@@ -3,10 +3,15 @@ use super::*;
 use nixe_gpu_vulkan::presentation::{HostFrame, PresentationClient};
 use std::ops::{Deref, DerefMut};
 impl PresenterState {
-    pub(super) fn new(window: Arc<Window>, backend_name: &'static str) -> Self {
+    pub(super) fn new(
+        window: Arc<Window>,
+        backend_name: &'static str,
+        game_title: Option<String>,
+    ) -> Self {
         Self {
             window,
             backend_name,
+            game_title,
             frame_dimensions: None,
             frame_rate: FrameRateTracker::new(Instant::now()),
             displayed_title: String::new(),
@@ -20,6 +25,7 @@ impl PresenterState {
 
     pub(super) fn update_title(&mut self) {
         let mut title = window_title(
+            self.game_title.as_deref(),
             self.backend_name,
             self.frame_dimensions,
             self.frame_rate.frames_per_second(),
@@ -203,7 +209,12 @@ impl WindowFrontend {
         options: nixe_gpu_vulkan::DeviceOptions,
     ) -> Result<(nixe_gpu_vulkan::VulkanDevice, PresentationClient), WindowError> {
         let mut attributes = WindowAttributes::default()
-            .with_title("Nixe - Vulkan")
+            .with_title(window_title(
+                self.application.game_title.as_deref(),
+                "Vulkan",
+                None,
+                None,
+            ))
             .with_inner_size(LogicalSize::new(1280., 720.))
             .with_min_inner_size(LogicalSize::new(320., 180.));
         if let Some(state) = self.application.initial_window_state {
@@ -238,7 +249,7 @@ impl WindowFrontend {
             let _ = proxy.send_event(FrontendEvent::FrameAvailable);
         }));
         self.application.presenter = Some(Presenter {
-            common: PresenterState::new(window, "Vulkan"),
+            common: PresenterState::new(window, "Vulkan", self.application.game_title.take()),
             client: client.clone(),
             pending: None,
             size: [size.width, size.height],

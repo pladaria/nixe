@@ -125,7 +125,12 @@ impl BlockDecoder {
         if width == 0 || height == 0 || blocks.len() as u64 != expected {
             return Err(unsupported("BC compressed block extent mismatch"));
         }
+        let hdr = matches!(
+            format,
+            ImageFormat::Bc6hRgbUfloat | ImageFormat::Bc6hRgbSfloat
+        );
         let channels = match format {
+            ImageFormat::Bc6hRgbUfloat | ImageFormat::Bc6hRgbSfloat => 3,
             ImageFormat::Bc4RUnorm | ImageFormat::Bc4RSnorm => 1,
             ImageFormat::Bc5RgUnorm | ImageFormat::Bc5RgSnorm => 2,
             ImageFormat::Bc1RgbUnorm
@@ -138,7 +143,13 @@ impl BlockDecoder {
             | ImageFormat::Bc7RgbaSrgb => 4,
             _ => return Err(unsupported("BC software import format")),
         };
-        let words_per_pixel = if channels == 4 { 2 } else { channels };
+        let words_per_pixel = if hdr {
+            4
+        } else if channels == 4 {
+            2
+        } else {
+            channels
+        };
         let size = u64::from(width)
             .checked_mul(u64::from(height))
             .and_then(|n| n.checked_mul(words_per_pixel as u64))
@@ -150,7 +161,14 @@ impl BlockDecoder {
             let y = (index / columns as usize) as u32 * bh;
             let mut normalized = [0.0; 32];
             let mut rgba = [0; 64];
+            let mut half_rgb = [0; 48];
             match format {
+                ImageFormat::Bc6hRgbUfloat | ImageFormat::Bc6hRgbSfloat => bcdec_rs::bc6h_half(
+                    encoded,
+                    &mut half_rgb,
+                    12,
+                    format == ImageFormat::Bc6hRgbSfloat,
+                ),
                 ImageFormat::Bc4RUnorm | ImageFormat::Bc4RSnorm => bcdec_rs::bc4_float(
                     encoded,
                     &mut normalized,
@@ -181,7 +199,11 @@ impl BlockDecoder {
                     let source = (row * bw + column) as usize * channels;
                     let destination = ((y + row) as usize * width as usize + (x + column) as usize)
                         * words_per_pixel;
-                    if channels == 4 {
+                    if hdr {
+                        self.pixels[destination..destination + 3]
+                            .copy_from_slice(&half_rgb[source..source + 3]);
+                        self.pixels[destination + 3] = half::f16::ONE.to_bits();
+                    } else if channels == 4 {
                         self.pixels[destination] =
                             u16::from_ne_bytes([rgba[source], rgba[source + 1]]);
                         self.pixels[destination + 1] =

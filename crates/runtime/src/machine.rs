@@ -5,7 +5,7 @@ use crate::{
     ExternalEventSender, ExternalEventSource, ProcessTeardownReport, RunnableProcess,
 };
 use nixe_scheduler::{
-    CoreSet, GuestThreadId, ProcessId, ScheduledThreadConfig, SchedulerState, VirtualCpuId,
+    GuestThreadId, ProcessId, ScheduledThreadConfig, SchedulerState, VirtualCpuId,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -18,13 +18,6 @@ use std::{
     time::Duration,
 };
 pub(crate) mod core;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProcessRegistration {
-    pub priority: i32,
-    pub ideal_vcpu: Option<VirtualCpuId>,
-    pub affinity: CoreSet,
-}
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -253,7 +246,6 @@ impl Runtime {
     pub fn register_process(
         &mut self,
         mut process: RunnableProcess,
-        registration: ProcessRegistration,
     ) -> Result<ProcessId, RuntimeError> {
         if !Arc::ptr_eq(process.scheduler(), self.scheduler()) {
             return Err(RuntimeError::ForeignKernel);
@@ -264,11 +256,20 @@ impl Runtime {
             .checked_add(1)
             .expect("process identity exhausted");
         process.assign_process_id(id);
+        // KThread::Initialize binds the main thread to the process default
+        // core with singleton affinity, just like subsequently created threads.
+        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/kernel/k_thread.cpp
+        let ideal = process.initial_ideal_vcpu();
+        let affinity = self
+            .scheduler()
+            .profile()
+            .core_set([ideal])
+            .map_err(|_| nixe_scheduler::SchedulerError::UnknownVirtualCpu(ideal))?;
         let thread = self.scheduler().create_thread(ScheduledThreadConfig {
             process: id,
-            base_priority: registration.priority,
-            ideal_vcpu: registration.ideal_vcpu,
-            affinity: registration.affinity,
+            base_priority: process.initial_thread_priority(),
+            ideal_vcpu: Some(ideal),
+            affinity,
         })?;
         process
             .assign_main_thread_id(thread)

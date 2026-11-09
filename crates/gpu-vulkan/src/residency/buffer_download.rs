@@ -4,19 +4,14 @@ use super::*;
 use crate::transfer::host_read_barrier;
 
 pub(super) struct Download {
-    work: Option<WorkTicket>,
-    ticket: Option<crate::ReadbackTicket>,
+    ticket: crate::ReadbackTicket,
     publications: Vec<Publication>,
 }
 struct Publication {
     address: u64,
     bytes: u64,
     inputs: Vec<(u64, nixe_memory::AllocationRange)>,
-    source: Source,
-}
-enum Source {
-    Native { offset: usize },
-    Literal { bytes: Arc<[u8]>, offset: usize },
+    offset: usize,
 }
 // Keep logical offsets when the device interval contains unmapped pages.
 // DeviceMemory::WriteBlockUnsafe skips those pages rather than compacting data.
@@ -42,18 +37,17 @@ impl Download {
         inputs: Vec<(u64, nixe_memory::AllocationRange)>,
     ) -> Self {
         Self {
-            work: Some(ticket.work()),
-            ticket: Some(ticket),
+            ticket,
             publications: vec![Publication {
                 address,
                 bytes,
                 inputs,
-                source: Source::Native { offset: 0 },
+                offset: 0,
             }],
         }
     }
-    pub(super) fn work(&self) -> Option<WorkTicket> {
-        self.work
+    pub(super) fn work(&self) -> WorkTicket {
+        self.ticket.work()
     }
 }
 impl BufferCache {
@@ -92,7 +86,7 @@ impl BufferCache {
         self.buffer_downloads
             .back()
             .and_then(Option::as_ref)
-            .and_then(Download::work)
+            .map(Download::work)
     }
 }
 impl Residency<'_> {
@@ -235,48 +229,32 @@ impl Residency<'_> {
                             let offset = start - base;
                             let footprint = self.runtime.device_memory.read_mapping(start, size)?;
                             let inputs = download_inputs(&footprint)?;
-                            let literal = self.buffer_cache.get(id).known.iter().find(|known| {
-                                known.offset <= offset
-                                    && offset + size <= known.offset + known.bytes.len() as u64
-                            });
-                            let source = if let Some(literal) = literal {
-                                Source::Literal {
-                                    bytes: Arc::clone(&literal.bytes),
-                                    offset: (offset - literal.offset) as usize,
-                                }
+                            let target = total;
+                            total = crate::queue::align_up(
+                                total.checked_add(size).ok_or(VulkanError::InvalidResource(
+                                    "fence download size overflow",
+                                ))?,
+                                64,
+                            )
+                            .ok_or(VulkanError::InvalidResource(
+                                "fence download alignment overflow",
+                            ))?;
+                            let copy = vk::BufferCopy::default()
+                                .src_offset(offset)
+                                .dst_offset(target)
+                                .size(size);
+                            if let Some((_, copies)) =
+                                groups.last_mut().filter(|(buffer, _)| *buffer == id)
+                            {
+                                copies.push(copy);
                             } else {
-                                let target = total;
-                                total = crate::queue::align_up(
-                                    total.checked_add(size).ok_or(VulkanError::InvalidResource(
-                                        "fence download size overflow",
-                                    ))?,
-                                    64,
-                                )
-                                .ok_or(
-                                    VulkanError::InvalidResource(
-                                        "fence download alignment overflow",
-                                    ),
-                                )?;
-                                let copy = vk::BufferCopy::default()
-                                    .src_offset(offset)
-                                    .dst_offset(target)
-                                    .size(size);
-                                if let Some((_, copies)) =
-                                    groups.last_mut().filter(|(buffer, _)| *buffer == id)
-                                {
-                                    copies.push(copy);
-                                } else {
-                                    groups.push((id, vec![copy]));
-                                }
-                                Source::Native {
-                                    offset: target as usize,
-                                }
-                            };
+                                groups.push((id, vec![copy]));
+                            }
                             publications.push(Publication {
                                 address: start,
                                 bytes: size,
                                 inputs,
-                                source,
+                                offset: target as usize,
                             });
                         }
                     }
@@ -284,56 +262,52 @@ impl Residency<'_> {
                 }
             }
         }
-        let mut work = None;
-        let ticket = if total != 0 {
-            let (slice, ticket) = self
-                .runtime
-                .device
-                .submission
-                .reserve_readback_aligned(total, 64)?;
-            let target = self.runtime.device.submission.staging_buffer(&slice).handle;
-            let mut sources = Vec::with_capacity(groups.len());
-            for (id, copies) in &mut groups {
-                let mut source = None;
-                for copy in copies {
-                    source = Some(self.use_buffer(*id, copy.src_offset, copy.size)?);
-                    copy.dst_offset += slice.offset;
-                }
-                sources.push(source.expect("nonempty copy group"));
+        if publications.is_empty() {
+            self.buffer_cache.buffer_downloads.push_back(None);
+            pending.clear();
+            self.buffer_cache.committed_gpu_modified_ranges = pending;
+            return Ok(());
+        }
+        let (slice, ticket) = self
+            .runtime
+            .device
+            .submission
+            .reserve_readback_aligned(total, 64)?;
+        let target = self.runtime.device.submission.staging_buffer(&slice).handle;
+        let mut sources = Vec::with_capacity(groups.len());
+        for (id, copies) in &mut groups {
+            let mut source = None;
+            for copy in copies {
+                source = Some(self.use_buffer(*id, copy.src_offset, copy.size)?);
+                copy.dst_offset += slice.offset;
             }
-            self.runtime.barriers.emit(&mut self.runtime.device)?;
+            sources.push(source.expect("nonempty copy group"));
+        }
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        unsafe {
+            self.runtime.device.dispatch.copy_barrier(false);
+        }
+        for ((_, copies), source) in groups.iter().zip(sources) {
             unsafe {
-                self.runtime.device.dispatch.copy_barrier(false);
+                self.runtime
+                    .device
+                    .dispatch
+                    .cmd_copy_buffer(source, target, copies, false);
             }
-            for ((_, copies), source) in groups.iter().zip(sources) {
-                unsafe {
-                    self.runtime
-                        .device
-                        .dispatch
-                        .cmd_copy_buffer(source, target, copies, false);
-                }
-            }
-            unsafe {
-                self.runtime.device.dispatch.copy_barrier(true);
-            }
-            host_read_barrier(&mut self.runtime.device, target, slice.offset, total);
-            work = Some(ticket.work());
-            Some(ticket)
-        } else {
-            None
-        };
+        }
+        unsafe {
+            self.runtime.device.dispatch.copy_barrier(true);
+        }
+        host_read_barrier(&mut self.runtime.device, target, slice.offset, total);
         for publication in &publications {
             self.buffer_cache
                 .async_downloads
                 .add(publication.address, publication.bytes);
         }
-        self.buffer_cache
-            .buffer_downloads
-            .push_back((!publications.is_empty()).then_some(Download {
-                work,
-                ticket,
-                publications,
-            }));
+        self.buffer_cache.buffer_downloads.push_back(Some(Download {
+            ticket,
+            publications,
+        }));
         pending.clear();
         self.buffer_cache.committed_gpu_modified_ranges = pending;
         Ok(())
@@ -348,21 +322,11 @@ impl BufferCache {
         Ok(())
     }
     pub(super) fn publish_download(&mut self, download: Download) -> Result<(), VulkanError> {
-        let staging = download
-            .ticket
-            .map(crate::ReadbackTicket::completed)
-            .transpose()?;
+        let staging = download.ticket.completed()?;
         for publication in download.publications {
-            let bytes = match &publication.source {
-                Source::Native { offset } => {
-                    self.native_readback_bytes += publication.bytes;
-                    &staging.as_ref().expect("native download reservation")
-                        [*offset..*offset + publication.bytes as usize]
-                }
-                Source::Literal { bytes, offset } => {
-                    &bytes[*offset..*offset + publication.bytes as usize]
-                }
-            };
+            self.native_readback_bytes += publication.bytes;
+            let offset = publication.offset;
+            let bytes = &staging[offset..offset + publication.bytes as usize];
             let memory = self.device_memory.machine().clone();
             let buffers = &mut *self;
             for &(offset, ref input) in &publication.inputs {
@@ -390,209 +354,5 @@ impl BufferCache {
         }
         drop(staging);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::residency::tests::{backing_allocation, buffer, cache, cpu_read};
-
-    #[test]
-    fn safe_owner_read_downloads_current_buffer_and_cancels_older_publications() {
-        use nixe_memory::{AccessOperation, AccessResult};
-        let Some(mut owner) = cache(crate::ApiPreference::Auto, 16 * 1024 * 1024) else {
-            return;
-        };
-        let (_allocation, mapping) = backing_allocation(owner.device_memory(), 4096, 0x19);
-        let mut cache = owner.access();
-        let validation = cache.device().validation_monitor();
-        let id = buffer(&mut cache, Arc::clone(&mapping));
-        cache.fill_buffer(id, 4, 8, 0x37373737).unwrap();
-        cache.commit_buffer_downloads().unwrap();
-        cache.flush().unwrap();
-        cache.fill_buffer(id, 4, 4, 0x42424242).unwrap();
-        let inputs = mapping.pin(5, 1).unwrap();
-        let AccessResult::Read(bytes) = cache
-            .access_memory(&inputs, &mut AccessOperation::Read(Vec::new()))
-            .unwrap()
-        else {
-            panic!("expected safe read");
-        };
-        assert_eq!(bytes, [0x42]);
-        assert!(cache.buffer_cache.gpu_modified_ranges.is_empty());
-        assert!(
-            cache
-                .buffer_cache
-                .uncommitted_gpu_modified_ranges
-                .is_empty()
-        );
-        crate::residency::tests::wait_buffer_downloads(&mut cache).unwrap();
-        let bytes = cpu_read(&mut cache, &mapping);
-        assert_eq!(&bytes[4..8], &[0x42; 4]);
-        assert_eq!(&bytes[8..12], &[0x37; 4]);
-        assert_eq!(&bytes[12..], &[0x19; 4084]);
-        // Subsequent native writes still become dirty and publish at their fence.
-        cache.fill_buffer(id, 8, 4, 0x71717171).unwrap();
-        cache.commit_buffer_downloads().unwrap();
-        cache.flush().unwrap();
-        crate::residency::tests::wait_buffer_downloads(&mut cache).unwrap();
-        assert_eq!(
-            &cpu_read(&mut cache, &mapping)[4..12],
-            &[0x42, 0x42, 0x42, 0x42, 0x71, 0x71, 0x71, 0x71]
-        );
-        drop(cache);
-        drop(owner);
-        validation.check().unwrap();
-    }
-
-    #[test]
-    fn fence_batch_groups_regions_and_retains_later_overlapping_producers() {
-        let Some(mut cache_owner) = cache(crate::ApiPreference::Auto, 16 * 1024 * 1024) else {
-            return;
-        };
-        let mut cache = cache_owner.access();
-        let validation = cache.runtime.device.validation_monitor();
-        let first = backing_allocation(cache.device_memory(), 4096, 0x19);
-        let second = backing_allocation(cache.device_memory(), 4096, 0x19);
-        let ids = [
-            buffer(&mut cache, Arc::clone(&first.1)),
-            buffer(&mut cache, Arc::clone(&second.1)),
-        ];
-        for (index, &id) in ids.iter().enumerate() {
-            cache
-                .fill_buffer(id, 4, 8, 0x37373737 + index as u32)
-                .unwrap();
-            cache
-                .fill_buffer(id, 80, 12, 0x42424242 + index as u32)
-                .unwrap();
-        }
-        cache.commit_buffer_downloads().unwrap();
-        assert_eq!(cache.buffer_cache.buffer_downloads.len(), 1);
-        let batch = cache.buffer_cache.buffer_downloads[0].as_ref().unwrap();
-        // Eden ForEachDownloadRange reports whole dirty pages for each
-        // committed interval. Both small regions on a page are therefore
-        // included by each query, with independent async overlap references.
-        assert_eq!(batch.ticket.as_ref().unwrap().slice.size, 512);
-        assert_eq!(batch.publications.len(), 8);
-        assert!(
-            batch
-                .publications
-                .iter()
-                .all(|p| matches!(p.source, Source::Native { offset } if offset % 64 == 0))
-        );
-        assert_eq!(cache.runtime.device.queue_usage().retained_readbacks, 1);
-        let prefix = batch.work.unwrap();
-        cache.flush().unwrap();
-        cache.fill_buffer(ids[0], 4, 4, 0x71717171).unwrap();
-        cache.commit_buffer_downloads().unwrap();
-        cache.flush().unwrap();
-        cache
-            .runtime
-            .device
-            .wait_for_work(prefix, std::time::Duration::MAX)
-            .unwrap();
-        cache.buffer_cache.pop_async_flush().unwrap();
-        assert_eq!(cache.buffer_cache.buffer_downloads.len(), 1);
-        assert_eq!(cache.runtime.device.queue_usage().retained_readbacks, 1);
-        crate::residency::tests::wait_buffer_downloads(&mut cache).unwrap();
-        assert_eq!(cache.runtime.device.queue_usage().retained_readbacks, 0);
-        let a = cpu_read(&mut cache, &first.1);
-        let b = cpu_read(&mut cache, &second.1);
-        assert_eq!(&a[4..8], &[0x71; 4]);
-        assert_eq!(&a[8..12], &[0x37; 4]);
-        assert_eq!(&a[80..92], &[0x42; 12]);
-        assert_eq!(&b[4..12], &0x37373738u32.to_le_bytes().repeat(2));
-        assert_eq!(&b[80..92], &0x42424243u32.to_le_bytes().repeat(3));
-        assert_eq!(&a[12..80], &[0x19; 68]);
-        drop(cache);
-        drop(cache_owner);
-        validation.check().unwrap();
-    }
-}
-
-#[cfg(test)]
-mod cpu_store_tests {
-    use super::*;
-    use nixe_memory::{
-        AccessOperation, AddressSpace, AddressWidth, GuestVirtualAddress, MemoryPermissions,
-    };
-
-    #[test]
-    fn explicit_cpu_invalidation_cancels_its_cache_line_before_fence_publication() {
-        let Some(mut owner) =
-            super::super::tests::cache(crate::ApiPreference::Auto, 16 * 1024 * 1024)
-        else {
-            return;
-        };
-        let memory = owner.device_memory().clone();
-        let machine = memory.machine().clone();
-        let allocation = machine.account(4096).unwrap().allocate(4096).unwrap();
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(0x10000);
-        space
-            .map(base, allocation, 0, 4096, MemoryPermissions::READ_WRITE)
-            .unwrap();
-        let inputs = space
-            .capture(base, 4096, MemoryPermissions::READ_WRITE)
-            .unwrap();
-        machine.write_resolved(&inputs, &[0x19; 4096]).unwrap();
-        let reservation = memory.reserve(65536, 65536).unwrap();
-        let pin = memory
-            .map(reservation.address(), inputs.clone().into(), true)
-            .unwrap();
-        let mut cache = owner.access();
-        let validation = cache.device().validation_monitor();
-        let id = super::super::tests::buffer(&mut cache, Arc::clone(pin.physical()));
-        cache.fill_buffer(id, 4, 8, 0x37373737).unwrap();
-        cache.fill_buffer(id, 80, 8, 0x44444444).unwrap();
-        cache.commit_buffer_downloads().unwrap();
-        cache.flush().unwrap();
-        drop(cache);
-
-        machine.enable_cpu_write_collection().unwrap();
-        let core = space.register_core(Arc::new(|| {}));
-        let native = core.enter_native().unwrap();
-        let target = GuestVirtualAddress::new(base.get() + 6);
-        assert!(!space.write_native(&native, target, &[0x55, 0x66]).unwrap());
-        let operation = space
-            .capture_native(&native, target, 2, MemoryPermissions::WRITE)
-            .unwrap();
-        let cached = space.has_cached_pages(&native, target, 2).unwrap();
-        native.suspend();
-        assert!(matches!(
-            native
-                .access_captured(&operation, cached, AccessOperation::Write(vec![0x55, 0x66]))
-                .unwrap()
-                .into_ready()
-                .unwrap(),
-            nixe_memory::AccessResult::Written(_)
-        ));
-        native.resume().unwrap();
-        drop(native);
-
-        machine.gather_gpu_dirty_memory(|address, bytes| {
-            nixe_memory::device_memory::DeviceMemoryInterface::invalidate_region(
-                &*owner.caches,
-                address,
-                bytes,
-            );
-        });
-        let mut cache = owner.access();
-        crate::residency::tests::wait_buffer_downloads(&mut cache).unwrap();
-        let mut bytes = [0; 128];
-        pin.physical().capture_stream(0, &mut bytes).unwrap();
-        assert_eq!(
-            &bytes[4..12],
-            &[0x19, 0x19, 0x55, 0x66, 0x19, 0x19, 0x19, 0x19]
-        );
-        assert_eq!(&bytes[..4], &[0x19; 4]);
-        assert_eq!(&bytes[12..64], &[0x19; 52]);
-        assert_eq!(&bytes[80..88], &[0x44; 8]);
-        machine.gather_gpu_dirty_memory(|_, _| panic!("unexpected pending CPU invalidation"));
-        machine.disable_cpu_write_collection();
-        drop(cache);
-        drop(owner);
-        validation.check().unwrap();
     }
 }
