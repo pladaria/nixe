@@ -145,6 +145,7 @@ impl crate::native::pipeline_cache::PipelineCache {
         let polygon = registers::pack_polygon(r)?;
         let mut raw1 = u32::from(f.base)
             | (u32::from(f.base2) << 1)
+            | (u32::from(f.depth_clamp_enable) << 2)
             | (u32::from(f.blending()) << 3)
             | (u32::from(f.vertex_input) << 5)
             | (u32::from(r[0x0d7c / 4] == 0) << 7)
@@ -168,6 +169,9 @@ impl crate::native::pipeline_cache::PipelineCache {
             | (u32::from(r[0x1684 / 4] != 0) << 12)
             | (u32::from(r[0x1570 / 4] != 0) << 14)
             | (u32::from(depth_enabled && matches!(depth_code, 0x14 | 0x16 | 0x19)) << 18);
+        if !f.depth_clamp_enable {
+            raw2 |= u32::from(registers::depth_clamp_enabled(r)?);
+        }
         if let Some(t) = tessellation {
             raw1 &= !(0x3ff << 10);
             raw1 |= ((t.mode.domain as u32) << 10)
@@ -278,17 +282,18 @@ impl FixedPipelineState {
     /// current device, as Eden PipelineCache::LoadDiskResources checks.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp#L670-L679
     pub(in crate::native) fn matches_profile(&self, profile: &crate::DeviceProfile) -> bool {
-        const DYNAMIC_FEATURES: u32 = 1 | (1 << 1) | (1 << 3) | (1 << 5);
+        const DYNAMIC_FEATURES: u32 = 1 | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5);
         let state = &profile.dynamic_state;
         let features = u32::from(state.base)
             | (u32::from(state.base2) << 1)
+            | (u32::from(state.depth_clamp_enable) << 2)
             | (u32::from(state.blending()) << 3)
             | (u32::from(state.vertex_input) << 5);
         self.raw1 & DYNAMIC_FEATURES == features
     }
 
     pub(in crate::native) fn environment_key(&self) -> Vec<u8> {
-        let mut bytes = vec![6];
+        let mut bytes = vec![7];
         for hash in self.shader {
             bytes.extend_from_slice(&hash.to_le_bytes());
         }
@@ -328,7 +333,7 @@ impl FixedPipelineState {
             *bytes = &bytes[N..];
             Some(value)
         }
-        if take::<1>(&mut bytes)? != [6] {
+        if take::<1>(&mut bytes)? != [7] {
             return None;
         }
         let mut key = Self::default();
@@ -456,6 +461,7 @@ impl FixedPipelineState {
         state.primitive_restart = self.dynamic_state[0] & (1 << 3) != 0;
         state.raster_discard = self.raw1 & (1 << 1) == 0 && self.dynamic_state[0] & (1 << 5) == 0;
         state.depth_bias = self.dynamic_state[0] & (1 << 4) != 0;
+        state.depth_clamp = self.raw2 & 1 != 0;
         state.patch_points = self
             .tessellation()
             .map_or(0, |t| u32::from(t.input_control_points));

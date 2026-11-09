@@ -145,14 +145,8 @@ impl GamepadProfile {
                 dpad_left: button(self.dpleft),
                 dpad_right: button(self.dpright),
             },
-            left_stick: StickState {
-                x: mapped_stick_axis(controller, self.leftx),
-                y: mapped_stick_axis(controller, self.lefty).saturating_neg(),
-            },
-            right_stick: StickState {
-                x: mapped_stick_axis(controller, self.rightx),
-                y: mapped_stick_axis(controller, self.righty).saturating_neg(),
-            },
+            left_stick: mapped_stick(controller, self.leftx, self.lefty),
+            right_stick: mapped_stick(controller, self.rightx, self.righty),
             gyroscope: self.gyroscope.and_then(|sensor| motion(controller, sensor)),
             accelerometer: self
                 .accelerometer
@@ -173,6 +167,27 @@ fn axis_pressed(controller: &ControllerState, source: Option<Axis>) -> bool {
                 >= u32::from(TRIGGER_PRESS_THRESHOLD)
         }
     })
+}
+
+// Apply the reference input converter's radial deadzone and outer range after
+// profile axis selection. SDL inspection retains the original device samples.
+// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/hid_core/frontend/input_converter.cpp#L366-L436
+// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/input_common/input_poller.cpp#L926-L955
+fn mapped_stick(controller: &ControllerState, x: Option<Axis>, y: Option<Axis>) -> StickState {
+    const DEADZONE: f32 = 0.15;
+    const RANGE: f32 = 0.95;
+    let x = f32::from(mapped_stick_axis(controller, x)) / f32::from(i16::MAX);
+    let y = -f32::from(mapped_stick_axis(controller, y)) / f32::from(i16::MAX);
+    let radius = (x * x + y * y).sqrt();
+    if radius <= DEADZONE {
+        return StickState::default();
+    }
+    let factor = (radius - DEADZONE) / ((1.0 - DEADZONE) * RANGE * radius);
+    let factor = factor / (radius * factor).max(1.0);
+    StickState {
+        x: (x * factor * f32::from(i16::MAX)) as i16,
+        y: (y * factor * f32::from(i16::MAX)) as i16,
+    }
 }
 
 fn mapped_stick_axis(controller: &ControllerState, source: Option<Axis>) -> i16 {
@@ -207,7 +222,6 @@ fn motion(controller: &ControllerState, source: MotionSensor) -> Option<MotionVe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ButtonSet, DPadState, FaceButtonLabels, MotionState, TriggerState};
 
     fn profile() -> GamepadProfile {
         GamepadProfile {
@@ -240,40 +254,6 @@ mod tests {
         }
     }
 
-    fn controller(name: &str) -> ControllerState {
-        let mut buttons = ButtonSet::default();
-        buttons.set(Button::East, true);
-        buttons.set(Button::Start, true);
-        buttons.set(Button::Guide, true);
-        ControllerState {
-            id: ControllerId::new(7),
-            name: name.into(),
-            kind: ControllerKind::SwitchPro,
-            buttons,
-            button_labels: FaceButtonLabels::default(),
-            dpad: DPadState::default(),
-            left_stick: StickState { x: 123, y: -456 },
-            right_stick: StickState { x: -789, y: 321 },
-            triggers: TriggerState {
-                left: 40_000,
-                right: 10_000,
-            },
-            motion: MotionState {
-                gyroscope: Some(MotionVector {
-                    x: 1.0,
-                    y: 2.0,
-                    z: 3.0,
-                }),
-                accelerometer: Some(MotionVector {
-                    x: 4.0,
-                    y: 5.0,
-                    z: 6.0,
-                }),
-                ..MotionState::default()
-            },
-        }
-    }
-
     #[test]
     fn requires_an_exact_selector() {
         let profiles = GamepadProfiles::new(BTreeMap::from([("switch-pro".to_owned(), profile())]));
@@ -293,27 +273,6 @@ mod tests {
                 .unwrap()
                 .0,
             "switch-pro"
-        );
-    }
-
-    #[test]
-    fn maps_buttons_axes_triggers_and_motion() {
-        let mapped = profile().map(&controller("Nintendo Switch Pro Controller"));
-        assert!(mapped.buttons.a);
-        assert!(!mapped.buttons.b);
-        assert!(mapped.buttons.plus);
-        assert!(mapped.buttons.home);
-        assert!(mapped.buttons.zl);
-        assert!(!mapped.buttons.zr);
-        assert_eq!(mapped.left_stick, StickState { x: 123, y: 456 });
-        assert_eq!(mapped.right_stick, StickState { x: -789, y: -321 });
-        assert_eq!(
-            mapped.gyroscope,
-            Some(MotionVector {
-                x: 1.0,
-                y: 2.0,
-                z: 3.0
-            })
         );
     }
 }

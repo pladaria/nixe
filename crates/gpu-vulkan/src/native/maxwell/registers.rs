@@ -218,6 +218,21 @@ pub(super) fn pack_polygon(r: &Regs) -> Result<u32, VulkanError> {
         value => Err(unsupported(0x0dac, value, "unsupported polygon mode")),
     }
 }
+/// W-only and XY clipping retain geometry outside the depth interval. Match
+/// Eden's UpdateDepthClampEnable and its static pipeline fallback.
+/// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L1754-L1768
+pub(super) fn depth_clamp_enabled(r: &Regs) -> Result<bool, VulkanError> {
+    match (r[0x193c / 4] >> 11) & 7 {
+        0 | 2 | 4 | 6 => Ok(true),
+        1 | 3 | 5 => Ok(false),
+        _ => Err(unsupported(
+            0x193c,
+            r[0x193c / 4],
+            "invalid viewport geometry clipping mode",
+        )),
+    }
+}
+
 pub(super) fn depth_bias_enabled(r: &Regs, topology: u32) -> Result<bool, VulkanError> {
     let method = match topology {
         0 => 0x0dc0,

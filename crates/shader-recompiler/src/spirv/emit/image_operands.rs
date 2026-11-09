@@ -40,7 +40,10 @@ impl Operands {
                 O::CompositeConstructU32x4 => 4,
                 _ => 0,
             };
-            if n > 0 && (0..n).all(|i| matches!(inst.arg(i), Ok(Value::U32(_)))) {
+            // Folded scalar operands can remain behind Identity instructions.
+            // Match Eden's AreAllArgsImmediates before emitting ConstOffset.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp#L186-L220
+            if n > 0 && ir.all_args_immediate(id)? {
                 let mut components = [Id::NONE; 4];
                 for (i, component) in components.iter_mut().enumerate().take(n) {
                     *component = ctx

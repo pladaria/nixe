@@ -15,6 +15,7 @@ pub(crate) struct DynamicState {
     pub primitive_restart: bool,
     pub raster_discard: bool,
     pub depth_bias: bool,
+    pub depth_clamp: bool,
 }
 impl From<&crate::cache::GraphicsState> for DynamicState {
     fn from(state: &crate::cache::GraphicsState) -> Self {
@@ -32,6 +33,7 @@ impl From<&crate::cache::GraphicsState> for DynamicState {
             primitive_restart: state.primitive_restart,
             raster_discard: state.raster_discard,
             depth_bias: state.depth_bias,
+            depth_clamp: state.depth_clamp,
         }
     }
 }

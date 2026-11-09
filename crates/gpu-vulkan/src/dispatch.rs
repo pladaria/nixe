@@ -23,6 +23,7 @@ struct Functions {
     timestamp: vk::PFN_vkCmdWriteTimestamp2,
     state: Option<StateDispatch>,
     state2: Option<State2Dispatch>,
+    depth_clamp: Option<vk::PFN_vkCmdSetDepthClampEnableEXT>,
     feedback: Option<vk::PFN_vkCmdSetAttachmentFeedbackLoopEnableEXT>,
     vertex_input: Option<vk::PFN_vkCmdSetVertexInputEXT>,
     vertex_buffers2: Option<vk::PFN_vkCmdBindVertexBuffers2>,
@@ -169,8 +170,14 @@ impl Dispatch {
                 }
             }
         });
-        let dynamic_mask =
-            if state.is_some() { 0x3ff } else { 0 } | if state2.is_some() { 0x1c00 } else { 0 };
+        let depth_clamp = profile.dynamic_state.depth_clamp_enable.then(|| {
+            ash::ext::extended_dynamic_state3::Device::new(instance, device)
+                .fp()
+                .cmd_set_depth_clamp_enable_ext
+        });
+        let dynamic_mask = if state.is_some() { 0x3ff } else { 0 }
+            | if state2.is_some() { 0x1c00 } else { 0 }
+            | if depth_clamp.is_some() { 1 << 13 } else { 0 };
         let feedback = feedback_loop.then(|| {
             ash::ext::attachment_feedback_loop_dynamic_state::Device::new(instance, device)
                 .fp()
@@ -187,6 +194,7 @@ impl Dispatch {
                 timestamp,
                 state,
                 state2,
+                depth_clamp,
                 feedback,
                 vertex_buffers2: dynamic.then(|| match path {
                     ApiPath::Core13 => device.fp_v1_3().cmd_bind_vertex_buffers2,
@@ -416,6 +424,18 @@ impl Dispatch {
             Ok(())
         });
     }
+    pub unsafe fn cmd_set_depth_clamp_enable(&mut self, value: bool) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                (ctx.functions
+                    .depth_clamp
+                    .expect("enabled native depth clamp state"))(
+                    ctx.command, u32::from(value)
+                );
+            }
+            Ok(())
+        });
+    }
     pub unsafe fn cmd_set_stencil_op(
         &mut self,
         face: vk::StencilFaceFlags,
@@ -503,6 +523,9 @@ impl Dispatch {
                     if changed & (1 << 12) != 0 {
                         (state.bias)(command, u32::from(s.depth_bias));
                     }
+                }
+                if let Some(depth_clamp) = ctx.functions.depth_clamp {
+                    (depth_clamp)(command, u32::from(s.depth_clamp));
                 }
             }
             Ok(())

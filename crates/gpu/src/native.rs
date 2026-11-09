@@ -98,6 +98,7 @@ impl GraphicsDirty {
     /// buffer cache independently consumes the individual VERTICES slots.
     pub const VERTEX_BUFFERS: u128 = 1 << 76;
     pub const VIEWPORT_SWIZZLES: u128 = 1 << 77;
+    pub const DEPTH_CLAMP_ENABLE: u128 = 1 << 78;
     pub const NATIVE_STATE: u128 = Self::VERTEX_INPUT
         | Self::COLOR_OUTPUT
         | Self::VIEWPORT
@@ -120,7 +121,8 @@ impl GraphicsDirty {
         | Self::PRIMITIVE_RESTART
         | Self::RASTERIZER_DISCARD
         | Self::DEPTH_BIAS_ENABLE
-        | Self::DEPTH_BOUNDS_ENABLE;
+        | Self::DEPTH_BOUNDS_ENABLE
+        | Self::DEPTH_CLAMP_ENABLE;
     pub const PARAMETERS: u128 = Self::VIEWPORT_SWIZZLES
         | Self::NATIVE_STATE
         | Self::VERTEX_BUFFERS

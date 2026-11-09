@@ -82,6 +82,15 @@ pub(in crate::native) fn record(
         if needs(D::SCISSOR) {
             raw.cmd_set_scissor(0, &[registers::scissor(r)]);
         }
+        if profile.dynamic_state.depth_clamp_enable && needs(D::DEPTH_CLAMP_ENABLE) {
+            let enabled = registers::depth_clamp_enabled(r)?;
+            if enabled && profile.core.depth_clamp == 0 {
+                return Err(VulkanError::InvalidResource(
+                    "viewport depth clamp requires host depthClamp support",
+                ));
+            }
+            raw.cmd_set_depth_clamp_enable(enabled);
+        }
         if needs(D::DEPTH_BIAS) {
             let bias = [
                 f32::from_bits(r[0x15bc / 4]) * 0.5,

@@ -162,6 +162,9 @@ impl PipelineCompiler {
         if device.profile().dynamic_state.vertex_input {
             dynamic.push(vk::DynamicState::VERTEX_INPUT_EXT);
         }
+        if device.profile().dynamic_state.depth_clamp_enable {
+            dynamic.push(vk::DynamicState::DEPTH_CLAMP_ENABLE_EXT);
+        }
         if device.profile().dynamic_state.blending() {
             dynamic.extend([
                 vk::DynamicState::COLOR_BLEND_ENABLE_EXT,

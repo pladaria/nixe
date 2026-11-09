@@ -31,7 +31,7 @@ pub(crate) use descriptors::{DescriptorAllocator, DescriptorEntry};
 pub(crate) use update_queue::{DescriptorUpdate, UpdateDescriptorQueue};
 
 // Both on-disk files are invalidated together when translation or key ABI changes.
-const PERSISTENCE_VERSION: u32 = 6;
+const PERSISTENCE_VERSION: u32 = 7;
 pub(crate) mod archive;
 pub(crate) use shader::compile_guest;
 #[derive(Clone, Debug)]

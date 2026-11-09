@@ -150,6 +150,9 @@ impl GraphicsState {
             self.raster_discard = false;
             self.depth_bias = false;
         }
+        if dynamic.contains(&vk::DynamicState::DEPTH_CLAMP_ENABLE_EXT) {
+            self.depth_clamp = false;
+        }
         if dynamic.contains(&vk::DynamicState::VERTEX_INPUT_EXT) {
             self.vertex_bindings = Arc::from([]);
             self.vertex_attributes = Arc::from([]);
