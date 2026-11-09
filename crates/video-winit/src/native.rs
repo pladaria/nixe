@@ -7,6 +7,7 @@ impl PresenterState {
         window: Arc<Window>,
         backend_name: &'static str,
         game_title: Option<String>,
+        smooth_motion: Option<SmoothMotion>,
     ) -> Self {
         Self {
             window,
@@ -14,6 +15,7 @@ impl PresenterState {
             game_title,
             frame_dimensions: None,
             frame_rate: FrameRateTracker::new(Instant::now()),
+            smooth_motion: smooth_motion.map(PresentationRate::new),
             displayed_title: String::new(),
             paused: false,
             keyboard: None,
@@ -29,6 +31,10 @@ impl PresenterState {
             self.backend_name,
             self.frame_dimensions,
             self.frame_rate.frames_per_second(),
+            self.smooth_motion
+                .as_ref()
+                .and_then(|rate| rate.frames_per_second),
+            self.smooth_motion.is_some(),
         );
         if self.paused {
             title.push_str(" | Paused");
@@ -135,7 +141,11 @@ impl Presenter {
     }
     pub(super) fn refresh_title(&mut self, now: Instant) {
         self.poll();
+        let elapsed = now.saturating_duration_since(self.common.frame_rate.sample_started);
         if self.common.frame_rate.refresh(now) {
+            if let Some(rate) = &mut self.common.smooth_motion {
+                rate.refresh(elapsed, self.client.presentation_count());
+            }
             self.common.update_title();
         }
     }
@@ -214,6 +224,8 @@ impl WindowFrontend {
                 "Vulkan",
                 None,
                 None,
+                None,
+                self.application.smooth_motion.is_some(),
             ))
             .with_inner_size(LogicalSize::new(1280., 720.))
             .with_min_inner_size(LogicalSize::new(320., 180.));
@@ -242,6 +254,14 @@ impl WindowFrontend {
             }
         }
         let (window, device) = bootstrap.result.take().unwrap()?;
+        if let Some(counter) = &self.application.smooth_motion
+            && !counter.attached()
+        {
+            return Err(WindowError::new(
+                "NVIDIA Smooth Motion",
+                "the downstream presentation counter layer was not loaded by Vulkan",
+            ));
+        }
         let size = window.inner_size();
         let client = PresentationClient::default();
         let proxy = self.control.proxy.clone();
@@ -249,7 +269,12 @@ impl WindowFrontend {
             let _ = proxy.send_event(FrontendEvent::FrameAvailable);
         }));
         self.application.presenter = Some(Presenter {
-            common: PresenterState::new(window, "Vulkan", self.application.game_title.take()),
+            common: PresenterState::new(
+                window,
+                "Vulkan",
+                self.application.game_title.take(),
+                self.application.smooth_motion.take(),
+            ),
             client: client.clone(),
             pending: None,
             size: [size.width, size.height],

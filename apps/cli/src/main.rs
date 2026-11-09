@@ -53,7 +53,9 @@ fn main() -> ExitCode {
     }
 
     #[cfg(feature = "execution-trace")]
-    if let Err(error) = nixe_memory::trace::start() {
+    if !matches!(&invocation.command, Command::Run(_))
+        && let Err(error) = nixe_memory::trace::start()
+    {
         log::error!("cannot start execution trace: {error}");
         return ExitCode::FAILURE;
     }

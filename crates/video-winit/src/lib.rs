@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use nixe_config::WindowState;
+use nixe_gpu_vulkan::smooth_motion::SmoothMotion;
 use nixe_input::{
     EmulatedTouchContact, TOUCH_SCREEN_HEIGHT, TOUCH_SCREEN_WIDTH, TouchScreenReader,
     TouchScreenWriter, touch_screen_channel,
@@ -145,6 +146,7 @@ impl WindowFrontend {
                 initial_window_state: None,
                 last_window_state: None,
                 screenshots: None,
+                smooth_motion: None,
                 touch_screen_writer,
                 touch_tracker: TouchTracker::default(),
                 keyboard_host,
@@ -160,6 +162,12 @@ impl WindowFrontend {
     #[must_use]
     pub fn mailbox(&self) -> FrameMailbox {
         self.application.mailbox.clone()
+    }
+
+    #[must_use]
+    pub fn with_smooth_motion(mut self, smooth_motion: Option<SmoothMotion>) -> Self {
+        self.application.smooth_motion = smooth_motion;
+        self
     }
 
     #[must_use]
@@ -252,6 +260,7 @@ struct PresenterState {
     backend_name: &'static str,
     game_title: Option<String>,
     frame_rate: FrameRateTracker,
+    smooth_motion: Option<PresentationRate>,
     displayed_title: String,
     paused: bool,
     keyboard: Option<keyboard::KeyboardOverlay>,
@@ -298,6 +307,54 @@ impl FrameRateTracker {
 
     fn next_refresh(self) -> Instant {
         self.sample_started + TITLE_REFRESH_INTERVAL
+    }
+}
+
+struct PresentationRate {
+    counter: SmoothMotion,
+    previous_output: u64,
+    previous_input: u64,
+    frames_per_second: Option<f64>,
+    generation_observed: Option<bool>,
+}
+
+impl PresentationRate {
+    fn new(counter: SmoothMotion) -> Self {
+        Self {
+            previous_output: counter.presentation_count(),
+            previous_input: 0,
+            frames_per_second: None,
+            generation_observed: None,
+            counter,
+        }
+    }
+
+    fn refresh(&mut self, elapsed: Duration, input: u64) {
+        let output = self.counter.presentation_count();
+        let presented = output.saturating_sub(self.previous_output);
+        let submitted = input.saturating_sub(self.previous_input);
+        self.previous_output = output;
+        self.previous_input = input;
+        let fps = presented as f64 / elapsed.as_secs_f64();
+        self.frames_per_second = Some(fps);
+        // Compare against all application presents, including repeated UI frames.
+        // Leave margin for asynchronous presentations crossing a sample boundary.
+        if submitted >= 10 {
+            let generated = presented > submitted + 2 && output > input + 2;
+            if self.generation_observed != Some(generated) {
+                let input_fps = submitted as f64 / elapsed.as_secs_f64();
+                if generated {
+                    log::info!(
+                        "NVIDIA Smooth Motion: additional presentations observed; presentation_fps={fps:.0} application_fps={input_fps:.0}"
+                    );
+                } else {
+                    log::warn!(
+                        "NVIDIA Smooth Motion requested, but no additional presentations observed this interval; presentation_fps={fps:.0} application_fps={input_fps:.0}"
+                    );
+                }
+                self.generation_observed = Some(generated);
+            }
+        }
     }
 }
 
@@ -440,12 +497,26 @@ fn window_title(
     backend: &str,
     output: Option<(u32, u32)>,
     fps: Option<f64>,
+    presentation_fps: Option<f64>,
+    smooth_motion: bool,
 ) -> String {
     let output = output.map_or_else(
         || "-".to_owned(),
         |(width, height)| format!("{width}×{height}"),
     );
-    let fps = fps.map_or_else(|| "-- FPS".to_owned(), |fps| format!("{fps:.1} FPS"));
+    let fps = fps.map(|fps| fps.round() as u64);
+    let presentation_fps = presentation_fps.map(|fps| fps.round() as u64);
+    let format_fps =
+        |fps: Option<u64>| fps.map_or_else(|| "-- FPS".to_owned(), |fps| format!("{fps} FPS"));
+    let fps = if smooth_motion && presentation_fps != fps {
+        format!(
+            "{} (presentation) - {} (game)",
+            format_fps(presentation_fps),
+            format_fps(fps)
+        )
+    } else {
+        format_fps(fps)
+    };
     if let Some(game) = game {
         format!("Nixe - {game} | {backend} | {output} | {fps}")
     } else {
@@ -454,6 +525,7 @@ fn window_title(
 }
 
 struct PresenterApplication {
+    smooth_motion: Option<SmoothMotion>,
     mailbox: FrameMailbox,
     stop_requested: Arc<AtomicBool>,
     worker_completion: Arc<WorkerCompletionState>,

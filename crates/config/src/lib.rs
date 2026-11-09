@@ -412,10 +412,15 @@ fn audio_volume<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8,
 pub struct VideoConfig {
     /// Synchronize host presentation to the monitor's vertical refresh.
     pub vsync: bool,
+    /// Request NVIDIA's Linux Vulkan frame generation and measure its output.
+    pub nvidia_smooth_motion: bool,
 }
 impl Default for VideoConfig {
     fn default() -> Self {
-        Self { vsync: true }
+        Self {
+            vsync: true,
+            nvidia_smooth_motion: true,
+        }
     }
 }
 

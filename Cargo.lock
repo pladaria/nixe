@@ -1419,9 +1419,11 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+ "cc",
  "egui",
  "gpu-allocator",
  "libc",
+ "libloading",
  "log",
  "nixe-gpu",
  "nixe-gpu-maxwell",

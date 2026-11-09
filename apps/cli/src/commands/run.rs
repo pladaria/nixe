@@ -41,11 +41,23 @@ pub struct Arguments {
     pub file_system_access_log_override: Option<bool>,
 }
 
-pub fn run(arguments: Arguments) -> Result<(), String> {
+pub fn run(mut arguments: Arguments) -> Result<(), String> {
+    let config = load_config(arguments.config_path.take(), arguments.log_level_override)?;
+    // SAFETY: main defers tracing for this command. No window, signal handler,
+    // machine, profiler or worker has started, so environment access is exclusive.
+    let smooth_motion = unsafe {
+        nixe_gpu_vulkan::smooth_motion::SmoothMotion::configure(
+            config.video.nvidia_smooth_motion && !arguments.headless,
+        )?
+    };
+    #[cfg(feature = "execution-trace")]
+    nixe_memory::trace::start().map_err(|e| format!("cannot start execution trace: {e}"))?;
     let memory = nixe_memory::Machine::switch_ram().map_err(|error| error.to_string())?;
     #[cfg(feature = "performance-counters")]
     let capture = crate::performance::Capture::start(memory.clone()).map_err(|e| e.to_string())?;
-    let result = run_with_memory(arguments, memory);
+    // Retain the extracted layer and its native code through GPU teardown,
+    // independently of the window closing before the guest worker finishes.
+    let result = run_with_memory(arguments, memory, config, smooth_motion.clone());
     #[cfg(feature = "performance-counters")]
     if let Some(capture) = capture {
         capture.finish().map_err(|e| e.to_string())?;
@@ -53,10 +65,15 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     result
 }
 
-fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result<(), String> {
+fn run_with_memory(
+    arguments: Arguments,
+    memory: nixe_memory::Machine,
+    config: nixe_config::NixeConfig,
+    smooth_motion: Option<nixe_gpu_vulkan::smooth_motion::SmoothMotion>,
+) -> Result<(), String> {
     let Arguments {
-        config_path,
-        log_level_override,
+        config_path: _,
+        log_level_override: _,
         identifier,
         headless,
         vulkan,
@@ -69,7 +86,8 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         (None, None, None, None)
     } else {
         let mut frontend = WindowFrontend::new(Arc::clone(&frontend_stop_requested))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+            .with_smooth_motion(smooth_motion);
         let control = frontend.control();
         let mailbox = frontend.mailbox();
         let touch_screen = frontend.take_touch_screen();
@@ -82,7 +100,6 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
     };
     let machine_profile = switch_1_machine_profile();
     let scheduler_profile = machine_profile.scheduler().clone();
-    let config = load_config(config_path, log_level_override)?;
     let diagnostics_configuration = effective_diagnostics_configuration(
         config.diagnostics,
         guest_logs_level_override,

@@ -72,6 +72,25 @@ presentation performs no CPU readback. PNG screenshots use incremental readback
 followed by encoding on a CPU worker. Presentation leases and WSI fences control
 reuse independently of guest buffer-slot release.
 
+## NVIDIA Smooth Motion
+
+On Linux, `video.nvidia_smooth_motion = true` requests NVIDIA's implicit Vulkan
+frame generation layer before Vulkan and worker initialization. It requires a
+compatible NVIDIA GPU and driver. The default is true; disable it on unsupported
+hosts. NVIDIA requires at least driver 580.82.07 for GeForce RTX 40 Series, or
+575.51.02 beta (575.57.08 stable) for RTX 50 Series, with the `VK_LAYER_NV_present`
+layer installed. See [NVIDIA's RTX 40 support announcement](https://www.nvidia.com/en-us/drivers/details/253031/)
+and [the original RTX 50 documentation](https://download.nvidia.com/XFree86/Linux-x86_64/575.51.02/README/nvpresent.html).
+
+Nixe bundles an explicit presentation counter below NVIDIA's layer. It counts
+successful presentation requests, including generated frames, and reports those
+FPS separately from game FPS once per second. Equal rounded values share a single
+FPS label. Presentation requests are not a measurement of physical display
+scanouts. Logs distinguish requesting Smooth Motion from observing additional
+presentations. Missing layers fail startup explicitly. No counter layer is loaded
+when the preference is disabled; this preference overrides an inherited
+`NVPRESENT_ENABLE_SMOOTH_MOTION` value.
+
 ## Running and checking
 
 ```sh

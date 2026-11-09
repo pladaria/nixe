@@ -21,6 +21,7 @@ mod profile;
 mod queue;
 mod render_pass;
 pub(crate) mod residency;
+pub mod smooth_motion;
 mod transfer;
 pub use memory::NativeImageDescription;
 pub use residency::{

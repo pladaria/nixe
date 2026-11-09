@@ -45,6 +45,7 @@ struct Control {
     stopped: bool,
     failure: Option<String>,
     presented: std::collections::VecDeque<std::time::Instant>,
+    presentations: u64,
     notify: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 /// One pending host packet. Font deltas are never overwritten or lost: the
@@ -58,14 +59,23 @@ impl PresentationClient {
     pub fn take_presented(&self) -> Vec<std::time::Instant> {
         self.0.lock().unwrap().presented.drain(..).collect()
     }
-    pub(crate) fn record_presented(&self) {
+    /// Successful application presents, including UI redraws of an old frame.
+    pub fn presentation_count(&self) -> u64 {
+        self.0.lock().unwrap().presentations
+    }
+    pub(crate) fn record_presented(&self, new_frame: bool) {
         let notify = {
             let mut state = self.0.lock().unwrap();
-            if state.presented.len() == 64 {
-                state.presented.pop_front();
+            state.presentations += 1;
+            if new_frame {
+                if state.presented.len() == 64 {
+                    state.presented.pop_front();
+                }
+                state.presented.push_back(std::time::Instant::now());
+                state.notify.clone()
+            } else {
+                None
             }
-            state.presented.push_back(std::time::Instant::now());
-            state.notify.clone()
         };
         if let Some(notify) = notify {
             notify();

@@ -58,7 +58,7 @@ runtime. Unsupported instructions stop explicitly.
 Building requires a C++20 compiler, CMake and Boost headers, in addition to the
 Rust toolchain and graphics/audio dependencies. The NVDEC VP9 decoder links
 FFmpeg libraries through `pkg-config`. On Debian/Ubuntu the native build packages
-are `build-essential cmake libboost-dev pkg-config libavcodec-dev libavutil-dev`.
+are `build-essential cmake libboost-dev pkg-config libavcodec-dev libavutil-dev libvulkan-dev`.
 Dynarmic dependencies are built from the vendored tree; no CMake download step is required.
 Upstream adaptations are listed in [UPSTREAM.txt](vendor/dynarmic/UPSTREAM.txt).
 

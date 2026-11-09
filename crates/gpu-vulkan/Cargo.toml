@@ -18,6 +18,11 @@ raw-window-handle.workspace = true
 nixe-gpu.workspace = true
 nixe-gpu-maxwell.workspace = true
 nixe-shader-recompiler.workspace = true
+libloading = "0.8"
+tempfile.workspace = true
+
+[build-dependencies]
+cc = "1"
 
 [features]
 performance-counters = ["nixe-gpu/performance-counters"]

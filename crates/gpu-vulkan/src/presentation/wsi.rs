@@ -682,10 +682,14 @@ impl Swapchains {
             let a = &self.acquires[acquire];
             unsafe { device.owner.device.reset_fences(&[a.fence]) }
                 .map_err(|e| VulkanError::vk("reset acquire fence", e))?;
+            // Smooth Motion can keep returning TIMEOUT when polled with zero.
+            // Wait briefly on this WSI worker so interposed presentation can
+            // advance, while keeping shutdown responsive if no image is ready.
+            // https://docs.vulkan.org/refpages/latest/refpages/source/vkAcquireNextImageKHR.html
             match unsafe {
                 chain
                     .loader
-                    .acquire_next_image(chain.handle, 0, a.semaphore, a.fence)
+                    .acquire_next_image(chain.handle, 1_000_000, a.semaphore, a.fence)
             } {
                 Ok((index, suboptimal)) => {
                     self.acquires[acquire].issued = true;
@@ -958,13 +962,18 @@ impl Presenter {
                             let sequence = frame.sequence;
                             let work = frame.work;
                             let accepted = chains.present(&context, target, frame)?;
-                            if accepted
-                                && sequence != last_sequence
-                                && let Some(sequence) = sequence
-                            {
-                                nixe_gpu::trace::event("host_present", sequence, work.tick(), 0);
-                                last_sequence = Some(sequence);
-                                client.record_presented();
+                            if accepted {
+                                let new_frame = sequence.is_some() && sequence != last_sequence;
+                                if new_frame {
+                                    nixe_gpu::trace::event(
+                                        "host_present",
+                                        sequence.unwrap(),
+                                        work.tick(),
+                                        0,
+                                    );
+                                    last_sequence = sequence;
+                                }
+                                client.record_presented(new_frame);
                             }
                             events
                                 .send(Event::Idle)
