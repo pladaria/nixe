@@ -650,6 +650,8 @@ pub enum AddressMode {
     MirroredRepeat,
     ClampToEdge,
     ClampToBorder,
+    /// Clamp coordinates, with border contributions under linear filtering.
+    Clamp,
 }
 
 /// Immutable logical sampler description.
@@ -661,7 +663,7 @@ pub struct SamplerDescription {
     pub mag_filter: FilterMode,
     pub mip_filter: FilterMode,
     pub address_modes: [AddressMode; 3],
-    /// Raw RGBA float bits, consumed only by ClampToBorder addressing.
+    /// Raw RGBA float bits, consumed by modes that sample the border.
     pub border_color: Option<[u32; 4]>,
     pub lod_bias: f32,
     pub lod_min: f32,

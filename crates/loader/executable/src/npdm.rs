@@ -1388,7 +1388,14 @@ fn validate_filesystem(
 }
 
 fn owner_authorized(id: u64, explicit: &[u64], range: Option<(u64, u64)>) -> bool {
-    explicit.contains(&id) || range.is_some_and(|(min, max)| id >= min && id <= max)
+    // Explicit owner lists take precedence over ranges. Without a list, a zero
+    // range permits any owner ID requested by ACI0.
+    // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libstratosphere/source/fssrv/fssrv_access_control.cpp#L81-L95
+    if !explicit.is_empty() {
+        explicit.contains(&id)
+    } else {
+        range.is_some_and(|(min, max)| (min == 0 && max == 0) || (min <= id && id <= max))
+    }
 }
 
 fn validate_services(

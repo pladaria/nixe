@@ -21,6 +21,7 @@ enum HidCommand {
     SetGyroscopeZeroDriftMode,
     GetGyroscopeZeroDriftMode,
     ResetGyroscopeZeroDriftMode,
+    IsSixAxisSensorAtRest,
     SetSupportedNpadStyleSet,
     GetSupportedNpadStyleSet,
     SetSupportedNpadIdType,
@@ -63,6 +64,7 @@ impl HidCommand {
             79 => Some(Self::SetGyroscopeZeroDriftMode),
             80 => Some(Self::GetGyroscopeZeroDriftMode),
             81 => Some(Self::ResetGyroscopeZeroDriftMode),
+            82 => Some(Self::IsSixAxisSensorAtRest),
             100 => Some(Self::SetSupportedNpadStyleSet),
             101 => Some(Self::GetSupportedNpadStyleSet),
             102 => Some(Self::SetSupportedNpadIdType),
@@ -376,6 +378,23 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
             };
             match hid_system.set_gyroscope_drift_mode(handle, mode) {
                 Ok(()) => semantic_success(request.token, false, &[], &[], &[], None),
+                Err(error) => cmif_error(request.token, error),
+            }
+        }
+        HidCommand::IsSixAxisSensorAtRest => {
+            // SixAxisSensorHandle, padding, ARUID and caller PID; returns bool.
+            // https://switchbrew.org/wiki/HID_services#IsSixAxisSensorAtRest
+            if hipc.pid.is_none()
+                || !request.has_payload_size(16)
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let handle = request_u32(request.data, 0).unwrap();
+            match hid_system.six_axis_sensor_at_rest(handle) {
+                Ok(at_rest) => {
+                    semantic_success(request.token, false, &[u8::from(at_rest)], &[], &[], None)
+                }
                 Err(error) => cmif_error(request.token, error),
             }
         }

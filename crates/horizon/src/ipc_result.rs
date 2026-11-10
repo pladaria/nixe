@@ -97,6 +97,9 @@ impl HorizonIpcResult {
     pub const AUDIO_INVALID_REVISION: Self = Self::new(MODULE_AUDIO, 1537);
     pub const AUDIO_INVALID_ARGUMENT: Self = Self::new(MODULE_AUDIO, 900);
     pub const FS_PATH_NOT_FOUND: Self = Self::new(MODULE_FS, 1);
+    // A missing save-data filesystem is a target lookup failure.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/file_sys/errors.h
+    pub const FS_TARGET_NOT_FOUND: Self = Self::new(MODULE_FS, 1002);
     // https://github.com/Atmosphere-NX/Atmosphere/blob/36cc9a9f490da37dd1d5f958ee9a256be132cc1d/libraries/libvapours/include/vapours/results/fs_results.hpp
     pub const FS_TARGET_LOCKED: Self = Self::new(MODULE_FS, 7);
     pub const FS_OUT_OF_RANGE: Self = Self::new(MODULE_FS, 3005);

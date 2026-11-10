@@ -1,4 +1,4 @@
-//! Application save-data identity and creation from NACP declarations.
+//! Save-data access by application/user identity and creation from NACP declarations.
 
 use nixe_runtime::TransactionalDirectory;
 use std::collections::BTreeMap;
@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex, Weak};
 use nixe_loader_title::ApplicationControlProperty;
 
 static CREATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-type OpenVolumes = BTreeMap<(String, u128), Weak<Mutex<TransactionalDirectory>>>;
+type OpenVolumes = BTreeMap<(u64, String, u128), Weak<Mutex<TransactionalDirectory>>>;
 
 const METADATA_MAGIC: &[u8; 8] = b"NIXESAV1";
 
-/// Persistent save-data namespace for one launched application.
+/// Persistent save-data access with the launch application's creation settings.
 #[derive(Clone, Debug)]
 pub struct SaveDataSystem {
     root: PathBuf,
@@ -53,15 +53,11 @@ impl SaveDataSystem {
         }
     }
 
-    pub(crate) fn path(&self, kind: &str, user: u128) -> PathBuf {
+    fn path(&self, program_id: u64, kind: &str, user: u128) -> PathBuf {
         self.root
-            .join(format!("{:016x}", self.program_id))
+            .join(format!("{program_id:016x}"))
             .join(kind)
             .join(format!("{user:032x}"))
-    }
-
-    pub(crate) const fn program_id(&self) -> u64 {
-        self.program_id
     }
 
     pub(crate) fn bcat_directory(&self) -> PathBuf {
@@ -86,10 +82,19 @@ impl SaveDataSystem {
 
     pub(crate) fn open(
         &self,
+        program_id: u64,
         kind: &str,
         user: u128,
     ) -> io::Result<Arc<Mutex<TransactionalDirectory>>> {
-        let key = (kind.to_owned(), user);
+        // Zero refers to the caller's application; an explicit ID selects that
+        // application's existing save. Opening never creates a missing save.
+        // https://switchbrew.org/wiki/Filesystem_services#SaveDataAttribute
+        let program_id = if program_id == 0 {
+            self.program_id
+        } else {
+            program_id
+        };
+        let key = (program_id, kind.to_owned(), user);
         let mut volumes = self
             .volumes
             .lock()
@@ -97,7 +102,7 @@ impl SaveDataSystem {
         if let Some(volume) = volumes.get(&key).and_then(Weak::upgrade) {
             return Ok(volume);
         }
-        let path = self.path(kind, user);
+        let path = self.path(program_id, kind, user);
         let metadata = fs::read(path.join("metadata"))?;
         if metadata.len() != 24 || &metadata[..8] != METADATA_MAGIC {
             return Err(io::Error::new(
@@ -120,7 +125,7 @@ impl SaveDataSystem {
             return Err(SaveDataError::Unsupported("negative NACP save-data size"));
         }
         ensure_volume(
-            &self.path("account", user),
+            &self.path(self.program_id, "account", user),
             self.account_size as u64,
             self.account_journal as u64,
         )?;
@@ -138,7 +143,11 @@ impl SaveDataSystem {
             if size == 0 || (kind == "account" && uid == 0) {
                 continue;
             }
-            ensure_volume(&self.path(kind, uid), size as u64, journal as u64)?;
+            ensure_volume(
+                &self.path(self.program_id, kind, uid),
+                size as u64,
+                journal as u64,
+            )?;
         }
         Ok(())
     }

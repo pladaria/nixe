@@ -47,11 +47,6 @@ pub(in crate::ipc_wire::services) async fn open_save_data(
             "save space, static ID, rank or index is unsupported",
         ));
     }
-    if program != 0 && program != saves.program_id() {
-        return Err(unsupported(
-            "cross-application save-data access is unsupported",
-        ));
-    }
     let kind = match request.data[40] {
         1 if user != 0 => "account",
         2 if user == 0 => "device",
@@ -61,11 +56,11 @@ pub(in crate::ipc_wire::services) async fn open_save_data(
             ));
         }
     };
-    let volume = match saves.open(kind, user) {
+    let volume = match saves.open(program, kind, user) {
         Ok(volume) => volume,
         Err(error) => {
             let result = if error.kind() == std::io::ErrorKind::NotFound {
-                HorizonIpcResult::FS_PATH_NOT_FOUND
+                HorizonIpcResult::FS_TARGET_NOT_FOUND
             } else {
                 log::error!("opening save data failed: {error}");
                 HorizonIpcResult::FS_UNEXPECTED

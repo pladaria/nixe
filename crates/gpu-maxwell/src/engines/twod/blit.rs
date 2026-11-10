@@ -83,7 +83,7 @@ fn pixel_bytes(format: u8) -> Option<u32> {
     match format {
         0xca => Some(8),
         0xf3 => Some(1),
-        0xcf | 0xd0 | 0xd5 | 0xd6 | 0xe0 => Some(4),
+        0xcf | 0xd0 | 0xd1 | 0xd5 | 0xd6 | 0xe0 => Some(4),
         _ => None,
     }
 }

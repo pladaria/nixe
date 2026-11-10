@@ -310,7 +310,14 @@ impl NativeExecution<'_> {
             nixe_gpu::AddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
             nixe_gpu::AddressMode::MirroredRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
             nixe_gpu::AddressMode::ClampToBorder => vk::SamplerAddressMode::CLAMP_TO_BORDER,
+            // Clamp selects the border only for linear magnification.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/maxwell_to_vk.cpp
+            nixe_gpu::AddressMode::Clamp => match s.mag_filter {
+                nixe_gpu::FilterMode::Nearest => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                nixe_gpu::FilterMode::Linear => vk::SamplerAddressMode::CLAMP_TO_BORDER,
+            },
         };
+        let address_modes = s.address_modes.map(address);
         let filter = |f| {
             if f == nixe_gpu::FilterMode::Linear {
                 vk::Filter::LINEAR
@@ -326,9 +333,9 @@ impl NativeExecution<'_> {
             } else {
                 vk::SamplerMipmapMode::NEAREST
             })
-            .address_mode_u(address(s.address_modes[0]))
-            .address_mode_v(address(s.address_modes[1]))
-            .address_mode_w(address(s.address_modes[2]))
+            .address_mode_u(address_modes[0])
+            .address_mode_v(address_modes[1])
+            .address_mode_w(address_modes[2])
             .mip_lod_bias(s.lod_bias)
             .min_lod(s.lod_min)
             .max_lod(s.lod_max)
@@ -340,7 +347,8 @@ impl NativeExecution<'_> {
                     .map(state::compare)
                     .unwrap_or(vk::CompareOp::ALWAYS),
             );
-        let (border, custom_border) = sampler_border(s);
+        let samples_border = address_modes.contains(&vk::SamplerAddressMode::CLAMP_TO_BORDER);
+        let (border, custom_border) = sampler_border(s, samples_border);
         let info = info.border_color(border);
         let sampler = self.residency.texture_cache.samplers.get_extended(
             &info,
@@ -544,12 +552,10 @@ pub(super) fn rect(r: nixe_gpu::ScissorRect) -> vk::Rect2D {
 
 fn sampler_border(
     s: &nixe_gpu::SamplerDescription,
+    samples_border: bool,
 ) -> (vk::BorderColor, Option<CustomBorderColor>) {
     let core = vk::BorderColor::FLOAT_TRANSPARENT_BLACK;
-    if !s
-        .address_modes
-        .contains(&nixe_gpu::AddressMode::ClampToBorder)
-    {
+    if !samples_border {
         return (core, None);
     }
     match s.border_color {

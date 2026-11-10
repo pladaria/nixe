@@ -108,6 +108,7 @@ impl Drop for HidState {
 #[derive(Debug)]
 struct HidProducer {
     sampling_number: u64,
+    six_axis_at_rest: [bool; 10],
     console_six_axis_sampling_number: u64,
     console_motion: nixe_input::MotionInput,
     seven_six_axis: SevenSixAxis,
@@ -295,6 +296,7 @@ impl HidSystem {
             }),
             producer: Arc::new(Mutex::new(HidProducer {
                 sampling_number: 0,
+                six_axis_at_rest: [true; 10],
                 console_six_axis_sampling_number: 0,
                 console_motion: nixe_input::MotionInput::default(),
                 seven_six_axis: SevenSixAxis::default(),
@@ -350,11 +352,12 @@ impl HidSystem {
         if key.0 == 0
             && let Some(settings) = self.state.motion_settings.get()
         {
-            settings.set_gyroscope_threshold(match mode {
-                0 => 0.01,
-                2 => 0.002,
-                _ => 0.007,
-            });
+            let (gyroscope, rest) = match mode {
+                0 => (0.01, 0.02),
+                2 => (0.002, 0.005),
+                _ => (0.007, 0.01),
+            };
+            settings.set_thresholds(gyroscope, rest);
         }
         Ok(())
     }
@@ -369,6 +372,14 @@ impl HidSystem {
             .gyroscope_drift_modes
             .get(&key)
             .unwrap_or(&1))
+    }
+    pub(crate) fn six_axis_sensor_at_rest(
+        &self,
+        handle: u32,
+    ) -> Result<bool, crate::HorizonIpcResult> {
+        let (npad, _, _) = six_axis_key(handle)?;
+        let index = npad_index(u32::from(npad)).expect("validated six-axis Npad ID");
+        Ok(self.producer.lock().unwrap().six_axis_at_rest[index])
     }
     pub(crate) fn send_vibration_values(
         &self,
@@ -848,6 +859,7 @@ impl HidProducer {
                 state.and_then(|state| state.accelerometer),
                 delta,
                 0.0,
+                0.01,
             );
         }
         if console_six_axis_active {
@@ -952,6 +964,7 @@ impl HidProducer {
             .publish(writes, NPAD_OFFSET + SYSTEM_EXT_LIFO_OFFSET, &common);
 
         if publish_six_axis {
+            self.six_axis_at_rest[0] = state.motion.is_none_or(|motion| motion.is_at_rest);
             let mut sensor = [0_u8; SIX_AXIS_ENTRY_SIZE];
             put_u64(&mut sensor, 0, self.sampling_number.wrapping_shl(1));
             put_u64(

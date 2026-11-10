@@ -127,6 +127,7 @@ impl<B: HostInputBackend> InputManager<B> {
             state.accelerometer,
             delta,
             self.motion_settings.gyroscope_threshold(),
+            self.motion_settings.rest_sensitivity(),
         );
         Ok(Some(ProfiledControllerState {
             controller_id: controller.id,

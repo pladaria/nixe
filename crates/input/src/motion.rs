@@ -12,26 +12,41 @@ use std::sync::{
 use std::time::Duration;
 const STANDARD_GRAVITY: f32 = 9.806_65;
 
-/// Controller-owned threshold shared with its host sampling worker.
+/// Controller-owned motion thresholds shared with its host sampling worker.
 #[derive(Clone, Debug)]
-pub struct MotionSettings(Arc<AtomicU32>);
+pub struct MotionSettings(Arc<MotionThresholds>);
+#[derive(Debug)]
+struct MotionThresholds {
+    gyroscope: AtomicU32,
+    rest: AtomicU32,
+}
 impl Default for MotionSettings {
     fn default() -> Self {
-        Self(Arc::new(AtomicU32::new(0.007_f32.to_bits())))
+        Self(Arc::new(MotionThresholds {
+            gyroscope: AtomicU32::new(0.007_f32.to_bits()),
+            rest: AtomicU32::new(0.01_f32.to_bits()),
+        }))
     }
 }
 impl MotionSettings {
-    pub fn set_gyroscope_threshold(&self, turns_per_second: f32) {
-        self.0.store(turns_per_second.to_bits(), Ordering::Relaxed);
+    pub fn set_thresholds(&self, gyroscope: f32, rest: f32) {
+        self.0
+            .gyroscope
+            .store(gyroscope.to_bits(), Ordering::Relaxed);
+        self.0.rest.store(rest.to_bits(), Ordering::Relaxed);
     }
     pub(crate) fn gyroscope_threshold(&self) -> f32 {
-        f32::from_bits(self.0.load(Ordering::Relaxed))
+        f32::from_bits(self.0.gyroscope.load(Ordering::Relaxed))
+    }
+    pub(crate) fn rest_sensitivity(&self) -> f32 {
+        f32::from_bits(self.0.rest.load(Ordering::Relaxed))
     }
 }
 
 /// Motion in the emulated sensor frame, in g and turns, ready for HID publication.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MotionEstimate {
+    pub is_at_rest: bool,
     pub acceleration: [f32; 3],
     pub gyroscope: [f32; 3],
     pub rotation: [f32; 3],
@@ -83,6 +98,7 @@ impl MotionInput {
         accel: Option<MotionVector>,
         delta: Duration,
         threshold: f32,
+        rest_sensitivity: f32,
     ) -> Option<MotionEstimate> {
         if accel.is_none() && gyro.is_none() {
             return None;
@@ -128,7 +144,7 @@ impl MotionInput {
             }
         }
         if dt > 0.1 {
-            return Some(self.estimate());
+            return Some(self.estimate(rest_sensitivity));
         }
         let [gx, gy, gz] = self.gyroscope.map(|value| value * std::f32::consts::TAU);
         let mut angular = if self.accelerometer_only {
@@ -156,13 +172,14 @@ impl MotionInput {
             }
         }
         self.integrate(angular, dt);
-        Some(self.estimate())
+        Some(self.estimate(rest_sensitivity))
     }
 
-    fn estimate(&self) -> MotionEstimate {
+    fn estimate(&self, rest_sensitivity: f32) -> MotionEstimate {
         let [qx, qy, qz, qw] = self.quaternion;
         let [x, y, z, w] = [-qy, -qx, -qw, -qz];
         MotionEstimate {
+            is_at_rest: !self.moving(rest_sensitivity),
             acceleration: self.acceleration,
             gyroscope: self.gyroscope,
             rotation: self.rotation,
