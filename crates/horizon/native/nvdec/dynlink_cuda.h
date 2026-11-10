@@ -420,6 +420,14 @@ typedef struct CUeglFrame_st {
 #define CU_STREAM_DEFAULT      0
 #define CU_STREAM_NON_BLOCKING 1
 
+typedef enum CUstreamCaptureMode_enum {
+    CU_STREAM_CAPTURE_MODE_GLOBAL = 0,
+    CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1,
+    CU_STREAM_CAPTURE_MODE_RELAXED = 2
+} CUstreamCaptureMode;
+
+typedef CUresult CUDAAPI tcuThreadExchangeStreamCaptureMode(CUstreamCaptureMode *mode);
+
 #define CU_EVENT_DEFAULT        0
 #define CU_EVENT_BLOCKING_SYNC  1
 #define CU_EVENT_DISABLE_TIMING 2

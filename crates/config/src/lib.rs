@@ -448,7 +448,7 @@ impl Default for VideoConfig {
         Self {
             scaling_filter: nixe_video::ScalingFilter::Bilinear,
             vsync: true,
-            nvidia_smooth_motion: true,
+            nvidia_smooth_motion: false,
         }
     }
 }

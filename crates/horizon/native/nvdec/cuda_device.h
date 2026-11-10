@@ -17,6 +17,7 @@ struct CudaDevice {
 #define CUDA_SYMBOL(name) t##name* name{};
     CUDA_SYMBOL(cuInit) CUDA_SYMBOL(cuDeviceGetCount) CUDA_SYMBOL(cuDeviceGet)
     CUDA_SYMBOL(cuDeviceGetUuid) CUDA_SYMBOL(cuGetErrorString)
+    CUDA_SYMBOL(cuThreadExchangeStreamCaptureMode)
 #undef CUDA_SYMBOL
     CudaDevice() {
         library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -25,6 +26,7 @@ struct CudaDevice {
 #define CUDA_SYMBOL(name) name = reinterpret_cast<t##name*>(dlsym(library, #name)); if (!name) throw std::runtime_error("CUDA symbol unavailable: " #name);
             CUDA_SYMBOL(cuInit) CUDA_SYMBOL(cuDeviceGetCount) CUDA_SYMBOL(cuDeviceGet)
             CUDA_SYMBOL(cuDeviceGetUuid) CUDA_SYMBOL(cuGetErrorString)
+            CUDA_SYMBOL(cuThreadExchangeStreamCaptureMode)
 #undef CUDA_SYMBOL
             const auto initialized = cuInit(0);
             // CUDA_ERROR_NO_DEVICE is a capability result, not a failed decode.
@@ -38,7 +40,25 @@ struct CudaDevice {
         const char* message = nullptr; cuGetErrorString(result, &message);
         throw std::runtime_error(std::string("CUDA: ") + (message ? message : "unknown error"));
     }
-    static CudaDevice& get() { static CudaDevice driver; return driver; }
+    static CudaDevice& get() {
+        static CudaDevice driver;
+        // NVDEC workers do not capture graphs. Their synchronous FFmpeg calls
+        // must remain independent of graph capture on presentation threads
+        // (e.g. Smooth Motion rebuilding its graph after a window resize).
+        // THREAD_LOCAL still enforces capture restrictions on this thread.
+        // Configure once per worker, before creating or using its decoder.
+        // cuThreadExchangeStreamCaptureMode:
+        // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html
+        static thread_local const bool capture_mode_configured = [&] {
+            if (driver.available) {
+                auto mode = CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+                driver.check(driver.cuThreadExchangeStreamCaptureMode(&mode));
+            }
+            return true;
+        }();
+        (void)capture_mode_configured;
+        return driver;
+    }
     int find_device(const uint8_t* uuid) {
         if (!available) return -1;
         int count{}; check(cuDeviceGetCount(&count));

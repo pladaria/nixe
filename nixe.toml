@@ -76,12 +76,12 @@ volume = 10
 # "area": pixel-area averaging; especially suitable for reducing high resolutions.
 # "scaleforce": edge-aware enlargement; less suitable for reduction.
 # "fsr": AMD FSR 1 spatial enlargement (EASU + RCAS); not frame generation.
-# FSR is intended for enlargement, although Eden also applies it when reducing.
+# FSR is intended for enlargement.
 scaling_filter = "bilinear"
 # Synchronize host presentation to the monitor. Defaults to true when omitted.
 # Disabling this allows tearing; guest-requested frame intervals are preserved.
 vsync = true
-# NVIDIA Smooth Motion on Linux/Vulkan. Defaults to true when omitted.
+# NVIDIA Smooth Motion on Linux/Vulkan. Defaults to false when omitted.
 # Minimum NVIDIA requirements:
 # - GeForce RTX 40 series: driver 580.82.07 or newer.
 # - GeForce RTX 50 series: driver 575.51.02 beta (575.57.08 stable) or newer.
@@ -89,7 +89,10 @@ nvidia_smooth_motion = true
 
 [gpu]
 # Internal render resolution: 1.0 (native), 1.5, 2.0 or 3.0.
-resolution_scale = 1.0
+# 1.5: 720p => 1080p, 1080p => 1440p
+# 2.0: 720p => 1440p, 1080p => 2160p
+# 3.0: 720p => 2160p, 1080p => 6K
+resolution_scale = 2.0
 # Compile MME macros to native AMD64 code; selected once per channel. Defaults to true.
 mme_jit = true
 # Per-title shader environments and Vulkan driver caches, relative to this file.
