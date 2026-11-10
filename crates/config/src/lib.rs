@@ -22,6 +22,39 @@ pub const CONFIG_FILE_NAME: &str = "nixe.toml";
 /// Current configuration schema version.
 pub const CONFIG_VERSION: u32 = 2;
 
+/// Internal rendering scale. Guest framebuffer and touch coordinates stay native.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "f64")]
+pub enum ResolutionScale {
+    #[default]
+    Native,
+    OneAndHalf,
+    Double,
+    Triple,
+}
+impl TryFrom<f64> for ResolutionScale {
+    type Error = &'static str;
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        match value {
+            1.0 => Ok(Self::Native),
+            1.5 => Ok(Self::OneAndHalf),
+            2.0 => Ok(Self::Double),
+            3.0 => Ok(Self::Triple),
+            _ => Err("resolution_scale must be 1.0, 1.5, 2.0 or 3.0"),
+        }
+    }
+}
+impl ResolutionScale {
+    pub const fn ratio(self) -> (u32, u32) {
+        match self {
+            Self::Native => (1, 0),
+            Self::OneAndHalf => (3, 1),
+            Self::Double => (2, 0),
+            Self::Triple => (3, 0),
+        }
+    }
+}
+
 /// Per-title guest environment and Vulkan driver cache location.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuConfig {
@@ -29,12 +62,14 @@ pub struct GpuConfig {
     pub cache_directory: PathBuf,
     /// Compile uploaded MME macros on supported host architectures.
     pub mme_jit: bool,
+    pub resolution_scale: ResolutionScale,
 }
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
             cache_directory: PathBuf::from("./storage/cache/gpu"),
             mme_jit: true,
+            resolution_scale: ResolutionScale::default(),
         }
     }
 }
@@ -93,6 +128,7 @@ impl NixeConfig {
         let mut gpu = GpuConfig {
             cache_directory: raw.gpu.cache_directory,
             mme_jit: raw.gpu.mme_jit,
+            resolution_scale: raw.gpu.resolution_scale,
         };
         gpu.cache_directory = resolve_path(base_directory, gpu.cache_directory);
 
@@ -400,6 +436,8 @@ fn audio_volume<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8,
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
+    /// Window presentation filter; independent of internal render resolution.
+    pub scaling_filter: nixe_video::ScalingFilter,
     /// Synchronize host presentation to the monitor's vertical refresh.
     pub vsync: bool,
     /// Request NVIDIA's Linux Vulkan frame generation and measure its output.
@@ -408,6 +446,7 @@ pub struct VideoConfig {
 impl Default for VideoConfig {
     fn default() -> Self {
         Self {
+            scaling_filter: nixe_video::ScalingFilter::Bilinear,
             vsync: true,
             nvidia_smooth_motion: true,
         }
@@ -441,6 +480,8 @@ struct RawGpuConfig {
     cache_directory: PathBuf,
     #[serde(default = "default_true")]
     mme_jit: bool,
+    #[serde(default)]
+    resolution_scale: ResolutionScale,
 }
 
 impl Default for RawGpuConfig {
@@ -448,6 +489,7 @@ impl Default for RawGpuConfig {
         Self {
             cache_directory: default_gpu_cache_directory(),
             mme_jit: true,
+            resolution_scale: ResolutionScale::default(),
         }
     }
 }

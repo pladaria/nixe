@@ -89,6 +89,7 @@ pub fn device_for_test_with_validation(
             validation,
             api,
             adapter: Some(adapter),
+            ..Default::default()
         },
         None,
     )

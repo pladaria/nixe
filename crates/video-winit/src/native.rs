@@ -14,6 +14,7 @@ impl PresenterState {
             backend_name,
             game_title,
             frame_dimensions: None,
+            requested_frame_size: None,
             frame_rate: FrameRateTracker::new(Instant::now()),
             smooth_motion: smooth_motion.map(PresentationRate::new),
             displayed_title: String::new(),
@@ -58,6 +59,16 @@ impl DerefMut for Presenter {
 }
 impl Presenter {
     pub(super) fn resize(&mut self, width: u32, height: u32) {
+        if self
+            .common
+            .requested_frame_size
+            .is_some_and(|(w, h)| width >= w && height >= h)
+        {
+            self.common.requested_frame_size = None;
+            self.common
+                .window
+                .set_min_inner_size(Some(PhysicalSize::new(320, 180)));
+        }
         self.size = if self.occluded {
             [0, 0]
         } else {
@@ -67,9 +78,13 @@ impl Presenter {
     }
     pub(super) fn resize_to_frame(&mut self) {
         if let Some((width, height)) = self.common.frame_dimensions {
+            self.common.requested_frame_size = Some((width, height));
+            self.common.window.set_maximized(false);
+            // Let the requested render size exceed the monitor's work area.
+            // Restore ordinary resizing when the corresponding resize arrives.
             self.common
                 .window
-                .set_min_inner_size(Some(PhysicalSize::new(width.min(320), height.min(180))));
+                .set_min_inner_size(Some(PhysicalSize::new(width, height)));
             if let Some(size) = self
                 .common
                 .window

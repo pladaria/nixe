@@ -25,6 +25,7 @@ pub(crate) struct PresentFrame {
 }
 pub(crate) struct Frame {
     pub storage: Arc<FrameStorage>,
+    filter_targets: Option<[super::filters::FilterTarget; 2]>,
     pub work: WorkTicket,
     last_use: WorkTicket,
     pub content: nixe_gpu::FrameCrop,
@@ -55,6 +56,7 @@ struct RawImage {
 pub(crate) struct Frames {
     frames: Vec<Option<Frame>>,
     raw_image: Option<RawImage>,
+    last_resolution: Option<([u32; 2], [u32; 2])>,
     pub renderer: ScreenRenderer,
     generation: u32,
     sender: mpsc::Sender<PresentationRelease>,
@@ -66,6 +68,7 @@ impl Frames {
         Ok(Self {
             frames: Vec::new(),
             raw_image: None,
+            last_resolution: None,
             renderer: ScreenRenderer::new(device)?,
             generation: 0,
             sender,
@@ -172,6 +175,7 @@ impl Frames {
             ))?;
         let copy = wsi::CopyCommands::new(cache.device())?;
         let frame = Frame {
+            filter_targets: None,
             storage: Arc::new(FrameStorage {
                 copy,
                 view,
@@ -348,6 +352,7 @@ impl Frames {
         cache.record_framebuffer_upload(size);
         Ok(image)
     }
+    #[allow(clippy::too_many_arguments)]
     fn render_layer(
         &mut self,
         cache: &mut crate::residency::Residency<'_>,
@@ -356,15 +361,43 @@ impl Frames {
         layer: &render::LayerImage,
         extent: [u32; 2],
         format: vk::Format,
+        mut filter: nixe_video::ScalingFilter,
     ) -> Result<usize, VulkanError> {
         let slot = self.storage(cache, extent, format)?;
         let frame = self.frames[slot].as_mut().unwrap();
         let view_format = frame.storage.framebuffer.key.colors[0];
-        let pipeline = self.renderer.pipeline(
-            pipelines,
-            view_format,
-            u8::from(layer.format == vk::Format::R16_UINT),
-        )?;
+        let filtered;
+        let layer = if filter == nixe_video::ScalingFilter::Fsr {
+            let content = layer.content_rect(extent);
+            let mut size = [content.width, content.height];
+            if layer.transform.rotate_90_clockwise {
+                size.swap(0, 1);
+            }
+            if frame
+                .filter_targets
+                .as_ref()
+                .is_none_or(|targets| targets[0].extent != size)
+            {
+                frame.filter_targets = Some([
+                    super::filters::FilterTarget::new(cache, size)?,
+                    super::filters::FilterTarget::new(cache, size)?,
+                ]);
+            }
+            filtered = self.renderer.fsr(
+                cache,
+                pipelines,
+                descriptors,
+                layer,
+                frame.filter_targets.as_ref().unwrap(),
+            )?;
+            filter = nixe_video::ScalingFilter::Bilinear;
+            &filtered
+        } else {
+            layer
+        };
+        let pipeline = self
+            .renderer
+            .screen_pipeline(pipelines, view_format, filter, layer)?;
         cache.device_mut().end_rendering()?;
         render::transition(
             cache.device_mut(),
@@ -388,6 +421,7 @@ impl Frames {
             },
             view_format,
             true,
+            filter,
         )?;
         frame.content = layer.content_rect(extent);
         frame.display_extent = layer.dimensions();
@@ -431,12 +465,51 @@ impl Frames {
         } else {
             Arc::clone(&self.raw_image.as_ref().unwrap().view)
         };
+        let resolution = cache.resolution();
+        let render_extent = if source.transform.rotate_90_clockwise {
+            [source.crop.height, source.crop.width]
+        } else {
+            [source.crop.width, source.crop.height]
+        }
+        .map(|v| resolution.scale(v));
+        if self.last_resolution != Some((source.extent, render_extent)) {
+            log::info!(
+                "render resolution: framebuffer={}x{}, output={}x{}, scale={}",
+                source.extent[0],
+                source.extent[1],
+                render_extent[0],
+                render_extent[1],
+                resolution.up_factor
+            );
+            self.last_resolution = Some((source.extent, render_extent));
+        }
+        let mut image_extent = source.extent;
+        let mut crop = source.crop;
+        if let Some(id) = id {
+            let physical = cache.image_extent(
+                id,
+                vk::Extent3D {
+                    width: source.extent[0],
+                    height: source.extent[1],
+                    depth: 1,
+                },
+            );
+            image_extent = [physical.width, physical.height];
+            if image_extent != source.extent {
+                let right = resolution.scale(crop.left + crop.width);
+                let bottom = resolution.scale(crop.top + crop.height);
+                crop.left = resolution.scale(crop.left);
+                crop.top = resolution.scale(crop.top);
+                crop.width = right - crop.left;
+                crop.height = bottom - crop.top;
+            }
+        }
         let layer_image = render::LayerImage {
             view,
-            extent: source.extent,
+            extent: image_extent,
             format: source_format,
             encoding: source.format,
-            crop: source.crop,
+            crop,
             transform: source.transform,
         };
         if let Some(host) = host {
@@ -446,17 +519,25 @@ impl Frames {
                 pipelines,
                 descriptors,
                 &layer_image,
-                layer_image.dimensions(),
+                render_extent,
             )?;
         }
-        let layer =
-            self.render_layer(cache, pipelines, descriptors, &layer_image, extent, format)?;
+        let layer = self.render_layer(
+            cache,
+            pipelines,
+            descriptors,
+            &layer_image,
+            extent,
+            format,
+            self.renderer.filter,
+        )?;
         let work = self.frames[layer].as_ref().unwrap().work;
         cache.device_mut().retire_image(native, work)?;
         if raw_source {
             self.raw_image.as_mut().unwrap().last_use = work;
         }
         let frame = self.frames[layer].as_mut().unwrap();
+        frame.display_extent = render_extent;
         frame.leases = 1;
         let image = ResidentImage::from_lease(
             frame.display_extent,
@@ -499,7 +580,15 @@ impl Frames {
         }
         let slot = if let Some(image) = image {
             let layer = self.get(image)?.layer();
-            let slot = self.render_layer(cache, pipelines, descriptors, &layer, extent, format)?;
+            let slot = self.render_layer(
+                cache,
+                pipelines,
+                descriptors,
+                &layer,
+                extent,
+                format,
+                nixe_video::ScalingFilter::Bilinear,
+            )?;
             let work = self.frames[slot].as_ref().unwrap().work;
             self.used(image, work)?;
             slot
@@ -545,7 +634,9 @@ impl Frames {
             && !ui.primitives.is_empty()
         {
             let view_format = frame.storage.framebuffer.key.colors[0];
-            let pipeline = self.renderer.pipeline(pipelines, view_format, 2)?;
+            let pipeline =
+                self.renderer
+                    .pipeline(pipelines, view_format, super::filters::Program::Ui)?;
             self.renderer.ui(
                 cache,
                 descriptors,

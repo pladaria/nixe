@@ -1,9 +1,9 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#define PACKED 0
 #include "screen.inc"
-layout(set=0,binding=0) uniform texture2D source_image;
-layout(set=0,binding=1) uniform sampler source_sampler;
+#include "screen-sampling.inc"
 void main() {
-    color = texture(sampler2D(source_image, source_sampler), source_uv());
+    color = sample_source(source_uv());
     encode_target(color);
 }

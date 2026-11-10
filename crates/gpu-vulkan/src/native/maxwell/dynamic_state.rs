@@ -14,6 +14,7 @@ pub(crate) struct DynamicState {
 /// All other setters consume their individual engine flags directly.
 #[derive(Default)]
 pub(crate) struct CommandState {
+    rescaled: bool,
     initialized: bool,
     topology: Option<u32>,
     stencil_reset: bool,
@@ -42,6 +43,8 @@ pub(in crate::native) fn record(
     // Resource preparation may finish a native prefix. Consume flags only
     // after that preparation, against the command buffer which draws will use.
     let index = residency.runtime.device.recording_slot()?;
+    let rescaled = residency.is_rescaling();
+    let resolution = residency.resolution();
     let device = &mut residency.runtime.device;
     let command = &mut device.submission.slots[index].graphics_state;
     let first = !command.initialized;
@@ -57,6 +60,10 @@ pub(in crate::native) fn record(
     if first {
         dirty |= D::NATIVE_STATE;
     }
+    if command.rescaled != rescaled {
+        dirty |= D::VIEWPORT | D::SCISSOR;
+    }
+    command.rescaled = rescaled;
     if topology_changed {
         dirty |= D::DEPTH_BIAS_ENABLE | D::PRIMITIVE_RESTART;
     }
@@ -77,10 +84,28 @@ pub(in crate::native) fn record(
     let needs = |flag| dirty & flag != 0;
     unsafe {
         if needs(D::VIEWPORT) {
-            raw.cmd_set_viewport(0, &[registers::viewport(r, profile)?]);
+            let mut viewport = registers::viewport(r, profile)?;
+            if rescaled {
+                viewport.x *= resolution.up_factor;
+                viewport.y *= resolution.up_factor;
+                viewport.width *= resolution.up_factor;
+                viewport.height *= resolution.up_factor;
+            }
+            raw.cmd_set_viewport(0, &[viewport]);
         }
         if needs(D::SCISSOR) {
-            raw.cmd_set_scissor(0, &[registers::scissor(r)]);
+            let mut scissor = registers::scissor(r);
+            if rescaled {
+                scissor.offset.x = resolution.scale_signed(scissor.offset.x);
+                scissor.offset.y = resolution.scale_signed(scissor.offset.y);
+                if scissor.extent.width != i32::MAX as u32 {
+                    scissor.extent.width = resolution.scale(scissor.extent.width);
+                }
+                if scissor.extent.height != i32::MAX as u32 {
+                    scissor.extent.height = resolution.scale(scissor.extent.height);
+                }
+            }
+            raw.cmd_set_scissor(0, &[scissor]);
         }
         if profile.dynamic_state.depth_clamp_enable && needs(D::DEPTH_CLAMP_ENABLE) {
             let enabled = registers::depth_clamp_enabled(r)?;

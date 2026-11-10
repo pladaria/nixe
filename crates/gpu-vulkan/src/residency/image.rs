@@ -196,6 +196,12 @@ impl Residency<'_> {
             "resident image",
             |bytes| self.charge(bytes),
         )?;
+        let can_rescale = cached.as_ref().is_some_and(|cached| {
+            cached.can_rescale(
+                sync::native_image_aspects(description.format) != vk::ImageAspectFlags::COLOR,
+            )
+        });
+        let native = Arc::new(native);
         let id = self.texture_cache.images.insert(ImageEntry {
             synchronized: false,
             aliases: Vec::new(),
@@ -212,7 +218,17 @@ impl Residency<'_> {
                 last_use: None,
                 touched: 0,
             },
-            native: Arc::new(native),
+            original: Arc::clone(&native),
+            native,
+            scaled: None,
+            rescaled: false,
+            original_initialized: false,
+            scaled_initialized: false,
+            can_rescale,
+            checking_rescale: false,
+            rescale_checked: false,
+            scale_rating: 0,
+            scale_tick: 0,
             description,
             planes: planes.clone().into(),
             sample_grid,
@@ -281,10 +297,21 @@ impl Residency<'_> {
                 && p.array_layer == plane.array_layer
                 && p.depth_slice == plane.depth_slice
                 && aspects.contains(p.aspect)
-                && rect == super::transfers::full_rect(*p)
+                && rect == self.image_rect(id, super::transfers::full_rect(*p))
         })
     }
     fn refresh_image(&mut self, id: ImageId) -> Result<(), VulkanError> {
+        let scaled = self.texture_cache.get(id).rescaled;
+        if scaled {
+            self.switch_image_scale(id, false, true, false)?;
+        }
+        self.refresh_original_image(id)?;
+        if scaled {
+            self.switch_image_scale(id, true, false, false)?;
+        }
+        Ok(())
+    }
+    fn refresh_original_image(&mut self, id: ImageId) -> Result<(), VulkanError> {
         // Eden RefreshContents uploads the full CPU-modified image. Aliases are
         // synchronized separately by their image modification ticks.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L1115-L1178

@@ -1,12 +1,10 @@
 //! Presentation and the bounded egui mesh contract use the ordinary native
 //! pipeline/descriptor caches, command slots, allocator and timeline.
+use super::filters::{self, FilterTarget, Program};
 use super::*;
 use crate::cache::*;
 use ash::vk;
-use nixe_gpu::{
-    ShaderStage,
-    shader_module::{self as spirv, ResourceId},
-};
+use nixe_video::ScalingFilter;
 use rustc_hash::FxHashMap as HashMap;
 pub(crate) fn color_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
@@ -42,64 +40,9 @@ pub(crate) fn transition(
             .barrier(&vk::DependencyInfo::default().image_memory_barriers(&barriers));
     }
 }
-fn shader(kind: u8) -> Arc<ShaderArtifact> {
-    use std::sync::OnceLock;
-    static SCREEN: OnceLock<Arc<ShaderArtifact>> = OnceLock::new();
-    static PACKED: OnceLock<Arc<ShaderArtifact>> = OnceLock::new();
-    static UI: OnceLock<Arc<ShaderArtifact>> = OnceLock::new();
-    let cell = match kind {
-        0 => &SCREEN,
-        1 => &PACKED,
-        _ => &UI,
-    };
-    (cell.get_or_init(|| {
-        let stage = crate::residency::helper_stage;
-        let vertex: &[u8] = if kind == 2 {
-            include_bytes!("../../shaders/spv/ui.vert.spv")
-        } else {
-            include_bytes!("../../shaders/spv/screen.vert.spv")
-        };
-        let fragment: &[u8] = match kind {
-            0 => include_bytes!("../../shaders/spv/screen.frag.spv"),
-            1 => include_bytes!("../../shaders/spv/screen-packed.frag.spv"),
-            _ => include_bytes!("../../shaders/spv/ui.frag.spv"),
-        };
-        let bindings = [
-            spirv::DescriptorKind::SampledImage,
-            spirv::DescriptorKind::Sampler,
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(i, kind)| spirv::Binding {
-            resource: ResourceId::new(i as u32),
-            binding: i as u32,
-            kind,
-            count: 1,
-            sampler: None,
-            readable: true,
-            writable: false,
-        })
-        .collect();
-        Arc::new(ShaderArtifact::new(Box::new([
-            stage(
-                ShaderStage::Vertex,
-                vertex,
-                Box::new([]),
-                if kind == 2 { 8 } else { 0 },
-            ),
-            stage(
-                ShaderStage::Fragment,
-                fragment,
-                bindings,
-                if kind == 2 { 0 } else { 32 },
-            ),
-        ])))
-    }))
-    .clone()
-}
-fn state(format: vk::Format, kind: u8) -> GraphicsState {
+fn state(format: vk::Format, ui: bool) -> GraphicsState {
     let mut state = GraphicsState::color(format);
-    if kind == 2 {
+    if ui {
         state.vertex_bindings = std::sync::Arc::from([VertexBinding {
             binding: 0,
             stride: 20,
@@ -176,7 +119,9 @@ impl LayerImage {
     }
 }
 pub(crate) struct ScreenRenderer {
-    pipelines: HashMap<(vk::Format, u8), NativePipeline>,
+    pipelines: HashMap<(vk::Format, Program), NativePipeline>,
+    pub(super) filter: ScalingFilter,
+    half: bool,
     linear: Sampler,
     nearest: Sampler,
     textures: HashMap<egui::TextureId, Texture>,
@@ -200,6 +145,8 @@ impl ScreenRenderer {
         };
         Ok(Self {
             pipelines: HashMap::default(),
+            filter: device.scaling_filter,
+            half: device.profile().shader_compiler.host.support_float16,
             linear: make(vk::Filter::LINEAR)?,
             nearest: make(vk::Filter::NEAREST)?,
             textures: HashMap::default(),
@@ -207,24 +154,24 @@ impl ScreenRenderer {
             indices: Vec::new(),
         })
     }
-    pub fn pipeline(
+    pub(super) fn pipeline(
         &mut self,
         compiler: &PipelineCompiler,
         format: vk::Format,
-        kind: u8,
+        program: Program,
     ) -> Result<NativePipeline, VulkanError> {
         if let std::collections::hash_map::Entry::Vacant(entry) =
-            self.pipelines.entry((format, kind))
+            self.pipelines.entry((format, program))
         {
             let pending = compiler
                 .request(PipelineRecipe::Graphics {
-                    shader: shader(kind),
-                    state: state(format, kind),
+                    shader: program.shader(),
+                    state: state(format, program == Program::Ui),
                 })
                 .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
             entry.insert(pending);
         }
-        Ok((self.pipelines[&(format, kind)]).clone())
+        Ok((self.pipelines[&(format, program)]).clone())
     }
     pub fn update_textures(
         &mut self,
@@ -389,6 +336,7 @@ impl ScreenRenderer {
         extent: vk::Extent2D,
         format: vk::Format,
         letterbox: bool,
+        filter: ScalingFilter,
     ) -> Result<(), VulkanError> {
         if frame.crop.width == 0
             || frame.crop.height == 0
@@ -407,32 +355,7 @@ impl ScreenRenderer {
                 "presentation crop exceeds native source extent",
             ));
         }
-        let sampler = if frame.format == vk::Format::R16_UINT {
-            &self.nearest
-        } else {
-            &self.linear
-        };
-        let record = descriptors.get(
-            &pipeline.layout,
-            &[
-                DescriptorResource::Image {
-                    view: Arc::clone(&frame.view),
-                    layout: vk::ImageLayout::GENERAL,
-                },
-                DescriptorResource::Sampler(sampler.clone()),
-            ],
-        )?;
-        let mut parameters = GraphicsParameters::new(
-            state(
-                format,
-                if frame.format == vk::Format::R16_UINT {
-                    1
-                } else {
-                    0
-                },
-            ),
-            extent,
-        );
+        let mut parameters = GraphicsParameters::new(state(format, false), extent);
         if letterbox {
             let [width, height] = frame.dimensions().map(u64::from);
             let ow = u64::from(extent.width);
@@ -451,8 +374,7 @@ impl ScreenRenderer {
                 max_depth: 1.,
             };
         }
-        let graphics = cache.prepare_host_graphics(pipeline, record, parameters)?;
-        let mut push = [0u8; 32];
+        let mut push = [0u8; 40];
         for (i, value) in [
             frame.crop.left as f32 / frame.extent[0] as f32,
             frame.crop.top as f32 / frame.extent[1] as f32,
@@ -478,9 +400,75 @@ impl ScreenRenderer {
         {
             push[16 + i * 4..20 + i * 4].copy_from_slice(&value.to_le_bytes());
         }
-        cache.bind_host_graphics(&graphics, &push)?;
+        let mut size = [
+            parameters.viewports[0].width,
+            parameters.viewports[0].height,
+        ];
+        if frame.transform.rotate_90_clockwise {
+            size.swap(0, 1);
+        }
+        // Area sampling integrates only the cropped source, even with letterboxing.
+        size[0] *= frame.extent[0] as f32 / frame.crop.width as f32;
+        size[1] *= frame.extent[1] as f32 / frame.crop.height as f32;
+        for (i, value) in size.into_iter().enumerate() {
+            push[32 + i * 4..36 + i * 4].copy_from_slice(&value.to_le_bytes());
+        }
+        self.draw_source(
+            cache,
+            descriptors,
+            pipeline,
+            frame,
+            target,
+            extent,
+            parameters,
+            &push,
+            filter == ScalingFilter::Nearest,
+        )
+    }
+    pub fn screen_pipeline(
+        &mut self,
+        compiler: &PipelineCompiler,
+        format: vk::Format,
+        filter: ScalingFilter,
+        frame: &LayerImage,
+    ) -> Result<NativePipeline, VulkanError> {
+        self.pipeline(
+            compiler,
+            format,
+            Program::filter(filter, frame.format == vk::Format::R16_UINT, self.half),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn draw_source(
+        &self,
+        cache: &mut crate::residency::Residency<'_>,
+        descriptors: &mut DescriptorCache,
+        pipeline: NativePipeline,
+        frame: &LayerImage,
+        target: &Arc<crate::render_pass::Framebuffer>,
+        extent: vk::Extent2D,
+        parameters: GraphicsParameters,
+        push: &[u8],
+        nearest: bool,
+    ) -> Result<(), VulkanError> {
+        let sampler = if nearest || frame.format == vk::Format::R16_UINT {
+            &self.nearest
+        } else {
+            &self.linear
+        };
+        let record = descriptors.get(
+            &pipeline.layout,
+            &[
+                DescriptorResource::Image {
+                    view: Arc::clone(&frame.view),
+                    layout: vk::ImageLayout::GENERAL,
+                },
+                DescriptorResource::Sampler(sampler.clone()),
+            ],
+        )?;
+        let graphics = cache.prepare_host_graphics(pipeline, record, parameters)?;
+        cache.bind_host_graphics(&graphics, push)?;
         let device = cache.device_mut();
-
         let mut pass = target.key;
         pass.color_clear = 1;
         device.begin_render_pass(
@@ -501,6 +489,79 @@ impl ScreenRenderer {
             device.dispatch.end_rendering();
         }
         Ok(())
+    }
+    pub(super) fn fsr(
+        &mut self,
+        cache: &mut crate::residency::Residency<'_>,
+        compiler: &PipelineCompiler,
+        descriptors: &mut DescriptorCache,
+        source: &LayerImage,
+        targets: &[FilterTarget; 2],
+    ) -> Result<LayerImage, VulkanError> {
+        let mut layer = LayerImage {
+            view: Arc::clone(&source.view),
+            extent: source.extent,
+            format: source.format,
+            encoding: source.encoding,
+            crop: source.crop,
+            transform: nixe_gpu::FrameTransform::default(),
+        };
+        for (index, target) in targets.iter().enumerate() {
+            let program = if index == 0 {
+                Program::Easu {
+                    packed: source.format == vk::Format::R16_UINT,
+                    half: self.half,
+                }
+            } else {
+                Program::Rcas { half: self.half }
+            };
+            let pipeline = self.pipeline(compiler, vk::Format::R16G16B16A16_SFLOAT, program)?;
+            let push = filters::fsr_constants(&layer, target.extent, index == 0);
+            let extent = vk::Extent2D {
+                width: target.extent[0],
+                height: target.extent[1],
+            };
+            cache.device_mut().end_rendering()?;
+            // The frame slot is reused only after its previous graphics and WSI work completes.
+            transition(
+                cache.device_mut(),
+                target.view.image.handle,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags2::NONE,
+                vk::AccessFlags2::NONE,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            );
+            self.draw_source(
+                cache,
+                descriptors,
+                pipeline,
+                &layer,
+                &target.framebuffer,
+                extent,
+                GraphicsParameters::new(state(vk::Format::R16G16B16A16_SFLOAT, false), extent),
+                &push,
+                false,
+            )?;
+            transition(
+                cache.device_mut(),
+                target.view.image.handle,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            );
+            let work = cache.device_mut().current_work();
+            cache
+                .device_mut()
+                .retire_image_views(vec![Arc::clone(&target.view)], work)?;
+            layer = target.layer(source.encoding, nixe_gpu::FrameTransform::default());
+        }
+        layer.transform = source.transform;
+        Ok(layer)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn ui(
@@ -617,7 +678,7 @@ impl ScreenRenderer {
                         DescriptorResource::Sampler((texture.sampler).clone()),
                     ],
                 )?;
-                let mut parameters = GraphicsParameters::new(state(format, 2), extent);
+                let mut parameters = GraphicsParameters::new(state(format, true), extent);
                 let min = (clip.min.to_vec2() * ui.pixels_per_point)
                     .floor()
                     .max(egui::Vec2::ZERO);

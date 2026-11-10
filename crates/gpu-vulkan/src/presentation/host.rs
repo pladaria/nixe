@@ -114,10 +114,11 @@ impl Host {
     ) -> Result<Option<WorkTicket>, VulkanError> {
         let mut use_ticket = None;
         if self.screenshot.is_some() {
-            let pipeline = renderer.pipeline(
+            let pipeline = renderer.screen_pipeline(
                 pipelines,
                 vk::Format::R8G8B8A8_UNORM,
-                u8::from(layer.format == vk::Format::R16_UINT),
+                nixe_video::ScalingFilter::Bilinear,
+                layer,
             )?;
             {
                 let image = cache.allocate_host_image(extent, vk::Format::R8G8B8A8_UNORM)?;
@@ -154,6 +155,7 @@ impl Host {
                     },
                     vk::Format::R8G8B8A8_UNORM,
                     false,
+                    nixe_video::ScalingFilter::Bilinear,
                 )?;
                 render::transition(
                     cache.device_mut(),

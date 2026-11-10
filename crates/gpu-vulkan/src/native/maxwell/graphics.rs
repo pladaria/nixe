@@ -320,13 +320,25 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         // Keep the inline payload in this frame instead of moving it through
         // large Result values between preparation and recording.
         let mut images = smallvec::SmallVec::new();
-        self.configure_resources::<STAGES, STORAGE>(
-            execution,
-            registers,
-            space,
-            groups,
-            &mut images,
-        )?;
+        loop {
+            execution.update_render_targets(registers, space)?;
+            self.configure_resources::<STAGES, STORAGE>(
+                execution,
+                registers,
+                space,
+                groups,
+                &mut images,
+            )?;
+            execution.update_render_targets(registers, space)?;
+            if !execution
+                .residency
+                .texture_cache
+                .bindings
+                .has_deleted_images
+            {
+                break;
+            }
+        }
         let mut geometry_changed = false;
         loop {
             execution
@@ -483,7 +495,12 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         descriptors: crate::residency::execution::DescriptorQueue,
     ) -> Result<(), VulkanError> {
         let pipeline = &self.pipeline;
-        let push = state::ShaderConstants::graphics(&self.resources, registers)?;
+        let push = state::ShaderConstants::graphics(
+            &self.resources,
+            registers,
+            images,
+            &execution.residency,
+        )?;
         execution.residency.record_draw_inner(
             pipeline,
             targets,

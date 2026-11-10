@@ -35,6 +35,7 @@ pub use memory::{AllocatedBuffer, AllocatedImage, AllocatedImageView, Allocation
 pub use device::{DeviceOptions, QueueSelection, SurfaceProfile, VulkanDevice};
 pub use error::VulkanError;
 pub use instance::{NativeWindow, SurfaceTarget};
+pub use nixe_shader_recompiler::profile::ResolutionScaling;
 pub use profile::{
     ApiPath, ApiPreference, DeviceProfile, DynamicStateSupport, FloatControls, PortabilitySupport,
     SubgroupSupport, SwapchainMaintenance,

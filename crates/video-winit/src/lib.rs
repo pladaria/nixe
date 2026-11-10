@@ -257,6 +257,7 @@ impl WindowFrontend {
 struct PresenterState {
     window: Arc<Window>,
     frame_dimensions: Option<(u32, u32)>,
+    requested_frame_size: Option<(u32, u32)>,
     backend_name: &'static str,
     game_title: Option<String>,
     frame_rate: FrameRateTracker,

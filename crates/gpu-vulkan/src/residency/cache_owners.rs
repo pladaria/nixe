@@ -188,6 +188,7 @@ impl BufferCache {
     }
 }
 pub(crate) struct TextureCache {
+    pub(super) frame_tick: u64,
     // Native samplers live with the texture cache, through queue shutdown,
     // including replaced TSC selections and exceptional native teardown.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache_base.h
@@ -213,6 +214,7 @@ pub(crate) struct TextureCache {
     pub(super) downloads: std::collections::VecDeque<texture_download::Download>,
     pub(super) decoder: nixe_gpu::texture_decode::BlockDecoder,
     pub(super) sample_conversion: Option<sample_readback::SampleConversion>,
+    pub(super) scaling: Option<scaling::Helpers>,
 }
 
 impl BufferCache {
@@ -234,6 +236,7 @@ impl TextureCache {
     ) -> Self {
         Self {
             samplers,
+            frame_tick: 0,
             bindings: Default::default(),
             framebuffers: Default::default(),
             slot_framebuffers: Default::default(),
@@ -254,6 +257,7 @@ impl TextureCache {
             downloads: Default::default(),
             decoder: Default::default(),
             sample_conversion: Default::default(),
+            scaling: None,
         }
     }
     #[inline]

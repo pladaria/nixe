@@ -124,6 +124,9 @@ impl Residency<'_> {
             return Ok(None);
         }
         self.runtime.device.realize_deferred_clear()?;
+        for &id in ids {
+            self.scale_image(id, false, false)?;
+        }
         let sources = ids
             .iter()
             .map(|&id| Arc::clone(&self.texture_cache.get(id).native))

@@ -142,7 +142,11 @@ impl crate::native::pipeline_cache::ComputePipeline {
         execution
             .residency
             .update_compute_buffers(&self.resources.stages[5], space)?;
-        let push = crate::native::state::ShaderConstants::default();
+        let push = crate::native::state::ShaderConstants::resources(
+            &self.resources,
+            &images,
+            &execution.residency,
+        );
         execution.residency.dispatch_guest(
             pipeline,
             &self.resources,

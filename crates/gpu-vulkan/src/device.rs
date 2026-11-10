@@ -15,6 +15,8 @@ use std::{
 
 #[derive(Clone, Debug, Default)]
 pub struct DeviceOptions {
+    pub scaling_filter: nixe_video::ScalingFilter,
+    pub resolution_scale: nixe_shader_recompiler::profile::ResolutionScaling,
     pub validation: ValidationMode,
     pub api: ApiPreference,
     /// Case-insensitive adapter-name substring. No vendor-specific selection.
@@ -36,6 +38,7 @@ pub struct SurfaceProfile {
 /// Sole queue owner. Buffers/images retain its device lifetime, not its queue.
 /// Construct before GPU workers start, then move this concrete value to the owner.
 pub struct VulkanDevice {
+    pub(crate) scaling_filter: nixe_video::ScalingFilter,
     pub(crate) owner: Arc<DeviceOwner>,
     pub(crate) submission: QueueState,
     pub(crate) dispatch: Dispatch,
@@ -182,6 +185,7 @@ impl VulkanDevice {
             }
             return Err(VulkanError::NoSuitableDevice(failures));
         };
+        selected.profile.shader_compiler.settings.resolution_info = options.resolution_scale;
         // One queue per selected family; presentation may share graphics.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/vulkan_common/vulkan_device.cpp
         let priority = [1_f32];
@@ -278,6 +282,7 @@ impl VulkanDevice {
             &mut dispatch,
         )?;
         Ok(Self {
+            scaling_filter: options.scaling_filter,
             owner,
             dispatch,
             objects,

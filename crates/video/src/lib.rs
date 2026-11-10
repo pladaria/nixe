@@ -5,6 +5,21 @@ use std::sync::{Arc, Mutex};
 
 use nixe_gpu::ResidentImage;
 
+/// Filter used to fit the rendered game image to the host window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScalingFilter {
+    Nearest,
+    #[default]
+    Bilinear,
+    Bicubic,
+    Lanczos,
+    Gaussian,
+    Area,
+    ScaleForce,
+    Fsr,
+}
+
 /// Composed frame ready for host presentation.
 #[derive(Clone, Debug)]
 pub struct PresentationFrame {

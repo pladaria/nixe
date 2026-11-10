@@ -291,13 +291,41 @@ impl Default for RuntimeInfo {
 }
 
 /// Values supplied by the caller, with no process-global settings dependency.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResolutionScaling {
     pub active: bool,
     pub up_scale: u32,
     pub down_shift: u32,
     pub up_factor: f32,
     pub down_factor: f32,
+}
+impl Default for ResolutionScaling {
+    fn default() -> Self {
+        Self::new(1, 0)
+    }
+}
+impl ResolutionScaling {
+    /// Eden's integer ratio keeps viewport, transfer and shader rounding identical.
+    pub const fn new(up_scale: u32, down_shift: u32) -> Self {
+        let up_factor = up_scale as f32 / (1u32 << down_shift) as f32;
+        Self {
+            active: up_scale != 1 || down_shift != 0,
+            up_scale,
+            down_shift,
+            up_factor,
+            down_factor: 1.0 / up_factor,
+        }
+    }
+    pub fn scale(self, value: u32) -> u32 {
+        if value == 0 {
+            0
+        } else {
+            ((value * self.up_scale) >> self.down_shift).max(1)
+        }
+    }
+    pub fn scale_signed(self, value: i32) -> i32 {
+        ((i64::from(value) * i64::from(self.up_scale)) >> self.down_shift) as i32
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -1356,6 +1356,7 @@ dependencies = [
  "nixe-input",
  "nixe-loader-content",
  "nixe-loader-title",
+ "nixe-video",
  "serde",
  "toml",
 ]
@@ -1568,6 +1569,7 @@ name = "nixe-video"
 version = "0.1.0"
 dependencies = [
  "nixe-gpu",
+ "serde",
 ]
 
 [[package]]

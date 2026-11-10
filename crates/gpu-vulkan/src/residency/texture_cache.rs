@@ -31,6 +31,13 @@ fn image_type(dimension: ImageDimension) -> u8 {
     }
 }
 impl CachedImage {
+    pub(super) fn can_rescale(&self, depth: bool) -> bool {
+        let info = &self.info;
+        matches!(info.layout, ImageMemoryLayout::BlockLinear(block) if block.block_depth_log2 == 0)
+            && info.description.dimension() == ImageDimension::Two
+            && info.description.mip_levels() == 1
+            && (info.description.extent().height > 288 || depth)
+    }
     pub(super) fn new(
         info: ImageInfo,
         address_space: MaxwellAddressSpaceId,
@@ -280,6 +287,12 @@ impl TextureCache {
             .collect();
         self.retired
             .push(entry.native, views, entry.contents.last_use);
+        self.retired
+            .push(entry.original, Vec::new(), entry.contents.last_use);
+        if let Some(scaled) = entry.scaled {
+            self.retired
+                .push(scaled, Vec::new(), entry.contents.last_use);
+        }
     }
     /// TextureCache::UnmapMemory unregisters actual DAddr overlaps and erases
     /// their logical slots. Native images/views survive in the destruction ring.

@@ -45,6 +45,7 @@ pub(crate) struct TextureBindings {
 }
 #[derive(Default)]
 pub(crate) struct TextureChannel {
+    pub(crate) rescaled: bool,
     // Only texture-cache operations touch this mask, under its existing mutex.
     // A cleared native selection must be resolved even without a register write.
     pub(crate) invalidated_targets: u16,

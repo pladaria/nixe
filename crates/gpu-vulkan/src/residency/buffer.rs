@@ -54,6 +54,7 @@ impl Residency<'_> {
     /// of host presentation frequency. Alignment copies remain mandatory.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
     pub(crate) fn tick_frame(&mut self) {
+        self.texture_cache.frame_tick += 1;
         self.runtime.descriptor_queue.tick_frame();
         self.runtime.compute_pass_descriptor_queue.tick_frame();
         let completed = self.runtime.device.completed_tick();

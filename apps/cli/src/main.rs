@@ -218,6 +218,7 @@ fn parse_arguments(
                             nixe_gpu_vulkan::ValidationMode::Disabled
                         },
                         adapter,
+                        ..Default::default()
                     },
                 }),
                 log_level: log_level.unwrap_or_default(),
@@ -271,6 +272,7 @@ fn parse_arguments(
                             nixe_gpu_vulkan::ValidationMode::Disabled
                         },
                         adapter,
+                        ..Default::default()
                     },
                     guest_logs_level_override: guest_logs_level,
                     file_system_access_log_override: file_system_access_log,

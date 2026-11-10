@@ -325,6 +325,7 @@ impl Residency<'_> {
         {
             return Ok(false);
         }
+        self.scale_image(image, false, false)?;
         self.prepare_image(image, upload, false)?;
         let mut region = vk::BufferImageCopy::default()
             .buffer_row_length(pitch / plane.bytes_per_block)

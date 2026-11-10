@@ -127,11 +127,12 @@ impl super::super::NativeExecution<'_> {
         &mut self,
         view: ImageViewId,
     ) -> Result<ImageViewId, VulkanError> {
-        self.residency.prepare_image(
-            self.residency.texture_cache.views[view].image,
-            false,
-            false,
-        )?;
+        let image = self.residency.texture_cache.views[view].image;
+        let description = self.residency.texture_cache.views[view].description;
+        self.residency.prepare_image(image, false, false)?;
+        if !self.residency.texture_cache.views.contains(view) {
+            return self.residency.image_view(image, description);
+        }
         Ok(view)
     }
     pub(in crate::native) fn shader_texture_view(

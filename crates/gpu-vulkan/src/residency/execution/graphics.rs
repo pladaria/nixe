@@ -382,6 +382,12 @@ impl Residency<'_> {
             size[0] = size[0].min(extent.width);
             size[1] = size[1].min(extent.height);
         }
+        if let Some(view) = key.views.iter().flatten().next()
+            && self.image_is_rescaled(*view)
+        {
+            let scale = self.resolution();
+            size = size.map(|v| scale.scale(v));
+        }
         let area = vk::Rect2D {
             offset: vk::Offset2D::default(),
             extent: vk::Extent2D {
@@ -502,11 +508,19 @@ impl Residency<'_> {
         let (description, p, view, size) = match a.source {
             AttachmentSource::Canonical { view, plane } => {
                 let image = self.texture_cache.views[view].image;
-                let p = self.checked_image_rect(image, plane, area)?;
+                let p = *self
+                    .texture_cache
+                    .get(image)
+                    .planes
+                    .get(plane)
+                    .ok_or(VulkanError::InvalidResource("attachment plane is absent"))?;
                 let mut description = self.texture_cache.get(image).description;
                 let d = self.image_view_description(view)?;
-                if (area.offset.x as u32).saturating_add(area.extent.width) > d.size.width
-                    || (area.offset.y as u32).saturating_add(area.extent.height) > d.size.height
+                let size = self.image_extent(image, d.size);
+                if area.offset.x < 0
+                    || area.offset.y < 0
+                    || (area.offset.x as u32).saturating_add(area.extent.width) > size.width
+                    || (area.offset.y as u32).saturating_add(area.extent.height) > size.height
                 {
                     return Err(VulkanError::InvalidResource(
                         "render area exceeds the logical image view",
@@ -521,7 +535,7 @@ impl Residency<'_> {
                     ));
                 }
                 description.format = d.format;
-                (description, p, self.image_view_lease(view)?, d.size)
+                (description, p, self.image_view_lease(view)?, size)
             }
             AttachmentSource::ResidentOnly(id) => {
                 let entry = self.attachment(id)?;

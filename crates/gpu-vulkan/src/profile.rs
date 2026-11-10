@@ -320,6 +320,9 @@ impl FeatureSet {
         if ext.contains(ash::ext::depth_range_unrestricted::NAME) {
             self.names.push(ash::ext::depth_range_unrestricted::NAME);
         }
+        if ext.contains(ash::ext::shader_stencil_export::NAME) {
+            self.names.push(ash::ext::shader_stencil_export::NAME);
+        }
         if ext.contains(ash::nv::fill_rectangle::NAME) {
             self.names.push(ash::nv::fill_rectangle::NAME);
         }

@@ -1,0 +1,6 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#define HALF 1
+#define PACKED 0
+#define EASU 1
+#include "screen-fsr.inc"

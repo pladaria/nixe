@@ -113,6 +113,7 @@ impl NativeGpuExecution {
             .access()
             .enable_sample_conversion((pipelines).clone());
         residency.access().enable_quad_indices((pipelines).clone());
+        residency.access().enable_scaling(Arc::clone(&pipelines));
         residency
             .access()
             .device_mut()
@@ -547,19 +548,20 @@ impl NativeExecution<'_> {
             self.residency.statistics().buffer_merges,
             0,
         );
+        let render_extent = if request.transform.rotate_90_clockwise {
+            [request.crop.height, request.crop.width]
+        } else {
+            [request.crop.width, request.crop.height]
+        };
+        // Eden's display layer composites at the window size. Keep the actual
+        // render dimensions independent of this presentation canvas.
         let extent = self
             .state
             .host
             .as_ref()
             .map(|h| h.client.output_size())
             .filter(|s| !s.contains(&0))
-            .unwrap_or({
-                if request.transform.rotate_90_clockwise {
-                    [request.crop.height, request.crop.width]
-                } else {
-                    [request.crop.width, request.crop.height]
-                }
-            });
+            .unwrap_or_else(|| render_extent.map(|v| self.residency.resolution().scale(v)));
         let format = self
             .state
             .host

@@ -27,6 +27,7 @@ mod raster_transfer;
 mod recording;
 mod retirement;
 mod sample_readback;
+mod scaling;
 mod texture_cache;
 mod texture_download;
 mod transfers;
@@ -107,6 +108,16 @@ pub(crate) struct ImageEntry {
     dma_downloaded: bool,
     contents: Contents,
     native: Arc<AllocatedImage>,
+    original: Arc<AllocatedImage>,
+    scaled: Option<Arc<AllocatedImage>>,
+    pub(crate) rescaled: bool,
+    original_initialized: bool,
+    scaled_initialized: bool,
+    can_rescale: bool,
+    checking_rescale: bool,
+    rescale_checked: bool,
+    scale_rating: u32,
+    scale_tick: u64,
     pub(crate) description: NativeImageDescription,
     pub(crate) planes: Arc<[ImagePlane]>,
     sample_grid: [u32; 2],

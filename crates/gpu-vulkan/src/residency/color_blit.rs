@@ -56,6 +56,15 @@ impl Residency<'_> {
         step: [i64; 2],
         sampler: crate::cache::Sampler,
     ) -> Result<WorkTicket, VulkanError> {
+        let source_image_id = self.texture_cache.views[source].image;
+        let destination_image_id = self.texture_cache.views[destination_view].image;
+        let source_description = self.image_view_description(source)?;
+        let destination_description = self.image_view_description(destination_view)?;
+        self.prepare_image(source_image_id, false, false)?;
+        self.prepare_image(destination_image_id, true, false)?;
+        self.rescale_blit_images(source_image_id, destination_image_id, false)?;
+        let source = self.image_view(source_image_id, source_description)?;
+        let destination_view = self.image_view(destination_image_id, destination_description)?;
         let destination = self.texture_cache.views[destination_view].image;
         let source_image = self
             .texture_cache
@@ -93,6 +102,20 @@ impl Residency<'_> {
             ));
         }
         let p = self.checked_image_rect(destination, plane, destination_rect)?;
+        let source_id = self.texture_cache.views[source].image;
+        let factor = self.resolution().up_factor as f64;
+        let source_scale = if self.texture_cache.get(source_id).rescaled {
+            factor
+        } else {
+            1.0
+        };
+        let destination_scale = if self.texture_cache.get(destination).rescaled {
+            factor
+        } else {
+            1.0
+        };
+        let destination_rect = self.image_rect(destination, destination_rect);
+        let physical_extent = self.image_extent(destination, p.extent);
         let format = self.image_view_description(destination_view)?.format;
         let program = self.prepare_host_program(
             pipeline,
@@ -104,8 +127,8 @@ impl Residency<'_> {
         let mut parameters = GraphicsParameters::new(
             GraphicsState::color(format),
             vk::Extent2D {
-                width: p.extent.width,
-                height: p.extent.height,
+                width: physical_extent.width,
+                height: physical_extent.height,
             },
         );
         parameters.scissors[0] = destination_rect;
@@ -120,12 +143,12 @@ impl Residency<'_> {
         let graphics = self.prepare_host_pipeline(program, parameters)?;
         let targets = self.framebuffer_for_view(destination_view)?;
         let unit = 4294967296.0_f64;
-        let scale = [step[0] as f64 / unit, step[1] as f64 / unit];
+        let scale = [step[0] as f64 / unit, step[1] as f64 / unit].map(|v| v * source_scale);
         let push = [
-            (scale[0] * f64::from(destination_rect.extent.width)) as f32,
-            (scale[1] * f64::from(destination_rect.extent.height)) as f32,
-            (first[0] as f64 / unit - scale[0] * 0.5) as f32,
-            (first[1] as f64 / unit - scale[1] * 0.5) as f32,
+            (scale[0] * f64::from(destination_rect.extent.width) / destination_scale) as f32,
+            (scale[1] * f64::from(destination_rect.extent.height) / destination_scale) as f32,
+            (first[0] as f64 / unit * source_scale - scale[0] * 0.5) as f32,
+            (first[1] as f64 / unit * source_scale - scale[1] * 0.5) as f32,
         ]
         .into_iter()
         .flat_map(f32::to_le_bytes)

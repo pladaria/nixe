@@ -211,15 +211,27 @@ impl Residency<'_> {
         id: ImageId,
         planes: &[PlaneCopies],
     ) -> Result<(), VulkanError> {
+        self.match_image_scales(source, id)?;
         let (native, layout) =
             self.image_planes_transfer(source, planes.iter().map(|plane| plane.source))?;
         let (target, target_layout) =
             self.image_planes_transfer(id, planes.iter().map(|plane| plane.destination))?;
         self.runtime.barriers.emit(&mut self.runtime.device)?;
-        let copies: smallvec::SmallVec<[vk::ImageCopy; 16]> = planes
+        let mut copies: smallvec::SmallVec<[vk::ImageCopy; 16]> = planes
             .iter()
             .flat_map(|plane| plane.copies.iter().copied())
             .collect();
+        if self.texture_cache.get(source).rescaled {
+            let scale = self.resolution();
+            for copy in &mut copies {
+                copy.src_offset.x = scale.scale_signed(copy.src_offset.x);
+                copy.src_offset.y = scale.scale_signed(copy.src_offset.y);
+                copy.dst_offset.x = scale.scale_signed(copy.dst_offset.x);
+                copy.dst_offset.y = scale.scale_signed(copy.dst_offset.y);
+                copy.extent.width = scale.scale(copy.extent.width);
+                copy.extent.height = scale.scale(copy.extent.height);
+            }
+        }
         unsafe {
             self.runtime
                 .device

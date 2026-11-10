@@ -1,0 +1,9 @@
+AMD FidelityFX Super Resolution 1
+https://github.com/GPUOpen-Effects/FidelityFX-FSR
+
+ffx_a.h and ffx_fsr1.h are copied without modification from
+dev-tools/eden/externals/FidelityFX-FSR/ffx-fsr at Eden commit
+d85005b2b27ebdbe785316886cdf04c2894d550e.
+Eden's external source tree: bcae897899097e64b31b89bf98d07c1c67f39c33.
+
+License: MIT (see LICENSE).

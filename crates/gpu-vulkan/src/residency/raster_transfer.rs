@@ -32,6 +32,7 @@ impl Residency<'_> {
             };
         }
         let targets = self.framebuffer_for_view(view)?;
+        let rect = self.image_rect(id, rect);
         self.clear_framebuffer(
             &targets,
             vk::ClearRect::default()
@@ -62,6 +63,8 @@ impl Residency<'_> {
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
         if source_rect.extent == destination_rect.extent
             && filter == vk::Filter::NEAREST
+            && self.texture_cache.get(source).rescaled
+                == self.texture_cache.get(destination).rescaled
             && descriptions[0].format == descriptions[1].format
             && descriptions
                 .iter()
@@ -140,6 +143,9 @@ impl Residency<'_> {
         }
         self.prepare_image(source, false, false)?;
         self.prepare_image(destination, true, false)?;
+        self.rescale_blit_images(source, destination, false)?;
+        let source_rect = self.image_rect(source, source_rect);
+        let destination_rect = self.image_rect(destination, destination_rect);
         let (source_handle, src_layout) =
             self.image_planes_transfer(source, selected.iter().map(|(src, _)| *src))?;
         let (target, dst_layout) =

@@ -1,6 +1,6 @@
 layout(location=0) in vec2 uv;
 layout(location=0) out vec4 color;
-layout(push_constant) uniform Parameters { vec4 crop; uvec4 flags; } p;
+layout(push_constant) uniform Parameters { vec4 crop; uvec4 flags; vec2 output_size; } p;
 vec2 source_uv() {
     vec2 q = uv;
     if ((p.flags.x & 4u) != 0u) q = vec2(q.y, 1.0-q.x);

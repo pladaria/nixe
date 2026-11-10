@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 nixe-gpu.workspace = true
+serde.workspace = true

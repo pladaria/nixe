@@ -187,7 +187,7 @@ impl Residency<'_> {
             );
         }
         let rect = full_rect(p);
-        let invalidate = self.is_full_image_clear(id, p, rect, p.aspect);
+        let invalidate = self.is_full_image_clear(id, p, self.image_rect(id, rect), p.aspect);
         self.prepare_image(id, true, invalidate)?;
         let (image, layout) = self.transfer_image(id, plane_range(p))?;
         self.runtime.barriers.emit(&mut self.runtime.device)?;
@@ -230,7 +230,7 @@ impl Residency<'_> {
             ));
         }
         let rect = full_rect(p);
-        let invalidate = self.is_full_image_clear(id, p, rect, p.aspect);
+        let invalidate = self.is_full_image_clear(id, p, self.image_rect(id, rect), p.aspect);
         self.prepare_image(id, true, invalidate)?;
         let (image, layout) = self.transfer_image(id, plane_range(p))?;
         self.runtime.barriers.emit(&mut self.runtime.device)?;
@@ -287,6 +287,9 @@ impl Residency<'_> {
             ));
         }
         self.prepare_image(destination, true, false)?;
+        self.rescale_blit_images(source, destination, true)?;
+        let source_rect = self.image_rect(source, source_rect);
+        let rect = self.image_rect(destination, rect);
         let (source, source_layout) = self.transfer_image(source, plane_range(src))?;
         let (destination_handle, destination_layout) =
             self.transfer_image(destination, plane_range(dst))?;
@@ -367,7 +370,9 @@ impl Residency<'_> {
             ));
         }
         self.prepare_image(destination, true, false)?;
-
+        self.match_image_scales(source, destination)?;
+        let source_rect = self.image_rect(source, source_rect);
+        let rect = self.image_rect(destination, rect);
         let extent = vk::Extent3D {
             width: rect.extent.width,
             height: rect.extent.height,

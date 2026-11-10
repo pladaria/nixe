@@ -31,8 +31,18 @@ impl crate::native::NativeExecution<'_> {
                 MaxwellLoweringError::UnsupportedClearStencilMaskSemantics,
             ));
         }
-        let rect = registers::clear_rect(state.register_words(), targets.render_area())
-            .map_err(compilation)?;
+        let mut logical_area = targets.render_area();
+        if self.residency.is_rescaling() {
+            let factor = self.residency.resolution().down_factor;
+            logical_area.extent.width = (logical_area.extent.width as f32 * factor).round() as u32;
+            logical_area.extent.height =
+                (logical_area.extent.height as f32 * factor).round() as u32;
+        }
+        let mut rect =
+            registers::clear_rect(state.register_words(), logical_area).map_err(compilation)?;
+        if self.residency.is_rescaling() {
+            rect = self.residency.scale_rect(rect);
+        }
         if rect.extent.width == 0 || rect.extent.height == 0 {
             return Ok(());
         }
@@ -264,6 +274,7 @@ impl crate::native::NativeExecution<'_> {
                         self.residency.texture_cache.views[id].image,
                     ));
                 }
+                self.residency.rescale_render_targets()?;
             }
             Ok(())
         })();

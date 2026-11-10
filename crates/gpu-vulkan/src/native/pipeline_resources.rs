@@ -23,6 +23,7 @@ pub(super) struct ImageHandle {
     pub(super) shift: u32,
 }
 pub(super) struct ImageSlot {
+    pub(super) rescaling_index: usize,
     pub(super) descriptor: usize,
     pub(super) primary: ImageHandle,
     pub(super) secondary: Option<ImageHandle>,
@@ -50,6 +51,18 @@ impl PipelineResources {
         let mut uniforms: [Vec<UniformSlot>; 6] = std::array::from_fn(|_| Vec::new());
         let mut storage: [Vec<StorageSlot>; 6] = std::array::from_fn(|_| Vec::new());
         let mut images: [Vec<ImageSlot>; 6] = std::array::from_fn(|_| Vec::new());
+        let mut scale_bases = [[0usize; 2]; 6];
+        let mut scale_counts = [0usize; 2];
+        for stage in &shader.stages {
+            if let Some(metadata) = &stage.guest {
+                scale_bases[stage.stage as usize] = scale_counts;
+                scale_counts[0] += metadata.info.texture_descriptors.len();
+                scale_counts[1] += metadata.info.image_descriptors.len();
+            }
+        }
+        if scale_counts[0] > 128 || scale_counts[1] > 64 {
+            return Err(fail("image descriptors exceed the rescaling mask ABI"));
+        }
         for stage in &shader.stages {
             if let Some(metadata) = &stage.guest {
                 for descriptor in metadata.info.constant_buffer_descriptors.iter() {
@@ -120,6 +133,8 @@ impl PipelineResources {
                         })
                     };
                     images[stage].push(ImageSlot {
+                        rescaling_index: scale_bases[stage][0]
+                            + metadata.bindings[origin.descriptor].resource_index.0 as usize,
                         descriptor,
                         primary: handle(
                             d.cbuf_index.0,
@@ -161,6 +176,8 @@ impl PipelineResources {
                         .and_then(|offset| d.cbuf_offset.0.checked_add(offset))
                         .ok_or(fail("storage image descriptor array offset overflow"))?;
                     images[stage].push(ImageSlot {
+                        rescaling_index: scale_bases[stage][1]
+                            + metadata.bindings[origin.descriptor].resource_index.0 as usize,
                         descriptor,
                         primary: ImageHandle {
                             cbuf: d.cbuf_index.0,

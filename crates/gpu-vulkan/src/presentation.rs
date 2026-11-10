@@ -1,6 +1,7 @@
 //! Host packets; graphics recording stays on the GPU owner, WSI on its own queue.
 use crate::*;
 use std::sync::{Arc, Mutex, mpsc};
+mod filters;
 mod frames;
 mod render;
 mod wsi;

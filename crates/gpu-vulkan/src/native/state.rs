@@ -26,11 +26,41 @@ impl Default for ShaderConstants {
     }
 }
 impl ShaderConstants {
+    pub(super) fn resources(
+        resources: &super::pipeline_resources::PipelineResources,
+        images: &[crate::residency::execution::ShaderImage],
+        residency: &crate::Residency<'_>,
+    ) -> Self {
+        let mut constants = Self::default();
+        if !residency.resolution().active {
+            return constants;
+        }
+        let slots = resources
+            .stages
+            .iter()
+            .flat_map(|stage| stage.images.iter());
+        for (slot, image) in slots.zip(images) {
+            if image
+                .view
+                .is_some_and(|view| residency.image_is_rescaled(view))
+            {
+                let base = if slot.storage_format.is_some() { 4 } else { 0 };
+                constants.0[base + slot.rescaling_index / 32] |= 1 << (slot.rescaling_index % 32);
+            }
+        }
+        if residency.is_rescaling() {
+            constants.0[nixe_shader_recompiler::host_abi::DOWN_FACTOR_OFFSET as usize / 4] =
+                residency.resolution().down_factor.to_bits();
+        }
+        constants
+    }
     pub(super) fn graphics(
         resources: &super::pipeline_resources::PipelineResources,
         state: &nixe_gpu_maxwell::engines::threed::MaxwellThreeDState,
+        images: &[crate::residency::execution::ShaderImage],
+        residency: &crate::Residency<'_>,
     ) -> Result<Self, VulkanError> {
-        let mut constants = Self::default();
+        let mut constants = Self::resources(resources, images, residency);
         if resources.uses_render_area {
             let extent = maxwell::registers::surface_extent(state.register_words());
             constants.0[..4]
