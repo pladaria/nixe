@@ -11,6 +11,10 @@ use nixe_video::ScalingFilter;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Program {
+    Fxaa,
+    SmaaEdges,
+    SmaaWeights,
+    SmaaBlend,
     Filter {
         filter: ScalingFilter,
         packed: bool,
@@ -40,6 +44,10 @@ impl Program {
             };
         }
         match self {
+            Self::Fxaa => module!("fxaa"),
+            Self::SmaaEdges => module!("smaa-edge-detection"),
+            Self::SmaaWeights => module!("smaa-blending-weight-calculation"),
+            Self::SmaaBlend => module!("smaa-neighborhood-blending"),
             Self::Filter {
                 filter: ScalingFilter::Nearest,
                 packed: false,
@@ -147,38 +155,66 @@ impl Program {
     }
     pub fn shader(self) -> Arc<ShaderArtifact> {
         let ui = self == Self::Ui;
-        let vertex: &[u8] = if ui {
-            include_bytes!("../../shaders/spv/ui.vert.spv")
-        } else {
-            include_bytes!("../../shaders/spv/screen.vert.spv")
+        let vertex: &[u8] = match self {
+            Self::Fxaa => include_bytes!("../../shaders/spv/fxaa.vert.spv"),
+            Self::SmaaEdges => include_bytes!("../../shaders/spv/smaa-edge-detection.vert.spv"),
+            Self::SmaaWeights => {
+                include_bytes!("../../shaders/spv/smaa-blending-weight-calculation.vert.spv")
+            }
+            Self::SmaaBlend => {
+                include_bytes!("../../shaders/spv/smaa-neighborhood-blending.vert.spv")
+            }
+            Self::Ui => include_bytes!("../../shaders/spv/ui.vert.spv"),
+            _ => include_bytes!("../../shaders/spv/screen.vert.spv"),
         };
+        let aa = matches!(
+            self,
+            Self::Fxaa | Self::SmaaEdges | Self::SmaaWeights | Self::SmaaBlend
+        );
         let push_size = match self {
             Self::Ui => 0,
             Self::Easu { .. } | Self::Rcas { .. } => 96,
             Self::Filter { .. } => 40,
+            Self::Fxaa | Self::SmaaEdges | Self::SmaaWeights | Self::SmaaBlend => 16,
         };
-        let bindings = [
-            spirv::DescriptorKind::SampledImage,
-            spirv::DescriptorKind::Sampler,
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(i, kind)| spirv::Binding {
-            resource: ResourceId::new(i as u32),
-            binding: i as u32,
-            kind,
-            count: 1,
-            sampler: None,
-            readable: true,
-            writable: false,
-        })
-        .collect();
+        let images = match self {
+            Self::SmaaWeights => 3,
+            Self::SmaaBlend => 2,
+            _ => 1,
+        };
+        let kinds: Vec<_> = if aa {
+            vec![spirv::DescriptorKind::CombinedImageSampler; images]
+        } else {
+            vec![
+                spirv::DescriptorKind::SampledImage,
+                spirv::DescriptorKind::Sampler,
+            ]
+        };
+        let bindings = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| spirv::Binding {
+                resource: ResourceId::new(i as u32),
+                binding: i as u32,
+                kind,
+                count: 1,
+                sampler: None,
+                readable: true,
+                writable: false,
+            })
+            .collect();
         Arc::new(ShaderArtifact::new(Box::new([
             crate::residency::helper_stage(
                 ShaderStage::Vertex,
                 vertex,
                 Box::new([]),
-                if ui { 8 } else { 0 },
+                if ui {
+                    8
+                } else if aa {
+                    16
+                } else {
+                    0
+                },
             ),
             crate::residency::helper_stage(
                 ShaderStage::Fragment,
@@ -194,14 +230,14 @@ pub(super) struct FilterTarget {
     pub view: Arc<AllocatedImageView>,
     pub framebuffer: Arc<crate::render_pass::Framebuffer>,
     pub extent: [u32; 2],
+    pub format: vk::Format,
 }
 impl FilterTarget {
     pub fn new(
         cache: &mut crate::residency::Residency<'_>,
         extent: [u32; 2],
+        format: vk::Format,
     ) -> Result<Self, VulkanError> {
-        // Eden retains EASU and RCAS outputs per in-flight presentation image.
-        let format = vk::Format::R16G16B16A16_SFLOAT;
         let image = cache.allocate_host_image(extent, format)?;
         let view = image.view_2d(format)?;
         let framebuffer = crate::render_pass::Framebuffer::color(
@@ -216,6 +252,7 @@ impl FilterTarget {
             view,
             framebuffer,
             extent,
+            format,
         })
     }
     pub fn layer(
@@ -226,7 +263,7 @@ impl FilterTarget {
         render::LayerImage {
             view: Arc::clone(&self.view),
             extent: self.extent,
-            format: vk::Format::R16G16B16A16_SFLOAT,
+            format: self.format,
             encoding,
             crop: nixe_gpu::FrameCrop {
                 left: 0,

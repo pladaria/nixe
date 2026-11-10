@@ -210,11 +210,17 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
     fn service_host_requests(&mut self) -> Result<(), Error> {
         let mut renderer = self.renderer.borrow_mut();
         let renderer = renderer.as_mut().expect("installed renderer");
-        let steps = renderer
+        let (steps, anti_aliasing_steps) = renderer
             .state
             .host
             .as_ref()
-            .map_or(0, |host| host.client.take_resolution_steps());
+            .map_or((0, 0), |host| host.client.take_setting_steps());
+        if anti_aliasing_steps != 0 {
+            renderer
+                .state
+                .frames
+                .cycle_anti_aliasing(anti_aliasing_steps);
+        }
         if steps == 0 {
             return Ok(());
         }

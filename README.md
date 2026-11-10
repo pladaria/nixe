@@ -94,7 +94,8 @@ Hotkeys:
 - <kbd>S</kbd>: save a screenshot as a PNG file (see `nixe.toml` for the screenshots directory)
 - <kbd>P</kbd>: pause or resume the emulation
 - <kbd>F</kbd>: toggle fullscreen; <kbd>Esc</kbd> also returns to windowed mode
-- <kbd>R</kbd>: cycle render resolution through 1×, 1.5×, 2× and 3× for the current session
+- <kbd>R</kbd>: cycle render resolution through `1×`, `1.5×`, `2×` and `3×` for the current session
+- <kbd>A</kbd>: cycle antialiasing through `none`, `FXAA` and `SMAA` for the current session
 - <kbd>1</kbd>: resize the window to the current render resolution
 
 ## Testing

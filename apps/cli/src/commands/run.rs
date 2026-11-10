@@ -298,6 +298,7 @@ fn run_with_memory(
     let (video_system, gpu_diagnostics) = {
         let mut options = vulkan;
         options.scaling_filter = config.video.scaling_filter;
+        options.anti_aliasing = config.video.anti_aliasing;
         let (up_scale, down_shift) = config.gpu.resolution_scale.ratio();
         options.resolution_scale = nixe_gpu_vulkan::ResolutionScaling::new(up_scale, down_shift);
         let (device, native_presentation) = if let Some(frontend) = frontend.as_mut() {

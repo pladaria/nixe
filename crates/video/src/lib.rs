@@ -20,6 +20,36 @@ pub enum ScalingFilter {
     Fsr,
 }
 
+/// Post-process antialiasing applied before presentation scaling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AntiAliasing {
+    #[default]
+    None,
+    Fxaa,
+    Smaa,
+}
+impl AntiAliasing {
+    pub const MODES: [Self; 3] = [Self::None, Self::Fxaa, Self::Smaa];
+
+    pub fn cycled(self, steps: u8) -> Self {
+        let index = match self {
+            Self::None => 0,
+            Self::Fxaa => 1,
+            Self::Smaa => 2,
+        };
+        Self::MODES[(index + usize::from(steps)) % Self::MODES.len()]
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Fxaa => "fxaa",
+            Self::Smaa => "smaa",
+        }
+    }
+}
+
 /// Composed frame ready for host presentation.
 #[derive(Clone, Debug)]
 pub struct PresentationFrame {

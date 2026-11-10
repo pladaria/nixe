@@ -86,6 +86,7 @@ struct Texture {
     size: [usize; 2],
     sampler: Sampler,
 }
+#[derive(Clone)]
 pub(crate) struct LayerImage {
     pub view: Arc<AllocatedImageView>,
     pub extent: [u32; 2],
@@ -121,8 +122,10 @@ impl LayerImage {
 pub(crate) struct ScreenRenderer {
     pipelines: HashMap<(vk::Format, Program), NativePipeline>,
     pub(super) filter: ScalingFilter,
+    pub(super) anti_aliasing: nixe_video::AntiAliasing,
+    pub(super) aa_lookup: Option<super::anti_aliasing::LookupTables>,
     half: bool,
-    linear: Sampler,
+    pub(super) linear: Sampler,
     nearest: Sampler,
     textures: HashMap<egui::TextureId, Texture>,
     vertices: Vec<u8>,
@@ -146,6 +149,8 @@ impl ScreenRenderer {
         Ok(Self {
             pipelines: HashMap::default(),
             filter: device.scaling_filter,
+            anti_aliasing: device.anti_aliasing,
+            aa_lookup: None,
             half: device.profile().shader_compiler.host.support_float16,
             linear: make(vk::Filter::LINEAR)?,
             nearest: make(vk::Filter::NEAREST)?,

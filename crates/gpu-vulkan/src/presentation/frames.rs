@@ -26,6 +26,7 @@ pub(crate) struct PresentFrame {
 pub(crate) struct Frame {
     pub storage: Arc<FrameStorage>,
     filter_targets: Option<[super::filters::FilterTarget; 2]>,
+    anti_aliasing: Option<super::anti_aliasing::Targets>,
     pub work: WorkTicket,
     last_use: WorkTicket,
     pub content: nixe_gpu::FrameCrop,
@@ -65,6 +66,7 @@ pub(crate) struct Frames {
 impl Frames {
     pub fn new(device: &VulkanDevice) -> Result<Self, VulkanError> {
         let (sender, releases) = mpsc::channel();
+        log::info!("anti-aliasing: {}", device.anti_aliasing.name());
         Ok(Self {
             frames: Vec::new(),
             raw_image: None,
@@ -176,6 +178,7 @@ impl Frames {
         let copy = wsi::CopyCommands::new(cache.device())?;
         let frame = Frame {
             filter_targets: None,
+            anti_aliasing: None,
             storage: Arc::new(FrameStorage {
                 copy,
                 view,
@@ -352,19 +355,25 @@ impl Frames {
         cache.record_framebuffer_upload(size);
         Ok(image)
     }
+    pub fn cycle_anti_aliasing(&mut self, steps: u8) {
+        self.renderer.anti_aliasing = self.renderer.anti_aliasing.cycled(steps);
+        log::info!(
+            "anti-aliasing changed to {}",
+            self.renderer.anti_aliasing.name()
+        );
+    }
     #[allow(clippy::too_many_arguments)]
     fn render_layer(
         &mut self,
         cache: &mut crate::residency::Residency<'_>,
         pipelines: &PipelineCompiler,
         descriptors: &mut DescriptorCache,
+        slot: usize,
         layer: &render::LayerImage,
-        extent: [u32; 2],
-        format: vk::Format,
         mut filter: nixe_video::ScalingFilter,
-    ) -> Result<usize, VulkanError> {
-        let slot = self.storage(cache, extent, format)?;
+    ) -> Result<(), VulkanError> {
         let frame = self.frames[slot].as_mut().unwrap();
+        let extent = frame.storage.extent;
         let view_format = frame.storage.framebuffer.key.colors[0];
         let filtered;
         let layer = if filter == nixe_video::ScalingFilter::Fsr {
@@ -379,8 +388,16 @@ impl Frames {
                 .is_none_or(|targets| targets[0].extent != size)
             {
                 frame.filter_targets = Some([
-                    super::filters::FilterTarget::new(cache, size)?,
-                    super::filters::FilterTarget::new(cache, size)?,
+                    super::filters::FilterTarget::new(
+                        cache,
+                        size,
+                        vk::Format::R16G16B16A16_SFLOAT,
+                    )?,
+                    super::filters::FilterTarget::new(
+                        cache,
+                        size,
+                        vk::Format::R16G16B16A16_SFLOAT,
+                    )?,
                 ]);
             }
             filtered = self.renderer.fsr(
@@ -434,7 +451,7 @@ impl Frames {
         cache
             .device_mut()
             .retire_image(Arc::clone(&frame.storage.view.image), frame.work)?;
-        Ok(slot)
+        Ok(())
     }
     #[allow(clippy::too_many_arguments)]
     pub fn compose(
@@ -512,23 +529,50 @@ impl Frames {
             crop,
             transform: source.transform,
         };
+        let layer = self.storage(cache, extent, format)?;
+        let mode = self.renderer.anti_aliasing;
+        let antialiased;
+        let layer_image = if mode == nixe_video::AntiAliasing::None {
+            self.frames[layer].as_mut().unwrap().anti_aliasing = None;
+            &layer_image
+        } else {
+            let targets = &mut self.frames[layer].as_mut().unwrap().anti_aliasing;
+            if targets
+                .as_ref()
+                .is_none_or(|targets| !targets.matches(&layer_image, mode))
+            {
+                *targets = Some(super::anti_aliasing::Targets::new(
+                    cache,
+                    layer_image.extent,
+                    mode,
+                    layer_image.format == vk::Format::R16_UINT,
+                )?);
+            }
+            antialiased = targets.as_ref().unwrap().draw(
+                &mut self.renderer,
+                cache,
+                pipelines,
+                descriptors,
+                &layer_image,
+            )?;
+            &antialiased
+        };
         if let Some(host) = host {
             host.capture_source(
                 cache,
                 &mut self.renderer,
                 pipelines,
                 descriptors,
-                &layer_image,
+                layer_image,
                 render_extent,
             )?;
         }
-        let layer = self.render_layer(
+        self.render_layer(
             cache,
             pipelines,
             descriptors,
-            &layer_image,
-            extent,
-            format,
+            layer,
+            layer_image,
             self.renderer.filter,
         )?;
         let work = self.frames[layer].as_ref().unwrap().work;
@@ -580,13 +624,13 @@ impl Frames {
         }
         let slot = if let Some(image) = image {
             let layer = self.get(image)?.layer();
-            let slot = self.render_layer(
+            let slot = self.storage(cache, extent, format)?;
+            self.render_layer(
                 cache,
                 pipelines,
                 descriptors,
+                slot,
                 &layer,
-                extent,
-                format,
                 nixe_video::ScalingFilter::Bilinear,
             )?;
             let work = self.frames[slot].as_ref().unwrap().work;

@@ -58,6 +58,10 @@ impl DerefMut for Presenter {
     }
 }
 impl Presenter {
+    pub(super) fn cycle_anti_aliasing(&self) {
+        self.client.cycle_anti_aliasing();
+    }
+
     pub(super) fn cycle_resolution(&self) {
         self.client.cycle_resolution();
     }

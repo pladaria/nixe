@@ -15,6 +15,7 @@ use std::{
 #[derive(Clone, Debug, Default)]
 pub struct DeviceOptions {
     pub scaling_filter: nixe_video::ScalingFilter,
+    pub anti_aliasing: nixe_video::AntiAliasing,
     pub resolution_scale: nixe_shader_recompiler::profile::ResolutionScaling,
     pub validation: ValidationMode,
     pub api: ApiPreference,
@@ -38,6 +39,7 @@ pub struct SurfaceProfile {
 /// Construct before GPU workers start, then move this concrete value to the owner.
 pub struct VulkanDevice {
     pub(crate) scaling_filter: nixe_video::ScalingFilter,
+    pub(crate) anti_aliasing: nixe_video::AntiAliasing,
     pub(crate) resolution_scale: crate::ResolutionScaling,
     pub(crate) owner: Arc<DeviceOwner>,
     pub(crate) submission: QueueState,
@@ -279,6 +281,7 @@ impl VulkanDevice {
         )?;
         Ok(Self {
             scaling_filter: options.scaling_filter,
+            anti_aliasing: options.anti_aliasing,
             resolution_scale: options.resolution_scale,
             owner,
             dispatch,

@@ -1,6 +1,7 @@
 //! Host packets; graphics recording stays on the GPU owner, WSI on its own queue.
 use crate::*;
 use std::sync::{Arc, Mutex, mpsc};
+mod anti_aliasing;
 mod filters;
 mod frames;
 mod render;
@@ -45,6 +46,7 @@ struct Control {
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
     stopped: bool,
     resolution_steps: u8,
+    anti_aliasing_steps: u8,
     failure: Option<String>,
     presented: std::collections::VecDeque<std::time::Instant>,
     presentations: u64,
@@ -69,8 +71,26 @@ impl PresentationClient {
             wake();
         }
     }
-    pub(crate) fn take_resolution_steps(&self) -> u8 {
-        std::mem::take(&mut self.0.lock().unwrap().resolution_steps)
+    pub fn cycle_anti_aliasing(&self) {
+        let wake = {
+            let mut state = self.0.lock().unwrap();
+            if state.stopped {
+                return;
+            }
+            state.anti_aliasing_steps =
+                (state.anti_aliasing_steps + 1) % nixe_video::AntiAliasing::MODES.len() as u8;
+            state.wake.clone()
+        };
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+    pub(crate) fn take_setting_steps(&self) -> (u8, u8) {
+        let mut state = self.0.lock().unwrap();
+        (
+            std::mem::take(&mut state.resolution_steps),
+            std::mem::take(&mut state.anti_aliasing_steps),
+        )
     }
     pub fn set_notifier(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         self.0.lock().unwrap().notify = Some(notify);

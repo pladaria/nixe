@@ -438,6 +438,8 @@ fn audio_volume<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8,
 pub struct VideoConfig {
     /// Window presentation filter; independent of internal render resolution.
     pub scaling_filter: nixe_video::ScalingFilter,
+    /// Antialiasing before the window presentation filter.
+    pub anti_aliasing: nixe_video::AntiAliasing,
     /// Synchronize host presentation to the monitor's vertical refresh.
     pub vsync: bool,
     /// Request NVIDIA's Linux Vulkan frame generation and measure its output.
@@ -447,6 +449,7 @@ impl Default for VideoConfig {
     fn default() -> Self {
         Self {
             scaling_filter: nixe_video::ScalingFilter::Bilinear,
+            anti_aliasing: nixe_video::AntiAliasing::None,
             vsync: true,
             nvidia_smooth_motion: false,
         }

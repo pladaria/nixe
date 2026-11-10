@@ -876,12 +876,19 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && !event.repeat
-                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyR) =>
+                    && matches!(
+                        event.physical_key,
+                        PhysicalKey::Code(KeyCode::KeyR | KeyCode::KeyA)
+                    ) =>
             {
                 if let Some(presenter) = &self.presenter
                     && presenter.window.has_focus()
                 {
-                    presenter.cycle_resolution();
+                    if event.physical_key == PhysicalKey::Code(KeyCode::KeyR) {
+                        presenter.cycle_resolution();
+                    } else {
+                        presenter.cycle_anti_aliasing();
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
