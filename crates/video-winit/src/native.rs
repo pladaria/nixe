@@ -58,6 +58,10 @@ impl DerefMut for Presenter {
     }
 }
 impl Presenter {
+    pub(super) fn stop(&self) {
+        self.client.close();
+    }
+
     pub(super) fn resize(&mut self, width: u32, height: u32) {
         if self
             .common
@@ -222,7 +226,7 @@ impl Presenter {
 }
 impl Drop for Presenter {
     fn drop(&mut self) {
-        self.client.close();
+        self.stop();
     }
 }
 impl WindowFrontend {

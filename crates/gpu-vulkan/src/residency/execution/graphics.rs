@@ -339,7 +339,7 @@ impl Residency<'_> {
 
     pub fn prepare_targets(
         &mut self,
-        targets: RenderingTargets,
+        mut targets: RenderingTargets,
     ) -> Result<Arc<PreparedTargets>, VulkanError> {
         if targets.colors.len() > 8
             || targets.colors.len()
@@ -349,24 +349,66 @@ impl Residency<'_> {
                 "rendering targets exceed supported color attachment slots",
             ));
         }
-        let area = targets.area;
-        let colors = targets
+        let selected: smallvec::SmallVec<[_; 10]> = targets
             .colors
             .iter()
-            .map(|a| {
-                a.map(|a| self.prepare_attachment(a, area, vk::ImageAspectFlags::COLOR))
-                    .transpose()
+            .flatten()
+            .chain(targets.depth.iter())
+            .chain(targets.stencil.iter())
+            .filter_map(|attachment| match attachment.source {
+                AttachmentSource::Canonical { view, .. } => {
+                    let view = &self.texture_cache.views[view];
+                    Some((view.image, view.description))
+                }
+                AttachmentSource::ResidentOnly(_) => None,
             })
-            .collect::<Result<Box<[_]>, _>>()?;
-        let depth = targets
-            .depth
-            .map(|a| self.prepare_attachment(a, area, vk::ImageAspectFlags::DEPTH))
-            .transpose()?;
-        let stencil = targets
-            .stencil
-            .map(|a| self.prepare_attachment(a, area, vk::ImageAspectFlags::STENCIL))
-            .transpose()?;
-        self.create_framebuffer(area, colors, depth, stencil)
+            .collect();
+        let retained = self.runtime.constructing.len();
+        self.runtime
+            .constructing
+            .extend(selected.iter().map(|(image, _)| Resource::Image(*image)));
+        let result = (|| {
+            for &(image, _) in &selected {
+                self.prepare_image(image, false, false)?;
+            }
+            let mut selected = selected.into_iter();
+            for attachment in targets
+                .colors
+                .iter_mut()
+                .flatten()
+                .chain(targets.depth.iter_mut())
+                .chain(targets.stencil.iter_mut())
+            {
+                if let AttachmentSource::Canonical { plane, .. } = attachment.source {
+                    let (image, description) =
+                        selected.next().expect("captured canonical attachment");
+                    attachment.source = AttachmentSource::Canonical {
+                        view: self.image_view(image, description)?,
+                        plane,
+                    };
+                }
+            }
+            let area = targets.area;
+            let colors = targets
+                .colors
+                .iter()
+                .map(|a| {
+                    a.map(|a| self.prepare_attachment(a, area, vk::ImageAspectFlags::COLOR))
+                        .transpose()
+                })
+                .collect::<Result<Box<[_]>, _>>()?;
+            let depth = targets
+                .depth
+                .map(|a| self.prepare_attachment(a, area, vk::ImageAspectFlags::DEPTH))
+                .transpose()?;
+            let stencil = targets
+                .stencil
+                .map(|a| self.prepare_attachment(a, area, vk::ImageAspectFlags::STENCIL))
+                .transpose()?;
+            self.create_framebuffer(area, colors, depth, stencil)
+        })();
+        self.runtime.constructing.truncate(retained);
+        result
     }
 
     /// Construct cached native attachment metadata directly from the current
@@ -834,6 +876,38 @@ impl Residency<'_> {
                     }
                 }
             }
+            // Host helpers prepare their explicit attachments here. Guest
+            // targets are prepared before framebuffer capture by their owner.
+            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L457-L490
+            for a in targets
+                .colors
+                .iter()
+                .filter_map(Option::as_ref)
+                .chain(targets.depth.as_ref().or(targets.stencil.as_ref()))
+            {
+                if let AttachmentSource::Canonical { view, .. } = a.description.source {
+                    let image = self.texture_cache.views[view].image;
+                    let clear_aspects = if a.plane.aspect == vk::ImageAspectFlags::COLOR {
+                        if a.description.load == vk::AttachmentLoadOp::CLEAR {
+                            vk::ImageAspectFlags::COLOR
+                        } else {
+                            vk::ImageAspectFlags::empty()
+                        }
+                    } else {
+                        targets
+                            .depth
+                            .iter()
+                            .chain(targets.stencil.iter())
+                            .filter(|a| a.description.load == vk::AttachmentLoadOp::CLEAR)
+                            .fold(vk::ImageAspectFlags::empty(), |aspects, a| {
+                                aspects | a.plane.aspect
+                            })
+                    };
+                    let invalidate = !clear_aspects.is_empty()
+                        && self.is_full_image_clear(image, a.plane, targets.area, clear_aspects);
+                    self.prepare_image(image, true, invalidate)?;
+                }
+            }
             let result = self.record_draw_inner(
                 &graphics.program.pipeline,
                 targets,
@@ -949,38 +1023,6 @@ impl Residency<'_> {
         } else {
             None
         };
-        // UpdateRenderTargets prepares each color image and the combined
-        // depth/stencil image once. Draw coverage never invalidates an image.
-        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L457-L490
-        for a in targets
-            .colors
-            .iter()
-            .filter_map(Option::as_ref)
-            .chain(targets.depth.as_ref().or(targets.stencil.as_ref()))
-        {
-            if let AttachmentSource::Canonical { view, .. } = a.description.source {
-                let image = self.texture_cache.views[view].image;
-                let clear_aspects = if a.plane.aspect == vk::ImageAspectFlags::COLOR {
-                    if a.description.load == vk::AttachmentLoadOp::CLEAR {
-                        vk::ImageAspectFlags::COLOR
-                    } else {
-                        vk::ImageAspectFlags::empty()
-                    }
-                } else {
-                    targets
-                        .depth
-                        .iter()
-                        .chain(targets.stencil.iter())
-                        .filter(|a| a.description.load == vk::AttachmentLoadOp::CLEAR)
-                        .fold(vk::ImageAspectFlags::empty(), |aspects, a| {
-                            aspects | a.plane.aspect
-                        })
-                };
-                let invalidate = !clear_aspects.is_empty()
-                    && self.is_full_image_clear(image, a.plane, targets.area, clear_aspects);
-                self.prepare_image(image, true, invalidate)?;
-            }
-        }
         // Framebuffer operations in one rendering instance already execute in
         // rasterization order. Only unchanged native attachments can continue;
         // imports and real native dependencies terminate the scope.

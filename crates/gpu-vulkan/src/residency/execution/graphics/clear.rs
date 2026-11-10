@@ -165,7 +165,6 @@ impl Residency<'_> {
             ));
         }
         let mut actual = smallvec::SmallVec::<[vk::ClearAttachment; 9]>::new();
-        let mut colors = 0u8;
         let mut ds = vk::ImageAspectFlags::empty();
         let present_ds = targets.depth_stencil_aspects();
         for clear in clears {
@@ -175,7 +174,6 @@ impl Residency<'_> {
                 if targets.colors.get(slot).is_none_or(Option::is_none) {
                     continue;
                 }
-                colors |= 1 << slot;
             } else {
                 clear.aspect_mask &= present_ds;
                 if clear.aspect_mask.is_empty() {
@@ -210,44 +208,21 @@ impl Residency<'_> {
             {
                 self.runtime.device.end_rendering()?;
             }
-            for (slot, a) in targets
-                .colors
-                .iter()
-                .enumerate()
-                .filter_map(|(i, a)| a.as_ref().map(|a| (i, a)))
-                .chain(
-                    targets
-                        .depth
-                        .as_ref()
-                        .or(targets.stencil.as_ref())
-                        .map(|a| (8, a)),
-                )
+            // The attachment or transfer owner prepares content before
+            // this framebuffer is captured.
+            if !self.runtime.device.render_pass_matches(targets)
+                && !self.runtime.device.deferred_clear_matches(targets)
             {
-                let selected = if slot == 8 {
-                    ds.intersects(present_ds)
-                } else {
-                    colors & (1 << slot) != 0
-                };
-                if let AttachmentSource::Canonical { view, .. } = a.description.source {
-                    let image = self.texture_cache.views[view].image;
-                    let aspects = if slot == 8 {
-                        ds
-                    } else {
-                        vk::ImageAspectFlags::COLOR
-                    };
-                    let invalidate =
-                        selected && self.is_full_image_clear(image, a.plane, rect, aspects);
-                    self.prepare_image(image, true, invalidate)?;
-                    if !self.runtime.device.render_pass_matches(targets)
-                        && !self.runtime.device.deferred_clear_matches(targets)
-                    {
-                        self.use_image(image)?;
+                for a in targets.attachments() {
+                    match a.description.source {
+                        AttachmentSource::Canonical { view, .. } => {
+                            let image = self.texture_cache.views[view].image;
+                            self.use_image(image)?;
+                        }
+                        AttachmentSource::ResidentOnly(id) => {
+                            self.use_attachment(id)?;
+                        }
                     }
-                } else if let AttachmentSource::ResidentOnly(id) = a.description.source
-                    && !self.runtime.device.render_pass_matches(targets)
-                    && !self.runtime.device.deferred_clear_matches(targets)
-                {
-                    self.use_attachment(id)?;
                 }
             }
             if !self.runtime.barriers.is_empty() {

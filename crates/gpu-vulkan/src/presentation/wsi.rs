@@ -804,6 +804,26 @@ impl Swapchains {
         if let Some(work) = self.current.as_ref().and_then(|c| c.last_work) {
             device.drain(work)?;
         }
+        // Drain the device before destroying presentation resources.
+        // Interposed presentation may retain generated frames beyond our
+        // graphics timeline; let it drain before waiting for release fences.
+        // https://docs.vulkan.org/refpages/latest/refpages/source/vkDeviceWaitIdle.html
+        {
+            let _queue = device
+                .owner
+                .queue_mutex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            unsafe { device.owner.device.device_wait_idle() }
+                .or_else(|error| {
+                    if error == vk::Result::ERROR_DEVICE_LOST {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|e| VulkanError::vk("final presentation device drain", e))?;
+        }
         if let Some((_, acquire, _)) = self.held.take() {
             unsafe {
                 device

@@ -31,6 +31,10 @@ impl Residency<'_> {
                 self.clear_depth_stencil(id, plane, value.depth, value.stencil)
             };
         }
+        let physical = self.image_rect(id, rect);
+        let invalidate = self.is_full_image_clear(id, p, physical, p.aspect);
+        self.prepare_image(id, true, invalidate)?;
+        let view = self.image_view(id, selected)?;
         let targets = self.framebuffer_for_view(view)?;
         let rect = self.image_rect(id, rect);
         self.clear_framebuffer(

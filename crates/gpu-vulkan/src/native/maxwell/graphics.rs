@@ -314,151 +314,171 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         arguments: Draw,
         dirty: u128,
     ) -> Result<(), VulkanError> {
-        let pipeline = &self.pipeline;
-        let vertex_attributes = self.vertex_attributes;
-        // ConfigureImpl owns and consumes the draw-local views, as Eden does.
-        // Keep the inline payload in this frame instead of moving it through
-        // large Result values between preparation and recording.
-        let mut images = smallvec::SmallVec::new();
         loop {
-            execution.update_render_targets(registers, space)?;
-            self.configure_resources::<STAGES, STORAGE>(
-                execution,
-                registers,
-                space,
-                groups,
-                &mut images,
-            )?;
-            execution.update_render_targets(registers, space)?;
-            if !execution
-                .residency
-                .texture_cache
-                .bindings
-                .has_deleted_images
-            {
-                break;
-            }
-        }
-        let mut geometry_changed = false;
-        loop {
-            execution
-                .residency
-                .runtime
-                .buffer_bindings
-                .channel
-                .has_deleted_buffers = false;
-            geometry_changed |= execution
-                .residency
-                .update_geometry(registers, draw, space)?;
-            graphics_stages!(STAGES, |STAGE| {
-                self.update_stage_buffers::<STAGE, STORAGE>(execution, space, groups[STAGE])?;
-            });
-            if !execution
-                .residency
-                .runtime
-                .buffer_bindings
-                .channel
-                .has_deleted_buffers
-            {
-                break;
-            }
-        }
-        let (arguments, native_index) =
-            execution
-                .residency
-                .assemble_quads(draw.topology, arguments, draw.inline_indices())?;
-        let channel = execution
-            .state
-            .current_context
-            .expect("selected guest channel");
-        let enabled = execution
-            .residency
-            .runtime
-            .buffer_bindings
-            .channel
-            .enabled_vertex_buffers;
-        execution.residency.bind_host_geometry_buffers(
-            Some(channel),
-            enabled,
-            arguments,
-            native_index.as_ref(),
-            |binding| registers.register_words()[0x1c00 / 4 + binding as usize * 4] & 0xfff,
-        )?;
-        let device = execution.residency.device();
-        let slot = device.recording_slot()?;
-        let pipeline_changed = device.submission.slots[slot].bound_graphics != pipeline.identity();
-        if geometry_changed || pipeline_changed || dirty & GraphicsDirty::VERTEX_INPUT != 0 {
-            let words = registers.register_words();
-            let mut attributes = vertex_attributes;
-            while attributes != 0 {
-                let location = attributes.trailing_zeros() as usize;
-                attributes &= attributes - 1;
-                let attribute = words[0x1160 / 4 + location];
-                if attribute & 64 == 0
-                    && execution
-                        .residency
-                        .runtime
-                        .buffer_bindings
-                        .channel
-                        .vertex_buffers
-                        .get((attribute & 31) as usize)
-                        .copied()
-                        .flatten()
-                        .is_none()
+            let pipeline = &self.pipeline;
+            let vertex_attributes = self.vertex_attributes;
+            // Keep draw-local views and their inline payload in this frame
+            // instead of moving them through large Result values between
+            // preparation and recording.
+            let mut images = smallvec::SmallVec::new();
+            loop {
+                execution.resolve_render_targets(registers, space)?;
+                self.configure_resources::<STAGES, STORAGE>(
+                    execution,
+                    registers,
+                    space,
+                    groups,
+                    &mut images,
+                )?;
+                execution.resolve_render_targets(registers, space)?;
+                if !execution
+                    .residency
+                    .texture_cache
+                    .bindings
+                    .has_deleted_images
                 {
-                    return Err(VulkanError::Compilation(
+                    break;
+                }
+            }
+            let mut geometry_changed = false;
+            loop {
+                execution
+                    .residency
+                    .runtime
+                    .buffer_bindings
+                    .channel
+                    .has_deleted_buffers = false;
+                geometry_changed |= execution
+                    .residency
+                    .update_geometry(registers, draw, space)?;
+                graphics_stages!(STAGES, |STAGE| {
+                    self.update_stage_buffers::<STAGE, STORAGE>(execution, space, groups[STAGE])?;
+                });
+                if !execution
+                    .residency
+                    .runtime
+                    .buffer_bindings
+                    .channel
+                    .has_deleted_buffers
+                {
+                    break;
+                }
+            }
+            let (arguments, native_index) = execution.residency.assemble_quads(
+                draw.topology,
+                arguments,
+                draw.inline_indices(),
+            )?;
+            let channel = execution
+                .state
+                .current_context
+                .expect("selected guest channel");
+            let enabled = execution
+                .residency
+                .runtime
+                .buffer_bindings
+                .channel
+                .enabled_vertex_buffers;
+            execution.residency.bind_host_geometry_buffers(
+                Some(channel),
+                enabled,
+                arguments,
+                native_index.as_ref(),
+                |binding| registers.register_words()[0x1c00 / 4 + binding as usize * 4] & 0xfff,
+            )?;
+            let device = execution.residency.device();
+            let slot = device.recording_slot()?;
+            let pipeline_changed =
+                device.submission.slots[slot].bound_graphics != pipeline.identity();
+            if geometry_changed || pipeline_changed || dirty & GraphicsDirty::VERTEX_INPUT != 0 {
+                let words = registers.register_words();
+                let mut attributes = vertex_attributes;
+                while attributes != 0 {
+                    let location = attributes.trailing_zeros() as usize;
+                    attributes &= attributes - 1;
+                    let attribute = words[0x1160 / 4 + location];
+                    if attribute & 64 == 0
+                        && execution
+                            .residency
+                            .runtime
+                            .buffer_bindings
+                            .channel
+                            .vertex_buffers
+                            .get((attribute & 31) as usize)
+                            .copied()
+                            .flatten()
+                            .is_none()
+                    {
+                        return Err(VulkanError::Compilation(
                         format!(
                             "vertex attribute {location}: shader consumes null vertex binding {}",
                             attribute & 31
                         )
                         .into(),
                     ));
+                    }
                 }
             }
-        }
-        let descriptors = if arguments.is_empty() {
-            crate::residency::execution::DescriptorQueue {
-                record: None,
-                dynamic_offsets: None,
-                update: None,
+            if execution
+                .residency
+                .texture_cache
+                .bindings
+                .has_deleted_images
+            {
+                continue;
             }
-        } else {
-            execution.residency.begin_guest_descriptors(pipeline)?;
-            if STORAGE {
+            let descriptors = if arguments.is_empty() {
+                crate::residency::execution::DescriptorQueue {
+                    record: None,
+                    dynamic_offsets: None,
+                    update: None,
+                }
+            } else {
+                execution.residency.begin_guest_descriptors(pipeline)?;
+                if STORAGE {
+                    graphics_stages!(STAGES, |STAGE| {
+                        execution
+                            .residency
+                            .import_guest_stage_storage::<STAGE>(&self.resources.stages[STAGE])?;
+                    });
+                }
+                let mut image_index = 0;
                 graphics_stages!(STAGES, |STAGE| {
+                    let resources = &self.resources.stages[STAGE];
+                    let end = image_index + resources.images.len();
                     execution
                         .residency
-                        .import_guest_stage_storage::<STAGE>(&self.resources.stages[STAGE])?;
+                        .configure_guest_stage::<STAGE, STORAGE>(
+                            pipeline,
+                            resources,
+                            groups[STAGE],
+                            &images[image_index..end],
+                        )?;
+                    image_index = end;
                 });
+                debug_assert_eq!(image_index, images.len());
+                execution.residency.guest_descriptor_update()
+            };
+            execution.update_render_targets(registers, space, false)?;
+            if execution
+                .residency
+                .texture_cache
+                .bindings
+                .has_deleted_images
+            {
+                continue;
             }
-            let mut image_index = 0;
-            graphics_stages!(STAGES, |STAGE| {
-                let resources = &self.resources.stages[STAGE];
-                let end = image_index + resources.images.len();
-                execution
-                    .residency
-                    .configure_guest_stage::<STAGE, STORAGE>(
-                        pipeline,
-                        resources,
-                        groups[STAGE],
-                        &images[image_index..end],
-                    )?;
-                image_index = end;
-            });
-            debug_assert_eq!(image_index, images.len());
-            execution.residency.guest_descriptor_update()
-        };
-        execution.update_render_targets(registers, space)?;
-        let targets = execution.current_framebuffer(registers)?;
-        self.record(
-            execution,
-            registers,
-            draw,
-            &targets,
-            arguments,
-            &images,
-            descriptors,
-        )
+            let targets = execution.residency.current_framebuffer()?;
+            return self.record(
+                execution,
+                registers,
+                draw,
+                &targets,
+                arguments,
+                &images,
+                descriptors,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

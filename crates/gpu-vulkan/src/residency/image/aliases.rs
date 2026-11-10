@@ -166,10 +166,14 @@ impl Residency<'_> {
         }
         Ok(())
     }
+    // Select one scale for the destination and all newer alias producers before
+    // copying them in modification order. Scale changes can retire image views.
+    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L2470-L2520
     pub(super) fn synchronize_image_aliases(&mut self, id: ImageId) -> Result<(), VulkanError> {
         let target = self.texture_cache.get(id);
         let tick = target.modification_tick;
         let mut modified = target.gpu_modified;
+        let mut any_rescaled = target.rescaled;
         let mut newest = tick;
         let mut aliases = smallvec::SmallVec::<[(ImageId, Arc<[PlaneCopies]>, u64); 8]>::new();
         for alias in &target.aliases {
@@ -177,6 +181,7 @@ impl Residency<'_> {
             if source.modification_tick > tick {
                 newest = newest.max(source.modification_tick);
                 modified |= source.gpu_modified;
+                any_rescaled |= source.rescaled;
                 aliases.push((
                     alias.image,
                     Arc::clone(&alias.copies),
@@ -187,13 +192,20 @@ impl Residency<'_> {
         if aliases.is_empty() {
             return Ok(());
         }
-        aliases.sort_unstable_by_key(|alias| alias.2);
         let retained = self.runtime.constructing.len();
         self.runtime
             .constructing
             .extend(aliases.iter().map(|alias| Resource::Image(alias.0)));
         let result: Result<(), VulkanError> = (|| {
+            let can_rescale = self.texture_cache.image_can_rescale(id);
+            if any_rescaled {
+                self.scale_image(id, can_rescale, false)?;
+            }
+            aliases.sort_unstable_by_key(|alias| alias.2);
             for (source, copies, _) in aliases {
+                if self.resolution().active && any_rescaled {
+                    self.scale_image(source, can_rescale, false)?;
+                }
                 self.copy_alias_regions(source, id, &copies)?;
             }
             Ok(())
@@ -211,7 +223,6 @@ impl Residency<'_> {
         id: ImageId,
         planes: &[PlaneCopies],
     ) -> Result<(), VulkanError> {
-        self.match_image_scales(source, id)?;
         let (native, layout) =
             self.image_planes_transfer(source, planes.iter().map(|plane| plane.source))?;
         let (target, target_layout) =

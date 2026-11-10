@@ -19,9 +19,9 @@ impl crate::native::NativeExecution<'_> {
         if surface.color_mask() == 0 && !surface.depth() && !surface.stencil() {
             return Ok(());
         }
-        self.update_render_targets(state, space)
+        self.update_render_targets(state, space, true)
             .map_err(compilation)?;
-        let targets = self.current_framebuffer(state).map_err(compilation)?;
+        let targets = self.residency.current_framebuffer().map_err(compilation)?;
         let present_ds = targets.depth_stencil_aspects();
         if surface.stencil()
             && present_ds.contains(vk::ImageAspectFlags::STENCIL)
@@ -202,7 +202,7 @@ impl crate::native::NativeExecution<'_> {
             },
         )
     }
-    pub(in crate::native) fn update_render_targets(
+    pub(in crate::native) fn resolve_render_targets(
         &mut self,
         state: &MaxwellThreeDState,
         space: &MaxwellGpuMemory,
@@ -213,11 +213,11 @@ impl crate::native::NativeExecution<'_> {
             bank.invalidated_targets = 0x1ff;
         }
         let retained = self.residency.runtime.constructing.len();
-        let result = (|| {
+        let result: Result<(), crate::VulkanError> = (|| {
             loop {
                 let bank = &mut self.residency.texture_cache.bindings.channel;
-                // Eden RenderTargetControl forces current attachment lookups
-                // in the texture owner instead of fanning out at each write.
+                // Resolve attachment selections when render-target control is
+                // consumed, keeping register writes independent of texture state.
                 // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L375-L419
                 let force = state
                     .graphics_dirty()
@@ -279,12 +279,7 @@ impl crate::native::NativeExecution<'_> {
             Ok(())
         })();
         self.residency.runtime.constructing.truncate(retained);
-        result
-    }
-    pub(in crate::native) fn current_framebuffer(
-        &mut self,
-        state: &MaxwellThreeDState,
-    ) -> Result<Arc<crate::residency::execution::PreparedTargets>, crate::VulkanError> {
+        result?;
         if state.graphics_dirty().take(GraphicsDirty::FRAMEBUFFER) != 0 {
             let r = state.register_words();
             let [width, height] = registers::surface_extent(r);
@@ -298,6 +293,113 @@ impl crate::native::NativeExecution<'_> {
                 bank.render_targets_changed();
             }
         }
-        self.residency.current_framebuffer()
+        Ok(())
+    }
+    /// Resolve coherence before capturing native framebuffer views. Alias
+    /// synchronization may change physical scale and retire view slots;
+    /// only image IDs survive that operation.
+    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L462-L527
+    pub(in crate::native) fn update_render_targets(
+        &mut self,
+        state: &MaxwellThreeDState,
+        space: &MaxwellGpuMemory,
+        is_clear: bool,
+    ) -> Result<(), crate::VulkanError> {
+        let retained = self.residency.runtime.constructing.len();
+        let result: Result<(), crate::VulkanError> = (|| {
+            loop {
+                self.resolve_render_targets(state, space)?;
+                let bank = &self.residency.texture_cache.bindings.channel;
+                let views = bank.render_targets.views;
+                let mut size = bank.render_targets.size;
+                let images = views.map(|view| {
+                    view.map(|view| {
+                        let entry = &self.residency.texture_cache.views[view];
+                        size[0] = size[0].min(entry.description.size.width);
+                        size[1] = size[1].min(entry.description.size.height);
+                        entry.image
+                    })
+                });
+                self.residency
+                    .runtime
+                    .constructing
+                    .extend(images.into_iter().flatten().map(Resource::Image));
+                let clear = if is_clear {
+                    Some(
+                        *state
+                            .render_targets()
+                            .clear()
+                            .last_surface()
+                            .value()
+                            .ok_or(crate::VulkanError::InvalidResource(
+                                "CLEAR_SURFACE state is incomplete",
+                            ))?,
+                    )
+                } else {
+                    None
+                };
+                let rect = if clear.is_some() {
+                    let area = vk::Rect2D {
+                        offset: Default::default(),
+                        extent: vk::Extent2D {
+                            width: size[0],
+                            height: size[1],
+                        },
+                    };
+                    let rect = registers::clear_rect(state.register_words(), area)
+                        .map_err(|e| crate::VulkanError::Compilation(e.to_string().into()))?;
+                    if self.residency.is_rescaling() {
+                        self.residency.scale_rect(rect)
+                    } else {
+                        rect
+                    }
+                } else {
+                    vk::Rect2D::default()
+                };
+                for (slot, image) in images.into_iter().enumerate() {
+                    let Some(image) = image else {
+                        continue;
+                    };
+                    let aspects = clear.map_or(vk::ImageAspectFlags::empty(), |clear| {
+                        if slot < 8 {
+                            if slot == clear.color_target() as usize && clear.color_mask() == 15 {
+                                vk::ImageAspectFlags::COLOR
+                            } else {
+                                vk::ImageAspectFlags::empty()
+                            }
+                        } else {
+                            let mut aspects = vk::ImageAspectFlags::empty();
+                            if clear.depth() {
+                                aspects |= vk::ImageAspectFlags::DEPTH;
+                            }
+                            if clear.stencil() {
+                                aspects |= vk::ImageAspectFlags::STENCIL;
+                            }
+                            aspects
+                        }
+                    });
+                    let plane = self.residency.texture_cache.get(image).planes[0];
+                    let invalidate = !aspects.is_empty()
+                        && self
+                            .residency
+                            .is_full_image_clear(image, plane, rect, aspects);
+                    self.residency.prepare_image(image, true, invalidate)?;
+                }
+                if self
+                    .residency
+                    .texture_cache
+                    .bindings
+                    .channel
+                    .invalidated_targets
+                    == 0
+                {
+                    break;
+                }
+                self.residency.runtime.constructing.truncate(retained);
+            }
+            Ok(())
+        })();
+        self.residency.runtime.constructing.truncate(retained);
+        result
     }
 }

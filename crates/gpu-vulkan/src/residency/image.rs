@@ -278,7 +278,7 @@ impl Residency<'_> {
         self.unpin(Resource::Image(id));
         result
     }
-    pub(super) fn is_full_image_clear(
+    pub(crate) fn is_full_image_clear(
         &self,
         id: ImageId,
         plane: ImagePlane,

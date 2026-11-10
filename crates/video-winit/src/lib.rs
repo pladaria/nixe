@@ -25,10 +25,10 @@ use nixe_input::{
 use nixe_video::{FrameMailbox, FrameNotifier, PresentationFrame};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, Touch, TouchPhase, WindowEvent};
+use winit::event::{ElementState, MouseButton, StartCause, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 #[derive(Clone, Copy, Debug)]
 enum FrontendEvent {
@@ -136,10 +136,13 @@ impl WindowFrontend {
                 stop_requested,
                 worker_completion: Arc::clone(&worker_completion),
                 frame_wakeup_pending,
+                stop_handler: None,
                 pause_handler: None,
                 pause_key_down: false,
                 volume_handler: None,
                 volume_keys_down: [false; 2],
+                cursor_hide_at: None,
+                cursor_hidden: false,
                 presenter: None,
                 game_title: None,
                 failure: None,
@@ -237,7 +240,13 @@ impl WindowFrontend {
     }
 
     /// Runs window event dispatch and frontend UI on the calling thread.
-    pub fn run(self) -> Result<Option<WindowState>, WindowError> {
+    /// The stop handler requests teardown; the event loop stays active until
+    /// `FrontendControl::worker_finished` reports that teardown is complete.
+    pub fn run(
+        mut self,
+        stop_handler: impl FnOnce() + 'static,
+    ) -> Result<Option<WindowState>, WindowError> {
+        self.application.stop_handler = Some(Box::new(stop_handler));
         let Self {
             event_loop,
             mut application,
@@ -245,6 +254,7 @@ impl WindowFrontend {
             touch_screen: _,
         } = self;
         let event_result = event_loop.run_app(&mut application);
+        application.request_stop();
         application.capture_window_state();
         if let Some(error) = application.failure.take() {
             return Err(error);
@@ -270,6 +280,7 @@ struct PresenterState {
     screenshots: Option<screenshot::Screenshots>,
 }
 const TITLE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const CURSOR_HIDE_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug)]
 struct FrameRateTracker {
@@ -531,10 +542,13 @@ struct PresenterApplication {
     stop_requested: Arc<AtomicBool>,
     worker_completion: Arc<WorkerCompletionState>,
     frame_wakeup_pending: Arc<AtomicBool>,
+    stop_handler: Option<Box<dyn FnOnce()>>,
     pause_handler: Option<PauseHandler>,
     pause_key_down: bool,
     volume_handler: Option<VolumeHandler>,
     volume_keys_down: [bool; 2],
+    cursor_hide_at: Option<Instant>,
+    cursor_hidden: bool,
     presenter: Option<Presenter>,
     game_title: Option<String>,
     failure: Option<WindowError>,
@@ -547,10 +561,47 @@ struct PresenterApplication {
 }
 
 impl PresenterApplication {
+    fn show_cursor(&mut self) {
+        self.cursor_hide_at = None;
+        if self.cursor_hidden {
+            if let Some(presenter) = &self.presenter {
+                presenter.window.set_cursor_visible(true);
+            }
+            self.cursor_hidden = false;
+        }
+    }
+
+    fn reset_cursor_timeout(&mut self) {
+        self.show_cursor();
+        if let Some(presenter) = &self.presenter
+            && presenter.window.fullscreen().is_some()
+            && presenter.window.has_focus()
+        {
+            self.cursor_hide_at = Some(Instant::now() + CURSOR_HIDE_DELAY);
+        }
+    }
+
+    fn request_stop(&mut self) {
+        let Some(handler) = self.stop_handler.take() else {
+            return;
+        };
+        self.stop_requested.store(true, Ordering::Release);
+        self.show_cursor();
+        self.touch_tracker.cancel_all(&self.touch_screen_writer);
+        self.capture_window_state();
+        if let Some(presenter) = &self.presenter {
+            presenter.stop();
+        }
+        handler();
+    }
+
     fn capture_window_state(&mut self) {
         let Some(presenter) = &self.presenter else {
             return;
         };
+        if presenter.window.fullscreen().is_some() {
+            return;
+        }
         let size = presenter.window.inner_size();
         // Minimization can report a zero-sized client area. Keep the last
         // usable size instead of replacing it with one we cannot reopen.
@@ -575,6 +626,9 @@ impl PresenterApplication {
     }
 
     fn redraw(&mut self) -> Result<(), WindowError> {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let Some(presenter) = &mut self.presenter else {
             return Ok(());
         };
@@ -590,6 +644,23 @@ impl PresenterApplication {
 }
 
 impl ApplicationHandler<FrontendEvent> for PresenterApplication {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::ResumeTimeReached {
+            requested_resume, ..
+        } = cause
+            && self.cursor_hide_at == Some(requested_resume)
+        {
+            self.cursor_hide_at = None;
+            if let Some(presenter) = &self.presenter
+                && presenter.window.fullscreen().is_some()
+                && presenter.window.has_focus()
+            {
+                presenter.window.set_cursor_visible(false);
+                self.cursor_hidden = true;
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.worker_completion.is_finished() {
             event_loop.exit();
@@ -618,12 +689,12 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                     presenter.window.request_redraw();
                 }
             }
-            FrontendEvent::StopRequested => {}
+            FrontendEvent::StopRequested => self.request_stop(),
             FrontendEvent::WorkerFinished => {
                 // Drop the surface, device, queue and all presentation
                 // resources before leaving the event loop. This event is sent
                 // only after guest-process and guest-graphics teardown.
-                self.capture_window_state();
+                self.request_stop();
                 self.presenter = None;
                 event_loop.exit();
             }
@@ -632,7 +703,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
 
     fn window_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        _event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
     ) {
@@ -642,6 +713,13 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             .is_none_or(|presenter| presenter.window.id() != window_id)
         {
             return;
+        }
+        match &event {
+            WindowEvent::CursorMoved { .. }
+            | WindowEvent::CursorEntered { .. }
+            | WindowEvent::Focused(true) => self.reset_cursor_timeout(),
+            WindowEvent::CursorLeft { .. } | WindowEvent::Focused(false) => self.show_cursor(),
+            _ => {}
         }
         if let WindowEvent::KeyboardInput {
             event,
@@ -727,16 +805,9 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 }
             }
             WindowEvent::CloseRequested => {
-                self.touch_tracker.cancel_all(&self.touch_screen_writer);
-                self.stop_requested.store(true, Ordering::Release);
-                self.capture_window_state();
-                self.presenter = None;
-                // Returning from `run_app` lets the CLI publish HostStop and
-                // join the guest worker through the normal teardown path.
-                // Merely recording the atomic flag would deadlock: this event
-                // loop waited for WorkerFinished while the worker waited for
-                // the HostStop sent after the event loop returned.
-                event_loop.exit();
+                // Keep the native event loop and window alive until graphics
+                // teardown completes. Publish the stop request immediately.
+                self.request_stop();
             }
             WindowEvent::Occluded(occluded) => {
                 if let Some(presenter) = &mut self.presenter {
@@ -755,7 +826,12 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             }
             WindowEvent::Moved(position) => {
                 self.capture_window_state();
-                if let Some(state) = &mut self.last_window_state {
+                if let Some(state) = &mut self.last_window_state
+                    && self
+                        .presenter
+                        .as_ref()
+                        .is_some_and(|presenter| presenter.window.fullscreen().is_none())
+                {
                     state.position = Some((position.x, position.y));
                 }
             }
@@ -815,6 +891,28 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                     && !event.repeat
                     && matches!(
                         event.physical_key,
+                        PhysicalKey::Code(KeyCode::KeyF | KeyCode::Escape)
+                    ) =>
+            {
+                if let Some(presenter) = &self.presenter
+                    && presenter.window.has_focus()
+                {
+                    let window = Arc::clone(&presenter.window);
+                    if window.fullscreen().is_some() {
+                        window.set_fullscreen(None);
+                        self.show_cursor();
+                    } else if event.physical_key == PhysicalKey::Code(KeyCode::KeyF) {
+                        self.capture_window_state();
+                        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                        self.reset_cursor_timeout();
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(
+                        event.physical_key,
                         PhysicalKey::Code(KeyCode::Digit1 | KeyCode::Numpad1)
                     ) =>
             {
@@ -829,8 +927,6 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 if let Err(error) = self.redraw() {
                     self.failure = Some(error);
                     self.stop_requested.store(true, Ordering::Release);
-                    self.capture_window_state();
-                    self.presenter = None;
                 }
             }
             _ => {}
@@ -838,18 +934,23 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Like window close, frontend failure must return so the CLI can send
-        // HostStop and join the guest; waiting here for that join would deadlock.
-        if self.failure.is_some() || self.worker_completion.is_finished() {
-            self.capture_window_state();
+        if self.failure.is_some() {
+            self.request_stop();
+        }
+        if self.worker_completion.is_finished() {
+            self.request_stop();
             self.presenter = None;
             event_loop.exit();
+            return;
+        }
+        if self.stop_requested.load(Ordering::Acquire) {
+            event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
         if let Some(presenter) = &mut self.presenter {
             let now = Instant::now();
             presenter.refresh_title(now);
-            if presenter
+            let wake_at = if presenter
                 .keyboard
                 .as_ref()
                 .is_some_and(keyboard::KeyboardOverlay::active)
@@ -858,11 +959,14 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 if now >= presenter.keyboard_redraw_at {
                     presenter.window.request_redraw();
                 }
-                event_loop.set_control_flow(ControlFlow::WaitUntil(presenter.keyboard_redraw_at));
+                presenter.keyboard_redraw_at
             } else {
-                event_loop
-                    .set_control_flow(ControlFlow::WaitUntil(presenter.frame_rate.next_refresh()));
-            }
+                presenter.frame_rate.next_refresh()
+            };
+            let wake_at = self
+                .cursor_hide_at
+                .map_or(wake_at, |deadline| wake_at.min(deadline));
+            event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }

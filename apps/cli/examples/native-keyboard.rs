@@ -62,13 +62,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         move |submission| {
             println!("{submission:?}");
-            control.worker_finished();
+            control.stop_requested();
         },
     )?;
-    window.run()?;
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let control = window.control();
+    let worker = std::thread::spawn(move || {
+        let _ = stopped.recv();
+        let _ = video.teardown();
+        drop(video);
+        control.worker_finished();
+    });
+    let result = window.run(move || {
+        let _ = stop.send(());
+    });
+    worker.join().expect("graphics teardown worker panicked");
+    result?;
     session.finish();
     host.close(&session);
-    drop(video);
     monitor.check()?;
     Ok(())
 }
