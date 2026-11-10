@@ -1,6 +1,5 @@
 use crate::{
-    ApiPreference, DeviceProfile, SurfaceTarget, SwapchainMaintenance, ValidationMode,
-    ValidationMonitor, VulkanError,
+    ApiPreference, DeviceProfile, SurfaceTarget, ValidationMode, ValidationMonitor, VulkanError,
     dispatch::Dispatch,
     instance::InstanceOwner,
     profile::{self, ExtensionSet, FeatureSet},
@@ -39,6 +38,7 @@ pub struct SurfaceProfile {
 /// Construct before GPU workers start, then move this concrete value to the owner.
 pub struct VulkanDevice {
     pub(crate) scaling_filter: nixe_video::ScalingFilter,
+    pub(crate) resolution_scale: crate::ResolutionScaling,
     pub(crate) owner: Arc<DeviceOwner>,
     pub(crate) submission: QueueState,
     pub(crate) dispatch: Dispatch,
@@ -246,10 +246,6 @@ impl VulkanDevice {
             Arc::clone(&owner.queue_mutex),
             Arc::clone(&objects),
         )?;
-        debug_assert_eq!(
-            dispatch.release_swapchain_images.is_some(),
-            selected.profile.swapchain_maintenance != SwapchainMaintenance::Disabled
-        );
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: owner.instance.instance.clone(),
             device: owner.device.clone(),
@@ -283,6 +279,7 @@ impl VulkanDevice {
         )?;
         Ok(Self {
             scaling_filter: options.scaling_filter,
+            resolution_scale: options.resolution_scale,
             owner,
             dispatch,
             objects,
@@ -310,20 +307,9 @@ impl VulkanDevice {
         }
         .map_err(|e| format!("vkEnumerateDeviceExtensionProperties: {e:?}"))?;
         let ext = ExtensionSet::new(&extensions);
-        let maintenance = if instance.surface_maintenance_khr
-            && ext.contains(crate::extensions::SWAPCHAIN_MAINTENANCE_KHR)
-        {
-            SwapchainMaintenance::Khr
-        } else if instance.surface_maintenance_ext
-            && ext.contains(ash::ext::swapchain_maintenance1::NAME)
-        {
-            SwapchainMaintenance::Ext
-        } else {
-            SwapchainMaintenance::Disabled
-        };
         // SAFETY: queries use only supported feature structures for this device.
         let mut features =
-            unsafe { FeatureSet::query(&instance.instance, physical, &ext, version, maintenance) };
+            unsafe { FeatureSet::query(&instance.instance, physical, &ext, version) };
         if ext.contains(ash::ext::calibrated_timestamps::NAME) {
             features.names.push(ash::ext::calibrated_timestamps::NAME);
         }
@@ -407,9 +393,8 @@ impl VulkanDevice {
         .ok_or_else(|| {
             "no graphics+compute family and compatible presentation family".to_string()
         })?;
-        features.finish_enabling(&ext, version, maintenance);
-        let profile =
-            unsafe { features.profile(&instance.instance, physical, version, maintenance) };
+        features.finish_enabling(&ext, version);
+        let profile = unsafe { features.profile(&instance.instance, physical, version) };
         let score = match properties.device_type {
             vk::PhysicalDeviceType::DISCRETE_GPU => 4,
             vk::PhysicalDeviceType::INTEGRATED_GPU => 3,

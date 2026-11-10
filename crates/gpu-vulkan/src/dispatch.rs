@@ -41,7 +41,6 @@ struct BlendingDispatch {
 pub(crate) struct Dispatch {
     recorder: Recorder,
     pub dynamic_mask: u16,
-    pub release_swapchain_images: Option<vk::PFN_vkReleaseSwapchainImagesEXT>,
 }
 
 impl Dispatch {
@@ -70,7 +69,6 @@ impl Dispatch {
         objects: std::sync::Arc<crate::cache::NativeObjects>,
     ) -> Result<Self, VulkanError> {
         let path = profile.api_path;
-        let maintenance = profile.swapchain_maintenance;
         let dynamic = profile.dynamic_state.base;
         let feedback_loop = profile.attachment_feedback_loop;
         let push_descriptor = profile.max_push_descriptors != 0;
@@ -96,28 +94,6 @@ impl Dispatch {
                 ash::khr::synchronization2::Device::new(instance, device)
                     .fp()
                     .cmd_write_timestamp2_khr
-            }
-        };
-        let release_swapchain_images = match maintenance {
-            crate::SwapchainMaintenance::Disabled => None,
-            crate::SwapchainMaintenance::Ext | crate::SwapchainMaintenance::Khr => {
-                let name = if maintenance == crate::SwapchainMaintenance::Khr {
-                    c"vkReleaseSwapchainImagesKHR"
-                } else {
-                    c"vkReleaseSwapchainImagesEXT"
-                };
-                // SAFETY: an enabled extension defines this ABI; KHR/EXT aliases
-                // have identical parameters in the registry. Resolve once.
-                let raw = unsafe { instance.get_device_proc_addr(device.handle(), name.as_ptr()) }
-                    .ok_or(VulkanError::InvalidResource(
-                        "enabled swapchain maintenance command is missing",
-                    ))?;
-                Some(unsafe {
-                    std::mem::transmute::<
-                        unsafe extern "system" fn(),
-                        vk::PFN_vkReleaseSwapchainImagesEXT,
-                    >(raw)
-                })
             }
         };
         let state = dynamic.then(|| match path {
@@ -231,7 +207,6 @@ impl Dispatch {
         Ok(Self {
             recorder,
             dynamic_mask,
-            release_swapchain_images,
         })
     }
     #[cfg(feature = "binding-probe")]

@@ -13,8 +13,6 @@ pub enum VulkanError {
     Allocation(gpu_allocator::AllocationError),
     WindowHandle(Box<str>),
     MissingInstanceExtension(String),
-    SurfaceMaintenanceUnavailable,
-    SwapchainMaintenanceUnavailable,
     ValidationUnavailable,
     ApiVersion {
         available: u32,
@@ -46,10 +44,6 @@ impl Display for VulkanError {
             Self::Allocation(e) => write!(f, "Vulkan allocation failed: {e}"),
             Self::WindowHandle(e) => write!(f, "cannot obtain native window handles: {e}"),
             Self::MissingInstanceExtension(e) => write!(f, "Vulkan instance extension required by the surface is unavailable: {e}"),
-            // First upstream loader extension allowlist with EXT surface maintenance:
-            // https://github.com/KhronosGroup/Vulkan-Loader/blob/v1.3.237/loader/generated/vk_loader_extensions.c
-            Self::SurfaceMaintenanceUnavailable => f.write_str("The Vulkan runtime does not expose VK_EXT_surface_maintenance1 or VK_KHR_surface_maintenance1, required for windowed rendering. Use Khronos Vulkan Loader 1.3.237 or newer (EXT support) and a compatible GPU driver."),
-            Self::SwapchainMaintenanceUnavailable => f.write_str("The selected GPU/driver does not provide the swapchainMaintenance1 feature with compatible KHR/EXT surface extensions, required for windowed rendering. Update your GPU driver or select a supported GPU."),
             Self::ValidationUnavailable => f.write_str("Vulkan validation requested, but VK_LAYER_KHRONOS_validation or VK_EXT_debug_utils is unavailable; install a Vulkan SDK/validation layer or configure VK_LAYER_PATH"),
             Self::ApiVersion { available } => write!(f, "Vulkan 1.2 or newer is required; loader provides {}.{}", vk::api_version_major(*available), vk::api_version_minor(*available)),
             Self::NoSuitableDevice(reasons) => write!(f, "no device meets the Vulkan profile: {}", reasons.join("; ")),

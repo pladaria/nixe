@@ -259,6 +259,10 @@ where
             if self.budget.is_stopped() {
                 return Ok(());
             }
+            self.frontend
+                .borrow_mut()
+                .service_host_requests()
+                .map_err(|error| self.failure(FrontendSubmissionId::new(0), error.to_string()))?;
             self.poll()?;
             if self.budget.take_progress_request() {
                 self.flush_progress()?;

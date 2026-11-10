@@ -14,13 +14,6 @@ pub enum ApiPreference {
     Auto,
     Compatibility12,
 }
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SwapchainMaintenance {
-    #[default]
-    Disabled,
-    Khr,
-    Ext,
-}
 
 // Eden Device selects the shader conversion path for the proprietary Qualcomm driver.
 // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/vulkan_common/vulkan_device.cpp#L522-L526
@@ -74,7 +67,6 @@ pub struct DeviceProfile {
     pub smooth_lines: bool,
     pub bresenham_lines: bool,
     pub attachment_feedback_loop: bool,
-    pub swapchain_maintenance: SwapchainMaintenance,
     pub swapchain_mutable_format: bool,
     pub portability: Option<PortabilitySupport>,
     pub enabled_extensions: Vec<String>,
@@ -231,7 +223,7 @@ macro_rules! optional_features {
         }
         impl FeatureSet {
             pub unsafe fn query(instance: &Instance, physical: vk::PhysicalDevice, ext: &ExtensionSet,
-                version: u32, maintenance: SwapchainMaintenance) -> Self {
+                version: u32) -> Self {
                 let mut result = Self::default();
                 let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut result.v11).push_next(&mut result.v12);
                 if version >= vk::API_VERSION_1_3 || ext.contains(ash::khr::synchronization2::NAME) { query = query.push_next(&mut result.sync); }
@@ -240,7 +232,7 @@ macro_rules! optional_features {
                     query = query.push_next(&mut result.subgroup);
                     if version < vk::API_VERSION_1_3 { result.names.push(ash::ext::subgroup_size_control::NAME); }
                 }
-                $(if let Some(name) = ($name)(version, maintenance, ext) {
+                $(if let Some(name) = ($name)(version, ext) {
                     result.names.push(name);
                     result.chains.$field = true;
                     query = query.push_next(&mut result.$field);
@@ -267,14 +259,13 @@ macro_rules! optional_features {
     }
 }
 
-// Extension dependency selection is cold initialization work; enabled chains
-// retain their selection explicitly, including KHR/EXT aliases.
+// Select extension dependencies once and retain their chains for the device lifetime.
 fn supported(ext: &ExtensionSet, name: &'static CStr) -> Option<&'static CStr> {
     ext.contains(name).then_some(name)
 }
 macro_rules! fixed {
     ($name:expr) => {
-        |_: u32, _: SwapchainMaintenance, e: &ExtensionSet| supported(e, $name)
+        |_: u32, e: &ExtensionSet| supported(e, $name)
     };
 }
 optional_features! {
@@ -291,23 +282,17 @@ optional_features! {
     feedback: vk::PhysicalDeviceTransformFeedbackFeaturesEXT<'static> => fixed!(ash::ext::transform_feedback::NAME),
     feedback_layout: vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT<'static> => fixed!(ash::ext::attachment_feedback_loop_layout::NAME),
     feedback_dynamic: vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT<'static> => fixed!(ash::ext::attachment_feedback_loop_dynamic_state::NAME),
-    index8: vk::PhysicalDeviceIndexTypeUint8FeaturesKHR<'static> => |_, _, e: &ExtensionSet| supported(e, ash::khr::index_type_uint8::NAME).or_else(|| supported(e, ash::ext::index_type_uint8::NAME)),
+    index8: vk::PhysicalDeviceIndexTypeUint8FeaturesKHR<'static> => |_, e: &ExtensionSet| supported(e, ash::khr::index_type_uint8::NAME).or_else(|| supported(e, ash::ext::index_type_uint8::NAME)),
     list_restart: vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT<'static> => fixed!(ash::ext::primitive_topology_list_restart::NAME),
     custom_border: vk::PhysicalDeviceCustomBorderColorFeaturesEXT<'static> => fixed!(ash::ext::custom_border_color::NAME),
     provoking: vk::PhysicalDeviceProvokingVertexFeaturesEXT<'static> => fixed!(ash::ext::provoking_vertex::NAME),
     portability: vk::PhysicalDevicePortabilitySubsetFeaturesKHR<'static> => fixed!(ash::khr::portability_subset::NAME),
     fma: ShaderFma<'static> => fixed!(extensions::SHADER_FMA),
-    lines: vk::PhysicalDeviceLineRasterizationFeaturesKHR<'static> => |_, _, e: &ExtensionSet| supported(e, ash::khr::line_rasterization::NAME).or_else(|| supported(e, ash::ext::line_rasterization::NAME)),
-    maintenance: vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'static> => |_, m, _: &ExtensionSet| match m { SwapchainMaintenance::Khr => Some(extensions::SWAPCHAIN_MAINTENANCE_KHR), SwapchainMaintenance::Ext => Some(ash::ext::swapchain_maintenance1::NAME), SwapchainMaintenance::Disabled => None },
+    lines: vk::PhysicalDeviceLineRasterizationFeaturesKHR<'static> => |_, e: &ExtensionSet| supported(e, ash::khr::line_rasterization::NAME).or_else(|| supported(e, ash::ext::line_rasterization::NAME)),
 }
 
 impl FeatureSet {
-    pub fn finish_enabling(
-        &mut self,
-        ext: &ExtensionSet,
-        version: u32,
-        maintenance: SwapchainMaintenance,
-    ) {
+    pub fn finish_enabling(&mut self, ext: &ExtensionSet, version: u32) {
         if version < vk::API_VERSION_1_3 {
             self.names.push(ash::khr::synchronization2::NAME);
         }
@@ -373,15 +358,6 @@ impl FeatureSet {
         self.v12.buffer_device_address_multi_device = vk::FALSE;
         self.fma.float16 &= self.v12.shader_float16;
         self.fma.float64 &= self.core.shader_float64;
-        if maintenance != SwapchainMaintenance::Disabled
-            && self.maintenance.swapchain_maintenance1 == 0
-        {
-            self.names.retain(|n| {
-                *n != extensions::SWAPCHAIN_MAINTENANCE_KHR
-                    && *n != ash::ext::swapchain_maintenance1::NAME
-            });
-            self.chains.maintenance = false;
-        }
         if version < vk::API_VERSION_1_3 && ext.contains(ash::ext::pipeline_creation_feedback::NAME)
         {
             self.names.push(ash::ext::pipeline_creation_feedback::NAME);
@@ -433,7 +409,6 @@ impl FeatureSet {
         instance: &Instance,
         physical: vk::PhysicalDevice,
         version: u32,
-        maintenance: SwapchainMaintenance,
     ) -> DeviceProfile {
         let mut floats = vk::PhysicalDeviceFloatControlsProperties::default();
         let mut driver = vk::PhysicalDeviceDriverProperties::default();
@@ -629,11 +604,6 @@ impl FeatureSet {
             swapchain_mutable_format: self
                 .names
                 .contains(&ash::khr::swapchain_mutable_format::NAME),
-            swapchain_maintenance: if self.maintenance.swapchain_maintenance1 != 0 {
-                maintenance
-            } else {
-                SwapchainMaintenance::Disabled
-            },
             portability: self
                 .names
                 .contains(&ash::khr::portability_subset::NAME)

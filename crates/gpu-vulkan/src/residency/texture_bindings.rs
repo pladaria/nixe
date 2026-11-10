@@ -75,6 +75,16 @@ impl TextureChannel {
     }
 }
 impl TextureBindings {
+    pub(super) fn reset_resolution(&mut self) {
+        for bank in std::iter::once(&mut *self.channel)
+            .chain(self.channels.values_mut().flatten().map(Box::as_mut))
+        {
+            bank.rescaled = false;
+            bank.invalidated_targets = 0x1ff;
+            bank.last_framebuffer_id = None;
+            bank.render_targets_changed();
+        }
+    }
     pub(crate) fn create_channel(&mut self, id: u64) {
         assert!(self.channels.insert(id, Some(Box::default())).is_none());
     }

@@ -11,6 +11,7 @@ use nixe_gpu::{
     shader_module::{Binding, DescriptorKind, ResourceId},
 };
 use std::sync::OnceLock;
+use std::time::Duration;
 
 pub(super) struct Helpers {
     compiler: Arc<PipelineCompiler>,
@@ -146,12 +147,45 @@ impl Residency<'_> {
         });
     }
     pub(crate) fn resolution(&self) -> crate::ResolutionScaling {
+        self.runtime.device.resolution_scale
+    }
+    pub(crate) fn change_resolution(
+        &mut self,
+        resolution: crate::ResolutionScaling,
+    ) -> Result<(), VulkanError> {
+        let images: Vec<_> = self
+            .texture_cache
+            .images
+            .iter()
+            .filter_map(|(id, image)| image.scaled.is_some().then_some(id))
+            .collect();
+        let retained = self.runtime.constructing.len();
         self.runtime
-            .device
-            .profile
-            .shader_compiler
-            .settings
-            .resolution_info
+            .constructing
+            .extend(images.iter().copied().map(Resource::Image));
+        let result = (|| {
+            // Preserve every physical version with the old ratio before
+            // replacing scaled storage. Alias modification order stays intact.
+            self.runtime.device.end_rendering()?;
+            for &image in &images {
+                self.scale_image(image, false, false)?;
+            }
+            let work = self.flush()?;
+            self.runtime.device.wait_for_work(work, Duration::MAX)?;
+            for image in images {
+                let entry = &mut self.texture_cache.images[image];
+                entry.scaled = None;
+                entry.scaled_initialized = false;
+            }
+            self.runtime.device.resolution_scale = resolution;
+            for slot in &mut self.runtime.device.submission.slots {
+                slot.graphics_state = Default::default();
+            }
+            self.texture_cache.bindings.reset_resolution();
+            Ok(())
+        })();
+        self.runtime.constructing.truncate(retained);
+        result
     }
     pub(crate) fn is_rescaling(&self) -> bool {
         self.texture_cache.bindings.channel.rescaled

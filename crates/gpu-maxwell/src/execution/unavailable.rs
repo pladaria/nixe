@@ -7,6 +7,9 @@ fn unavailable<T>() -> Result<T, MaxwellSubmissionExecutionError> {
     ))
 }
 impl MaxwellFrontend for MissingRenderer {
+    fn service_host_requests(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {
+        Ok(())
+    }
     fn bind_gpu_memory(&mut self, _: &crate::MaxwellGpuMemoryHandle) {}
     fn create_channel(&mut self, _: crate::MaxwellChannelId) {}
     fn bind_channel(&mut self, _: crate::MaxwellChannelId, _: &crate::MaxwellThreeDState) {}

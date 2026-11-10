@@ -4,6 +4,8 @@ use crate::engines::{MaxwellResolvedComputeLaunch, MaxwellTwoDSolidOperation};
 use crate::{MaxwellThreeDState, MaxwellTwoDBlitOperation};
 
 pub trait MaxwellFrontend: 'static {
+    /// Apply host settings between complete command lists.
+    fn service_host_requests(&mut self) -> Result<(), MaxwellSubmissionExecutionError>;
     fn bind_gpu_memory(&mut self, memory: &crate::MaxwellGpuMemoryHandle);
     fn create_channel(&mut self, channel: crate::MaxwellChannelId);
     fn bind_channel(&mut self, channel: crate::MaxwellChannelId, state: &MaxwellThreeDState);

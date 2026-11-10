@@ -18,6 +18,12 @@ impl Residency<'_> {
             let work = self.runtime.device.current_work();
             let entry = self.buffer_cache.get_mut(id);
             entry.contents.last_use = Some(work);
+            // Uploads also write their destination. Later overlapping copies
+            // must retain command order and the corresponding dependencies.
+            // https://docs.vulkan.org/guide/latest/synchronization_examples.html
+            for region in &regions {
+                entry.used.mark(region.dst_offset, region.size);
+            }
             self.touch(Resource::Buffer(id));
         } else {
             for region in &regions {

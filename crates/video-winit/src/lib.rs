@@ -876,6 +876,17 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && !event.repeat
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyR) =>
+            {
+                if let Some(presenter) = &self.presenter
+                    && presenter.window.has_focus()
+                {
+                    presenter.cycle_resolution();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyS) =>
             {
                 if let Some(presenter) = &mut self.presenter

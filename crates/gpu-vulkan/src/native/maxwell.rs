@@ -73,7 +73,10 @@ impl MaxwellVulkanRasterizer {
             let backend = backend.as_ref().expect("installed renderer");
             (
                 backend.shader_cache(),
-                PipelineCache::new(Arc::clone(&backend.compiler)),
+                PipelineCache::new(
+                    Arc::clone(&backend.compiler),
+                    &backend.residency.device().profile().shader_compiler,
+                ),
                 backend.residency.device().profile_handle(),
             )
         };
@@ -204,6 +207,40 @@ fn plane_metadata_bytes(image: &GuestImage) -> usize {
 }
 
 impl MaxwellFrontend for MaxwellVulkanRasterizer {
+    fn service_host_requests(&mut self) -> Result<(), Error> {
+        let mut renderer = self.renderer.borrow_mut();
+        let renderer = renderer.as_mut().expect("installed renderer");
+        let steps = renderer
+            .state
+            .host
+            .as_ref()
+            .map_or(0, |host| host.client.take_resolution_steps());
+        if steps == 0 {
+            return Ok(());
+        }
+        let current = renderer.residency.device().resolution_scale;
+        let scales = crate::RESOLUTION_SCALES;
+        let index = scales
+            .iter()
+            .position(|scale| {
+                scale.up_scale == current.up_scale && scale.down_shift == current.down_shift
+            })
+            .ok_or_else(|| {
+                compilation("render resolution is outside the supported hotkey cycle")
+            })?;
+        let resolution = scales[(index + usize::from(steps)) % scales.len()];
+        renderer
+            .residency
+            .access()
+            .change_resolution(resolution)
+            .map_err(compilation)?;
+        self.pipelines.change_resolution(resolution);
+        log::info!(
+            "render resolution scale changed to {}x",
+            resolution.up_factor
+        );
+        Ok(())
+    }
     fn report_samples_passed(
         &mut self,
         target: Vec<nixe_memory::AllocationRange>,
@@ -403,14 +440,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
         };
         let slot = self
             .pipelines
-            .current_compute(
-                &self.profile,
-                launch,
-                &shader,
-                space,
-                access,
-                &mut self.statistics,
-            )
+            .current_compute(launch, &shader, space, access, &mut self.statistics)
             .map_err(compilation)?;
         let pipeline = &self.pipelines.compute_pipelines[slot];
         let mut renderer = self.renderer.borrow_mut();

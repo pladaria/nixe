@@ -33,8 +33,6 @@ pub(crate) struct InstanceOwner {
     pub surface: Option<Surface>,
     pub validation: Arc<ValidationState>,
     messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
-    pub surface_maintenance_khr: bool,
-    pub surface_maintenance_ext: bool,
     pub debug_utils: bool,
 }
 
@@ -89,21 +87,6 @@ impl InstanceOwner {
         if debug_utils {
             names.push(ash::ext::debug_utils::NAME);
         }
-        let capabilities2 =
-            target.is_some() && supported.contains(ash::khr::get_surface_capabilities2::NAME);
-        if capabilities2 {
-            names.push(ash::khr::get_surface_capabilities2::NAME);
-        }
-        let surface_maintenance_khr =
-            capabilities2 && supported.contains(crate::extensions::SURFACE_MAINTENANCE_KHR);
-        let surface_maintenance_ext =
-            capabilities2 && supported.contains(ash::ext::surface_maintenance1::NAME);
-        if surface_maintenance_khr {
-            names.push(crate::extensions::SURFACE_MAINTENANCE_KHR);
-        }
-        if surface_maintenance_ext {
-            names.push(ash::ext::surface_maintenance1::NAME);
-        }
         let layers = unsafe { entry.enumerate_instance_layer_properties() }
             .map_err(|e| VulkanError::vk("vkEnumerateInstanceLayerProperties", e))?;
         let validation_enabled = validation_mode == ValidationMode::Enabled;
@@ -142,8 +125,6 @@ impl InstanceOwner {
             surface: None,
             validation,
             messenger: None,
-            surface_maintenance_khr,
-            surface_maintenance_ext,
             debug_utils,
         };
         if validation_enabled {

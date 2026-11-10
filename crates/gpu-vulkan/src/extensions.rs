@@ -7,8 +7,6 @@ use ash::vk;
 use std::{ffi::c_void, marker::PhantomData};
 
 pub(crate) const SHADER_FMA: &std::ffi::CStr = c"VK_KHR_shader_fma";
-pub(crate) const SURFACE_MAINTENANCE_KHR: &std::ffi::CStr = c"VK_KHR_surface_maintenance1";
-pub(crate) const SWAPCHAIN_MAINTENANCE_KHR: &std::ffi::CStr = c"VK_KHR_swapchain_maintenance1";
 
 macro_rules! feature_struct {
     ($name:ident, $s_type:expr, $($field:ident),+) => {

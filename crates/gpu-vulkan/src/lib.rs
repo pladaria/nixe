@@ -36,9 +36,15 @@ pub use device::{DeviceOptions, QueueSelection, SurfaceProfile, VulkanDevice};
 pub use error::VulkanError;
 pub use instance::{NativeWindow, SurfaceTarget};
 pub use nixe_shader_recompiler::profile::ResolutionScaling;
+pub(crate) const RESOLUTION_SCALES: [ResolutionScaling; 4] = [
+    ResolutionScaling::new(1, 0),
+    ResolutionScaling::new(3, 1),
+    ResolutionScaling::new(2, 0),
+    ResolutionScaling::new(3, 0),
+];
 pub use profile::{
     ApiPath, ApiPreference, DeviceProfile, DynamicStateSupport, FloatControls, PortabilitySupport,
-    SubgroupSupport, SwapchainMaintenance,
+    SubgroupSupport,
 };
 pub use queue::{
     CompletedReadback, QueueUsage, ReadbackTicket, RecordingStatistics, WorkStatus, WorkTicket,

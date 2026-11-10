@@ -1,4 +1,4 @@
-//! Presentation release fences are distinct from ordinary GPU timeline uses.
+//! Copy completion protects frame storage; acquisition protects per-image semaphores.
 //! https://docs.vulkan.org/guide/latest/swapchain_semaphore_reuse.html
 use super::*;
 use crate::device::DeviceOwner;
@@ -73,10 +73,6 @@ struct Context {
     vsync: bool,
 }
 impl Context {
-    fn completed(&self) -> Result<u64, VulkanError> {
-        unsafe { self.owner.device.get_semaphore_counter_value(self.timeline) }
-            .map_err(|e| VulkanError::vk("WSI graphics completion", e))
-    }
     fn drain(&self, work: WorkTicket) -> Result<(), VulkanError> {
         // The owner publishes complete work before handing out this ticket.
         // Wait for the native worker to accept it before querying the timeline.
@@ -169,8 +165,7 @@ impl CopyCommands {
         frame: &PresentFrame,
         target: &Acquired,
     ) -> Result<(), VulkanError> {
-        // GetRenderFrame waits present_done before reusing this frame command buffer.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_present_manager.cpp#L172-L187
+        // A frame's command buffer and source remain in use until its copy completes.
         self.wait()?;
         context.progress.wait_submitted(frame.work.tick(), None)?;
         let d = &self.owner.device;
@@ -352,8 +347,6 @@ struct Image {
     copy_submitted: bool,
     source: Option<Arc<FrameStorage>>,
     finished: vk::Semaphore,
-    present: vk::Fence,
-    presented: bool,
 }
 struct Chain {
     owner: Arc<DeviceOwner>,
@@ -365,35 +358,15 @@ struct Chain {
     extent: vk::Extent2D,
     last_work: Option<WorkTicket>,
 }
-impl Chain {
-    fn releasable(&self, completed: u64) -> Result<bool, VulkanError> {
-        if self.last_work.is_some_and(|w| w.tick() > completed) {
-            return Ok(false);
-        }
-        for image in &self.images {
-            if image.copy_submitted && !image.copy.as_ref().unwrap().ready()? {
-                return Ok(false);
-            }
-            if image.presented
-                && !unsafe { self.owner.device.get_fence_status(image.present) }
-                    .map_err(|e| VulkanError::vk("presentation release status", e))?
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-}
 impl Drop for Chain {
     fn drop(&mut self) {
         unsafe {
+            self.loader.destroy_swapchain(self.handle, None);
             for image in &mut self.images {
                 image.source.take();
                 image.copy.take();
                 self.owner.device.destroy_semaphore(image.finished, None);
-                self.owner.device.destroy_fence(image.present, None);
             }
-            self.loader.destroy_swapchain(self.handle, None);
         }
     }
 }
@@ -417,7 +390,6 @@ pub(crate) struct Acquired {
 struct Swapchains {
     owner: Arc<DeviceOwner>,
     current: Option<Chain>,
-    retired: Vec<Chain>,
     acquires: Vec<Acquire>,
     held: Option<(u32, usize, bool)>,
     dirty: bool,
@@ -433,7 +405,6 @@ impl Swapchains {
         let result = Self {
             owner: Arc::clone(&device.owner),
             current: None,
-            retired: Vec::new(),
             acquires: Vec::new(),
             held: None,
             dirty: true,
@@ -475,20 +446,11 @@ impl Swapchains {
         }
     }
     pub fn update(&mut self, device: &Context) -> Result<bool, VulkanError> {
-        let completed = device.completed()?;
-        for chain in self.current.iter_mut().chain(&mut self.retired) {
+        if let Some(chain) = &mut self.current {
             for image in &mut chain.images {
                 if image.copy_submitted && image.copy.as_ref().unwrap().ready()? {
                     image.source = None;
                 }
-            }
-        }
-        let mut at = 0;
-        while at < self.retired.len() {
-            if self.retired[at].releasable(completed)? {
-                self.retired.remove(at);
-            } else {
-                at += 1;
             }
         }
         if self.requested.contains(&0) {
@@ -499,10 +461,6 @@ impl Swapchains {
         }
         if !self.dirty {
             return Ok(true);
-        }
-        // Bounds rapid resize generations without blocking guest progress.
-        if self.retired.len() == 8 {
-            return Ok(false);
         }
         let surface = device.owner.instance.surface.as_ref().unwrap();
         let capabilities = unsafe {
@@ -597,6 +555,9 @@ impl Swapchains {
         }
         let loader =
             ash::khr::swapchain::Device::new(&device.owner.instance.instance, &device.owner.device);
+        // Resize retires the previous native work before replacing its swapchain.
+        // Ordinary frames keep using the asynchronous copy/present worker.
+        self.drain(device)?;
         let handle = unsafe { loader.create_swapchain(&info, None) }
             .map_err(|e| VulkanError::vk("vkCreateSwapchainKHR", e))?;
         let mut chain = Chain {
@@ -626,8 +587,6 @@ impl Swapchains {
                 copy_submitted: false,
                 source: None,
                 finished: vk::Semaphore::null(),
-                present: vk::Fence::null(),
-                presented: false,
             });
             let entry = chain.images.last_mut().unwrap();
             entry.finished = unsafe {
@@ -637,18 +596,9 @@ impl Swapchains {
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
             }
             .map_err(|e| VulkanError::vk("present semaphore", e))?;
-            entry.present = unsafe {
-                device.owner.device.create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )
-            }
-            .map_err(|e| VulkanError::vk("present release fence", e))?;
         }
         self.reserve_acquires(chain.images.len())?;
-        if let Some(old) = self.current.replace(chain) {
-            self.retired.push(old);
-        }
+        self.current = Some(chain);
         self.dirty = false;
         Ok(true)
     }
@@ -721,12 +671,9 @@ impl Swapchains {
         if image.copy_submitted && !image.copy.as_ref().unwrap().ready()? {
             return Ok(None);
         }
-        if image.presented
-            && !unsafe { device.owner.device.get_fence_status(image.present) }
-                .map_err(|e| VulkanError::vk("present release status", e))?
-        {
-            return Ok(None);
-        }
+        // Acquiring this image and completing its acquire fence also completes
+        // the previous presentation's use of its per-image wait semaphore.
+        // https://docs.vulkan.org/guide/latest/swapchain_semaphore_reuse.html
         self.dirty |= suboptimal;
         Ok(Some(Acquired {
             format: chain.format,
@@ -754,18 +701,13 @@ impl Swapchains {
         image.copy_submitted = true;
         self.acquires[frame.acquire].copy = Some(Arc::clone(copy));
         image.source = Some(source.storage);
-        unsafe { device.owner.device.reset_fences(&[image.present]) }
-            .map_err(|e| VulkanError::vk("reset present release fence", e))?;
-        let fences = [image.present];
-        let mut release = vk::SwapchainPresentFenceInfoEXT::default().fences(&fences);
         let chains = [chain.handle];
         let indices = [frame.index];
         let waits = [frame.signal];
         let info = vk::PresentInfoKHR::default()
             .wait_semaphores(&waits)
             .swapchains(&chains)
-            .image_indices(&indices)
-            .push_next(&mut release);
+            .image_indices(&indices);
         chain.last_work = Some(work);
         let result = {
             let _queue = device
@@ -776,17 +718,14 @@ impl Swapchains {
             unsafe { chain.loader.queue_present(self.present_queue, &info) }
         };
         // OOM does not enqueue or consume the wait semaphore. Keep acquisition
-        // for explicit release after graphics completion, not a never-signaled
-        // presentation fence. Out-of-date/surface-lost do enqueue their waits.
+        // until shutdown drains its copy. Out-of-date/surface-lost enqueue waits.
         // https://docs.vulkan.org/refpages/latest/refpages/source/vkQueuePresentKHR.html
         if matches!(
             result,
             Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
         ) {
-            image.presented = false;
             return Err(VulkanError::vk("vkQueuePresentKHR", result.unwrap_err()));
         }
-        image.presented = true;
         self.held = None;
         match result {
             Ok(suboptimal) => {
@@ -800,13 +739,29 @@ impl Swapchains {
             Err(error) => Err(VulkanError::vk("vkQueuePresentKHR", error)),
         }
     }
-    pub fn shutdown(&mut self, device: &Context) -> Result<(), VulkanError> {
+    fn drain(&mut self, device: &Context) -> Result<(), VulkanError> {
         if let Some(work) = self.current.as_ref().and_then(|c| c.last_work) {
             device.drain(work)?;
         }
-        // Drain the device before destroying presentation resources.
-        // Interposed presentation may retain generated frames beyond our
-        // graphics timeline; let it drain before waiting for release fences.
+        if let Some((_, acquire, _)) = self.held {
+            unsafe {
+                device
+                    .owner
+                    .device
+                    .wait_for_fences(&[self.acquires[acquire].fence], true, u64::MAX)
+            }
+            .or_else(|error| {
+                if error == vk::Result::ERROR_DEVICE_LOST {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(|e| VulkanError::vk("final acquire completion", e))?;
+            self.held = None;
+        }
+        // Drain native submissions on resize/shutdown before releasing their
+        // swapchain, copy storage and semaphores. No drain is needed per frame.
         // https://docs.vulkan.org/refpages/latest/refpages/source/vkDeviceWaitIdle.html
         {
             let _queue = device
@@ -822,65 +777,21 @@ impl Swapchains {
                         Err(error)
                     }
                 })
-                .map_err(|e| VulkanError::vk("final presentation device drain", e))?;
-        }
-        if let Some((_, acquire, _)) = self.held.take() {
-            unsafe {
-                device
-                    .owner
-                    .device
-                    .wait_for_fences(&[self.acquires[acquire].fence], true, u64::MAX)
-            }
-            .or_else(|error| {
-                if error == vk::Result::ERROR_DEVICE_LOST {
-                    Ok(())
-                } else {
-                    Err(error)
-                }
-            })
-            .map_err(|e| VulkanError::vk("final acquire completion", e))?;
-            // Destruction needs completed acquire/graphics/presentation uses,
-            // not a separate release of an unused acquired image. No continuing
-            // swapchain exists here. Avoid an unnecessary surface-dependent call.
-            // https://docs.vulkan.org/refpages/latest/refpages/source/vkDestroySwapchainKHR.html
-        }
-        for chain in self.current.iter().chain(&self.retired) {
-            for image in &chain.images {
-                if image.copy_submitted {
-                    image.copy.as_ref().unwrap().wait()?;
-                }
-            }
-            if let Some(work) = chain.last_work {
-                device.drain(work)?;
-            }
-            let fences: Vec<_> = chain
-                .images
-                .iter()
-                .filter(|i| i.presented)
-                .map(|i| i.present)
-                .collect();
-            if !fences.is_empty() {
-                unsafe { device.owner.device.wait_for_fences(&fences, true, u64::MAX) }
-                    .or_else(|error| {
-                        if error == vk::Result::ERROR_DEVICE_LOST {
-                            Ok(())
-                        } else {
-                            Err(error)
-                        }
-                    })
-                    .map_err(|e| VulkanError::vk("final presentation release", e))?;
-            }
+                .map_err(|e| VulkanError::vk("presentation device drain", e))?;
         }
         self.safe_to_drop = true;
+        Ok(())
+    }
+    pub fn shutdown(&mut self, device: &Context) -> Result<(), VulkanError> {
+        self.drain(device)?;
         self.current = None;
-        self.retired.clear();
         Ok(())
     }
 }
 impl Drop for Swapchains {
     fn drop(&mut self) {
         if !self.safe_to_drop {
-            log::error!("WSI resources destroyed without presentation release proof");
+            log::error!("WSI resources destroyed without graphics completion");
             std::process::abort();
         }
         unsafe {
@@ -920,17 +831,6 @@ impl Presenter {
             return Err(VulkanError::InvalidResource(
                 "native presentation requires the startup window surface",
             ));
-        }
-        if device.profile().swapchain_maintenance == SwapchainMaintenance::Disabled {
-            return Err(
-                if !device.owner.instance.surface_maintenance_khr
-                    && !device.owner.instance.surface_maintenance_ext
-                {
-                    VulkanError::SurfaceMaintenanceUnavailable
-                } else {
-                    VulkanError::SwapchainMaintenanceUnavailable
-                },
-            );
         }
         let format = surface_format(&device.owner)?.format;
         let context = Context {

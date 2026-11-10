@@ -74,12 +74,13 @@ struct FlushStatus {
 }
 pub(super) struct PipelineCache {
     pub(super) compiler: Arc<PipelineCompiler>,
-    graphics: HashMap<FixedPipelineState, usize>,
+    graphics: HashMap<([u32; 2], FixedPipelineState), usize>,
     pub(super) graphics_pipelines: Vec<GraphicsPipeline>,
-    compute: HashMap<ComputeKey, usize>,
+    compute: HashMap<([u32; 2], ComputeKey), usize>,
     pub(super) compute_pipelines: Vec<ComputePipeline>,
     pub(super) current_graphics: Option<usize>,
     pub(super) pipeline_state: Option<FixedPipelineState>,
+    configuration: Arc<nixe_gpu::shader_compilation::Configuration>,
     main_compiler: Option<nixe_shader_recompiler::Compiler>,
     archive: Option<crate::cache::archive::EnvironmentArchive>,
     flush: Arc<FlushStatus>,
@@ -87,7 +88,10 @@ pub(super) struct PipelineCache {
     last_flush: Option<Instant>,
 }
 impl PipelineCache {
-    pub(super) fn new(compiler: Arc<PipelineCompiler>) -> Self {
+    pub(super) fn new(
+        compiler: Arc<PipelineCompiler>,
+        configuration: &nixe_gpu::shader_compilation::Configuration,
+    ) -> Self {
         Self {
             compiler,
             graphics: HashMap::default(),
@@ -96,12 +100,24 @@ impl PipelineCache {
             compute_pipelines: Vec::new(),
             current_graphics: None,
             pipeline_state: None,
+            configuration: Arc::new(configuration.clone()),
             main_compiler: None,
             archive: None,
             flush: Arc::default(),
             pipelines_since_flush: 0,
             last_flush: None,
         }
+    }
+    fn scale_key(&self) -> [u32; 2] {
+        let resolution = self.configuration.settings.resolution_info;
+        [resolution.up_scale, resolution.down_shift]
+    }
+    pub(super) fn change_resolution(&mut self, resolution: crate::ResolutionScaling) {
+        Arc::make_mut(&mut self.configuration)
+            .settings
+            .resolution_info = resolution;
+        self.current_graphics = None;
+        self.pipeline_state = None;
     }
     pub(super) fn load_disk_resources(
         &mut self,
@@ -133,6 +149,7 @@ impl PipelineCache {
             total += 1;
             let compiler = Arc::clone(&self.compiler);
             let profile = Arc::clone(profile);
+            let configuration = Arc::clone(&self.configuration);
             let sender = sender.clone();
             if let Err(error) = self.compiler.queue(move |worker| {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
@@ -141,13 +158,14 @@ impl PipelineCache {
                             nixe_shader_recompiler::Compiler::new().map_err(compilation)?;
                         let programs = environment
                             .inputs
-                            .translate(&mut pools, &profile.shader_compiler)
+                            .translate(&mut pools, &configuration)
                             .map_err(compilation)?;
                         if let Some(key) = graphics {
                             Self::build_graphics(
                                 &compiler,
                                 &mut pools,
                                 &profile,
+                                &configuration,
                                 key,
                                 &programs,
                                 Some(worker),
@@ -157,7 +175,7 @@ impl PipelineCache {
                             Self::build_compute(
                                 &compiler,
                                 &mut pools,
-                                &profile,
+                                &configuration,
                                 compute.unwrap(),
                                 &programs,
                                 Some(worker),
@@ -182,17 +200,20 @@ impl PipelineCache {
         for result in receiver {
             match result {
                 Ok(DiskPipeline::Graphics(pipeline)) => {
-                    if !self.graphics.contains_key(&pipeline.key) {
+                    if !self
+                        .graphics
+                        .contains_key(&(self.scale_key(), pipeline.key))
+                    {
                         let slot = self.graphics_pipelines.len();
-                        self.graphics.insert(pipeline.key, slot);
+                        self.graphics.insert((self.scale_key(), pipeline.key), slot);
                         self.graphics_pipelines.push(pipeline);
                         loaded += 1;
                     }
                 }
                 Ok(DiskPipeline::Compute(pipeline)) => {
-                    if !self.compute.contains_key(&pipeline.key) {
+                    if !self.compute.contains_key(&(self.scale_key(), pipeline.key)) {
                         let slot = self.compute_pipelines.len();
-                        self.compute.insert(pipeline.key, slot);
+                        self.compute.insert((self.scale_key(), pipeline.key), slot);
                         self.compute_pipelines.push(pipeline);
                         loaded += 1;
                     }
@@ -246,7 +267,6 @@ impl PipelineCache {
     #[allow(clippy::type_complexity)]
     fn capture_inputs(
         &mut self,
-        profile: &DeviceProfile,
         space: &nixe_gpu_maxwell::MaxwellGpuMemory,
         access: &mut nixe_gpu::MemoryAccess<'_>,
         statistics: &mut maxwell::NativeFrontendStatistics,
@@ -264,7 +284,7 @@ impl PipelineCache {
             self.main_compiler.as_mut().unwrap(),
             space,
             requests,
-            &profile.shader_compiler,
+            &self.configuration,
             access,
         )
         .map_err(compilation)?;
@@ -314,10 +334,14 @@ impl PipelineCache {
             }
         }
 
-        let index = if let Some(&index) = self.graphics.get(id) {
+        let index = if let Some(&index) = self.graphics.get(&(self.scale_key(), *id)) {
             index
         } else {
             let id = *id;
+            let new_environment = !crate::RESOLUTION_SCALES.iter().any(|scale| {
+                self.graphics
+                    .contains_key(&([scale.up_scale, scale.down_shift], id))
+            });
             let requests = shaders
                 .infos
                 .iter()
@@ -339,21 +363,23 @@ impl PipelineCache {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            let (inputs, programs) =
-                self.capture_inputs(profile, space, access, statistics, requests)?;
+            let (inputs, programs) = self.capture_inputs(space, access, statistics, requests)?;
             let pipeline = Self::build_graphics(
                 &self.compiler,
                 self.main_compiler.as_mut().unwrap(),
                 profile,
+                &self.configuration,
                 id,
                 &programs,
                 None,
             )?;
             let index = self.graphics_pipelines.len();
             self.graphics_pipelines.push(pipeline);
-            self.graphics.insert(id, index);
+            self.graphics.insert((self.scale_key(), id), index);
             statistics.prepared_graphics += 1;
-            self.serialize(id.environment_key(), inputs);
+            if new_environment {
+                self.serialize(id.environment_key(), inputs);
+            }
             index
         };
         self.select_graphics(index);
@@ -363,15 +389,15 @@ impl PipelineCache {
         compiler: &PipelineCompiler,
         pools: &mut nixe_shader_recompiler::Compiler,
         profile: &DeviceProfile,
+        configuration: &nixe_gpu::shader_compilation::Configuration,
         key: FixedPipelineState,
         programs: &[nixe_shader_recompiler::ProgramId],
         worker: Option<usize>,
     ) -> Result<GraphicsPipeline, VulkanError> {
         let runtime = key.runtime().map_err(compilation)?;
         nixe_gpu::trace::event("shader_compile", 0, 0, 0);
-        let shader =
-            crate::cache::compile_guest(pools, programs, &profile.shader_compiler, Some(&runtime))
-                .map_err(compilation)?;
+        let shader = crate::cache::compile_guest(pools, programs, configuration, Some(&runtime))
+            .map_err(compilation)?;
         let shader = Self::graphics_shader(&key, profile, shader)?;
         let vertex_attributes = shader
             .stages
@@ -444,10 +470,8 @@ impl PipelineCache {
         Ok(shader)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn current_compute(
         &mut self,
-        profile: &DeviceProfile,
         launch: &nixe_gpu_maxwell::MaxwellResolvedComputeLaunch,
         shader: &nixe_gpu_maxwell::recompiler::ShaderInfo,
         space: &nixe_gpu_maxwell::MaxwellGpuMemory,
@@ -459,11 +483,14 @@ impl PipelineCache {
             shared_memory: launch.shared_memory_size(),
             workgroup: launch.workgroup_size(),
         };
-        let slot = if let Some(&slot) = self.compute.get(&key) {
+        let slot = if let Some(&slot) = self.compute.get(&(self.scale_key(), key)) {
             slot
         } else {
+            let new_environment = !crate::RESOLUTION_SCALES.iter().any(|scale| {
+                self.compute
+                    .contains_key(&([scale.up_scale, scale.down_shift], key))
+            });
             let (inputs, programs) = self.capture_inputs(
-                profile,
                 space,
                 access,
                 statistics,
@@ -472,15 +499,17 @@ impl PipelineCache {
             let pipeline = Self::build_compute(
                 &self.compiler,
                 self.main_compiler.as_mut().unwrap(),
-                profile,
+                &self.configuration,
                 key,
                 &programs,
                 None,
             )?;
             let slot = self.compute_pipelines.len();
             self.compute_pipelines.push(pipeline);
-            self.compute.insert(key, slot);
-            self.serialize(key.environment_key(), inputs);
+            self.compute.insert((self.scale_key(), key), slot);
+            if new_environment {
+                self.serialize(key.environment_key(), inputs);
+            }
             slot
         };
         Ok(slot)
@@ -488,13 +517,13 @@ impl PipelineCache {
     fn build_compute(
         compiler: &PipelineCompiler,
         pools: &mut nixe_shader_recompiler::Compiler,
-        profile: &DeviceProfile,
+        configuration: &nixe_gpu::shader_compilation::Configuration,
         key: ComputeKey,
         programs: &[nixe_shader_recompiler::ProgramId],
         worker: Option<usize>,
     ) -> Result<ComputePipeline, VulkanError> {
         nixe_gpu::trace::event("shader_compile", 0, 0, 0);
-        let shader = crate::cache::compile_guest(pools, programs, &profile.shader_compiler, None)
+        let shader = crate::cache::compile_guest(pools, programs, configuration, None)
             .map_err(compilation)?;
         let recipe = PipelineRecipe::Compute(Arc::clone(&shader));
         let pipeline = match worker {

@@ -20,15 +20,16 @@ pools, upload/main recording and queue submission. Recyclable byte-sized chunks
 contain owned native parameters and retained handles; queues and native pools
 grow without capacity-driven submits or waits. A separate WSI worker owns
 swapchain acquire, present and recreation. Presentation may share the graphics
-queue, with native queue calls externally synchronized. Windowed hosts require swapchain maintenance and its instance dependencies;
-missing support is an explicit startup error.
+queue, with native queue calls externally synchronized. Per-frame copy fences retain
+source storage, and per-image semaphores are reused after acquisition completes.
 
 Resources retain the device, allocator and instance until their last use. One
 monotonic timeline controls command-slot reuse, staging and resource retirement.
 A global streaming/reusable staging pool preserves uploads and deferred CPU
 readbacks independently of command-context reuse. Work-count cadence and real
 dependencies drive submission; there is no elapsed-time submit deadline.
-Ordinary submission and shutdown do not use device-wide idle. CPU visibility requests resolve only the required producers;
+Swapchain recreation and shutdown drain the device before releasing presentation
+resources. Ordinary submission does not use device-wide idle. CPU visibility requests resolve only the required producers;
 acceptance, GPU completion and guest fence publication remain separate events.
 
 ## Compilation and rendering

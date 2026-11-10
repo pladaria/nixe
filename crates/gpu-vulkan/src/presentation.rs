@@ -44,6 +44,7 @@ struct Control {
     size: [u32; 2],
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
     stopped: bool,
+    resolution_steps: u8,
     failure: Option<String>,
     presented: std::collections::VecDeque<std::time::Instant>,
     presentations: u64,
@@ -54,6 +55,23 @@ struct Control {
 #[derive(Clone, Default)]
 pub struct PresentationClient(Arc<Mutex<Control>>);
 impl PresentationClient {
+    pub fn cycle_resolution(&self) {
+        let wake = {
+            let mut state = self.0.lock().unwrap();
+            if state.stopped {
+                return;
+            }
+            state.resolution_steps =
+                (state.resolution_steps + 1) % crate::RESOLUTION_SCALES.len() as u8;
+            state.wake.clone()
+        };
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+    pub(crate) fn take_resolution_steps(&self) -> u8 {
+        std::mem::take(&mut self.0.lock().unwrap().resolution_steps)
+    }
     pub fn set_notifier(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         self.0.lock().unwrap().notify = Some(notify);
     }
