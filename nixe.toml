@@ -80,7 +80,7 @@ volume = 10
 scaling_filter = "bilinear"
 # Antialiasing before presentation scaling. "none" (default) disables it;
 # "fxaa" is a fast single-pass filter; "smaa" uses three passes for sharper edges.
-anti_aliasing = "smaa"
+anti_aliasing = "none"
 # Synchronize host presentation to the monitor. Defaults to true when omitted.
 # Disabling this allows tearing; guest-requested frame intervals are preserved.
 vsync = true
@@ -88,14 +88,14 @@ vsync = true
 # Minimum NVIDIA requirements:
 # - GeForce RTX 40 series: driver 580.82.07 or newer.
 # - GeForce RTX 50 series: driver 575.51.02 beta (575.57.08 stable) or newer.
-nvidia_smooth_motion = true
+nvidia_smooth_motion = false
 
 [gpu]
 # Internal render resolution: 1.0 (native), 1.5, 2.0 or 3.0.
 # 1.5: 720p => 1080p, 1080p => 1440p
 # 2.0: 720p => 1440p, 1080p => 2160p
 # 3.0: 720p => 2160p, 1080p => 3240p
-resolution_scale = 2.0
+resolution_scale = 1.0
 # Compile MME macros to native AMD64 code; selected once per channel. Defaults to true.
 mme_jit = true
 # Per-title shader environments and Vulkan driver caches, relative to this file.
