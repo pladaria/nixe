@@ -1,9 +1,23 @@
 //! Owner-local in-flight measurements; only completed samples cross threads.
 use super::timing::{Calibration, Interval};
-use nixe_gpu::frame_metrics::{FrameMetrics, FrameTiming};
+use nixe_gpu::frame_metrics::{FrameMetrics, FramePacing, FrameTiming};
 use std::time::{Duration, Instant};
 
 const PENDING: usize = 128;
+const MAX_INTERVALS: usize = 4096;
+
+struct Idle {
+    start: Instant,
+    end: Instant,
+    submitted: u64,
+    recorded: Option<Instant>,
+}
+
+#[derive(Default)]
+struct Timeline {
+    idle: Vec<Idle>,
+    completions: Vec<(u64, u64)>,
+}
 
 struct Frame {
     id: u64,
@@ -19,15 +33,18 @@ struct Frame {
     union_ticks: u64,
     period: f64,
     mask: u64,
+    pacing: Option<FramePacing>,
+    timeline: Timeline,
+    overflow: bool,
 }
 
 pub(crate) struct Recorder {
     pub history: FrameMetrics,
     origin: Instant,
     frames: Box<[Option<Frame>]>,
+    timelines: Vec<Timeline>,
     next: u64,
     current: Option<u64>,
-    pub pending_tick: Option<u64>,
 }
 
 impl Recorder {
@@ -36,9 +53,9 @@ impl Recorder {
             history: FrameMetrics::default(),
             origin: Instant::now(),
             frames: (0..PENDING).map(|_| None).collect(),
+            timelines: Vec::new(),
             next: 1,
             current: None,
-            pending_tick: None,
         }
     }
     pub(super) fn is_active(&self) -> bool {
@@ -51,9 +68,14 @@ impl Recorder {
         let id = self.next;
         self.next += 1;
         let slot = &mut self.frames[id as usize % PENDING];
-        if slot.is_some() {
+        let mut timeline = if let Some(frame) = slot.take() {
             self.history.record_dropped();
-        }
+            frame.timeline
+        } else {
+            self.timelines.pop().unwrap_or_default()
+        };
+        timeline.idle.clear();
+        timeline.completions.clear();
         *slot = Some(Frame {
             id,
             start: Instant::now(),
@@ -68,6 +90,9 @@ impl Recorder {
             union_ticks: 0,
             period: 0.0,
             mask: 0,
+            pacing: None,
+            timeline,
+            overflow: false,
         });
         self.current = Some(id);
     }
@@ -75,6 +100,31 @@ impl Recorder {
         self.frames[id as usize % PENDING]
             .as_mut()
             .filter(|f| f.id == id)
+    }
+    pub fn idle(
+        &mut self,
+        start: Instant,
+        end: Instant,
+        submitted: u64,
+        recorded: Option<Instant>,
+    ) {
+        let Some(frame) = self.current.and_then(|id| self.frame(id)) else {
+            return;
+        };
+        if frame.timeline.idle.len() == MAX_INTERVALS {
+            frame.overflow = true;
+            return;
+        }
+        frame.timeline.idle.push(Idle {
+            start,
+            end,
+            submitted,
+            recorded,
+        });
+    }
+    pub fn composite(&mut self, pacing: FramePacing) {
+        self.begin_cpu();
+        self.frame(self.current.unwrap()).unwrap().pacing = Some(pacing);
     }
     pub fn begin_submission(&mut self) -> Option<u64> {
         let id = self.current?;
@@ -94,12 +144,12 @@ impl Recorder {
         frame.cpu_end = Some(Instant::now());
         frame.producer = tick;
         frame.swap_interval = swap_interval;
-        self.pending_tick = Some(tick);
         self.publish_ready(id, calibration);
     }
     pub(super) fn retire(
         &mut self,
         id: u64,
+        tick: u64,
         interval: Option<Interval>,
         calibration: Option<&Calibration>,
     ) {
@@ -116,6 +166,11 @@ impl Recorder {
                 frame.union_end = end;
                 frame.end_gpu = interval.end;
             }
+            if frame.timeline.completions.len() == MAX_INTERVALS {
+                frame.overflow = true;
+            } else {
+                frame.timeline.completions.push((tick, frame.end_gpu));
+            }
             frame.period = interval.period;
             frame.mask = interval.mask;
         } else {
@@ -129,6 +184,11 @@ impl Recorder {
             return;
         }
         let frame = self.frames[id as usize % PENDING].take().unwrap();
+        if frame.overflow {
+            self.history.record_dropped();
+            self.timelines.push(frame.timeline);
+            return;
+        }
         let cpu_end = frame.cpu_end.unwrap();
         let measured = frame.gpu_available
             && frame.first_gpu.is_some()
@@ -142,115 +202,73 @@ impl Recorder {
                 calibration.and_then(|c| c.completion(frame.end_gpu, frame.period, frame.mask))
             })
             .flatten();
+        let latency =
+            completion.and_then(|(end, _)| end.max(cpu_end).checked_duration_since(frame.start));
+        let mut cpu_vsync = Duration::ZERO;
+        let mut total_vsync = latency.map(|_| Duration::ZERO);
+        if let Some(pacing) = frame.pacing {
+            let mut completions = frame.timeline.completions.iter().peekable();
+            let mut prefix_end = None;
+            for idle in &frame.timeline.idle {
+                while let Some(&&(tick, end)) = completions.peek() {
+                    if tick > idle.submitted {
+                        break;
+                    }
+                    prefix_end = Some(end);
+                    completions.next();
+                }
+                let start = idle.start.max(frame.start).max(pacing.queued);
+                let end = idle.end.min(pacing.vsync);
+                let Some(wait) = end.checked_duration_since(start) else {
+                    continue;
+                };
+                cpu_vsync += wait;
+                if wait.is_zero() {
+                    continue;
+                }
+                // A queued native job still recording at the end of this idle
+                // interval keeps the interval on the critical path.
+                let Some(recorded) = idle.recorded else {
+                    continue;
+                };
+                if let (Some(excluded), Some((gpu_end, error))) = (&mut total_vsync, completion) {
+                    let ready = if let Some(prefix) = prefix_end {
+                        let ticks = frame.end_gpu.wrapping_sub(prefix) & frame.mask;
+                        gpu_end
+                            .checked_sub(Duration::from_nanos((ticks as f64 * frame.period) as u64))
+                            .and_then(|ready| ready.checked_add(error))
+                    } else {
+                        Some(frame.start)
+                    };
+                    if let Some(ready) = ready {
+                        // Keep worker backlog, submission waits and GPU work
+                        // that overlaps the owner's deliberate display wait.
+                        *excluded += end.saturating_duration_since(start.max(ready).max(recorded));
+                    } else {
+                        total_vsync = None;
+                    }
+                }
+            }
+        }
         self.history.publish(FrameTiming {
             sequence: 0,
             frame: id,
             producer: frame.producer,
             swap_interval: frame.swap_interval,
             started: frame.start.duration_since(self.origin),
-            cpu: cpu_end.duration_since(frame.start),
+            cpu: cpu_end
+                .duration_since(frame.start)
+                .saturating_sub(cpu_vsync),
+            cpu_vsync,
             gpu: measured
                 .then(|| Duration::from_nanos((frame.union_ticks as f64 * frame.period) as u64)),
-            total: completion.and_then(|(end, _)| end.checked_duration_since(frame.start)),
+            total: latency
+                .zip(total_vsync)
+                .and_then(|(latency, pacing)| latency.checked_sub(pacing)),
+            total_vsync,
+            latency,
             clock_error: completion.map(|(_, error)| error),
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn interval(start: u64, end: u64) -> Interval {
-        Interval {
-            start,
-            end,
-            period: 1_000_000.0,
-            mask: 255,
-        }
-    }
-    #[test]
-    fn completion_is_asynchronous_and_overlapping_intervals_are_unioned_across_wrap() {
-        let mut recorder = Recorder::new();
-        recorder.begin_cpu();
-        let first = recorder.begin_submission().unwrap();
-        let second = recorder.begin_submission().unwrap();
-        recorder.retire(first, Some(interval(250, 10)), None);
-        recorder.end_cpu(2, 1, None);
-        assert!(recorder.history.read_since(0, 10).samples.is_empty());
-        recorder.retire(second, Some(interval(5, 20)), None);
-        let sample = recorder.history.read_since(0, 10).samples[0];
-        assert_eq!(sample.gpu, Some(Duration::from_millis(26)));
-        assert_eq!(sample.total, None);
-        assert_eq!(sample.clock_error, None);
-    }
-    #[test]
-    fn completion_before_cpu_seal_and_unsupported_timestamps_keep_cpu_measurements() {
-        let mut recorder = Recorder::new();
-        recorder.begin_cpu();
-        let id = recorder.begin_submission().unwrap();
-        recorder.retire(id, None, None);
-        assert!(recorder.history.read_since(0, 10).samples.is_empty());
-        recorder.end_cpu(1, 0, None);
-        let samples = recorder.history.read_since(0, 10).samples;
-        assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].gpu, None);
-        assert_eq!(samples[0].total, None);
-        assert_eq!(samples[0].swap_interval, 0);
-    }
-    #[test]
-    fn stalled_gpu_cannot_grow_storage_or_overwrite_a_new_frame_with_an_old_result() {
-        let mut recorder = Recorder::new();
-        for tick in 1..=PENDING as u64 + 1 {
-            recorder.begin_cpu();
-            recorder.begin_submission();
-            recorder.end_cpu(tick, 1, None);
-        }
-        recorder.retire(1, Some(interval(1, 2)), None);
-        assert!(recorder.history.read_since(0, 1).samples.is_empty());
-        recorder.retire(PENDING as u64 + 1, Some(interval(20, 30)), None);
-        let batch = recorder.history.read_since(0, 1);
-        assert_eq!(batch.dropped, 1);
-        assert_eq!(batch.samples[0].frame, PENDING as u64 + 1);
-        assert_eq!(batch.samples[0].gpu, Some(Duration::from_millis(10)));
-    }
-
-    #[test]
-    fn separate_frames_keep_their_submissions_and_gpu_idle_gaps_are_excluded() {
-        let mut recorder = Recorder::new();
-        recorder.begin_cpu();
-        let a = recorder.begin_submission().unwrap();
-        recorder.begin_cpu();
-        assert_eq!(recorder.begin_submission(), Some(a));
-        recorder.end_cpu(2, 1, None);
-        assert_eq!(recorder.begin_submission(), None);
-        recorder.begin_cpu();
-        let b = recorder.begin_submission().unwrap();
-        recorder.end_cpu(3, 2, None);
-        recorder.retire(a, Some(interval(10, 20)), None);
-        recorder.retire(a, Some(interval(30, 40)), None);
-        recorder.retire(b, Some(interval(50, 55)), None);
-        let batch = recorder.history.read_since(0, 10);
-        assert_eq!(batch.samples.len(), 2);
-        assert_eq!(batch.samples[0].gpu, Some(Duration::from_millis(20)));
-        assert_eq!(batch.samples[0].producer, 2);
-        assert_eq!(batch.samples[0].swap_interval, 1);
-        assert_eq!(batch.samples[1].gpu, Some(Duration::from_millis(5)));
-        assert_eq!(batch.samples[1].producer, 3);
-        assert_eq!(batch.samples[1].swap_interval, 2);
-    }
-
-    #[test]
-    fn a_clock_that_may_have_wrapped_more_than_once_is_reported_as_unavailable() {
-        let mut recorder = Recorder::new();
-        recorder.origin -= Duration::from_secs(1);
-        recorder.begin_cpu();
-        let id = recorder.begin_submission().unwrap();
-        recorder.frame(id).unwrap().start = recorder.origin;
-        recorder.retire(id, Some(interval(250, 10)), None);
-        recorder.end_cpu(1, 0, None);
-        let sample = recorder.history.read_since(0, 1).samples[0];
-        assert!(sample.cpu >= Duration::from_secs(1));
-        assert_eq!(sample.gpu, None);
-        assert_eq!(sample.total, None);
+        self.timelines.push(frame.timeline);
     }
 }

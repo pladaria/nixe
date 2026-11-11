@@ -269,10 +269,18 @@ where
             }
             let message = match self.deferred.pop_front() {
                 Some(message) => message,
-                None => match self.receiver.recv() {
-                    Ok(message) => message,
-                    Err(_) => return Ok(()),
-                },
+                None => {
+                    let start = std::time::Instant::now();
+                    let message = match self.receiver.recv() {
+                        Ok(message) => message,
+                        Err(_) => return Ok(()),
+                    };
+                    let end = std::time::Instant::now();
+                    if let Some(backend) = self.backend.borrow_mut().as_mut() {
+                        backend.frame_idle(start, end);
+                    }
+                    message
+                }
             };
             self.execute(message)?;
         }
@@ -494,6 +502,7 @@ where
         let Composite {
             request,
             swap_interval,
+            pacing,
             presenter,
             sequence,
             source,
@@ -504,9 +513,8 @@ where
             let backend = backend.as_mut().ok_or_else(|| {
                 self.failure(FrontendSubmissionId::new(0), "GPU backend is unavailable")
             })?;
-            backend.begin_frame_work();
             backend
-                .composite(request, swap_interval)
+                .composite(request, swap_interval, pacing)
                 .map_err(|error| self.runtime_failure(FrontendSubmissionId::new(0), error))?
         };
         nixe_memory::trace::event(

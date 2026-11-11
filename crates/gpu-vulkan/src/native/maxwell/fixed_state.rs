@@ -13,7 +13,7 @@ use std::hash::{Hash, Hasher};
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::native) struct FixedPipelineState {
-    shader: [u64; 6],
+    pub(in crate::native) shader: [u64; 6],
     raw1: u32,
     raw2: u32,
     colors: [u8; 8],

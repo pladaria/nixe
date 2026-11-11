@@ -993,8 +993,12 @@ impl MaxwellThreeDFrontendState {
 
     #[inline(always)]
     pub(super) fn write_register(&mut self, method: GpuMethodId, argument: u32) {
-        // ProcessDirtyRegisters stores repeated words and touches two byte-
-        // indexed flags. Execution effects are handled separately by admission.
+        // Only changed state invalidates the current draw. Shadow tracking and
+        // execution effects remain in admission, including repeated methods.
+        // https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/engines/maxwell_3d.h#L3312-L3336
+        if self.operation.registers.word(method) == argument {
+            return;
+        }
         self.operation.registers.write(method, argument);
         for table in &super::registers::DIRTY_TABLES {
             self.operation

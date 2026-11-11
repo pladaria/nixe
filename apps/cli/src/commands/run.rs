@@ -933,7 +933,7 @@ fn execute(
                     log::info!("{}", gpu_caches.sample());
                     if let Some(frame) = frame_metrics.latest() {
                         log::info!(
-                            "frame timing: frame={} swap_interval={} cpu_ms={:.3} gpu_ms={} total_ms={}",
+                            "graphics frame timing (latest, excluding VSync): frame={} swap_interval={} cpu_ms={:.3} gpu_ms={} total_ms={} vsync_cpu_ms={:.3} vsync_total_ms={}",
                             frame.frame,
                             frame.swap_interval,
                             frame.cpu.as_secs_f64() * 1000.0,
@@ -945,9 +945,14 @@ fn execute(
                                 || "n/a".to_owned(),
                                 |time| format!("{:.3}", time.as_secs_f64() * 1000.0),
                             ),
+                            frame.cpu_vsync.as_secs_f64() * 1000.0,
+                            frame.total_vsync.map_or_else(
+                                || "n/a".to_owned(),
+                                |time| format!("{:.3}", time.as_secs_f64() * 1000.0),
+                            ),
                         );
                     } else {
-                        log::info!("frame timing: no completed frames");
+                        log::info!("graphics frame timing: no completed frames");
                     }
                     if log::log_enabled!(log::Level::Trace)
                         && let Some(process) = runtime.process(process_id)

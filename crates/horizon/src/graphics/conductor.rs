@@ -7,12 +7,13 @@ use std::sync::{
 };
 use std::task::{Wake, Waker};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 const FRAME_NS: u64 = 1_000_000_000 / 60;
 
 #[derive(Debug, Default)]
 struct State {
-    tick: bool,
+    tick: Option<Instant>,
     registered: bool,
     stopping: bool,
     failure: Option<Box<str>>,
@@ -25,19 +26,22 @@ struct Signals {
     failed: AtomicBool,
 }
 impl Signals {
-    fn wait_tick(&self) -> bool {
+    fn wait_tick(&self) -> Option<Instant> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !state.stopping && !state.tick {
+        while !state.stopping && state.tick.is_none() {
             state = self
                 .tick
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        state.tick = false;
-        !state.stopping
+        if state.stopping {
+            None
+        } else {
+            state.tick.take()
+        }
     }
     fn wait_registration(&self) -> bool {
         let mut state = self
@@ -82,13 +86,14 @@ impl Wake for Tick {
         self.wake_by_ref();
     }
     fn wake_by_ref(self: &Arc<Self>) {
+        let now = Instant::now();
         let mut state = self
             .0
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.stopping && !state.tick {
-            state.tick = true;
+        if !state.stopping && state.tick.is_none() {
+            state.tick = Some(now);
             self.0.tick.notify_one();
         }
     }
@@ -181,7 +186,7 @@ impl Conductor {
         timer: &nixe_scheduler::LoopingEvent,
         registration: &Waker,
     ) -> Result<(), FramebufferError> {
-        while signals.wait_tick() {
+        while let Some(vsync) = signals.wait_tick() {
             if timer.is_stopped() {
                 if signals.is_stopping() {
                     return Ok(());
@@ -206,7 +211,7 @@ impl Conductor {
                 match VideoSystem::poll_composite_registration(&mut state)? {
                     true => {
                         if !kernel.clock().is_paused() {
-                            VideoSystem::compose(&mut state, registration)?;
+                            VideoSystem::compose(&mut state, registration, vsync)?;
                         }
                         break;
                     }

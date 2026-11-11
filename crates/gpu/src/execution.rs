@@ -60,6 +60,9 @@ pub trait GpuExecution: OwnerMemory + 'static {
     /// Mark graphics command consumption, before frontend decoding. Repeated
     /// calls belong to the current image until composite.
     fn begin_frame_work(&mut self) {}
+    /// The graphics owner waited for an inbox message, outside command/fence
+    /// processing. The renderer intersects this with explicit VI pacing.
+    fn frame_idle(&mut self, _start: std::time::Instant, _end: std::time::Instant) {}
     /// Host control is serviced by the same concrete owner, outside draw loops.
     fn bind_host_wakeup(
         &mut self,
@@ -130,6 +133,7 @@ pub trait GpuExecution: OwnerMemory + 'static {
         &mut self,
         request: Self::ImageRequest,
         swap_interval: u32,
+        pacing: crate::frame_metrics::FramePacing,
     ) -> Result<ResidentImage, BackendRuntimeError>;
     /// Drains accepted host uses; cancels unaccepted work without guest success.
     fn teardown(&mut self) -> Result<(), BackendRuntimeError>;

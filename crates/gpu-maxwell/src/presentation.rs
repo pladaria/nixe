@@ -106,6 +106,7 @@ impl GpuExecution for MissingGpuExecution {
         &mut self,
         _request: Self::ImageRequest,
         _swap_interval: u32,
+        _pacing: nixe_gpu::frame_metrics::FramePacing,
     ) -> Result<ResidentImage, BackendRuntimeError> {
         match *self {}
     }

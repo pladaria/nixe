@@ -197,6 +197,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         group: Option<u8>,
         via_header: bool,
         textures: &mut smallvec::SmallVec<[super::textures::ShaderTexture; 64]>,
+        read_images: bool,
     ) -> Result<(), VulkanError> {
         let resources = &self.resources.stages[STAGE];
         if resources.storage.is_empty() && resources.images.is_empty() {
@@ -224,6 +225,9 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 )?;
             }
         }
+        if !read_images {
+            return Ok(());
+        }
         for slot in &resources.images {
             let read_handle = |source: &crate::native::pipeline_resources::ImageHandle| {
                 let address = crate::native::NativeExecution::graphics_constant_address(
@@ -236,12 +240,12 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 )?;
                 space
                     .read_u32(address)
-                    .map(|value| value << source.shift)
+                    .map(|value| (address.get(), value, value << source.shift))
                     .map_err(|error| VulkanError::Compilation(error.to_string().into()))
             };
-            let mut handle = read_handle(&slot.primary)?;
+            let (address, raw, mut handle) = read_handle(&slot.primary)?;
             if let Some(secondary) = &slot.secondary {
-                handle |= read_handle(secondary)?;
+                handle |= read_handle(secondary)?.2;
             }
             let reference = model::engines::threed::MaxwellThreeDTextureReference::new(
                 group,
@@ -263,6 +267,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 None
             };
             textures.push(super::textures::ShaderTexture {
+                handle: Some((address, raw)),
                 index: handle & 0xfffff,
                 reference,
                 dimension: slot.dimension,
@@ -303,8 +308,9 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         state: &MaxwellThreeDState,
         space: &MaxwellGpuMemory,
         groups: [Option<u8>; 5],
-        images: &mut smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>,
-    ) -> Result<(), crate::VulkanError> {
+        memo: &mut super::reuse::SampledTextures,
+        delta: bool,
+    ) -> Result<bool, crate::VulkanError> {
         let bindings = state.shader_bindings();
         let via_header = bindings.sampler_binding().value()
             == Some(&model::engines::threed::MaxwellThreeDSamplerBindingMode::ViaTextureHeader);
@@ -330,7 +336,49 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
             },
         );
         execution.synchronize_shader_descriptors(false, space, image_pool, sampler_pool);
-        let mut textures = smallvec::SmallVec::with_capacity(self.resources.texture_count);
+        use super::reuse::{DrawMiss, TextureMiss};
+        let eligible = self.sampled_reuse;
+        let mut reused = false;
+        let mut delta = delta;
+        if eligible {
+            execution.state.statistics.reuse.texture_attempts += 1;
+            let validation =
+                memo.validate(execution, space, state, &self.resources, groups, via_header);
+            match validation {
+                Ok(()) => {
+                    // The validated views survived earlier invalidations.
+                    // Retry only for views invalidated by this preparation.
+                    execution
+                        .residency
+                        .texture_cache
+                        .bindings
+                        .has_deleted_images = false;
+                    if delta && !memo.ready(execution) {
+                        execution.state.statistics.reuse.draw_misses[DrawMiss::Content as usize] +=
+                            1;
+                        delta = false;
+                    }
+                    if delta || memo.prepare(execution)? {
+                        reused = true;
+                        memo.hit();
+                        execution.state.statistics.reuse.texture_hits += 1;
+                    } else {
+                        execution.state.statistics.reuse.texture_misses
+                            [TextureMiss::Image as usize] += 1;
+                    }
+                }
+                Err(reason) => {
+                    execution.state.statistics.reuse.texture_misses[reason as usize] += 1
+                }
+            }
+        } else {
+            execution.state.statistics.reuse.texture_misses[TextureMiss::Unsupported as usize] += 1;
+        }
+        if delta && !reused {
+            execution.state.statistics.reuse.draw_misses[DrawMiss::Texture as usize] += 1;
+            delta = false;
+        }
+        let mut textures = smallvec::SmallVec::new();
         graphics_stages!(STAGES, |STAGE| {
             self.configure_stage::<STAGE, STORAGE>(
                 execution,
@@ -339,9 +387,17 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 groups[STAGE],
                 via_header,
                 &mut textures,
+                !reused,
             )?;
         });
-        execution.fill_shader_images(false, space, &textures, images)
+        if !reused {
+            let remember = eligible && memo.miss();
+            execution.fill_shader_images(false, space, &textures, &mut memo.images)?;
+            if remember && memo.remember(execution, space, &textures, via_header) {
+                execution.state.statistics.reuse.memo_builds += 1;
+            }
+        }
+        Ok(delta)
     }
     #[allow(clippy::too_many_arguments)]
     fn configure_impl<const STAGES: u8, const STORAGE: bool>(
@@ -354,23 +410,41 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         arguments: Draw,
         dirty: u128,
     ) -> Result<(), VulkanError> {
+        use super::reuse::{DrawMiss, ResolvedDraw};
+        let eligible = self.sampled_reuse
+            && !matches!(arguments, Draw::Indirect { .. })
+            && !matches!(draw.topology, 7 | 8 | 14)
+            && draw.inline_indices().is_none();
+        let previous = execution.state.last_draw.take();
+        let candidate = if eligible {
+            execution.state.statistics.reuse.eligible_draws += 1;
+            previous.ok_or(DrawMiss::Cold).and_then(|p| {
+                p.validate(execution, self.pipeline.identity(), registers, draw, space)
+            })
+        } else {
+            Err(DrawMiss::Kind)
+        };
+        let mut delta = match candidate {
+            Ok(()) => true,
+            Err(reason) => {
+                execution.state.statistics.reuse.draw_misses[reason as usize] += 1;
+                false
+            }
+        };
+        let mut memo = self.textures.borrow_mut();
         loop {
             let pipeline = &self.pipeline;
             let vertex_attributes = self.vertex_attributes;
-            // Keep draw-local views and their inline payload in this frame
-            // instead of moving them through large Result values between
-            // preparation and recording.
-            let mut images = smallvec::SmallVec::new();
             loop {
-                execution.resolve_render_targets(registers, space)?;
-                self.configure_resources::<STAGES, STORAGE>(
-                    execution,
-                    registers,
-                    space,
-                    groups,
-                    &mut images,
+                if !delta {
+                    execution.resolve_render_targets(registers, space)?;
+                }
+                delta = self.configure_resources::<STAGES, STORAGE>(
+                    execution, registers, space, groups, &mut memo, delta,
                 )?;
-                execution.resolve_render_targets(registers, space)?;
+                if !delta {
+                    execution.resolve_render_targets(registers, space)?;
+                }
                 if !execution
                     .residency
                     .texture_cache
@@ -465,8 +539,13 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 .bindings
                 .has_deleted_images
             {
+                if delta {
+                    execution.state.statistics.reuse.draw_misses[DrawMiss::Content as usize] += 1;
+                }
+                delta = false;
                 continue;
             }
+            let images = &memo.images;
             let descriptors = if arguments.is_empty() {
                 crate::residency::execution::DescriptorQueue {
                     record: None,
@@ -506,18 +585,34 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 .bindings
                 .has_deleted_images
             {
+                if delta {
+                    execution.state.statistics.reuse.draw_misses[DrawMiss::Content as usize] += 1;
+                }
+                delta = false;
                 continue;
             }
             let targets = execution.residency.current_framebuffer()?;
-            return self.record(
+            self.record(
                 execution,
                 registers,
                 draw,
                 &targets,
                 arguments,
-                &images,
+                images,
                 descriptors,
-            );
+            )?;
+            if delta {
+                execution.state.statistics.reuse.draw_hits += 1;
+            }
+            if eligible {
+                execution.state.last_draw = Some(ResolvedDraw::capture(
+                    execution,
+                    pipeline.identity(),
+                    draw,
+                    space,
+                ));
+            }
+            return Ok(());
         }
     }
 

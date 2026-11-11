@@ -13,6 +13,7 @@ use model::recompiler::TexturePool;
 /// A consumed handle is retained while FillImageViews resolves the cache.
 /// Eviction retries do not re-read constant buffers or sampler descriptors.
 pub(in crate::native) struct ShaderTexture {
+    pub(in crate::native) handle: Option<(u64, u32)>,
     pub(in crate::native) index: u32,
     pub(in crate::native) reference: MaxwellThreeDTextureReference,
     pub(in crate::native) dimension: Dimension,
@@ -82,12 +83,14 @@ impl super::super::NativeExecution<'_> {
     // Eden ConfigureImpl gathers handles/samplers first; FillImageViews repeats
     // only view resolution and PrepareImageView when an image was deleted.
     // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L219-L240
-    pub(in crate::native) fn fill_shader_images(
+    pub(in crate::native) fn fill_shader_images<
+        A: smallvec::Array<Item = crate::residency::execution::ShaderImage>,
+    >(
         &mut self,
         compute: bool,
         space: &MaxwellGpuMemory,
         textures: &[ShaderTexture],
-        images: &mut smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>,
+        images: &mut smallvec::SmallVec<A>,
     ) -> Result<(), VulkanError> {
         images.clear();
         images.reserve(textures.len());
@@ -115,7 +118,12 @@ impl super::super::NativeExecution<'_> {
                 images.push(crate::residency::execution::ShaderImage {
                     view,
                     descriptor: texture.descriptor,
-                    sampler,
+                    native: vk::DescriptorImageInfo::default()
+                        .image_view(view.map_or(vk::ImageView::null(), |id| {
+                            self.residency.texture_cache.views[id].native.handle
+                        }))
+                        .image_layout(vk::ImageLayout::GENERAL)
+                        .sampler(sampler.unwrap_or(vk::Sampler::null())),
                 });
             }
             if !self.residency.texture_cache.bindings.has_deleted_images {
@@ -123,7 +131,7 @@ impl super::super::NativeExecution<'_> {
             }
         }
     }
-    fn prepare_shader_texture_view(
+    pub(in crate::native) fn prepare_shader_texture_view(
         &mut self,
         view: ImageViewId,
     ) -> Result<ImageViewId, VulkanError> {

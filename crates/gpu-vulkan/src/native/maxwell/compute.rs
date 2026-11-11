@@ -108,6 +108,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
                 None
             };
             textures.push(super::textures::ShaderTexture {
+                handle: None,
                 index: handle & 0xfffff,
                 reference,
                 dimension: slot.dimension,

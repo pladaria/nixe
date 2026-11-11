@@ -426,17 +426,22 @@ impl QueueState {
             };
             if let Some(frame) = slot.frame.take() {
                 self.frame_metrics
-                    .retire(frame, interval, self.calibration.as_ref());
+                    .retire(frame, slot.tick, interval, self.calibration.as_ref());
             }
         }
-        if self
-            .frame_metrics
-            .pending_tick
-            .is_some_and(|tick| tick <= completed)
-        {
-            self.frame_metrics.pending_tick = None;
-        }
         Ok(())
+    }
+    pub fn frame_idle(&mut self, start: Instant, end: Instant, recorded: Option<Instant>) {
+        self.frame_metrics
+            .idle(start, end, self.scheduled, recorded);
+    }
+    pub fn begin_composite(
+        &mut self,
+        dispatch: &mut crate::dispatch::Dispatch,
+        pacing: nixe_gpu::frame_metrics::FramePacing,
+    ) {
+        self.frame_metrics.composite(pacing);
+        self.begin_frame_work(dispatch);
     }
     pub fn begin_frame_work(&mut self, dispatch: &mut crate::dispatch::Dispatch) {
         self.frame_metrics.begin_cpu();
@@ -455,9 +460,6 @@ impl QueueState {
     pub fn end_frame(&mut self, producer: u64, swap_interval: u32) {
         self.frame_metrics
             .end_cpu(producer, swap_interval, self.calibration.as_ref());
-        if producer <= self.completed {
-            self.frame_metrics.pending_tick = None;
-        }
     }
     fn reclaim(&mut self, completed: u64) {
         if completed > self.completed {

@@ -211,17 +211,14 @@ impl Residency<'_> {
             }
         }
         for image in images {
-            let native = if let Some(view) = image.view {
+            if let Some(view) = image.view {
                 let id = self.texture_cache.views[view].image;
                 let scope = pipeline.resources[image.descriptor];
                 if scope.writes() {
                     self.mark_image_modified(id)?;
                 }
                 self.shader_image(id)?;
-                self.texture_cache.views[view].native.handle
-            } else if self.runtime.device.profile().null_descriptor {
-                vk::ImageView::null()
-            } else {
+            } else if !self.runtime.device.profile().null_descriptor {
                 return Err(VulkanError::InvalidResource(
                     "null guest image requires nullDescriptor support",
                 ));
@@ -229,10 +226,7 @@ impl Residency<'_> {
             self.runtime.descriptor_queue.write(
                 image.descriptor,
                 DescriptorEntry {
-                    image: vk::DescriptorImageInfo::default()
-                        .image_view(native)
-                        .image_layout(vk::ImageLayout::GENERAL)
-                        .sampler(image.sampler.unwrap_or(vk::Sampler::null())),
+                    image: image.native,
                 },
             );
         }

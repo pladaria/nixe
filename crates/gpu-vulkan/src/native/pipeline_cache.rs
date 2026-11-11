@@ -24,6 +24,8 @@ pub(super) struct GraphicsPipeline {
     pub(super) resources: PipelineResources,
     pub(super) vertex_attributes: u32,
     pub(super) configure: ConfigureGraphics,
+    pub(super) sampled_reuse: bool,
+    pub(super) textures: std::cell::RefCell<maxwell::reuse::SampledTextures>,
 }
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct ComputeKey {
@@ -80,6 +82,7 @@ pub(super) struct PipelineCache {
     pub(super) compute_pipelines: Vec<ComputePipeline>,
     pub(super) current_graphics: Option<usize>,
     pub(super) pipeline_state: Option<FixedPipelineState>,
+    last_draw_kind: Option<(u32, bool)>,
     configuration: Arc<nixe_gpu::shader_compilation::Configuration>,
     main_compiler: Option<nixe_shader_recompiler::Compiler>,
     archive: Option<crate::cache::archive::EnvironmentArchive>,
@@ -100,6 +103,7 @@ impl PipelineCache {
             compute_pipelines: Vec::new(),
             current_graphics: None,
             pipeline_state: None,
+            last_draw_kind: None,
             configuration: Arc::new(configuration.clone()),
             main_compiler: None,
             archive: None,
@@ -310,8 +314,28 @@ impl PipelineCache {
         draw: &nixe_gpu_maxwell::MaxwellThreeDDrawState,
         space: &nixe_gpu_maxwell::MaxwellGpuMemory,
         access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<(), VulkanError> {
+    ) -> Result<bool, VulkanError> {
+        let light = nixe_gpu::native::GraphicsDirty::BUFFERS
+            | if profile.dynamic_state.vertex_input && profile.dynamic_state.base {
+                nixe_gpu::native::GraphicsDirty::VERTEX_BUFFERS
+            } else {
+                0
+            };
+        if self.current_graphics.is_some()
+            && self.last_draw_kind == Some((draw.topology, draw.indexed))
+            && !registers
+                .graphics_dirty()
+                .is_dirty(nixe_gpu::native::GraphicsDirty::ALL & !light)
+            && self
+                .pipeline_state
+                .as_ref()
+                .is_some_and(|key| key.shader == shaders.hashes)
+        {
+            maxwell::registers::validate_draw(registers)?;
+            return Ok(true);
+        }
         self.refresh_fixed_pipeline_state(profile, shaders, registers, draw)?;
+        self.last_draw_kind = Some((draw.topology, draw.indexed));
         statistics.fixed_state_refreshes += 1;
         let id = self
             .pipeline_state
@@ -330,7 +354,7 @@ impl PipelineCache {
             };
             if let Some(next) = next {
                 self.current_graphics = Some(next);
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -383,7 +407,7 @@ impl PipelineCache {
             index
         };
         self.select_graphics(index);
-        Ok(())
+        Ok(false)
     }
     fn build_graphics(
         compiler: &PipelineCompiler,
@@ -421,6 +445,7 @@ impl PipelineCache {
         .map_err(compilation)?;
         let resources = PipelineResources::new(&shader, &pipeline.layout.key)?;
         let configure = GraphicsPipeline::configure_func(&shader, &resources);
+        let sampled_reuse = maxwell::reuse::SampledTextures::eligible(&resources);
         Ok(GraphicsPipeline {
             key,
             transition_keys: Vec::new(),
@@ -429,6 +454,8 @@ impl PipelineCache {
             resources,
             vertex_attributes,
             configure,
+            textures: Default::default(),
+            sampled_reuse,
         })
     }
     fn graphics_shader(

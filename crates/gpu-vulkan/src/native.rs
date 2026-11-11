@@ -25,6 +25,7 @@ pub struct NativeExecutionStatistics {
     pub submits: u64,
     pub dispatches: u64,
     pub dynamic_state_refreshes: u64,
+    pub reuse: maxwell::reuse::ReuseStatistics,
 }
 pub struct NativeGpuExecution {
     // The fencing thread joins before the native timeline is destroyed.
@@ -54,6 +55,7 @@ struct NativeState {
     video_pipelines: HashMap<vk::Format, NativePipeline>,
     video_inputs: Option<crate::residency::Nv12Inputs>,
     draw_counter: u32,
+    last_draw: Option<maxwell::reuse::ResolvedDraw>,
     pub statistics: NativeExecutionStatistics,
 }
 fn runtime(error: VulkanError) -> BackendRuntimeError {
@@ -137,6 +139,7 @@ impl NativeGpuExecution {
                 video_pipelines: HashMap::default(),
                 video_inputs: None,
                 draw_counter: 0,
+                last_draw: None,
                 statistics: Default::default(),
             },
             compiler: pipelines,
@@ -394,10 +397,6 @@ impl Drop for NativeGpuExecution {
     }
 }
 impl NativeExecution<'_> {
-    fn begin_frame_work(&mut self) {
-        let device = self.residency.device_mut();
-        device.submission.begin_frame_work(&mut device.dispatch);
-    }
     fn bind_host_wakeup(
         &mut self,
         wake: Arc<dyn Fn() + Send + Sync>,
@@ -410,6 +409,7 @@ impl NativeExecution<'_> {
     }
     fn flush(&mut self) -> Result<WorkTicket, BackendRuntimeError> {
         self.state.draw_counter = 0;
+        self.state.last_draw = None;
         self.residency.flush().map_err(runtime)
     }
 
@@ -517,13 +517,41 @@ impl NativeExecution<'_> {
     fn compose_frame(
         &mut self,
         request: &nixe_gpu_maxwell::PresentationImageRequest,
-        swap_interval: u32,
     ) -> Result<ResidentImage, BackendRuntimeError> {
-        self.begin_frame_work();
         self.residency
             .invalidate_device_mappings()
             .map_err(runtime)?;
         self.state.draw_counter = 0;
+        self.state.last_draw = None;
+        let reuse = self.state.statistics.reuse;
+        nixe_gpu::trace::event(
+            "frame_reuse",
+            reuse.eligible_draws,
+            reuse.draw_hits,
+            reuse.pipeline_hits,
+        );
+        nixe_gpu::trace::event(
+            "frame_texture_reuse",
+            reuse.texture_attempts,
+            reuse.texture_hits,
+            reuse.memo_builds,
+        );
+        for (index, reasons) in reuse.draw_misses.chunks_exact(3).enumerate() {
+            nixe_gpu::trace::event(
+                ["frame_draw_miss0", "frame_draw_miss1", "frame_draw_miss2"][index],
+                reasons[0],
+                reasons[1],
+                reasons[2],
+            );
+        }
+        for (index, reasons) in reuse.texture_misses.chunks_exact(3).enumerate() {
+            nixe_gpu::trace::event(
+                ["frame_texture_miss0", "frame_texture_miss1"][index],
+                reasons[0],
+                reasons[1],
+                reasons[2],
+            );
+        }
         nixe_gpu::trace::event(
             "frame_work",
             self.state.statistics.draws,
@@ -591,10 +619,6 @@ impl NativeExecution<'_> {
                 format,
             )
             .map_err(runtime)?;
-        self.residency
-            .device_mut()
-            .submission
-            .end_frame(image.lease().producer().slot(), swap_interval);
         Ok(image)
     }
     fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
@@ -633,7 +657,15 @@ impl GpuExecution for NativeGpuExecution {
     type Conversion = NativeNv12Conversion;
     type ImageRequest = nixe_gpu_maxwell::PresentationImageRequest;
     fn begin_frame_work(&mut self) {
-        self.execution().begin_frame_work()
+        // Start before taking resource-cache locks so contention is measured.
+        let device = &mut self.residency.runtime.device;
+        device.submission.begin_frame_work(&mut device.dispatch);
+    }
+    fn frame_idle(&mut self, start: std::time::Instant, end: std::time::Instant) {
+        let device = &mut self.residency.runtime.device;
+        device
+            .submission
+            .frame_idle(start, end, device.dispatch.completed_recording());
     }
     fn device_uuid(&self) -> Option<[u8; 16]> {
         Some(self.residency.device().profile().device_uuid)
@@ -744,8 +776,13 @@ impl GpuExecution for NativeGpuExecution {
         &mut self,
         request: nixe_gpu_maxwell::PresentationImageRequest,
         swap_interval: u32,
+        pacing: nixe_gpu::frame_metrics::FramePacing,
     ) -> Result<ResidentImage, BackendRuntimeError> {
-        let image = self.execution().compose_frame(&request, swap_interval)?;
+        let device = &mut self.residency.runtime.device;
+        device
+            .submission
+            .begin_composite(&mut device.dispatch, pacing);
+        let image = self.execution().compose_frame(&request)?;
         // Composite/Present own this boundary outside resource-cache locks.
         // Composition retains its actual native inputs and output.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/renderer_vulkan.cpp#L204-L248
@@ -758,6 +795,11 @@ impl GpuExecution for NativeGpuExecution {
         let mut residency = self.residency.access();
         residency.tick_frame();
         residency.maintain_budget(true).map_err(runtime)?;
+        // Recording-worker and cache-maintenance waits are production costs.
+        residency
+            .device_mut()
+            .submission
+            .end_frame(image.lease().producer().slot(), swap_interval);
         Ok(image)
     }
     fn teardown(&mut self) -> Result<(), BackendRuntimeError> {

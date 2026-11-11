@@ -200,7 +200,7 @@ pub(crate) struct TextureCache {
     pub(crate) bindings: texture_bindings::TextureBindings,
     pub(super) framebuffers: HashMap<texture_bindings::FramebufferKey, SlotId>,
     pub(crate) slot_framebuffers: SlotVector<Arc<execution::PreparedTargets>>,
-    pub(super) binding_revision: u64,
+    pub(crate) binding_revision: u64,
     pub(super) lru: budget::ResourceLru,
     pub(super) native_readback_bytes: u64,
     pub(super) canonical_readback_bytes: u64,

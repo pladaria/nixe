@@ -107,6 +107,7 @@ impl CompositeRegistration {
 pub(crate) struct Composite {
     pub(crate) request: PresentationImageRequest,
     pub(crate) swap_interval: u32,
+    pub(crate) pacing: nixe_gpu::frame_metrics::FramePacing,
     pub(crate) presenter: nixe_video::FrameMailbox,
     pub(crate) sequence: u64,
     pub(crate) source: u64,

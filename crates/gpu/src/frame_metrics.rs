@@ -1,8 +1,17 @@
 //! Bounded, non-destructive history of completed render measurements.
 use std::{
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+/// The display buffer was queued before this VI tick. Only idle time inside
+/// this interval can be attributed to display pacing, not registration or
+/// acquire-fence waits after the tick.
+#[derive(Clone, Copy, Debug)]
+pub struct FramePacing {
+    pub queued: Instant,
+    pub vsync: Instant,
+}
 
 /// About 68 seconds at 60 frames per second. Recording never grows this storage.
 pub const FRAME_METRICS_CAPACITY: usize = 4096;
@@ -19,15 +28,23 @@ pub struct FrameTiming {
     pub swap_interval: u32,
     /// Monotonic time since this recorder was created.
     pub started: Duration,
-    /// Elapsed graphics preparation time, including dependency waits, across all
-    /// command lists consumed for this image. This is not summed thread CPU usage.
+    /// Elapsed graphics preparation time, including dependency/lock waits, less
+    /// identified VI pacing. This is not summed thread CPU usage.
     pub cpu: Duration,
+    /// Identified display pacing excluded from `cpu`.
+    pub cpu_vsync: Duration,
     /// Union of native submission timestamp intervals, including uploads and
     /// device dependencies. Not a hardware utilization or shader occupancy count.
     pub gpu: Option<Duration>,
-    /// CPU start to the GPU timestamp of the resident image's completion.
-    /// CPU/GPU overlap is preserved; this is not `cpu + gpu`. Excludes WSI/scanout.
+    /// First graphics work through CPU and resident-image GPU completion, less
+    /// identified VI pacing after the producer finished. Preserves CPU/GPU
+    /// overlap, queue/dependency waits and contention; excludes WSI/scanout.
+    /// Unavailable without a reliable CPU/GPU clock correlation.
     pub total: Option<Duration>,
+    /// Identified display pacing excluded from `total`, when measurable.
+    pub total_vsync: Option<Duration>,
+    /// Unadjusted first-work to completion latency, including VI pacing.
+    pub latency: Option<Duration>,
     /// Upper uncertainty of GPU/CPU clock correlation, when available.
     pub clock_error: Option<Duration>,
 }
@@ -79,6 +96,14 @@ impl FrameMetrics {
             sample.gpu.map_or(u64::MAX, |time| time.as_nanos() as u64),
             sample
                 .clock_error
+                .map_or(u64::MAX, |time| time.as_nanos() as u64),
+        );
+        crate::trace::event(
+            "frame_vsync_timing",
+            sample.frame,
+            sample.cpu_vsync.as_nanos() as u64,
+            sample
+                .total_vsync
                 .map_or(u64::MAX, |time| time.as_nanos() as u64),
         );
         let mut history = self.0.lock().unwrap();

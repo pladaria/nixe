@@ -543,7 +543,9 @@ pub(super) fn clear_rect(r: &Regs, area: vk::Rect2D) -> Result<vk::Rect2D, Vulka
 
 /// Unsupported effects are checked at consumption; ordinary register admission
 /// stays a raw store. These checks do not build another draw description.
-pub(super) fn validate_draw(state: &super::MaxwellThreeDState) -> Result<(), VulkanError> {
+pub(in crate::native) fn validate_draw(
+    state: &super::MaxwellThreeDState,
+) -> Result<(), VulkanError> {
     let r = state.register_words();
     if r[0x1618 / 4] & ((1 << 24) | (3 << 29)) != 0 {
         return Err(unsupported(

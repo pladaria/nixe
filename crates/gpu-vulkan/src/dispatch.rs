@@ -56,6 +56,9 @@ impl Dispatch {
     pub(crate) fn submit(&mut self, work: QueueSubmission) -> Result<(), VulkanError> {
         self.recorder.submit(work)
     }
+    pub(crate) fn completed_recording(&self) -> Option<std::time::Instant> {
+        self.recorder.completed_recording()
+    }
 
     pub(crate) fn discard_pending(&mut self) {
         self.recorder.discard_pending();

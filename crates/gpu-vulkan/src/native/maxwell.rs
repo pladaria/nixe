@@ -14,6 +14,7 @@ mod graphics;
 pub(in crate::native) mod identity;
 pub(crate) mod image;
 pub(in crate::native) mod registers;
+pub(super) mod reuse;
 mod targets;
 pub(in crate::native) mod textures;
 pub(in crate::native) mod vertex_input;
@@ -373,7 +374,8 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
     ) -> Result<(), Error> {
         self.refresh_shaders(state, space, access)?;
         let shaders = self.shaders.as_ref().unwrap();
-        self.pipelines
+        let pipeline_reused = self
+            .pipelines
             .current_graphics(
                 &self.profile,
                 &mut self.statistics,
@@ -393,6 +395,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
         let mut renderer = self.renderer.borrow_mut();
         let renderer = renderer.as_mut().expect("installed renderer");
         self.statistics.draws += 1;
+        renderer.state.statistics.reuse.pipeline_hits += u64::from(pipeline_reused);
         let result = renderer
             .execution()
             .record(frontend, |native| {

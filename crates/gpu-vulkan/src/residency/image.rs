@@ -244,6 +244,21 @@ impl Residency<'_> {
         self.touch(Resource::Image(id));
         Ok(id)
     }
+    /// A resolved sampled view can bypass preparation only while both its RAM
+    /// contents and every physical alias are current. The texture lock covers
+    /// this decision and the draw that consumes it.
+    pub(crate) fn sampled_image_ready(&self, view: ImageViewId) -> bool {
+        let cache = &self.texture_cache;
+        let Some(view) = cache.views.get(view) else {
+            return false;
+        };
+        let image = cache.get(view.image);
+        image.synchronized
+            && image
+                .aliases
+                .iter()
+                .all(|alias| cache.get(alias.image).modification_tick <= image.modification_tick)
+    }
     /// Refresh CPU contents and aliases before consumption, or discard them
     /// for a full clear. Modification belongs to the image, not its rectangles.
     /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L2523-L2553

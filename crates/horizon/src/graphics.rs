@@ -673,6 +673,7 @@ impl VideoSystem {
                 ));
             }
             queue.pending.push_back(PendingFrame {
+                queued: std::time::Instant::now(),
                 slot: request.slot,
                 acquire_fences: request.input.acquire_fences,
                 swap_interval: request.input.swap_interval,
@@ -716,7 +717,11 @@ impl VideoSystem {
         }
         Ok(true)
     }
-    fn compose(state: &mut VideoState, registration: &Waker) -> Result<(), FramebufferError> {
+    fn compose(
+        state: &mut VideoState,
+        registration: &Waker,
+        vsync: std::time::Instant,
+    ) -> Result<(), FramebufferError> {
         if !state.layers.values().any(|layer| layer.visible) {
             for event in state.vsync_events.values() {
                 event.signal();
@@ -766,6 +771,10 @@ impl VideoSystem {
                         crate::nvdrv::Composite {
                             request,
                             swap_interval: pending.swap_interval,
+                            pacing: nixe_gpu::frame_metrics::FramePacing {
+                                queued: pending.queued,
+                                vsync,
+                            },
                             presenter: presenter
                                 .as_ref()
                                 .expect("resident composition retains its presenter")
@@ -990,6 +999,7 @@ pub(crate) struct BinderTransaction {
 
 #[derive(Debug)]
 struct PendingFrame {
+    queued: std::time::Instant,
     slot: i32,
     acquire_fences: NvMultiFence,
     swap_interval: u32,

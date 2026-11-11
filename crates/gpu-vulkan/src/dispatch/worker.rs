@@ -3,8 +3,10 @@ use super::*;
 use super::{arena::Arena, slot::CommandSlot};
 use crate::queue::progress::{NativeFailure, SubmissionProgress};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 pub(crate) struct QueueSubmission {
     pub queue: vk::Queue,
@@ -77,6 +79,7 @@ struct Begin {
 }
 #[derive(Default)]
 struct Chunk {
+    sequence: u64,
     begin: Option<Begin>,
     commands: Arena,
     submit: Option<QueueSubmission>,
@@ -103,6 +106,9 @@ struct WorkQueue {
     running: bool,
 }
 struct RecordingState {
+    timing_origin: Instant,
+    completed_sequence: AtomicU64,
+    completed_ns: AtomicU64,
     queue: Mutex<WorkQueue>,
     event: Condvar,
     execution: Mutex<()>,
@@ -113,6 +119,7 @@ struct RecordingState {
     failure: Arc<OnceLock<NativeFailure>>,
 }
 pub(super) struct Recorder {
+    submitted_sequence: u64,
     pub(super) handle: RecordingHandle,
     chunk: Option<Box<Chunk>>,
     worker: Option<JoinHandle<()>>,
@@ -125,6 +132,9 @@ impl Recorder {
         objects: Arc<crate::cache::NativeObjects>,
     ) -> Result<Self, VulkanError> {
         let state = Arc::new(RecordingState {
+            timing_origin: Instant::now(),
+            completed_sequence: AtomicU64::new(0),
+            completed_ns: AtomicU64::new(0),
             queue: Mutex::new(WorkQueue {
                 pending: VecDeque::new(),
                 stopped: false,
@@ -183,6 +193,13 @@ impl Recorder {
                             .as_nanos() as u64,
                     );
                     record_chunk(&mut scope, &mut context, &queue_mutex, &mut chunk);
+                    worker_state.completed_ns.store(
+                        worker_state.timing_origin.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    worker_state
+                        .completed_sequence
+                        .store(chunk.sequence, Ordering::Release);
                     drop(execution);
                     worker_state.reserve.lock().unwrap().push(chunk);
                 }
@@ -191,6 +208,7 @@ impl Recorder {
                 VulkanError::Loader(format!("Vulkan recording worker: {error}").into())
             })?;
         Ok(Self {
+            submitted_sequence: 0,
             handle: RecordingHandle { inner: state },
             chunk: Some(Box::default()),
             worker: Some(worker),
@@ -312,7 +330,9 @@ impl Recorder {
         // Transfer and recycle stable chunk ownership, as CommandChunk's
         // unique_ptr in Eden; neither queue copies the boundary parameters.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_scheduler.cpp
-        let chunk = self.chunk.take().unwrap();
+        let mut chunk = self.chunk.take().unwrap();
+        self.submitted_sequence += 1;
+        chunk.sequence = self.submitted_sequence;
         nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::NativeQueuedChunks, 1);
         nixe_gpu::metrics::record(
             nixe_gpu::metrics::Counter::NativeChunkCommands,
@@ -326,8 +346,6 @@ impl Recorder {
         );
         #[cfg(feature = "performance-counters")]
         let queued_at = std::time::Instant::now();
-        #[cfg(feature = "performance-counters")]
-        let mut chunk = chunk;
         #[cfg(feature = "performance-counters")]
         {
             chunk.queued_at = Some(queued_at);
@@ -369,6 +387,14 @@ impl Recorder {
             return Err(RecordingHandle::disconnected());
         }
         Ok(())
+    }
+    /// Called only by the producer, before it can enqueue another chunk. An
+    /// acquire of the completed sequence makes its timestamp stable as well.
+    pub(super) fn completed_recording(&self) -> Option<Instant> {
+        let state = &self.handle.inner;
+        (state.completed_sequence.load(Ordering::Acquire) == self.submitted_sequence).then(|| {
+            state.timing_origin + Duration::from_nanos(state.completed_ns.load(Ordering::Relaxed))
+        })
     }
     pub(crate) fn discard_pending(&mut self) {
         if let Some(chunk) = &mut self.chunk {

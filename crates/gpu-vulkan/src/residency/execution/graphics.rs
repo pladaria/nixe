@@ -298,12 +298,13 @@ fn read_only_state(aspect: vk::ImageAspectFlags, state: &GraphicsState) -> bool 
 
 /// Image selections consumed by ConfigureDraw. Buffer selections stay in
 /// BufferCache; this span follows Eden's FillImageViews/CheckFeedbackLoop.
+#[derive(Clone, Copy)]
 pub(crate) struct ShaderImage {
     pub(crate) view: Option<ImageViewId>,
     pub(crate) descriptor: usize,
     // The texture cache owns guest samplers; HostProgram owns utility samplers.
     // Configure captures native handles after those actual owners retain them.
-    pub(crate) sampler: Option<vk::Sampler>,
+    pub(crate) native: vk::DescriptorImageInfo,
 }
 impl Residency<'_> {
     pub(crate) fn targets_current(&self, targets: &PreparedTargets) -> bool {
@@ -863,13 +864,18 @@ impl Residency<'_> {
                         HostBinding::Image(view) => images.push(ShaderImage {
                             view: Some(view.id),
                             descriptor,
-                            sampler: None,
+                            native: vk::DescriptorImageInfo::default()
+                                .image_view(view.native.handle)
+                                .image_layout(vk::ImageLayout::GENERAL),
                         }),
                         HostBinding::CombinedImageSampler { image, sampler } => {
                             images.push(ShaderImage {
                                 view: Some(image.id),
                                 descriptor,
-                                sampler: Some(sampler.handle),
+                                native: vk::DescriptorImageInfo::default()
+                                    .image_view(image.native.handle)
+                                    .image_layout(vk::ImageLayout::GENERAL)
+                                    .sampler(sampler.handle),
                             })
                         }
                         _ => unreachable!("compiled shader image slot"),
