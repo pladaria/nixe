@@ -354,8 +354,10 @@ const fn passive_method(index: usize) -> bool {
     if output_state(method) {
         true
     } else if matches!(family, RegisterFamily::VertexAndBinding) {
-        !matches!(method, 0x0d74 | 0x17dc | 0x1614 | 0x1618 | 0x1970)
-            && !(method >= 0x2400 && method < 0x2500)
+        !matches!(
+            method,
+            0x0d74 | 0x1118 | 0x1434 | 0x1438 | 0x1614 | 0x1618 | 0x17dc | 0x1970
+        ) && !(method >= 0x2400 && method < 0x2500)
     } else if (method >= 0x3400
         && method < 0x3400 + MAXWELL_THREE_D_MME_SHADOW_SCRATCH_COUNT as u32 * 4)
         || (method >= 0x180 && method <= 0x1ac)

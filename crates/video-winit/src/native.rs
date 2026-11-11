@@ -19,9 +19,8 @@ impl PresenterState {
             smooth_motion: smooth_motion.map(PresentationRate::new),
             displayed_title: String::new(),
             paused: false,
-            keyboard: None,
-            keyboard_host: None,
-            keyboard_redraw_at: Instant::now(),
+            overlay: None,
+            redraw_at: Instant::now(),
             screenshots: None,
         }
     }
@@ -108,14 +107,14 @@ impl Presenter {
         }
     }
     pub(super) fn touch_position(&self, position: PhysicalPosition<f64>) -> Option<(u32, u32)> {
-        map_touch_position(
-            position,
-            letterbox_viewport(
-                self.common
-                    .frame_dimensions
-                    .unwrap_or((TOUCH_SCREEN_WIDTH, TOUCH_SCREEN_HEIGHT)),
-                (self.size[0], self.size[1]),
-            ),
+        map_touch_position(position, self.viewport())
+    }
+    fn viewport(&self) -> Viewport {
+        letterbox_viewport(
+            self.common
+                .frame_dimensions
+                .unwrap_or((TOUCH_SCREEN_WIDTH, TOUCH_SCREEN_HEIGHT)),
+            (self.size[0], self.size[1]),
         )
     }
     pub(super) fn bind_frame(&mut self, frame: Arc<PresentationFrame>) -> Result<(), WindowError> {
@@ -130,11 +129,29 @@ impl Presenter {
         host: nixe_applets::keyboard::KeyboardHost,
     ) {
         self.common
-            .keyboard
-            .get_or_insert_with(|| keyboard::KeyboardOverlay::new(&self.common.window, 4096))
-            .open(request);
-        self.common.keyboard_host = Some(host);
+            .overlay
+            .get_or_insert_with(|| overlay::Overlay::new(&self.common.window))
+            .open_keyboard(request, host);
         self.redraw_pending = true;
+    }
+    pub(super) fn show_volume(&mut self, volume: u8) {
+        self.common
+            .overlay
+            .get_or_insert_with(|| overlay::Overlay::new(&self.common.window))
+            .show_volume(volume, Instant::now());
+        self.redraw_pending = true;
+        self.common.window.request_redraw();
+    }
+    pub(super) fn expire_overlays(&mut self, now: Instant) {
+        if self
+            .common
+            .overlay
+            .as_mut()
+            .is_some_and(|overlay| overlay.expire_volume(now))
+        {
+            self.redraw_pending = true;
+            self.common.window.request_redraw();
+        }
     }
     pub(super) fn needs_retry(&self) -> bool {
         self.redraw_pending
@@ -191,23 +208,23 @@ impl Presenter {
                 .is_some_and(screenshot::Screenshots::has_request)
             && !self
                 .common
-                .keyboard
+                .overlay
                 .as_ref()
-                .is_some_and(keyboard::KeyboardOverlay::active)
+                .is_some_and(overlay::Overlay::keyboard_active)
         {
             return Ok(());
         }
         if !admitted {
             self.redraw_pending = true;
-            self.common.keyboard_redraw_at = Instant::now() + Duration::from_millis(1);
+            self.common.redraw_at = Instant::now() + Duration::from_millis(1);
             return Ok(());
         }
-        let ui = self.common.keyboard.as_mut().and_then(|keyboard| {
-            keyboard.prepare(
-                self.common.keyboard_host.as_ref().unwrap(),
-                &self.common.window,
-            )
-        });
+        let viewport = self.viewport();
+        let ui = self
+            .common
+            .overlay
+            .as_mut()
+            .and_then(|overlay| overlay.prepare(&self.common.window, viewport));
         // The GPU owner retains the last completed composition. Capturing
         // it does not require a new guest frame, including during host pause.
         let screenshot = self
@@ -223,11 +240,11 @@ impl Presenter {
                 screenshot,
             })
             .map_err(|e| WindowError::new("Vulkan presentation", e))?;
-        if let Some(keyboard) = &mut self.common.keyboard {
-            keyboard.dispatch_submission();
+        if let Some(overlay) = &mut self.common.overlay {
+            overlay.dispatch_submission();
         }
         self.redraw_pending = false;
-        self.common.keyboard_redraw_at = Instant::now() + Duration::from_millis(16);
+        self.common.redraw_at = Instant::now() + Duration::from_millis(16);
         self.refresh_title(Instant::now());
         Ok(())
     }

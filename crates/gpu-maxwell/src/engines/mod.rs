@@ -751,11 +751,6 @@ fn call_dma_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     }
     if engine == Engine::ThreeD {
         threed::consume_sink(channel.three_d_mut());
-        if method.0 == 0x1618
-            && !threed::draw::admit_method(channel.three_d_mut(), method, argument)
-        {
-            threed::draw::flush(channel.three_d_mut(), execution)?;
-        }
         let (profile, state) = channel.three_d_with_profile_mut();
         threed::call_method(profile, method, argument, state, execution, origin)?;
     } else {

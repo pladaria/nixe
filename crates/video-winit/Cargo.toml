@@ -10,6 +10,7 @@ chrono.workspace = true
 log.workspace = true
 nixe-applets.workspace = true
 egui.workspace = true
+egui-phosphor.workspace = true
 egui-winit.workspace = true
 nixe-config.workspace = true
 nixe-gpu.workspace = true

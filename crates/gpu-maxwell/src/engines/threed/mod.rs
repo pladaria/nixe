@@ -1128,10 +1128,6 @@ impl<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost> MaxwellThreeDMmeHo
     #[inline(always)]
     fn emit_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error> {
         let method = GpuMethodId(u32::from(method_dword) * 4);
-        if !draw::admit_method(self.candidate, method, argument) {
-            draw::flush(self.candidate, self.execution)
-                .map_err(MaxwellEngineStreamError::execution)?;
-        }
         if is_mme_aperture(method) {
             return Err(MaxwellEngineStreamError::dispatch(
                 MaxwellEngineDispatchError::MmeExecution {
@@ -1175,6 +1171,9 @@ pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHos
     let argument = candidate
         .mme()
         .resolve_shadow_argument(method, submitted_argument);
+    if draw::ends_instance_run(candidate, method, argument) {
+        draw::flush(candidate, execution)?;
+    }
     candidate
         .mme_mut()
         .track_shadow_register(control, method, argument);
@@ -1196,6 +1195,7 @@ pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHos
     // record. COUNT still latches indexed drawing on every repeated write.
     match method.0 {
         0x0d74 | 0x17dc | 0x1970 => return Ok(()),
+        0x1118 | 0x1434 | 0x1438 if candidate.pending_notification.is_none() => return Ok(()),
         0x0d78 if candidate.pending_notification.is_none() => return Ok(()),
         0x17e0 if candidate.pending_notification.is_none() => {
             draw::index_count(candidate);

@@ -50,20 +50,26 @@ pub(in crate::engines) fn is_pending(state: &MaxwellThreeDFrontendState) -> bool
     state.draw.mode == Mode::Instance && state.draw.instances != 0
 }
 
-/// Only a new first BEGIN consumes a deferred instance sequence. Ordinary
-/// register writes do not probe/compare the previous draw's state.
+/// Submit a completed instance sequence before starting another one or
+/// changing the bases that its vertex fetch and shader inputs still use.
 #[inline]
-pub(in crate::engines) fn admit_method(
-    state: &mut MaxwellThreeDFrontendState,
+pub(super) fn ends_instance_run(
+    state: &MaxwellThreeDFrontendState,
     method: GpuMethodId,
     argument: u32,
 ) -> bool {
-    if method.0 != 0x1618 || !is_pending(state) {
-        return true;
+    match method.0 {
+        0x1618 => {
+            is_pending(state)
+                && MaxwellThreeDBegin::parse(argument)
+                    .is_some_and(|begin| begin.instance() == MaxwellThreeDBeginInstance::First)
+        }
+        0x1118 | 0x1434 | 0x1438 => {
+            is_pending(state)
+                && state.operation_state().register_words()[(method.0 / 4) as usize] != argument
+        }
+        _ => false,
     }
-    let argument = state.mme().resolve_shadow_argument(method, argument);
-    MaxwellThreeDBegin::parse(argument)
-        .is_none_or(|begin| begin.instance() != MaxwellThreeDBeginInstance::First)
 }
 
 pub(super) fn begin(

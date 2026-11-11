@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use winit::{event::WindowEvent, window::Window};
+use winit::window::Window;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Action {
@@ -29,9 +29,8 @@ struct Key {
     action: Action,
 }
 
+#[derive(Default)]
 pub(super) struct KeyboardOverlay {
-    ctx: egui::Context,
-    input: egui_winit::State,
     editor: Option<Editor>,
 }
 struct Editor {
@@ -352,45 +351,11 @@ fn enabled(editor: &Editor, key: &Key) -> bool {
     }
 }
 impl KeyboardOverlay {
-    pub fn new(window: &Window, max_texture: usize) -> Self {
-        let ctx = egui::Context::default();
-        let mut fonts = egui::FontDefinitions::empty();
-        fonts.font_data.insert(
-            "DejaVu".into(),
-            Arc::new(egui::FontData::from_static(include_bytes!(
-                "../../../assets/DejaVuSans.ttf"
-            ))),
-        );
-        fonts
-            .families
-            .insert(egui::FontFamily::Proportional, vec!["DejaVu".into()]);
-        fonts
-            .families
-            .insert(egui::FontFamily::Monospace, vec!["DejaVu".into()]);
-        ctx.set_fonts(fonts);
-        ctx.set_visuals(egui::Visuals::light());
-        let input = egui_winit::State::new(
-            ctx.clone(),
-            egui::ViewportId::ROOT,
-            window,
-            Some(window.scale_factor() as f32),
-            None,
-            Some(max_texture),
-        );
-        Self {
-            ctx,
-            input,
-            editor: None,
-        }
-    }
     pub fn open(&mut self, session: Arc<KeyboardSession>) {
         self.editor = Some(Editor::new(session));
     }
     pub fn active(&self) -> bool {
         self.editor.is_some()
-    }
-    pub fn event(&mut self, window: &Window, event: &WindowEvent) {
-        let _ = self.input.on_window_event(window, event);
     }
     pub fn dispatch_submission(&mut self) {
         if let Some(editor) = &mut self.editor
@@ -399,17 +364,15 @@ impl KeyboardOverlay {
             editor.session.submit(value);
         }
     }
-    pub fn prepare(
-        &mut self,
-        host: &KeyboardHost,
-        window: &Window,
-    ) -> Option<nixe_gpu_vulkan::presentation::UiFrame> {
-        let editor = self.editor.as_mut()?;
+    pub fn prepare(&mut self, host: &KeyboardHost, window: &Window, input: &mut egui::RawInput) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
         if editor.session.finished() {
             host.close(&editor.session);
             self.editor = None;
             window.request_redraw();
-            return None;
+            return;
         }
         if let Some(feedback) = editor.session.take_feedback() {
             editor.waiting = false;
@@ -419,18 +382,6 @@ impl KeyboardOverlay {
                 Some(feedback)
             };
         }
-        self.input.egui_input_mut().focused = window.has_focus();
-        egui_winit::update_viewport_info(
-            self.input
-                .egui_input_mut()
-                .viewports
-                .entry(egui::ViewportId::ROOT)
-                .or_default(),
-            &self.ctx,
-            window,
-            false,
-        );
-        let mut input = self.input.take_egui_input(window);
         input.events.retain_mut(|event| match event {
             egui::Event::Text(text) | egui::Event::Paste(text) => {
                 let nonempty = !text.is_empty();
@@ -455,248 +406,240 @@ impl KeyboardOverlay {
             }
             true
         });
-        let ctx = self.ctx.clone();
-        let output = ctx.run_ui(input, |root| {
-            let ctx = root.ctx();
-            let screen = ctx.viewport_rect();
-            let scale = (screen.width() / 1280.0).min(screen.height() / 720.0);
-            let origin = screen.center() - vec2(640.0, 360.0) * scale;
-            let mut key_list = keys(
-                &editor.session.config,
-                editor.shifted,
-                editor.symbols,
-                origin + vec2(40.0, 350.0) * scale,
-                100.0 * scale,
-            );
-            // The reference layout uses wide, shallow keys.
-            for key in &mut key_list {
-                let min = key.rect.min - origin;
-                let max = key.rect.max - origin;
-                key.rect.min.y = origin.y + 350.0 * scale + (min.y - 350.0 * scale) * 0.56;
-                key.rect.max.y = origin.y + 350.0 * scale + (max.y - 350.0 * scale) * 0.56;
-            }
-            for sample in host.take_controller_samples() {
-                editor.controller(sample, &key_list, Instant::now());
-            }
-            if editor.seen_controller {
-                let current = editor.controller;
-                editor.controller(current, &key_list, Instant::now());
-            }
-            egui::Area::new(egui::Id::new("software-keyboard"))
-                .fixed_pos(screen.min)
-                .movable(false)
-                .show(ctx, |ui| {
-                    ui.set_min_size(screen.size());
-                    let painter = ui.painter();
-                    painter.rect_filled(screen, 0.0, Color32::from_rgb(28, 31, 33));
-                    let header_rect = Rect::from_min_size(
-                        origin + vec2(40.0, 35.0) * scale,
-                        vec2(1200.0, 55.0) * scale,
-                    );
-                    painter.text(
-                        header_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        &editor.session.config.header,
-                        FontId::proportional(28.0 * scale),
-                        Color32::WHITE,
-                    );
-                    painter.text(
-                        origin + vec2(640.0, 115.0) * scale,
-                        egui::Align2::CENTER_CENTER,
-                        &editor.session.config.subtitle,
-                        FontId::proportional(20.0 * scale),
-                        Color32::LIGHT_GRAY,
-                    );
-                    let field = Rect::from_min_size(
-                        origin + vec2(380.0, 215.0) * scale,
-                        vec2(520.0, 55.0) * scale,
-                    );
-                    let id = egui::Id::new("keyboard-text");
-                    if editor.cursor_changed {
-                        let mut state =
-                            egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
-                        state
-                            .cursor
-                            .set_char_range(Some(egui::text::CCursorRange::two(
-                                egui::text::CCursor::new(editor.cursor.start),
-                                egui::text::CCursor::new(editor.cursor.end),
-                            )));
-                        state.store(ctx, id);
-                        editor.cursor_changed = false;
-                    }
-                    let text_before = editor.text.clone();
-                    let output = ui
-                        .scope_builder(egui::UiBuilder::new().max_rect(field), |ui| {
-                            ui.visuals_mut().override_text_color = Some(Color32::WHITE);
-                            let edit = if editor.session.config.multiline {
-                                egui::TextEdit::multiline(&mut editor.text)
-                            } else {
-                                egui::TextEdit::singleline(&mut editor.text)
-                            };
-                            edit.id(id)
-                                .font(FontId::proportional(30.0 * scale))
-                                .password(editor.session.config.password)
-                                .char_limit(editor.session.config.maximum)
-                                .interactive(!editor.waiting && editor.feedback.is_none())
-                                .frame(egui::Frame::NONE)
-                                .desired_width(field.width())
-                                .show(ui)
-                        })
-                        .inner;
-                    if !editor.text.chars().all(|c| editor.session.config.allows(c)) {
-                        editor.text = text_before;
-                    }
-                    if let Some(range) = output.cursor_range {
-                        let indices = range.as_sorted_char_range();
-                        editor.cursor = usize::from(indices.start).min(editor.text.len())
-                            ..usize::from(indices.end).min(editor.text.len());
-                    }
-                    output.response.request_focus();
-                    ui.painter().line_segment(
-                        [field.left_bottom(), field.right_bottom()],
-                        Stroke::new(2.0 * scale, Color32::LIGHT_GRAY),
-                    );
-                    ui.painter().text(
-                        field.right_bottom() + vec2(0.0, 20.0) * scale,
-                        egui::Align2::RIGHT_CENTER,
-                        format!("{}/{}", editor.text.len(), editor.session.config.maximum),
-                        FontId::proportional(18.0 * scale),
-                        Color32::LIGHT_GRAY,
-                    );
-                    ui.painter().text(
-                        origin + vec2(640.0, 315.0) * scale,
-                        egui::Align2::CENTER_CENTER,
-                        &editor.session.config.guide,
-                        FontId::proportional(18.0 * scale),
-                        Color32::LIGHT_GRAY,
-                    );
-                    ui.painter().rect_filled(
-                        Rect::from_min_max(
-                            origin + vec2(0.0, 335.0) * scale,
-                            origin + vec2(1280.0, 720.0) * scale,
-                        ),
-                        0.0,
-                        Color32::from_rgb(242, 243, 244),
-                    );
-                    let pointer = ctx.input(|i| i.pointer.hover_pos());
-                    let pointer_moved = pointer != editor.pointer;
-                    editor.pointer = pointer;
-                    for (index, key) in key_list.iter().enumerate() {
-                        let can = enabled(editor, key);
-                        let response = ui.interact(
-                            key.rect,
-                            egui::Id::new(("osk-key", index)),
-                            egui::Sense::click(),
-                        );
-                        if pointer_moved && response.hovered() {
-                            editor.selected = index;
-                        }
-                        let accepting = key.action == Action::Accept;
-                        let fill = if accepting {
-                            Color32::from_rgb(55, 74, 220)
+    }
+    pub fn show(&mut self, host: &KeyboardHost, ctx: &egui::Context) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        let screen = ctx.viewport_rect();
+        let scale = (screen.width() / 1280.0).min(screen.height() / 720.0);
+        let origin = screen.center() - vec2(640.0, 360.0) * scale;
+        let mut key_list = keys(
+            &editor.session.config,
+            editor.shifted,
+            editor.symbols,
+            origin + vec2(40.0, 350.0) * scale,
+            100.0 * scale,
+        );
+        // The reference layout uses wide, shallow keys.
+        for key in &mut key_list {
+            let min = key.rect.min - origin;
+            let max = key.rect.max - origin;
+            key.rect.min.y = origin.y + 350.0 * scale + (min.y - 350.0 * scale) * 0.56;
+            key.rect.max.y = origin.y + 350.0 * scale + (max.y - 350.0 * scale) * 0.56;
+        }
+        for sample in host.take_controller_samples() {
+            editor.controller(sample, &key_list, Instant::now());
+        }
+        if editor.seen_controller {
+            let current = editor.controller;
+            editor.controller(current, &key_list, Instant::now());
+        }
+        egui::Area::new(egui::Id::new("software-keyboard"))
+            .fixed_pos(screen.min)
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_min_size(screen.size());
+                let painter = ui.painter();
+                painter.rect_filled(screen, 0.0, Color32::from_rgb(28, 31, 33));
+                let header_rect = Rect::from_min_size(
+                    origin + vec2(40.0, 35.0) * scale,
+                    vec2(1200.0, 55.0) * scale,
+                );
+                painter.text(
+                    header_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &editor.session.config.header,
+                    FontId::proportional(28.0 * scale),
+                    Color32::WHITE,
+                );
+                painter.text(
+                    origin + vec2(640.0, 115.0) * scale,
+                    egui::Align2::CENTER_CENTER,
+                    &editor.session.config.subtitle,
+                    FontId::proportional(20.0 * scale),
+                    Color32::LIGHT_GRAY,
+                );
+                let field = Rect::from_min_size(
+                    origin + vec2(380.0, 215.0) * scale,
+                    vec2(520.0, 55.0) * scale,
+                );
+                let id = egui::Id::new("keyboard-text");
+                if editor.cursor_changed {
+                    let mut state =
+                        egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(editor.cursor.start),
+                            egui::text::CCursor::new(editor.cursor.end),
+                        )));
+                    state.store(ctx, id);
+                    editor.cursor_changed = false;
+                }
+                let text_before = editor.text.clone();
+                let output = ui
+                    .scope_builder(egui::UiBuilder::new().max_rect(field), |ui| {
+                        ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+                        let edit = if editor.session.config.multiline {
+                            egui::TextEdit::multiline(&mut editor.text)
                         } else {
-                            Color32::from_rgb(227, 229, 231)
+                            egui::TextEdit::singleline(&mut editor.text)
                         };
-                        ui.painter().rect_filled(key.rect, 0.0, fill);
-                        let color = if !can {
-                            Color32::from_gray(158)
-                        } else if accepting {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_gray(45)
-                        };
-                        let font = if key.label.len() == 1 { 30.0 } else { 20.0 };
-                        ui.painter().text(
-                            key.rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            &key.label,
-                            FontId::proportional(font * scale),
-                            color,
-                        );
-                        if index == editor.selected {
-                            ui.painter().rect_stroke(
-                                key.rect,
-                                0.0,
-                                Stroke::new(4.0 * scale, Color32::from_rgb(30, 218, 191)),
-                                StrokeKind::Inside,
-                            );
-                        }
-                        if can && response.clicked() {
-                            editor.selected = index;
-                            editor.action(&key.action);
-                        }
-                    }
-                    let cancel = Rect::from_min_size(
-                        origin + vec2(960.0, 655.0) * scale,
-                        vec2(260.0, 60.0) * scale,
-                    );
-                    let cancel_response = ui.interact(
-                        cancel,
-                        egui::Id::new("keyboard-cancel"),
+                        edit.id(id)
+                            .font(FontId::proportional(30.0 * scale))
+                            .password(editor.session.config.password)
+                            .char_limit(editor.session.config.maximum)
+                            .interactive(!editor.waiting && editor.feedback.is_none())
+                            .frame(egui::Frame::NONE)
+                            .desired_width(field.width())
+                            .show(ui)
+                    })
+                    .inner;
+                if !editor.text.chars().all(|c| editor.session.config.allows(c)) {
+                    editor.text = text_before;
+                }
+                if let Some(range) = output.cursor_range {
+                    let indices = range.as_sorted_char_range();
+                    editor.cursor = usize::from(indices.start).min(editor.text.len())
+                        ..usize::from(indices.end).min(editor.text.len());
+                }
+                output.response.request_focus();
+                ui.painter().line_segment(
+                    [field.left_bottom(), field.right_bottom()],
+                    Stroke::new(2.0 * scale, Color32::LIGHT_GRAY),
+                );
+                ui.painter().text(
+                    field.right_bottom() + vec2(0.0, 20.0) * scale,
+                    egui::Align2::RIGHT_CENTER,
+                    format!("{}/{}", editor.text.len(), editor.session.config.maximum),
+                    FontId::proportional(18.0 * scale),
+                    Color32::LIGHT_GRAY,
+                );
+                ui.painter().text(
+                    origin + vec2(640.0, 315.0) * scale,
+                    egui::Align2::CENTER_CENTER,
+                    &editor.session.config.guide,
+                    FontId::proportional(18.0 * scale),
+                    Color32::LIGHT_GRAY,
+                );
+                ui.painter().rect_filled(
+                    Rect::from_min_max(
+                        origin + vec2(0.0, 335.0) * scale,
+                        origin + vec2(1280.0, 720.0) * scale,
+                    ),
+                    0.0,
+                    Color32::from_rgb(242, 243, 244),
+                );
+                let pointer = ctx.input(|i| i.pointer.hover_pos());
+                let pointer_moved = pointer != editor.pointer;
+                editor.pointer = pointer;
+                for (index, key) in key_list.iter().enumerate() {
+                    let can = enabled(editor, key);
+                    let response = ui.interact(
+                        key.rect,
+                        egui::Id::new(("osk-key", index)),
                         egui::Sense::click(),
                     );
-                    ui.painter().text(
-                        cancel.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "X Cancel",
-                        FontId::proportional(20.0 * scale),
-                        if editor.session.config.cancel_disabled {
-                            Color32::GRAY
-                        } else {
-                            Color32::from_gray(45)
-                        },
-                    );
-                    if cancel_response.clicked() {
-                        editor.action(&Action::Cancel);
+                    if pointer_moved && response.hovered() {
+                        editor.selected = index;
                     }
-                    let footer = "L/R Cursor    Stick click Shift    B Delete    A Select    + OK";
+                    let accepting = key.action == Action::Accept;
+                    let fill = if accepting {
+                        Color32::from_rgb(55, 74, 220)
+                    } else {
+                        Color32::from_rgb(227, 229, 231)
+                    };
+                    ui.painter().rect_filled(key.rect, 0.0, fill);
+                    let color = if !can {
+                        Color32::from_gray(158)
+                    } else if accepting {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_gray(45)
+                    };
+                    let font = if key.label.len() == 1 { 30.0 } else { 20.0 };
                     ui.painter().text(
-                        origin + vec2(485.0, 687.0) * scale,
+                        key.rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        footer,
-                        FontId::proportional(18.0 * scale),
-                        Color32::from_gray(45),
+                        &key.label,
+                        FontId::proportional(font * scale),
+                        color,
                     );
-                });
-            if let Some(feedback) = editor.feedback.clone() {
-                let confirming = matches!(feedback, Validation::Confirm(_));
-                let message = match feedback {
-                    Validation::Failure(m) | Validation::Confirm(m) => m,
-                    Validation::Retry => String::new(),
-                };
-                egui::Window::new(if confirming { "Confirm" } else { "Check input" })
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        ui.label(message);
-                        ui.horizontal(|ui| {
-                            if confirming && ui.button("Cancel").clicked() {
-                                editor.feedback = None;
+                    if index == editor.selected {
+                        ui.painter().rect_stroke(
+                            key.rect,
+                            0.0,
+                            Stroke::new(4.0 * scale, Color32::from_rgb(30, 218, 191)),
+                            StrokeKind::Inside,
+                        );
+                    }
+                    if can && response.clicked() {
+                        editor.selected = index;
+                        editor.action(&key.action);
+                    }
+                }
+                let cancel = Rect::from_min_size(
+                    origin + vec2(960.0, 655.0) * scale,
+                    vec2(260.0, 60.0) * scale,
+                );
+                let cancel_response = ui.interact(
+                    cancel,
+                    egui::Id::new("keyboard-cancel"),
+                    egui::Sense::click(),
+                );
+                ui.painter().text(
+                    cancel.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "X Cancel",
+                    FontId::proportional(20.0 * scale),
+                    if editor.session.config.cancel_disabled {
+                        Color32::GRAY
+                    } else {
+                        Color32::from_gray(45)
+                    },
+                );
+                if cancel_response.clicked() {
+                    editor.action(&Action::Cancel);
+                }
+                let footer = "L/R Cursor    Stick click Shift    B Delete    A Select    + OK";
+                ui.painter().text(
+                    origin + vec2(485.0, 687.0) * scale,
+                    egui::Align2::CENTER_CENTER,
+                    footer,
+                    FontId::proportional(18.0 * scale),
+                    Color32::from_gray(45),
+                );
+            });
+        if let Some(feedback) = editor.feedback.clone() {
+            let confirming = matches!(feedback, Validation::Confirm(_));
+            let message = match feedback {
+                Validation::Failure(m) | Validation::Confirm(m) => m,
+                Validation::Retry => String::new(),
+            };
+            egui::Window::new(if confirming { "Confirm" } else { "Check input" })
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(message);
+                    ui.horizontal(|ui| {
+                        if confirming && ui.button("Cancel").clicked() {
+                            editor.feedback = None;
+                        }
+                        if ui.button("OK").clicked() {
+                            editor.feedback = None;
+                            if confirming {
+                                editor.waiting = true;
+                                editor.submit(Submission::Accept {
+                                    text: editor.text.clone(),
+                                    confirmed: true,
+                                });
                             }
-                            if ui.button("OK").clicked() {
-                                editor.feedback = None;
-                                if confirming {
-                                    editor.waiting = true;
-                                    editor.submit(Submission::Accept {
-                                        text: editor.text.clone(),
-                                        confirmed: true,
-                                    });
-                                }
-                            }
-                        });
+                        }
                     });
-            }
-        });
-        self.input
-            .handle_platform_output(window, output.platform_output);
-        let pixels = output.pixels_per_point;
-        let jobs = ctx.tessellate(output.shapes, pixels);
-        Some(nixe_gpu_vulkan::presentation::UiFrame {
-            primitives: jobs,
-            textures: output.textures_delta,
-            pixels_per_point: pixels,
-        })
+                });
+        }
     }
 }
 

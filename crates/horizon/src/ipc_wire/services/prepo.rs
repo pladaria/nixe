@@ -1,8 +1,11 @@
-//! Application play-report IPC and local persistence.
+//! Application play-report IPC and debug logging.
 //! https://switchbrew.org/wiki/BCAT_services#prepo:a,_prepo:a2,_prepo:m,_prepo:u,_prepo:s
 //! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/prepo/prepo.cpp
 use super::prelude::*;
 use crate::PlayReportSession;
+
+const MAX_REPORT_BYTES: u64 = 64 * 1024;
+const MAX_REPORT_DEPTH: usize = 64;
 
 pub(in crate::ipc_wire) async fn dispatch_play_report(
     process: &Request,
@@ -51,12 +54,8 @@ pub(in crate::ipc_wire) async fn dispatch_play_report(
                 return reply(HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             match request.command_id {
-                // Match Eden's RequestImmediateTransmission: acknowledge the
-                // request without uploading reports. SaveReport persists locally.
-                10200 => {
-                    log::debug!("play-report transmission requested (local storage only)");
-                    return reply(HorizonIpcResult::SUCCESS);
-                }
+                // Acknowledge the transmission request for the offline service.
+                10200 => return reply(HorizonIpcResult::SUCCESS),
                 // Eden GetTransmissionStatus returns an s32 status of zero;
                 // requesting transmission does not create a pending upload.
                 10300 => {
@@ -104,36 +103,53 @@ pub(in crate::ipc_wire) async fn dispatch_play_report(
     if pointer.index != 0 {
         return reply(HorizonIpcResult::CMIF_INVALID_IN_HEADER);
     }
-    let buffers = [&process.send_buffers()[0], &process.send_statics()[0]];
-    let buffer_size = buffers
-        .iter()
-        .map(|buffer| buffer.size)
-        .max()
-        .unwrap_or(0)
-        .min(1024 * 1024) as usize;
-    process.reserve_payload(buffer_size).await?;
-    let mut bytes = vec![0; buffer_size];
-    let (mut report, path) = session
-        .create(
-            request.command_id,
-            process.process_id(),
-            &request.data[..inline],
-            [buffers[0].size, buffers[1].size],
-        )
-        .map_err(|error| IpcWireError::PlayReport(error.to_string().into()))?;
-    for buffer in buffers {
-        let mut offset = 0;
-        while offset < buffer.size {
-            let count = (buffer.size - offset).min(buffer_size as u64) as usize;
-            bytes.resize(count, 0);
-            process.read(buffer, offset, &mut bytes).await?;
-            std::io::Write::write_all(&mut report, &bytes[..count])
-                .map_err(|error| IpcWireError::PlayReport(error.to_string().into()))?;
-            offset += count as u64;
-        }
+    if log::log_enabled!(log::Level::Debug)
+        && let Err(error) = log_report(process).await
+    {
+        let error = crate::ipc_wire::HorizonIpcFault::from_wire(error);
+        log::error!("[guest] [SaveReport] {error}");
     }
-    std::io::Write::flush(&mut report)
-        .map_err(|error| IpcWireError::PlayReport(error.to_string().into()))?;
-    log::debug!("saved play report {}", path.display());
     semantic_success(request.token, domain, &[], &[], &[], None)
+}
+
+async fn log_report(process: &Request) -> Result<(), IpcWireError> {
+    // The pointer carries the report name and the mapped buffer its MessagePack data.
+    // https://git.axenov.dev/Museum/ryujinx/src/commit/6f60e102a29aa04fff5c6bcdec37213b2d8ac646/Ryujinx.Horizon/Prepo/Ipc/PrepoService.cs
+    let name = &process.send_statics()[0];
+    let payload = &process.send_buffers()[0];
+    let size = name
+        .size
+        .checked_add(payload.size)
+        .filter(|&size| size <= MAX_REPORT_BYTES)
+        .ok_or_else(|| {
+            IpcWireError::PlayReport(
+                format!("exceeds the {MAX_REPORT_BYTES}-byte diagnostic limit").into(),
+            )
+        })?;
+    process.reserve_payload(size as usize).await?;
+    let mut buffers = [Vec::new(), Vec::new()];
+    for (buffer, bytes) in [name, payload].into_iter().zip(&mut buffers) {
+        let size = buffer.size as usize;
+        bytes.try_reserve_exact(size).map_err(|_| {
+            IpcWireError::HostResourceExhausted("allocating a play-report diagnostic buffer")
+        })?;
+        bytes.resize(size, 0);
+        process.read(buffer, 0, bytes).await?;
+    }
+    let [name, payload] = &buffers;
+    let name = std::str::from_utf8(name)
+        .map_err(|error| IpcWireError::PlayReport(format!("invalid UTF-8 name: {error}").into()))?
+        .trim_end_matches('\0');
+    let mut remaining = payload.as_slice();
+    let fields = rmpv::decode::read_value_ref_with_max_depth(&mut remaining, MAX_REPORT_DEPTH)
+        .map_err(|error| {
+            IpcWireError::PlayReport(format!("invalid MessagePack: {error}").into())
+        })?;
+    if !remaining.is_empty() {
+        return Err(IpcWireError::PlayReport(
+            "trailing data after the MessagePack value".into(),
+        ));
+    }
+    log::debug!("[guest] [SaveReport] {name:?} {fields}");
+    Ok(())
 }

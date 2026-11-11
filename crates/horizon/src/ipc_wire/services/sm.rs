@@ -287,9 +287,9 @@ fn connect_service(
         ServiceKind::Opus => process.return_service(HorizonIpcObject::OpusManager(
             resources.audio.opus.open_session(),
         )),
-        ServiceKind::PlayReport => process.return_service(HorizonIpcObject::PlayReport(
-            crate::PlayReportSession::new("dump/play-reports"),
-        )),
+        ServiceKind::PlayReport => {
+            process.return_service(HorizonIpcObject::PlayReport(crate::PlayReportSession::new()))
+        }
         ServiceKind::Vi(kind) => process.return_service(HorizonIpcObject::Vi(ViSession::new(
             ViObjectKind::Root(kind),
             resources.graphics.video.clone(),

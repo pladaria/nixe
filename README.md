@@ -91,6 +91,7 @@ cargo cli run <id | name>
 
 Hotkeys:
 
+- Numpad <kbd>+</kbd> / <kbd>-</kbd>: adjust volume in steps of 10; show the volume indicator for two seconds
 - <kbd>S</kbd>: save a screenshot as a PNG file (see `nixe.toml` for the screenshots directory)
 - <kbd>P</kbd>: pause or resume the emulation
 - <kbd>F</kbd>: toggle fullscreen; <kbd>Esc</kbd> also returns to windowed mode
@@ -130,6 +131,7 @@ Nixe is grateful to the projects and communities whose work has helped make this
 - [Dynarmic](https://github.com/lioncash/dynarmic), for the dynamic recompiler used by Nixe's CPU emulation.
 - [AsmJit](https://github.com/asmjit/asmjit), for the machine-code assembler used by Nixe's MME JIT compiler.
 - [AMD FidelityFX Super Resolution](https://github.com/GPUOpen-Effects/FidelityFX-FSR), for the FSR 1 spatial presentation filter.
+- [Phosphor Icons](https://phosphoricons.com/) and [egui-phosphor](https://github.com/amPerl/egui-phosphor), for the host interface icons.
 
 ## Contributing
 

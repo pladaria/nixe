@@ -423,7 +423,7 @@ fn run_with_memory(
                 .set_volume(volume)
                 .map_err(|error| error.to_string())?;
             log::info!("audio volume: {volume}%");
-            Ok(())
+            Ok(volume)
         });
 
     let worker_control =

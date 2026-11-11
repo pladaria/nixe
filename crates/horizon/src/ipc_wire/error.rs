@@ -108,7 +108,7 @@ impl std::fmt::Display for HorizonIpcFault {
                 write!(formatter, "audio renderer failed: {reason}")
             }
             IpcWireError::PlayReport(reason) => {
-                write!(formatter, "play-report storage failed: {reason}")
+                write!(formatter, "play report: {reason}")
             }
             IpcWireError::Bcat(reason) => write!(formatter, "BCAT storage failed: {reason}"),
             IpcWireError::InputBackend(reason) => {

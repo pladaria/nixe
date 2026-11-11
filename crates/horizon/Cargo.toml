@@ -14,6 +14,7 @@ bytemuck.workspace = true
 nixe-applets.workspace = true
 flate2.workspace = true
 serde.workspace = true
+rmpv.workspace = true
 toml.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true

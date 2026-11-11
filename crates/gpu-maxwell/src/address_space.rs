@@ -1134,7 +1134,6 @@ impl MaxwellGpuAddressSpace {
         cacheable: bool,
     ) -> Result<(), MaxwellAddressSpaceError> {
         let shared = Arc::clone(&self.memory.inner);
-        let mut retired = Vec::new();
         let mut tables = shared
             .mappings
             .write()
@@ -1202,7 +1201,6 @@ impl MaxwellGpuAddressSpace {
             return Err(MaxwellAddressSpaceError::PartialMapping);
         }
 
-        let generation = self.next_mapping_generation()?;
         let address_bits = self.profile.virtual_address().address_bits().bits();
         let affected = tables
             .live
@@ -1213,27 +1211,49 @@ impl MaxwellGpuAddressSpace {
                     .end()
                     .ok()
                     .filter(|mapping_end| {
-                        mapping.id == id && start < *mapping_end && mapping.offset.get() < end
+                        mapping.id == id
+                            && start < *mapping_end
+                            && mapping.offset.get() < end
+                            && (mapping.kind != kind || mapping.cacheable != cacheable)
                     })
                     .map(|_| *offset)
             })
             .collect::<Vec<_>>();
+        if affected.is_empty() {
+            return Ok(());
+        }
+        let generation = self.next_mapping_generation()?;
+        // Modify updates the page attributes while retaining the physical
+        // backing and the renderer's resident contents.
+        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/address_space.c#L74-L83
         for offset in affected {
-            let mapping = tables
+            let LiveMapping {
+                descriptor: mapping,
+                _device: device,
+            } = tables
                 .live
-                .get(&offset)
-                .map(|live| live.descriptor.clone())
+                .remove(&offset)
                 .ok_or(MaxwellAddressSpaceError::UnknownMapping)?;
-            retired.extend(self.remove_mapping(&mut tables, offset));
             let mapping_start = mapping.offset.get();
             let mapping_end = mapping.end()?;
             let changed_start = mapping_start.max(start);
             let changed_end = mapping_end.min(end);
+            mapping.current.store(false, Ordering::Release);
+            let mut insert = |mut mapping: MaxwellGpuMapping| {
+                mapping.current = Arc::new(AtomicBool::new(true));
+                mapping.generation = generation;
+                tables.live.insert(
+                    mapping.offset,
+                    LiveMapping {
+                        descriptor: mapping,
+                        _device: Arc::clone(&device),
+                    },
+                );
+            };
             if mapping_start < changed_start {
                 let mut left = mapping.clone();
                 left.size = changed_start - mapping_start;
-                left.generation = generation;
-                self.install_split(&mut tables, left)?;
+                insert(left);
             }
             let mut changed = mapping.clone();
             changed.offset = GpuVirtualAddress::try_new(changed_start, address_bits)
@@ -1245,8 +1265,7 @@ impl MaxwellGpuAddressSpace {
             changed.size = changed_end - changed_start;
             changed.kind = kind;
             changed.cacheable = cacheable;
-            changed.generation = generation;
-            self.install_split(&mut tables, changed)?;
+            insert(changed);
             if changed_end < mapping_end {
                 let mut right = mapping;
                 right.offset = GpuVirtualAddress::try_new(changed_end, address_bits)
@@ -1256,21 +1275,15 @@ impl MaxwellGpuAddressSpace {
                     .checked_add(changed_end - mapping_start)
                     .ok_or(MaxwellAddressSpaceError::ArithmeticOverflow)?;
                 right.size = mapping_end - changed_end;
-                right.generation = generation;
-                self.install_split(&mut tables, right)?;
+                insert(right);
             }
         }
+        tables.kinds.map(start, size, kind);
         self.mapping_generation = generation;
         self.memory
             .inner
             .generation
             .store(generation.get(), Ordering::Release);
-        drop(tables);
-        for live in &retired {
-            self.memory.unmap_memory(live, start, end);
-        }
-        self.memory.modify_gpu_memory(start, size);
-        drop(retired);
         Ok(())
     }
 

@@ -5,6 +5,7 @@ pub mod metrics;
 
 mod keyboard;
 mod native;
+mod overlay;
 mod screenshot;
 mod vulkan;
 use native::Presenter;
@@ -39,7 +40,7 @@ enum FrontendEvent {
 }
 
 type PauseHandler = Box<dyn Fn(bool) -> Result<(), String> + Send + Sync>;
-type VolumeHandler = Box<dyn FnMut(i8) -> Result<(), String> + Send>;
+type VolumeHandler = Box<dyn FnMut(i8) -> Result<u8, String> + Send>;
 
 fn hotkey_pressed(down: &mut bool, state: ElementState, repeat: bool, synthetic: bool) -> bool {
     if synthetic {
@@ -198,11 +199,11 @@ impl WindowFrontend {
         self
     }
 
-    /// Routes numpad volume hotkeys as changes in percentage points.
+    /// Routes numpad volume hotkeys as percentage-point changes and returns the applied volume.
     #[must_use]
     pub fn with_volume_handler(
         mut self,
-        handler: impl FnMut(i8) -> Result<(), String> + Send + 'static,
+        handler: impl FnMut(i8) -> Result<u8, String> + Send + 'static,
     ) -> Self {
         self.application.volume_handler = Some(Box::new(handler));
         self
@@ -274,9 +275,8 @@ struct PresenterState {
     smooth_motion: Option<PresentationRate>,
     displayed_title: String,
     paused: bool,
-    keyboard: Option<keyboard::KeyboardOverlay>,
-    keyboard_host: Option<nixe_applets::keyboard::KeyboardHost>,
-    keyboard_redraw_at: Instant,
+    overlay: Option<overlay::Overlay>,
+    redraw_at: Instant,
     screenshots: Option<screenshot::Screenshots>,
 }
 const TITLE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -740,10 +740,14 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 .presenter
                 .as_ref()
                 .is_some_and(|p| p.window.has_focus())
-                && let Err(error) = handler(if increase { 10 } else { -10 })
             {
-                self.failure = Some(WindowError::new("volume control", error));
-                self.stop_requested.store(true, Ordering::Release);
+                match handler(if increase { 10 } else { -10 }) {
+                    Ok(volume) => self.presenter.as_mut().unwrap().show_volume(volume),
+                    Err(error) => {
+                        self.failure = Some(WindowError::new("volume control", error));
+                        self.stop_requested.store(true, Ordering::Release);
+                    }
+                }
             }
             return;
         }
@@ -767,10 +771,10 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             _ => false,
         };
         if let Some(presenter) = &mut self.presenter
-            && let Some(keyboard) = &mut presenter.keyboard
-            && keyboard.active()
+            && let Some(overlay) = &mut presenter.overlay
+            && overlay.keyboard_active()
         {
-            keyboard.event(event_window.as_ref().unwrap(), &event);
+            overlay.event(event_window.as_ref().unwrap(), &event);
             if matches!(
                 event,
                 WindowEvent::KeyboardInput { .. }
@@ -967,20 +971,26 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
         }
         if let Some(presenter) = &mut self.presenter {
             let now = Instant::now();
+            presenter.expire_overlays(now);
             presenter.refresh_title(now);
             let wake_at = if presenter
-                .keyboard
+                .overlay
                 .as_ref()
-                .is_some_and(keyboard::KeyboardOverlay::active)
+                .is_some_and(overlay::Overlay::keyboard_active)
                 || presenter.needs_retry()
             {
-                if now >= presenter.keyboard_redraw_at {
+                if now >= presenter.redraw_at {
                     presenter.window.request_redraw();
                 }
-                presenter.keyboard_redraw_at
+                presenter.redraw_at
             } else {
                 presenter.frame_rate.next_refresh()
             };
+            let wake_at = presenter
+                .overlay
+                .as_ref()
+                .and_then(overlay::Overlay::volume_deadline)
+                .map_or(wake_at, |deadline| wake_at.min(deadline));
             let wake_at = self
                 .cursor_hide_at
                 .map_or(wake_at, |deadline| wake_at.min(deadline));
