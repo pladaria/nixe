@@ -228,7 +228,7 @@ pub struct ResidencyStatistics {
 /// Concrete single-owner storage, selected once at startup. No generic backend
 /// handle registry, virtual resource dispatch or guest-ISA branch in its hot path.
 mod bindings;
-pub(crate) use bindings::StorageBuffer;
+pub(crate) use bindings::{StorageBuffer, StorageBufferKey};
 pub(crate) mod texture_bindings;
 pub struct VulkanResidency {
     pub(crate) caches: Arc<CacheOwners>,

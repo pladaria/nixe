@@ -89,17 +89,20 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
             .unwrap()
             .region_gpu_modified(address, bytes)
     }
+    fn try_on_cpu_read(&self, address: u64, bytes: u64) -> Option<nixe_memory::NativeReadArea> {
+        // The graphics owner can hold this mutex while waiting for native
+        // quiescence. An admitted vCPU must never block on that mutex.
+        self.texture_cache
+            .try_lock()
+            .ok()?
+            .flush_area::<false>(address, bytes)
+    }
     fn on_cpu_read(&self, address: u64, bytes: u64) -> nixe_memory::NativeReadArea {
-        let area = self
-            .texture_cache
+        self.texture_cache
             .lock()
             .unwrap()
-            .flush_area(address, bytes);
-        nixe_memory::NativeReadArea {
-            start: area.start,
-            end: area.end,
-            preemptive: area.preemptive,
-        }
+            .flush_area::<true>(address, bytes)
+            .expect("reactive reads always resolve an area")
     }
 
     fn on_cpu_write(&self, address: u64, bytes: u64) -> bool {

@@ -65,6 +65,10 @@ impl Drop for CachedRangeGuard<'_> {
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/device_memory_manager.inc#L244-L270
 pub trait DeviceMemoryInterface: Send + Sync + std::fmt::Debug {
     fn must_flush_region(&self, address: u64, bytes: u64) -> bool;
+    /// Resolve an already available read without blocking native execution.
+    /// Return only preemptive areas. A reactive read must remain pending and
+    /// must not be marked flushed until on_cpu_read requests its publication.
+    fn try_on_cpu_read(&self, address: u64, bytes: u64) -> Option<crate::NativeReadArea>;
     fn on_cpu_read(&self, address: u64, bytes: u64) -> crate::NativeReadArea;
     fn invalidate_region(&self, address: u64, bytes: u64);
     fn unmap_memory(&self, address: u64, bytes: u64);

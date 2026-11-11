@@ -49,12 +49,6 @@ struct PlaneDownload {
     geometry: Arc<Footprint>,
     inputs: Vec<nixe_memory::AllocationRange>,
 }
-#[derive(Clone, Copy)]
-pub(super) struct ReadArea {
-    pub start: u64,
-    pub end: u64,
-    pub preemptive: bool,
-}
 impl Residency<'_> {
     pub(crate) fn bind_render_target(&mut self, slot: usize, selected: Option<ImageViewId>) {
         if self.texture_cache.bindings.channel.render_targets.views[slot] == selected {
@@ -74,9 +68,13 @@ impl Residency<'_> {
     }
 }
 impl TextureCache {
-    pub(super) fn flush_area(&mut self, address: u64, bytes: u64) -> ReadArea {
+    pub(super) fn flush_area<const REACTIVE: bool>(
+        &mut self,
+        address: u64,
+        bytes: u64,
+    ) -> Option<nixe_memory::NativeReadArea> {
         let end = address + bytes;
-        let mut area = ReadArea {
+        let mut area = nixe_memory::NativeReadArea {
             start: address,
             end,
             preemptive: true,
@@ -96,6 +94,12 @@ impl TextureCache {
                 {
                     continue;
                 }
+                // Native reads cannot wait for publication while admitted.
+                // Leave this image untouched so the suspended caller still
+                // observes the required reactive download.
+                if !REACTIVE && !entry.forced_flushed {
+                    return None;
+                }
                 found = true;
                 for &(base, size) in &entry.maps {
                     area.start = area.start.min(base);
@@ -112,7 +116,7 @@ impl TextureCache {
             area.start = address / 4096 * 4096;
             area.end = end.div_ceil(4096) * 4096;
         }
-        area
+        Some(area)
     }
 }
 impl Residency<'_> {

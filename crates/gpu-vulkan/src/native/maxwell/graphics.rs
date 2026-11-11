@@ -33,29 +33,68 @@ impl crate::native::NativeExecution<'_> {
             .address(binding.address().get() + u64::from(offset))
             .map_err(|error| V::Compilation(error.to_string().into()))
     }
-    /// StorageBufferBinding reads its actual NVN pointer descriptor. Bounds
-    /// come from MemoryManager's same-kind layout, exactly as in Eden.
-    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L2006-L2065
-    pub(in crate::native) fn storage_binding(
+    pub(in crate::native) fn bind_guest_storage_buffer(
         &mut self,
         space: &MaxwellGpuMemory,
         descriptor: nixe_gpu::GpuVirtualAddress,
         written: bool,
+        stage: usize,
+        slot: usize,
+    ) -> Result<(), crate::VulkanError> {
+        use crate::residency::StorageBufferKey;
+        let fail = |error: model::MaxwellGpuAccessError| {
+            VulkanError::Compilation(error.to_string().into())
+        };
+        let target = space.read_u64(descriptor).map_err(fail)?;
+        if target == 0 {
+            self.residency
+                .runtime
+                .buffer_bindings
+                .channel
+                .storage_buffers[stage][slot] = None;
+            return Ok(());
+        }
+        let size_address = space
+            .checked_add(descriptor, 8)
+            .map_err(|error| VulkanError::Compilation(error.to_string().into()))?;
+        let key = StorageBufferKey {
+            descriptor: [target, space.read_u64(size_address).map_err(fail)?],
+            address_space: space.id(),
+            mapping_generation: space.mapping_generation().get(),
+            written,
+        };
+        if self
+            .residency
+            .runtime
+            .buffer_bindings
+            .channel
+            .storage_buffers[stage][slot]
+            .as_ref()
+            .is_some_and(|binding| binding.key == key)
+        {
+            return Ok(());
+        }
+        let binding = self.resolve_storage_binding(space, key)?;
+        self.residency
+            .runtime
+            .buffer_bindings
+            .channel
+            .storage_buffers[stage][slot] = binding;
+        Ok(())
+    }
+
+    fn resolve_storage_binding(
+        &self,
+        space: &MaxwellGpuMemory,
+        key: crate::residency::StorageBufferKey,
     ) -> Result<Option<crate::residency::StorageBuffer>, crate::VulkanError> {
         use crate::VulkanError as V;
         let fail = |error: model::MaxwellGpuAccessError| V::Compilation(error.to_string().into());
-        let target = space.read_u64(descriptor).map_err(fail)?;
-        if target == 0 {
-            return Ok(None);
-        }
+        let [target, size_word] = key.descriptor;
         let address = space
             .address(target)
             .map_err(|e| V::Compilation(e.to_string().into()))?;
         let layout = u64::from(space.memory_layout_size(address).map_err(fail)? as u32);
-        let size_address = space
-            .checked_add(descriptor, 8)
-            .map_err(|error| V::Compilation(error.to_string().into()))?;
-        let size_word = space.read_u64(size_address).map_err(fail)?;
         let packed = size_word as u32;
         let size = if size_word >> 32 == 0 && packed != 0 && u64::from(packed) <= layout {
             u64::from(packed)
@@ -80,20 +119,20 @@ impl crate::native::NativeExecution<'_> {
             Err(model::MaxwellGpuAccessError::UnmappedAddress { .. }) => return Ok(None),
             Err(error) => return Err(fail(error)),
         };
-        let binding_size = if written {
+        let binding_size = if key.written {
             target - aligned + size
         } else {
             let begin = space.device_address(address).map_err(fail)?;
             (begin + size).div_ceil(nixe_memory::PAGE_SIZE) * nixe_memory::PAGE_SIZE - device
         };
         Ok(Some(crate::residency::StorageBuffer {
+            key,
             source: GuestBufferRange {
                 address: device,
                 size: binding_size,
             },
             gpu_address: aligned_gpu,
             native: None,
-            written,
         }))
     }
 }
@@ -176,12 +215,13 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                     slot.offset,
                     16,
                 )?;
-                let source = execution.storage_binding(space, descriptor, slot.written)?;
-                execution
-                    .residency
-                    .runtime
-                    .buffer_bindings
-                    .bind_storage_buffer(STAGE, slot.slot, source);
+                execution.bind_guest_storage_buffer(
+                    space,
+                    descriptor,
+                    slot.written,
+                    STAGE,
+                    slot.slot,
+                )?;
             }
         }
         for slot in &resources.images {

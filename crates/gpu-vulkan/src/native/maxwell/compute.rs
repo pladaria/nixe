@@ -64,12 +64,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
                 slot.offset,
                 16,
             )?;
-            let source = execution.storage_binding(space, descriptor, slot.written)?;
-            execution
-                .residency
-                .runtime
-                .buffer_bindings
-                .bind_storage_buffer(5, slot.slot, source);
+            execution.bind_guest_storage_buffer(space, descriptor, slot.written, 5, slot.slot)?;
         }
         let mut textures =
             smallvec::SmallVec::<[super::textures::ShaderTexture; 64]>::with_capacity(

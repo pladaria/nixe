@@ -376,18 +376,36 @@ impl Residency<'_> {
                 .submission
                 .staging
                 .write_with(&slice, |destination| {
-                    destination.fill(0);
                     self.runtime
                         .memory
                         .read_resources(inputs, |reader| {
                             for ((footprint, plane), &(offset, bytes)) in
                                 geometry.iter().zip(planes).zip(&regions)
                             {
-                                footprint.capture_resource(
-                                    reader,
-                                    plane.offset,
-                                    &mut destination[offset as usize..(offset + bytes) as usize],
-                                )?;
+                                let target =
+                                    &mut destination[offset as usize..(offset + bytes) as usize];
+                                let complete = matches!(
+                                    footprint.domain(),
+                                    nixe_gpu::physical::WriteDomain::Image(image)
+                                        if image.rect.x == 0
+                                            && image.rect.y == 0
+                                            && image.rect.width == image.columns
+                                            && image.rect.height == image.rows
+                                            && image.aspect_bytes == image.native_element_bytes
+                                            && image.native_base == plane.offset
+                                            && image.native_row_pitch
+                                                == u64::from(image.columns)
+                                                    * u64::from(image.native_element_bytes)
+                                            && image.native_row_pitch * u64::from(image.rows)
+                                                == bytes
+                                );
+                                // Packed depth/stencil aspects can leave native
+                                // padding. Ordinary planes overwrite every byte;
+                                // alignment gaps are not part of a Vulkan copy.
+                                if !complete {
+                                    target.fill(0);
+                                }
+                                footprint.capture_resource(reader, plane.offset, target)?;
                             }
                             Ok(())
                         })

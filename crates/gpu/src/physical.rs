@@ -366,11 +366,17 @@ impl WriteDomain {
 }
 impl ImageFootprint {
     fn has_complete_gob(self) -> bool {
+        self.aspect_bytes == self.packed_bytes
+            && self.native_element_bytes == self.packed_bytes
+            && self.has_complete_storage_gob()
+    }
+
+    fn has_complete_storage_gob(self) -> bool {
         let left = u64::from(self.rect.x) * u64::from(self.packed_bytes);
         let right = left + u64::from(self.rect.width) * u64::from(self.packed_bytes);
         matches!(self.storage, ImageStorage::BlockLinear { .. })
-            && self.aspect_bytes == self.packed_bytes
-            && self.native_element_bytes == self.packed_bytes
+            && self.packed_bytes.is_power_of_two()
+            && self.packed_bytes <= 16
             && left.next_multiple_of(64) + 64 <= right
             && u64::from(self.rect.y).next_multiple_of(8) + 8
                 <= u64::from(self.rect.y) + u64::from(self.rect.height)
@@ -382,14 +388,13 @@ impl ImageFootprint {
         native_start: u64,
         destination: &mut [u8],
     ) -> Result<(), MemoryError> {
-        let ImageStorage::BlockLinear {
-            block_height_log2,
-            block_depth_log2,
-        } = self.storage
-        else {
+        let ImageStorage::BlockLinear { .. } = self.storage else {
             unreachable!("complete GOBs require block-linear storage");
         };
-        let stride = 512u64 << (block_height_log2 + block_depth_log2);
+        let packed = u64::from(self.packed_bytes);
+        let element = u64::from(self.native_element_bytes);
+        let full_element = self.aspect_bytes == self.packed_bytes
+            && self.native_element_bytes == self.packed_bytes;
         let left = u64::from(self.rect.x) * u64::from(self.packed_bytes);
         let right = left + u64::from(self.rect.width) * u64::from(self.packed_bytes);
         let bottom = u64::from(self.rect.y + self.rect.height);
@@ -405,41 +410,57 @@ impl ImageFootprint {
             while x < right {
                 let width = (right - x).min(64 - x % 64);
                 if lines == 8 && width == 64 {
-                    // Eden captures input before deswizzling. Capture exactly
-                    // one fully demanded GOB here, then permute owned bytes;
-                    // physical translation/admission is not repeated per lane.
-                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/textures/decoders.cpp
+                    // Capture packed pixels once, then extract native aspects
+                    // from owned bytes. The caller admits the whole GOB.
                     read(self.base + self.offset(x, y), &mut gob)?;
                     for row in 0..8 {
-                        let native = self.native_base + (y + row) * self.native_row_pitch + x;
-                        let target = capture_destination(destination, native_start, native, 64)?;
+                        let native = self.native_base
+                            + (y + row) * self.native_row_pitch
+                            + x / packed * element;
+                        let target = capture_destination(
+                            destination,
+                            native_start,
+                            native,
+                            64 / packed * element,
+                        )?;
                         let row_offset = (((row & 6) << 5) | ((row & 1) << 4)) as usize;
-                        for (column, target) in target.chunks_exact_mut(16).enumerate() {
-                            let at = row_offset + ((column & 2) << 7) + ((column & 1) << 5);
-                            target.copy_from_slice(&gob[at..at + 16]);
+                        if full_element {
+                            for (column, target) in target.chunks_exact_mut(16).enumerate() {
+                                let at = row_offset + ((column & 2) << 7) + ((column & 1) << 5);
+                                target.copy_from_slice(&gob[at..at + 16]);
+                            }
+                        } else {
+                            for (column, target) in
+                                target.chunks_exact_mut(element as usize).enumerate()
+                            {
+                                let x = column * packed as usize;
+                                let at = row_offset
+                                    + ((x & 32) << 3)
+                                    + ((x & 16) << 1)
+                                    + (x & 15)
+                                    + self.aspect_offset as usize;
+                                let bytes = self.aspect_bytes as usize;
+                                target[..bytes].copy_from_slice(&gob[at..at + bytes]);
+                            }
                         }
                     }
                 } else {
-                    // Partial GOBs contain undemanded pixels or padding. Read
-                    // only the exact active runs, including cropped edge rows.
-                    for line in 0..lines {
-                        let row = self.base + self.offset(0, y + line);
-                        let mut at = x;
-                        while at < x + width {
-                            let bytes = (x + width - at).min(16 - (at & 15));
-                            let logical = row
-                                + (at >> 6) * stride
-                                + ((at & 32) << 3)
-                                + ((at & 16) << 1)
-                                + (at & 15);
-                            let native = self.native_base + (y + line) * self.native_row_pitch + at;
-                            read(
-                                logical,
-                                capture_destination(destination, native_start, native, bytes)?,
-                            )?;
-                            at += bytes;
-                        }
-                    }
+                    // Cropped edges read only their demanded aspect bytes.
+                    let edge = Self {
+                        rect: ByteRect {
+                            x: (x / packed) as u32,
+                            y: y as u32,
+                            width: (width / packed) as u32,
+                            height: lines as u32,
+                        },
+                        ..self
+                    };
+                    WriteDomain::Image(edge).for_each_copy(|logical, bytes, native| {
+                        read(
+                            logical,
+                            capture_destination(destination, native_start, native, bytes)?,
+                        )
+                    })?;
                 }
                 x += width;
             }
@@ -893,19 +914,53 @@ impl Footprint {
                 "resource capture names another machine",
             ));
         }
-        let mut region: Option<(nixe_memory::Extent, nixe_memory::ResourceRead<'_>)> = None;
-        let read = |mut logical: u64, mut destination: &mut [u8]| {
+        // Read packed GOBs only when every mapped byte they can touch is
+        // retained. Physical fragmentation does not change the decoder; holes
+        // retain the ordinary zero-fill behavior.
+        let packed_image = match self.domain {
+            WriteDomain::Image(image) if image.has_complete_storage_gob() => {
+                let left = u64::from(image.rect.x) * u64::from(image.packed_bytes);
+                let right =
+                    u64::from(image.rect.x + image.rect.width) * u64::from(image.packed_bytes);
+                let begin = image.base + image.offset(left, u64::from(image.rect.y));
+                let end = image.base
+                    + image.offset(right - 1, u64::from(image.rect.y + image.rect.height - 1))
+                    + 1;
+                let spans = self.mapping.spans();
+                let first = spans.partition_point(|span| span.logical + span.bytes <= begin);
+                let retained = spans[first..]
+                    .iter()
+                    .take_while(|span| span.logical < end)
+                    .all(|span| {
+                        let start = begin.max(span.logical);
+                        let stop = end.min(span.logical + span.bytes);
+                        reader
+                            .region(nixe_memory::Extent {
+                                start: ArenaOffset::new(span.start.get() + start - span.logical),
+                                bytes: stop - start,
+                            })
+                            .is_ok()
+                    });
+                retained.then_some(image)
+            }
+            _ => None,
+        };
+        let mut region: Option<(std::ops::Range<u64>, nixe_memory::ResourceRead<'_>)> = None;
+        let mut read = |mut logical: u64, mut destination: &mut [u8]| {
             while !destination.is_empty() {
-                let spans = &self.mapping.spans();
-                let index = if spans.len() == 1 {
-                    0
-                } else {
-                    spans.partition_point(|span| span.logical + span.bytes <= logical)
-                };
-                let span = spans
-                    .get(index)
-                    .filter(|span| logical < span.logical + span.bytes);
-                let Some(span) = span else {
+                if let Some((range, read)) = &region
+                    && range.contains(&logical)
+                {
+                    let count = (destination.len() as u64).min(range.end - logical) as usize;
+                    let (target, rest) = destination.split_at_mut(count);
+                    read.copy(logical - range.start, target)?;
+                    destination = rest;
+                    logical += count as u64;
+                    continue;
+                }
+                let spans = self.mapping.spans();
+                let index = spans.partition_point(|span| span.logical + span.bytes <= logical);
+                let Some(span) = spans.get(index) else {
                     destination.fill(0);
                     break;
                 };
@@ -917,27 +972,35 @@ impl Footprint {
                     destination = rest;
                     continue;
                 }
-                let count = (destination.len() as u64).min(span.logical + span.bytes - logical);
-                let start = ArenaOffset::new(span.start.get() + logical - span.logical);
-                if region.as_ref().is_none_or(|(extent, _)| {
-                    start < extent.start || start.get() + count > extent.start.get() + extent.bytes
-                }) {
-                    let regions = reader.regions();
-                    let index = regions.partition_point(|extent| extent.start <= start);
-                    let extent = index.checked_sub(1).map(|index| regions[index]).ok_or(
-                        MemoryError::Invalid("resource capture has no retained input"),
-                    )?;
-                    region = Some((extent, reader.region(extent)?));
+                let start = span.start.get() + logical - span.logical;
+                let regions = reader.regions();
+                let index = regions.partition_point(|extent| extent.start.get() <= start);
+                let extent = index.checked_sub(1).map(|index| regions[index]).ok_or(
+                    MemoryError::Invalid("resource capture has no retained input"),
+                )?;
+                let begin = span.start.get().max(extent.start.get());
+                let end = (span.start.get() + span.bytes).min(extent.start.get() + extent.bytes);
+                if start < begin || start >= end {
+                    return Err(MemoryError::Invalid(
+                        "resource capture has no retained input",
+                    ));
                 }
-                let (extent, read) = region.as_ref().unwrap();
-                let (target, remaining) = destination.split_at_mut(count as usize);
-                read.copy(start.get() - extent.start.get(), target)?;
-                destination = remaining;
-                logical += count;
+                let read = reader.region(nixe_memory::Extent {
+                    start: ArenaOffset::new(begin),
+                    bytes: end - begin,
+                })?;
+                region = Some((
+                    span.logical + begin - span.start.get()..span.logical + end - span.start.get(),
+                    read,
+                ));
             }
             Ok(())
         };
-        self.domain.capture(read, native_start, destination)
+        if let Some(image) = packed_image {
+            image.capture_gobs(&mut read, native_start, destination)
+        } else {
+            self.domain.capture(read, native_start, destination)
+        }
     }
     /// The index supplies the candidate mapping span. This routine proves only
     /// the actual covered intersection, never the resource's bounding interval.

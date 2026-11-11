@@ -284,6 +284,7 @@ impl Residency<'_> {
         resources: &StageResources,
         space: &nixe_gpu_maxwell::MaxwellGpuMemory,
     ) -> Result<(), VulkanError> {
+        self.invalidate_device_mappings()?;
         loop {
             self.runtime.buffer_bindings.channel.has_deleted_buffers = false;
             for uniform in &resources.uniforms {

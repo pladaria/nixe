@@ -62,14 +62,21 @@ pub(crate) struct UniformBuffer {
     pub(crate) source: GuestBufferRange,
     pub(crate) native: Option<BufferRange>,
 }
-/// Current storage slots belong to the cache, just like graphics/compute
-/// uniform slots. Rebinding an NVN pointer clears the native ID before Update.
+/// Descriptor contents and virtual mappings identify a storage selection.
+/// Physical buffer retirement invalidates its native binding independently.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorageBufferKey {
+    pub(crate) descriptor: [u64; 2],
+    pub(crate) address_space: nixe_gpu_maxwell::MaxwellAddressSpaceId,
+    pub(crate) mapping_generation: u64,
+    pub(crate) written: bool,
+}
 #[derive(Clone)]
 pub(crate) struct StorageBuffer {
+    pub(crate) key: StorageBufferKey,
     pub(crate) source: GuestBufferRange,
     pub(crate) gpu_address: nixe_gpu::GpuVirtualAddress,
     pub(crate) native: Option<StorageBufferBinding>,
-    pub(crate) written: bool,
 }
 #[derive(Clone)]
 pub(crate) enum StorageBufferBinding {
@@ -172,29 +179,30 @@ impl BufferBindings {
             Self::invalidate_buffer_channel(channel, id);
         }
     }
-    pub(crate) fn bind_storage_buffer(
-        &mut self,
-        stage: usize,
-        slot: usize,
-        binding: Option<StorageBuffer>,
-    ) {
-        self.channel.storage_buffers[stage][slot] = binding;
-    }
     pub(crate) fn bind_compute_uniform(&mut self, slot: usize, source: GuestBufferRange) {
+        if self.channel.compute_uniform_buffers[slot]
+            .is_some_and(|binding| binding.source == source)
+        {
+            return;
+        }
         self.channel.compute_uniform_buffers[slot] = Some(UniformBuffer {
             source,
             native: None,
         });
     }
-    /// ProcessCBBind updates the hardware bank directly, independently of the
-    /// compiled shader's enabled mask and used size. Repeated binds clear the ID.
-    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L330-L349
+    /// A repeated binding retains its selection. Content changes are tracked
+    /// by BufferCache; physical remaps and retirement invalidate native IDs.
     pub(crate) fn bind_graphics_uniform(
         &mut self,
         group: u8,
         slot: u8,
         source: Option<GuestBufferRange>,
     ) {
+        if self.channel.uniform_buffers[group as usize][slot as usize].map(|binding| binding.source)
+            == source
+        {
+            return;
+        }
         self.channel.uniform_buffers[group as usize][slot as usize] =
             source.map(|source| UniformBuffer {
                 source,
@@ -439,14 +447,18 @@ impl Residency<'_> {
         slot: usize,
         space: &nixe_gpu_maxwell::MaxwellGpuMemory,
     ) -> Result<(), VulkanError> {
+        self.invalidate_device_mappings()?;
         let Some(binding) =
             self.runtime.buffer_bindings.channel.storage_buffers[stage][slot].as_ref()
         else {
             return Ok(());
         };
+        if matches!(binding.native, Some(StorageBufferBinding::Buffer(_))) {
+            return Ok(());
+        }
         let source = binding.source;
         let gpu_address = binding.gpu_address;
-        let written = binding.written;
+        let written = binding.key.written;
         let ordinary = self.device_buffer(
             source.address,
             source.size,

@@ -1296,7 +1296,7 @@ impl AddressSpace {
                     .host_address(ArenaOffset::new(0), 0)
                     .unwrap()
                     .as_ptr() as usize;
-                if !native.read_area_contains(Extent {
+                if !native.prepare_read(Extent {
                     start: ArenaOffset::new((source as usize - base) as u64),
                     bytes: bytes as u64,
                 }) {

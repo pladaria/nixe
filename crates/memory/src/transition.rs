@@ -320,20 +320,30 @@ impl NativeAdmission<'_> {
         }
         self.context.gpu_device.get()
     }
-    pub(crate) fn read_area_contains(&self, extent: crate::Extent) -> bool {
+    pub(crate) fn prepare_read(&self, extent: crate::Extent) -> bool {
         let Some(device) = self.gpu_device() else {
             return false;
         };
-        let area = self.context.read_area.get();
-        let mut contains = true;
+        let mut ready = true;
         device.apply_on_physical(
             extent,
             &self.context.device_address_scratch,
             |address, bytes| {
-                contains &= area.contains(address, bytes);
+                if !ready || self.context.read_area.get().contains(address, bytes) {
+                    return;
+                }
+                let Some(area) = device
+                    .interface()
+                    .and_then(|rasterizer| rasterizer.try_on_cpu_read(address, bytes))
+                else {
+                    ready = false;
+                    return;
+                };
+                debug_assert!(area.preemptive && area.contains(address, bytes));
+                self.context.read_area.set(area);
             },
         );
-        contains
+        ready
     }
     pub(crate) fn collect_write(
         &self,
