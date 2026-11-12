@@ -12,7 +12,7 @@ pub mod lowering;
 pub(crate) mod memory_copy;
 mod spa;
 pub mod threed;
-pub(crate) use threed::MaxwellThreeDFrontendState;
+pub(crate) use threed::MaxwellThreeDEngineState;
 pub mod twod;
 
 pub use spa::MaxwellSpaVersion;
@@ -149,7 +149,6 @@ use std::fmt::{Display, Formatter};
 
 use nixe_gpu::{GpuClassId, GpuMethodId};
 
-use crate::pushbuffer::dispatch::call_puller_method;
 use crate::{
     MaxwellAamVersionRange, MaxwellGpuChannel, MaxwellMethodDispatchError, MaxwellMethodSource,
     MaxwellShaderProgramHeaderVersionRange,
@@ -157,6 +156,7 @@ use crate::{
 
 /// Direct engine selection owned by each PBDMA subchannel, as in DmaPusher.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
 pub(crate) enum Engine {
     ThreeD,
     Compute,
@@ -447,339 +447,67 @@ impl From<crate::MaxwellSubmissionExecutionError> for MaxwellEngineStreamError {
     }
 }
 
-/// Only execution effects leave ProcessCommands. There is no per-method
-/// future, command representation or secondary admission pass.
-/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp#L114-L204
-fn execute_dma_macro<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+/// Consume expanded methods on the preparation owner. Macro ISA and shadow
+/// replay have already run on the command owner; this bank owns all effects.
+pub(crate) fn select_engine(
     channel: &mut MaxwellGpuChannel,
-    commands: &mut crate::pushbuffer::dma::CommandState,
-    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+    source: MaxwellMethodSource,
+    engine: Engine,
+    bind: bool,
 ) -> Result<(), MaxwellEngineStreamError> {
-    let source = commands.mme_method.take().expect("admitted macro");
-    let (profile, state) = channel.three_d_with_profile_mut();
-    threed::consume_sink(state);
-    threed::execute_mme_call(profile, source, &commands.mme_parameters, state, execution)?;
-    commands.mme_parameters.clear();
-    Ok(())
-}
-
-/// Synchronous ProcessCommands consumes the hardware cursor and literal words.
-/// Effects and macro sends execute directly before the next hardware word.
-/// The reader owns the RAM arena or gathered storage through every effect.
-/// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/dma_pusher.cpp#L114-L204
-pub(crate) fn process_maxwell_commands<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
-    channel: &mut MaxwellGpuChannel,
-    reader: &crate::pushbuffer::dma::CommandReader,
-    commands: &mut crate::pushbuffer::dma::CommandState,
-    index: &mut usize,
-    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Result<(), MaxwellEngineStreamError> {
-    let mut engine = channel
-        .frontend()
-        .subchannel_engine(commands.dma.subchannel);
-    while *index < reader.len() {
-        if commands.dma.method_count == 0 {
-            let header_index = *index;
-            let word = reader.word(header_index);
-            let immediate = match word >> 29 {
-                1 => {
-                    commands.dma.set_state(word);
-                    commands.dma.non_incrementing = false;
-                    commands.dma.increment_once = false;
-                    None
-                }
-                3 => {
-                    commands.dma.set_state(word);
-                    commands.dma.non_incrementing = true;
-                    commands.dma.increment_once = false;
-                    None
-                }
-                4 => {
-                    commands.dma.set_method(word);
-                    commands.dma.non_incrementing = true;
-                    commands.dma.increment_once = false;
-                    Some((word >> 16) & 0x1fff)
-                }
-                5 => {
-                    commands.dma.set_state(word);
-                    commands.dma.non_incrementing = false;
-                    commands.dma.increment_once = true;
-                    None
-                }
-                _ => {
-                    // DmaPusher's default consumes this header word only,
-                    // preserving the DMA registers and the remaining entry.
-                    *index += 1;
-                    continue;
-                }
-            };
-            let method = commands.dma.method;
-            let subchannel = commands.dma.subchannel;
-            engine = channel.frontend().subchannel_engine(subchannel);
-            if let Some(argument) = immediate {
-                if commands.mme_method.is_none()
-                    && method.0 >= 0x100
-                    && engine == Some(Engine::ThreeD)
-                    && channel.three_d_mut().pending_notification.is_none()
-                    && threed::queue_method(method, argument, channel.three_d_mut())?
-                {
-                    *index += 1;
-                    continue;
-                }
-                call_dma_method(
-                    channel,
-                    commands,
-                    &mut engine,
-                    method,
-                    subchannel,
-                    argument,
-                    true,
-                    || {
-                        MaxwellMethodSource::dma(
-                            reader.location_at(header_index * 4),
-                            subchannel,
-                            method,
-                            argument,
-                        )
-                    },
-                    execution,
-                )?;
-
-                *index += 1;
-            } else {
-                *index += 1;
-            }
-            continue;
-        }
-        let method = commands.dma.method;
-        let subchannel = commands.dma.subchannel;
-        let count = (commands.dma.method_count as usize).min(reader.len() - *index);
-        if commands.dma.non_incrementing {
-            let arguments = reader.arguments(*index, count);
-            let last = count as u32 == commands.dma.method_count;
-            if engine == Some(Engine::ThreeD) {
-                threed::consume_sink(channel.three_d_mut());
-            }
-            if engine == Some(Engine::ThreeD) && threed::is_mme_aperture(method) {
-                admit_dma_macro(commands, method, || arguments.source(0, method, subchannel))?;
-                arguments
-                    .append_arguments(&mut commands.mme_parameters)
-                    .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-                commands.dma.method_count -= count as u32;
-                *index += count;
-                if last {
-                    execute_dma_macro(channel, commands, execution)?;
-                }
-            } else {
-                let handled = if commands.mme_method.is_none()
-                    && method.0 >= 0x100
-                    && let Some(engine) = engine
-                    && let Some(port) = bulk::port(method)
-                {
-                    bulk::call_multi_method(
-                        channel,
-                        engine.class(),
-                        subchannel,
-                        method,
-                        arguments,
-                        port,
-                        execution,
-                    )?
-                } else {
-                    false
-                };
-                if handled {
-                    commands.dma.method_count -= count as u32;
-                    *index += count;
-                } else {
-                    for offset in 0..count {
-                        let argument = arguments.argument_at(offset);
-                        call_dma_method(
-                            channel,
-                            commands,
-                            &mut engine,
-                            method,
-                            subchannel,
-                            argument,
-                            last && offset + 1 == count,
-                            || arguments.source(offset, method, subchannel),
-                            execution,
-                        )?;
-
-                        commands.dma.method_count -= 1;
-                        *index += 1;
-                    }
-                }
-            }
-        } else {
-            if commands.mme_method.is_none()
-                && engine == Some(Engine::ThreeD)
-                && method.0 >= 0x100
-                && channel.three_d_mut().pending_notification.is_none()
-            {
-                let available = if commands.dma.increment_once {
-                    1
-                } else {
-                    count
-                };
-                let consumed = threed::queue_methods(
-                    method,
-                    reader.arguments(*index, available),
-                    channel.three_d_mut(),
-                )?;
-                if consumed != 0 {
-                    commands.dma.method.0 += consumed as u32 * 4;
-                    commands.dma.non_incrementing |= commands.dma.increment_once;
-                    commands.dma.method_count -= consumed as u32;
-                    *index += consumed;
-                    continue;
-                }
-            }
-            let offset = *index;
-            let argument = reader.word(offset);
-            let last = commands.dma.method_count == 1;
-            call_dma_method(
-                channel,
-                commands,
-                &mut engine,
-                method,
-                subchannel,
-                argument,
-                last,
-                || {
-                    MaxwellMethodSource::dma(
-                        reader.location_at(offset * 4),
-                        subchannel,
-                        method,
-                        argument,
-                    )
-                },
-                execution,
-            )?;
-
-            commands.dma.method.0 += 4;
-            commands.dma.non_incrementing |= commands.dma.increment_once;
-            commands.dma.method_count -= 1;
-            *index += 1;
-        }
-    }
-    Ok(())
-}
-
-fn admit_dma_macro(
-    commands: &mut crate::pushbuffer::dma::CommandState,
-    method: GpuMethodId,
-    origin: impl Fn() -> MaxwellMethodSource,
-) -> Result<(), MaxwellEngineDispatchError> {
-    let expected = commands
-        .mme_method
-        .as_ref()
-        .map_or(method.0, |source| source.method().0);
-    let starts = commands.mme_method.is_none() && (method.0 - 0x3800) & 7 == 0;
-    let continues =
-        commands.mme_method.is_some() && (method.0 == expected || method.0 == expected + 4);
-    if !starts && !continues {
-        return Err(MaxwellEngineDispatchError::MmeExecution {
-            source: origin(),
-            error: MaxwellThreeDMmeExecutionError::DataWithoutCall,
-        });
-    }
-    if starts {
-        commands.mme_method = Some(origin());
-        commands.mme_parameters.clear();
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn call_dma_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
-    channel: &mut MaxwellGpuChannel,
-    commands: &mut crate::pushbuffer::dma::CommandState,
-    engine: &mut Option<Engine>,
-    method: GpuMethodId,
-    subchannel: crate::MaxwellPushbufferSubchannel,
-    argument: u32,
-    last: bool,
-    origin: impl Fn() -> MaxwellMethodSource,
-    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Result<(), MaxwellEngineStreamError> {
-    if method.0 < 0x100 {
-        let source = origin();
-        if commands.mme_method.is_some() {
-            return Err(threed_interrupted_macro(source).into());
-        }
-        if let Some((_, armed)) = channel.three_d_mut().pending_notification
-            && (subchannel != armed.subchannel() || method.0 == 0)
-        {
-            return Err(pending_notification_switch(source).into());
-        }
-        let profile = channel.profile();
-        if let Some(operation) = call_puller_method(&profile, source, channel.frontend_mut())
-            .map_err(|error| MaxwellEngineStreamError::dispatch(error.into()))?
-        {
-            execution.host_synchronization(source, operation)?;
-        }
-        if method.0 == 0 {
-            *engine = channel.frontend().subchannel_engine(subchannel);
-        }
-        return Ok(());
-    }
-    let engine = engine.ok_or_else(|| {
-        MaxwellEngineStreamError::dispatch(
-            MaxwellMethodDispatchError::UnboundSubchannel { source: origin() }.into(),
-        )
-    })?;
-    if engine == Engine::ThreeD && threed::is_mme_aperture(method) {
-        admit_dma_macro(commands, method, &origin)?;
-        commands
-            .mme_parameters
-            .try_reserve(1)
-            .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-        commands.mme_parameters.push(argument);
-        if last {
-            execute_dma_macro(channel, commands, execution)?;
-        }
-        return Ok(());
-    }
-    if commands.mme_method.is_some() {
-        return Err(threed_interrupted_macro(origin()).into());
-    }
     if let Some((_, armed)) = channel.three_d_mut().pending_notification
-        && (subchannel != armed.subchannel() || engine != Engine::ThreeD)
+        && (bind || source.subchannel() != armed.subchannel() || engine != Engine::ThreeD)
     {
-        return Err(pending_notification_switch(origin()).into());
-    }
-    if engine == Engine::ThreeD {
-        threed::consume_sink(channel.three_d_mut());
-        let (profile, state) = channel.three_d_with_profile_mut();
-        threed::call_method(profile, method, argument, state, execution, origin)?;
-    } else {
-        let source = origin();
-        match engine {
-            Engine::Compute => {
-                compute::call_method(source, channel.compute_mut(), execution)?;
-            }
-            Engine::Copy => {
-                dma_copy::call_method(source, channel.dma_copy_mut(), execution)?;
-            }
-            Engine::InlineToMemory => {
-                inline_to_memory::call_method(source, channel.inline_to_memory_mut(), execution)?;
-            }
-            Engine::TwoD => {
-                twod::call_method(source, channel.two_d_mut(), execution)?;
-            }
-            Engine::ThreeD => unreachable!(),
-        }
+        return Err(pending_notification_switch(source).into());
     }
     Ok(())
 }
-
-fn threed_interrupted_macro(source: MaxwellMethodSource) -> MaxwellEngineDispatchError {
-    MaxwellEngineDispatchError::InvalidMethodEncoding {
-        source,
-        method_name: "MME",
-        reason: "macro arguments interrupted before the final parameter",
+pub(crate) fn execute_host<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    channel: &mut MaxwellGpuChannel,
+    source: MaxwellMethodSource,
+    effect: crate::MaxwellHostSynchronizationKind,
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<(), MaxwellEngineStreamError> {
+    if let Some((_, armed)) = channel.three_d_mut().pending_notification
+        && source.subchannel() != armed.subchannel()
+    {
+        return Err(pending_notification_switch(source).into());
     }
+    execution.host_synchronization(source, effect)?;
+    Ok(())
+}
+pub(crate) fn execute_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    channel: &mut MaxwellGpuChannel,
+    engine: Engine,
+    source: MaxwellMethodSource,
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<(), MaxwellEngineStreamError> {
+    let method = source.method();
+    match engine {
+        Engine::ThreeD => {
+            let (profile, state) = channel.three_d_with_profile_mut();
+            threed::call_method(profile, method, source.argument(), state, execution, || {
+                source
+            })?;
+        }
+        Engine::Compute => compute::call_method(source, channel.compute_mut(), execution)?,
+        Engine::Copy => {
+            dma_copy::call_method(source, channel.dma_copy_mut(), execution)?;
+        }
+        Engine::InlineToMemory => {
+            inline_to_memory::call_method(source, channel.inline_to_memory_mut(), execution)?;
+        }
+        Engine::TwoD => twod::call_method(source, channel.two_d_mut(), execution)?,
+    }
+    Ok(())
+}
+pub(crate) use bulk::execute_multi;
+pub(crate) fn flush_macro<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
+    channel: &mut MaxwellGpuChannel,
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<(), MaxwellEngineStreamError> {
+    threed::draw::flush(channel.three_d_mut(), execution, false)
+        .map_err(MaxwellEngineStreamError::execution)
 }
 fn pending_notification_switch(source: MaxwellMethodSource) -> MaxwellEngineDispatchError {
     MaxwellEngineDispatchError::InvalidMethodEncoding {

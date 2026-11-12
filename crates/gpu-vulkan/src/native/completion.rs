@@ -17,6 +17,7 @@ struct Queue {
     pending: VecDeque<Fence>,
     active: bool,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    submit: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 #[derive(Default)]
 struct Shared {
@@ -96,7 +97,7 @@ impl FenceManager {
         let progress = Arc::clone(&device.submission.progress);
         let pending = Arc::clone(&progress);
         let owner = Arc::clone(&device.owner);
-        let timeline = device.submission.timeline;
+        let timeline = Arc::clone(&device.submission.timeline);
         let worker = thread::Builder::new()
             .name("nixe-gpu-fence".into())
             .spawn(move || {
@@ -131,21 +132,28 @@ impl FenceManager {
                                 }
                                 // MasterSemaphore::Wait refreshes the physical
                                 // counter before falling back to a native wait.
-                                let counter =
-                                    unsafe { owner.device.get_semaphore_counter_value(timeline) }
-                                        .map_err(|result| {
-                                        pending.fail(
-                                            work.tick(),
-                                            NativeFailure::Vulkan {
-                                                operation: "GPU fence counter",
-                                                result,
-                                            },
-                                        );
-                                        failure(VulkanError::vk("GPU fence counter", result))
-                                    })?;
+                                let counter = unsafe {
+                                    owner.device.get_semaphore_counter_value(timeline.handle)
+                                }
+                                .map_err(|result| {
+                                    pending.fail(
+                                        work.tick(),
+                                        NativeFailure::Vulkan {
+                                            operation: "GPU fence counter",
+                                            result,
+                                        },
+                                    );
+                                    failure(VulkanError::vk("GPU fence counter", result))
+                                })?;
                                 pending.observe_completed(counter);
                                 if counter >= work.tick() {
                                     break;
+                                }
+                                if work.tick() > pending.submitted() {
+                                    let submit = queue.queue.lock().unwrap().submit.clone();
+                                    if let Some(submit) = submit {
+                                        submit();
+                                    }
                                 }
                                 if !pending
                                     .wait_submitted(
@@ -156,7 +164,7 @@ impl FenceManager {
                                 {
                                     continue;
                                 }
-                                let semaphores = [timeline];
+                                let semaphores = [timeline.handle];
                                 let values = [work.tick()];
                                 let info = vk::SemaphoreWaitInfo::default()
                                     .semaphores(&semaphores)
@@ -224,11 +232,16 @@ impl FenceManager {
             uncommitted_operations: Vec::new(),
         })
     }
-    pub fn bind_wakeup(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+    pub fn bind_wakeup(
+        &self,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        submit: Arc<dyn Fn() + Send + Sync>,
+    ) {
         self.progress.bind_wakeup(Arc::clone(&wake));
         let ready = {
             let mut state = self.shared.queue.lock().unwrap();
             state.wake = Some(Arc::clone(&wake));
+            state.submit = Some(submit);
             self.shared.failure.get().is_some()
         };
         if ready {

@@ -64,6 +64,7 @@ impl BufferCache {
             ))?
             + offset;
         self.memory_tracker.gpu_write(address, bytes);
+        self.note_command_write(id, address, bytes);
         self.gpu_modified_ranges.insert(address, bytes);
         self.uncommitted_gpu_modified_ranges.insert(address, bytes);
         Ok(())

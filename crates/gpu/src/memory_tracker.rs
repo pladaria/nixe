@@ -184,6 +184,7 @@ impl MemoryTracker {
         self.change(Kind::CachedCpu, true, address, size)
     }
     pub fn gpu_write(&mut self, address: u64, size: u64) {
+        self.device.mark_gpu_written(address, size);
         self.change(Kind::Gpu, true, address, size);
     }
     pub fn clear_gpu(&mut self, address: u64, size: u64) {

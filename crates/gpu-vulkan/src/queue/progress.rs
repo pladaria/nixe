@@ -7,6 +7,55 @@ use std::sync::{
 };
 use std::time::Instant;
 
+/// Shared ownership keeps pending completion queries valid through queue teardown.
+pub(crate) struct Timeline {
+    owner: Arc<crate::device::DeviceOwner>,
+    pub handle: vk::Semaphore,
+}
+impl Timeline {
+    pub fn new(owner: Arc<crate::device::DeviceOwner>) -> Result<Self, VulkanError> {
+        let mut kind = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let info = vk::SemaphoreCreateInfo::default().push_next(&mut kind);
+        let handle = unsafe { owner.device.create_semaphore(&info, None) }
+            .map_err(|e| VulkanError::vk("vkCreateSemaphore(owner timeline)", e))?;
+        Ok(Self { owner, handle })
+    }
+
+    // Refresh pending reads from native completion, independently of back-thread activity.
+    // https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L2418
+    pub fn is_done(&self, progress: &SubmissionProgress, tick: u64) -> Result<bool, VulkanError> {
+        progress.check(tick)?;
+        if progress.completed() >= tick {
+            return Ok(true);
+        }
+        let submitted = progress.submitted();
+        if submitted < tick {
+            return Ok(false);
+        }
+        let completed = unsafe { self.owner.device.get_semaphore_counter_value(self.handle) }
+            .map_err(|result| {
+                progress.fail(
+                    tick,
+                    NativeFailure::Vulkan {
+                        operation: "vkGetSemaphoreCounterValue(command read)",
+                        result,
+                    },
+                );
+                VulkanError::vk("vkGetSemaphoreCounterValue(command read)", result)
+            })?;
+        progress.observe_completed(completed.min(submitted));
+        progress.check(tick)?;
+        Ok(progress.completed() >= tick)
+    }
+}
+impl Drop for Timeline {
+    fn drop(&mut self) {
+        unsafe { self.owner.device.destroy_semaphore(self.handle, None) };
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum NativeFailure {
     Compilation(Arc<nixe_gpu::compilation::CompileError>),

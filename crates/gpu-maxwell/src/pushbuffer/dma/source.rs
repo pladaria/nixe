@@ -1,130 +1,131 @@
-//! Consume contiguous command RAM directly, gathering only split physical spans.
+//! Retained command bytes. Clean RAM is copied on the command owner; native
+//! producers are published by the preparation owner before their bytes are read.
 use super::MaxwellDmaArguments;
 use crate::{
-    MaxwellGpfifoSourceError, MaxwellGpfifoSourceLocation, MaxwellGpuMemory,
-    MaxwellValidatedGpfifoSubmission,
+    MaxwellAddressSpaceId, MaxwellGpfifoEntry, MaxwellGpfifoSourceError,
+    MaxwellGpfifoSourceLocation, MaxwellGpuMemory,
 };
 
-#[derive(Default)]
-pub struct MaxwellCommandSourceScratch {
-    bytes: Vec<u8>,
+/// One fetch prefix, ending before the next SYNC_WAIT entry. The owner publishes
+/// cache producers before copying RAM; parsing never borrows native resources.
+/// https://github.com/NVIDIA/open-gpu-doc/blob/ab27fc22db5de0d02a4cabe08e555663b62db4d4/manuals/volta/gv100/dev_pbdma.ref.txt#L104-L138
+pub struct MaxwellCommandFetch {
+    pub space: MaxwellAddressSpaceId,
+    pub origin: MaxwellGpfifoSourceLocation,
+    pub entries: std::sync::Arc<[MaxwellGpfifoEntry]>,
+    pub range: std::ops::Range<usize>,
+    pub bytes: Vec<u8>,
+    /// Validated prefix retained across the coherent owner handoff.
+    pub(crate) copied: usize,
+    pub(crate) generation: Option<(u64, u64)>,
 }
-impl MaxwellCommandSourceScratch {
-    pub fn recycle(&mut self, completed: Self) {
-        if completed.bytes.capacity() > self.bytes.capacity() {
-            *self = completed;
-        }
+impl MaxwellCommandFetch {
+    pub(crate) fn invalidate_tail(&mut self, offset: usize) {
+        self.copied = self.copied.min(offset);
     }
-}
-
-pub(crate) struct CommandReader {
-    // Raw RAM remains mapped for the machine's lifetime, including suspension
-    // and guest remaps. Native resource inputs retain their own physical pins.
-    _machine: nixe_memory::Machine,
-    next_entry: usize,
-    origin: Option<MaxwellGpfifoSourceLocation>,
-    end: usize,
-    gathered: Option<Vec<u8>>,
-    address: Option<nixe_memory::HostAddress>,
-}
-impl CommandReader {
-    pub(crate) fn new(machine: nixe_memory::Machine) -> Self {
+    pub fn take_storage(&mut self) -> Self {
         Self {
-            _machine: machine,
-            next_entry: 0,
-            origin: None,
-            end: 0,
-            gathered: None,
-            address: None,
+            space: self.space,
+            origin: self.origin,
+            entries: std::sync::Arc::clone(&self.entries),
+            range: self.range.clone(),
+            bytes: std::mem::take(&mut self.bytes),
+            copied: self.copied,
+            generation: self.generation,
         }
     }
-    /// Eden's SafeRead GuestMemory uses GetSpan followed by FlushRegion, or
-    /// ReadBlock into reusable scratch storage when the span is not contiguous.
-    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/guest_memory.h#L123-L163
-    pub(crate) fn load_entry<H: crate::MaxwellCommandHost>(
-        &mut self,
-        submission: &MaxwellValidatedGpfifoSubmission,
-        memory: &MaxwellGpuMemory,
-        scratch: &mut MaxwellCommandSourceScratch,
-        host: &mut H,
-    ) -> Result<bool, MaxwellGpfifoSourceError> {
-        self.finish(scratch);
-        while let Some(entry) = submission.decoded().entries().get(self.next_entry).copied() {
-            let entry_index = self.next_entry;
-            self.next_entry += 1;
-            self.end = entry.byte_count() as usize;
-            if self.end == 0 {
-                continue;
+    pub(crate) fn prepare_storage(&mut self) -> Result<(), MaxwellGpfifoSourceError> {
+        let count = self.entries[self.range.clone()]
+            .iter()
+            .try_fold(0usize, |count, entry| {
+                count.checked_add(entry.byte_count() as usize)
+            })
+            .ok_or(MaxwellGpfifoSourceError::ArithmeticOverflow)?;
+        self.bytes
+            .try_reserve(count.saturating_sub(self.bytes.len()))
+            .map_err(|_| MaxwellGpfifoSourceError::ResourceExhausted)?;
+        self.bytes.resize(count.max(self.bytes.len()), 0);
+        Ok(())
+    }
+    pub fn read(
+        mut self,
+        memory: &mut MaxwellGpuMemory,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
+    ) -> Result<Self, MaxwellGpfifoSourceError> {
+        self.prepare_storage()?;
+        if self.generation
+            != Some((
+                memory.mapping_generation().get(),
+                memory.device_memory().device().generation(),
+            ))
+        {
+            self.copied = 0;
+        }
+        memory
+            .flush_caching(access)
+            .map_err(|error| MaxwellGpfifoSourceError::Access {
+                location: self.origin,
+                error,
+            })?;
+        let mut offset = 0;
+        for (index, entry) in self.entries[self.range.clone()].iter().enumerate() {
+            let end = offset + entry.byte_count() as usize;
+            if self.copied < end {
+                let start = offset.max(self.copied);
+                let address = memory
+                    .address(entry.address().get() + (start - offset) as u64)
+                    .map_err(|error| MaxwellGpfifoSourceError::Access {
+                        location: MaxwellGpfifoSourceLocation {
+                            entry_index: self.origin.entry_index + index as u32,
+                            pushbuffer: entry.address(),
+                            word_offset: (start - offset) as u64 / 4,
+                            ..self.origin
+                        },
+                        error: crate::MaxwellGpuAccessError::Address(error),
+                    })?;
+                memory
+                    .read_command_into(address, &mut self.bytes[start..end], access)
+                    .map_err(|error| MaxwellGpfifoSourceError::Access {
+                        location: MaxwellGpfifoSourceLocation {
+                            entry_index: self.origin.entry_index + index as u32,
+                            pushbuffer: entry.address(),
+                            word_offset: (start - offset) as u64 / 4,
+                            ..self.origin
+                        },
+                        error,
+                    })?;
+                self.copied = end;
             }
-            let location = MaxwellGpfifoSourceLocation {
-                channel: submission.channel(),
-                frontend: submission.frontend(),
-                entry_index: entry_index as u32,
-                pushbuffer: entry.address(),
-                word_offset: 0,
-            };
-            let span = memory
-                .get_span(entry.address(), entry.byte_count())
-                .map_err(|error| MaxwellGpfifoSourceError::Resolution {
-                    channel: submission.channel(),
-                    frontend: submission.frontend(),
-                    entry_index: entry_index as u32,
-                    pushbuffer: entry.address(),
-                    address_space_generation: memory.mapping_generation(),
-                    error,
-                })?;
-            self.address = Some(if let Some(span) = span {
-                memory
-                    .flush_region(entry.address(), entry.byte_count(), host)
-                    .map_err(|error| MaxwellGpfifoSourceError::Access { location, error })?;
-                span
-            } else {
-                scratch
-                    .bytes
-                    .try_reserve(self.end.saturating_sub(scratch.bytes.len()))
-                    .map_err(|_| MaxwellGpfifoSourceError::ResourceExhausted)?;
-                scratch.bytes.resize(self.end, 0);
-                memory
-                    .read_into(entry.address(), &mut scratch.bytes, host)
-                    .map_err(|error| MaxwellGpfifoSourceError::Access { location, error })?;
-                let bytes = std::mem::take(&mut scratch.bytes);
-                let address = nixe_memory::HostAddress::from_pointer(bytes.as_ptr().cast_mut());
-                self.gathered = Some(bytes);
-                address
-            });
-            self.origin = Some(location);
-            return Ok(true);
+            offset = end;
         }
-        Ok(false)
+        Ok(self)
     }
+}
 
+pub(crate) struct CommandReader<'a> {
+    origin: MaxwellGpfifoSourceLocation,
+    bytes: &'a [u8],
+}
+impl<'a> CommandReader<'a> {
+    pub(crate) fn new(origin: MaxwellGpfifoSourceLocation, bytes: &'a [u8]) -> Self {
+        Self { origin, bytes }
+    }
     pub(crate) fn location_at(&self, offset: usize) -> MaxwellGpfifoSourceLocation {
-        let mut origin = self.origin.unwrap();
-        origin.word_offset = offset as u64 / 4;
-        origin
+        MaxwellGpfifoSourceLocation {
+            word_offset: offset as u64 / 4,
+            ..self.origin
+        }
     }
     pub(crate) fn len(&self) -> usize {
-        self.end / 4
+        self.bytes.len() / 4
     }
     pub(crate) fn word(&self, index: usize) -> u32 {
-        debug_assert!(index < self.len());
-        // SAFETY: GetSpan bounds contiguous RAM in the retained machine's arena;
-        // otherwise the reader owns gathered storage. No RAM reference is formed.
-        unsafe { self.address.unwrap().read_u32(index * 4) }
+        u32::from_le_bytes(self.bytes[index * 4..index * 4 + 4].try_into().unwrap())
     }
     pub(crate) fn arguments(&self, first: usize, count: usize) -> MaxwellDmaArguments<'_> {
-        assert!(first <= self.len() && count <= self.len() - first);
-        MaxwellDmaArguments::new(self, self.address.unwrap(), first * 4, count)
-    }
-    pub(super) fn gathered_bytes(&self, begin: usize, end: usize) -> Option<&[u8]> {
-        self.gathered.as_ref().map(|bytes| &bytes[begin..end])
-    }
-    pub(crate) fn finish(&mut self, scratch: &mut MaxwellCommandSourceScratch) {
-        if let Some(bytes) = self.gathered.take() {
-            scratch.bytes = bytes;
-        }
-        self.origin = None;
-        self.end = 0;
-        self.address = None;
+        MaxwellDmaArguments::owned(
+            self.location_at(first * 4),
+            &self.bytes[first * 4..(first + count) * 4],
+        )
     }
 }

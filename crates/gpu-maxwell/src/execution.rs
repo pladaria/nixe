@@ -184,13 +184,13 @@ pub trait MaxwellCommandHost: nixe_gpu::OwnerMemory + Sized {
     /// DispatchCalls checks shutdown once per GPFIFO entry. This does not poll
     /// the owner inbox or advance CPU coherence requests.
     fn is_stopped(&self) -> bool;
-    /// PrepareDraw services CPU requests after consuming the complete draw.
-    /// The GPU owner also services them at its existing inbox boundary.
-    fn tick_work(&mut self) -> Result<(), MaxwellSubmissionExecutionError>;
+    /// Service requested host/submission progress between complete ordered
+    /// methods. This never consumes controls ahead of the current payload.
+    fn service_progress(&mut self) -> Result<(), MaxwellSubmissionExecutionError>;
     fn timestamp(&self) -> u64;
 }
-/// The current channel executes directly against its graphics and memory owner.
-/// Methods consume effects directly without a continuation or command conversion queue.
+/// The preparation owner executes expanded methods against its graphics and
+/// memory state. No register or resource snapshots cross the ordered boundary.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
 pub(crate) struct ChannelExecution<'a, L: MaxwellFrontend, H: MaxwellCommandHost> {
     pub(crate) address_space: &'a std::cell::RefCell<MaxwellGpuMemory>,
@@ -198,11 +198,13 @@ pub(crate) struct ChannelExecution<'a, L: MaxwellFrontend, H: MaxwellCommandHost
     completion: Option<&'a ReservedTimelinePoint>,
     cache: &'a std::cell::RefCell<L>,
     pub(crate) host: &'a mut H,
+    progress: &'a mut ExecutionProgress,
+}
+#[derive(Default)]
+pub(crate) struct ExecutionProgress {
     prior_work_pending: bool,
     completion_signal_count: u32,
-    driver_completion_increments: u32,
-    #[cfg(feature = "performance-counters")]
-    pub(crate) consumed: std::time::Duration,
+    pub(crate) driver_completion_increments: u32,
 }
 impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'a, L, H> {
     pub(crate) fn new(
@@ -211,6 +213,7 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'a, L, H> {
         completion: Option<&'a ReservedTimelinePoint>,
         cache: &'a std::cell::RefCell<L>,
         host: &'a mut H,
+        progress: &'a mut ExecutionProgress,
     ) -> Self {
         Self {
             address_space,
@@ -218,26 +221,13 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'a, L, H> {
             completion,
             cache,
             host,
-            prior_work_pending: false,
-            completion_signal_count: 0,
-            driver_completion_increments: 0,
-            #[cfg(feature = "performance-counters")]
-            consumed: std::time::Duration::ZERO,
+            progress,
         }
     }
     // RasterizerVulkan::PrepareDraw's TickWork boundary, after resources and
     // native recording have been consumed and their cache borrows released.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L235-L259
-    pub(crate) fn tick_work(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {
-        #[cfg(feature = "performance-counters")]
-        let started = std::time::Instant::now();
-        let result = self.host.tick_work();
-        #[cfg(feature = "performance-counters")]
-        {
-            self.consumed += started.elapsed();
-        }
-        result
-    }
+
     fn push_inline_words(
         &mut self,
         base: u64,
@@ -404,20 +394,17 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'a, L, H> {
                 reserved: reserved.syncpoint(),
             });
         }
-        self.completion_signal_count = self.completion_signal_count.saturating_add(1);
-        let expected = completion.increments() - self.driver_completion_increments;
-        if self.completion_signal_count > expected {
+        self.progress.completion_signal_count =
+            self.progress.completion_signal_count.saturating_add(1);
+        let expected = completion.increments() - self.progress.driver_completion_increments;
+        if self.progress.completion_signal_count > expected {
             return Err(MaxwellSubmissionExecutionError::DuplicateCompletionSignal {
                 reserved,
                 expected,
-                observed: self.completion_signal_count,
+                observed: self.progress.completion_signal_count,
             });
         }
         self.host.signal_syncpoint()
-    }
-
-    pub(crate) fn set_driver_completion_increments(&mut self, increments: u32) {
-        self.driver_completion_increments = increments;
     }
 
     pub(crate) fn finish(
@@ -427,20 +414,20 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'a, L, H> {
         if let Some(completion) = self.completion {
             let expected = completion
                 .increments()
-                .checked_sub(self.driver_completion_increments)
+                .checked_sub(self.progress.driver_completion_increments)
                 .expect("driver increments are included in the timeline reservation");
-            if self.completion_signal_count > expected {
+            if self.progress.completion_signal_count > expected {
                 return Err(MaxwellSubmissionExecutionError::DuplicateCompletionSignal {
                     reserved: completion.point(),
                     expected,
-                    observed: self.completion_signal_count,
+                    observed: self.progress.completion_signal_count,
                 });
             }
-            if self.completion_signal_count < expected {
+            if self.progress.completion_signal_count < expected {
                 return Err(MaxwellSubmissionExecutionError::MissingCompletionSignal {
                     reserved: completion.point(),
                     expected,
-                    observed: self.completion_signal_count,
+                    observed: self.progress.completion_signal_count,
                 });
             }
         }
@@ -449,7 +436,7 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'a, L, H> {
         if driver_wait_for_idle {
             self.host.order_device(self.frontend)?;
         }
-        for _ in 0..self.driver_completion_increments {
+        for _ in 0..self.progress.driver_completion_increments {
             self.host.signal_syncpoint()?;
         }
         Ok(())

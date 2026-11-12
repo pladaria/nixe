@@ -16,10 +16,10 @@ use super::output::{
 use super::{
     MAXWELL_COLOR_TARGET_COUNT, MAXWELL_PIPELINE_SHADER_COUNT, MaxwellThreeDColorReductionState,
     MaxwellThreeDCoverageState, MaxwellThreeDFixedFunctionState, MaxwellThreeDInlineToMemoryState,
-    MaxwellThreeDInlineToMemoryStateWrite, MaxwellThreeDLineState, MaxwellThreeDMmeState,
-    MaxwellThreeDRenderEnableState, MaxwellThreeDRenderTargetState,
-    MaxwellThreeDReportSemaphoreState, MaxwellThreeDShaderBindingState,
-    MaxwellThreeDShaderExecutionState, MaxwellThreeDVertexInputState,
+    MaxwellThreeDInlineToMemoryStateWrite, MaxwellThreeDLineState, MaxwellThreeDRenderEnableState,
+    MaxwellThreeDRenderTargetState, MaxwellThreeDReportSemaphoreState,
+    MaxwellThreeDShaderBindingState, MaxwellThreeDShaderExecutionState,
+    MaxwellThreeDVertexInputState,
     render_targets::{
         MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD, MAXWELL_THREE_D_COLOR_COMPRESSION_RESET,
         MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE, MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD,
@@ -267,7 +267,7 @@ pub(super) struct MaxwellThreeDRawRegisterFile {
     // The physical aperture is fixed, as in Eden's Maxwell3D::Regs. Keep its
     // size in the type so constant register reads need no dynamic length check.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.h
-    values: Box<[u32; CLASS_REGISTER_WORDS]>,
+    pub(super) values: Box<[u32; CLASS_REGISTER_WORDS]>,
 }
 
 impl Default for MaxwellThreeDRawRegisterFile {
@@ -863,15 +863,13 @@ pub enum GeneratedPrimitive {
 
 /// Complete currently modeled live state of one channel's `MAXWELL_B` engine.
 #[derive(Clone, Debug, Default)]
-pub struct MaxwellThreeDFrontendState {
-    pub(super) method_sink: Vec<(GpuMethodId, u32)>,
+pub struct MaxwellThreeDEngineState {
     pub(super) draw: super::draw::MaxwellThreeDDrawState,
-    pub(in crate::engines) pending_notification: Option<(u64, MaxwellMethodSource)>,
+    pub(crate) pending_notification: Option<(u64, MaxwellMethodSource)>,
     operation: MaxwellThreeDState,
-    mme: MaxwellThreeDMmeState,
 }
 
-impl MaxwellThreeDFrontendState {
+impl MaxwellThreeDEngineState {
     pub(super) fn has_inline_indices(&self) -> bool {
         !self.draw.inline_indices.is_empty()
     }
@@ -970,29 +968,12 @@ impl MaxwellThreeDFrontendState {
         }
     }
     #[must_use]
-    pub fn new(mme_jit: bool) -> Self {
-        Self {
-            mme: MaxwellThreeDMmeState::new(mme_jit),
-            ..Self::default()
-        }
-    }
-
-    #[must_use]
     pub fn operation_state(&self) -> &MaxwellThreeDState {
         &self.operation
     }
 
-    #[must_use]
-    pub const fn mme(&self) -> &MaxwellThreeDMmeState {
-        &self.mme
-    }
-
-    pub(super) const fn mme_mut(&mut self) -> &mut MaxwellThreeDMmeState {
-        &mut self.mme
-    }
-
     #[inline(always)]
-    pub(super) fn write_register(&mut self, method: GpuMethodId, argument: u32) {
+    pub(crate) fn write_register(&mut self, method: GpuMethodId, argument: u32) {
         // Only changed state invalidates the current draw. Shadow tracking and
         // execution effects remain in admission, including repeated methods.
         // https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/engines/maxwell_3d.h#L3312-L3336
@@ -1011,11 +992,6 @@ impl MaxwellThreeDFrontendState {
     #[must_use]
     pub(in crate::engines) fn raw_register_value(&self, method: GpuMethodId) -> Option<u32> {
         self.operation.registers.raw(method)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub(super) fn register_words_ptr(&mut self) -> *mut u32 {
-        self.operation.registers.values.as_mut_ptr()
     }
 
     pub(super) fn record_raw_register(&mut self, source: MaxwellMethodSource) {
@@ -1149,7 +1125,7 @@ impl MaxwellThreeDState {
     }
 }
 
-impl MaxwellThreeDFrontendState {
+impl MaxwellThreeDEngineState {
     pub(super) fn begin_primitive(&mut self, raw: u32, value: super::MaxwellThreeDBegin) {
         self.operation.primitive_sequence.begin(raw, value);
     }
@@ -1196,11 +1172,11 @@ impl MaxwellThreeDFrontendState {
 
 #[cfg(test)]
 mod tests {
-    use super::MaxwellThreeDFrontendState;
+    use super::MaxwellThreeDEngineState;
 
     #[test]
     fn viewport_depth_reset_is_shared_by_typed_live_state_and_mme_shadow_reads() {
-        let frontend = MaxwellThreeDFrontendState::default();
+        let frontend = MaxwellThreeDEngineState::default();
         for index in 0..16 {
             let viewport = frontend.operation_state().fixed_function().viewport(index);
             for (offset, register, expected) in [

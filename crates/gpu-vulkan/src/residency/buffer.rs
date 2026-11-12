@@ -704,6 +704,11 @@ impl Residency<'_> {
         {
             return Ok(false);
         }
+        // Inline uploads bypass write_memory to preserve GPU-owned neighbours.
+        // The committed host bytes still invalidate any retained command copy.
+        self.buffer_cache
+            .device_memory
+            .write_command_pages(address, bytes);
         self.buffer_cache.clear_download(address, bytes);
         self.buffer_cache
             .gpu_modified_ranges

@@ -5,6 +5,7 @@ mod buffer;
 pub use buffer::BufferRange;
 mod buffer_download;
 pub(crate) mod cache_owners;
+mod command_pages;
 mod multi_range;
 mod quad_indices;
 pub(crate) mod query;
@@ -310,6 +311,7 @@ impl VulkanResidency {
             caches: Arc::new(CacheOwners::new(
                 device_memory.clone(),
                 Arc::clone(&device.submission.progress),
+                Arc::clone(&device.submission.timeline),
                 crate::cache::SamplerCache::new(&device),
             )),
             runtime: ResidencyRuntime {

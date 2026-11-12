@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
-        atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
 };
 mod reader;
@@ -151,6 +151,12 @@ pub(crate) struct Inner {
     // ApplyOpOnPAddr must not retain the mapping guard during rasterizer callbacks.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/device_memory_manager.h#L75-L89
     reverse: Box<[AtomicU32]>,
+    // Monotonic physical producer history. False proves no native cache/query
+    // has ever owned these bytes; true still requires consulting actual caches.
+    gpu_written: Box<[AtomicU64]>,
+    command_versions: Box<[OnceLock<Box<CommandVersions>>]>,
+    command_blocks: Box<[AtomicU64]>,
+    has_command_pages: AtomicBool,
     // Pin coverage is serialized independently of table readers. Cache
     // invalidation may inspect the original backing before taking its writer.
     pin_guard: Mutex<()>,
@@ -158,6 +164,14 @@ pub(crate) struct Inner {
     generation: AtomicU64,
     counts: Box<[OnceLock<Box<[AtomicU8; LEAF_PAGES]>>]>,
     counter_guard: CachedRangeMutex,
+}
+#[derive(Debug)]
+struct CommandVersions {
+    mask: AtomicU64,
+    // Low bit: the full physical page is synchronized to RAM. Higher bits:
+    // content generation. Host stores preserve synchronization; GPU producers
+    // and mapping retirement invalidate it atomically with the generation.
+    versions: [AtomicU64; 64],
 }
 #[derive(Clone, Debug)]
 pub struct DeviceMemory(pub(crate) Arc<Inner>);
@@ -269,6 +283,16 @@ impl DeviceMemory {
                 processes: vec![Weak::new()],
             }),
             reverse: (0..physical_pages).map(|_| AtomicU32::new(0)).collect(),
+            gpu_written: (0..physical_pages.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            command_versions: (0..physical_pages.div_ceil(64))
+                .map(|_| OnceLock::new())
+                .collect(),
+            command_blocks: (0..physical_pages.div_ceil(4096))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            has_command_pages: AtomicBool::new(false),
             generation: AtomicU64::new(1),
             counts: (0..1usize << (address_bits - LEAF_SHIFT))
                 .map(|_| OnceLock::new())
@@ -281,9 +305,175 @@ impl DeviceMemory {
     pub fn reader(&self) -> DeviceMemoryReader {
         DeviceMemoryReader::new(self.clone())
     }
-    /// DeviceMemoryManager::GetPointer's compressed physical translation.
-    /// The machine retains the arena; this numeric address is not a RAM lease.
+    /// Record producers by physical page so aliases and address reuse cannot
+    /// turn a written page into a false clean result. History is never cleared.
     #[inline]
+    pub fn mark_gpu_written(&self, address: u64, bytes: u64) {
+        self.visit_physical_pages(address, bytes, |page| {
+            let word = &self.0.gpu_written[page / 64];
+            let mask = 1 << (page % 64);
+            if word.load(Ordering::Relaxed) & mask == 0 {
+                word.fetch_or(mask, Ordering::Release);
+            }
+            if let Some(versions) = self.0.command_versions[page / 64].get() {
+                let version = &versions.versions[page % 64];
+                if version.load(Ordering::Relaxed) != 0 {
+                    let _ = version.fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
+                        Some((state.wrapping_add(2)) & !1)
+                    });
+                }
+            }
+            false
+        });
+    }
+    /// Physical identity and producer versions survive SMMU aliases. Allocate
+    /// counters only for pages actually consumed as command lists.
+    pub fn register_command_pages(&self, address: u64, bytes: u64) -> bool {
+        let mut written = false;
+        self.visit_physical_pages(address, bytes, |page| {
+            if self.0.gpu_written[page / 64].load(Ordering::Acquire) & (1 << (page % 64)) == 0 {
+                return false;
+            }
+            written = true;
+            let versions = self.0.command_versions[page / 64].get_or_init(|| {
+                Box::new(CommandVersions {
+                    mask: AtomicU64::new(0),
+                    versions: std::array::from_fn(|_| AtomicU64::new(0)),
+                })
+            });
+            if versions.versions[page % 64].load(Ordering::Acquire) == 0 {
+                let _ = versions.versions[page % 64].compare_exchange(
+                    0,
+                    2,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+                versions.mask.fetch_or(1 << (page % 64), Ordering::Release);
+                self.0.command_blocks[page / 4096]
+                    .fetch_or(1 << (page / 64 % 64), Ordering::Release);
+                self.0.has_command_pages.store(true, Ordering::Release);
+            }
+            false
+        });
+        written
+    }
+    pub fn command_version(&self, physical_page: u64) -> u64 {
+        self.command_page_state(physical_page).0
+    }
+    pub fn command_page_state(&self, physical_page: u64) -> (u64, bool) {
+        let page = (physical_page / PAGE_SIZE) as usize;
+        let state = self
+            .0
+            .command_versions
+            .get(page / 64)
+            .and_then(OnceLock::get)
+            .map_or(0, |versions| {
+                versions.versions[page % 64].load(Ordering::Acquire)
+            });
+        (state >> 1, state & 1 != 0)
+    }
+    /// Walk only registered physical command pages. The upper bitmap skips
+    /// empty 16 MiB ranges; the leaves select individual pages. Both indexes
+    /// are monotonic, so aliases and mapping retirement cannot clear a writer.
+    pub fn visit_command_pages(&self, address: u64, bytes: u64, mut visit: impl FnMut(u64, u64)) {
+        if bytes == 0 || !self.0.has_command_pages.load(Ordering::Acquire) {
+            return;
+        }
+        let end = address + bytes;
+        let mut at = address & !(PAGE_SIZE - 1);
+        while at < end {
+            let page = self.0.tracked.entry(at).page();
+            if page.physical == 0 {
+                at += PAGE_SIZE;
+                continue;
+            }
+            let physical = (page.physical - 1) as usize;
+            let available = ((end - at).div_ceil(PAGE_SIZE) as usize)
+                .min(page.continuity as usize + 1)
+                .min(4096 - physical % 4096);
+            let blocks = self.0.command_blocks[physical / 4096].load(Ordering::Acquire)
+                >> (physical / 64 % 64);
+            if blocks == 0 {
+                at += available as u64 * PAGE_SIZE;
+                continue;
+            }
+            let next = (physical / 64 + blocks.trailing_zeros() as usize) * 64;
+            if next > physical {
+                at += available.min(next - physical) as u64 * PAGE_SIZE;
+                continue;
+            }
+            let count = available.min(64 - physical % 64);
+            if let Some(versions) = self.0.command_versions[physical / 64].get() {
+                let mask = u64::MAX >> (64 - count);
+                let mut bits = (versions.mask.load(Ordering::Acquire) >> (physical % 64)) & mask;
+                while bits != 0 {
+                    let offset = bits.trailing_zeros() as u64;
+                    visit(
+                        at + offset * PAGE_SIZE,
+                        (physical as u64 + offset) * PAGE_SIZE,
+                    );
+                    bits &= bits - 1;
+                }
+            }
+            at += count as u64 * PAGE_SIZE;
+        }
+    }
+    pub fn invalidate_command_pages(&self, address: u64, bytes: u64) {
+        self.visit_command_pages(address, bytes, |_, physical| {
+            let page = (physical / PAGE_SIZE) as usize;
+            self.0.command_versions[page / 64].get().unwrap().versions[page % 64]
+                .fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
+                    Some((state.wrapping_add(2)) & !1)
+                })
+                .ok();
+        });
+    }
+    /// A RAM store invalidates retained GPU copies without making an already
+    /// synchronized page dirty again. Unknown/dirty pages remain unsynchronized.
+    /// https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/buffer_cache/buffer_cache.h#L3428-L3455
+    pub fn write_command_pages(&self, address: u64, bytes: u64) {
+        self.visit_command_pages(address, bytes, |_, physical| {
+            let page = (physical / PAGE_SIZE) as usize;
+            self.0.command_versions[page / 64].get().unwrap().versions[page % 64]
+                .fetch_add(2, Ordering::Release);
+        });
+    }
+    /// Call only after publishing every byte of the covered physical pages.
+    pub fn sync_command_pages(&self, address: u64, bytes: u64) {
+        self.visit_command_pages(address, bytes, |_, physical| {
+            let page = (physical / PAGE_SIZE) as usize;
+            self.0.command_versions[page / 64].get().unwrap().versions[page % 64]
+                .fetch_or(1, Ordering::Release);
+        });
+    }
+    pub fn may_be_gpu_written(&self, address: u64, bytes: u64) -> bool {
+        self.visit_physical_pages(address, bytes, |page| {
+            self.0.gpu_written[page / 64].load(Ordering::Acquire) & (1 << (page % 64)) != 0
+        })
+    }
+    fn visit_physical_pages(
+        &self,
+        address: u64,
+        bytes: u64,
+        mut visit: impl FnMut(usize) -> bool,
+    ) -> bool {
+        if bytes == 0 {
+            return false;
+        }
+        let Some(end) = address
+            .checked_add(bytes)
+            .filter(|&end| end <= 1 << self.0.address_bits)
+        else {
+            return true;
+        };
+        for at in (address & !(PAGE_SIZE - 1)..end).step_by(PAGE_SIZE as usize) {
+            let page = self.0.tracked.entry(at).page().physical;
+            if page != 0 && visit((page - 1) as usize) {
+                return true;
+            }
+        }
+        false
+    }
     pub fn physical_address(&self, address: u64) -> Option<crate::ArenaOffset> {
         if address >= 1 << self.0.address_bits {
             return None;
@@ -647,7 +837,7 @@ impl DeviceMemory {
             let previous = count.fetch_add(delta as u8, Ordering::Release);
             assert!(
                 (delta > 0 && previous < u8::MAX) || (delta < 0 && previous > 0),
-                "unbalanced SMMU cached-page references at {at:#x}"
+                "unbalanced SMMU cached-page references at {at:#x}: previous={previous}, delta={delta}, range={first:#x}..{end:#x}"
             );
             let changed = if delta > 0 {
                 previous == 0

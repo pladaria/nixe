@@ -82,6 +82,22 @@ impl ReadbackTicket {
             length,
         })
     }
+    /// Borrow a retained reservation only after native completion. The pool
+    /// cannot recycle its atom-isolated storage while the ticket is alive.
+    pub(crate) fn try_completed(&self) -> Result<Option<&[u8]>, VulkanError> {
+        self.progress.check(self.work.tick)?;
+        if self.work.tick > self.progress.completed() {
+            return Ok(None);
+        }
+        if !self.allocation.valid(self.work.tick) {
+            return Err(VulkanError::InvalidResource(
+                "stale or cancelled readback reservation",
+            ));
+        }
+        Ok(Some(unsafe {
+            self.allocation.completed_bytes(&self.slice)?
+        }))
+    }
     pub fn work(&self) -> WorkTicket {
         self.work
     }
@@ -230,8 +246,12 @@ pub(crate) struct QueueState {
     recording_handle: crate::dispatch::RecordingHandle,
     pub(crate) progress: Arc<progress::SubmissionProgress>,
     pub statistics: RecordingStatistics,
+    #[cfg(feature = "performance-counters")]
+    pub dependency_wait_ns: u64,
+    #[cfg(feature = "performance-counters")]
+    pub recording_wait_ns: u64,
     owner: Arc<DeviceOwner>,
-    pub timeline: vk::Semaphore,
+    pub timeline: Arc<progress::Timeline>,
     pub(crate) wait_for_idle_event: vk::Event,
     instance: BackendInstanceId,
     family: u32,
@@ -242,6 +262,9 @@ pub(crate) struct QueueState {
     pub(crate) deferred_clear: Option<crate::residency::execution::DeferredClear>,
     next_slot: usize,
     pub scheduled: u64,
+    submitted_serial: u64,
+    last_flush: Option<Instant>,
+    pub(crate) flush_pending: bool,
     pub completed: u64,
     stopped: bool,
     lost: bool,
@@ -265,13 +288,8 @@ impl QueueState {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
             .map_err(|_| VulkanError::InvalidResource("Vulkan instance identity exhausted"))?;
         let staging = staging::StagingPool::new(Arc::clone(&owner))?;
-        let mut kind = vk::SemaphoreTypeCreateInfo::default()
-            .semaphore_type(vk::SemaphoreType::TIMELINE)
-            .initial_value(0);
         let calibration = timing::Calibration::new(&owner)?;
-        let info = vk::SemaphoreCreateInfo::default().push_next(&mut kind);
-        let timeline = unsafe { owner.device.create_semaphore(&info, None) }
-            .map_err(|e| VulkanError::vk("vkCreateSemaphore(owner timeline)", e))?;
+        let timeline = Arc::new(progress::Timeline::new(Arc::clone(&owner))?);
         let mut state = Self {
             samples: Default::default(),
             frame_metrics: frame_metrics::Recorder::new(),
@@ -280,7 +298,7 @@ impl QueueState {
             progress: Arc::new(progress::SubmissionProgress::default()),
             staging,
             owner,
-            timeline,
+            timeline: Arc::clone(&timeline),
             wait_for_idle_event: vk::Event::null(),
             instance: BackendInstanceId::new(instance),
             family,
@@ -290,7 +308,14 @@ impl QueueState {
             deferred_clear: None,
             next_slot: 0,
             statistics: Default::default(),
+            #[cfg(feature = "performance-counters")]
+            dependency_wait_ns: 0,
+            #[cfg(feature = "performance-counters")]
+            recording_wait_ns: 0,
             scheduled: 0,
+            submitted_serial: 0,
+            last_flush: None,
+            flush_pending: false,
             completed: 0,
             stopped: false,
             lost: false,
@@ -308,7 +333,9 @@ impl QueueState {
         state
             .owner
             .name(state.wait_for_idle_event, "nixe wait for idle")?;
-        state.owner.name(timeline, "nixe submission timeline")?;
+        state
+            .owner
+            .name(timeline.handle, "nixe submission timeline")?;
         state.allocate_context(dispatch)?;
         Ok(state)
     }
@@ -384,8 +411,12 @@ impl QueueState {
         if self.completed >= submitted {
             return Ok(self.completed);
         }
-        let completed = unsafe { self.owner.device.get_semaphore_counter_value(self.timeline) }
-            .map_err(|e| self.error("vkGetSemaphoreCounterValue", e))?;
+        let completed = unsafe {
+            self.owner
+                .device
+                .get_semaphore_counter_value(self.timeline.handle)
+        }
+        .map_err(|e| self.error("vkGetSemaphoreCounterValue", e))?;
         if completed.min(submitted) > self.completed {
             self.retire_timings(completed.min(submitted))?;
             self.progress.observe_completed(completed.min(submitted));
@@ -530,7 +561,7 @@ impl QueueState {
             Arc::clone(&slot.native),
             tick,
             Arc::clone(&self.progress),
-            self.timeline,
+            self.timeline.handle,
         )?;
         let slot = &mut self.slots[index];
         // Frame ownership is attached by begin_frame_work or when this
@@ -561,6 +592,7 @@ impl QueueState {
         slot.bound_compute_layout = vk::PipelineLayout::null();
         slot.bound_graphics_layout = vk::PipelineLayout::null();
         self.recording = Some(index);
+        self.submitted_serial = dispatch.record_serial();
         Ok(())
     }
     pub fn reserve_upload(&mut self, bytes: &[u8]) -> Result<Slice, VulkanError> {
@@ -629,6 +661,25 @@ impl QueueState {
     fn current_tick(&self) -> u64 {
         self.scheduled + 1
     }
+    /// Empty contexts keep their tick for explicit fences. Command-list ends
+    /// submit only actual recorded work, and nearby lists may share that tick.
+    pub(crate) fn finish_command_list(&mut self, dispatch: &crate::dispatch::Dispatch) -> bool {
+        if self.deferred_clear.is_none() && dispatch.record_serial() == self.submitted_serial {
+            return false;
+        }
+        !self.defer_flush()
+    }
+    pub(crate) fn defer_flush(&mut self) -> bool {
+        if self
+            .last_flush
+            .is_some_and(|at| at.elapsed() < Duration::from_micros(500))
+        {
+            self.flush_pending = true;
+            true
+        } else {
+            false
+        }
+    }
     pub unsafe fn flush(
         &mut self,
         queue: vk::Queue,
@@ -666,7 +717,7 @@ impl QueueState {
         }
         let signals = [
             vk::SemaphoreSubmitInfo::default()
-                .semaphore(self.timeline)
+                .semaphore(self.timeline.handle)
                 .value(tick)
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
             extra_signals.first().copied().unwrap_or_default(),
@@ -711,6 +762,8 @@ impl QueueState {
         }
         self.in_flight.push_back(index);
         self.scheduled = tick;
+        self.last_flush = Some(Instant::now());
+        self.flush_pending = false;
         self.recording = None;
         self.allocate_context(dispatch)?;
         Ok(self.ticket(tick))
@@ -741,10 +794,17 @@ impl QueueState {
             return Ok(true);
         }
         self.progress.check(ticket.tick)?;
-        if !self.progress.wait_submitted(ticket.tick, deadline)? {
+        #[cfg(feature = "performance-counters")]
+        let submitted_at = Instant::now();
+        let submitted = self.progress.wait_submitted(ticket.tick, deadline)?;
+        #[cfg(feature = "performance-counters")]
+        {
+            self.recording_wait_ns += submitted_at.elapsed().as_nanos() as u64;
+        }
+        if !submitted {
             return Ok(false);
         }
-        let semaphores = [self.timeline];
+        let semaphores = [self.timeline.handle];
         let values = [ticket.tick];
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
@@ -770,6 +830,7 @@ impl QueueState {
         };
         #[cfg(feature = "performance-counters")]
         {
+            self.dependency_wait_ns += waited_at.elapsed().as_nanos() as u64;
             nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::HostQueueWaits, 1);
             nixe_gpu::metrics::record(
                 nixe_gpu::metrics::Counter::HostQueueWaitNanoseconds,
@@ -823,7 +884,7 @@ impl QueueState {
         self.lost |= self.is_device_lost();
         let submitted = self.progress.submitted();
         if !self.lost && self.completed < submitted {
-            let semaphores = [self.timeline];
+            let semaphores = [self.timeline.handle];
             let values = [submitted];
             let info = vk::SemaphoreWaitInfo::default()
                 .semaphores(&semaphores)
@@ -878,7 +939,6 @@ impl Drop for QueueState {
             self.owner
                 .device
                 .destroy_event(self.wait_for_idle_event, None);
-            self.owner.device.destroy_semaphore(self.timeline, None);
         }
     }
 }

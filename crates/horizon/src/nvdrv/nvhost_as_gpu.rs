@@ -6,7 +6,7 @@ use nixe_gpu_maxwell::{
 };
 
 use super::diagnostics::NvDrvCallError;
-use super::nvmap::{NvMapHandle, NvMapObjects, NvMapOwner};
+use super::nvmap::{NvMapHandle, NvMapObject, NvMapObjects, NvMapOwner};
 use super::{
     NV_BAD_PARAMETER, NV_BAD_VALUE, NV_INSUFFICIENT_MEMORY, NV_INVALID_STATE, NV_NOT_SUPPORTED,
     NV_OVERFLOW, NvDrvDeviceDescriptor, NvDrvErrorContext, NvDrvValidationReason,
@@ -29,189 +29,350 @@ const MAP_KNOWN_FLAGS: u32 = MAP_FIXED | MAP_CACHEABLE | MAP_MODIFY;
 const REMAP_CACHEABLE: u16 = 1 << 2;
 const REMAP_ENTRY_SIZE: usize = 20;
 
-/// Parses the Switch ABI and invokes only typed Maxwell operations.
-///
-/// Exact structures and request values:
-/// https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#/dev/nvhost-as-gpu
-///
-/// The pinned libnx wrappers used by the target homebrew:
-/// https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/ioctl/nvhost-as-gpu.c
-pub(super) fn ioctl_nvhost_as_gpu(
-    address_space: &mut MaxwellGpuAddressSpace,
-    nvmap: &NvMapObjects,
+/// Typed operations own their nvmap inputs until the preparation owner applies
+/// them. The driver retains only the shared read-only address-space handle.
+/// https://switchbrew.org/wiki/NV_services#/dev/nvhost-as-gpu
+pub(super) struct Request {
     descriptor: NvDrvDeviceDescriptor,
-    request: u32,
-    input: &[u8],
-) -> Result<Vec<u8>, NvDrvCallError> {
-    if request & 0xffff == 0x4114 {
-        return remap(address_space, nvmap, descriptor, request, input);
-    }
-    let driver_result = |error| address_space_driver_result(descriptor, request, error);
-    match request {
-        IOCTL_AS_GPU_ALLOC_AS => {
-            require_size(input, 16)?;
-            address_space
-                .initialize(MaxwellAddressSpaceInitialization {
-                    big_page_size: input_u32(input, 0)?,
-                    ..Default::default()
-                })
-                .map_err(driver_result)?;
-            Ok(input.to_vec())
-        }
-        IOCTL_AS_GPU_ALLOC_AS_EX => {
-            require_size(input, 40)?;
-            let flags = input_u32(input, 0)?;
-            // Public Switch callers use either zero or bit zero. No semantics
-            // are documented for any other bit.
-            if flags & !1 != 0 {
-                return Err(NvDrvCallError::GuestResult(NV_BAD_VALUE));
-            }
-            address_space
-                .initialize(MaxwellAddressSpaceInitialization {
-                    big_page_size: input_u32(input, 8)?,
-                    va_range_start: input_u64(input, 16)?,
-                    va_range_end: input_u64(input, 24)?,
-                    va_range_split: input_u64(input, 32)?,
-                })
-                .map_err(driver_result)?;
-            Ok(input.to_vec())
-        }
-        IOCTL_AS_GPU_GET_VA_REGIONS => {
-            require_size(input, 64)?;
-            let regions = address_space.regions().map_err(driver_result)?;
-            let mut output = input.to_vec();
-            write_u32(&mut output, 8, 48)?;
-            write_u32(&mut output, 12, 0)?;
-            for (index, region) in regions.into_iter().enumerate() {
-                let offset = 16 + index * 24;
-                write_u64(&mut output, offset, region.offset().get())?;
-                write_u32(&mut output, offset + 8, region.page_size())?;
-                write_u32(&mut output, offset + 12, 0)?;
-                write_u64(&mut output, offset + 16, region.pages())?;
-            }
-            Ok(output)
-        }
-        IOCTL_AS_GPU_ALLOC_SPACE => {
-            require_size(input, 24)?;
-            let reservation = address_space
-                .reserve(
-                    input_u32(input, 0)?,
-                    input_u32(input, 4)?,
-                    input_u32(input, 8)?,
-                    input_u64(input, 16)?,
+    ioctl: u32,
+    output: Vec<u8>,
+    operation: Operation,
+}
+enum Operation {
+    Initialize(MaxwellAddressSpaceInitialization),
+    Regions,
+    Reserve {
+        pages: u32,
+        page_size: u32,
+        flags: u32,
+        offset: u64,
+    },
+    Free {
+        offset: u64,
+        pages: u32,
+        page_size: u32,
+    },
+    Unmap(u64),
+    Modify {
+        offset: u64,
+        within: u64,
+        bytes: u64,
+        kind: u8,
+        cacheable: bool,
+    },
+    Map {
+        object: NvMapObject,
+        offset: u64,
+        within: u64,
+        bytes: u64,
+        kind: u8,
+        flags: u32,
+    },
+    Remap(Vec<Remap>),
+}
+struct Remap {
+    offset_pages: u32,
+    pages: u32,
+    within_pages: u32,
+    object: Option<NvMapObject>,
+    kind: u8,
+    cacheable: bool,
+}
+impl Request {
+    pub(super) fn decode(
+        nvmap: &NvMapObjects,
+        descriptor: NvDrvDeviceDescriptor,
+        ioctl: u32,
+        input: &[u8],
+    ) -> Result<Self, NvDrvCallError> {
+        let object = |handle| {
+            nvmap
+                .object_snapshot_by_owned_handle(
+                    NvMapOwner::new(descriptor.owner().process_id()),
+                    NvMapHandle::new(handle),
                 )
-                .map_err(driver_result)?;
-            let mut output = input.to_vec();
-            write_u64(&mut output, 16, reservation.offset().get())?;
-            Ok(output)
-        }
-        IOCTL_AS_GPU_FREE_SPACE => {
-            require_size(input, 16)?;
-            let offset = address_space
-                .address(input_u64(input, 0)?)
-                .map_err(|error| driver_result(MaxwellAddressSpaceError::Address(error)))?;
-            address_space
-                .free(offset, input_u32(input, 8)?, input_u32(input, 12)?)
-                .map_err(driver_result)?;
-            Ok(input.to_vec())
-        }
-        IOCTL_AS_GPU_MAP_BUFFER_EX => {
-            require_size(input, 40)?;
-            let flags = input_u32(input, 0)?;
-            if flags & !MAP_KNOWN_FLAGS != 0 {
-                return Err(NvDrvCallError::GuestResult(NV_BAD_VALUE));
+                .map_err(nvmap_driver_result)
+        };
+        let operation = if ioctl & 0xffff == 0x4114 {
+            let encoded_size = ((ioctl >> 16) & 0x3fff) as usize;
+            if ioctl >> 30 != 3
+                || encoded_size != input.len()
+                || input.is_empty()
+                || !input.len().is_multiple_of(REMAP_ENTRY_SIZE)
+            {
+                return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
             }
-            let kind = input_u32(input, 4)?;
-            let buffer_offset = input_u64(input, 16)?;
-            let mapping_size = input_u64(input, 24)?;
-            let offset = address_space
-                .address(input_u64(input, 32)?)
-                .map_err(|error| driver_result(MaxwellAddressSpaceError::Address(error)))?;
-            if flags & MAP_MODIFY != 0 {
-                // libnx deliberately emits Modify without FixedOffset here;
-                // the IOVA field already identifies the existing mapping.
-                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/nvidia/address_space.c#L74-L83
-                address_space
-                    .modify_mapping(
-                        offset,
-                        buffer_offset,
-                        mapping_size,
-                        decode_explicit_kind(kind)?,
-                        flags & MAP_CACHEABLE != 0,
-                    )
-                    .map_err(driver_result)?;
-                return Ok(input.to_vec());
+            let mut entries = Vec::with_capacity(input.len() / REMAP_ENTRY_SIZE);
+            for entry in input.chunks_exact(REMAP_ENTRY_SIZE) {
+                let flags = input_u16(entry, 0)?;
+                if flags & !REMAP_CACHEABLE != 0 {
+                    return Err(NvDrvCallError::GuestResult(NV_BAD_VALUE));
+                }
+                let handle = input_u32(entry, 4)?;
+                entries.push(Remap {
+                    offset_pages: input_u32(entry, 12)?,
+                    pages: input_u32(entry, 16)?,
+                    within_pages: input_u32(entry, 8)?,
+                    object: if handle == 0 {
+                        None
+                    } else {
+                        Some(object(handle)?)
+                    },
+                    kind: if handle == 0 {
+                        0
+                    } else {
+                        decode_explicit_kind(u32::from(input_u16(entry, 2)?))?
+                    },
+                    cacheable: flags & REMAP_CACHEABLE != 0,
+                });
             }
-
-            let handle = NvMapHandle::new(input_u32(input, 8)?);
-            let owner = NvMapOwner::new(descriptor.owner().process_id());
-            let object = nvmap
-                .object_snapshot_by_owned_handle(owner, handle)
-                .map_err(nvmap_driver_result)?;
-            let metadata = object
-                .allocation_metadata()
-                .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
-            let backing = object
-                .pin_device(address_space.memory().device_memory())
-                .map_err(|fault| {
-                    NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::PhysicalMemory {
-                        context: NvDrvErrorContext::new(
-                            descriptor.kind(),
-                            request,
-                            descriptor.fd(),
-                            Some(handle),
-                            NvDrvValidationReason::PhysicalMemoryUnavailable,
-                        ),
-                        fault: std::sync::Arc::new(fault),
+            Operation::Remap(entries)
+        } else {
+            match ioctl {
+                IOCTL_AS_GPU_ALLOC_AS => {
+                    require_size(input, 16)?;
+                    Operation::Initialize(MaxwellAddressSpaceInitialization {
+                        big_page_size: input_u32(input, 0)?,
+                        ..Default::default()
                     })
-                })?;
-            let mapping_size = if mapping_size == 0 {
-                u64::from(object.size())
-            } else {
-                mapping_size
-            };
-            let mapping = address_space
-                .map(MaxwellMapRequest {
-                    allocation: MaxwellAllocationId::new(object.id().raw()),
-                    backing,
-                    backing_offset: buffer_offset,
-                    size: mapping_size,
-                    allocation_alignment: metadata.alignment(),
-                    kind: decode_kind(kind, metadata.kind())?,
-                    cacheable: flags & MAP_CACHEABLE != 0,
-
-                    fixed_offset: (flags & MAP_FIXED != 0).then_some(offset),
+                }
+                IOCTL_AS_GPU_ALLOC_AS_EX => {
+                    require_size(input, 40)?;
+                    if input_u32(input, 0)? & !1 != 0 {
+                        return Err(NvDrvCallError::GuestResult(NV_BAD_VALUE));
+                    }
+                    Operation::Initialize(MaxwellAddressSpaceInitialization {
+                        big_page_size: input_u32(input, 8)?,
+                        va_range_start: input_u64(input, 16)?,
+                        va_range_end: input_u64(input, 24)?,
+                        va_range_split: input_u64(input, 32)?,
+                    })
+                }
+                IOCTL_AS_GPU_GET_VA_REGIONS => {
+                    require_size(input, 64)?;
+                    Operation::Regions
+                }
+                IOCTL_AS_GPU_ALLOC_SPACE => {
+                    require_size(input, 24)?;
+                    Operation::Reserve {
+                        pages: input_u32(input, 0)?,
+                        page_size: input_u32(input, 4)?,
+                        flags: input_u32(input, 8)?,
+                        offset: input_u64(input, 16)?,
+                    }
+                }
+                IOCTL_AS_GPU_FREE_SPACE => {
+                    require_size(input, 16)?;
+                    Operation::Free {
+                        offset: input_u64(input, 0)?,
+                        pages: input_u32(input, 8)?,
+                        page_size: input_u32(input, 12)?,
+                    }
+                }
+                IOCTL_AS_GPU_UNMAP_BUFFER => {
+                    require_size(input, 8)?;
+                    Operation::Unmap(input_u64(input, 0)?)
+                }
+                IOCTL_AS_GPU_MAP_BUFFER_EX => {
+                    require_size(input, 40)?;
+                    let flags = input_u32(input, 0)?;
+                    if flags & !MAP_KNOWN_FLAGS != 0 {
+                        return Err(NvDrvCallError::GuestResult(NV_BAD_VALUE));
+                    }
+                    let kind = input_u32(input, 4)?;
+                    let offset = input_u64(input, 32)?;
+                    let within = input_u64(input, 16)?;
+                    let bytes = input_u64(input, 24)?;
+                    if flags & MAP_MODIFY != 0 {
+                        Operation::Modify {
+                            offset,
+                            within,
+                            bytes,
+                            kind: decode_explicit_kind(kind)?,
+                            cacheable: flags & MAP_CACHEABLE != 0,
+                        }
+                    } else {
+                        let object = object(input_u32(input, 8)?)?;
+                        let metadata = object
+                            .allocation_metadata()
+                            .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
+                        let kind = decode_kind(kind, metadata.kind())?;
+                        Operation::Map {
+                            object,
+                            offset,
+                            within,
+                            bytes,
+                            kind,
+                            flags,
+                        }
+                    }
+                }
+                _ => {
+                    return Err(NvDrvCallError::Unsupported(
+                        UnsupportedNvDrvOperation::Ioctl {
+                            context: NvDrvErrorContext::new(
+                                descriptor.kind(),
+                                ioctl,
+                                descriptor.fd(),
+                                None,
+                                NvDrvValidationReason::UnsupportedOperation,
+                            ),
+                        },
+                    ));
+                }
+            }
+        };
+        Ok(Self {
+            descriptor,
+            ioctl,
+            output: input.to_vec(),
+            operation,
+        })
+    }
+    pub(super) fn execute(
+        mut self,
+        space: &mut MaxwellGpuAddressSpace,
+    ) -> Result<super::NvDrvIoctlResponse, UnsupportedNvDrvOperation> {
+        let driver_result = |e| address_space_driver_result(self.descriptor, self.ioctl, e);
+        let device = space.memory().device_memory().clone();
+        let bits = space.profile().virtual_address().address_bits().bits();
+        let pin = |object: &NvMapObject| {
+            object.pin_device(&device).map_err(|fault| {
+                NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::PhysicalMemory {
+                    context: NvDrvErrorContext::new(
+                        self.descriptor.kind(),
+                        self.ioctl,
+                        self.descriptor.fd(),
+                        None,
+                        NvDrvValidationReason::PhysicalMemoryUnavailable,
+                    ),
+                    fault: std::sync::Arc::new(fault),
                 })
-                .map_err(driver_result)?;
-            let mut output = input.to_vec();
-            write_u64(&mut output, 32, mapping.offset().get())?;
-            Ok(output)
-        }
-        IOCTL_AS_GPU_UNMAP_BUFFER => {
-            require_size(input, 8)?;
-            let offset = address_space
-                .address(input_u64(input, 0)?)
-                .map_err(|error| driver_result(MaxwellAddressSpaceError::Address(error)))?;
-            address_space.unmap(offset).map_err(driver_result)?;
-            Ok(input.to_vec())
-        }
-        _ => Err(NvDrvCallError::Unsupported(
-            UnsupportedNvDrvOperation::Ioctl {
-                context: NvDrvErrorContext::new(
-                    descriptor.kind(),
-                    request,
-                    descriptor.fd(),
-                    None,
-                    NvDrvValidationReason::UnsupportedOperation,
-                ),
-            },
-        )),
+            })
+        };
+        let address = |at| {
+            nixe_gpu::GpuVirtualAddress::try_new(at, bits)
+                .map_err(|e| driver_result(MaxwellAddressSpaceError::Address(e)))
+        };
+        let result = (|| -> Result<(), NvDrvCallError> {
+            match self.operation {
+                Operation::Initialize(init) => space.initialize(init).map_err(driver_result)?,
+                Operation::Regions => {
+                    let regions = space.regions().map_err(driver_result)?;
+                    write_u32(&mut self.output, 8, 48)?;
+                    write_u32(&mut self.output, 12, 0)?;
+                    for (index, region) in regions.into_iter().enumerate() {
+                        let at = 16 + index * 24;
+                        write_u64(&mut self.output, at, region.offset().get())?;
+                        write_u32(&mut self.output, at + 8, region.page_size())?;
+                        write_u32(&mut self.output, at + 12, 0)?;
+                        write_u64(&mut self.output, at + 16, region.pages())?;
+                    }
+                }
+                Operation::Reserve {
+                    pages,
+                    page_size,
+                    flags,
+                    offset,
+                } => {
+                    let value = space
+                        .reserve(pages, page_size, flags, offset)
+                        .map_err(driver_result)?;
+                    write_u64(&mut self.output, 16, value.offset().get())?;
+                }
+                Operation::Free {
+                    offset,
+                    pages,
+                    page_size,
+                } => {
+                    space
+                        .free(address(offset)?, pages, page_size)
+                        .map_err(driver_result)?;
+                }
+                Operation::Unmap(at) => {
+                    space.unmap(address(at)?).map_err(driver_result)?;
+                }
+                Operation::Modify {
+                    offset,
+                    within,
+                    bytes,
+                    kind,
+                    cacheable,
+                } => {
+                    space
+                        .modify_mapping(address(offset)?, within, bytes, kind, cacheable)
+                        .map_err(driver_result)?;
+                }
+                Operation::Map {
+                    object,
+                    offset,
+                    within,
+                    bytes,
+                    kind,
+                    flags,
+                } => {
+                    let metadata = object
+                        .allocation_metadata()
+                        .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
+                    let request = MaxwellMapRequest {
+                        allocation: MaxwellAllocationId::new(object.id().raw()),
+                        backing: pin(&object)?,
+                        backing_offset: within,
+                        size: if bytes == 0 {
+                            u64::from(object.size())
+                        } else {
+                            bytes
+                        },
+                        allocation_alignment: metadata.alignment(),
+                        kind,
+                        cacheable: flags & MAP_CACHEABLE != 0,
+                        fixed_offset: (flags & MAP_FIXED != 0).then_some(address(offset)?),
+                    };
+                    let mapping = space.map(request).map_err(driver_result)?;
+                    write_u64(&mut self.output, 32, mapping.offset().get())?;
+                }
+                Operation::Remap(entries) => {
+                    let page = u64::from(space.regions().map_err(driver_result)?[1].page_size());
+                    let mut mappings = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        let mapping = if let Some(object) = entry.object {
+                            object
+                                .allocation_metadata()
+                                .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
+                            Some(MaxwellSparseMapping {
+                                allocation: MaxwellAllocationId::new(object.id().raw()),
+                                backing: pin(&object)?,
+                                backing_offset: u64::from(entry.within_pages) * page,
+                                kind: entry.kind,
+                                cacheable: entry.cacheable,
+                            })
+                        } else {
+                            None
+                        };
+                        mappings.push(MaxwellSparseRemapRequest {
+                            offset: address(u64::from(entry.offset_pages) * page)?,
+                            size: u64::from(entry.pages) * page,
+                            mapping,
+                        });
+                    }
+                    space.remap_sparse(mappings).map_err(driver_result)?;
+                }
+            }
+            Ok(())
+        })();
+        let driver_result = match result {
+            Ok(()) => super::NV_SUCCESS,
+            Err(NvDrvCallError::GuestResult(code)) => code,
+            Err(NvDrvCallError::Unsupported(error)) => return Err(error),
+        };
+        Ok(super::NvDrvIoctlResponse {
+            output: self.output,
+            additional_output: Vec::new(),
+            driver_result,
+        })
     }
 }
 
-/// Decodes the channel descriptor from the bind ioctl without performing the
-/// semantic association. The session resolves both existing objects before
-/// `MaxwellGpuChannel::bind_address_space` mutates channel state.
 pub(super) fn decode_bind_channel(
     input: &[u8],
 ) -> Result<super::NvDrvFileDescriptor, NvDrvCallError> {
@@ -219,89 +380,83 @@ pub(super) fn decode_bind_channel(
     Ok(super::NvDrvFileDescriptor::new(input_u32(input, 0)?))
 }
 
-fn remap(
-    address_space: &mut MaxwellGpuAddressSpace,
-    nvmap: &NvMapObjects,
-    descriptor: NvDrvDeviceDescriptor,
-    request: u32,
-    input: &[u8],
-) -> Result<Vec<u8>, NvDrvCallError> {
-    let driver_result = |error| address_space_driver_result(descriptor, request, error);
-    // The Switch 1 command has a variable-length array of 20-byte entries.
-    // Its size is encoded directly in the ioctl request:
-    // https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#NVGPU_AS_IOCTL_REMAP
-    let encoded_size = usize::try_from((request >> 16) & 0x3fff)
-        .map_err(|_| NvDrvCallError::GuestResult(NV_BAD_PARAMETER))?;
-    if request >> 30 != 3
-        || encoded_size != input.len()
-        || input.is_empty()
-        || !input.len().is_multiple_of(REMAP_ENTRY_SIZE)
-    {
-        return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
-    }
-    let regions = address_space.regions().map_err(driver_result)?;
-    let big_page_size = u64::from(regions[1].page_size());
-    let owner = NvMapOwner::new(descriptor.owner().process_id());
-    let mut entries = Vec::with_capacity(input.len() / REMAP_ENTRY_SIZE);
-    for entry in input.chunks_exact(REMAP_ENTRY_SIZE) {
-        let flags = input_u16(entry, 0)?;
-        if flags & !REMAP_CACHEABLE != 0 {
-            return Err(NvDrvCallError::GuestResult(NV_BAD_VALUE));
-        }
-        let handle = NvMapHandle::new(input_u32(entry, 4)?);
-        let offset = u64::from(input_u32(entry, 12)?)
-            .checked_mul(big_page_size)
-            .ok_or_else(|| driver_result(MaxwellAddressSpaceError::ArithmeticOverflow))?;
-        let size = u64::from(input_u32(entry, 16)?)
-            .checked_mul(big_page_size)
-            .ok_or_else(|| driver_result(MaxwellAddressSpaceError::ArithmeticOverflow))?;
-        let offset = address_space
-            .address(offset)
-            .map_err(|error| driver_result(MaxwellAddressSpaceError::Address(error)))?;
-        let mapping = if handle.raw() == 0 {
-            None
-        } else {
-            let object = nvmap
-                .object_snapshot_by_owned_handle(owner, handle)
-                .map_err(nvmap_driver_result)?;
-            object
-                .allocation_metadata()
-                .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
-            let backing = object
-                .pin_device(address_space.memory().device_memory())
-                .map_err(|fault| {
-                    NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::PhysicalMemory {
-                        context: NvDrvErrorContext::new(
-                            descriptor.kind(),
-                            request,
-                            descriptor.fd(),
-                            Some(handle),
-                            NvDrvValidationReason::PhysicalMemoryUnavailable,
-                        ),
-                        fault: std::sync::Arc::new(fault),
-                    })
-                })?;
-            let backing_offset = u64::from(input_u32(entry, 8)?)
-                .checked_mul(big_page_size)
-                .ok_or_else(|| driver_result(MaxwellAddressSpaceError::ArithmeticOverflow))?;
-            Some(MaxwellSparseMapping {
-                allocation: MaxwellAllocationId::new(object.id().raw()),
-                backing,
-                backing_offset,
-                kind: decode_explicit_kind(u32::from(input_u16(entry, 2)?))?,
-                cacheable: flags & REMAP_CACHEABLE != 0,
-            })
-        };
-        entries.push(MaxwellSparseRemapRequest {
-            offset,
-            size,
-            mapping,
-        });
-    }
-    address_space.remap_sparse(entries).map_err(driver_result)?;
-    Ok(input.to_vec())
+/// Completion signals even when an ordered operation is cancelled during close.
+/// Service workers await the event without retaining a driver or GPU lock.
+pub(super) struct Reply {
+    result:
+        std::sync::mpsc::SyncSender<Result<super::NvDrvIoctlResponse, UnsupportedNvDrvOperation>>,
+    ready: nixe_runtime::WritableEventObject,
 }
-
+impl Reply {
+    pub(super) fn complete(
+        self,
+        result: Result<super::NvDrvIoctlResponse, UnsupportedNvDrvOperation>,
+    ) {
+        let _ = self.result.send(result);
+    }
+}
+impl Drop for Reply {
+    fn drop(&mut self) {
+        self.ready.signal();
+    }
+}
+pub(crate) struct Pending {
+    wait: nixe_runtime::EventFuture,
+    result: std::sync::mpsc::Receiver<Result<super::NvDrvIoctlResponse, UnsupportedNvDrvOperation>>,
+    descriptor: NvDrvDeviceDescriptor,
+    ioctl: u32,
+    pub(crate) inline_length: usize,
+}
+pub(super) fn completion(
+    kernel: &std::sync::Arc<nixe_scheduler::SchedulerState>,
+    descriptor: NvDrvDeviceDescriptor,
+    ioctl: u32,
+) -> (Reply, Pending) {
+    let (ready, event) = nixe_runtime::EventObject::create_pair(kernel);
+    let (result, receiver) = std::sync::mpsc::sync_channel(1);
+    (
+        Reply { result, ready },
+        Pending {
+            wait: event.wait_async(),
+            result: receiver,
+            descriptor,
+            ioctl,
+            inline_length: 0,
+        },
+    )
+}
+impl std::future::Future for Pending {
+    type Output = Result<super::NvDrvIoctlResponse, UnsupportedNvDrvOperation>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        std::task::ready!(std::pin::Pin::new(&mut this.wait).poll(cx));
+        std::task::Poll::Ready(
+            this.result
+                .try_recv()
+                .unwrap_or_else(|_| {
+                    Err(UnsupportedNvDrvOperation::Ioctl {
+                        context: NvDrvErrorContext::new(
+                            this.descriptor.kind(),
+                            this.ioctl,
+                            this.descriptor.fd(),
+                            None,
+                            NvDrvValidationReason::NeutralBackendExecutionFailed,
+                        ),
+                    })
+                })
+                .map(|mut response| {
+                    if response.driver_result == super::NV_SUCCESS && this.inline_length != 0 {
+                        response.additional_output =
+                            response.output[16..16 + this.inline_length].to_vec();
+                    }
+                    response
+                }),
+        )
+    }
+}
 fn decode_kind(requested: u32, default: u8) -> Result<u8, NvDrvCallError> {
     if requested == u32::MAX {
         Ok(default)
@@ -436,4 +591,13 @@ fn write_u64(output: &mut [u8], offset: usize, value: u64) -> Result<(), u32> {
         .ok_or(NV_BAD_PARAMETER)?
         .copy_from_slice(&value.to_le_bytes());
     Ok(())
+}
+
+impl std::fmt::Debug for Pending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingAddressSpace")
+            .field("descriptor", &self.descriptor)
+            .field("ioctl", &self.ioctl)
+            .finish_non_exhaustive()
+    }
 }

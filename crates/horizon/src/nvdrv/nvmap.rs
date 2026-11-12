@@ -751,19 +751,6 @@ impl NvMapObjects {
         Ok(&record.object)
     }
 
-    #[cfg(test)]
-    pub(super) fn handle_references(&self, handle: NvMapHandle) -> Result<u32, NvMapStateError> {
-        let object_id = self
-            .handles
-            .get(&handle)
-            .map(|record| record.object_id)
-            .ok_or(NvMapStateError::BadParameter)?;
-        self.objects
-            .get(&object_id)
-            .map(|record| record.handle_references)
-            .ok_or(NvMapStateError::InvalidState)
-    }
-
     pub(super) fn clear(&mut self) -> usize {
         let released = self.objects.len();
         self.handles.clear();

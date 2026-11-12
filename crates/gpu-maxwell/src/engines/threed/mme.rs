@@ -793,11 +793,6 @@ impl MaxwellThreeDMmeState {
     }
 
     #[inline]
-    pub(super) fn shadow_word(&self, method: GpuMethodId) -> u32 {
-        self.shadow_registers.word(method)
-    }
-
-    #[inline]
     pub(super) fn resolve_shadow_argument(
         &self,
         method: GpuMethodId,

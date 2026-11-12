@@ -175,7 +175,15 @@ impl Residency<'_> {
                     .write_block_unsafe(destination_address, nixe_memory::WriteSource::Bytes(&copy))
             });
         self.buffer_cache.dma_buffer = copy;
-        result.map_err(Into::into)
+        result?;
+        if !modified.is_empty() {
+            self.buffer_cache.collect_command_copies = true;
+            self.buffer_cache
+                .note_command_write(destination.buffer, destination_address, bytes);
+            self.buffer_cache.collect_command_copies = false;
+            self.copy_command_pages()?;
+        }
+        Ok(())
     }
 }
 
@@ -427,7 +435,11 @@ impl Residency<'_> {
             if let Some(attachment) = converted {
                 self.release_attachment(attachment)?;
             }
-            self.finish_buffer_write(buffer.buffer, buffer.offset, buffer_size)?;
+            self.buffer_cache.collect_command_copies = true;
+            let writes = self.finish_buffer_write(buffer.buffer, buffer.offset, buffer_size);
+            self.buffer_cache.collect_command_copies = false;
+            writes?;
+            self.copy_command_pages()?;
             self.buffer_cache.async_downloads.add(address, buffer_size);
             self.texture_cache.pending_downloads.push(
                 super::texture_download::PendingDownload::Buffer(

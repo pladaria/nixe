@@ -120,6 +120,7 @@ struct RecordingState {
 }
 pub(super) struct Recorder {
     submitted_sequence: u64,
+    pub(super) record_serial: u64,
     pub(super) handle: RecordingHandle,
     chunk: Option<Box<Chunk>>,
     worker: Option<JoinHandle<()>>,
@@ -209,6 +210,7 @@ impl Recorder {
             })?;
         Ok(Self {
             submitted_sequence: 0,
+            record_serial: 0,
             handle: RecordingHandle { inner: state },
             chunk: Some(Box::default()),
             worker: Some(worker),
@@ -305,6 +307,7 @@ impl Recorder {
     ) where
         F: Fn(&mut Context, &[A], &[B], &[C], &[D]) -> Result<(), NativeFailure> + Send + 'static,
     {
+        self.record_serial += 1;
         let lengths = [first.len(), second.len(), third.len(), fourth.len()]
             .map(|n| u32::try_from(n).expect("native argument count exceeds u32"));
         let plan = super::arena::Plan::new::<F, A, B, C, D>(lengths);

@@ -12,7 +12,7 @@ use nixe_gpu::{GpuClassId, GpuVirtualAddress, GuestSyncpointId};
 use crate::{
     GpuProfileId, MaxwellAddressSpaceId, MaxwellComputeState, MaxwellDmaCopyState,
     MaxwellGpuProfile, MaxwellInlineToMemoryState, MaxwellPushbufferSubchannel, MaxwellThreeDState,
-    MaxwellTwoDState, engines::MaxwellThreeDFrontendState,
+    MaxwellTwoDState, engines::MaxwellThreeDEngineState,
 };
 
 /// Stable identity of one Maxwell channel lifetime.
@@ -260,10 +260,6 @@ impl MaxwellChannelFrontendState {
     pub(crate) fn set_reference_count(&mut self, value: u32) {
         self.reference_count = value;
     }
-
-    pub(crate) fn reset_subchannel_bindings(&mut self) {
-        self.subchannel_bindings = [None; 8];
-    }
 }
 
 /// Driver configuration carried by value with an accepted delivery.
@@ -319,17 +315,15 @@ pub struct MaxwellChannelConfiguration {
     scheduling_policy: MaxwellChannelSchedulingPolicy,
 }
 
-/// Engine registers owned exclusively by the GPU command processor.
+/// Engine registers owned exclusively by graphics preparation.
 #[derive(Clone, Debug)]
 pub struct MaxwellGpuChannel {
     configuration: MaxwellChannelConfiguration,
-    frontend: MaxwellChannelFrontendState,
     compute: MaxwellComputeState,
     dma_copy: MaxwellDmaCopyState,
     inline_to_memory: MaxwellInlineToMemoryState,
     two_d: MaxwellTwoDState,
-    three_d: MaxwellThreeDFrontendState,
-    pub(crate) commands: crate::pushbuffer::dma::CommandState,
+    three_d: MaxwellThreeDEngineState,
 }
 impl std::ops::Deref for MaxwellGpuChannel {
     type Target = MaxwellChannelConfiguration;
@@ -349,18 +343,16 @@ impl MaxwellGpuChannel {
         owner: MaxwellChannelOwner,
         profile: MaxwellGpuProfile,
     ) -> Self {
-        Self::from_configuration(MaxwellChannelConfiguration::new(id, owner, profile), true)
+        Self::from_configuration(MaxwellChannelConfiguration::new(id, owner, profile))
     }
-    pub fn from_configuration(configuration: MaxwellChannelConfiguration, mme_jit: bool) -> Self {
+    pub fn from_configuration(configuration: MaxwellChannelConfiguration) -> Self {
         Self {
             configuration,
-            frontend: MaxwellChannelFrontendState::default(),
             compute: MaxwellComputeState::new(),
             dma_copy: MaxwellDmaCopyState::new(),
             inline_to_memory: MaxwellInlineToMemoryState::new(),
             two_d: MaxwellTwoDState::new(),
-            three_d: MaxwellThreeDFrontendState::new(mme_jit),
-            commands: Default::default(),
+            three_d: MaxwellThreeDEngineState::default(),
         }
     }
     pub const fn configuration(&self) -> MaxwellChannelConfiguration {
@@ -372,12 +364,6 @@ impl MaxwellGpuChannel {
             "channel lifetime must not change"
         );
         self.configuration = configuration;
-    }
-    pub const fn frontend(&self) -> &MaxwellChannelFrontendState {
-        &self.frontend
-    }
-    pub(crate) const fn frontend_mut(&mut self) -> &mut MaxwellChannelFrontendState {
-        &mut self.frontend
     }
 
     /// Returns an immutable snapshot of channel-owned `MAXWELL_COMPUTE_B` state.
@@ -426,20 +412,14 @@ impl MaxwellGpuChannel {
         self.three_d.operation_state()
     }
 
-    pub(crate) const fn three_d_mut(&mut self) -> &mut MaxwellThreeDFrontendState {
+    pub(crate) const fn three_d_mut(&mut self) -> &mut MaxwellThreeDEngineState {
         &mut self.three_d
     }
 
     pub(crate) const fn three_d_with_profile_mut(
         &mut self,
-    ) -> (&MaxwellGpuProfile, &mut MaxwellThreeDFrontendState) {
+    ) -> (&MaxwellGpuProfile, &mut MaxwellThreeDEngineState) {
         (&self.configuration.profile, &mut self.three_d)
-    }
-
-    /// Resets frontend class selection at a verified channel-reset boundary.
-    /// Closing a channel normally drops the complete object instead.
-    pub fn reset_subchannel_bindings(&mut self) {
-        self.frontend.reset_subchannel_bindings();
     }
 }
 
@@ -750,21 +730,6 @@ mod tests {
                 .bits(),
         )
         .unwrap()
-    }
-
-    #[test]
-    fn channel_starts_with_explicit_deterministic_scheduling_state() {
-        let channel = channel();
-        assert_eq!(channel.priority(), MaxwellChannelPriority::Medium);
-        assert_eq!(channel.timeslice(), MaxwellChannelTimeslice::DriverDefault);
-        assert_eq!(channel.timeout(), MaxwellChannelTimeout::DriverDefault);
-        assert_eq!(
-            channel.scheduling_policy(),
-            MaxwellChannelSchedulingPolicy::DeterministicSingleQueue
-        );
-        assert_eq!(channel.owner().process_id(), 9);
-        assert_eq!(channel.profile_id(), SWITCH_1_GM20B_PROFILE.id());
-        assert_eq!(channel.frontend(), &MaxwellChannelFrontendState::default());
     }
 
     #[test]

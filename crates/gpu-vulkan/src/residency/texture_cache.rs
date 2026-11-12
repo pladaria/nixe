@@ -647,7 +647,20 @@ impl Residency<'_> {
             .expect("image modification tick exhausted");
         self.texture_cache.images[id].modification_tick =
             self.texture_cache.image_modification_tick;
-        self.texture_cache.images[id].gpu_modified = true;
+        let entry = &mut self.texture_cache.images[id];
+        for &(address, bytes) in &entry.maps {
+            if !entry.gpu_modified {
+                self.runtime.device_memory.mark_gpu_written(address, bytes);
+            } else {
+                self.runtime
+                    .device_memory
+                    .invalidate_command_pages(address, bytes);
+            }
+            self.caches
+                .command_pages
+                .draw_write(&self.runtime.device_memory, address, bytes);
+        }
+        entry.gpu_modified = true;
         Ok(())
     }
     pub fn attachment_view(

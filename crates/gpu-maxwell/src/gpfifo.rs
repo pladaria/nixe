@@ -168,7 +168,7 @@ pub struct MaxwellDecodedGpfifoSubmission {
     mode: MaxwellGpfifoSubmissionMode,
     fence_id: u32,
     fence_value: u32,
-    entries: Box<[MaxwellGpfifoEntry]>,
+    entries: std::sync::Arc<[MaxwellGpfifoEntry]>,
 }
 
 impl MaxwellDecodedGpfifoSubmission {
@@ -188,6 +188,9 @@ impl MaxwellDecodedGpfifoSubmission {
     }
 
     #[must_use]
+    pub fn shared_entries(&self) -> std::sync::Arc<[MaxwellGpfifoEntry]> {
+        std::sync::Arc::clone(&self.entries)
+    }
     pub fn entries(&self) -> &[MaxwellGpfifoEntry] {
         &self.entries
     }
@@ -641,6 +644,6 @@ pub fn decode_gpfifo_submission(
         },
         fence_id: request.fence_id,
         fence_value: request.fence_value,
-        entries: entries.into_boxed_slice(),
+        entries: entries.into(),
     })
 }

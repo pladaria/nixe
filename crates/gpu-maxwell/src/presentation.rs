@@ -32,6 +32,9 @@ impl GpuExecution for MissingGpuExecution {
     fn flush(&mut self) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
+    fn flush_deferred(&mut self) -> Result<(), BackendRuntimeError> {
+        match *self {}
+    }
     fn end_command_list(&mut self) -> Result<(), BackendRuntimeError> {
         match *self {}
     }

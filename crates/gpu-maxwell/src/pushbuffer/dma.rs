@@ -5,7 +5,7 @@ mod arguments;
 pub(crate) use arguments::MaxwellDmaArguments;
 mod source;
 pub(crate) use source::CommandReader;
-pub use source::MaxwellCommandSourceScratch;
+pub use source::MaxwellCommandFetch;
 
 use nixe_gpu::GpuMethodId;
 use std::fmt::{Display, Formatter};

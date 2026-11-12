@@ -840,7 +840,7 @@ impl Presenter {
                 graphics_compute_family: device.queues().graphics_compute_family,
                 present_family: device.queues().present_family,
             },
-            timeline: device.submission.timeline,
+            timeline: device.submission.timeline.handle,
             vsync,
         };
         let mut chains = Swapchains::new(&context)?;

@@ -3,8 +3,11 @@
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache_base.h
 use super::*;
 pub(crate) struct CacheOwners {
+    pub(super) command_pages: Arc<command_pages::CommandPages>,
     pub(crate) shader_cache: nixe_gpu_maxwell::recompiler::ShaderCache,
     device_memory: nixe_memory::device_memory::DeviceMemory,
+    progress: Arc<crate::queue::progress::SubmissionProgress>,
+    timeline: Arc<crate::queue::progress::Timeline>,
     pub(crate) query_cache: std::sync::Mutex<query::QueryCache>,
     pub(crate) buffer_cache: std::sync::Mutex<BufferCache>,
     pub(crate) texture_cache: std::sync::Mutex<TextureCache>,
@@ -14,11 +17,16 @@ impl CacheOwners {
     pub(crate) fn new(
         device: nixe_memory::device_memory::DeviceMemory,
         progress: Arc<crate::queue::progress::SubmissionProgress>,
+        timeline: Arc<crate::queue::progress::Timeline>,
         samplers: crate::cache::SamplerCache,
     ) -> Self {
-        let buffer_cache = BufferCache::new(device.clone());
+        let command_pages = Arc::new(command_pages::CommandPages::default());
+        let buffer_cache = BufferCache::new(device.clone(), Arc::clone(&command_pages));
         let gpu_invalidations = Arc::clone(&buffer_cache.virtual_ranges.invalidations);
         Self {
+            command_pages,
+            progress: Arc::clone(&progress),
+            timeline,
             shader_cache: nixe_gpu_maxwell::recompiler::ShaderCache::new(device.clone()),
             device_memory: device.clone(),
             query_cache: Default::default(),
@@ -31,6 +39,7 @@ impl CacheOwners {
     /// their contents modified. Committed downloads own their physical inputs.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp
     fn unmap_memory(&self, address: u64, bytes: u64) {
+        self.device_memory.invalidate_command_pages(address, bytes);
         self.texture_cache
             .lock()
             .unwrap()
@@ -47,6 +56,52 @@ impl CacheOwners {
     }
 }
 impl nixe_gpu_maxwell::MaxwellGpuMemoryInterface for CacheOwners {
+    fn command_tick_done(&self, tick: u64) -> Result<bool, Arc<nixe_memory::MemoryError>> {
+        self.timeline
+            .is_done(&self.progress, tick)
+            .map_err(|e| Arc::new(nixe_memory::MemoryError::Execution(e.to_string().into())))
+    }
+    fn read_command(
+        &self,
+        address: u64,
+        output: &mut [u8],
+        past_sync: bool,
+    ) -> Result<nixe_gpu_maxwell::CommandRead, Arc<nixe_memory::MemoryError>> {
+        self.command_pages
+            .read(&self.device_memory, address, output, past_sync)
+            .map_err(|e| Arc::new(nixe_memory::MemoryError::Execution(e.to_string().into())))
+    }
+    fn must_flush_region(&self, address: u64, bytes: u64) -> bool {
+        // Lock each owner once for the range and all its physical aliases.
+        // Never-written pages were rejected by the command reader already.
+        let mut aliases = smallvec::SmallVec::<[(u64, u64); 4]>::new();
+        aliases.push((address, bytes));
+        self.device_memory
+            .apply_device_aliases(address, bytes, |at, size| aliases.push((at, size)));
+        {
+            let cache = self.buffer_cache.lock().unwrap();
+            if aliases
+                .iter()
+                .any(|&(at, size)| cache.memory_tracker.gpu_modified(at, size))
+            {
+                return true;
+            }
+        }
+        {
+            let cache = self.texture_cache.lock().unwrap();
+            if aliases
+                .iter()
+                .any(|&(at, size)| cache.region_gpu_modified(at, size))
+            {
+                return true;
+            }
+        }
+        let cache = self.query_cache.lock().unwrap();
+        aliases
+            .iter()
+            .any(|&(at, size)| cache.must_flush_region(at, size))
+    }
+
     fn unmap_memory(&self, address: u64, bytes: u64) {
         self.unmap_memory(address, bytes);
     }
@@ -112,9 +167,14 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
                 .any(|page| cache.buffer_index.at(page << 16).is_some());
             if registered {
                 if cache.memory_tracker.gpu_modified(address, bytes) {
+                    // Invalidate now and again when the deferred write is applied;
+                    // a producer can create a new command copy in between.
+                    self.device_memory.write_command_pages(address, bytes);
                     return true;
                 }
                 cache.write_memory(address, bytes);
+            } else {
+                self.device_memory.write_command_pages(address, bytes);
             }
         }
         self.texture_cache
@@ -146,6 +206,9 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
     }
 }
 pub(crate) struct BufferCache {
+    pub(super) command_pages: Arc<command_pages::CommandPages>,
+    pub(super) collect_command_copies: bool,
+    pub(super) command_copy_requests: Vec<(BufferId, u64, u64)>,
     pub(super) virtual_ranges: virtual_range_cache::VirtualRangeCache,
     pub(super) lru: budget::ResourceLru,
     pub(super) device_memory: nixe_memory::device_memory::DeviceMemory,
@@ -164,14 +227,24 @@ pub(crate) struct BufferCache {
 }
 impl BufferCache {
     pub(super) fn write_memory(&mut self, address: u64, bytes: u64) {
+        // Include ordered host writes, even if they were already notified before
+        // being deferred. Versions follow physical pages, including all aliases.
+        // https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/buffer_cache/buffer_cache.h#L225
+        self.device_memory.write_command_pages(address, bytes);
         if self.gpu_modified_ranges.intersects(address, bytes) {
             self.clear_download(address, bytes);
             self.gpu_modified_ranges.subtract(address, bytes);
         }
         self.memory_tracker.cpu_write(address, bytes);
     }
-    pub(super) fn new(device: nixe_memory::device_memory::DeviceMemory) -> Self {
+    pub(super) fn new(
+        device: nixe_memory::device_memory::DeviceMemory,
+        command_pages: Arc<command_pages::CommandPages>,
+    ) -> Self {
         Self {
+            command_pages,
+            collect_command_copies: false,
+            command_copy_requests: Vec::new(),
             virtual_ranges: Default::default(),
             lru: Default::default(),
             device_memory: device.clone(),

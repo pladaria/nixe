@@ -187,6 +187,9 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
                     .map_err(IpcWireError::UnsupportedNvDrv)?;
                 match response {
                     NvDrvIoctlOutcome::Complete(response) => break response,
+                    NvDrvIoctlOutcome::PendingAddressSpace(pending) => {
+                        break pending.await.map_err(IpcWireError::UnsupportedNvDrv)?;
+                    }
                     NvDrvIoctlOutcome::PendingHost1x(capture) => {
                         break capture
                             .finish()

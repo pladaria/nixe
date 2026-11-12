@@ -8,6 +8,22 @@ use std::sync::{OnceLock, RwLock, Weak, atomic::AtomicU64};
 pub trait MaxwellGpuMemoryInterface: Send + Sync + std::fmt::Debug {
     fn modify_gpu_memory(&self, address_space: MaxwellAddressSpaceId, address: u64, bytes: u64);
     fn unmap_memory(&self, address: u64, bytes: u64);
+    fn must_flush_region(&self, address: u64, bytes: u64) -> bool;
+    fn command_tick_done(&self, tick: u64) -> Result<bool, Arc<nixe_memory::MemoryError>>;
+    fn read_command(
+        &self,
+        address: u64,
+        output: &mut [u8],
+        past_sync: bool,
+    ) -> Result<CommandRead, Arc<nixe_memory::MemoryError>>;
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandRead {
+    Unknown,
+    NeedsSync,
+    Synced,
+    Copied,
+    Pending(u64),
 }
 
 #[derive(Debug)]
@@ -207,57 +223,6 @@ impl MaxwellGpuMemory {
             .device
             .device()
             .pointer(self.inner.table.translate(address.get())?, bytes)
-    }
-    /// MemoryManager::GetSpan checks GPU-to-device continuity, then the device
-    /// PTE's physical continuity. The caller owns the machine while consuming
-    /// the numeric span, and resolves coherence separately before reading.
-    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/memory_manager.cpp#L721-L742
-    pub(crate) fn get_span(
-        &self,
-        address: GpuVirtualAddress,
-        bytes: u64,
-    ) -> Result<Option<nixe_memory::HostAddress>, MaxwellGpuAccessError> {
-        self.validate_resolution_request(address)?;
-        if bytes == 0 {
-            return Ok(None);
-        }
-        self.checked_add(address, bytes - 1)
-            .map_err(MaxwellGpuAccessError::Address)?;
-        if self.max_continuous_range(address, bytes)? != bytes {
-            return Ok(None);
-        }
-        let Some(device) = self.inner.table.translate(address.get()) else {
-            return Ok(None);
-        };
-        Ok(self.inner.device.device().span(device, bytes))
-    }
-    /// Safe GuestMemory reads flush actual device cache producers after GetSpan.
-    /// No mapping snapshot, physical pin or command-source cache is involved.
-    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/memory_manager.cpp#L442-L462
-    pub(crate) fn flush_region(
-        &self,
-        address: GpuVirtualAddress,
-        bytes: u64,
-        access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<(), MaxwellGpuAccessError> {
-        self.validate_resolution_request(address)?;
-        if bytes == 0 {
-            return Ok(());
-        }
-        self.checked_add(address, bytes - 1)
-            .map_err(MaxwellGpuAccessError::Address)?;
-        let mut offset = 0;
-        while offset < bytes {
-            let span = self.inner.table.span(address.get() + offset);
-            let count = span.bytes.min(bytes - offset);
-            if let Some(device) = span.address {
-                access
-                    .flush_region(device, count)
-                    .map_err(MaxwellGpuAccessError::Backing)?;
-            }
-            offset += count;
-        }
-        Ok(())
     }
     #[cold]
     fn scalar_read_error(&self, address: GpuVirtualAddress) -> MaxwellGpuAccessError {
@@ -632,7 +597,7 @@ impl MaxwellGpuMemory {
         output: &mut [u8],
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<(), MaxwellGpuAccessError> {
-        self.read_block(address, output, Some(access))
+        self.read_block(address, output, Some(access), false)
     }
     /// ReadBlockUnsafe consumes QMD, descriptors and CBuf RAM without cache flushes.
     pub fn read_into_unsafe(
@@ -640,13 +605,22 @@ impl MaxwellGpuMemory {
         address: GpuVirtualAddress,
         output: &mut [u8],
     ) -> Result<(), MaxwellGpuAccessError> {
-        self.read_block(address, output, None)
+        self.read_block(address, output, None, false)
+    }
+    pub(crate) fn read_command_into(
+        &self,
+        address: GpuVirtualAddress,
+        output: &mut [u8],
+        access: &mut nixe_gpu::MemoryAccess<'_>,
+    ) -> Result<(), MaxwellGpuAccessError> {
+        self.read_block(address, output, Some(access), true)
     }
     fn read_block(
         &self,
         address: GpuVirtualAddress,
         output: &mut [u8],
         mut access: Option<&mut nixe_gpu::MemoryAccess<'_>>,
+        commands: bool,
     ) -> Result<(), MaxwellGpuAccessError> {
         self.validate_resolution_request(address)?;
         if output.is_empty() {
@@ -661,9 +635,36 @@ impl MaxwellGpuMemory {
             let target = &mut output[offset..offset + count];
             if let Some(device) = span.address {
                 if let Some(access) = access.as_deref_mut() {
-                    access
-                        .flush_region(device, count as u64)
-                        .map_err(MaxwellGpuAccessError::Backing)?;
+                    let start = if commands { device & !4095 } else { device };
+                    let bytes = if commands {
+                        (device + count as u64).next_multiple_of(4096) - start
+                    } else {
+                        count as u64
+                    };
+                    if commands {
+                        // Producer waits precede this read. Register newly
+                        // GPU-written pages before publishing their full RAM.
+                        self.inner
+                            .device
+                            .device()
+                            .register_command_pages(start, bytes);
+                    }
+                    let mut result = access.flush_region(start, bytes);
+                    // Every device alias of these physical bytes may own a
+                    // pending producer. Resolve it before consuming the RAM.
+                    self.inner.device.device().apply_device_aliases(
+                        start,
+                        bytes,
+                        |alias, bytes| {
+                            if result.is_ok() {
+                                result = access.flush_region(alias, bytes);
+                            }
+                        },
+                    );
+                    result.map_err(MaxwellGpuAccessError::Backing)?;
+                    if commands {
+                        self.inner.device.device().sync_command_pages(start, bytes);
+                    }
                 }
                 if span.continuous {
                     self.device_reader.read_contiguous(device, target)
@@ -745,5 +746,200 @@ impl MaxwellGpuMemory {
         self.address(offset.get())
             .map_err(MaxwellGpuAccessError::Address)?;
         Ok(())
+    }
+}
+
+/// Command-reader state. Native caches remain on the preparation owner; clean
+/// reads only consult their shared coherence state after the relevant producers.
+pub struct MaxwellCommandMemory {
+    handle: MaxwellGpuMemoryHandle,
+    reader: nixe_memory::device_memory::DeviceMemoryReader,
+    generation: (u64, u64),
+}
+impl MaxwellCommandMemory {
+    pub fn new(handle: MaxwellGpuMemoryHandle) -> Self {
+        let reader = handle.device_memory().device().reader();
+        let generation = (
+            handle.inner.generation.load(Ordering::Acquire),
+            handle.device_memory().device().generation(),
+        );
+        Self {
+            handle,
+            reader,
+            generation,
+        }
+    }
+    fn generation(&self) -> (u64, u64) {
+        (
+            self.handle.inner.generation.load(Ordering::Acquire),
+            self.handle.device_memory().device().generation(),
+        )
+    }
+    pub fn mappings_changed(&self) -> bool {
+        self.generation != self.generation()
+    }
+    pub fn refresh_mappings(&mut self) {
+        self.generation = self.generation();
+    }
+    pub fn read_semaphore(&self, address: u64) -> Result<Option<u32>, MaxwellGpuAccessError> {
+        let inner = &self.handle.inner;
+        let address = nixe_gpu::GpuVirtualAddress::try_new(
+            address,
+            inner.profile.virtual_address().address_bits().bits(),
+        )
+        .map_err(MaxwellGpuAccessError::Address)?;
+        let span = inner.table.span(address.get());
+        let Some(device) = span.address else {
+            return Ok(Some(0));
+        };
+        let Some(caches) = inner.rasterizer.get().and_then(Weak::upgrade) else {
+            return Ok(None);
+        };
+        if caches.must_flush_region(device, 4) {
+            return Ok(None);
+        }
+        let mut bytes = [0; 4];
+        self.reader
+            .read_block_unsafe(device, &mut bytes)
+            .map_err(|e| MaxwellGpuAccessError::Backing(Arc::new(e)))?;
+        Ok(Some(u32::from_le_bytes(bytes)))
+    }
+    pub fn command_tick_done(&self, tick: u64) -> Result<bool, Arc<nixe_memory::MemoryError>> {
+        self.handle
+            .inner
+            .rasterizer
+            .get()
+            .and_then(Weak::upgrade)
+            .map_or(Ok(false), |cache| cache.command_tick_done(tick))
+    }
+    pub fn gpu_written(&self, request: &crate::MaxwellCommandFetch) -> bool {
+        let inner = &self.handle.inner;
+        for entry in &request.entries[request.range.clone()] {
+            let mut at = entry.address().get();
+            let Some(end) = at
+                .checked_add(entry.byte_count())
+                .filter(|&end| end <= 1 << inner.profile.virtual_address().address_bits().bits())
+            else {
+                return true;
+            };
+            while at < end {
+                let span = inner.table.span(at);
+                let count = span.bytes.min(end - at);
+                if let Some(device) = span.address
+                    && inner.device.device().may_be_gpu_written(device, count)
+                {
+                    return true;
+                }
+                at += count;
+            }
+        }
+        false
+    }
+    pub fn read_clean(
+        &self,
+        request: &mut crate::MaxwellCommandFetch,
+        past_sync: bool,
+    ) -> Result<CommandRead, crate::MaxwellGpfifoSourceError> {
+        let inner = &self.handle.inner;
+        if !inner.initialized.load(Ordering::Acquire) || self.mappings_changed() {
+            return Ok(CommandRead::Unknown);
+        }
+        let Some(caches) = inner.rasterizer.get().and_then(Weak::upgrade) else {
+            return Ok(CommandRead::Unknown);
+        };
+        request.prepare_storage()?;
+        if request.generation != Some(self.generation) {
+            request.copied = 0;
+        }
+        request.generation = Some(self.generation);
+        let mut offset = 0;
+        for (index, entry) in request.entries[request.range.clone()].iter().enumerate() {
+            if entry
+                .address()
+                .get()
+                .checked_add(entry.byte_count())
+                .is_none_or(|end| end > 1 << inner.profile.virtual_address().address_bits().bits())
+            {
+                return Ok(CommandRead::Unknown);
+            }
+            let end = offset + entry.byte_count() as usize;
+            let mut at = entry.address().get();
+            while offset < end {
+                let span = inner.table.span(at);
+                let count = span
+                    .bytes
+                    .min((end - offset) as u64)
+                    .min(4096 - (at & 4095)) as usize;
+                if offset + count <= request.copied {
+                    at += count as u64;
+                    offset += count;
+                    continue;
+                }
+                let output = &mut request.bytes[offset..offset + count];
+                if let Some(device) = span.address {
+                    let written = inner
+                        .device
+                        .device()
+                        .register_command_pages(device, count as u64);
+                    let mut synchronized = false;
+                    if written {
+                        let read =
+                            caches
+                                .read_command(device, output, past_sync)
+                                .map_err(|error| crate::MaxwellGpfifoSourceError::Access {
+                                    location: crate::MaxwellGpfifoSourceLocation {
+                                        entry_index: request.origin.entry_index + index as u32,
+                                        pushbuffer: entry.address(),
+                                        ..request.origin
+                                    },
+                                    error: MaxwellGpuAccessError::Backing(error),
+                                })?;
+                        match read {
+                            CommandRead::Copied => {
+                                at += count as u64;
+                                offset += count;
+                                request.copied = offset;
+                                continue;
+                            }
+                            CommandRead::Pending(tick) => return Ok(CommandRead::Pending(tick)),
+                            CommandRead::NeedsSync => return Ok(CommandRead::NeedsSync),
+                            CommandRead::Synced => synchronized = true,
+                            CommandRead::Unknown => {}
+                        }
+                    }
+                    let dirty =
+                        written && !synchronized && caches.must_flush_region(device, count as u64);
+                    if dirty {
+                        if self.mappings_changed() {
+                            request.copied = 0;
+                        }
+                        return Ok(CommandRead::Unknown);
+                    }
+                    let result = if span.continuous {
+                        self.reader.read_contiguous(device, output)
+                    } else {
+                        self.reader.read_block_unsafe(device, output)
+                    };
+                    result.map_err(|error| crate::MaxwellGpfifoSourceError::Access {
+                        location: crate::MaxwellGpfifoSourceLocation {
+                            entry_index: request.origin.entry_index + index as u32,
+                            pushbuffer: entry.address(),
+                            ..request.origin
+                        },
+                        error: MaxwellGpuAccessError::Backing(Arc::new(error)),
+                    })?;
+                } else {
+                    output.fill(0);
+                }
+                at += count as u64;
+                offset += count;
+                request.copied = offset;
+            }
+        }
+        if self.mappings_changed() {
+            request.copied = 0;
+            return Ok(CommandRead::Unknown);
+        }
+        Ok(CommandRead::Copied)
     }
 }

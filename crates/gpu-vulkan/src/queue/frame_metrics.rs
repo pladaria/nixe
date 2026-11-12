@@ -62,6 +62,9 @@ impl Recorder {
         self.current.is_some()
     }
     pub fn begin_cpu(&mut self) {
+        self.begin_cpu_at(Instant::now());
+    }
+    pub fn begin_cpu_at(&mut self, start: Instant) {
         if self.current.is_some() {
             return;
         }
@@ -78,7 +81,7 @@ impl Recorder {
         timeline.completions.clear();
         *slot = Some(Frame {
             id,
-            start: Instant::now(),
+            start,
             cpu_end: None,
             producer: 0,
             swap_interval: 0,

@@ -326,7 +326,9 @@ impl NativeGpuExecution {
         residency.commit_texture_downloads()?;
         residency.commit_buffer_downloads()?;
         let work = residency.visibility_work();
-        if work.is_some_and(|work| work.tick() > residency.device().scheduled_tick()) {
+        if work.is_some_and(|work| work.tick() > residency.device().scheduled_tick())
+            && !residency.device_mut().submission.defer_flush()
+        {
             residency.flush()?;
         }
         self.state.fences.queue(work, true, action)?;
@@ -400,8 +402,9 @@ impl NativeExecution<'_> {
     fn bind_host_wakeup(
         &mut self,
         wake: Arc<dyn Fn() + Send + Sync>,
+        submit: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<(), BackendRuntimeError> {
-        self.state.fences.bind_wakeup(Arc::clone(&wake));
+        self.state.fences.bind_wakeup(Arc::clone(&wake), submit);
         if let Some(host) = &self.state.host {
             host.client.bind_wakeup(wake);
         }
@@ -414,10 +417,15 @@ impl NativeExecution<'_> {
     }
 
     fn end_command_list(&mut self) -> Result<(), BackendRuntimeError> {
-        // DmaPusher::DispatchCalls seals outstanding draws through FlushCommands;
-        // it does not wait for their native completion.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp
-        if self.state.draw_counter != 0 {
+        self.state.draw_counter = 0;
+        let device = self.residency.device_mut();
+        if device.submission.finish_command_list(&device.dispatch) {
+            self.flush()?;
+        }
+        Ok(())
+    }
+    fn flush_deferred(&mut self) -> Result<(), BackendRuntimeError> {
+        if self.residency.device().submission.flush_pending {
             self.flush()?;
         }
         Ok(())
@@ -523,6 +531,16 @@ impl NativeExecution<'_> {
             .map_err(runtime)?;
         self.state.draw_counter = 0;
         self.state.last_draw = None;
+        #[cfg(feature = "performance-counters")]
+        {
+            let queue = &self.residency.device().submission;
+            nixe_gpu::trace::event(
+                "frame_dependency_wait",
+                queue.dependency_wait_ns,
+                queue.recording_wait_ns,
+                0,
+            );
+        }
         let reuse = self.state.statistics.reuse;
         nixe_gpu::trace::event(
             "frame_reuse",
@@ -661,6 +679,11 @@ impl GpuExecution for NativeGpuExecution {
         let device = &mut self.residency.runtime.device;
         device.submission.begin_frame_work(&mut device.dispatch);
     }
+    fn begin_frame_work_at(&mut self, start: std::time::Instant) {
+        let device = &mut self.residency.runtime.device;
+        device.submission.frame_metrics.begin_cpu_at(start);
+        device.submission.begin_frame_work(&mut device.dispatch);
+    }
     fn frame_idle(&mut self, start: std::time::Instant, end: std::time::Instant) {
         let device = &mut self.residency.runtime.device;
         device
@@ -673,8 +696,9 @@ impl GpuExecution for NativeGpuExecution {
     fn bind_host_wakeup(
         &mut self,
         wake: Arc<dyn Fn() + Send + Sync>,
+        submit: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<(), BackendRuntimeError> {
-        self.execution().bind_host_wakeup(wake)
+        self.execution().bind_host_wakeup(wake, submit)
     }
     fn flush(&mut self) -> Result<(), BackendRuntimeError> {
         self.execution().flush().map(|_| ())
@@ -682,6 +706,9 @@ impl GpuExecution for NativeGpuExecution {
 
     fn end_command_list(&mut self) -> Result<(), BackendRuntimeError> {
         self.execution().end_command_list()
+    }
+    fn flush_deferred(&mut self) -> Result<(), BackendRuntimeError> {
+        self.execution().flush_deferred()
     }
     fn convert_nv12(&mut self, conversion: &Self::Conversion) -> Result<(), BackendRuntimeError> {
         self.execution().record(conversion.frontend, |native| {
@@ -805,6 +832,7 @@ impl GpuExecution for NativeGpuExecution {
     fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
         // WaitPendingFences(true) commits a final cache prefix before waiting.
         self.fence_caches(None).map_err(runtime)?;
+        self.execution().flush_deferred()?;
         self.state.fences.wait_pending().map_err(runtime)?;
         self.execution().teardown()
     }

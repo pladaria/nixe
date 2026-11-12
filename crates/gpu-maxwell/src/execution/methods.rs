@@ -29,7 +29,7 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                     error,
                 })?;
             self.report(source, &target, 0, false, true, true)?;
-            self.prior_work_pending = false;
+            self.progress.prior_work_pending = false;
             Ok(())
         })();
         at_method(|| source, result)
@@ -41,6 +41,9 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
     ) -> Result<(), MaxwellSubmissionExecutionError> {
         let result = (|| {
             match operation {
+                MaxwellHostSynchronizationKind::SemaphoreAcquire { .. } => {
+                    unreachable!("acquires execute on the command owner")
+                }
                 MaxwellHostSynchronizationKind::SemaphoreRelease {
                     address,
                     payload,
@@ -63,7 +66,7 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                         })?;
                     self.report(source, &target, payload, short, true, false)?;
                     if wait {
-                        self.prior_work_pending = false;
+                        self.progress.prior_work_pending = false;
                     }
                     Ok(())
                 }
@@ -77,7 +80,7 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                     // backend stream. Both scopes therefore drain its prior
                     // segment; they never complete another channel's work.
                     self.host.order_device(self.frontend)?;
-                    self.prior_work_pending = false;
+                    self.progress.prior_work_pending = false;
                     Ok(())
                 }
                 MaxwellHostSynchronizationKind::L2SysmemInvalidate { .. }
@@ -172,7 +175,7 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                 )?;
                 self.report(operation.source(), &target, payload, true, true, false)?;
             }
-            self.prior_work_pending = true;
+            self.progress.prior_work_pending = true;
             Ok(())
         })();
         at_method(|| source, result)
@@ -183,11 +186,12 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
     ) -> Result<(), MaxwellSubmissionExecutionError> {
         let source = operation.source();
         let result = (|| {
-            let plan = lower_maxwell_compute_synchronization(operation, self.prior_work_pending);
+            let plan =
+                lower_maxwell_compute_synchronization(operation, self.progress.prior_work_pending);
             match plan {
                 MaxwellComputeSynchronizationPlan::WaitForIdle { .. } => {
                     self.host.order_device(self.frontend)?;
-                    self.prior_work_pending = false;
+                    self.progress.prior_work_pending = false;
                 }
                 MaxwellComputeSynchronizationPlan::InvalidateShaderCaches { caches, .. }
                 | MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { caches } => {
@@ -195,7 +199,7 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                         plan,
                         MaxwellComputeSynchronizationPlan::InvalidateShaderCaches { .. }
                     ) {
-                        self.prior_work_pending = false;
+                        self.progress.prior_work_pending = false;
                     }
                     self.host.cache_maintenance(
                         self.frontend,
@@ -256,9 +260,12 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
     ) -> Result<(), MaxwellSubmissionExecutionError> {
         let source = trigger.source();
         let result = (|| {
-            let plan =
-                lower_maxwell_three_d_synchronization(trigger, three_d, self.prior_work_pending)
-                    .map_err(MaxwellSubmissionExecutionError::ThreeDSynchronization)?;
+            let plan = lower_maxwell_three_d_synchronization(
+                trigger,
+                three_d,
+                self.progress.prior_work_pending,
+            )
+            .map_err(MaxwellSubmissionExecutionError::ThreeDSynchronization)?;
             if let MaxwellThreeDSynchronizationPlan::IncrementSyncpoint { request } = plan {
                 self.increment_syncpoint(source, request.syncpoint())?;
             }
@@ -327,7 +334,7 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                 self.host.cache_maintenance(self.frontend, operation)?;
             }
             if drains_prior_work {
-                self.prior_work_pending = matches!(plan, MaxwellThreeDSynchronizationPlan::ReportSemaphoreWrite(report) if report.samples_passed());
+                self.progress.prior_work_pending = matches!(plan, MaxwellThreeDSynchronizationPlan::ReportSemaphoreWrite(report) if report.samples_passed());
             }
             Ok(())
         })();
@@ -345,7 +352,7 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                     &self.address_space.borrow(),
                     self.frontend,
                 )?;
-                self.prior_work_pending = true;
+                self.progress.prior_work_pending = true;
             }
             Ok(())
         })();
@@ -360,7 +367,7 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                 .borrow_mut()
                 .blit(request, &self.address_space.borrow(), self.frontend);
         at_method(|| request.source(), result)?;
-        self.prior_work_pending = true;
+        self.progress.prior_work_pending = true;
         Ok(())
     }
     pub(crate) fn draw(
@@ -382,12 +389,11 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                     self.frontend,
                     self.host,
                 )?;
-                self.prior_work_pending = true;
+                self.progress.prior_work_pending = true;
             }
             Ok(())
         })();
-        at_method(origin, result)?;
-        self.tick_work()
+        at_method(origin, result)
     }
     /// Clear consumes current registers directly; unlike shader preparation it
     /// has no unavailable-pipeline continuation. Eden exposes distinct Draw and
@@ -409,7 +415,7 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
             self.cache
                 .borrow_mut()
                 .clear(three_d, &self.address_space.borrow(), self.frontend)?;
-            self.prior_work_pending = true;
+            self.progress.prior_work_pending = true;
             Ok(())
         })();
         at_method(origin, result)
@@ -436,7 +442,7 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                 self.frontend,
                 self.host,
             )?;
-            self.prior_work_pending = true;
+            self.progress.prior_work_pending = true;
             Ok(())
         })();
         at_method(|| launch.source(), result)

@@ -43,10 +43,6 @@ pub struct MaxwellMethodSource {
 }
 
 impl MaxwellMethodSource {
-    pub(crate) const fn set_argument(&mut self, argument: u32) {
-        self.argument = argument;
-    }
-
     pub(crate) const fn dma(
         location: MaxwellGpfifoSourceLocation,
         subchannel: MaxwellPushbufferSubchannel,
@@ -120,6 +116,11 @@ pub enum MaxwellHostSynchronizationKind {
     SignalReference,
     IncrementSyncpoint {
         syncpoint: nixe_gpu::GuestSyncpointId,
+    },
+    SemaphoreAcquire {
+        address: u64,
+        payload: u32,
+        operation: u8,
     },
     SemaphoreRelease {
         address: u64,
@@ -283,10 +284,19 @@ pub(crate) fn call_puller_method(
             Ok(None)
         }
         0x1c => {
-            if source.argument & 0x1f != 2 || source.argument & !0x0110_001f != 0 {
+            if !matches!(source.argument & 0x1f, 1 | 2 | 4 | 8)
+                || source.argument & !0x0110_001f != 0
+            {
                 return Err(MaxwellMethodDispatchError::UnsupportedHostMethod { source });
             }
             let [high, low, payload] = frontend.host_semaphore();
+            if source.argument & 0x1f != 2 {
+                return Ok(Some(Effect::SemaphoreAcquire {
+                    address: (u64::from(high) << 32) | u64::from(low),
+                    payload,
+                    operation: (source.argument & 0x1f) as u8,
+                }));
+            }
             Ok(Some(Effect::SemaphoreRelease {
                 address: (u64::from(high) << 32) | u64::from(low),
                 payload,

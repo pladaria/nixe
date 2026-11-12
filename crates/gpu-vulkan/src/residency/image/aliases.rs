@@ -214,6 +214,11 @@ impl Residency<'_> {
         result?;
         let target = &mut self.texture_cache.images[id];
         target.modification_tick = newest;
+        if modified && !target.gpu_modified {
+            for &(address, bytes) in &target.maps {
+                self.runtime.device_memory.mark_gpu_written(address, bytes);
+            }
+        }
         target.gpu_modified = modified;
         Ok(())
     }

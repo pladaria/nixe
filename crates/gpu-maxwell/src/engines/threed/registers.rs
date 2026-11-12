@@ -378,8 +378,15 @@ pub(super) fn executable(method: GpuMethodId) -> bool {
             .is_none_or(|word| word & (1 << (index % 64)) != 0)
 }
 
+pub(super) fn completes_notification(method: GpuMethodId) -> bool {
+    METHODS_BY_DWORD
+        .get((method.0 / 4) as usize)
+        .and_then(|declaration| *declaration)
+        .is_some_and(|declaration| matches!(declaration.action, MethodAction::NoOperation))
+}
+
 pub(in crate::engines) fn embedded_words(
-    candidate: &mut MaxwellThreeDFrontendState,
+    candidate: &mut MaxwellThreeDEngineState,
     method: GpuMethodId,
     subchannel: crate::MaxwellPushbufferSubchannel,
     words: crate::MaxwellDmaArguments<'_>,
@@ -403,10 +410,6 @@ pub(in crate::engines) fn embedded_words(
         source: last,
     });
     candidate.record_raw_register(last);
-    let control = candidate.mme().shadow_ram_control().value().copied();
-    candidate
-        .mme_mut()
-        .track_shadow_register(control, last.method(), last.argument());
     Ok((upload, count))
 }
 

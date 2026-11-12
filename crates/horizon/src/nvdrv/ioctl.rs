@@ -56,6 +56,7 @@ pub(crate) struct NvDrvIoctlResponse {
 #[derive(Debug)]
 pub(crate) enum NvDrvIoctlOutcome {
     Complete(NvDrvIoctlResponse),
+    PendingAddressSpace(super::nvhost_as_gpu::Pending),
     PendingHost1x(super::host1x::CaptureSubmission),
     PendingSyncpointWait(PendingNvHostCtrlWait),
     PendingSubmission(super::PendingGpuSubmission),

@@ -20,6 +20,7 @@ impl DeviceMemory {
             .arena()
             .host_address(physical, source.len() as u64)
             .ok_or(MemoryError::Invalid("device write exceeds physical RAM"))?;
+        self.write_command_pages(address, source.len() as u64);
         // The machine retains its stable physical arena; cache owners resolve
         // coherence. Raw instruction copies expose no Rust references to RAM.
         unsafe {

@@ -56,7 +56,7 @@ impl NvDrvSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&fd)
-            .map(|space| space.memory().clone())
+            .cloned()
     }
 
     /// Returns pointer-free Maxwell channel state for diagnostics and tests.

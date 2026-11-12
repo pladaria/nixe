@@ -10,7 +10,7 @@ use nixe_gpu::{
 use nixe_gpu_maxwell::{
     MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellChannelConfiguration, MaxwellChannelError,
     MaxwellChannelPriority, MaxwellFrontendDispatchBoundary, MaxwellGpfifoDecodeError,
-    MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellInvalidGpfifoSubmission,
+    MaxwellGpfifoSubmitRequest, MaxwellGpuMemoryHandle, MaxwellInvalidGpfifoSubmission,
     MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler, MaxwellZCullMode,
     decode_gpfifo_submission, validate_gpfifo_submission,
 };
@@ -95,7 +95,7 @@ pub(super) struct NvHostGpuIoctlResources<'a> {
 
 pub(super) struct NvHostGpuSubmitResources<'a> {
     pub control: &'a Arc<Mutex<NvHostControl>>,
-    pub address_space: Option<&'a MaxwellGpuAddressSpace>,
+    pub address_space: Option<&'a MaxwellGpuMemoryHandle>,
 }
 
 struct NvHostGpuSubmit<'a> {
@@ -409,11 +409,6 @@ impl NvHostGpu {
     pub(super) fn channel(&self, fd: NvDrvFileDescriptor) -> Option<MaxwellChannelConfiguration> {
         self.channels.get(&fd).copied()
     }
-
-    #[cfg(test)]
-    pub(super) fn accepted_submission_count(&self) -> u64 {
-        self.next_frontend_submission - 1
-    }
 }
 
 fn is_legacy_submit_gpfifo(request: u32) -> bool {
@@ -545,7 +540,7 @@ fn submit_gpfifo(
     let following_frontend_submission = next_frontend_submission
         .checked_add(1)
         .ok_or_else(|| unsupported_state(descriptor, request))?;
-    let validated = validate_gpfifo_submission(&channel, frontend, decoded, address_space.memory())
+    let validated = validate_gpfifo_submission(&channel, frontend, decoded, address_space)
         .map_err(|error| {
             NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::GpfifoMemory {
                 context: NvDrvErrorContext::new(
@@ -609,7 +604,7 @@ fn submit_gpfifo(
         .filter(|address_space| address_space.id() == next_address_space)
         .ok_or_else(|| unsupported_state(descriptor, request))?;
     let dispatch = scheduler
-        .dispatch_next(dependency_reached, dispatch_address_space.memory())
+        .dispatch_next(dependency_reached, dispatch_address_space)
         .map_err(|error| scheduling_error(descriptor, request, error))?
         .ok_or_else(|| unsupported_state(descriptor, request))?;
     let reservation = dispatch.scheduled().completion().cloned();

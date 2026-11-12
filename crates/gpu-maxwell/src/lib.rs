@@ -10,6 +10,9 @@ mod channel;
 pub mod engines;
 mod execution;
 mod frontend;
+mod ordered;
+pub use frontend::MaxwellCommandProcessor;
+pub use ordered::{MaxwellMethodExecution, MaxwellMethodSink, MaxwellMethodState};
 mod gpfifo;
 mod presentation;
 pub use presentation::{MissingGpuExecution, PresentationImageRequest};
@@ -20,12 +23,12 @@ mod shader;
 mod shader_stage;
 
 pub use address_space::{
-    MAX_MAPPING_DUMP_ENTRIES, MaxwellAddressSpaceError, MaxwellAddressSpaceId,
-    MaxwellAddressSpaceInitialization, MaxwellAllocationId, MaxwellGpuAccessError,
-    MaxwellGpuAddressSpace, MaxwellGpuMapping, MaxwellGpuMemory, MaxwellGpuMemoryHandle,
-    MaxwellGpuMemoryInterface, MaxwellMapRequest, MaxwellMappingDiagnostic, MaxwellMappingDump,
-    MaxwellMappingId, MaxwellResolvedMapping, MaxwellResolvedRange, MaxwellSparseMapping,
-    MaxwellSparseRemapRequest, MaxwellVaRegion, MaxwellVaReservation,
+    CommandRead, MAX_MAPPING_DUMP_ENTRIES, MaxwellAddressSpaceError, MaxwellAddressSpaceId,
+    MaxwellAddressSpaceInitialization, MaxwellAllocationId, MaxwellCommandMemory,
+    MaxwellGpuAccessError, MaxwellGpuAddressSpace, MaxwellGpuMapping, MaxwellGpuMemory,
+    MaxwellGpuMemoryHandle, MaxwellGpuMemoryInterface, MaxwellMapRequest, MaxwellMappingDiagnostic,
+    MaxwellMappingDump, MaxwellMappingId, MaxwellResolvedMapping, MaxwellResolvedRange,
+    MaxwellSparseMapping, MaxwellSparseRemapRequest, MaxwellVaRegion, MaxwellVaReservation,
 };
 pub use channel::{
     MaxwellChannelConfiguration, MaxwellChannelDriverState, MaxwellChannelError,
@@ -152,9 +155,7 @@ pub use engines::{
 };
 pub use execution::{MaxwellCanonicalExecutionError, MaxwellSubmissionExecutionError};
 
-pub use frontend::{
-    MaxwellCommandSourceScratch, MaxwellFrontendDispatchError, stream_maxwell_frontend,
-};
+pub use frontend::{MaxwellCommandFetch, MaxwellCommandStream, MaxwellFrontendDispatchError};
 pub use gpfifo::{
     MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellDecodedGpfifoSubmission, MaxwellGpfifoDecodeError,
     MaxwellGpfifoEntry, MaxwellGpfifoFetchMode, MaxwellGpfifoLevel, MaxwellGpfifoSourceError,

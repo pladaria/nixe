@@ -233,6 +233,9 @@ impl Dispatch {
     {
         self.recorder.record(function);
     }
+    pub(crate) fn record_serial(&self) -> u64 {
+        self.recorder.record_serial
+    }
     pub fn dispatch_work(&mut self) -> Result<(), VulkanError> {
         self.recorder.flush_chunks()
     }

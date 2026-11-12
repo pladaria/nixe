@@ -332,7 +332,12 @@ impl Residency<'_> {
                 .dispatch
                 .cmd_dispatch(groups[0], groups[1], groups[2]);
         }
-        self.finish_guest_writes(pipeline, resources)?;
-        Ok(self.runtime.device.current_work())
+        let work = self.runtime.device.current_work();
+        self.buffer_cache.collect_command_copies = true;
+        let writes = self.finish_guest_writes(pipeline, resources);
+        self.buffer_cache.collect_command_copies = false;
+        writes?;
+        self.copy_command_pages()?;
+        Ok(work)
     }
 }

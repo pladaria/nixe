@@ -3,7 +3,8 @@
 mod bindings;
 mod color_reduction;
 mod coverage;
-pub(super) mod draw;
+pub(crate) mod draw;
+pub(crate) mod front;
 pub use draw::{MaxwellThreeDDrawIndexBuffer, MaxwellThreeDDrawState};
 mod inline_to_memory;
 mod line;
@@ -129,7 +130,7 @@ pub use shader_execution::{
     MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
     MaxwellThreeDVisibleCallLimit,
 };
-pub use state::MaxwellThreeDFrontendState;
+pub use state::MaxwellThreeDEngineState;
 pub use state::{
     MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT, MaxwellThreeDAlphaFraction,
     MaxwellThreeDAttributePointSize, MaxwellThreeDConservativeRasterEnable, MaxwellThreeDEdgeFlag,
@@ -154,8 +155,6 @@ pub use vertex::{
 };
 
 use nixe_gpu::{GpuClassId, GpuMethodId};
-
-use mme::{MaxwellThreeDMmeHost, MaxwellThreeDMmeRunError};
 
 use super::{
     MaxwellEngineCapability, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata,
@@ -1061,102 +1060,21 @@ methods!(
     ),
 );
 
-pub(super) const fn is_mme_aperture(method: GpuMethodId) -> bool {
+pub(crate) const fn is_mme_aperture(method: GpuMethodId) -> bool {
     // Maxwell3D::CallMethod treats every method above MacroRegistersStart as
     // a macro pair. Program selection aliases pairs onto macro_positions.
     // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/engines/maxwell_3d.cpp#L375-L410
     method.0 >= 0x3800 && method.0 & 3 == 0
 }
 
-pub(super) fn execute_mme_call<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
-    profile: &MaxwellGpuProfile,
-    source: crate::MaxwellMethodSource,
-    parameters: &[u32],
-    candidate: &mut MaxwellThreeDFrontendState,
-    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
-) -> Result<(), MaxwellEngineStreamError> {
-    let macro_index = ((source.method().0 - 0x3800) / 8) as u8;
-    let program = candidate.mme_mut().program(macro_index).map_err(|error| {
-        MaxwellEngineStreamError::dispatch(MaxwellEngineDispatchError::MmeExecution {
-            source,
-            error,
-        })
-    })?;
-    {
-        let mut host = MmeDispatchHost {
-            profile,
-            source,
-            candidate,
-            execution,
-        };
-        match program.execute(parameters, &mut host) {
-            Ok(()) => {}
-            Err(MaxwellThreeDMmeRunError::Execution(error)) => {
-                return Err(MaxwellEngineStreamError::dispatch(
-                    MaxwellEngineDispatchError::MmeExecution { source, error },
-                ));
-            }
-            Err(MaxwellThreeDMmeRunError::Host(error)) => return Err(error),
-        }
-    }
-    draw::flush(candidate, execution).map_err(MaxwellEngineStreamError::execution)?;
-    Ok(())
-}
-struct MmeDispatchHost<'a, 'owner, L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost> {
-    profile: &'a MaxwellGpuProfile,
-    source: crate::MaxwellMethodSource,
-    candidate: &'a mut MaxwellThreeDFrontendState,
-    execution: &'a mut crate::execution::ChannelExecution<'owner, L, H>,
-}
-impl<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost> MaxwellThreeDMmeHost
-    for MmeDispatchHost<'_, '_, L, H>
-{
-    type Error = MaxwellEngineStreamError;
-    #[cfg(target_arch = "x86_64")]
-    fn register_words_ptr(&mut self) -> *mut u32 {
-        self.candidate.register_words_ptr()
-    }
-    fn read_register(&self, method_dword: u16) -> Result<u32, Self::Error> {
-        let method = GpuMethodId(u32::from(method_dword) * 4);
-        self.candidate.raw_register_value(method).ok_or_else(|| {
-            MaxwellEngineStreamError::dispatch(MaxwellEngineDispatchError::MmeExecution {
-                source: self.source,
-                error: MaxwellThreeDMmeExecutionError::RegisterReadUnavailable { method_dword },
-            })
-        })
-    }
-    #[inline(always)]
-    fn emit_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error> {
-        let method = GpuMethodId(u32::from(method_dword) * 4);
-        if is_mme_aperture(method) {
-            return Err(MaxwellEngineStreamError::dispatch(
-                MaxwellEngineDispatchError::MmeExecution {
-                    source: self.source,
-                    error: MaxwellThreeDMmeExecutionError::RecursiveMacroCall { method_dword },
-                },
-            ));
-        }
-        let source = self.source;
-        call_method(
-            self.profile,
-            method,
-            argument,
-            self.candidate,
-            self.execution,
-            || source.emitted_by_mme(method, argument),
-        )
-    }
-}
-
-/// The engine entry shared by PFIFO and interpreter sends. Only executing
-/// methods construct effect provenance; ordinary writes store raw state directly.
+/// Consume an admitted effect against the preparation owner's canonical bank.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp#L388-L413
 #[inline]
 pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     profile: &MaxwellGpuProfile,
     method: GpuMethodId,
-    submitted_argument: u32,
-    candidate: &mut MaxwellThreeDFrontendState,
+    argument: u32,
+    candidate: &mut MaxwellThreeDEngineState,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
     origin: impl Fn() -> crate::MaxwellMethodSource,
 ) -> Result<(), MaxwellEngineStreamError> {
@@ -1167,16 +1085,9 @@ pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHos
         })
         .into());
     }
-    let control = candidate.mme().shadow_ram_control().value().copied();
-    let argument = candidate
-        .mme()
-        .resolve_shadow_argument(method, submitted_argument);
-    if draw::ends_instance_run(candidate, method, argument) {
-        draw::flush(candidate, execution)?;
+    if registers::executable(method) || candidate.raw_register_value(method) != Some(argument) {
+        draw::before_write(candidate, method, execution)?;
     }
-    candidate
-        .mme_mut()
-        .track_shadow_register(control, method, argument);
     candidate.write_register(method, argument);
     if !registers::executable(method) {
         if candidate.pending_notification.is_some()
@@ -1225,6 +1136,9 @@ pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHos
                     "invalid topology or begin modifier",
                 )
             })?;
+            if value.instance() == MaxwellThreeDBeginInstance::First {
+                draw::flush(candidate, execution, false)?;
+            }
             draw::begin(candidate, argument, value, consumed_origin);
             return Ok(());
         }
@@ -1247,91 +1161,64 @@ pub(super) fn call_method<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHos
         )?;
         return Ok(());
     }
-    let mut source = origin();
-    // Shadow control executes the submitted word while its canonical register
-    // receives the shadowed word, as in Maxwell3D::CallMethod.
-    source.set_argument(if method.0 == 0x124 {
-        submitted_argument
-    } else {
-        argument
-    });
-    execute_register(profile, source, candidate, family, execution)
+    execute_register(profile, origin(), candidate, family, execution)
 }
 
-/// DmaPusher buffers literal method/value pairs. It never interprets state or
-/// builds per-write source/class/kind records. Non-incrementing calls go through
-/// CallMultiMethod after consuming the engine sink.
-/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp#L175-L203
-pub(super) fn queue_method(
-    method: GpuMethodId,
-    argument: u32,
-    candidate: &mut MaxwellThreeDFrontendState,
-) -> Result<bool, MaxwellEngineDispatchError> {
-    if registers::executable(method) {
-        return Ok(false);
-    }
-    candidate
-        .method_sink
-        .try_reserve(1)
-        .map_err(|_| MaxwellEngineDispatchError::ResourceExhausted)?;
-    candidate.method_sink.push((method, argument));
-    Ok(true)
-}
-
-pub(super) fn queue_methods(
-    first: GpuMethodId,
-    words: crate::MaxwellDmaArguments<'_>,
-    candidate: &mut MaxwellThreeDFrontendState,
-) -> Result<usize, MaxwellEngineDispatchError> {
-    for index in 0..words.len() {
-        let method = GpuMethodId(first.0 + index as u32 * 4);
-        if !queue_method(method, words.argument_at(index), candidate)? {
-            return Ok(index);
+/// Coalesce adjacent scalar sends only when every word has the same valid
+/// page/selector boundary. Invalid or clipped writes retain per-word effects
+/// and the original failing method. Shadow RAM was already applied on admission.
+pub(crate) fn call_constant_buffer_words<
+    L: crate::MaxwellFrontend,
+    H: crate::MaxwellCommandHost,
+>(
+    channel: &mut crate::MaxwellGpuChannel,
+    source: crate::MaxwellMethodSource,
+    methods: &[GpuMethodId],
+    arguments: &[u32],
+    execution: &mut crate::execution::ChannelExecution<'_, L, H>,
+) -> Result<(), MaxwellEngineStreamError> {
+    let (profile, state) = channel.three_d_with_profile_mut();
+    draw::before_write(state, source.method(), execution)?;
+    let r = state.operation_state().register_words();
+    let address = (u64::from(r[0x2384 / 4]) << 32) | u64::from(r[0x2388 / 4]);
+    let size = r[0x2380 / 4];
+    let offset = r[0x238c / 4];
+    let bytes = arguments.len() as u64 * 4;
+    if arguments.len() == 1
+        || r[0x030c / 4] != 0
+        || r[0x2384 / 4] > 0xff
+        || address == 0
+        || offset > size
+        || bytes > u64::from(size.saturating_sub(offset))
+        || address + u64::from(offset) + bytes > 1_u64 << 40
+        || bytes > 4096 - ((address + u64::from(offset)) & 4095)
+        || state.pending_notification.is_some()
+    {
+        for (&method, &argument) in methods.iter().zip(arguments) {
+            call_method(profile, method, argument, state, execution, || {
+                source.emitted_by_mme(method, argument)
+            })?;
         }
+        return Ok(());
     }
-    Ok(words.len())
-}
-
-/// Select shadow mode once for the whole literal sink, then store canonical
-/// words and their direct dirty-table bits without another admission pass.
-/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp#L284-L305
-pub(super) fn consume_sink(candidate: &mut MaxwellThreeDFrontendState) {
-    if candidate.method_sink.is_empty() {
-        return;
+    let mut data = [0u8; 256];
+    for (index, (&method, &argument)) in methods.iter().zip(arguments).enumerate() {
+        state.write_register(method, argument);
+        data[index * 4..index * 4 + 4].copy_from_slice(&argument.to_le_bytes());
     }
-    match candidate.mme().shadow_ram_control().value().copied() {
-        Some(MaxwellThreeDMmeShadowRamControl::MethodReplay) => {
-            consume_sink_mode::<true, false>(candidate)
-        }
-        Some(
-            MaxwellThreeDMmeShadowRamControl::MethodTrack
-            | MaxwellThreeDMmeShadowRamControl::MethodTrackWithFilter,
-        ) => consume_sink_mode::<false, true>(candidate),
-        _ => consume_sink_mode::<false, false>(candidate),
-    }
-    candidate.method_sink.clear();
-}
-fn consume_sink_mode<const REPLAY: bool, const TRACK: bool>(
-    candidate: &mut MaxwellThreeDFrontendState,
-) {
-    for index in 0..candidate.method_sink.len() {
-        let (method, submitted) = candidate.method_sink[index];
-        let argument = if REPLAY {
-            candidate.mme().shadow_word(method)
-        } else {
-            submitted
-        };
-        if TRACK {
-            candidate.mme_mut().write_shadow_register(method, argument);
-        }
-        candidate.write_register(method, argument);
-    }
+    process_constant_buffer_data(
+        state,
+        nixe_memory::WriteSource::Bytes(&data[..bytes as usize]),
+        execution,
+        || source,
+    )?;
+    Ok(())
 }
 
 /// Packet index ports normalize packed lanes into the native UINT32 stream.
 /// No state operation, source vector or reserve call is produced per lane.
 pub(super) fn inline_index_words(
-    candidate: &mut MaxwellThreeDFrontendState,
+    candidate: &mut MaxwellThreeDEngineState,
     method: GpuMethodId,
     subchannel: crate::MaxwellPushbufferSubchannel,
     words: crate::MaxwellDmaArguments<'_>,
@@ -1339,10 +1226,6 @@ pub(super) fn inline_index_words(
     candidate.append_index_values(words.source(0, method, subchannel), words.arguments())?;
     let last = words.source(words.len() - 1, method, subchannel);
     candidate.record_raw_register(last);
-    let control = candidate.mme().shadow_ram_control().value().copied();
-    candidate
-        .mme_mut()
-        .track_shadow_register(control, last.method(), last.argument());
     Ok(())
 }
 
@@ -1355,7 +1238,6 @@ pub(super) fn inline_index_words(
 enum RegisterFamily {
     Other,
     InlineToMemory,
-    Mme,
     ConstantBuffer,
     VertexAndBinding,
 }
@@ -1363,7 +1245,6 @@ enum RegisterFamily {
 const fn classify_family(method: u32) -> RegisterFamily {
     match method {
         0x180..=0x1b4 => RegisterFamily::InlineToMemory,
-        0x114 | 0x118 | 0x11c | 0x120 | 0x3400..=0x37fc => RegisterFamily::Mme,
         0x2390..=0x23fc => RegisterFamily::ConstantBuffer,
         0x1120..=0x112c
         | 0x1160..=0x11dc
@@ -1423,7 +1304,7 @@ const fn classify_family(method: u32) -> RegisterFamily {
 fn execute_register<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     profile: &MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
-    candidate: &mut MaxwellThreeDFrontendState,
+    candidate: &mut MaxwellThreeDEngineState,
     family: RegisterFamily,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
 ) -> Result<(), MaxwellEngineStreamError> {
@@ -1442,12 +1323,6 @@ fn execute_register<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
         if let Some(upload) = upload {
             execution.inline_to_memory(upload, None)?;
         }
-        return Ok(());
-    }
-    if family == RegisterFamily::Mme
-        && let Some(write) = preflight_mme_state(source, candidate)?
-    {
-        candidate.mme_mut().apply(write);
         return Ok(());
     }
     let Some(declaration) = (source.method().0 & 3 == 0)
@@ -1699,29 +1574,8 @@ fn execute_register<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
                 MaxwellThreeDSynchronizationTrigger::TiledCacheBarrier { source },
             )?;
         }
-        MethodAction::MmeShadowRamControl => {
-            let value = MaxwellThreeDMmeShadowRamControl::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            candidate
-                .mme_mut()
-                .apply(MaxwellThreeDMmeStateWrite::ShadowRamControl { value, source });
-        }
-        MethodAction::MutableMethodControl => {
-            let value = MaxwellThreeDMutableMethodControl::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            candidate
-                .mme_mut()
-                .apply(MaxwellThreeDMmeStateWrite::MutableMethodControl { value, source });
+        MethodAction::MmeShadowRamControl | MethodAction::MutableMethodControl => {
+            unreachable!("macro control belongs to the command processor")
         }
         MethodAction::FalconFirmwareCall4 => {
             // These internal hardware writes do not configure the emulated
@@ -1921,76 +1775,6 @@ fn execute_register<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
     Ok(())
 }
 
-fn preflight_mme_state(
-    source: crate::MaxwellMethodSource,
-    candidate: &MaxwellThreeDFrontendState,
-) -> Result<Option<MaxwellThreeDMmeStateWrite>, MaxwellEngineDispatchError> {
-    let mme = candidate.mme();
-    let write = match source.method().0 {
-        0x0114 => MaxwellThreeDMmeStateWrite::InstructionPointer {
-            value: MaxwellThreeDMmeRamAddress::new(source.argument()),
-            source,
-        },
-        0x0118 => {
-            let address =
-                mme.next_instruction_address()
-                    .ok_or(MaxwellEngineDispatchError::MmeRamLoad {
-                        source,
-                        ram: MaxwellThreeDMmeRam::Instruction,
-                        error: MaxwellThreeDMmeLoadError::PointerUnset,
-                    })?;
-            if address.raw() == u32::MAX {
-                return Err(MaxwellEngineDispatchError::MmeRamLoad {
-                    source,
-                    ram: MaxwellThreeDMmeRam::Instruction,
-                    error: MaxwellThreeDMmeLoadError::PointerOverflow,
-                });
-            }
-            MaxwellThreeDMmeStateWrite::Instruction {
-                address,
-                value: MaxwellThreeDMmeInstruction::new(source.argument()),
-                source,
-            }
-        }
-        0x011c => MaxwellThreeDMmeStateWrite::StartAddressPointer {
-            value: MaxwellThreeDMmeRamAddress::new(source.argument()),
-            source,
-        },
-        0x0120 => {
-            let index =
-                mme.next_start_address_index()
-                    .ok_or(MaxwellEngineDispatchError::MmeRamLoad {
-                        source,
-                        ram: MaxwellThreeDMmeRam::StartAddress,
-                        error: MaxwellThreeDMmeLoadError::PointerUnset,
-                    })?;
-            if index.raw() == u32::MAX {
-                return Err(MaxwellEngineDispatchError::MmeRamLoad {
-                    source,
-                    ram: MaxwellThreeDMmeRam::StartAddress,
-                    error: MaxwellThreeDMmeLoadError::PointerOverflow,
-                });
-            }
-            if index.raw() as usize >= mme::MME_MACRO_POSITIONS {
-                return Err(MaxwellEngineDispatchError::MmeRamLoad {
-                    source,
-                    ram: MaxwellThreeDMmeRam::StartAddress,
-                    error: MaxwellThreeDMmeLoadError::StorageLimitExceeded {
-                        limit: mme::MME_MACRO_POSITIONS,
-                    },
-                });
-            }
-            MaxwellThreeDMmeStateWrite::StartAddress {
-                index,
-                address: MaxwellThreeDMmeRamAddress::new(source.argument()),
-                source,
-            }
-        }
-        _ => return Ok(None),
-    };
-    Ok(Some(write))
-}
-
 /// ProcessCBData and ProcessCBMultiData write the canonical selector directly
 /// through MemoryManager::WriteBlockCached, then advance its offset. DMA packets
 /// and single MME words share this synchronous path without upload records.
@@ -1999,7 +1783,7 @@ pub(in crate::engines) fn process_constant_buffer_data<
     L: crate::MaxwellFrontend,
     H: crate::MaxwellCommandHost,
 >(
-    candidate: &mut MaxwellThreeDFrontendState,
+    candidate: &mut MaxwellThreeDEngineState,
     data: nixe_memory::WriteSource<'_>,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,
     origin: impl FnOnce() -> crate::MaxwellMethodSource,
@@ -2079,7 +1863,7 @@ pub(in crate::engines) fn process_constant_buffer_data<
 }
 
 fn bind_constant_buffer<L: crate::MaxwellFrontend, H: crate::MaxwellCommandHost>(
-    candidate: &mut MaxwellThreeDFrontendState,
+    candidate: &mut MaxwellThreeDEngineState,
     method: GpuMethodId,
     raw: u32,
     execution: &mut crate::execution::ChannelExecution<'_, L, H>,

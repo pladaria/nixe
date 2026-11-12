@@ -60,6 +60,10 @@ pub trait GpuExecution: OwnerMemory + 'static {
     /// Mark graphics command consumption, before frontend decoding. Repeated
     /// calls belong to the current image until composite.
     fn begin_frame_work(&mut self) {}
+    /// First frontend work for this ordered prefix, before preparation can start.
+    fn begin_frame_work_at(&mut self, _start: std::time::Instant) {
+        self.begin_frame_work();
+    }
     /// The graphics owner waited for an inbox message, outside command/fence
     /// processing. The renderer intersects this with explicit VI pacing.
     fn frame_idle(&mut self, _start: std::time::Instant, _end: std::time::Instant) {}
@@ -67,6 +71,7 @@ pub trait GpuExecution: OwnerMemory + 'static {
     fn bind_host_wakeup(
         &mut self,
         _wake: Arc<dyn Fn() + Send + Sync>,
+        _submit: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<(), BackendRuntimeError> {
         Ok(())
     }
@@ -75,6 +80,8 @@ pub trait GpuExecution: OwnerMemory + 'static {
     /// Seal draw/dispatch work at a command-list boundary without waiting for
     /// device completion or publishing a guest syncpoint.
     fn end_command_list(&mut self) -> Result<(), BackendRuntimeError>;
+    /// Submit a deferred command-list prefix before the preparation owner sleeps.
+    fn flush_deferred(&mut self) -> Result<(), BackendRuntimeError>;
     fn device_uuid(&self) -> Option<[u8; 16]> {
         None
     }

@@ -15,6 +15,7 @@ mod conversion;
 pub use conversion::{ConversionImage, Nv12ColorTransform, Nv12Planes};
 mod diagnostics;
 mod execution;
+pub mod ordered;
 mod presentation;
 mod resource;
 mod runtime;

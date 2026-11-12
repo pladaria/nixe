@@ -101,6 +101,14 @@ impl QueryCache {
         self.unregister(query);
         result
     }
+    pub(super) fn must_flush_region(&self, address: u64, bytes: u64) -> bool {
+        self.cached
+            .range(address.saturating_sub(15)..address.saturating_add(bytes))
+            .any(|(&at, query)| {
+                at + query.bytes.len() as u64 > address
+                    && !query.invalidated.load(Ordering::Relaxed)
+            })
+    }
     pub(super) fn flush_region(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
         let end = address.saturating_add(bytes);
         for (&at, query) in self.cached.range(address.saturating_sub(3)..end) {
@@ -136,6 +144,14 @@ impl Residency<'_> {
             .ok_or(VulkanError::InvalidResource(
                 "query destination has no device address",
             ))?;
+        self.runtime
+            .device_memory
+            .mark_gpu_written(address, bytes.len() as u64);
+        self.caches.command_pages.draw_write(
+            &self.runtime.device_memory,
+            address,
+            bytes.len() as u64,
+        );
         let query = Arc::new(Query {
             address,
             machine: self.runtime.memory.clone(),
