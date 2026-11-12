@@ -15,11 +15,11 @@ pub(super) struct ImageDownload {
 // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L865-L950
 pub(super) enum PendingDownload {
     Image(ImageId),
-    Buffer(buffer_download::Download),
+    Buffer(buffer_download::DownloadEnd),
 }
 enum Publication {
     Image(std::ops::Range<usize>),
-    Buffer(buffer_download::Download),
+    Buffer(buffer_download::DownloadEnd),
 }
 pub(super) struct Download {
     images: Option<ImageDownload>,
@@ -426,7 +426,7 @@ impl TextureCache {
                             )?;
                         }
                     }
-                    Publication::Buffer(buffer) => buffers.publish_download(buffer)?,
+                    Publication::Buffer(buffer) => buffers.publish_dma_download(buffer)?,
                 }
             }
         }

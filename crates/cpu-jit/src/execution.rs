@@ -430,13 +430,16 @@ unsafe extern "C" fn memory(
             let admission = context.admission;
             admission.suspend();
             let completed = admission.read_captured::<MemoryAccessFailure>(&ranges, |area| {
-                let operation = AccessOperation::Flush(area);
+                let operation = AccessOperation::PrepareRead(area);
                 let result = context
                     .process
                     .resolve_access(context.space.machine().access_captured(&ranges, operation))?;
                 match result {
-                    AccessResult::Flushed => Ok(()),
-                    _ => Err(MemoryError::Invalid("native flush returned a data operation").into()),
+                    AccessResult::ReadPrepared(read) => read.finish().map_err(Into::into),
+                    _ => Err(MemoryError::Invalid(
+                        "native read preparation returned a data operation",
+                    )
+                    .into()),
                 }
             });
             resume_memory(context)?;

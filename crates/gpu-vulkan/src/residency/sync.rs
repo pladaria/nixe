@@ -136,7 +136,6 @@ impl Residency<'_> {
                 .dispatch
                 .wait_for_idle(self.runtime.device.submission.wait_for_idle_event, stages);
         }
-        self.buffer_cache.accumulate_flushes();
         Ok(())
     }
     pub(super) fn use_buffer(

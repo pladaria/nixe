@@ -26,7 +26,9 @@ pub struct RamAccess {
     machine: Machine,
 }
 impl nixe_gpu::OwnerMemory for RamAccess {
-    fn invalidate_gpu_cache(&mut self) {}
+    fn invalidate_gpu_cache(&mut self) -> Result<(), std::sync::Arc<MemoryError>> {
+        Ok(())
+    }
     fn invalidate_regions(
         &mut self,
         _: &[nixe_gpu::native::GuestBufferRange],
@@ -72,7 +74,9 @@ where
     ) -> Result<nixe_memory::AccessResult, std::sync::Arc<MemoryError>>,
     G: FnMut(u64, u64) -> Result<(), std::sync::Arc<MemoryError>>,
 {
-    fn invalidate_gpu_cache(&mut self) {}
+    fn invalidate_gpu_cache(&mut self) -> Result<(), std::sync::Arc<MemoryError>> {
+        Ok(())
+    }
     fn invalidate_regions(
         &mut self,
         _: &[nixe_gpu::native::GuestBufferRange],
@@ -103,7 +107,9 @@ where
 }
 pub struct PhysicalAccess;
 impl nixe_gpu::OwnerMemory for PhysicalAccess {
-    fn invalidate_gpu_cache(&mut self) {}
+    fn invalidate_gpu_cache(&mut self) -> Result<(), std::sync::Arc<MemoryError>> {
+        Ok(())
+    }
     fn invalidate_regions(
         &mut self,
         _: &[nixe_gpu::native::GuestBufferRange],
@@ -152,7 +158,9 @@ pub struct SafeRead<G>(G);
 impl<G: FnMut(u64, u64) -> Result<(), std::sync::Arc<MemoryError>>> nixe_gpu::OwnerMemory
     for SafeRead<G>
 {
-    fn invalidate_gpu_cache(&mut self) {}
+    fn invalidate_gpu_cache(&mut self) -> Result<(), std::sync::Arc<MemoryError>> {
+        Ok(())
+    }
     fn invalidate_regions(
         &mut self,
         _: &[nixe_gpu::native::GuestBufferRange],

@@ -19,7 +19,7 @@ pub type MemoryAccess<'a> = dyn OwnerMemory + 'a;
 /// decides whether a native producer needs publication.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/memory_manager.cpp
 pub trait OwnerMemory {
-    fn invalidate_gpu_cache(&mut self);
+    fn invalidate_gpu_cache(&mut self) -> Result<(), Arc<nixe_memory::MemoryError>>;
     fn flush_region(
         &mut self,
         address: u64,

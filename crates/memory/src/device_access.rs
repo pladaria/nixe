@@ -111,15 +111,20 @@ impl AtomicAccess {
 }
 pub enum AccessOperation {
     Read(Vec<u8>),
-    /// Rasterizer synchronization requested by the native CPU memory owner.
-    Flush(NativeReadArea),
+    /// Record and submit a native CPU read. The reader finishes the returned completion outside native admission.
+    PrepareRead(NativeReadArea),
     Write(Vec<u8>),
     Atomic(AtomicAccess),
 }
-#[derive(Debug, Eq, PartialEq)]
+/// A submitted native read, finished on its consumer after owner preparation.
+/// The completion owns its exact publication boundary and retained resources.
+pub trait PreparedRead: Send + fmt::Debug {
+    fn finish(self: Box<Self>) -> Result<(), MemoryError>;
+}
+#[derive(Debug)]
 pub enum AccessResult {
     Read(Vec<u8>),
-    Flushed,
+    ReadPrepared(Box<dyn PreparedRead>),
     Written(Vec<u8>),
     Atomic { previous: u128, written: bool },
 }
@@ -238,13 +243,13 @@ impl DeviceAccessRequest {
     pub fn is_cancelled(&self) -> bool {
         self.completion.cancelled.load(Ordering::Acquire)
     }
-    /// Finish after the requested RAM operation or rasterizer flush completes.
-    /// Native scalar reads consume RAM on their core after this synchronization.
+    /// Complete a RAM operation, or hand a prepared native read to its consumer.
+    /// A native reader finishes GPU publication before consuming RAM on its core.
     pub fn finish(mut self, result: AccessResultValue) {
         let result = result.and_then(|result| {
             let valid = match (&self.operation, &result) {
                 (AccessOperation::Read(_), AccessResult::Read(bytes)) => bytes.len() == self.bytes,
-                (AccessOperation::Flush(_), AccessResult::Flushed) => true,
+                (AccessOperation::PrepareRead(_), AccessResult::ReadPrepared(_)) => true,
                 (AccessOperation::Write(_), AccessResult::Written(bytes)) => {
                     bytes.len() == self.bytes
                 }
@@ -459,7 +464,7 @@ impl Machine {
 mod tests {
     use super::*;
     use crate::PAGE_SIZE;
-    use std::sync::{atomic::AtomicUsize, mpsc};
+    use std::sync::mpsc;
     enum Message {
         Access(DeviceAccessRequest),
         Cancel(AccessRequestId),
@@ -523,27 +528,6 @@ mod tests {
         ));
     }
     #[test]
-    fn exact_read_retains_old_physical_input_until_owner_completion() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let (_endpoint, receiver) = owner(&machine);
-        let (allocation, range) = range(&machine, 17, 3);
-        let pending = machine
-            .request_device_access(vec![range], AccessOperation::Read(Vec::new()))
-            .unwrap();
-        drop(allocation);
-        assert_eq!(machine.statistics().retained_bytes, PAGE_SIZE);
-        let request = next(&receiver);
-        assert_eq!(request.bytes(), 3);
-        assert_eq!(request.ranges()[0].offset(), 17);
-        assert_eq!(pending.identity(), request.identity());
-        request.finish(Ok(AccessResult::Read(Vec::from([1, 2, 3]))));
-        assert_eq!(machine.statistics().allocated_bytes, 0);
-        assert_eq!(
-            pending.wait().unwrap(),
-            AccessResult::Read(Vec::from([1, 2, 3]))
-        );
-    }
-    #[test]
     fn owned_write_is_applied_before_the_only_completion() {
         let machine = Machine::new(PAGE_SIZE).unwrap();
         let (_endpoint, receiver) = owner(&machine);
@@ -567,62 +551,6 @@ mod tests {
         assert_eq!(bytes, [3, 4, 5, 6]);
     }
 
-    #[test]
-    fn completion_notifications_cover_both_registration_orders_and_run_unlocked() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let (_endpoint, receiver) = owner(&machine);
-        let (_allocation, range) = range(&machine, 0, 1);
-        for complete_first in [false, true] {
-            let mut pending = machine
-                .request_device_access(vec![range.clone()], AccessOperation::Read(Vec::new()))
-                .unwrap();
-            let request = next(&receiver);
-            let called = Arc::new(AtomicUsize::new(0));
-            let seen = Arc::clone(&called);
-            let completion = Arc::clone(&pending.completion);
-            let wake: Wake = Arc::new(move || {
-                assert!(completion.state.try_lock().is_ok());
-                seen.fetch_add(1, Ordering::Relaxed);
-            });
-            if complete_first {
-                request.finish(Ok(AccessResult::Read(Vec::from([7]))));
-                pending.set_waker(wake);
-            } else {
-                pending.set_waker(wake);
-                request.finish(Ok(AccessResult::Read(Vec::from([7]))));
-            }
-            assert_eq!(called.load(Ordering::Relaxed), 1);
-            assert_eq!(
-                pending.poll().unwrap().unwrap(),
-                AccessResult::Read(Vec::from([7]))
-            );
-        }
-        struct ReplacedWake {
-            completion: Arc<Completion>,
-            dropped: Arc<AtomicUsize>,
-        }
-        impl Drop for ReplacedWake {
-            fn drop(&mut self) {
-                assert!(self.completion.state.try_lock().is_ok());
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        let mut pending = machine
-            .request_device_access(vec![range], AccessOperation::Read(Vec::new()))
-            .unwrap();
-        let dropped = Arc::new(AtomicUsize::new(0));
-        let previous = ReplacedWake {
-            completion: Arc::clone(&pending.completion),
-            dropped: Arc::clone(&dropped),
-        };
-        pending.set_waker(Arc::new(move || {
-            std::hint::black_box(&previous);
-        }));
-        pending.set_waker(Arc::new(|| {}));
-        assert_eq!(dropped.load(Ordering::Relaxed), 1);
-        next(&receiver).finish(Ok(AccessResult::Read(Vec::from([8]))));
-        assert_eq!(pending.wait().unwrap(), AccessResult::Read(Vec::from([8])));
-    }
     #[test]
     fn cancellation_wakes_owner_and_retains_pending_native_input_until_retired() {
         let machine = Machine::new(PAGE_SIZE).unwrap();

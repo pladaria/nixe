@@ -368,20 +368,53 @@ impl VulkanResidency {
 }
 
 impl Residency<'_> {
-    pub(crate) fn inline_write_regions(
+    /// Apply a completed RAM store without discarding GPU-owned bytes elsewhere
+    /// on its pages. Partial uploads keep those pages resident on the GPU.
+    /// https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/buffer_cache/buffer_cache.h#L225-L296
+    pub(crate) fn write_memory(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
+        self.write_cpu_ranges(std::iter::once((address, bytes)))
+    }
+    pub(crate) fn write_cpu_ranges(
         &mut self,
-        regions: &[nixe_gpu::native::GuestBufferRange],
+        ranges: impl Iterator<Item = (u64, u64)> + Clone,
     ) -> Result<(), VulkanError> {
-        for range in regions {
-            if !self.inline_memory(range.address, range.size)? {
-                self.buffer_cache.write_memory(range.address, range.size);
+        let ranges = ranges.filter(|&(_, bytes)| bytes != 0);
+        // Claim the entire batch before deciding which pages still need GPU
+        // ownership. Several CPU stores can together replace all dirty bytes.
+        // https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L2640-L2650
+        for (address, bytes) in ranges.clone() {
+            self.buffer_cache.claim_cpu_write(address, bytes);
+        }
+        for (address, bytes) in ranges {
+            if !self.upload_partial_write(address, bytes)? {
+                self.buffer_cache.memory_tracker.cpu_write(address, bytes);
             }
-            self.texture_cache.write_memory(range.address, range.size);
+            self.texture_cache.write_memory(address, bytes);
             self.caches
                 .query_cache
                 .lock()
                 .unwrap()
-                .invalidate_region(range.address, range.size);
+                .invalidate_region(address, bytes);
+            self.shader_cache.invalidate_region(address, bytes);
+        }
+        Ok(())
+    }
+    pub(crate) fn write_regions(
+        &mut self,
+        regions: &[nixe_gpu::native::GuestBufferRange],
+    ) -> Result<(), VulkanError> {
+        let device = self.runtime.device_memory.clone();
+        for range in regions {
+            self.write_memory(range.address, range.size)?;
+            // GPU virtual stores name one device mapping. Other mappings of
+            // the same RAM must receive the same content invalidation.
+            let mut result = Ok(());
+            device.apply_device_aliases(range.address, range.size, |alias, bytes| {
+                if result.is_ok() {
+                    result = self.write_memory(alias, bytes);
+                }
+            });
+            result?;
         }
         Ok(())
     }

@@ -58,12 +58,16 @@ impl std::fmt::Debug for ReadbackTicket {
     }
 }
 impl ReadbackTicket {
+    /// Query completion without mapping or invalidating the staging allocation.
+    pub(crate) fn is_complete(&self) -> Result<bool, VulkanError> {
+        self.progress.check(self.work.tick)?;
+        Ok(self.work.tick <= self.progress.completed())
+    }
     /// Consume this reservation after its native timeline has completed.
     /// Staging ownership and progress travel with the reservation, so the
     /// fencing thread needs neither the recorder nor its mutable staging pool.
     pub fn completed(self) -> Result<CompletedReadback, VulkanError> {
-        self.progress.check(self.work.tick)?;
-        if self.work.tick > self.progress.completed() {
+        if !self.is_complete()? {
             return Err(VulkanError::InvalidResource(
                 "readback work has not completed",
             ));
@@ -85,8 +89,7 @@ impl ReadbackTicket {
     /// Borrow a retained reservation only after native completion. The pool
     /// cannot recycle its atom-isolated storage while the ticket is alive.
     pub(crate) fn try_completed(&self) -> Result<Option<&[u8]>, VulkanError> {
-        self.progress.check(self.work.tick)?;
-        if self.work.tick > self.progress.completed() {
+        if !self.is_complete()? {
             return Ok(None);
         }
         if !self.allocation.valid(self.work.tick) {

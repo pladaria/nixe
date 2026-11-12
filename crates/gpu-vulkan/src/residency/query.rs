@@ -13,8 +13,18 @@ pub(crate) struct Query {
     bytes: Arc<[u8]>,
     invalidated: AtomicBool,
     rewritten: AtomicBool,
+    gpu_rewritten: AtomicBool,
 }
 impl Query {
+    pub(super) fn outdate(&self, address: u64, bytes: u64) {
+        if self.address < address + bytes && address < self.address + self.bytes.len() as u64 {
+            self.gpu_rewritten.store(true, Ordering::Relaxed);
+        }
+    }
+    pub(super) fn pending_overwrite(&self) -> Option<(u64, u64)> {
+        (self.gpu_rewritten.load(Ordering::Relaxed) && !self.invalidated.load(Ordering::Relaxed))
+            .then_some((self.address, self.bytes.len() as u64))
+    }
     fn value(&self) -> &[u8] {
         &self.bytes[..if self.bytes.len() == 4 { 4 } else { 8 }]
     }
@@ -159,7 +169,9 @@ impl Residency<'_> {
             bytes,
             invalidated: AtomicBool::new(false),
             rewritten: AtomicBool::new(false),
+            gpu_rewritten: AtomicBool::new(false),
         });
+        let report_noted = self.buffer_cache.note_report_pending(address, &query);
         let caches = Arc::clone(self.caches);
         {
             let mut cache = caches.query_cache.lock().unwrap();
@@ -169,7 +181,33 @@ impl Residency<'_> {
             cache.pending_sync.push(Arc::clone(&query));
         }
         Ok(Box::new(move |result| {
-            caches.query_cache.lock().unwrap().publish(&query, result)
+            // A report must land after overlapping reactive copies. The wait
+            // uses only the shared timeline, with no cache lock held.
+            // https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/query_cache/query_cache.h#L684-L694
+            let result = result.and_then(|()| {
+                caches
+                    .finish_buffer_reads(query.address, query.bytes.len() as u64)
+                    .map_err(|error| {
+                        Arc::new(nixe_memory::MemoryError::Execution(
+                            error.to_string().into(),
+                        ))
+                    })
+            });
+            // Only learned readback pages need a buffer-cache lock at report
+            // publication. Keep that lock before the query lock, as on the owner.
+            let mut buffers = report_noted.then(|| caches.buffer_cache.lock().unwrap());
+            let result = caches.query_cache.lock().unwrap().publish(&query, result);
+            if let Some(buffers) = buffers.as_mut() {
+                if let Some((address, bytes)) = query.pending_overwrite()
+                    && buffers.gpu_modified_ranges.intersects(address, bytes)
+                {
+                    buffers.pending_download_ranges.insert(address, bytes);
+                }
+                buffers
+                    .pending_reports
+                    .retain(|pending| !Arc::ptr_eq(pending, &query));
+            }
+            result
         }))
     }
     pub(super) fn sync_query_values(&mut self) -> Result<(), VulkanError> {

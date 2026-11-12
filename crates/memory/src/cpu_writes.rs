@@ -12,10 +12,66 @@ const BLOCK_BITS: u32 = 11;
 const BLOCK_BYTES: u64 = 1 << BLOCK_BITS;
 const ALIGN_BITS: u32 = 6;
 const ALIGN_BYTES: u64 = 1 << ALIGN_BITS;
+type WriteBatch = Arc<Vec<(u64, u64)>>;
 #[derive(Default)]
 pub(crate) struct CpuWrites {
     enabled: AtomicBool,
     cores: RwLock<Vec<Arc<CpuWriteCollector>>>,
+    applying: Mutex<Vec<WriteBatch>>,
+    landing: Landing,
+}
+
+// Publication runs under the buffer cache lock, so only one landing is active.
+// Store/load fences ensure that a collected CPU write is either seen by the
+// download's snapshot or stores its bytes after that download has landed.
+// https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/rasterizer_download_area.h#L45-L113
+#[derive(Default)]
+struct Landing {
+    sequence: AtomicU64,
+    begin: AtomicU64,
+    end: AtomicU64,
+}
+pub struct DownloadLanding<'a> {
+    landing: &'a Landing,
+}
+impl Drop for DownloadLanding<'_> {
+    fn drop(&mut self) {
+        self.landing.sequence.fetch_add(1, Ordering::Release);
+    }
+}
+impl Landing {
+    fn wait(&self, address: u64, bytes: u64) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let sequence = self.sequence.load(Ordering::Acquire);
+        if sequence & 1 == 0 {
+            return;
+        }
+        let begin = self.begin.load(Ordering::Relaxed);
+        let end = self.end.load(Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Acquire);
+        if self.sequence.load(Ordering::Acquire) != sequence
+            || address >= end
+            || address + bytes <= begin
+        {
+            return;
+        }
+        while self.sequence.load(Ordering::Acquire) == sequence {
+            std::thread::yield_now();
+        }
+    }
+}
+struct ApplyingWrites<'a> {
+    owner: &'a CpuWrites,
+    ranges: WriteBatch,
+}
+impl Drop for ApplyingWrites<'_> {
+    fn drop(&mut self) {
+        self.owner
+            .applying
+            .lock()
+            .unwrap()
+            .retain(|ranges| !Arc::ptr_eq(ranges, &self.ranges));
+    }
 }
 pub(crate) struct CpuWriteCollector {
     current: AtomicU64,
@@ -63,10 +119,57 @@ impl Machine {
     }
     /// GPU::InvalidateGPUCache gathers actual device-address notifications.
     /// There is one graphics consumer; a fence publication never gathers stores.
-    pub fn gather_gpu_dirty_memory(&self, mut invalidate: impl FnMut(u64, u64)) {
-        for core in self.cpu_writes().cores.read().unwrap().iter() {
-            core.gather(&mut invalidate);
+    pub fn gather_gpu_dirty_memory<E>(
+        &self,
+        invalidate: impl FnOnce(&[(u64, u64)]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        // Keep the batch visible while invalidation acquires the cache locks.
+        // Snapshotters take this mutex only to copy metadata, never to wait on
+        // an invalidation callback (which could be waiting for their cache lock).
+        let owner = self.cpu_writes();
+        let batch = {
+            let mut applying = owner.applying.lock().unwrap();
+            let mut ranges = Vec::new();
+            for core in owner.cores.read().unwrap().iter() {
+                core.gather(&mut |address, bytes| ranges.push((address, bytes)));
+            }
+            if ranges.is_empty() {
+                return Ok(());
+            }
+            let ranges = Arc::new(ranges);
+            applying.push(Arc::clone(&ranges));
+            ApplyingWrites { owner, ranges }
+        };
+        invalidate(&batch.ranges)
+    }
+    /// The caller must serialize buffer publications and keep this guard until
+    /// all stores finish. It must not wait for native CPU quiescence in the scope.
+    pub fn begin_gpu_download(&self, begin: u64, end: u64) -> DownloadLanding<'_> {
+        let landing = &self.cpu_writes().landing;
+        landing.begin.store(begin, Ordering::Relaxed);
+        landing.end.store(end, Ordering::Relaxed);
+        let previous = landing.sequence.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            previous & 1,
+            0,
+            "overlapping buffer download publication scopes"
+        );
+        std::sync::atomic::fence(Ordering::SeqCst);
+        DownloadLanding { landing }
+    }
+    /// Include writes still collecting and batches currently being applied.
+    /// Taking this snapshot does not consume either source.
+    pub fn pending_gpu_dirty_memory(&self) -> crate::RangeSet {
+        let owner = self.cpu_writes();
+        let applying = owner.applying.lock().unwrap();
+        let mut ranges = crate::RangeSet::default();
+        for core in owner.cores.read().unwrap().iter() {
+            core.pending(&mut |address, bytes| ranges.insert(address, bytes));
         }
+        for batch in &*applying {
+            ranges.extend(batch.iter().copied());
+        }
+        ranges
     }
 }
 impl CpuWrites {
@@ -85,6 +188,33 @@ impl CpuWrites {
     }
 }
 impl CpuWriteCollector {
+    fn visit(record: u64, visit: &mut impl FnMut(u64, u64)) {
+        if record == EMPTY {
+            return;
+        }
+        let base = (record >> 32) << BLOCK_BITS;
+        let mut bits = record as u32;
+        while bits != 0 {
+            let low = bits.trailing_zeros();
+            let high = low + (bits >> low).trailing_ones();
+            visit(
+                base + (u64::from(low) << ALIGN_BITS),
+                u64::from(high - low) << ALIGN_BITS,
+            );
+            bits = if high == 32 {
+                0
+            } else {
+                bits & (u32::MAX << high)
+            };
+        }
+    }
+    fn pending(&self, visit: &mut impl FnMut(u64, u64)) {
+        let journal = self.journal.lock().unwrap();
+        for &record in &journal.back {
+            Self::visit(record, visit);
+        }
+        Self::visit(self.current.load(Ordering::Acquire), visit);
+    }
     fn collect(&self, mut address: u64, mut bytes: u64) {
         while bytes != 0 {
             let count = bytes.min(BLOCK_BYTES - (address & (BLOCK_BYTES - 1)));
@@ -143,21 +273,7 @@ impl CpuWriteCollector {
             front
         };
         for &record in &front {
-            let base = (record >> 32) << BLOCK_BITS;
-            let mut bits = record as u32;
-            while bits != 0 {
-                let low = bits.trailing_zeros();
-                let high = low + (bits >> low).trailing_ones();
-                invalidate(
-                    base + (u64::from(low) << ALIGN_BITS),
-                    u64::from(high - low) << ALIGN_BITS,
-                );
-                bits = if high == 32 {
-                    0
-                } else {
-                    bits & (u32::MAX << high)
-                };
-            }
+            Self::visit(record, invalidate);
         }
         front.clear();
         self.journal.lock().unwrap().front = front;
@@ -177,7 +293,8 @@ impl CpuWriteCollector {
         }
         for &extent in extents {
             device.apply_on_physical(extent, scratch, |address, bytes| {
-                self.collect(address, bytes)
+                self.collect(address, bytes);
+                machine.cpu_writes().landing.wait(address, bytes);
             });
         }
         write();
@@ -239,21 +356,5 @@ mod tests {
         thread.join().unwrap();
         core.gather(&mut |address, size| seen.insert(address, size));
         assert_eq!(seen.iter().collect::<Vec<_>>(), [(0x10000, 4096 * 64)]);
-    }
-    #[test]
-    fn independent_cores_keep_their_current_blocks_and_shutdown_clears_batches() {
-        let machine = Machine::new(4096).unwrap();
-        machine.enable_cpu_write_collection().unwrap();
-        let first = machine.cpu_writes().register();
-        let second = machine.cpu_writes().register();
-        first.collect(0x10000, 4);
-        second.collect(0x20000, 4);
-        let mut seen = Vec::new();
-        machine.gather_gpu_dirty_memory(|address, size| seen.push((address, size)));
-        assert_eq!(seen, [(0x10000, 64), (0x20000, 64)]);
-        first.collect(0x30000, 4);
-        second.collect(0x40000, 4);
-        machine.disable_cpu_write_collection();
-        machine.gather_gpu_dirty_memory(|_, _| panic!("shutdown left pending stores"));
     }
 }

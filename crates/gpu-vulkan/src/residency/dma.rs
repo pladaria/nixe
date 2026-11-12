@@ -55,6 +55,10 @@ impl Residency<'_> {
         if !registered(source) && !registered(destination) {
             return Ok(false);
         }
+        // Finish an earlier CPU read before replacing its destination. This
+        // copy also mirrors RAM, so preserve publication order before cancelling.
+        // https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/buffer_cache/buffer_cache.h#L1373-L1377
+        self.finish_buffer_reads(destination, bytes)?;
         self.buffer_cache.clear_download(destination, bytes);
         let retained = self.runtime.constructing.len();
         let result = self.record_dma_buffer_copy(source, destination, bytes);
@@ -106,9 +110,10 @@ impl Residency<'_> {
             .gpu_modified_ranges
             .subtract(destination_address, bytes);
         for &(address, size) in &modified {
+            self.buffer_cache.outdate_downloads(address, size);
             self.buffer_cache.gpu_modified_ranges.insert(address, size);
             self.buffer_cache
-                .uncommitted_gpu_modified_ranges
+                .pending_download_ranges
                 .insert(address, size);
         }
         let source_handle = self.use_buffer(source.buffer, source.offset, bytes)?;
@@ -440,17 +445,17 @@ impl Residency<'_> {
             self.buffer_cache.collect_command_copies = false;
             writes?;
             self.copy_command_pages()?;
-            self.buffer_cache.async_downloads.add(address, buffer_size);
-            self.texture_cache.pending_downloads.push(
-                super::texture_download::PendingDownload::Buffer(
-                    super::buffer_download::Download::image_copy(
-                        ticket,
-                        address,
-                        buffer_size,
-                        inputs,
-                    ),
+            let end = self.buffer_cache.enqueue_dma_download(
+                super::buffer_download::ReadDownload::image_copy(
+                    ticket,
+                    address,
+                    buffer_size,
+                    inputs,
                 ),
             );
+            self.texture_cache
+                .pending_downloads
+                .push(super::texture_download::PendingDownload::Buffer(end));
         }
         self.runtime.statistics.dma_image_downloads += u64::from(!upload);
         self.runtime.statistics.gpu_copied_bytes +=

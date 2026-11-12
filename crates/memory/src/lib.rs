@@ -11,7 +11,7 @@ pub mod device_memory;
 mod physical_mapping;
 mod range_set;
 pub use physical_mapping::{PhysicalMapping, PhysicalSpan};
-pub use range_set::{OverlapRangeSet, RangeSet};
+pub use range_set::RangeSet;
 mod heap;
 mod host;
 mod intervals;
@@ -28,10 +28,11 @@ pub use address_space::{
     MappingVersion, NativeCodePage, PageEntry, Translation, capture_subrange,
 };
 pub use captured::CapturedMemory;
+pub use cpu_writes::DownloadLanding;
 pub use device_access::{
     Access, AccessOperation, AccessOrdering, AccessRequestId, AccessResult, AccessResultValue,
     AtomicAccess, AtomicOperation, AtomicTransform, DeviceAccessEndpoint, DeviceAccessRequest,
-    NativeReadArea, PendingAccess,
+    NativeReadArea, PendingAccess, PreparedRead,
 };
 pub use heap::Extent;
 pub use host::{HostAddress, PhysicalArena};

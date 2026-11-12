@@ -240,6 +240,7 @@ impl Drop for DeviceMapping {
         }
         let mut state = self.memory.0.state.write().unwrap();
         let mut changed = false;
+        let mut refresh = BTreeMap::<u32, crate::RangeSet>::new();
         for at in (self.address..self.address + self.bytes).step_by(PAGE_SIZE as usize) {
             let page = state.page_mut(at);
             assert!(page.users != 0);
@@ -249,6 +250,10 @@ impl Drop for DeviceMapping {
             let physical = physical as usize;
             if retired {
                 changed = true;
+                let (process, cpu) = self.memory.0.tracked.entry(at).cpu_backing();
+                if cpu != 0 && self.memory.cached_count(at) != 0 {
+                    refresh.entry(process).or_default().insert(cpu, PAGE_SIZE);
+                }
                 self.memory.0.tracked.entry(at).set_cpu_backing(0, 0);
                 self.memory.0.tracked.entry(at).set_physical(0);
                 state.remove_reverse(&self.memory.0.reverse, physical, at);
@@ -261,6 +266,10 @@ impl Drop for DeviceMapping {
         if changed {
             self.memory.0.generation.fetch_add(1, Ordering::Release);
         }
+        drop(state);
+        self.memory
+            .refresh_cpu_backing(refresh)
+            .expect("retired SMMU mapping protection update");
     }
 }
 impl DeviceMemory {
@@ -689,6 +698,7 @@ impl DeviceMemory {
         }
         let mut at = address;
         let mut changed = false;
+        let mut refresh = BTreeMap::<u32, crate::RangeSet>::new();
         for range in ranges.iter() {
             let (process, cpu) = range.cpu_backing().map_or((0, 0), |(space, address)| {
                 (state.register_process(&space), address.get())
@@ -723,6 +733,12 @@ impl DeviceMemory {
                             at,
                         );
                         state.changed.insert(at, PAGE_SIZE);
+                        if cpu != 0 && self.cached_count(at) != 0 {
+                            refresh
+                                .entry(process)
+                                .or_default()
+                                .insert(cpu + offset - range.offset(), PAGE_SIZE);
+                        }
                     }
                     at += PAGE_SIZE;
                     offset += PAGE_SIZE;
@@ -734,14 +750,51 @@ impl DeviceMemory {
             self.0.generation.fetch_add(1, Ordering::Release);
         }
         drop(state);
-        Ok(DeviceMapping {
+        let mapping = DeviceMapping {
             memory: self.clone(),
             address,
             bytes,
             physical,
             ranges,
             tracked,
-        })
+        };
+        let refreshed = self.refresh_cpu_backing(refresh);
+        drop(_pins);
+        refreshed?;
+        Ok(mapping)
+    }
+    fn cached_count(&self, address: u64) -> u8 {
+        self.0.counts[(address >> LEAF_SHIFT) as usize]
+            .get()
+            .map_or(0, |counts| {
+                counts[((address >> 12) as usize) & (LEAF_PAGES - 1)].load(Ordering::Acquire)
+            })
+    }
+    // Logical cache references can cover SMMU holes. Mapping changes must
+    // refresh the affected CPU aliases even when no reference changes count.
+    fn refresh_cpu_backing(
+        &self,
+        regions: BTreeMap<u32, crate::RangeSet>,
+    ) -> Result<(), MemoryError> {
+        if regions.is_empty() {
+            return Ok(());
+        }
+        let state = self.0.state.read().unwrap();
+        let regions: Vec<_> = regions
+            .into_iter()
+            .filter_map(|(process, ranges)| {
+                state.processes[process as usize]
+                    .upgrade()
+                    .map(|space| (space, ranges))
+            })
+            .collect();
+        drop(state);
+        for (space, ranges) in regions {
+            for (start, bytes) in ranges.iter() {
+                space.refresh_cached_region(crate::GuestVirtualAddress::new(start), bytes, self)?;
+            }
+        }
+        Ok(())
     }
     /// Canonical DAddr cached-page counts, shared by all buffer/image users.
     /// Only zero/one edges change CPU page types, coalesced by CPU continuity.
@@ -827,10 +880,9 @@ impl DeviceMemory {
         };
         for at in (first..end).step_by(PAGE_SIZE as usize) {
             let (cpu_process, cpu_address) = self.0.tracked.entry(at).cpu_backing();
-            if cpu_address == 0 {
-                flush(&mut pending)?;
-                continue;
-            }
+            // Count the cache's logical reference even through a device hole.
+            // Skipping acquisition here but releasing after the page is mapped
+            // would subtract a reference that was never counted.
             let counts = self.0.counts[(at >> LEAF_SHIFT) as usize]
                 .get_or_init(|| Box::new(std::array::from_fn(|_| AtomicU8::new(0))));
             let count = &counts[((at >> 12) as usize) & (LEAF_PAGES - 1)];
@@ -844,7 +896,7 @@ impl DeviceMemory {
             } else {
                 previous == 1
             };
-            if !changed {
+            if !changed || cpu_address == 0 {
                 flush(&mut pending)?;
                 continue;
             }
@@ -880,13 +932,7 @@ impl DeviceMemory {
             },
             &scratch,
             |address, _| {
-                cached |= self.0.counts[(address >> LEAF_SHIFT) as usize]
-                    .get()
-                    .is_some_and(|counts| {
-                        counts[((address >> 12) as usize) & (LEAF_PAGES - 1)]
-                            .load(Ordering::Acquire)
-                            != 0
-                    });
+                cached |= self.cached_count(address) != 0;
             },
         );
         cached

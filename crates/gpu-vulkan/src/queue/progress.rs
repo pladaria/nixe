@@ -49,6 +49,42 @@ impl Timeline {
         progress.check(tick)?;
         Ok(progress.completed() >= tick)
     }
+
+    /// Wait without borrowing the scheduler or holding a resource-cache lock.
+    /// A finite native wait permits cancellation; a timeout is never completion.
+    pub fn wait(&self, progress: &SubmissionProgress, tick: u64) -> Result<(), VulkanError> {
+        while !self.is_done(progress, tick)? {
+            if progress.cancelled() {
+                return Err(VulkanError::QueueStopped);
+            }
+            if !progress.wait_submitted(
+                tick,
+                Some(Instant::now() + std::time::Duration::from_millis(10)),
+            )? {
+                continue;
+            }
+            let semaphores = [self.handle];
+            let values = [tick];
+            let info = vk::SemaphoreWaitInfo::default()
+                .semaphores(&semaphores)
+                .values(&values);
+            match unsafe { self.owner.device.wait_semaphores(&info, 10_000_000) } {
+                Ok(()) => progress.observe_completed(tick),
+                Err(vk::Result::TIMEOUT) => {}
+                Err(result) => {
+                    progress.fail(
+                        tick,
+                        NativeFailure::Vulkan {
+                            operation: "GPU readback wait",
+                            result,
+                        },
+                    );
+                    return Err(VulkanError::vk("GPU readback wait", result));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 impl Drop for Timeline {
     fn drop(&mut self) {

@@ -302,6 +302,10 @@ impl Drop for FenceManager {
             self.shared.changed.notify_all();
             std::mem::take(&mut state.pending)
         };
+        // Active query actions can be waiting on a reactive read's timeline.
+        // Cancel those waits before joining; the queue's own shutdown happens
+        // only after this worker has exited and still drains submitted GPU work.
+        self.progress.cancel_pending();
         for mut fence in pending {
             for action in fence.operations.drain(..) {
                 let _ = action(Err(failure("GPU fencing thread stopped")));

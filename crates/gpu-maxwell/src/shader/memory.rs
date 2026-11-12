@@ -172,12 +172,6 @@ impl ShaderCache {
             }
         }
     }
-    pub fn invalidate_device_write(&self, memory: &DeviceMemory, address: u64, bytes: u64) {
-        self.invalidate_region(address, bytes);
-        memory.apply_device_aliases(address, bytes, |alias, size| {
-            self.invalidate_region(alias, size)
-        });
-    }
 }
 
 /// Only the graphics owner reads mutable guest memory. Compilation workers

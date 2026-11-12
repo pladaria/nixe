@@ -1,14 +1,17 @@
 //! The shared GPU page table used directly by the command processor.
 use super::*;
-use std::sync::{OnceLock, RwLock, Weak, atomic::AtomicU64};
+use std::sync::{
+    OnceLock, RwLock, Weak,
+    atomic::{AtomicU64, AtomicUsize},
+};
 
-/// MemoryManager::BindRasterizer connects GPU mapping changes to the actual
-/// buffer and texture cache owners. It is independent of device RAM coherence.
+/// Connect GPU mapping changes and ordered RAM writes to the actual cache owners.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/rasterizer_interface.h
 pub trait MaxwellGpuMemoryInterface: Send + Sync + std::fmt::Debug {
     fn modify_gpu_memory(&self, address_space: MaxwellAddressSpaceId, address: u64, bytes: u64);
     fn unmap_memory(&self, address: u64, bytes: u64);
     fn must_flush_region(&self, address: u64, bytes: u64) -> bool;
+    fn finish_read(&self, address: u64, bytes: u64) -> Result<(), Arc<nixe_memory::MemoryError>>;
     fn command_tick_done(&self, tick: u64) -> Result<bool, Arc<nixe_memory::MemoryError>>;
     fn read_command(
         &self,
@@ -27,6 +30,12 @@ pub enum CommandRead {
 }
 
 #[derive(Debug)]
+struct RasterizerBinding {
+    interface: Weak<dyn MaxwellGpuMemoryInterface>,
+    pending_reads: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
 pub(super) struct TranslationState {
     id: MaxwellAddressSpaceId,
     machine: Machine,
@@ -36,7 +45,7 @@ pub(super) struct TranslationState {
     pub(super) mappings: RwLock<Mappings>,
     pub(super) generation: AtomicU64,
     pub(super) initialized: AtomicBool,
-    rasterizer: OnceLock<Weak<dyn MaxwellGpuMemoryInterface>>,
+    rasterizer: OnceLock<RasterizerBinding>,
 }
 #[derive(Debug)]
 pub(super) struct Mappings {
@@ -98,17 +107,28 @@ impl MaxwellGpuMemoryHandle {
     pub fn device_memory(&self) -> &crate::MaxwellDeviceMemory {
         &self.inner.device
     }
-    pub fn bind_rasterizer(&self, rasterizer: Weak<dyn MaxwellGpuMemoryInterface>) {
+    pub fn bind_rasterizer(
+        &self,
+        interface: Weak<dyn MaxwellGpuMemoryInterface>,
+        pending_reads: Arc<AtomicUsize>,
+    ) {
         self.inner
             .rasterizer
-            .set(rasterizer)
+            .set(RasterizerBinding {
+                interface,
+                pending_reads,
+            })
             .expect("GPU memory rasterizer already bound");
     }
     /// Notify after releasing the live mapping registry. Cache consumers may
     /// resolve cold physical inputs while holding their own content locks.
     pub(super) fn modify_gpu_memory(&self, address: u64, bytes: u64) {
         if bytes != 0
-            && let Some(rasterizer) = self.inner.rasterizer.get().and_then(Weak::upgrade)
+            && let Some(rasterizer) = self
+                .inner
+                .rasterizer
+                .get()
+                .and_then(|binding| binding.interface.upgrade())
         {
             rasterizer.modify_gpu_memory(self.inner.id, address, bytes);
         }
@@ -121,7 +141,11 @@ impl MaxwellGpuMemoryHandle {
         let begin = start.max(mapping.offset.get());
         let end = end.min(mapping.offset.get() + mapping.size);
         if begin < end
-            && let Some(rasterizer) = self.inner.rasterizer.get().and_then(Weak::upgrade)
+            && let Some(rasterizer) = self
+                .inner
+                .rasterizer
+                .get()
+                .and_then(|binding| binding.interface.upgrade())
         {
             let address =
                 live._device.address() + mapping.backing_offset + begin - mapping.offset.get();
@@ -440,8 +464,9 @@ impl MaxwellGpuMemory {
         Ok(())
     }
 
-    /// WriteBlockCached changes RAM now and defers GPU cache invalidation to
-    /// FlushCaching. No backend callback or native upload runs on a CB write.
+    /// WriteBlockCached changes RAM after prior reactive reads have landed and
+    /// defers cache invalidation to FlushCaching. Native uploads remain deferred
+    /// until a consumer needs the modified buffer.
     pub fn write_block_cached(
         &mut self,
         address: GpuVirtualAddress,
@@ -503,6 +528,7 @@ impl MaxwellGpuMemory {
         }
         self.checked_add(address, source.len() as u64 - 1)
             .map_err(MaxwellGpuAccessError::Address)?;
+        let binding = self.inner.rasterizer.get();
         let mut at = address.get();
         let end = at + source.len() as u64;
         while at < end {
@@ -511,6 +537,17 @@ impl MaxwellGpuMemory {
             // WriteBlockImpl advances over reserved/unmapped GPU pages. Already
             // written prefixes are not preflighted, captured or rolled back.
             if let Some(device) = span.address {
+                // A pending read must land before this store, rather than
+                // overwrite it before deferred cache invalidation runs.
+                // https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/memory_manager.cpp#L537-L554
+                if let Some(binding) = binding
+                    && binding.pending_reads.load(Ordering::Acquire) != 0
+                    && let Some(rasterizer) = binding.interface.upgrade()
+                {
+                    rasterizer
+                        .finish_read(device, count)
+                        .map_err(MaxwellGpuAccessError::Backing)?;
+                }
                 let begin = (at - address.get()) as usize;
                 let source = source.slice(begin..begin + count as usize);
                 let device_memory = self.device_memory().device();
@@ -792,7 +829,11 @@ impl MaxwellCommandMemory {
         let Some(device) = span.address else {
             return Ok(Some(0));
         };
-        let Some(caches) = inner.rasterizer.get().and_then(Weak::upgrade) else {
+        let Some(caches) = inner
+            .rasterizer
+            .get()
+            .and_then(|binding| binding.interface.upgrade())
+        else {
             return Ok(None);
         };
         if caches.must_flush_region(device, 4) {
@@ -809,7 +850,7 @@ impl MaxwellCommandMemory {
             .inner
             .rasterizer
             .get()
-            .and_then(Weak::upgrade)
+            .and_then(|binding| binding.interface.upgrade())
             .map_or(Ok(false), |cache| cache.command_tick_done(tick))
     }
     pub fn gpu_written(&self, request: &crate::MaxwellCommandFetch) -> bool {
@@ -844,7 +885,11 @@ impl MaxwellCommandMemory {
         if !inner.initialized.load(Ordering::Acquire) || self.mappings_changed() {
             return Ok(CommandRead::Unknown);
         }
-        let Some(caches) = inner.rasterizer.get().and_then(Weak::upgrade) else {
+        let Some(caches) = inner
+            .rasterizer
+            .get()
+            .and_then(|binding| binding.interface.upgrade())
+        else {
             return Ok(CommandRead::Unknown);
         };
         request.prepare_storage()?;

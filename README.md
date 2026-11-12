@@ -128,6 +128,7 @@ Nixe is grateful to the projects and communities whose work has helped make this
   for system interfaces and homebrew behavior.
 - [Eden](https://git.eden-emu.dev/eden-emu/eden) and yuzu, for the many architectural and optimization ideas
   drawn from their emulators, as well as code used in parts of Nixe.
+- [Lichii](https://github.com/zortos293/Lichii), for its graphics architecture and optimization techniques.
 - [Dynarmic](https://github.com/lioncash/dynarmic), for the dynamic recompiler used by Nixe's CPU emulation.
 - [AsmJit](https://github.com/asmjit/asmjit), for the machine-code assembler used by Nixe's MME JIT compiler.
 - [AMD FidelityFX Super Resolution](https://github.com/GPUOpen-Effects/FidelityFX-FSR), for the FSR 1 spatial presentation filter.

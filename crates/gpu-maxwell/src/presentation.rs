@@ -118,7 +118,7 @@ impl GpuExecution for MissingGpuExecution {
     }
 }
 impl nixe_gpu::OwnerMemory for MissingGpuExecution {
-    fn invalidate_gpu_cache(&mut self) {
+    fn invalidate_gpu_cache(&mut self) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
         match *self {}
     }
     fn flush_region(

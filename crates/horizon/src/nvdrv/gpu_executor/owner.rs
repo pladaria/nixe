@@ -918,13 +918,13 @@ impl<
         >,
 > nixe_gpu::OwnerMemory for CommandHost<'_, '_, L, E>
 {
-    fn invalidate_gpu_cache(&mut self) {
+    fn invalidate_gpu_cache(&mut self) -> Result<(), Arc<MemoryError>> {
         self.owner
             .backend
             .borrow_mut()
             .as_mut()
             .unwrap()
-            .invalidate_gpu_cache();
+            .invalidate_gpu_cache()
     }
 
     fn flush_region(&mut self, address: u64, bytes: u64) -> Result<(), Arc<MemoryError>> {

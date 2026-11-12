@@ -334,7 +334,7 @@ impl NativeGpuExecution {
         self.state.fences.queue(work, true, action)?;
         drop(residency);
         // SignalFence queues its committed prefix before InvalidateGPUCache.
-        nixe_gpu::OwnerMemory::invalidate_gpu_cache(self);
+        nixe_gpu::OwnerMemory::invalidate_gpu_cache(self).map_err(VulkanError::Memory)?;
         Ok(())
     }
 }
@@ -456,19 +456,6 @@ impl NativeExecution<'_> {
             .map_err(runtime)
     }
 
-    fn inline_memory(&mut self, regions: &[GuestBufferRange]) -> Result<(), BackendRuntimeError> {
-        for range in regions {
-            self.residency.shader_cache.invalidate_device_write(
-                self.residency.device_memory(),
-                range.address,
-                range.size,
-            );
-        }
-
-        self.residency
-            .inline_write_regions(regions)
-            .map_err(runtime)
-    }
     fn queue_device_access(
         &mut self,
         request: nixe_memory::DeviceAccessRequest,
@@ -771,6 +758,7 @@ impl GpuExecution for NativeGpuExecution {
         &mut self,
         request: nixe_memory::DeviceAccessRequest,
     ) -> Result<(), BackendRuntimeError> {
+        nixe_gpu::OwnerMemory::invalidate_gpu_cache(self).map_err(BackendRuntimeError::Memory)?;
         self.execution().queue_device_access(request)
     }
     fn progress(&mut self) -> Result<(), BackendRuntimeError> {
@@ -839,15 +827,15 @@ impl GpuExecution for NativeGpuExecution {
 }
 
 impl nixe_gpu::OwnerMemory for NativeGpuExecution {
-    fn invalidate_gpu_cache(&mut self) {
-        let caches = &self.residency.caches;
-        self.residency
-            .memory()
-            .gather_gpu_dirty_memory(|address, bytes| {
-                nixe_memory::device_memory::DeviceMemoryInterface::invalidate_region(
-                    &**caches, address, bytes,
-                );
-            });
+    fn invalidate_gpu_cache(&mut self) -> Result<(), Arc<nixe_memory::MemoryError>> {
+        let memory = self.residency.memory().clone();
+        memory
+            .gather_gpu_dirty_memory(|ranges| {
+                self.residency
+                    .access()
+                    .write_cpu_ranges(ranges.iter().copied())
+            })
+            .map_err(|error| owner_memory_error(runtime(error)))
     }
 
     fn flush_region(
@@ -855,6 +843,7 @@ impl nixe_gpu::OwnerMemory for NativeGpuExecution {
         address: u64,
         bytes: u64,
     ) -> Result<(), Arc<nixe_memory::MemoryError>> {
+        self.invalidate_gpu_cache()?;
         self.execution()
             .flush_region(address, bytes)
             .map_err(owner_memory_error)
@@ -863,22 +852,26 @@ impl nixe_gpu::OwnerMemory for NativeGpuExecution {
         &mut self,
         regions: &[GuestBufferRange],
     ) -> Result<(), Arc<nixe_memory::MemoryError>> {
-        self.residency.caches.invalidate_regions(regions);
-        Ok(())
+        self.residency
+            .access()
+            .write_regions(regions)
+            .map_err(|error| owner_memory_error(runtime(error)))
     }
     fn inline_memory(
         &mut self,
         regions: &[GuestBufferRange],
     ) -> Result<(), Arc<nixe_memory::MemoryError>> {
-        self.execution()
-            .inline_memory(regions)
-            .map_err(owner_memory_error)
+        self.residency
+            .access()
+            .write_regions(regions)
+            .map_err(|error| owner_memory_error(runtime(error)))
     }
     fn access_memory(
         &mut self,
         ranges: Vec<nixe_memory::AllocationRange>,
         operation: nixe_memory::AccessOperation,
     ) -> Result<nixe_memory::AccessResult, Arc<nixe_memory::MemoryError>> {
+        self.invalidate_gpu_cache()?;
         self.execution()
             .access_memory(ranges, operation)
             .map_err(owner_memory_error)

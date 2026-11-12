@@ -280,13 +280,14 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
     }
     fn bind_gpu_memory(&mut self, memory: &model::MaxwellGpuMemoryHandle) {
         let renderer = self.renderer.borrow();
-        let caches: Arc<dyn model::MaxwellGpuMemoryInterface> = renderer
+        let caches = &renderer
             .as_ref()
             .expect("installed renderer")
             .residency
-            .caches
-            .clone();
-        memory.bind_rasterizer(Arc::downgrade(&caches));
+            .caches;
+        let pending_reads = caches.pending_read_count();
+        let interface: Arc<dyn model::MaxwellGpuMemoryInterface> = caches.clone();
+        memory.bind_rasterizer(Arc::downgrade(&interface), pending_reads);
     }
     fn create_channel(&mut self, channel: model::MaxwellChannelId) {
         self.renderer

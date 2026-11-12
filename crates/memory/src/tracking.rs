@@ -509,7 +509,7 @@ impl Machine {
         operation: &mut crate::AccessOperation,
     ) -> Result<crate::AccessResult, MemoryError> {
         match operation {
-            crate::AccessOperation::Flush(_) => Err(MemoryError::Invalid(
+            crate::AccessOperation::PrepareRead(_) => Err(MemoryError::Invalid(
                 "rasterizer flush requires the graphics owner",
             )),
 
@@ -577,7 +577,7 @@ impl Machine {
             ));
         }
         match operation {
-            crate::AccessOperation::Flush(_) => return Ok(None),
+            crate::AccessOperation::PrepareRead(_) => return Ok(None),
 
             crate::AccessOperation::Write(bytes) => {
                 if self.write_physical_impl(ranges, bytes, true)? {

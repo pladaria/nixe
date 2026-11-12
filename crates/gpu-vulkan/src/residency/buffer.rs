@@ -673,15 +673,14 @@ impl Residency<'_> {
         }
         Ok(())
     }
-    /// AccelerateInlineToMemory preserves GPU-owned neighbours while uploading
-    /// the engine's written bytes in native queue order.
-    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L179-L199
-    pub(super) fn inline_memory(&mut self, address: u64, bytes: u64) -> Result<bool, VulkanError> {
-        let registered = (address >> 16..(address + bytes).div_ceil(1 << 16))
-            .any(|page| self.buffer_cache.buffer_index.at(page << 16).is_some());
-        if !registered {
-            return Ok(false);
-        }
+    /// After claiming the CPU-written bytes, preserve any GPU-owned neighbours
+    /// by uploading only the written interval in native queue order.
+    /// https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/buffer_cache/buffer_cache.h#L225-L296
+    pub(super) fn upload_partial_write(
+        &mut self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<bool, VulkanError> {
         let page = nixe_memory::PAGE_SIZE;
         let first = address / page * page;
         let end = (address + bytes).div_ceil(page) * page;
@@ -692,15 +691,11 @@ impl Residency<'_> {
         {
             return Ok(false);
         }
-        // Inline uploads bypass write_memory to preserve GPU-owned neighbours.
-        // The committed host bytes still invalidate any retained command copy.
-        self.buffer_cache
-            .device_memory
-            .write_command_pages(address, bytes);
-        self.buffer_cache.clear_download(address, bytes);
-        self.buffer_cache
-            .gpu_modified_ranges
-            .subtract(address, bytes);
+        let registered = (address >> 16..(address + bytes).div_ceil(1 << 16))
+            .any(|page| self.buffer_cache.buffer_index.at(page << 16).is_some());
+        if !registered {
+            return Ok(false);
+        }
         let range = self.device_buffer(
             address,
             bytes,

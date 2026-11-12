@@ -86,8 +86,9 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                 MaxwellHostSynchronizationKind::L2SysmemInvalidate { .. }
                 | MaxwellHostSynchronizationKind::L2FlushDirty { .. } => {
                     // Puller::MemOpB consumes the per-core GPU dirty managers.
-                    self.host.invalidate_gpu_cache();
-                    Ok(())
+                    self.host.invalidate_gpu_cache().map_err(|error| {
+                        MaxwellSubmissionExecutionError::Native(error.to_string().into())
+                    })
                 }
             }
         })();
@@ -284,7 +285,9 @@ impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
                 MaxwellThreeDSynchronizationPlan::InvalidateTextureCache { .. }
             ) {
                 // Maxwell3D::invalidate_texture_data_cache: invalidation then WFI.
-                self.host.invalidate_gpu_cache();
+                self.host.invalidate_gpu_cache().map_err(|error| {
+                    MaxwellSubmissionExecutionError::Native(error.to_string().into())
+                })?;
                 self.host.order_device(self.frontend)?;
             }
             if let MaxwellThreeDSynchronizationPlan::ReportSemaphoreWrite(report) = plan {

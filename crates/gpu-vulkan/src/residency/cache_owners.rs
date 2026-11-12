@@ -6,14 +6,40 @@ pub(crate) struct CacheOwners {
     pub(super) command_pages: Arc<command_pages::CommandPages>,
     pub(crate) shader_cache: nixe_gpu_maxwell::recompiler::ShaderCache,
     device_memory: nixe_memory::device_memory::DeviceMemory,
-    progress: Arc<crate::queue::progress::SubmissionProgress>,
-    timeline: Arc<crate::queue::progress::Timeline>,
+    pub(super) progress: Arc<crate::queue::progress::SubmissionProgress>,
+    pub(super) timeline: Arc<crate::queue::progress::Timeline>,
     pub(crate) query_cache: std::sync::Mutex<query::QueryCache>,
     pub(crate) buffer_cache: std::sync::Mutex<BufferCache>,
+    pending_buffer_reads: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) texture_cache: std::sync::Mutex<TextureCache>,
     gpu_invalidations: Arc<virtual_range_cache::Invalidations>,
 }
 impl CacheOwners {
+    pub(crate) fn pending_read_count(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.pending_buffer_reads)
+    }
+    pub(super) fn finish_buffer_reads(&self, address: u64, bytes: u64) -> Result<(), VulkanError> {
+        if self
+            .pending_buffer_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            return Ok(());
+        }
+        let end = self
+            .buffer_cache
+            .lock()
+            .unwrap()
+            .pending_read(address, bytes);
+        if let Some(end) = end {
+            self.timeline.wait(&self.progress, end.work().tick())?;
+            self.buffer_cache
+                .lock()
+                .unwrap()
+                .publish_reads_through(end)?;
+        }
+        Ok(())
+    }
     pub(crate) fn new(
         device: nixe_memory::device_memory::DeviceMemory,
         progress: Arc<crate::queue::progress::SubmissionProgress>,
@@ -22,6 +48,7 @@ impl CacheOwners {
     ) -> Self {
         let command_pages = Arc::new(command_pages::CommandPages::default());
         let buffer_cache = BufferCache::new(device.clone(), Arc::clone(&command_pages));
+        let pending_buffer_reads = Arc::clone(&buffer_cache.pending_read_count);
         let gpu_invalidations = Arc::clone(&buffer_cache.virtual_ranges.invalidations);
         Self {
             command_pages,
@@ -31,6 +58,7 @@ impl CacheOwners {
             device_memory: device.clone(),
             query_cache: Default::default(),
             buffer_cache: std::sync::Mutex::new(buffer_cache),
+            pending_buffer_reads,
             texture_cache: std::sync::Mutex::new(TextureCache::new(device, progress, samplers)),
             gpu_invalidations,
         }
@@ -56,6 +84,13 @@ impl CacheOwners {
     }
 }
 impl nixe_gpu_maxwell::MaxwellGpuMemoryInterface for CacheOwners {
+    fn finish_read(&self, address: u64, bytes: u64) -> Result<(), Arc<nixe_memory::MemoryError>> {
+        self.finish_buffer_reads(address, bytes).map_err(|error| {
+            Arc::new(nixe_memory::MemoryError::Execution(
+                error.to_string().into(),
+            ))
+        })
+    }
     fn command_tick_done(&self, tick: u64) -> Result<bool, Arc<nixe_memory::MemoryError>> {
         self.timeline
             .is_done(&self.progress, tick)
@@ -147,17 +182,42 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
     fn try_on_cpu_read(&self, address: u64, bytes: u64) -> Option<nixe_memory::NativeReadArea> {
         // The graphics owner can hold this mutex while waiting for native
         // quiescence. An admitted vCPU must never block on that mutex.
-        self.texture_cache
-            .try_lock()
-            .ok()?
-            .flush_area::<false>(address, bytes)
+        let mut textures = self.texture_cache.try_lock().ok()?;
+        let area = textures.flush_area::<false>(address, bytes)?;
+        // Check after locking textures: the owner takes that lock while adding
+        // a read. Sampling the count beforehand could miss a just-prepared copy.
+        // Buffer acquisition is nonblocking even though this is the opposite
+        // order from the owner; failure releases textures and suspends the read.
+        if self
+            .pending_buffer_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            let buffers = self.buffer_cache.try_lock().ok()?;
+            if buffers
+                .pending_read(area.start, area.end - area.start)
+                .is_some()
+            {
+                return None;
+            }
+        }
+        Some(area)
     }
     fn on_cpu_read(&self, address: u64, bytes: u64) -> nixe_memory::NativeReadArea {
-        self.texture_cache
+        let mut buffers = self.buffer_cache.lock().unwrap();
+        let mut area = self
+            .texture_cache
             .lock()
             .unwrap()
             .flush_area::<true>(address, bytes)
-            .expect("reactive reads always resolve an area")
+            .expect("reactive reads always resolve an area");
+        area.preemptive &= buffers
+            .pending_read(area.start, area.end - area.start)
+            .is_none();
+        if !area.preemptive {
+            buffers.note_read_back(address, bytes);
+        }
+        area
     }
 
     fn on_cpu_write(&self, address: u64, bytes: u64) -> bool {
@@ -220,21 +280,38 @@ pub(crate) struct BufferCache {
     pub(super) memory_tracker: nixe_gpu::memory_tracker::MemoryTracker,
     pub(super) gpu_modified_ranges: RangeSet,
     pub(super) device_mapping_generation: u64,
-    pub(super) uncommitted_gpu_modified_ranges: RangeSet,
-    pub(super) committed_gpu_modified_ranges: Vec<RangeSet>,
-    pub(super) async_downloads: nixe_memory::OverlapRangeSet,
+    pub(super) pending_download_ranges: RangeSet,
+    pub(super) download_serial: u64,
+    pub(super) pending_read_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) pending_reports: Vec<Arc<query::Query>>,
+    pub(super) read_back_pages: Vec<buffer_download::ReadBackPage>,
+    pub(super) read_back_reads: u64,
+    pub(super) read_download_ranges: RangeSet,
+    pub(super) read_downloads:
+        std::collections::VecDeque<(buffer_download::DownloadEnd, buffer_download::ReadDownload)>,
+    // DMA staging belongs to the texture cache's publication order, including
+    // interleaved images. A buffer prefix must not consume these entries.
+    pub(super) dma_downloads:
+        std::collections::VecDeque<(buffer_download::DownloadEnd, buffer_download::ReadDownload)>,
     pub(super) buffer_downloads: std::collections::VecDeque<Option<buffer_download::Download>>,
 }
 impl BufferCache {
-    pub(super) fn write_memory(&mut self, address: u64, bytes: u64) {
+    pub(super) fn claim_cpu_write(&mut self, address: u64, bytes: u64) {
         // Include ordered host writes, even if they were already notified before
         // being deferred. Versions follow physical pages, including all aliases.
         // https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/buffer_cache/buffer_cache.h#L225
         self.device_memory.write_command_pages(address, bytes);
-        if self.gpu_modified_ranges.intersects(address, bytes) {
+        if !self.read_downloads.is_empty()
+            || !self.buffer_downloads.is_empty()
+            || !self.dma_downloads.is_empty()
+            || self.gpu_modified_ranges.intersects(address, bytes)
+        {
             self.clear_download(address, bytes);
             self.gpu_modified_ranges.subtract(address, bytes);
         }
+    }
+    pub(super) fn write_memory(&mut self, address: u64, bytes: u64) {
+        self.claim_cpu_write(address, bytes);
         self.memory_tracker.cpu_write(address, bytes);
     }
     pub(super) fn new(
@@ -256,11 +333,23 @@ impl BufferCache {
             memory_tracker: nixe_gpu::memory_tracker::MemoryTracker::new(device),
             gpu_modified_ranges: RangeSet::default(),
             device_mapping_generation: 0,
-            uncommitted_gpu_modified_ranges: RangeSet::default(),
-            committed_gpu_modified_ranges: Vec::new(),
-            async_downloads: Default::default(),
+            pending_download_ranges: RangeSet::default(),
+            download_serial: 0,
+            pending_read_count: Default::default(),
+            pending_reports: Vec::new(),
+            read_back_pages: Vec::new(),
+            read_back_reads: 0,
+            read_download_ranges: Default::default(),
+            read_downloads: Default::default(),
+            dma_downloads: Default::default(),
             buffer_downloads: Default::default(),
         }
+    }
+}
+impl Drop for BufferCache {
+    fn drop(&mut self) {
+        self.pending_read_count
+            .store(0, std::sync::atomic::Ordering::Release);
     }
 }
 pub(crate) struct TextureCache {
@@ -365,34 +454,6 @@ impl Drop for TextureCache {
 }
 
 impl CacheOwners {
-    /// InnerInvalidation visits each actual cache under its own lock, before
-    /// draw preparation takes both locks.
-    pub(crate) fn invalidate_regions(&self, regions: &[nixe_gpu::native::GuestBufferRange]) {
-        {
-            let mut textures = self.texture_cache.lock().unwrap();
-            for range in regions {
-                textures.write_memory(range.address, range.size);
-            }
-        }
-        {
-            let mut buffers = self.buffer_cache.lock().unwrap();
-            for range in regions {
-                buffers.write_memory(range.address, range.size);
-            }
-        }
-        for range in regions {
-            self.query_cache
-                .lock()
-                .unwrap()
-                .invalidate_region(range.address, range.size);
-            self.shader_cache.invalidate_device_write(
-                &self.device_memory,
-                range.address,
-                range.size,
-            );
-        }
-    }
-
     /// FenceManager::PopAsyncFlushes runs after the native fence, under the
     /// actual cache locks, and consumes exactly one committed prefix per cache.
     pub(crate) fn pop_async_flushes(&self) -> Result<(), VulkanError> {
