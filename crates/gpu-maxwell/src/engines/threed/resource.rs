@@ -336,10 +336,7 @@ fn decode_sampled_texture_format(
         (0x0c, [1, 1, 1, 1], _, false) => Some(ImageFormat::Rg16Snorm),
         (0x03, [2, 2, 2, 2], _, false) => Some(ImageFormat::Rgba16Unorm),
         (0x03, [1, 1, 1, 1], _, false) => Some(ImageFormat::Rgba16Snorm),
-        // B5G6R5 stores R in the low bits. The B,G,R swizzle makes the high
-        // five bits the observable red channel (packed RGB565).
-        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/format_traits.inc
-        (0x15, [2, 2, 2, 2], [4, 3, 2, 7], false) => Some(ImageFormat::Rgb565Unorm),
+        (0x15, [2, 2, 2, 2], _, false) => Some(ImageFormat::Rgb565Unorm),
         // Z24S8 uses unsigned stencil R and normalized depth G. Selecting G
         // for RGB samples the depth aspect, with alpha forced to one.
         (0x29, [4, 2, 2, 2], [3, 3, 3, 7], false) => Some(ImageFormat::Depth24UnormStencil8Uint),
