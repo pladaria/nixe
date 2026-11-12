@@ -187,7 +187,4 @@ snapshot/feedback-loop lowering and is rejected when supplied as ordinary bindin
 - Unsupported ISA forms and resource combinations retain precise frontend/compiler
   errors. Shader execution uses the standalone recompiler and native Vulkan.
 
-The fixed-color/compute helper renderer and its separate solid pipeline factory
-have been removed. Tests use fixtures through this recorder. The alternative
-binding ABI implementation is compiled only with `binding-probe`; its independent
-pools/byte/address candidates are deliberately a diagnostic experiment.
+Tests use captured shader fixtures through this recorder.

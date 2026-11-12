@@ -120,7 +120,6 @@ python scripts/build-vulkan-shaders.py --sdk-bin /path/to/sdk/x86_64/bin
 python scripts/build-vulkan-shaders.py --sdk-bin /path/to/sdk/x86_64/bin --check
 ```
 
-The optional `binding-probe` example compares descriptor transport strategies. The
-ignored pipeline-construction probe checks exact pixels and reports cold creation
-and warm CPU/GPU timings. Neither synthetic probe establishes commercial workload
-parity or verification on untested host platforms.
+The ignored pipeline-construction probe checks exact pixels and reports cold
+creation and warm CPU/GPU timings. This synthetic probe does not establish
+commercial workload parity or verification on untested host platforms.

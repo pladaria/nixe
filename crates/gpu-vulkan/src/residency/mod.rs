@@ -22,8 +22,6 @@ pub(crate) mod execution;
 mod format;
 mod image;
 pub(crate) mod presentation;
-#[cfg(feature = "binding-probe")]
-pub(crate) mod probe_commands;
 mod raster_transfer;
 mod recording;
 mod retirement;
@@ -93,8 +91,6 @@ struct BufferEntry {
     contents: Contents,
     native: Arc<AllocatedBuffer>,
     usage: vk::BufferUsageFlags,
-    #[cfg(feature = "binding-probe")]
-    address: vk::DeviceAddress,
     used: sync::UsageTracker,
 }
 pub(crate) struct ImageEntry {
@@ -261,10 +257,6 @@ pub(crate) struct ResidencyRuntime {
     statistics: ResidencyStatistics,
     barriers: sync::Barriers,
     multi_range: multi_range::MultiRangeCache,
-    #[cfg(feature = "binding-probe")]
-    helpers: crate::helpers::Helpers,
-    #[cfg(feature = "binding-probe")]
-    descriptor_dispatch: Option<ash::ext::descriptor_buffer::Device>,
     /// Entries needed by a cold reconstruction cannot be evicted by its allocations.
     pub(crate) constructing: Vec<Resource>,
     descriptors: crate::cache::DescriptorCache,
@@ -298,13 +290,6 @@ impl VulkanResidency {
         if bytes == 0 {
             return Err(VulkanError::InvalidResource("empty residency budget"));
         }
-        #[cfg(feature = "binding-probe")]
-        let descriptor_dispatch = device.profile().descriptor_buffer.then(|| {
-            ash::ext::descriptor_buffer::Device::new(
-                &device.owner.instance.instance,
-                &device.owner.device,
-            )
-        });
         let descriptors = crate::cache::DescriptorCache::new(&device);
         let multi_range = multi_range::MultiRangeCache::new(&device);
         let mut cache = Self {
@@ -330,10 +315,6 @@ impl VulkanResidency {
                 statistics: ResidencyStatistics::default(),
                 barriers: sync::Barriers::default(),
                 multi_range,
-                #[cfg(feature = "binding-probe")]
-                helpers: crate::helpers::Helpers::default(),
-                #[cfg(feature = "binding-probe")]
-                descriptor_dispatch,
                 constructing: Vec::new(),
                 descriptor_resources: Vec::new(),
                 descriptor_queue: crate::cache::UpdateDescriptorQueue::new(

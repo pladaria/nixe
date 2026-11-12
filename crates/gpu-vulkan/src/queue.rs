@@ -147,8 +147,6 @@ pub(crate) fn align_up(value: u64, alignment: u64) -> Option<u64> {
 pub(crate) struct Slot {
     timing: Option<timing::Queries>,
     frame: Option<u64>,
-    #[cfg(feature = "binding-probe")]
-    owner: Arc<DeviceOwner>,
     pub native: Arc<crate::dispatch::CommandSlot>,
     pub tick: u64,
     pub retired_buffers: Vec<Arc<AllocatedBuffer>>,
@@ -161,10 +159,6 @@ pub(crate) struct Slot {
     pub bound_graphics_offsets: Vec<u32>,
     pub bound_compute_layout: vk::PipelineLayout,
     pub bound_graphics_layout: vk::PipelineLayout,
-    #[cfg(feature = "binding-probe")]
-    pub probe_queries: Vec<Arc<crate::probe::ProbeQueries>>,
-    #[cfg(feature = "binding-probe")]
-    pub descriptors: crate::residency::probe_commands::Descriptors,
     pub bound_compute: usize,
     pub bound_graphics: usize,
     pub vertex_channel: Option<u64>,
@@ -184,8 +178,6 @@ impl Slot {
             timing: timing::Queries::new(Arc::clone(&owner), family)?,
             frame: None,
             native,
-            #[cfg(feature = "binding-probe")]
-            owner,
             tick: 0,
             retired_buffers: Vec::new(),
             retired_images: Vec::new(),
@@ -197,10 +189,6 @@ impl Slot {
             bound_graphics_offsets: Vec::new(),
             bound_compute_layout: vk::PipelineLayout::null(),
             bound_graphics_layout: vk::PipelineLayout::null(),
-            #[cfg(feature = "binding-probe")]
-            probe_queries: Vec::new(),
-            #[cfg(feature = "binding-probe")]
-            descriptors: crate::residency::probe_commands::Descriptors::new(),
             bound_compute: 0,
             bound_graphics: 0,
             vertex_channel: None,
@@ -216,13 +204,6 @@ impl Slot {
     }
     fn reusable(&self, completed: u64) -> bool {
         self.tick <= completed
-    }
-}
-#[cfg(feature = "binding-probe")]
-impl Drop for Slot {
-    fn drop(&mut self) {
-        // QueueState proves completion/device loss before slots are dropped.
-        self.descriptors.destroy(&self.owner);
     }
 }
 
@@ -511,8 +492,6 @@ impl QueueState {
                 slot.retained_views.clear();
                 slot.graphics_state = Default::default();
                 slot.feedback_aspects = None;
-                #[cfg(feature = "binding-probe")]
-                slot.probe_queries.clear();
             }
         }
     }
@@ -575,8 +554,6 @@ impl QueueState {
             );
         }
         slot.tick = tick;
-        #[cfg(feature = "binding-probe")]
-        slot.descriptors.reset(&self.owner)?;
         slot.bound_compute = 0;
         slot.bound_graphics = 0;
         slot.vertex_channel = None;

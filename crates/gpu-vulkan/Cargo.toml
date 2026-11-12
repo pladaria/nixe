@@ -26,11 +26,6 @@ cc = "1"
 
 [features]
 performance-counters = ["nixe-gpu/performance-counters"]
-binding-probe = []
-
-[[example]]
-name = "binding-probe"
-required-features = ["binding-probe"]
 
 [dev-dependencies]
 nixe-gpu-maxwell = { workspace = true, features = ["test-support"] }

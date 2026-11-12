@@ -19,8 +19,6 @@ struct Functions {
     barrier: vk::PFN_vkCmdPipelineBarrier2,
     begin: vk::PFN_vkCmdBeginRenderPass,
     end: vk::PFN_vkCmdEndRenderPass,
-    #[cfg(feature = "binding-probe")]
-    timestamp: vk::PFN_vkCmdWriteTimestamp2,
     state: Option<StateDispatch>,
     state2: Option<State2Dispatch>,
     depth_clamp: Option<vk::PFN_vkCmdSetDepthClampEnableEXT>,
@@ -90,15 +88,6 @@ impl Dispatch {
         };
         let begin = device.fp_v1_0().cmd_begin_render_pass;
         let end = device.fp_v1_0().cmd_end_render_pass;
-        #[cfg(feature = "binding-probe")]
-        let timestamp = match path {
-            ApiPath::Core13 => device.fp_v1_3().cmd_write_timestamp2,
-            ApiPath::Khr12 => {
-                ash::khr::synchronization2::Device::new(instance, device)
-                    .fp()
-                    .cmd_write_timestamp2_khr
-            }
-        };
         let state = dynamic.then(|| match path {
             ApiPath::Core13 => {
                 let f = device.fp_v1_3();
@@ -169,8 +158,6 @@ impl Dispatch {
                 barrier,
                 begin,
                 end,
-                #[cfg(feature = "binding-probe")]
-                timestamp,
                 state,
                 state2,
                 depth_clamp,
@@ -211,27 +198,6 @@ impl Dispatch {
             recorder,
             dynamic_mask,
         })
-    }
-    #[cfg(feature = "binding-probe")]
-    pub unsafe fn timestamp(
-        &mut self,
-        stage: vk::PipelineStageFlags2,
-        pool: vk::QueryPool,
-        index: u32,
-    ) {
-        self.recorder.record(move |ctx| {
-            unsafe { (ctx.functions.timestamp)(ctx.command, stage, pool, index) };
-            Ok(())
-        });
-    }
-    #[cfg(feature = "binding-probe")]
-    pub(crate) unsafe fn record<F>(&mut self, function: F)
-    where
-        F: Fn(&mut worker::Context) -> Result<(), crate::queue::progress::NativeFailure>
-            + Send
-            + 'static,
-    {
-        self.recorder.record(function);
     }
     pub(crate) fn record_serial(&self) -> u64 {
         self.recorder.record_serial

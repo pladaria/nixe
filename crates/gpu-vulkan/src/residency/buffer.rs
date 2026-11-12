@@ -400,16 +400,6 @@ impl Residency<'_> {
             0
         };
         let native = self.allocate_buffer(bytes, usage, alignment)?;
-        #[cfg(feature = "binding-probe")]
-        let address = if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
-            unsafe {
-                self.runtime.device.owner.device.get_buffer_device_address(
-                    &vk::BufferDeviceAddressInfo::default().buffer(native.handle),
-                )
-            }
-        } else {
-            0
-        };
         let id = self.buffer_cache.buffers.insert(BufferEntry {
             growth: 0,
             sparse_compatible,
@@ -426,8 +416,6 @@ impl Residency<'_> {
             },
             native: Arc::new(native),
             usage,
-            #[cfg(feature = "binding-probe")]
-            address,
             used: sync::UsageTracker::new(bytes),
         });
         self.runtime.statistics.buffer_allocations += 1;

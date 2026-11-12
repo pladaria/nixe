@@ -6,17 +6,9 @@ mod device;
 mod dispatch;
 mod error;
 mod extensions;
-#[cfg(feature = "binding-probe")]
-mod helpers;
-#[cfg(feature = "binding-probe")]
-mod probe;
-#[cfg(feature = "binding-probe")]
-pub use probe::BindingMeasurement;
 mod image_layout;
 mod instance;
 mod memory;
-#[cfg(feature = "binding-probe")]
-pub use helpers::BufferBinding;
 mod profile;
 mod queue;
 mod render_pass;

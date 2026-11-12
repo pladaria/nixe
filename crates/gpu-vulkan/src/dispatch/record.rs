@@ -741,15 +741,6 @@ impl Dispatch {
             );
         }
     }
-    #[cfg(feature = "binding-probe")]
-    pub unsafe fn cmd_reset_query_pool(&mut self, pool: vk::QueryPool, first: u32, count: u32) {
-        self.recorder.record(move |context| {
-            let command = context.command;
-            let device = &context.device;
-            unsafe { device.cmd_reset_query_pool(command, pool, first, count) };
-            Ok(())
-        });
-    }
     pub unsafe fn cmd_write_timestamp(
         &mut self,
         stage: vk::PipelineStageFlags,
