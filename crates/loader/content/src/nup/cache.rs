@@ -38,6 +38,20 @@ impl Cache {
             self.ages.insert(entry.age, view.key);
             return Ok(entry.member.clone());
         }
+        // Validate on first consumption, so indexing a large tree never touches
+        // every compressed member or allocates a decoder for unopened files.
+        let mut header = [0; 18];
+        let count = view.source.len()?.min(header.len() as u64) as usize;
+        view.source.read_at(0, &mut header[..count])?;
+        if count < 4
+            || header[..4] != [0x28, 0xb5, 0x2f, 0xfd]
+            || zstd::zstd_safe::get_frame_content_size(&header[..count])
+                .ok()
+                .flatten()
+                != Some(view.size)
+        {
+            return Err(invalid("invalid NUP Zstandard frame or content size"));
+        }
         let memory = view.size <= BUDGET / 2;
         // Account for output, decoder window and scratch space. In-flight readers retain
         // their member if evicted; it cannot be recycled underneath a read.

@@ -37,9 +37,9 @@ pub use handle::{
     WritableEventObject,
 };
 pub use launch_plan::{
-    AddOnContent, HOME_BREW_EXECUTABLE_ARGV0, HOME_BREW_EXECUTABLE_GUEST_PATH, HomebrewIdentity,
-    LaunchKind, LaunchModule, LaunchModuleImage, LaunchPlan, ModuleRole, MountProvenance,
-    PackagedIdentity, ReadOnlyMount,
+    AddOnContent, ContentIdentity, HOME_BREW_EXECUTABLE_ARGV0, HOME_BREW_EXECUTABLE_GUEST_PATH,
+    HomebrewIdentity, LaunchKind, LaunchModule, LaunchModuleImage, LaunchPlan, ModuleRole,
+    MountProvenance, PackagedIdentity, ReadOnlyMount,
 };
 pub use launcher::{LaunchError, LaunchStage, Launcher, LauncherInput};
 pub use machine::{Runtime, RuntimeError};

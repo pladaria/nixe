@@ -1,3 +1,5 @@
+mod build;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -30,9 +32,19 @@ pub struct RomFsArchive {
     storage: StorageRef,
     file_data_offset: u64,
     files: Vec<RomFsFile>,
+    directories: Vec<String>,
 }
 
 impl RomFsArchive {
+    /// Builds metadata over the original file sources; payload reads remain lazy.
+    pub fn from_tree(tree: crate::ReadOnlyTree) -> Result<Self, LoadError> {
+        build::build(tree)
+    }
+
+    pub fn directories(&self) -> &[String] {
+        &self.directories
+    }
+
     fn parse(storage: StorageRef) -> Result<Self, LoadError> {
         let storage_len = storage.len()?;
         if storage_len < HEADER_SIZE {
@@ -82,13 +94,16 @@ impl RomFsArchive {
             visited_files: BTreeSet::new(),
             paths: BTreeSet::new(),
             files: Vec::new(),
+            directories: Vec::new(),
         };
         parser.parse_directory(0, None, "")?;
         parser
             .files
             .sort_by(|left, right| left.path.cmp(&right.path));
 
+        parser.directories.sort();
         Ok(Self {
+            directories: parser.directories,
             storage,
             file_data_offset,
             files: parser.files,
@@ -204,6 +219,7 @@ struct TreeParser {
     visited_files: BTreeSet<u32>,
     paths: BTreeSet<String>,
     files: Vec<RomFsFile>,
+    directories: Vec<String>,
 }
 
 impl TreeParser {
@@ -241,6 +257,11 @@ impl TreeParser {
             join_path(parent_path, &entry.name)
         };
 
+        self.directories.push(if path.is_empty() {
+            "/".into()
+        } else {
+            path.clone()
+        });
         self.parse_file_chain(entry.child_file, offset, &path)?;
         self.parse_directory_chain(entry.child_directory, offset, &path)
     }

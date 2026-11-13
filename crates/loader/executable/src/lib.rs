@@ -14,8 +14,8 @@ pub use npdm::{
     AcidFlags, AcidMemoryRegion, AddressSpaceType, EffectiveNpdmPolicy, FileSystemAccess,
     FileSystemPermissions, KernelCapabilities, KernelCapability, KernelMemoryMapping,
     KernelMemoryPermission, KernelMemoryRegion, KernelVersion, Npdm, NpdmLoader, ProcessFlags,
-    ProgramType, SaveDataOwnerAccess, SaveDataOwnerId, ServiceAccess, ServiceAccessControl,
-    ServiceAccessMode,
+    ProgramPlatform, ProgramType, SaveDataOwnerAccess, SaveDataOwnerId, ServiceAccess,
+    ServiceAccessControl, ServiceAccessMode,
 };
 pub use nro::{NroAssets, NroImage, NroLoader, NroMetadata, NroRange};
 pub use nso::{Mod0Metadata, NsoImage, NsoLoader, NsoMetadata, NsoRange, NsoSegmentCompression};

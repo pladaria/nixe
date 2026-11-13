@@ -1,8 +1,9 @@
 //! Host-generated, read-only system data archives exposed through fsp-srv.
 mod ng_word;
-mod romfs;
 
-use nixe_loader_storage::{Storage, StorageError, StorageRef};
+#[cfg(test)]
+use nixe_loader_storage::StorageError;
+use nixe_loader_storage::{BytesStorage, StorageRef};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -13,7 +14,7 @@ pub const NG_WORD_2_ID: u64 = 0x0100_0000_0000_0823;
 #[derive(Default)]
 pub struct SystemArchives {
     dictionary: Option<PathBuf>,
-    ng_word: OnceLock<Result<Arc<[u8]>, String>>,
+    ng_word: OnceLock<Result<StorageRef, String>>,
 }
 impl std::fmt::Debug for SystemArchives {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -46,35 +47,27 @@ impl SystemArchives {
                     .map_err(|e| format!("dictionary {}: {e}", path.display()))?;
                 let files = ng_word::files(&source)
                     .map_err(|e| format!("dictionary {}: {e}", path.display()))?;
-                let image = romfs::build(&files)?;
+                let mut tree = nixe_loader_content::ReadOnlyTree::default();
+                for (name, bytes) in files {
+                    tree.insert_file(&format!("/{name}"), Arc::new(BytesStorage(bytes.into())))
+                        .map_err(|error| error.to_string())?;
+                }
+                let image = nixe_loader_content::RomFsArchive::from_tree(tree)
+                    .map_err(|error| error.to_string())?
+                    .storage();
                 log::info!(
                     "generated NgWord2 system archive from {}: {} bytes",
                     path.display(),
-                    image.len()
+                    image.len().map_err(|error| error.to_string())?
                 );
-                Ok(image.into())
+                Ok(image)
             })
             .as_ref()
             .map_err(Clone::clone)?
             .clone();
-        Ok(Some(Arc::new(ImageStorage(image))))
+        Ok(Some(image))
     }
 }
-struct ImageStorage(Arc<[u8]>);
-impl Storage for ImageStorage {
-    fn len(&self) -> Result<u64, StorageError> {
-        Ok(self.0.len() as u64)
-    }
-    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<(), StorageError> {
-        let start = usize::try_from(offset).map_err(|_| StorageError::OutOfBounds)?;
-        let end = start
-            .checked_add(buffer.len())
-            .ok_or(StorageError::OutOfBounds)?;
-        buffer.copy_from_slice(self.0.get(start..end).ok_or(StorageError::OutOfBounds)?);
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

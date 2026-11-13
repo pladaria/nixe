@@ -296,6 +296,14 @@ impl PackageMetadata {
         .filter(|version| !version.is_empty())
     }
 
+    /// Application control fields, independent of their container provenance.
+    pub fn application_control(&self) -> Option<&ApplicationControlProperty> {
+        match &self.contents {
+            PackageContents::Nca(_) => self.control_metadata.as_ref().map(|control| &control.nacp),
+            PackageContents::Nup { nacp, .. } => nacp.as_deref(),
+        }
+    }
+
     /// Opens one NCA selected by this package's canonical CNMT record.
     ///
     /// Metadata constructed directly with [`Self::from_content_meta`] has no

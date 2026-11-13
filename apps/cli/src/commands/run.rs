@@ -137,7 +137,7 @@ fn run_with_memory(
             log::info!(
                 "source is an installed title; building from the resolved base, update and DLC set"
             );
-            Launcher::build_resolved_title((**title).clone(), &library.keys)
+            Launcher::build_resolved_title((**title).clone(), Some(&library.keys))
         }
         LibraryTitleSource::Homebrew(path) => {
             log::info!("source is a homebrew NRO: {}", path.display());
@@ -239,34 +239,33 @@ fn run_with_memory(
             config.system.font.clone(),
         )?,
         system_archives: nixe_horizon::SystemArchives::new(config.system.dictionary.clone()),
-        application_language: plan.control_metadata().and_then(|control| {
+        application_language: plan.application_control().and_then(|control| {
             desired_application_language(
-                control.supported_languages(),
+                control.supported_languages,
                 &config.system.preferred_languages,
             )
         }),
-        user_account_switch_locked: plan.control_metadata().and_then(|control| {
-            match control.nacp.user_account_switch_lock {
+        user_account_switch_locked: plan.application_control().and_then(|control| {
+            match control.user_account_switch_lock {
                 UserAccountSwitchLock::Disable => Some(false),
                 UserAccountSwitchLock::Enable => Some(true),
                 UserAccountSwitchLock::Unknown(_) => None,
             }
         }),
-        application_display_version: plan
-            .control_metadata()
-            .map(|control| control.nacp.display_version.clone()),
+        application_display_version: plan.display_version().map(str::to_owned),
         application_pseudo_device_seed: plan
-            .control_metadata()
-            .map(|control| control.nacp.seed_for_pseudo_device_id),
-        save_data: plan.packaged_identity().zip(plan.control_metadata()).map(
-            |(identity, control)| {
+            .application_control()
+            .map(|control| control.seed_for_pseudo_device_id),
+        save_data: plan
+            .packaged_identity()
+            .zip(plan.application_control())
+            .map(|(identity, control)| {
                 SaveDataSystem::new(
                     config.filesystem.save_data.clone(),
                     identity.application_id().get(),
-                    &control.nacp,
+                    control,
                 )
-            },
-        ),
+            }),
         diagnostics: horizon_diagnostics(diagnostics_configuration),
     };
     log::debug!(

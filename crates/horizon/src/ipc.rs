@@ -271,9 +271,11 @@ pub(crate) fn dispatch_session(
                 SemanticIpcObject::HostDirectoryFileSystem(HostDirectoryFileSystem::new(root)),
             ))
         }
-        (IpcService::AddOnContent, IpcRequest::GetAddOnContentBaseId) => {
-            Ok(IpcResponse::Size(mounts.add_on_content_base_id()))
-        }
+        (IpcService::AddOnContent, IpcRequest::GetAddOnContentBaseId) => Ok(IpcResponse::Size(
+            mounts
+                .add_on_content_base_id()
+                .ok_or(IpcResultCode::INTERNAL_STATE)?,
+        )),
         (IpcService::AddOnContent, IpcRequest::GetIndexedAddOnContentCount) => {
             let count = mounts
                 .add_ons()
@@ -823,21 +825,35 @@ fn directory_entries(
     } else {
         format!("{path}/")
     };
+    let romfs = filesystem.mount().romfs();
+    let directories = romfs.directories();
+    if directories
+        .binary_search_by(|entry| entry.as_str().cmp(path))
+        .is_err()
+    {
+        return Err(IpcResultCode::PATH_NOT_FOUND);
+    }
     let mut entries = BTreeMap::<&str, (DirectoryEntryKind, u64)>::new();
-    let mut directory_exists = path == "/";
-    for file in filesystem.mount().romfs().files() {
-        let Some(remainder) = file.path().strip_prefix(&prefix) else {
-            continue;
-        };
-        directory_exists = true;
-        if let Some((name, _)) = remainder.split_once('/') {
+    let start = directories.partition_point(|entry| entry.as_str() < prefix.as_str());
+    for directory in directories[start..]
+        .iter()
+        .take_while(|entry| entry.starts_with(&prefix))
+    {
+        let name = &directory[prefix.len()..];
+        if !name.is_empty() && !name.contains('/') {
             entries.insert(name, (DirectoryEntryKind::Directory, 0));
-        } else {
-            entries.insert(remainder, (DirectoryEntryKind::File, file.size()));
         }
     }
-    if !directory_exists {
-        return Err(IpcResultCode::PATH_NOT_FOUND);
+    let files = romfs.files();
+    let start = files.partition_point(|file| file.path() < prefix.as_str());
+    for file in files[start..]
+        .iter()
+        .take_while(|file| file.path().starts_with(&prefix))
+    {
+        let name = &file.path()[prefix.len()..];
+        if !name.contains('/') {
+            entries.insert(name, (DirectoryEntryKind::File, file.size()));
+        }
     }
     Ok(entries
         .into_iter()

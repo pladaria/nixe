@@ -17,6 +17,7 @@ mod nsz;
 mod nup;
 mod pfs0;
 mod romfs;
+mod tree;
 mod version;
 mod xci;
 mod xcz;
@@ -51,6 +52,7 @@ pub use nup::{
 };
 pub use pfs0::{Pfs0Archive, Pfs0Entry, Pfs0Loader};
 pub use romfs::{RomFsArchive, RomFsFile, RomFsLoader};
+pub use tree::ReadOnlyTree;
 pub use version::{
     ApplicationVersion, ContentMetaVersion, DecodedContentMetaVersion, SystemVersion,
 };

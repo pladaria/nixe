@@ -63,7 +63,46 @@ impl ProcessBuilder {
                 "architectural timer frequency must be nonzero",
             ));
         }
-        let metadata = process_metadata(plan);
+        if plan.platform() != self.config.target_platform {
+            return Err(error(
+                ProcessBuildStage::Metadata,
+                format!(
+                    "launch plan targets {:?}, but the configured machine is {:?}",
+                    plan.platform(),
+                    self.config.target_platform
+                ),
+            ));
+        }
+        if let Some(identity) = plan.packaged_identity() {
+            let npdm = identity.npdm();
+            if npdm.remote_memory_size() != 0
+                || npdm.platform() == nixe_loader_executable::ProgramPlatform::Switch2
+            {
+                return Err(error(
+                    ProcessBuildStage::Metadata,
+                    "Switch 2 process memory and machine composition are not implemented",
+                ));
+            }
+            if !npdm.flags().is_64_bit_instruction() {
+                return Err(error(
+                    ProcessBuildStage::Metadata,
+                    "AArch32 process execution is not implemented",
+                ));
+            }
+            if npdm.flags().enable_address_sanitizer() {
+                return Err(error(
+                    ProcessBuildStage::Metadata,
+                    "process address-sanitizer layout is not implemented",
+                ));
+            }
+            if npdm.enable_shadow_stack() {
+                return Err(error(
+                    ProcessBuildStage::Metadata,
+                    "process shadow stacks are not implemented",
+                ));
+            }
+        }
+        let metadata = process_metadata(plan)?;
         let address_space = metadata.address_space;
         let stack_size = metadata.stack_size;
         let abi = metadata.abi;
@@ -381,12 +420,12 @@ impl ThreadPolicy {
     }
 }
 
-fn process_metadata(plan: &LaunchPlan) -> ProcessMetadata {
-    match plan.kind() {
+fn process_metadata(plan: &LaunchPlan) -> Result<ProcessMetadata, ProcessBuildError> {
+    Ok(match plan.kind() {
         LaunchKind::Packaged(identity) => {
             let npdm = identity.npdm();
             ProcessMetadata {
-                address_space: ProcessAddressSpace::from_npdm(npdm.flags().address_space()),
+                address_space: ProcessAddressSpace::from_npdm(npdm.flags().address_space())?,
                 stack_size: u64::from(npdm.main_thread_stack_size()),
                 abi: InitialProcessAbi::Packaged,
                 priority: i32::from(npdm.main_thread_priority()),
@@ -413,7 +452,7 @@ fn process_metadata(plan: &LaunchPlan) -> ProcessMetadata {
             thread_policy: None,
             system_resource_size: 0,
         },
-    }
+    })
 }
 
 fn module_placements(

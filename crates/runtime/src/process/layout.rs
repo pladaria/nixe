@@ -18,13 +18,19 @@ pub enum ProcessMemoryLayoutProfile {
 }
 
 impl ProcessAddressSpace {
-    pub(super) const fn from_npdm(value: AddressSpaceType) -> Self {
-        match value {
+    pub(super) fn from_npdm(value: AddressSpaceType) -> Result<Self, ProcessBuildError> {
+        Ok(match value {
             AddressSpaceType::AddressSpace32Bit => Self::Bit32,
             AddressSpaceType::AddressSpace32BitNoReserved => Self::Bit32NoReserved,
             AddressSpaceType::AddressSpace64BitOld => Self::Bit64Old,
             AddressSpaceType::AddressSpace64Bit => Self::Bit64,
-        }
+            AddressSpaceType::AddressSpace64Bit42 => {
+                return Err(error(
+                    ProcessBuildStage::Metadata,
+                    "42-bit process address spaces are not implemented",
+                ));
+            }
+        })
     }
 
     pub const fn width(self) -> nixe_memory::AddressWidth {

@@ -1,10 +1,10 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use nixe_loader_content::{ApplicationVersion, RomFsArchive};
+use nixe_loader_content::{ApplicationControlProperty, ApplicationVersion, RomFsArchive};
 use nixe_loader_executable::{EffectiveNpdmPolicy, Npdm, NroImage, NsoImage};
 use nixe_loader_storage::StorageRef;
-use nixe_loader_title::{ApplicationId, ControlMetadata, TitleId};
+use nixe_loader_title::{ApplicationId, TitleId};
 
 /// Maximum executable modules retained by one launch plan.
 pub const MAX_LAUNCH_MODULES: usize = 64;
@@ -17,13 +17,21 @@ pub const HOME_BREW_EXECUTABLE_GUEST_PATH: &str = "/.nixe/launch.nro";
 /// `argv[0]` passed through the homebrew ABI for the launched NRO.
 pub const HOME_BREW_EXECUTABLE_ARGV0: &str = "sdmc:/.nixe/launch.nro";
 
+/// Real source identity, without requiring native trees to impersonate an NCA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentIdentity {
+    Nca([u8; 16]),
+    NupTree([u8; 32]),
+    NupOverlay { base: [u8; 32], update: [u8; 32] },
+}
+
 /// Security and content identity for a packaged application.
 #[derive(Clone)]
 pub struct PackagedIdentity {
     application_id: ApplicationId,
     effective_title_id: TitleId,
     effective_version: ApplicationVersion,
-    program_content_id: [u8; 16],
+    program_content: ContentIdentity,
     npdm: Npdm,
 }
 
@@ -34,7 +42,7 @@ impl Debug for PackagedIdentity {
             .field("application_id", &self.application_id)
             .field("effective_title_id", &self.effective_title_id)
             .field("effective_version", &self.effective_version)
-            .field("program_content_id", &self.program_content_id)
+            .field("program_content", &self.program_content)
             .field(
                 "npdm_program_id",
                 &format_args!("{:016X}", self.npdm.program_id()),
@@ -50,14 +58,14 @@ impl PackagedIdentity {
         application_id: ApplicationId,
         effective_title_id: TitleId,
         effective_version: ApplicationVersion,
-        program_content_id: [u8; 16],
+        program_content: ContentIdentity,
         npdm: Npdm,
     ) -> Self {
         Self {
             application_id,
             effective_title_id,
             effective_version,
-            program_content_id,
+            program_content,
             npdm,
         }
     }
@@ -71,8 +79,8 @@ impl PackagedIdentity {
     pub const fn effective_version(&self) -> ApplicationVersion {
         self.effective_version
     }
-    pub const fn program_content_id(&self) -> &[u8; 16] {
-        &self.program_content_id
+    pub const fn program_content(&self) -> &ContentIdentity {
+        &self.program_content
     }
     pub const fn npdm(&self) -> &Npdm {
         &self.npdm
@@ -202,14 +210,14 @@ pub enum MountProvenance {
 #[derive(Clone, Debug)]
 pub struct ReadOnlyMount {
     provenance: MountProvenance,
-    content_id: Option<[u8; 16]>,
+    content_id: Option<ContentIdentity>,
     romfs: Arc<RomFsArchive>,
 }
 
 impl ReadOnlyMount {
     pub(crate) fn new(
         provenance: MountProvenance,
-        content_id: Option<[u8; 16]>,
+        content_id: Option<ContentIdentity>,
         romfs: RomFsArchive,
     ) -> Self {
         Self {
@@ -221,8 +229,8 @@ impl ReadOnlyMount {
     pub const fn provenance(&self) -> MountProvenance {
         self.provenance
     }
-    /// Returns canonical NCA content identity, or `None` for an NRO asset.
-    pub const fn content_id(&self) -> Option<&[u8; 16]> {
+    /// Returns source content identity, or `None` for an NRO asset.
+    pub const fn content_identity(&self) -> Option<&ContentIdentity> {
         self.content_id.as_ref()
     }
     pub fn romfs(&self) -> &RomFsArchive {
@@ -274,7 +282,8 @@ pub struct LaunchPlan {
     entry_module: usize,
     primary_file_system: Option<ReadOnlyMount>,
     add_ons: Box<[AddOnContent]>,
-    control: Option<ControlMetadata>,
+    control: Option<ApplicationControlProperty>,
+    display_version: Option<String>,
 }
 
 impl LaunchPlan {
@@ -284,7 +293,7 @@ impl LaunchPlan {
         entry_module: usize,
         primary_file_system: Option<ReadOnlyMount>,
         add_ons: Vec<AddOnContent>,
-        control: Option<ControlMetadata>,
+        control: Option<ApplicationControlProperty>,
     ) -> Self {
         Self {
             kind,
@@ -292,7 +301,32 @@ impl LaunchPlan {
             entry_module,
             primary_file_system,
             add_ons: add_ons.into_boxed_slice(),
+            display_version: control
+                .as_ref()
+                .map(|control| control.display_version.clone()),
             control,
+        }
+    }
+
+    pub(crate) fn with_display_version(mut self, version: Option<&str>) -> Self {
+        self.display_version = version.map(str::to_owned);
+        self
+    }
+
+    pub fn display_version(&self) -> Option<&str> {
+        self.display_version.as_deref()
+    }
+
+    /// Guest platform comes from validated process metadata, not the package extension.
+    pub fn platform(&self) -> nixe_cpu::platform::TargetPlatform {
+        match self
+            .packaged_identity()
+            .map(|identity| identity.npdm().platform())
+        {
+            Some(nixe_loader_executable::ProgramPlatform::Switch2) => {
+                nixe_cpu::platform::TargetPlatform::Switch2
+            }
+            _ => nixe_cpu::platform::TargetPlatform::Switch1,
         }
     }
 
@@ -327,7 +361,7 @@ impl LaunchPlan {
     pub fn add_ons(&self) -> &[AddOnContent] {
         &self.add_ons
     }
-    pub const fn control_metadata(&self) -> Option<&ControlMetadata> {
+    pub const fn application_control(&self) -> Option<&ApplicationControlProperty> {
         self.control.as_ref()
     }
     pub fn effective_policy(&self) -> Option<&EffectiveNpdmPolicy> {

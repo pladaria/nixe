@@ -4,7 +4,7 @@ use nixe_loader_storage::{FormatLoader, LoadError, StorageRef};
 
 const META_SIZE: usize = 0x80;
 const ACI0_HEADER_SIZE: usize = 0x40;
-const ACID_HEADER_SIZE: usize = 0x240;
+const ACID_FIELDS_SIZE: usize = 0x40;
 const MAX_NPDM_SIZE: u64 = 16 * 1024 * 1024;
 const KNOWN_ACID_FLAGS: u32 = 0xff;
 
@@ -48,6 +48,22 @@ impl FormatLoader for NpdmLoader {
     }
 }
 
+/// Platform identified by the validated NPDM signed-header layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramPlatform {
+    Switch1,
+    Switch2,
+}
+
+impl ProgramPlatform {
+    const fn signature_size(self) -> usize {
+        match self {
+            Self::Switch1 => 0x100,
+            Self::Switch2 => 0x180,
+        }
+    }
+}
+
 /// Address-space layout requested by META.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressSpaceType {
@@ -55,6 +71,7 @@ pub enum AddressSpaceType {
     AddressSpace64BitOld,
     AddressSpace32BitNoReserved,
     AddressSpace64Bit,
+    AddressSpace64Bit42,
 }
 
 /// Validated process flags from the META header.
@@ -73,7 +90,8 @@ impl ProcessFlags {
             0 => AddressSpaceType::AddressSpace32Bit,
             1 => AddressSpaceType::AddressSpace64BitOld,
             2 => AddressSpaceType::AddressSpace32BitNoReserved,
-            _ => AddressSpaceType::AddressSpace64Bit,
+            3 => AddressSpaceType::AddressSpace64Bit,
+            _ => AddressSpaceType::AddressSpace64Bit42,
         }
     }
     pub const fn optimize_memory_allocation(self) -> bool {
@@ -82,7 +100,7 @@ impl ProcessFlags {
     pub const fn disable_device_address_space_merge(self) -> bool {
         self.0 & (1 << 5) != 0
     }
-    pub const fn enable_alias_region_extra_size(self) -> bool {
+    pub const fn enable_address_sanitizer(self) -> bool {
         self.0 & (1 << 6) != 0
     }
     pub const fn prevent_code_reads(self) -> bool {
@@ -499,6 +517,9 @@ impl EffectiveNpdmPolicy {
 /// Fully parsed NPDM, retaining requested and authorized security declarations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Npdm {
+    platform: ProgramPlatform,
+    flags1: u8,
+    remote_memory_size: u32,
     signature_key_generation: u32,
     flags: ProcessFlags,
     main_thread_priority: u8,
@@ -510,11 +531,11 @@ pub struct Npdm {
     product_code: [u8; 16],
     program_id: u64,
     acid_version: u8,
-    acid_unknown_209: u8,
+    acid_descriptor_version2: u8,
     acid_flags: AcidFlags,
     program_id_range: (u64, u64),
-    acid_signature: [u8; 256],
-    acid_public_key: [u8; 256],
+    acid_signature: Box<[u8]>,
+    acid_public_key: Box<[u8]>,
     requested_filesystem: FileSystemAccess,
     authorized_filesystem: FileSystemAccess,
     requested_services: ServiceAccessControl,
@@ -525,6 +546,15 @@ pub struct Npdm {
 }
 
 impl Npdm {
+    pub const fn platform(&self) -> ProgramPlatform {
+        self.platform
+    }
+    pub const fn remote_memory_size(&self) -> u32 {
+        self.remote_memory_size
+    }
+    pub const fn enable_shadow_stack(&self) -> bool {
+        self.flags1 & 1 != 0
+    }
     pub const fn signature_key_generation(&self) -> u32 {
         self.signature_key_generation
     }
@@ -564,8 +594,8 @@ impl Npdm {
     pub const fn acid_version(&self) -> u8 {
         self.acid_version
     }
-    pub const fn acid_unknown_209(&self) -> u8 {
-        self.acid_unknown_209
+    pub const fn acid_descriptor_version2(&self) -> u8 {
+        self.acid_descriptor_version2
     }
     pub const fn acid_flags(&self) -> AcidFlags {
         self.acid_flags
@@ -573,10 +603,10 @@ impl Npdm {
     pub const fn program_id_range(&self) -> (u64, u64) {
         self.program_id_range
     }
-    pub const fn acid_signature(&self) -> &[u8; 256] {
+    pub fn acid_signature(&self) -> &[u8] {
         &self.acid_signature
     }
-    pub const fn acid_public_key(&self) -> &[u8; 256] {
+    pub fn acid_public_key(&self) -> &[u8] {
         &self.acid_public_key
     }
     pub const fn requested_filesystem(&self) -> &FileSystemAccess {
@@ -627,11 +657,13 @@ fn parse_npdm(storage: StorageRef) -> Result<Npdm, LoadError> {
         return Err(invalid_at("META", 0, "expected META magic"));
     }
     require_zero(&bytes, 0x08..0x0c, "META")?;
-    require_zero(&bytes, 0x0d..0x0e, "META")?;
-    require_zero(&bytes, 0x10..0x14, "META")?;
+    if bytes[0x0d] & !1 != 0 {
+        return Err(invalid_at("META", 0x0d, "unknown Flags1 bits"));
+    }
+
     require_zero(&bytes, 0x40..0x70, "META")?;
     let flags = bytes[0x0c];
-    if (flags >> 1) & 7 > 3 {
+    if (flags >> 1) & 7 > 4 {
         return Err(invalid_at("META", 0x0c, "unknown process flag bits"));
     }
     let priority = bytes[0x0e];
@@ -667,13 +699,24 @@ fn parse_npdm(storage: StorageRef) -> Result<Npdm, LoadError> {
         0,
         read_u32(&bytes, 0x78, "META")?,
         read_u32(&bytes, 0x7c, "META")?,
-        ACID_HEADER_SIZE,
+        0x200 + ACID_FIELDS_SIZE,
         "ACID",
     )?;
     ensure_disjoint(aci.clone(), acid.clone(), "META")?;
+    if aci.start < META_SIZE || acid.start < META_SIZE {
+        return Err(invalid_at("META", 0x70, "process descriptor overlaps META"));
+    }
 
     let aci_parsed = parse_aci0(&bytes, aci.clone())?;
     let acid_parsed = parse_acid(&bytes, acid)?;
+    let remote_memory_size = read_u32(&bytes, 0x10, "META")?;
+    if acid_parsed.platform == ProgramPlatform::Switch1 && remote_memory_size != 0 {
+        return Err(invalid_at(
+            "META",
+            0x10,
+            "RemoteMemorySize requires Switch 2",
+        ));
+    }
     if aci_parsed.program_id < acid_parsed.program_id_min
         || aci_parsed.program_id > acid_parsed.program_id_max
     {
@@ -703,6 +746,9 @@ fn parse_npdm(storage: StorageRef) -> Result<Npdm, LoadError> {
         kernel_capabilities: aci_parsed.kernel.clone(),
     };
     Ok(Npdm {
+        platform: acid_parsed.platform,
+        flags1: bytes[0x0d],
+        remote_memory_size,
         signature_key_generation: read_u32(&bytes, 4, "META")?,
         flags: ProcessFlags(flags),
         main_thread_priority: priority,
@@ -714,7 +760,7 @@ fn parse_npdm(storage: StorageRef) -> Result<Npdm, LoadError> {
         product_code,
         program_id: aci_parsed.program_id,
         acid_version: acid_parsed.version,
-        acid_unknown_209: acid_parsed.unknown_209,
+        acid_descriptor_version2: acid_parsed.descriptor_version2,
         acid_flags: acid_parsed.flags,
         program_id_range: (acid_parsed.program_id_min, acid_parsed.program_id_max),
         acid_signature: acid_parsed.signature,
@@ -736,10 +782,11 @@ struct Aci0 {
     kernel: KernelCapabilities,
 }
 struct Acid {
-    signature: [u8; 256],
-    public_key: [u8; 256],
+    platform: ProgramPlatform,
+    signature: Box<[u8]>,
+    public_key: Box<[u8]>,
     version: u8,
-    unknown_209: u8,
+    descriptor_version2: u8,
     flags: AcidFlags,
     program_id_min: u64,
     program_id_max: u64,
@@ -760,6 +807,15 @@ fn parse_aci0(bytes: &[u8], range: std::ops::Range<usize>) -> Result<Aci0, LoadE
     let sac = local_subregion(data, range.start, 0x28, 0x2c, 0, "ACI0 SAC")?;
     let kac = local_subregion(data, range.start, 0x30, 0x34, 0, "ACI0 KAC")?;
     ensure_subregions_disjoint(&[fs.clone(), sac.clone(), kac.clone()], "ACI0")?;
+    for region in [&fs, &sac, &kac] {
+        if !region.is_empty() && region.start < range.start + ACI0_HEADER_SIZE {
+            return Err(invalid_at(
+                "ACI0",
+                region.start,
+                "access-control data overlaps its header",
+            ));
+        }
+    }
     Ok(Aci0 {
         program_id: read_u64(data, 0x10, "ACI0")?,
         filesystem: parse_aci_filesystem(bytes, fs)?,
@@ -768,71 +824,105 @@ fn parse_aci0(bytes: &[u8], range: std::ops::Range<usize>) -> Result<Aci0, LoadE
     })
 }
 
+// https://switchbrew.org/wiki/NPDM#Acid
+// Descriptor offsets remain relative to the signed block, including its signature.
 fn parse_acid(bytes: &[u8], range: std::ops::Range<usize>) -> Result<Acid, LoadError> {
     let data = &bytes[range.clone()];
-    if data.get(0x200..0x204) != Some(b"ACID") {
+    let platform = match (
+        data.get(0x200..0x204) == Some(b"ACID"),
+        data.get(0x300..0x304) == Some(b"ACID"),
+    ) {
+        (true, false) => ProgramPlatform::Switch1,
+        (false, true) => ProgramPlatform::Switch2,
+        _ => {
+            return Err(invalid_at(
+                "ACID",
+                range.start,
+                "missing or ambiguous signed-header layout",
+            ));
+        }
+    };
+    let signature_size = platform.signature_size();
+    let fields = signature_size * 2;
+    let header_end = fields + ACID_FIELDS_SIZE;
+    if data.len() < header_end {
         return Err(invalid_at(
             "ACID",
-            range.start + 0x200,
-            "expected ACID magic",
+            range.start,
+            "truncated authorization header",
         ));
     }
-    require_zero(data, 0x20a..0x20c, "ACID")?;
-    require_zero(data, 0x238..0x240, "ACID")?;
-    let signed_size = usize::try_from(read_u32(data, 0x204, "ACID")?).map_err(|_| {
-        invalid_at(
-            "ACID",
-            range.start + 0x204,
-            "signed size is not representable",
-        )
-    })?;
-    let signed_end = 0x100_usize
-        .checked_add(signed_size)
-        .ok_or_else(|| invalid_at("ACID", range.start + 0x204, "signed size overflows"))?;
-    if signed_end > data.len() || signed_end < ACID_HEADER_SIZE {
+    require_zero(data, fields + 0x0a..fields + 0x0c, "ACID")?;
+    require_zero(data, fields + 0x38..header_end, "ACID")?;
+    let signed_end = signature_size
+        .checked_add(read_u32(data, fields + 4, "ACID")? as usize)
+        .ok_or_else(|| invalid_at("ACID", range.start, "signed size overflows"))?;
+    if signed_end > data.len() || signed_end < header_end {
         return Err(invalid_at(
             "ACID",
-            range.start + 0x204,
+            range.start + fields + 4,
             "signed region is outside ACID",
         ));
     }
-    let raw_flags = read_u32(data, 0x20c, "ACID")?;
-    if raw_flags & !KNOWN_ACID_FLAGS != 0 {
+    let raw_flags = read_u32(data, fields + 0x0c, "ACID")?;
+    if raw_flags & !KNOWN_ACID_FLAGS != 0 || (raw_flags >> 2) & 0xf > 3 {
         return Err(invalid_at(
             "ACID",
-            range.start + 0x20c,
-            "unknown ACID flag bits",
+            range.start + fields + 0x0c,
+            "unknown ACID flags or memory region",
         ));
     }
-    if (raw_flags >> 2) & 0xf > 3 {
-        return Err(invalid_at(
-            "ACID",
-            range.start + 0x20c,
-            "unknown ACID memory region",
-        ));
-    }
-    let min = read_u64(data, 0x210, "ACID")?;
-    let max = read_u64(data, 0x218, "ACID")?;
+    let min = read_u64(data, fields + 0x10, "ACID")?;
+    let max = read_u64(data, fields + 0x18, "ACID")?;
     if min > max {
         return Err(invalid_at(
             "ACID",
-            range.start + 0x210,
+            range.start + fields + 0x10,
             "program ID range is reversed",
         ));
     }
-    let fs = local_subregion(data, range.start, 0x220, 0x224, 0x2c, "ACID FAC")?;
-    let sac = local_subregion(data, range.start, 0x228, 0x22c, 0, "ACID SAC")?;
-    let kac = local_subregion(data, range.start, 0x230, 0x234, 0, "ACID KAC")?;
+    let fs = local_subregion(
+        data,
+        range.start,
+        fields + 0x20,
+        fields + 0x24,
+        0x2c,
+        "ACID FAC",
+    )?;
+    let sac = local_subregion(
+        data,
+        range.start,
+        fields + 0x28,
+        fields + 0x2c,
+        0,
+        "ACID SAC",
+    )?;
+    let kac = local_subregion(
+        data,
+        range.start,
+        fields + 0x30,
+        fields + 0x34,
+        0,
+        "ACID KAC",
+    )?;
     ensure_subregions_disjoint(&[fs.clone(), sac.clone(), kac.clone()], "ACID")?;
-    let mut signature = [0; 256];
-    signature.copy_from_slice(&data[..0x100]);
-    let mut public_key = [0; 256];
-    public_key.copy_from_slice(&data[0x100..0x200]);
+    for region in [&fs, &sac, &kac] {
+        if !region.is_empty()
+            && (region.start < range.start + header_end || region.end > range.start + signed_end)
+        {
+            return Err(invalid_at(
+                "ACID",
+                region.start,
+                "authorization data is outside the signed payload",
+            ));
+        }
+    }
     Ok(Acid {
-        signature,
-        public_key,
-        version: data[0x208],
-        unknown_209: data[0x209],
+        platform,
+        signature: data[..signature_size].into(),
+        public_key: data[signature_size..fields].into(),
+        version: data[fields + 8],
+        descriptor_version2: data[fields + 9],
         flags: AcidFlags(raw_flags),
         program_id_min: min,
         program_id_max: max,

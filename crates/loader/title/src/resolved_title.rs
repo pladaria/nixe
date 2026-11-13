@@ -14,6 +14,17 @@ pub struct ResolvedTitle {
 }
 
 impl ResolvedTitle {
+    pub fn application_control(&self) -> Option<&nixe_loader_content::ApplicationControlProperty> {
+        self.patch
+            .as_ref()
+            .and_then(PackageMetadata::application_control)
+            .or_else(|| {
+                self.base
+                    .as_ref()
+                    .and_then(PackageMetadata::application_control)
+            })
+    }
+
     /// Returns the selected patch's Control metadata, falling back to the base.
     pub fn control_metadata(&self) -> Option<&ControlMetadata> {
         self.patch

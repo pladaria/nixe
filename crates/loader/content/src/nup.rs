@@ -142,21 +142,6 @@ impl NupArchive {
         if file.codec == NupCodec::Raw {
             return Ok(source);
         }
-        let mut header = [0; 18];
-        let count = file.stored_size.min(header.len() as u64) as usize;
-        source.read_at(0, &mut header[..count])?;
-        if count < 4
-            || header[..4] != [0x28, 0xb5, 0x2f, 0xfd]
-            || zstd::zstd_safe::get_frame_content_size(&header[..count])
-                .ok()
-                .flatten()
-                != Some(file.size)
-        {
-            return Err(invalid(format!(
-                "{}: invalid Zstandard frame or content size",
-                file.name
-            )));
-        }
         Ok(Arc::new(cache::CompressedFile {
             source,
             key: file.stored_offset,
@@ -164,6 +149,30 @@ impl NupArchive {
             hash: file.sha256,
             cache: self.cache.clone(),
         }))
+    }
+
+    /// Materializes names and bounded sources, without reading or decoding file data.
+    pub fn tree(&self, root: u32) -> Result<crate::ReadOnlyTree, LoadError> {
+        if root as usize >= self.directories.len() {
+            return Err(invalid("tree root is not a directory"));
+        }
+        let mut tree = crate::ReadOnlyTree::default();
+        let mut pending = vec![(root, String::new())];
+        while let Some((index, parent)) = pending.pop() {
+            for child in &self.children[self.directories[index as usize].children.clone()] {
+                let path = format!("{parent}/{}", self.node_name(*child));
+                if (*child as usize) < self.directories.len() {
+                    tree.insert_directory(&path)?;
+                    pending.push((*child, path));
+                } else {
+                    tree.insert_file(
+                        &path,
+                        self.open_file(*child as usize - self.directories.len())?,
+                    )?;
+                }
+            }
+        }
+        Ok(tree)
     }
 
     fn node_name(&self, node: u32) -> &str {

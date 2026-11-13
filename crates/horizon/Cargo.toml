@@ -25,6 +25,7 @@ nixe-cpu.workspace = true
 nixe-gpu.workspace = true
 nixe-gpu-maxwell.workspace = true
 nixe-input.workspace = true
+nixe-loader-content.workspace = true
 nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
 nixe-runtime.workspace = true
@@ -38,7 +39,6 @@ ash.workspace = true
 nixe-gpu-vulkan.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-nixe-loader-content.workspace = true
 
 [build-dependencies]
 cc = "1"

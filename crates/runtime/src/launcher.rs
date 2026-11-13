@@ -1,3 +1,6 @@
+mod native;
+use native::build_native;
+
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -17,9 +20,9 @@ use nixe_loader_title::{
 };
 
 use crate::launch_plan::{
-    AddOnContent, HomebrewIdentity, LaunchKind, LaunchModule, LaunchModuleImage, LaunchPlan,
-    MAX_ADD_ON_MOUNTS, MAX_LAUNCH_ADD_ONS, MAX_LAUNCH_MODULES, ModuleRole, MountProvenance,
-    PackagedIdentity, ReadOnlyMount,
+    AddOnContent, ContentIdentity, HomebrewIdentity, LaunchKind, LaunchModule, LaunchModuleImage,
+    LaunchPlan, MAX_ADD_ON_MOUNTS, MAX_LAUNCH_ADD_ONS, MAX_LAUNCH_MODULES, ModuleRole,
+    MountProvenance, PackagedIdentity, ReadOnlyMount,
 };
 
 /// Configuration consumed atomically by [`Launcher::build`].
@@ -252,10 +255,14 @@ impl Launcher {
     /// application has selected a title by ID.
     pub fn build_resolved_title(
         resolved: ResolvedTitle,
-        keys: &NcaKeySet,
+        keys: Option<&NcaKeySet>,
     ) -> Result<LaunchPlan, LaunchError> {
         let context = PathBuf::from(format!("resolved-title-{}", resolved.application_id));
-        build_packaged(&context, resolved, Some(keys))
+        build_packaged(
+            &context,
+            resolved,
+            keys.map(|keys| keys as &dyn NcaKeyProvider),
+        )
     }
 
     fn build_directory(path: &Path, input: &mut LauncherInput) -> Result<LaunchPlan, LaunchError> {
@@ -351,10 +358,32 @@ fn build_packaged(
     resolved: ResolvedTitle,
     keys: Option<&dyn NcaKeyProvider>,
 ) -> Result<LaunchPlan, LaunchError> {
-    if resolved.packages().any(|package| package.nup().is_some()) {
-        return Err(LaunchError::invalid(LaunchStage::ProgramContent, path,
-            "NUP titles can be catalogued, but execution of ExeFS/RomFS trees is not implemented yet")
-            .application(resolved.application_id));
+    let native = resolved
+        .base
+        .as_ref()
+        .or(resolved.patch.as_ref())
+        .is_some_and(|p| p.nup().is_some());
+    if resolved
+        .base
+        .iter()
+        .chain(resolved.patch.iter())
+        .any(|p| p.nup().is_some() != native)
+    {
+        return Err(LaunchError::invalid(
+            LaunchStage::ProgramContent,
+            path,
+            "base and update use incompatible native-tree and NCA patch formats",
+        ));
+    }
+    if resolved.add_ons.len() > MAX_LAUNCH_ADD_ONS {
+        return Err(LaunchError::invalid(
+            LaunchStage::AddOnContent,
+            path,
+            "resolved add-on count exceeds the launch limit",
+        ));
+    }
+    if native {
+        return build_native(path, resolved, keys);
     }
     let base = resolved.base.as_ref().ok_or_else(|| {
         LaunchError::invalid(
@@ -364,14 +393,6 @@ fn build_packaged(
         )
     })?;
     let build_started = Instant::now();
-    if resolved.add_ons.len() > MAX_LAUNCH_ADD_ONS {
-        return Err(LaunchError::invalid(
-            LaunchStage::AddOnContent,
-            path,
-            "resolved add-on count exceeds the launch limit",
-        )
-        .application(resolved.application_id));
-    }
     let effective = resolved
         .patch
         .as_ref()
@@ -402,7 +423,7 @@ fn build_packaged(
     {
         let archive = nixe_loader_content::ExeFsLoader::load_nca_section(section)
             .map_err(|error| LaunchError::load(LaunchStage::ProgramContent, path, error))?;
-        if archive.main().is_some() && archive.main_npdm().is_some() {
+        if archive.contains("main") && archive.contains("main.npdm") {
             exefs_candidates.push(archive);
         }
     }
@@ -423,33 +444,7 @@ fn build_packaged(
         }
     };
     log::debug!("ExeFS located and parsed in {:?}", exefs_started.elapsed());
-    let npdm_started = Instant::now();
-    let npdm_entry = exefs.main_npdm().ok_or_else(|| {
-        LaunchError::invalid(
-            LaunchStage::ProcessMetadata,
-            path,
-            "effective ExeFS has no main.npdm",
-        )
-    })?;
-    let npdm = NpdmLoader::load(
-        exefs
-            .open_entry(npdm_entry)
-            .map_err(|error| LaunchError::load(LaunchStage::ProcessMetadata, path, error))?,
-    )
-    .map_err(|error| LaunchError::load(LaunchStage::ProcessMetadata, path, error))?;
-    if npdm.program_id() != resolved.application_id.get() {
-        return Err(LaunchError::invalid(
-            LaunchStage::ProcessMetadata,
-            path,
-            format!(
-                "NPDM program ID {:016X} does not match application {}",
-                npdm.program_id(),
-                resolved.application_id
-            ),
-        )
-        .application(resolved.application_id));
-    }
-    log::debug!("main.npdm loaded in {:?}", npdm_started.elapsed());
+    let npdm = load_npdm(path, &exefs, resolved.application_id, None)?;
     let modules_started = Instant::now();
     let (modules, entry_module) = load_modules(path, &exefs)?;
     log::debug!(
@@ -474,7 +469,7 @@ fn build_packaged(
         resolved.application_id,
         effective.title_id,
         effective.version,
-        program_record.content_id,
+        ContentIdentity::Nca(program_record.content_id),
         npdm,
     );
     let plan = LaunchPlan::new(
@@ -483,7 +478,7 @@ fn build_packaged(
         entry_module,
         primary,
         add_ons,
-        resolved.control_metadata().cloned(),
+        resolved.application_control().cloned(),
     );
     log::debug!(
         "packaged launch plan built in {:?}",
@@ -492,14 +487,76 @@ fn build_packaged(
     Ok(plan)
 }
 
+fn load_npdm(
+    path: &Path,
+    exefs: &nixe_loader_content::ExeFsArchive,
+    application: ApplicationId,
+    expected: Option<&Arc<[u8]>>,
+) -> Result<nixe_loader_executable::Npdm, LaunchError> {
+    let source = exefs.open("main.npdm").ok_or_else(|| {
+        LaunchError::invalid(
+            LaunchStage::ProcessMetadata,
+            path,
+            "effective ExeFS has no main.npdm",
+        )
+    })?;
+    let source = if let Some(expected) = expected {
+        let mismatch = || {
+            LaunchError::invalid(
+                LaunchStage::ProcessMetadata,
+                path,
+                "NUP metadata does not match the executable main.npdm",
+            )
+        };
+        if source
+            .len()
+            .map_err(LoadError::Storage)
+            .map_err(|error| LaunchError::load(LaunchStage::ProcessMetadata, path, error))?
+            != expected.len() as u64
+        {
+            return Err(mismatch());
+        }
+        let mut bytes = vec![0; expected.len()];
+        source
+            .read_at(0, &mut bytes)
+            .map_err(LoadError::Storage)
+            .map_err(|error| LaunchError::load(LaunchStage::ProcessMetadata, path, error))?;
+        if bytes.as_slice() != expected.as_ref() {
+            return Err(mismatch());
+        }
+        Arc::new(nixe_loader_storage::BytesStorage(expected.clone())) as StorageRef
+    } else {
+        source
+    };
+    let npdm = NpdmLoader::load(source)
+        .map_err(|error| LaunchError::load(LaunchStage::ProcessMetadata, path, error))?;
+    if npdm.program_id() != application.get() {
+        return Err(LaunchError::invalid(
+            LaunchStage::ProcessMetadata,
+            path,
+            format!(
+                "NPDM program ID {:016X} does not match application {application}",
+                npdm.program_id()
+            ),
+        ));
+    }
+    if npdm.acid_flags().load_browser_core_dll() {
+        return Err(LaunchError::invalid(
+            LaunchStage::ExecutableModules,
+            path,
+            "LoadBrowserCoreDll requires the separate browser program's NPDM and executable modules",
+        ));
+    }
+    Ok(npdm)
+}
+
 fn load_modules(
     path: &Path,
     exefs: &nixe_loader_content::ExeFsArchive,
 ) -> Result<(Vec<LaunchModule>, usize), LaunchError> {
     let mut candidates = Vec::new();
     let mut roles = BTreeSet::new();
-    for entry in exefs.entries() {
-        let name = entry.name();
+    for name in exefs.names() {
         if name == "main.npdm" {
             continue;
         }
@@ -519,7 +576,7 @@ fn load_modules(
             )
             .module(name));
         }
-        candidates.push((role, name.to_owned(), entry));
+        candidates.push((role, name.to_owned()));
     }
     if candidates.len() > MAX_LAUNCH_MODULES {
         return Err(LaunchError::invalid(
@@ -528,7 +585,7 @@ fn load_modules(
             "module count exceeds the launch limit",
         ));
     }
-    candidates.sort_by_key(|(role, _, _)| *role);
+    candidates.sort_by_key(|(role, _)| *role);
     if !roles.contains(&ModuleRole::Main) {
         return Err(LaunchError::invalid(
             LaunchStage::ExecutableModules,
@@ -541,11 +598,9 @@ fn load_modules(
     // every present role in dependency order, and commercial ExeFS images may store the same
     // NSO under multiple roles.
     // Reference: https://github.com/Atmosphere-NX/Atmosphere/blob/cb4b882e3b176480ac57a1161a85ff175c3f162c/docs/components/modules/loader.md#file-replacement
-    for (role, name, entry) in candidates {
+    for (role, name) in candidates {
         let module_started = Instant::now();
-        let storage = exefs.open_entry(entry).map_err(|error| {
-            LaunchError::load(LaunchStage::ExecutableModules, path, error).module(&name)
-        })?;
+        let storage = exefs.open(&name).expect("enumerated executable file");
         let image = NsoLoader::load(storage).map_err(|error| {
             LaunchError::load(LaunchStage::ExecutableModules, path, error).module(&name)
         })?;
@@ -763,7 +818,7 @@ fn mount_nca(
         .map_err(|error| LaunchError::load(LaunchStage::PrimaryFileSystem, path, error))?
     };
     let file_count = romfs.files().len();
-    let mount = ReadOnlyMount::new(provenance, Some(content_id), romfs);
+    let mount = ReadOnlyMount::new(provenance, Some(ContentIdentity::Nca(content_id)), romfs);
     log::debug!(
         "RomFS ({provenance:?}, {file_count} files) indexed in {:?}",
         mount_started.elapsed()
@@ -777,8 +832,8 @@ fn load_add_ons(
     keys: Option<&dyn NcaKeyProvider>,
 ) -> Result<Vec<AddOnContent>, LaunchError> {
     let base_id = resolved
-        .control_metadata()
-        .map(|control| control.nacp.add_on_content_base_id)
+        .application_control()
+        .map(|control| control.add_on_content_base_id)
         .filter(|value| *value != 0);
     let mut indices = BTreeSet::new();
     let mut content_ids = BTreeSet::new();
@@ -796,43 +851,51 @@ fn load_add_ons(
             )
             .title_id(package.title_id));
         }
-        let mut data = records(package, CnmtContentType::Data);
-        data.sort_by_key(|record| (record.id_offset, record.content_id));
-        if data.is_empty() || data.len() > MAX_ADD_ON_MOUNTS {
-            return Err(LaunchError::invalid(
-                LaunchStage::AddOnContent,
+        let mounts = if let Some((archive, index)) = package.nup() {
+            vec![native::addon_mount(
                 path,
-                format!("add-on declares {} Data contents", data.len()),
-            )
-            .title_id(package.title_id));
-        }
-        let mut mounts = Vec::with_capacity(data.len());
-        for record in data {
-            if !content_ids.insert(record.content_id) {
+                archive,
+                &archive.packages()[index],
+            )?]
+        } else {
+            let mut data = records(package, CnmtContentType::Data);
+            data.sort_by_key(|record| (record.id_offset, record.content_id));
+            if data.is_empty() || data.len() > MAX_ADD_ON_MOUNTS {
                 return Err(LaunchError::invalid(
                     LaunchStage::AddOnContent,
                     path,
-                    "duplicate add-on Data content identity",
+                    format!("add-on declares {} Data contents", data.len()),
                 )
-                .title_id(package.title_id)
-                .content(record.content_id));
+                .title_id(package.title_id));
             }
-            let nca = package.open_content(record, keys).map_err(|error| {
-                LaunchError::load(LaunchStage::AddOnContent, path, error)
+            let mut mounts = Vec::with_capacity(data.len());
+            for record in data {
+                if !content_ids.insert(record.content_id) {
+                    return Err(LaunchError::invalid(
+                        LaunchStage::AddOnContent,
+                        path,
+                        "duplicate add-on Data content identity",
+                    )
                     .title_id(package.title_id)
-                    .content(record.content_id)
-            })?;
-            mounts.push(
-                mount_nca(path, &nca, None, MountProvenance::AddOn, record.content_id).map_err(
-                    |mut error| {
-                        error.stage = LaunchStage::AddOnContent;
-                        error.title_id = Some(package.title_id);
-                        error.content_id = Some(record.content_id);
-                        error
-                    },
-                )?,
-            );
-        }
+                    .content(record.content_id));
+                }
+                let nca = package.open_content(record, keys).map_err(|error| {
+                    LaunchError::load(LaunchStage::AddOnContent, path, error)
+                        .title_id(package.title_id)
+                        .content(record.content_id)
+                })?;
+                mounts.push(
+                    mount_nca(path, &nca, None, MountProvenance::AddOn, record.content_id)
+                        .map_err(|mut error| {
+                            error.stage = LaunchStage::AddOnContent;
+                            error.title_id = Some(package.title_id);
+                            error.content_id = Some(record.content_id);
+                            error
+                        })?,
+                );
+            }
+            mounts
+        };
         let horizon_index = base_id
             .map(|base| {
                 package
