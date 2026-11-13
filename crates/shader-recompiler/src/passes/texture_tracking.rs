@@ -1,10 +1,10 @@
 use super::fold::{arg, node};
 use crate::{
     CompileError, HostTranslateInfo, Result,
-    arena::InstId,
+    arena::{BlockId, InstId},
     diagnostics::FailureCategory,
     environment::{CbufWordKey, ConstBufferAddr, Environment, EnvironmentCaches, HandleKey},
-    ir::{Ir, Opcode as O, Value},
+    ir::{Ir, Opcode as O, Type, Value},
     types::{ByteOffset, CbufIndex, TextureHandle},
 };
 use std::collections::{HashSet, VecDeque};
@@ -19,6 +19,7 @@ pub(super) fn direct(index: CbufIndex, offset: ByteOffset) -> Address {
         secondary_offset: ByteOffset(0),
         secondary_shift_left: 0,
         dynamic_offset: Value::None,
+        handle_program: None,
         count: 1,
         has_secondary: false,
     }
@@ -49,6 +50,7 @@ pub(super) struct Tracker<'a> {
     pub caches: &'a mut EnvironmentCaches<InstId, Value>,
     pub host: &'a HostTranslateInfo,
     active: HashSet<InstId>,
+    pub block: Option<BlockId>,
 }
 impl<'a> Tracker<'a> {
     pub fn new(
@@ -62,6 +64,7 @@ impl<'a> Tracker<'a> {
             caches,
             host,
             active: HashSet::new(),
+            block: None,
         }
     }
     pub fn word(&mut self, index: CbufIndex, offset: ByteOffset) -> Result<u32> {
@@ -98,6 +101,11 @@ impl<'a> Tracker<'a> {
         Ok(handle)
     }
     pub fn track(&mut self, ir: &Ir, value: Value) -> Result<Option<Address>> {
+        let value = super::handle_control_flow::conditional_phi(
+            ir,
+            value,
+            self.block.expect("texture block selected"),
+        )?;
         let Value::Inst(key) = ir.resolve(value)? else {
             return Ok(None);
         };
@@ -115,18 +123,46 @@ impl<'a> Tracker<'a> {
         result
     }
     fn search(&mut self, ir: &Ir, root: InstId) -> Result<Option<Address>> {
+        // A loaded word is not the pointer used to address it. Track expression
+        // wrappers and phis, but never descend into memory, textures or floats.
+        // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/shader_recompiler/ir_opt/texture_pass.cpp#L591
         let mut queue = VecDeque::from([root]);
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::from([root]);
+        let floats = Type::F16.0
+            | Type::F32.0
+            | Type::F64.0
+            | Type::F16x2.0
+            | Type::F16x3.0
+            | Type::F16x4.0
+            | Type::F32x2.0
+            | Type::F32x3.0
+            | Type::F32x4.0
+            | Type::F64x2.0
+            | Type::F64x3.0
+            | Type::F64x4.0;
         while let Some(id) = queue.pop_front() {
-            if !seen.insert(id) {
-                continue;
-            }
             if let Some(address) = self.candidate(ir, id)? {
                 return Ok(Some(address));
             }
             let inst = ir.inst(id)?;
-            for i in (0..inst.num_args()).rev() {
-                if let Value::Inst(input) = arg(ir, id, i)? {
+            let op = inst.opcode();
+            if memory_load(op)
+                || super::texture_table::indexed(op).is_some()
+                || super::texture_table::sampled(op)
+                || super::texture_table::storage(op)
+                || inst.ty().0 & floats != 0
+            {
+                continue;
+            }
+            for index in (0..inst.num_args()).rev() {
+                let value = super::handle_control_flow::conditional_phi(
+                    ir,
+                    inst.arg(index)?,
+                    self.block.unwrap(),
+                )?;
+                if let Value::Inst(input) = ir.resolve(value)?
+                    && seen.insert(input)
+                {
                     queue.push_back(input);
                 }
             }
@@ -153,17 +189,21 @@ impl<'a> Tracker<'a> {
                 let (Some(mut left), Some(mut right)) = (left, right) else {
                     return Ok(None);
                 };
-                if left.has_secondary || right.has_secondary || left.count > 1 || right.count > 1 {
+                if left.has_secondary || right.has_secondary || (left.count > 1 && right.count > 1)
+                {
                     return Ok(None);
                 }
-                if left.shift_left > 0 || left.index > right.index || left.offset > right.offset {
+                if right.count > 1
+                    || (left.count == 1
+                        && (left.shift_left > 0
+                            || left.index > right.index
+                            || left.offset > right.offset))
+                {
                     std::mem::swap(&mut left, &mut right);
                 }
                 left.secondary_index = right.index;
                 left.secondary_offset = right.offset;
                 left.secondary_shift_left = right.shift_left;
-                left.dynamic_offset = Value::None;
-                left.count = 1;
                 left.has_secondary = true;
                 return Ok(Some(left));
             }
@@ -209,12 +249,15 @@ impl<'a> Tracker<'a> {
         if let Value::U32(offset) = offset {
             return Ok(Some(direct(CbufIndex(index), ByteOffset(offset))));
         }
-        let Some(add) = node(ir, offset, O::IAdd32)? else {
+        let (base, dynamic) = if let Some(add) = node(ir, offset, O::IAdd32)? {
+            match (arg(ir, add, 0)?, arg(ir, add, 1)?) {
+                (Value::U32(base), dynamic) | (dynamic, Value::U32(base)) => (base, dynamic),
+                _ => return Ok(None),
+            }
+        } else if node(ir, offset, O::ShiftLeftLogical32)?.is_some() {
+            (0, offset)
+        } else {
             return Ok(None);
-        };
-        let (base, dynamic) = match (arg(ir, add, 0)?, arg(ir, add, 1)?) {
-            (Value::U32(base), dynamic) | (dynamic, Value::U32(base)) => (base, dynamic),
-            _ => return Ok(None),
         };
         let limit = 1024
             .min(sampled_limit(self.host))
@@ -224,4 +267,32 @@ impl<'a> Tracker<'a> {
         address.count = descriptor_count(base, size_shift(ir, dynamic)?, limit);
         Ok(Some(address))
     }
+}
+
+fn memory_load(op: O) -> bool {
+    matches!(
+        op,
+        O::LoadGlobalU8
+            | O::LoadGlobalS8
+            | O::LoadGlobalU16
+            | O::LoadGlobalS16
+            | O::LoadGlobal32
+            | O::LoadGlobal64
+            | O::LoadGlobal128
+            | O::LoadStorageU8
+            | O::LoadStorageS8
+            | O::LoadStorageU16
+            | O::LoadStorageS16
+            | O::LoadStorage32
+            | O::LoadStorage64
+            | O::LoadStorage128
+            | O::LoadLocal
+            | O::LoadSharedU8
+            | O::LoadSharedS8
+            | O::LoadSharedU16
+            | O::LoadSharedS16
+            | O::LoadSharedU32
+            | O::LoadSharedU64
+            | O::LoadSharedU128
+    )
 }

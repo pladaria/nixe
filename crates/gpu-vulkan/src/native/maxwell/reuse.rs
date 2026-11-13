@@ -1,11 +1,40 @@
 //! Pipeline-local sampled selections and the last resolved draw.
 //! https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/texture_cache/texture_cache.h
 //! https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+use super::handles::{ConsumedHandle, HandleBuffers, HandleWord};
 use super::*;
 use crate::VulkanError;
+use crate::native::pipeline_resources::HandleSource;
 use crate::native::{NativeExecution, pipeline_resources::PipelineResources};
 use crate::residency::execution::ShaderImage;
 use nixe_memory::{HostAddress, Machine};
+
+struct RetainedWord {
+    word: HandleWord,
+    pointer: HostAddress,
+}
+impl RetainedWord {
+    fn matches(
+        &self,
+        space: &MaxwellGpuMemory,
+        buffers: HandleBuffers<'_>,
+        source: &crate::native::pipeline_resources::ImageHandle,
+    ) -> bool {
+        buffers
+            .address(space, source.cbuf, source.offset, 4)
+            .ok()
+            .flatten()
+            .is_some_and(|a| a.get() == self.word.address)
+            && unsafe { self.pointer.read_u32(0) } == self.word.raw
+    }
+}
+enum RetainedHandle {
+    Direct {
+        primary: RetainedWord,
+        secondary: Option<RetainedWord>,
+    },
+    Program(u32),
+}
 
 #[derive(Clone, Copy, Debug)]
 #[repr(usize)]
@@ -43,9 +72,7 @@ pub struct ReuseStatistics {
 }
 
 struct Entry {
-    address: u64,
-    handle: HostAddress,
-    raw: u32,
+    handle: RetainedHandle,
     tic: HostAddress,
     tsc: HostAddress,
     tic_bytes: [u64; 4],
@@ -66,6 +93,7 @@ impl Entry {
 #[derive(Default)]
 pub(in crate::native) struct SampledTextures {
     pub images: smallvec::SmallVec<[ShaderImage; 4]>,
+    pub computed_handles: Vec<u32>,
     entries: Vec<Entry>,
     identity: Option<[u64; 10]>,
     machine: Option<Machine>,
@@ -74,12 +102,10 @@ pub(in crate::native) struct SampledTextures {
 impl SampledTextures {
     pub fn eligible(resources: &PipelineResources) -> bool {
         resources.stages[..5].iter().all(|stage| {
-            stage.images.iter().all(|image| {
-                image.sampler
-                    && image.storage_format.is_none()
-                    && image.primary.shift == 0
-                    && image.secondary.is_none()
-            })
+            stage
+                .images
+                .iter()
+                .all(|image| image.sampler && image.storage_format.is_none())
         })
     }
     fn identity(
@@ -126,23 +152,36 @@ impl SampledTextures {
         }
         let mut entries = self.entries.iter();
         for (stage, group) in resources.stages[..5].iter().zip(groups) {
+            if stage.images.is_empty() {
+                continue;
+            }
+            let Some(group) = group else {
+                return Err(TextureMiss::Handle);
+            };
+            let buffers = HandleBuffers::Graphics(state, group);
             for image in &stage.images {
-                let binding = group
-                    .and_then(|g| state.shader_bindings().groups().get(g as usize))
-                    .and_then(|g| g.constant_buffers().get(image.primary.cbuf as usize))
-                    .copied()
-                    .flatten();
-                let Some(binding) = binding else {
-                    return Err(TextureMiss::Handle);
-                };
                 let entry = entries.next().expect("memo handle count");
-                if u64::from(image.primary.offset) + 4 > u64::from(binding.size())
-                    || binding.address().get() + u64::from(image.primary.offset) != entry.address
-                {
-                    return Err(TextureMiss::Handle);
-                }
-                // Check the handle before touching the descriptors it selected.
-                if unsafe { entry.handle.read_u32(0) } != entry.raw {
+                let matches = match (&entry.handle, &image.handle) {
+                    (
+                        RetainedHandle::Direct { primary, secondary },
+                        HandleSource::Direct {
+                            primary: source,
+                            secondary: second,
+                        },
+                    ) => {
+                        primary.matches(space, buffers, source)
+                            && match (secondary, second) {
+                                (Some(word), Some(source)) => word.matches(space, buffers, source),
+                                (None, None) => true,
+                                _ => false,
+                            }
+                    }
+                    (RetainedHandle::Program(value), HandleSource::Program { slot, .. }) => {
+                        self.computed_handles[*slot] == *value
+                    }
+                    _ => false,
+                };
+                if !matches {
                     return Err(TextureMiss::Handle);
                 }
                 if !entry.matches() {
@@ -207,8 +246,32 @@ impl SampledTextures {
             space.pointer(space.address(address).ok()?, size)
         };
         for (texture, image) in textures.iter().zip(&self.images) {
-            let Some((address, raw)) = texture.handle else {
-                return false;
+            let retain = |word: HandleWord| {
+                pointer(word.address, 4).map(|pointer| RetainedWord { word, pointer })
+            };
+            let handle = match texture.handle {
+                ConsumedHandle::Direct { primary, secondary } => {
+                    let Some(primary) = retain(primary) else {
+                        return false;
+                    };
+                    let secondary = if let Some(word) = secondary {
+                        let Some(word) = retain(word) else {
+                            return false;
+                        };
+                        Some(word)
+                    } else {
+                        None
+                    };
+                    if unsafe { primary.pointer.read_u32(0) } != primary.word.raw
+                        || secondary
+                            .as_ref()
+                            .is_some_and(|w| unsafe { w.pointer.read_u32(0) } != w.word.raw)
+                    {
+                        return false;
+                    }
+                    RetainedHandle::Direct { primary, secondary }
+                }
+                ConsumedHandle::Program(value) => RetainedHandle::Program(value),
             };
             if image.view.is_none() {
                 return false;
@@ -230,16 +293,10 @@ impl SampledTextures {
             else {
                 return false;
             };
-            let pointers = pointer(address, 4)
-                .zip(pointer(
-                    images.table.unwrap() + u64::from(texture.index) * 32,
-                    32,
-                ))
-                .zip(pointer(
-                    samplers.table.unwrap() + u64::from(sampler) * 32,
-                    32,
-                ));
-            let Some(((handle, tic_host), tsc_host)) = pointers else {
+            let pointers = pointer(images.table.unwrap() + u64::from(texture.index) * 32, 32).zip(
+                pointer(samplers.table.unwrap() + u64::from(sampler) * 32, 32),
+            );
+            let Some((tic_host, tsc_host)) = pointers else {
                 return false;
             };
             let words = |bytes: &[u8; 32]| {
@@ -248,15 +305,13 @@ impl SampledTextures {
                 })
             };
             let entry = Entry {
-                address,
                 handle,
-                raw,
                 tic: tic_host,
                 tsc: tsc_host,
                 tic_bytes: words(&tic.raw.bytes),
                 tsc_bytes: words(&tsc.bytes),
             };
-            if unsafe { entry.handle.read_u32(0) } != entry.raw || !entry.matches() {
+            if !entry.matches() {
                 return false;
             }
             self.entries.push(entry);
@@ -272,7 +327,7 @@ impl SampledTextures {
 
 #[derive(Clone, Copy)]
 pub(in crate::native) struct ResolvedDraw {
-    pipeline: usize,
+    pipeline: u64,
     channel: Option<u64>,
     space: u64,
     mapping: u64,
@@ -288,12 +343,12 @@ pub(in crate::native) struct ResolvedDraw {
 impl ResolvedDraw {
     pub fn capture(
         execution: &NativeExecution<'_>,
-        pipeline: usize,
+        pipeline: &crate::native::pipeline_cache::GraphicsPipeline,
         draw: &MaxwellThreeDDrawState,
         space: &MaxwellGpuMemory,
     ) -> Self {
         Self {
-            pipeline,
+            pipeline: pipeline.identity,
             channel: execution.state.current_context,
             space: space.id().get(),
             mapping: space.mapping_generation().get(),
@@ -319,7 +374,7 @@ impl ResolvedDraw {
     pub fn validate(
         &self,
         execution: &NativeExecution<'_>,
-        pipeline: usize,
+        pipeline: &crate::native::pipeline_cache::GraphicsPipeline,
         state: &MaxwellThreeDState,
         draw: &MaxwellThreeDDrawState,
         space: &MaxwellGpuMemory,
@@ -327,14 +382,30 @@ impl ResolvedDraw {
         if self.topology != draw.topology || self.indexed != draw.indexed {
             return Err(DrawMiss::Kind);
         }
-        if self.pipeline != pipeline
+        // Pipeline selection already compared all attribute type classes. The
+        // dynamic input consumer must still emit changed formats and offsets.
+        // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L530-L538
+        let light = GraphicsDirty::BUFFERS
+            | GraphicsDirty::VERTEX_BUFFER_ADDRESSES
+            | if pipeline.key.dynamic_vertex_input() {
+                GraphicsDirty::VERTEX_ATTRIBUTES
+            } else {
+                0
+            };
+        if self.pipeline != pipeline.identity
             || self.channel != execution.state.current_context
-            || state.graphics_dirty().is_dirty(
-                GraphicsDirty::ALL & !(GraphicsDirty::BUFFERS | GraphicsDirty::VERTEX_BUFFERS),
-            )
+            || state.graphics_dirty().is_dirty(GraphicsDirty::ALL & !light)
         {
             return Err(DrawMiss::State);
         }
+        self.validate_runtime(execution, pipeline.pipeline.identity(), space)
+    }
+    pub fn validate_runtime(
+        &self,
+        execution: &NativeExecution<'_>,
+        pipeline: usize,
+        space: &MaxwellGpuMemory,
+    ) -> Result<(), DrawMiss> {
         if self.space != space.id().get()
             || self.mapping != space.mapping_generation().get()
             || self.device_mapping != space.device_memory().device().generation()

@@ -8,6 +8,7 @@ impl From<crate::VulkanError> for CompileError {
 mod monitor;
 pub use monitor::CacheMonitor;
 mod shader;
+pub(crate) use shader::GuestStageMetadata;
 pub use shader::{CompiledStage, ShaderArtifact};
 mod layout;
 pub use layout::{LayoutBinding, LayoutKey, PipelineLayout};

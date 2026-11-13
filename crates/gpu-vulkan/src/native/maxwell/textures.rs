@@ -13,7 +13,7 @@ use model::recompiler::TexturePool;
 /// A consumed handle is retained while FillImageViews resolves the cache.
 /// Eviction retries do not re-read constant buffers or sampler descriptors.
 pub(in crate::native) struct ShaderTexture {
-    pub(in crate::native) handle: Option<(u64, u32)>,
+    pub(super) handle: super::handles::ConsumedHandle,
     pub(in crate::native) index: u32,
     pub(in crate::native) reference: MaxwellThreeDTextureReference,
     pub(in crate::native) dimension: Dimension,

@@ -33,6 +33,7 @@ pub enum CommandRead {
 struct RasterizerBinding {
     interface: Weak<dyn MaxwellGpuMemoryInterface>,
     pending_reads: Arc<AtomicUsize>,
+    memory_sync: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -111,12 +112,14 @@ impl MaxwellGpuMemoryHandle {
         &self,
         interface: Weak<dyn MaxwellGpuMemoryInterface>,
         pending_reads: Arc<AtomicUsize>,
+        memory_sync: Arc<AtomicU64>,
     ) {
         self.inner
             .rasterizer
             .set(RasterizerBinding {
                 interface,
                 pending_reads,
+                memory_sync,
             })
             .expect("GPU memory rasterizer already bound");
     }
@@ -794,6 +797,13 @@ pub struct MaxwellCommandMemory {
     generation: (u64, u64),
 }
 impl MaxwellCommandMemory {
+    /// Call after an acquire observes its producer and prior back work has been consumed.
+    /// The shared serial invalidates unobserved RAM contents without another queued command.
+    pub fn sync_guest_memory(&self) {
+        if let Some(binding) = self.handle.inner.rasterizer.get() {
+            binding.memory_sync.fetch_add(1, Ordering::Release);
+        }
+    }
     pub fn new(handle: MaxwellGpuMemoryHandle) -> Self {
         let reader = handle.device_memory().device().reader();
         let generation = (

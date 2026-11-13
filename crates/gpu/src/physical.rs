@@ -271,37 +271,6 @@ impl WriteDomain {
             )
         })
     }
-    /// Swizzle completed native bytes directly into the current guest mapping.
-    /// The caller owns RAM admission/publication and supplies the actual writer.
-    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/textures/decoders.cpp
-    pub fn scatter(
-        self,
-        source: &[u8],
-        native_start: u64,
-        mut write: impl FnMut(u64, &[u8]) -> Result<(), MemoryError>,
-    ) -> Result<(), MemoryError> {
-        if let WriteDomain::Image(image) = self
-            && image.has_complete_gob()
-        {
-            return image.scatter_gobs(source, native_start, &mut write);
-        }
-        self.for_each_copy(|logical, bytes, native| {
-            let start = native
-                .checked_sub(native_start)
-                .ok_or(MemoryError::Invalid(
-                    "swizzle source starts after its native plane",
-                ))? as usize;
-            let end = start
-                .checked_add(bytes as usize)
-                .ok_or(MemoryError::Invalid("swizzle source range overflows"))?;
-            write(
-                logical,
-                source.get(start..end).ok_or(MemoryError::Invalid(
-                    "swizzle source does not contain its native plane",
-                ))?,
-            )
-        })
-    }
     fn for_each_copy(
         self,
         mut copy: impl FnMut(u64, u64, u64) -> Result<(), MemoryError>,
@@ -312,7 +281,48 @@ impl WriteDomain {
                 let packed = u64::from(image.packed_bytes);
                 let full_element = image.aspect_bytes == image.packed_bytes
                     && image.native_element_bytes == image.packed_bytes;
+                let left = u64::from(image.rect.x) * packed;
                 let right = u64::from(image.rect.x + image.rect.width) * packed;
+                if full_element
+                    && (left | right).is_multiple_of(16)
+                    && let ImageStorage::BlockLinear {
+                        block_height_log2,
+                        block_depth_log2,
+                    } = image.storage
+                {
+                    // Resolve a GOB's base once, then copy its four fixed-width
+                    // units directly. Row bits are already included in offset.
+                    // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/textures/decoders.cpp#L80-L107
+                    const OFFSETS: [u64; 4] = [0, 32, 256, 288];
+                    let stride = 512u64 << (block_height_log2 + block_depth_log2);
+                    let first_gob = left / 64;
+                    let first_unit = (left % 64 / 16) as usize;
+                    let first_end = ((right - first_gob * 64).min(64) / 16) as usize;
+                    let gobs = left.div_ceil(64)..right.div_ceil(64);
+                    let units = right / 16;
+                    for y in image.rect.y..image.rect.y + image.rect.height {
+                        let row = image.base + image.offset(0, u64::from(y));
+                        let native_row = image.native_base + u64::from(y) * image.native_row_pitch;
+                        // Only a cropped first GOB starts at a nonzero unit.
+                        // The remaining GOBs use the same zero-origin loop as
+                        // complete planes, without recalculating that crop.
+                        if first_unit != 0 {
+                            let base = row + first_gob * stride;
+                            for (unit, &offset) in OFFSETS[first_unit..first_end].iter().enumerate()
+                            {
+                                copy(base + offset, 16, native_row + left + unit as u64 * 16)?;
+                            }
+                        }
+                        for gob in gobs.clone() {
+                            let base = row + gob * stride;
+                            let count = (units - gob * 4).min(4) as usize;
+                            for (unit, &offset) in OFFSETS[..count].iter().enumerate() {
+                                copy(base + offset, 16, native_row + gob * 64 + unit as u64 * 16)?;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
                 for y in image.rect.y..image.rect.y + image.rect.height {
                     let row = image.base + image.offset(0, u64::from(y));
                     let native_row = image.native_base + u64::from(y) * image.native_row_pitch;
@@ -333,7 +343,7 @@ impl WriteDomain {
                         ImageStorage::BlockLinear { .. } => bytes.min(16 - (x & 15)),
                     };
                     if full_element {
-                        let mut x = u64::from(image.rect.x) * packed;
+                        let mut x = left;
                         while x < right {
                             let count = contiguous(x, right - x);
                             copy(address(x), count, native_row + x)?;
@@ -461,80 +471,6 @@ impl ImageFootprint {
                             capture_destination(destination, native_start, native, bytes)?,
                         )
                     })?;
-                }
-                x += width;
-            }
-            y += lines;
-        }
-        Ok(())
-    }
-
-    fn scatter_gobs(
-        self,
-        source: &[u8],
-        native_start: u64,
-        write: &mut impl FnMut(u64, &[u8]) -> Result<(), MemoryError>,
-    ) -> Result<(), MemoryError> {
-        let ImageStorage::BlockLinear {
-            block_height_log2,
-            block_depth_log2,
-        } = self.storage
-        else {
-            unreachable!("complete GOBs require block-linear storage");
-        };
-        let read = |native: u64, bytes: usize| -> Result<&[u8], MemoryError> {
-            let offset = native
-                .checked_sub(native_start)
-                .ok_or(MemoryError::Invalid(
-                    "swizzle source begins after its plane",
-                ))? as usize;
-            source
-                .get(offset..offset + bytes)
-                .ok_or(MemoryError::Invalid(
-                    "swizzle source does not contain its plane",
-                ))
-        };
-        let stride = 512u64 << (block_height_log2 + block_depth_log2);
-        let left = u64::from(self.rect.x) * u64::from(self.packed_bytes);
-        let right = left + u64::from(self.rect.width) * u64::from(self.packed_bytes);
-        let bottom = u64::from(self.rect.y + self.rect.height);
-        let mut y = u64::from(self.rect.y);
-        let mut gob = [0; 512];
-        while y < bottom {
-            let lines = if y.is_multiple_of(8) && bottom - y >= 8 {
-                8
-            } else {
-                1
-            };
-            let mut x = left;
-            while x < right {
-                let width = (right - x).min(64 - x % 64);
-                if lines == 8 && width == 64 {
-                    for row in 0..8 {
-                        let native = self.native_base + (y + row) * self.native_row_pitch + x;
-                        let row_offset = (((row & 6) << 5) | ((row & 1) << 4)) as usize;
-                        for (column, bytes) in read(native, 64)?.chunks_exact(16).enumerate() {
-                            let at = row_offset + ((column & 2) << 7) + ((column & 1) << 5);
-                            gob[at..at + 16].copy_from_slice(bytes);
-                        }
-                    }
-                    write(self.base + self.offset(x, y), &gob)?;
-                } else {
-                    for line in 0..lines {
-                        let row = self.base + self.offset(0, y + line);
-                        let mut at = x;
-                        while at < x + width {
-                            let bytes = (x + width - at).min(16 - (at & 15));
-                            let logical = row
-                                + (at >> 6) * stride
-                                + ((at & 32) << 3)
-                                + ((at & 16) << 1)
-                                + (at & 15);
-                            let native = self.native_base + (y + line) * self.native_row_pitch + at;
-                            write(logical, read(native, bytes as usize)?)?;
-                            at += bytes;
-                        }
-                    }
                 }
                 x += width;
             }
@@ -780,6 +716,123 @@ impl Footprint {
     }
     pub fn bounds(&self) -> std::ops::Range<u64> {
         self.start..self.end
+    }
+    /// Publish a completed native plane into retained guest RAM. Resolve and
+    /// validate a contiguous destination once, then swizzle directly into it.
+    /// Fragmented/sparse mappings publish their actual spans in logical order.
+    /// https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/texture_cache/util.cpp#L532-L588
+    pub fn publish_resource(
+        &self,
+        writer: &nixe_memory::ResourceWriter<'_>,
+        native_start: u64,
+        source: &[u8],
+    ) -> Result<(), MemoryError> {
+        if writer.machine() != self.mapping.machine() {
+            return Err(MemoryError::Invalid(
+                "resource publication names another machine",
+            ));
+        }
+        // Footprint construction validated all layout arithmetic. Check the
+        // complete native interval once, before either publication traversal.
+        let (begin, end) = match self.domain {
+            WriteDomain::Buffer { start, bytes } => (start, start + bytes),
+            WriteDomain::Image(image) => (
+                image.native_base
+                    + u64::from(image.rect.y) * image.native_row_pitch
+                    + u64::from(image.rect.x) * u64::from(image.native_element_bytes),
+                image.native_base
+                    + u64::from(image.rect.y + image.rect.height - 1) * image.native_row_pitch
+                    + u64::from(image.rect.x + image.rect.width - 1)
+                        * u64::from(image.native_element_bytes)
+                    + u64::from(image.aspect_bytes),
+            ),
+        };
+        if native_start > begin || end - native_start > source.len() as u64 {
+            return Err(MemoryError::Invalid(
+                "publication source does not contain its native plane",
+            ));
+        }
+        let spans = self.mapping.spans();
+        let first = spans.partition_point(|span| span.logical + span.bytes <= self.start);
+        let spans = &spans[first..];
+        if let Some(extent) = self.contiguous_destination(spans) {
+            let destination = writer.region(extent)?;
+            let start = self.start;
+            // Capture immutable bases by value so native RAM stores cannot
+            // force reloads of borrowed metadata for every copy unit.
+            return self.domain.for_each_copy(move |logical, bytes, native| {
+                let offset = (native - native_start) as usize;
+                // SAFETY: the validated layout emits only this footprint's
+                // bytes, within its retained contiguous destination and the
+                // native interval checked above. RAM never becomes a slice.
+                unsafe {
+                    destination.write_unchecked(
+                        logical - start,
+                        source.get_unchecked(offset..offset + bytes as usize),
+                    );
+                }
+                Ok(())
+            });
+        }
+        // Resolve each physical fragment once. Visiting only covered bytes
+        // preserves padding, packed aspects, holes and later logical aliases
+        // without a scratch copy of the enclosing subresource.
+        for (index, span) in spans
+            .iter()
+            .take_while(|span| span.logical < self.end)
+            .enumerate()
+        {
+            let begin = self.start.max(span.logical);
+            let end = self.end.min(span.logical + span.bytes);
+            if begin >= end {
+                continue;
+            }
+            let extent = nixe_memory::Extent {
+                start: ArenaOffset::new(span.start.get() + begin - span.logical),
+                bytes: end - begin,
+            };
+            let destination = writer.region(extent)?;
+            self.visit(first + index, extent.start, extent.bytes, move |copy| {
+                let offset = (copy.native - native_start) as usize;
+                // SAFETY: visit clips every copy to the selected retained
+                // fragment and to the validated image rectangle/aspect. The
+                // native bounds above cover the corresponding source bytes.
+                unsafe {
+                    destination.write_unchecked(
+                        copy.start.get() - extent.start.get(),
+                        source.get_unchecked(offset..offset + copy.bytes as usize),
+                    );
+                }
+                true
+            })?;
+        }
+        Ok(())
+    }
+    fn contiguous_destination(&self, spans: &[PhysicalSpan]) -> Option<nixe_memory::Extent> {
+        let span = spans.first()?;
+        if span.logical > self.start {
+            return None;
+        }
+        let start = span.start.get() + self.start - span.logical;
+        let mut cursor = self.start;
+        // Physically adjacent runs can belong to separate allocations. Their
+        // retained union still admits one destination, while holes or aliases
+        // require the fragment traversal.
+        for span in spans {
+            if span.logical > cursor
+                || span.start.get() + cursor - span.logical != start + cursor - self.start
+            {
+                return None;
+            }
+            cursor = self.end.min(span.logical + span.bytes);
+            if cursor == self.end {
+                return Some(nixe_memory::Extent {
+                    start: ArenaOffset::new(start),
+                    bytes: self.end - self.start,
+                });
+            }
+        }
+        None
     }
     pub fn covers(&self, other: &Self) -> bool {
         if !self.mapping.same_addressing(&other.mapping) {
@@ -1364,57 +1417,6 @@ mod tests {
         assert!(!crop.covers(&shifted));
     }
     use nixe_memory::{Machine, PAGE_SIZE};
-
-    #[test]
-    fn swizzle_matches_storage_oracle_and_preserves_unwritten_padding() {
-        for storage in [
-            ImageStorage::Pitch { row_pitch: 112 },
-            ImageStorage::BlockLinear {
-                block_height_log2: 0,
-                block_depth_log2: 0,
-            },
-            ImageStorage::BlockLinear {
-                block_height_log2: 2,
-                block_depth_log2: 0,
-            },
-        ] {
-            let image = ImageFootprint {
-                depth_slice: 0,
-                base: 256,
-                columns: 19,
-                rows: 17,
-                packed_bytes: 4,
-                aspect_offset: 0,
-                aspect_bytes: 4,
-                storage,
-                native_base: 64,
-                native_element_bytes: 4,
-                native_row_pitch: 76,
-                rect: ByteRect {
-                    x: 0,
-                    y: 0,
-                    width: 19,
-                    height: 17,
-                },
-            };
-            let source: Vec<_> = (0..76 * 17).map(|at| (at % 251) as u8).collect();
-            let mut guest = vec![0xcc; 8192];
-            WriteDomain::Image(image)
-                .scatter(&source, 64, |offset, bytes| {
-                    guest[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
-                    Ok(())
-                })
-                .unwrap();
-            let mut expected = vec![0xcc; 8192];
-            for y in 0..17u64 {
-                for x in 0..76u64 {
-                    expected[256 + storage_offset(storage, 76, x, y) as usize] =
-                        source[(y * 76 + x) as usize];
-                }
-            }
-            assert_eq!(guest, expected);
-        }
-    }
 
     fn storage_offset(storage: ImageStorage, width: u64, x: u64, y: u64) -> u64 {
         match storage {

@@ -63,13 +63,21 @@ impl Query {
         })
     }
 }
-#[derive(Default)]
 pub(crate) struct QueryCache {
+    uniform_sync: Arc<std::sync::atomic::AtomicU64>,
     cached: BTreeMap<u64, Arc<Query>>,
     pending_sync: Vec<Arc<Query>>,
     pub(super) canonical_readback_bytes: u64,
 }
 impl QueryCache {
+    pub(super) fn new(uniform_sync: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            uniform_sync,
+            cached: Default::default(),
+            pending_sync: Vec::new(),
+            canonical_readback_bytes: 0,
+        }
+    }
     pub(super) fn invalidate_region(&mut self, address: u64, bytes: u64) {
         let end = address.saturating_add(bytes);
         let start = address.saturating_sub(3);
@@ -101,6 +109,7 @@ impl QueryCache {
         let result = result.and_then(|()| {
             if !query.invalidated.load(Ordering::Relaxed) {
                 query.write(&query.bytes).map_err(Arc::new)?;
+                self.uniform_sync.fetch_add(1, Ordering::Release);
                 self.canonical_readback_bytes += query.bytes.len() as u64;
             }
             Ok(())
@@ -124,6 +133,7 @@ impl QueryCache {
         for (&at, query) in self.cached.range(address.saturating_sub(3)..end) {
             if at + 4 > address && !query.invalidated.load(Ordering::Relaxed) {
                 query.write(query.value())?;
+                self.uniform_sync.fetch_add(1, Ordering::Release);
                 self.canonical_readback_bytes += query.value().len() as u64;
             }
         }
@@ -136,6 +146,7 @@ impl Residency<'_> {
         target: Vec<nixe_memory::AllocationRange>,
         bytes: Arc<[u8]>,
     ) -> Result<nixe_gpu::FenceAction, VulkanError> {
+        self.caches.sync_guest_memory();
         if !matches!(bytes.len(), 4 | 16) {
             return Err(VulkanError::InvalidResource(
                 "query report requires four or sixteen bytes",

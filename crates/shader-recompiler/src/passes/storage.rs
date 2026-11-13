@@ -123,23 +123,24 @@ pub fn global_memory_to_storage(
     }
     Ok(())
 }
-pub fn join_storage_info(base: &mut ShaderInfo, source: &ShaderInfo) -> Result<()> {
+pub(super) fn join_storage_info(base: &mut ShaderInfo, source: &ShaderInfo) -> Result<Vec<u32>> {
+    let mut indices = Vec::with_capacity(source.storage_buffers_descriptors.len());
     for descriptor in source.storage_buffers_descriptors.iter() {
-        if let Some(existing) = base
-            .storage_buffers_descriptors
-            .iter_mut()
-            .find(|existing| {
-                existing.cbuf_index == descriptor.cbuf_index
-                    && existing.cbuf_offset == descriptor.cbuf_offset
-                    && existing.count == descriptor.count
-            })
-        {
-            existing.is_written |= descriptor.is_written;
+        let index = base.storage_buffers_descriptors.iter().position(|d| {
+            d.cbuf_index == descriptor.cbuf_index
+                && d.cbuf_offset == descriptor.cbuf_offset
+                && d.count == descriptor.count
+        });
+        indices.push(if let Some(index) = index {
+            base.storage_buffers_descriptors[index].is_written |= descriptor.is_written;
+            index as u32
         } else {
+            let index = base.storage_buffers_descriptors.len();
             base.storage_buffers_descriptors.push(descriptor.clone())?;
-        }
+            index as u32
+        });
     }
-    Ok(())
+    Ok(indices)
 }
 
 pub fn add_nvn_storage_buffers(program: &mut Program) -> Result<()> {

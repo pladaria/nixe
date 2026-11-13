@@ -237,6 +237,14 @@ impl MaxwellMethodSink for Link<'_> {
             8 => word & payload != 0,
             _ => unreachable!("admitted acquire"),
         };
+        if matches {
+            // Successful acquires can expose CPU writes even when the read needed no back request.
+            self.current_memory
+                .as_ref()
+                .expect("active semaphore space")
+                .1
+                .sync_guest_memory();
+        }
         self.acquire = if matches {
             None
         } else {

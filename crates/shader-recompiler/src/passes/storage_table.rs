@@ -55,3 +55,59 @@ pub(super) fn storage_opcode(op: O) -> Option<O> {
         _ => return None,
     })
 }
+
+pub(super) fn is_storage(op: O) -> bool {
+    matches!(
+        op,
+        O::LoadStorageU8
+            | O::LoadStorageS8
+            | O::LoadStorageU16
+            | O::LoadStorageS16
+            | O::LoadStorage32
+            | O::LoadStorage64
+            | O::LoadStorage128
+            | O::WriteStorageU8
+            | O::WriteStorageS8
+            | O::WriteStorageU16
+            | O::WriteStorageS16
+            | O::WriteStorage32
+            | O::WriteStorage64
+            | O::WriteStorage128
+            | O::StorageAtomicIAdd32
+            | O::StorageAtomicSMin32
+            | O::StorageAtomicUMin32
+            | O::StorageAtomicSMax32
+            | O::StorageAtomicUMax32
+            | O::StorageAtomicInc32
+            | O::StorageAtomicDec32
+            | O::StorageAtomicAnd32
+            | O::StorageAtomicOr32
+            | O::StorageAtomicXor32
+            | O::StorageAtomicExchange32
+            | O::StorageAtomicIAdd64
+            | O::StorageAtomicSMin64
+            | O::StorageAtomicUMin64
+            | O::StorageAtomicSMax64
+            | O::StorageAtomicUMax64
+            | O::StorageAtomicAnd64
+            | O::StorageAtomicOr64
+            | O::StorageAtomicXor64
+            | O::StorageAtomicExchange64
+            | O::StorageAtomicIAdd32x2
+            | O::StorageAtomicSMin32x2
+            | O::StorageAtomicUMin32x2
+            | O::StorageAtomicSMax32x2
+            | O::StorageAtomicUMax32x2
+            | O::StorageAtomicAnd32x2
+            | O::StorageAtomicOr32x2
+            | O::StorageAtomicXor32x2
+            | O::StorageAtomicExchange32x2
+            | O::StorageAtomicAddF32
+            | O::StorageAtomicAddF16x2
+            | O::StorageAtomicAddF32x2
+            | O::StorageAtomicMinF16x2
+            | O::StorageAtomicMinF32x2
+            | O::StorageAtomicMaxF16x2
+            | O::StorageAtomicMaxF32x2
+    )
+}

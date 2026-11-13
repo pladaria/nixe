@@ -60,13 +60,38 @@ pub struct ResourceWriter<'a> {
     machine: &'a Machine,
     retained: Vec<Extent>,
 }
+/// One validated publication destination. The borrow keeps the writer and its
+/// retained inputs alive; it never grants an exclusive Rust reference to RAM.
+pub struct ResourceWrite<'a> {
+    destination: crate::HostAddress,
+    bytes: u64,
+    _publication: std::marker::PhantomData<&'a ()>,
+}
+impl ResourceWrite<'_> {
+    /// Copy disjoint host bytes into a previously validated destination.
+    ///
+    /// # Safety
+    /// `offset..offset + source.len()` must fit the region. Publication order
+    /// and GPU coherence must already be resolved by the cache owner. Native
+    /// guest instructions may access RAM concurrently; the instruction copy
+    /// forms no Rust references to those bytes and permits ordinary tearing.
+    #[inline]
+    pub unsafe fn write_unchecked(&self, offset: u64, source: &[u8]) {
+        debug_assert!(offset <= self.bytes && source.len() as u64 <= self.bytes - offset);
+        unsafe {
+            crate::raw::write(self.destination.as_ptr().add(offset as usize), source);
+        }
+    }
+}
 impl ResourceWriter<'_> {
-    pub fn write(&self, extent: Extent, source: &[u8]) -> Result<(), MemoryError> {
+    pub fn machine(&self) -> crate::MachineId {
+        self.machine.identity()
+    }
+    pub fn region(&self, extent: Extent) -> Result<ResourceWrite<'_>, MemoryError> {
         let index = self
             .retained
             .partition_point(|retained| retained.start <= extent.start);
-        if extent.bytes != source.len() as u64
-            || index == 0
+        if index == 0
             || extent
                 .start
                 .get()
@@ -77,10 +102,27 @@ impl ResourceWriter<'_> {
         {
             return Err(MemoryError::Invalid("GPU publication exceeds retained RAM"));
         }
-        // SAFETY: write_resources retains these pages and excludes physical
-        // access for the entire callback; the source is owned host memory.
+        Ok(ResourceWrite {
+            destination: self
+                .machine
+                .arena()
+                .host_address(extent.start, extent.bytes)
+                .expect("retained publication destination"),
+            bytes: extent.bytes,
+            _publication: std::marker::PhantomData,
+        })
+    }
+    pub fn write(&self, extent: Extent, source: &[u8]) -> Result<(), MemoryError> {
+        if extent.bytes != source.len() as u64 {
+            return Err(MemoryError::Invalid(
+                "GPU publication size differs from its source",
+            ));
+        }
+        let region = self.region(extent)?;
+        // SAFETY: the whole destination is retained through this publication;
+        // the checked size matches disjoint host memory, without borrowing RAM.
         unsafe {
-            self.machine.write_admitted(extent, source);
+            region.write_unchecked(0, source);
         }
         Ok(())
     }

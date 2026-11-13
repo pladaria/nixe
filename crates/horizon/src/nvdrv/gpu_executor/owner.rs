@@ -228,6 +228,9 @@ where
     }
     fn service_progress(&mut self) -> Result<(), GpuExecutorFailure> {
         let requested = self.budget.take_progress_request();
+        if requested != 0 {
+            self.frontend.borrow_mut().sync_guest_memory();
+        }
         if requested & GpuWorkBudget::FLUSH != 0 {
             self.flush_progress()?;
         } else if requested & GpuWorkBudget::SUBMIT_DEFERRED != 0
@@ -300,6 +303,37 @@ where
         Ok(receiver.try_recv())
     }
     fn execute(&mut self, message: GpuMessage) -> Result<(), GpuExecutorFailure> {
+        let synchronize = match &message {
+            // Transport bookkeeping and coherent fetches introduce no guest
+            // synchronization. Publications invalidate their actual contents;
+            // a successful acquire notes its boundary on the command owner.
+            GpuMessage::SelectSubmission(_)
+            | GpuMessage::EndSubmission
+            | GpuMessage::CommandFetch { .. }
+            | GpuMessage::SemaphoreRead { .. }
+            | GpuMessage::FrontIdle { .. } => false,
+            #[cfg(feature = "performance-counters")]
+            GpuMessage::FrontMetrics(_) => false,
+            // New command lists and external requests can expose CPU stores
+            // into unprotected RAM. Invalidate in order before consuming them.
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/gpu_thread.cpp#L191-L224
+            GpuMessage::Submission(_)
+            | GpuMessage::CreateAddressSpace(_)
+            | GpuMessage::AddressSpaceIoctl { .. }
+            | GpuMessage::CreateChannel(_)
+            | GpuMessage::CloseChannel(_)
+            | GpuMessage::CloseAddressSpace(_)
+            | GpuMessage::ConvertNv12 { .. }
+            | GpuMessage::RequestComposite { .. }
+            | GpuMessage::Composite(_)
+            | GpuMessage::MemoryAccess(_)
+            | GpuMessage::GuestMemoryReleased { .. }
+            | GpuMessage::PhysicalRetired { .. }
+            | GpuMessage::AllocationPressure { .. } => true,
+        };
+        if synchronize {
+            self.frontend.borrow_mut().sync_guest_memory();
+        }
         match message {
             GpuMessage::FrontIdle { start, end } => {
                 // Pacing can be excluded only while both CPU stages were idle.

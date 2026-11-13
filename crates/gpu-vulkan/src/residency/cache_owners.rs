@@ -3,6 +3,7 @@
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache_base.h
 use super::*;
 pub(crate) struct CacheOwners {
+    uniform_sync: Arc<std::sync::atomic::AtomicU64>,
     pub(super) command_pages: Arc<command_pages::CommandPages>,
     pub(crate) shader_cache: nixe_gpu_maxwell::recompiler::ShaderCache,
     device_memory: nixe_memory::device_memory::DeviceMemory,
@@ -15,6 +16,14 @@ pub(crate) struct CacheOwners {
     gpu_invalidations: Arc<virtual_range_cache::Invalidations>,
 }
 impl CacheOwners {
+    pub(crate) fn guest_memory_sync(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.uniform_sync)
+    }
+    /// A guest synchronization can expose CPU writes to unprotected streamed RAM.
+    pub(crate) fn sync_guest_memory(&self) {
+        self.uniform_sync
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
     pub(crate) fn pending_read_count(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         Arc::clone(&self.pending_buffer_reads)
     }
@@ -47,7 +56,12 @@ impl CacheOwners {
         samplers: crate::cache::SamplerCache,
     ) -> Self {
         let command_pages = Arc::new(command_pages::CommandPages::default());
-        let buffer_cache = BufferCache::new(device.clone(), Arc::clone(&command_pages));
+        let uniform_sync = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let buffer_cache = BufferCache::new(
+            device.clone(),
+            Arc::clone(&command_pages),
+            Arc::clone(&uniform_sync),
+        );
         let pending_buffer_reads = Arc::clone(&buffer_cache.pending_read_count);
         let gpu_invalidations = Arc::clone(&buffer_cache.virtual_ranges.invalidations);
         Self {
@@ -56,10 +70,16 @@ impl CacheOwners {
             timeline,
             shader_cache: nixe_gpu_maxwell::recompiler::ShaderCache::new(device.clone()),
             device_memory: device.clone(),
-            query_cache: Default::default(),
+            query_cache: std::sync::Mutex::new(query::QueryCache::new(Arc::clone(&uniform_sync))),
             buffer_cache: std::sync::Mutex::new(buffer_cache),
             pending_buffer_reads,
-            texture_cache: std::sync::Mutex::new(TextureCache::new(device, progress, samplers)),
+            texture_cache: std::sync::Mutex::new(TextureCache::new(
+                device,
+                progress,
+                samplers,
+                Arc::clone(&uniform_sync),
+            )),
+            uniform_sync,
             gpu_invalidations,
         }
     }
@@ -227,6 +247,7 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
                 .any(|page| cache.buffer_index.at(page << 16).is_some());
             if registered {
                 if cache.memory_tracker.gpu_modified(address, bytes) {
+                    cache.note_uniform_write(address, bytes);
                     // Invalidate now and again when the deferred write is applied;
                     // a producer can create a new command copy in between.
                     self.device_memory.write_command_pages(address, bytes);
@@ -266,6 +287,7 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
     }
 }
 pub(crate) struct BufferCache {
+    pub(super) uniform_streams: uniform_stream::UniformStreams,
     pub(super) command_pages: Arc<command_pages::CommandPages>,
     pub(super) collect_command_copies: bool,
     pub(super) command_copy_requests: Vec<(BufferId, u64, u64)>,
@@ -297,6 +319,7 @@ pub(crate) struct BufferCache {
 }
 impl BufferCache {
     pub(super) fn claim_cpu_write(&mut self, address: u64, bytes: u64) {
+        self.note_uniform_write(address, bytes);
         // Include ordered host writes, even if they were already notified before
         // being deferred. Versions follow physical pages, including all aliases.
         // https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/buffer_cache/buffer_cache.h#L225
@@ -317,8 +340,10 @@ impl BufferCache {
     pub(super) fn new(
         device: nixe_memory::device_memory::DeviceMemory,
         command_pages: Arc<command_pages::CommandPages>,
+        uniform_sync: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
+            uniform_streams: uniform_stream::UniformStreams::new(uniform_sync),
             command_pages,
             collect_command_copies: false,
             command_copy_requests: Vec::new(),
@@ -353,6 +378,7 @@ impl Drop for BufferCache {
     }
 }
 pub(crate) struct TextureCache {
+    pub(super) uniform_sync: Arc<std::sync::atomic::AtomicU64>,
     pub(super) frame_tick: u64,
     // Native samplers live with the texture cache, through queue shutdown,
     // including replaced TSC selections and exceptional native teardown.
@@ -398,8 +424,10 @@ impl TextureCache {
         device_memory: nixe_memory::device_memory::DeviceMemory,
         progress: Arc<crate::queue::progress::SubmissionProgress>,
         samplers: crate::cache::SamplerCache,
+        uniform_sync: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
+            uniform_sync,
             samplers,
             frame_tick: 0,
             bindings: Default::default(),

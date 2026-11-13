@@ -11,6 +11,7 @@ pub(crate) mod dynamic_state;
 pub(in crate::native) mod fixed_state;
 mod geometry;
 mod graphics;
+mod handles;
 pub(in crate::native) mod identity;
 pub(crate) mod image;
 pub(in crate::native) mod registers;
@@ -208,6 +209,15 @@ fn plane_metadata_bytes(image: &GuestImage) -> usize {
 }
 
 impl MaxwellFrontend for MaxwellVulkanRasterizer {
+    fn sync_guest_memory(&mut self) {
+        self.renderer
+            .borrow()
+            .as_ref()
+            .expect("installed renderer")
+            .residency
+            .caches
+            .sync_guest_memory();
+    }
     fn service_host_requests(&mut self) -> Result<(), Error> {
         let mut renderer = self.renderer.borrow_mut();
         let renderer = renderer.as_mut().expect("installed renderer");
@@ -286,8 +296,9 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             .residency
             .caches;
         let pending_reads = caches.pending_read_count();
+        let memory_sync = caches.guest_memory_sync();
         let interface: Arc<dyn model::MaxwellGpuMemoryInterface> = caches.clone();
-        memory.bind_rasterizer(Arc::downgrade(&interface), pending_reads);
+        memory.bind_rasterizer(Arc::downgrade(&interface), pending_reads, memory_sync);
     }
     fn create_channel(&mut self, channel: model::MaxwellChannelId) {
         self.renderer

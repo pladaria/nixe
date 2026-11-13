@@ -153,6 +153,7 @@ impl FeatureSet {
             ..Default::default()
         };
         let mut host = HostTranslateInfo {
+            support_handle_table_arrays: profile.support_sampled_image_array_nonuniform_indexing,
             min_ssbo_alignment: limits.min_storage_buffer_offset_alignment,
             max_per_stage_descriptor_sampled_images: limits.max_per_stage_descriptor_sampled_images,
             max_per_stage_resources: limits.max_per_stage_resources,

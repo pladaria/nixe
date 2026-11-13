@@ -161,7 +161,6 @@ pub(super) const fn passive_action(action: MethodAction) -> bool {
 pub(super) const VERTEX_SHIFT: u32 = Flags::VERTEX_SHIFT;
 pub(super) const COLOR_SHIFT: u32 = Flags::COLOR_SHIFT;
 use nixe_gpu::native::GraphicsDirty as Flags;
-pub(super) const VERTEX_LAYOUT: u128 = Flags::VERTEX_INPUT;
 const VIEWPORT: u128 = Flags::VIEWPORT;
 const SCISSOR: u128 = Flags::SCISSOR;
 const BLEND_CONSTANTS: u128 = Flags::BLEND_CONSTANTS;
@@ -198,10 +197,13 @@ const fn parameter_dirty(method: u32, domains: u16) -> u128 {
     } else {
         0
     };
-    if matches!(method, 0x1160..=0x11dc | 0x1880..=0x18fc)
+    if matches!(method, 0x1160..=0x11dc) {
+        return Flags::VERTEX_ATTRIBUTES | configuration;
+    }
+    if matches!(method, 0x1880..=0x18fc)
         || (method >= 0x1c00 && method <= 0x1dfc && (method - 0x1c00) % 16 == 12)
     {
-        return VERTEX_LAYOUT | configuration;
+        return Flags::VERTEX_INSTANCING | configuration;
     }
     // Stride belongs to VertexBuffers, not VertexInput. Static-stride hosts
     // read it while refreshing their fixed pipeline state, as Eden does.
@@ -284,7 +286,12 @@ pub(super) static DIRTY_TABLES: [[u8; 0xe00]; 2] = {
             | ((vertices as u128) << VERTEX_SHIFT)
             | ((colors as u128) << COLOR_SHIFT);
         if domains & VERTEX != 0 {
-            flags |= Flags::VERTEX_BUFFERS;
+            flags |= if method >= 0x1c00 && method <= 0x1df0 && (method - 0x1c00).is_multiple_of(16)
+            {
+                Flags::VERTEX_STRIDES
+            } else {
+                Flags::VERTEX_BUFFER_ADDRESSES
+            };
         }
         if domains & INDEX != 0 {
             flags |= Flags::INDEX;

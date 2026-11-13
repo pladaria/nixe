@@ -354,47 +354,16 @@ impl TextureCache {
         Ok(())
     }
     fn publish_plane(&mut self, data: &[u8], plane: &PlaneDownload) -> Result<(), VulkanError> {
+        // Publication changes streamed RAM too, including physical buffer aliases.
+        self.uniform_sync
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         let source = &data[plane.source as usize..(plane.source + plane.size) as usize];
-        let mapping = plane.geometry.mapping();
         self.device_memory
             .machine()
             .write_resources(&plane.inputs, |writer| {
-                plane.geometry.domain().scatter(
-                    source,
-                    plane.native_start,
-                    |mut logical, mut bytes| {
-                        while !bytes.is_empty() {
-                            let index = mapping
-                                .spans()
-                                .partition_point(|span| span.logical + span.bytes <= logical);
-                            let Some(span) = mapping.spans().get(index) else {
-                                break;
-                            };
-                            if logical < span.logical {
-                                let skip =
-                                    (span.logical - logical).min(bytes.len() as u64) as usize;
-                                bytes = &bytes[skip..];
-                                logical += skip as u64;
-                                continue;
-                            }
-                            let count = (span.logical + span.bytes - logical)
-                                .min(bytes.len() as u64)
-                                as usize;
-                            writer.write(
-                                nixe_memory::Extent {
-                                    start: nixe_memory::ArenaOffset::new(
-                                        span.start.get() + logical - span.logical,
-                                    ),
-                                    bytes: count as u64,
-                                },
-                                &bytes[..count],
-                            )?;
-                            bytes = &bytes[count..];
-                            logical += count as u64;
-                        }
-                        Ok(())
-                    },
-                )
+                plane
+                    .geometry
+                    .publish_resource(writer, plane.native_start, source)
             })?;
         self.native_readback_bytes += plane.size;
         self.canonical_readback_bytes += plane.size;

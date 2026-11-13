@@ -38,6 +38,7 @@ pub struct ConstBufferAddr<V> {
     pub secondary_offset: ByteOffset,
     pub secondary_shift_left: u32,
     pub dynamic_offset: V,
+    pub handle_program: Option<u32>,
     pub count: u32,
     pub has_secondary: bool,
 }

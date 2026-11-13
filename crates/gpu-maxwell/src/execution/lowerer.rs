@@ -4,6 +4,8 @@ use crate::engines::{MaxwellResolvedComputeLaunch, MaxwellTwoDSolidOperation};
 use crate::{MaxwellThreeDState, MaxwellTwoDBlitOperation};
 
 pub trait MaxwellFrontend: 'static {
+    /// Ordered boundary after which unprotected guest RAM must be read again.
+    fn sync_guest_memory(&mut self);
     /// Apply host settings between complete command lists.
     fn service_host_requests(&mut self) -> Result<(), MaxwellSubmissionExecutionError>;
     fn bind_gpu_memory(&mut self, memory: &crate::MaxwellGpuMemoryHandle);

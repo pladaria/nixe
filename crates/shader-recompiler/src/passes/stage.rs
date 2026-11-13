@@ -236,6 +236,7 @@ pub fn merge_dual_vertex<E: Environment>(
 ) -> Result<Program> {
     invalidate_first(ir, &a, O::Epilogue)?;
     invalidate_first(ir, &b, O::Prologue)?;
+    let b_blocks = b.post_order;
     let mut result = Program::new(Stage::VertexB);
     result.execution.provenance = crate::artifact::StageProvenance::MergedVertex;
     result.syntax = a
@@ -255,7 +256,6 @@ pub fn merge_dual_vertex<E: Environment>(
             }
         })
         .collect();
-    result.post_order = b.post_order.into_iter().chain(a.post_order).collect();
     result.info = a.info;
     result.execution.local_memory_size = a
         .execution
@@ -265,8 +265,11 @@ pub fn merge_dual_vertex<E: Environment>(
         result.info.loads.mask[i] |= b.info.loads.mask[i];
         result.info.stores.mask[i] |= b.info.stores.mask[i];
     }
-    super::join_texture_info(&mut result.info, &b.info);
-    super::join_storage_info(&mut result.info, &b.info)?;
+    let storage = super::storage::join_storage_info(&mut result.info, &b.info)?;
+    let textures =
+        super::texture_descriptors::join_texture_info(&mut result.info, &b.info, &storage);
+    super::texture_descriptors::remap(ir, &b_blocks, &textures, &storage)?;
+    result.post_order = b_blocks.into_iter().chain(a.post_order).collect();
     super::dead_code_elimination(ir, &result)?;
     if debug {
         super::verify_program(ir, &result)?;

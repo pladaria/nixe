@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct HostTranslateInfo {
+    pub support_handle_table_arrays: bool,
     pub min_ssbo_alignment: u64,
     pub max_per_stage_descriptor_sampled_images: u32,
     pub max_per_stage_resources: u32,

@@ -4,7 +4,7 @@
 use super::pipeline_resources::PipelineResources;
 use super::*;
 use maxwell::fixed_state::FixedPipelineState;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 pub(super) type ConfigureGraphics = fn(
     &GraphicsPipeline,
@@ -16,7 +16,11 @@ pub(super) type ConfigureGraphics = fn(
     Draw,
     u128,
 ) -> Result<(), VulkanError>;
+// Native Vulkan pipelines may be shared by distinct guest preparations. This
+// identity names the latter and survives movement of the owner vector.
+static NEXT_GRAPHICS_PIPELINE_ID: AtomicU64 = AtomicU64::new(1);
 pub(super) struct GraphicsPipeline {
+    pub(super) identity: u64,
     pub(super) key: FixedPipelineState,
     transition_keys: Vec<FixedPipelineState>,
     transitions: Vec<usize>,
@@ -315,21 +319,31 @@ impl PipelineCache {
         space: &nixe_gpu_maxwell::MaxwellGpuMemory,
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<bool, VulkanError> {
-        let light = nixe_gpu::native::GraphicsDirty::BUFFERS
+        use nixe_gpu::native::GraphicsDirty as D;
+        let light = D::BUFFERS
             | if profile.dynamic_state.vertex_input && profile.dynamic_state.base {
-                nixe_gpu::native::GraphicsDirty::VERTEX_BUFFERS
+                D::VERTEX_BUFFERS
+            } else {
+                0
+            }
+            | if profile.dynamic_state.vertex_input {
+                D::VERTEX_ATTRIBUTES
             } else {
                 0
             };
         if self.current_graphics.is_some()
             && self.last_draw_kind == Some((draw.topology, draw.indexed))
-            && !registers
-                .graphics_dirty()
-                .is_dirty(nixe_gpu::native::GraphicsDirty::ALL & !light)
+            && !registers.graphics_dirty().is_dirty(D::ALL & !light)
             && self
                 .pipeline_state
                 .as_ref()
                 .is_some_and(|key| key.shader == shaders.hashes)
+            && (!registers.graphics_dirty().is_dirty(D::VERTEX_ATTRIBUTES)
+                || self
+                    .pipeline_state
+                    .as_ref()
+                    .unwrap()
+                    .same_vertex_types(registers)?)
         {
             maxwell::registers::validate_draw(registers)?;
             return Ok(true);
@@ -447,6 +461,7 @@ impl PipelineCache {
         let configure = GraphicsPipeline::configure_func(&shader, &resources);
         let sampled_reuse = maxwell::reuse::SampledTextures::eligible(&resources);
         Ok(GraphicsPipeline {
+            identity: NEXT_GRAPHICS_PIPELINE_ID.fetch_add(1, Ordering::Relaxed),
             key,
             transition_keys: Vec::new(),
             transitions: Vec::new(),

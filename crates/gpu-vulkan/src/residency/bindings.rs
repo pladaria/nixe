@@ -28,6 +28,7 @@ pub(crate) struct BufferChannel {
     pub(crate) has_deleted_buffers: bool,
     pub(crate) streamed_uniforms: [u32; 6],
     pub(crate) uniform_buffers: Vec<Box<[Option<UniformBuffer>]>>,
+    pub(crate) uniform_bind_changes: [u32; nixe_gpu_maxwell::MAXWELL_BIND_GROUP_COUNT],
     pub(crate) address_space: Option<u64>,
     pub(crate) mapping_generation: u64,
     pub(crate) indexed: bool,
@@ -44,6 +45,7 @@ impl Default for BufferChannel {
             dirty_vertex_buffers: 0,
             index_buffer: None,
             uniform_buffers: Vec::new(),
+            uniform_bind_changes: [0; nixe_gpu_maxwell::MAXWELL_BIND_GROUP_COUNT],
             storage_buffers: std::array::from_fn(|_| vec![None; 16].into_boxed_slice()),
             compute_uniform_buffers: vec![None; 8].into_boxed_slice(),
             has_deleted_buffers: false,
@@ -84,6 +86,9 @@ pub(crate) enum StorageBufferBinding {
     MultiRange(super::multi_range::MultiRangeBinding),
 }
 impl BufferBindings {
+    pub(super) fn current_channel(&self) -> Option<u64> {
+        self.current_channel
+    }
     pub(crate) fn create_channel(&mut self, id: u64, vertices: usize, groups: usize, slots: usize) {
         let channel = BufferChannel {
             address_space: None,
@@ -208,6 +213,7 @@ impl BufferBindings {
                 source,
                 native: None,
             });
+        self.channel.uniform_bind_changes[group as usize] |= 1 << slot;
     }
 }
 impl Residency<'_> {

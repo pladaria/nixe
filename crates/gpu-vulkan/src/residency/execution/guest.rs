@@ -64,6 +64,7 @@ impl Residency<'_> {
     ) -> Result<(), VulkanError> {
         for slot in &resources.uniforms {
             let Some((address, range)) = self.guest_uniform::<STAGE>(slot, group) else {
+                self.buffer_cache.uniform_streams.forget::<STAGE>(slot.slot);
                 if !self.runtime.device.profile().null_descriptor {
                     return Err(VulkanError::InvalidResource(
                         "disabled guest uniform requires nullDescriptor support",
@@ -99,50 +100,43 @@ impl Residency<'_> {
             // directly. Guest uniforms never reclassify physical footprints or
             // fall through the host utility program's generic stream selector.
             // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/buffer_cache/buffer_cache.h#L931-L980
-            let stream = (unaligned
-                || range.size <= self.runtime.buffer_bindings.channel.uniform_stream_limit)
-                && !self
-                    .buffer_cache
-                    .gpu_modified_ranges
-                    .intersects(address, range.size);
-            let native = if stream {
-                let native = self.runtime.device.submission.reserve_slice(
-                    range.size,
-                    crate::queue::staging::Usage::Upload,
-                    alignment.max(4),
-                )?;
-                unsafe {
-                    self.runtime
-                        .device
-                        .submission
-                        .staging
-                        .write_with(&native, |bytes| {
-                            self.runtime
-                                .device_reader
-                                .read_block_unsafe(address, bytes)
-                                .map_err(memory_error)
-                        })?;
-                }
-                self.touch(Resource::Buffer(range.buffer));
-                self.runtime.statistics.cpu_streamed_bytes += range.size;
-                self.runtime.buffer_bindings.channel.streamed_uniforms[STAGE] |= 1 << slot.slot;
-                (native.buffer, native.offset)
-            } else if unaligned {
-                self.runtime.buffer_bindings.channel.streamed_uniforms[STAGE] |= 1 << slot.slot;
-                let copy = self.aligned_uniform_copy(range.buffer, range.offset, range.size)?;
-                (copy.buffer, copy.offset)
-            } else {
-                let uploaded = self.runtime.statistics.cpu_uploaded_bytes;
-                self.ensure_buffer_range(range.buffer, range.offset, range.size)?;
-                self.use_buffer(range.buffer, range.offset, range.size)?;
-                if self.runtime.statistics.cpu_uploaded_bytes == uploaded {
-                    self.runtime.buffer_bindings.channel.uniform_cache_hits[0] += 1;
-                }
-                (
-                    self.buffer_cache.get(range.buffer).native.handle,
-                    range.offset,
-                )
-            };
+            let native =
+                if let Some(native) = self.kept_uniform::<STAGE>(slot.slot, address, range.size) {
+                    self.touch(Resource::Buffer(range.buffer));
+                    self.runtime.buffer_bindings.channel.streamed_uniforms[STAGE] |= 1 << slot.slot;
+                    (native.buffer, native.offset)
+                } else if (unaligned
+                    || range.size <= self.runtime.buffer_bindings.channel.uniform_stream_limit)
+                    && !self
+                        .buffer_cache
+                        .gpu_modified_ranges
+                        .intersects(address, range.size)
+                {
+                    let native = self.stream_guest_uniform::<STAGE>(
+                        slot.slot,
+                        address,
+                        range,
+                        alignment.max(4),
+                    )?;
+                    self.touch(Resource::Buffer(range.buffer));
+                    self.runtime.buffer_bindings.channel.streamed_uniforms[STAGE] |= 1 << slot.slot;
+                    (native.buffer, native.offset)
+                } else if unaligned {
+                    self.runtime.buffer_bindings.channel.streamed_uniforms[STAGE] |= 1 << slot.slot;
+                    let copy = self.aligned_uniform_copy(range.buffer, range.offset, range.size)?;
+                    (copy.buffer, copy.offset)
+                } else {
+                    let uploaded = self.runtime.statistics.cpu_uploaded_bytes;
+                    self.ensure_buffer_range(range.buffer, range.offset, range.size)?;
+                    self.use_buffer(range.buffer, range.offset, range.size)?;
+                    if self.runtime.statistics.cpu_uploaded_bytes == uploaded {
+                        self.runtime.buffer_bindings.channel.uniform_cache_hits[0] += 1;
+                    }
+                    (
+                        self.buffer_cache.get(range.buffer).native.handle,
+                        range.offset,
+                    )
+                };
             self.runtime.descriptor_queue.write(
                 slot.descriptor,
                 DescriptorEntry {

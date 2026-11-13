@@ -11,7 +11,7 @@ mod ssa;
 mod storage;
 mod storage_table;
 
-pub use storage::{add_nvn_storage_buffers, global_memory_to_storage, join_storage_info};
+pub use storage::{add_nvn_storage_buffers, global_memory_to_storage};
 
 pub use fold::constant_propagation;
 
@@ -71,12 +71,13 @@ pub fn early_passes(ir: &mut Ir, program: &Program, host: &HostTranslateInfo) ->
     rewrite_ssa(ir, program)
 }
 
+mod handle_control_flow;
+mod handle_program;
 mod texture;
 mod texture_descriptors;
 mod texture_table;
 mod texture_tracking;
 pub use texture::texture_pass;
-pub use texture_descriptors::join_texture_info;
 
 mod stage;
 pub use stage::{

@@ -74,6 +74,8 @@ impl Residency<'_> {
         destination_address: u64,
         bytes: u64,
     ) -> Result<(), VulkanError> {
+        self.buffer_cache
+            .note_uniform_gpu_write(destination_address, bytes);
         let (source, destination) = loop {
             let src = self.device_buffer(
                 source_address,

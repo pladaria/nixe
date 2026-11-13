@@ -307,8 +307,12 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellMethodExecution<'a, L
                     )
                     .map_err(dispatch_error)?;
                     *self.engine = Some(engine);
+                    if engine != crate::engines::Engine::ThreeD {
+                        self.effects.sync_guest_memory();
+                    }
                 }
                 HOST => {
+                    self.effects.sync_guest_memory();
                     use crate::MaxwellHostSynchronizationKind as Effect;
                     let a = words[cursor];
                     let b = words[cursor + 1];

@@ -43,7 +43,8 @@ pub use machine::{
 };
 
 pub use tracking::{
-    PhysicalCapture, ResourceRead, ResourceReader, ResourceWriter, TrackingStatistics, WriteSource,
+    PhysicalCapture, ResourceRead, ResourceReader, ResourceWrite, ResourceWriter,
+    TrackingStatistics, WriteSource,
 };
 pub use transition::{CodeInvalidation, CoreContext, NativeAdmission};
 pub use virtual_arena::{AddressWidth, MemoryPermissions, VirtualArena};

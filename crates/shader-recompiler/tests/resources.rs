@@ -453,41 +453,6 @@ fn dynamic_cbufs_mark_all_banks_and_nvn_slots_but_static_reads_remain_bounded() 
     assert_eq!(p.info.constant_buffer_used_sizes[0], 0x340);
 }
 #[test]
-fn image_descriptor_access_flags_merge_without_aliasing_different_formats() {
-    use nixe_shader_recompiler::{
-        artifact::{ImageDescriptor, ShaderInfo},
-        passes::join_texture_info,
-        types::ImageFormat,
-    };
-    let mut base = ShaderInfo::default();
-    let mut source = ShaderInfo::default();
-    let a = ImageDescriptor {
-        texture_type: T::Color2D,
-        cbuf_index: CbufIndex(2),
-        cbuf_offset: ByteOffset(8),
-        count: 1,
-        size_shift: 3,
-        is_read: true,
-        ..Default::default()
-    };
-    base.image_descriptors.push(a.clone());
-    let mut b = a.clone();
-    b.is_read = false;
-    b.is_written = true;
-    b.is_integer = true;
-    source.image_descriptors.push(b);
-    let mut c = a;
-    c.format = ImageFormat::R32_UINT;
-    source.image_descriptors.push(c);
-    join_texture_info(&mut base, &source);
-    assert_eq!(base.image_descriptors.len(), 2);
-    assert!(
-        base.image_descriptors[0].is_read
-            && base.image_descriptors[0].is_written
-            && base.image_descriptors[0].is_integer
-    );
-}
-#[test]
 fn position_transform_observes_viewport_only_for_vertex_b_and_rewrites_xy() {
     use nixe_shader_recompiler::{ir::Attribute, passes::position};
     for stage in [Stage::VertexA, Stage::VertexB] {

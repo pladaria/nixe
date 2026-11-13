@@ -183,6 +183,7 @@ impl BufferCache {
                 "GPU buffer writes require a mapped device-address range",
             ))?
             + offset;
+        self.note_uniform_gpu_write(address, bytes);
         self.memory_tracker.gpu_write(address, bytes);
         self.note_command_write(id, address, bytes);
         self.outdate_downloads(address, bytes);
@@ -349,6 +350,9 @@ impl BufferCache {
     // The caller holds the landing guard through publication and ownership
     // updates. Staging remains pinned until all of its borrowed bytes are used.
     fn write_download(&mut self, download: Download) -> Result<RangeSet, VulkanError> {
+        for (address, bytes) in download.write_ranges.iter() {
+            self.note_uniform_gpu_write(address, bytes);
+        }
         let staging = download.ticket.completed()?;
         let memory = self.device_memory.machine();
         for publication in download.publications {

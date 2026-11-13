@@ -70,3 +70,19 @@ pub(super) fn storage(op: O) -> bool {
             | O::ImageAtomicExchange32
     )
 }
+
+pub(super) fn sampled(op: O) -> bool {
+    matches!(
+        op,
+        O::ImageSampleImplicitLod
+            | O::ImageSampleExplicitLod
+            | O::ImageSampleDrefImplicitLod
+            | O::ImageSampleDrefExplicitLod
+            | O::ImageGather
+            | O::ImageGatherDref
+            | O::ImageFetch
+            | O::ImageQueryDimensions
+            | O::ImageQueryLod
+            | O::ImageGradient
+    )
+}

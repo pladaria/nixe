@@ -165,38 +165,41 @@ pub(crate) unsafe fn copy(source: *const u8, destination: *mut u8, bytes: usize)
         }
     }
 }
+// One accepted 16-byte run, in either direction. Unaligned instructions stay
+// within the retained ranges without creating Rust references to guest RAM.
+#[inline]
+unsafe fn copy_16(source: *const u8, destination: *mut u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        asm!(
+            "movdqu xmm0, [{source}]",
+            "movdqu [{destination}], xmm0",
+            source = in(reg) source,
+            destination = in(reg) destination,
+            out("xmm0") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        asm!(
+            "ldr q0, [{source}]",
+            "str q0, [{destination}]",
+            source = in(reg) source,
+            destination = in(reg) destination,
+            out("v0") _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
 /// # Safety
 /// The source is live RAM in a retained machine. The caller resolves coherence;
 /// the instruction copy permits guest races without forming Rust references.
 /// Destination is exclusively owned host memory, disjoint from guest backing.
 #[inline]
 pub(crate) unsafe fn capture(mut source: *const u8, destination: &mut [u8]) {
-    // Block-linear textures copy adjacent 16-byte runs. Load/store the whole
-    // accepted run without references to guest RAM or a scalar word loop.
-    // Unaligned moves stay within the exact admitted source and destination.
     if destination.len() == 16 {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            asm!(
-                "movdqu xmm0, [{source}]",
-                "movdqu [{destination}], xmm0",
-                source = in(reg) source,
-                destination = in(reg) destination.as_mut_ptr(),
-                out("xmm0") _,
-                options(nostack, preserves_flags),
-            );
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            asm!(
-                "ldr q0, [{source}]",
-                "str q0, [{destination}]",
-                source = in(reg) source,
-                destination = in(reg) destination.as_mut_ptr(),
-                out("v0") _,
-                options(nostack, preserves_flags),
-            );
-        }
+        unsafe { copy_16(source, destination.as_mut_ptr()) };
         return;
     }
     let mut offset = 0;
@@ -221,7 +224,12 @@ pub(crate) unsafe fn capture(mut source: *const u8, destination: &mut [u8]) {
 /// # Safety
 /// The destination is admitted/tracked guest RAM with stable physical lifetime.
 /// Source is owned host memory, disjoint from the guest backing.
+#[inline]
 pub(crate) unsafe fn write(mut destination: *mut u8, source: &[u8]) {
+    if source.len() == 16 {
+        unsafe { copy_16(source.as_ptr(), destination) };
+        return;
+    }
     let mut offset = 0;
     while offset < source.len() {
         let remaining = source.len() - offset;

@@ -64,7 +64,9 @@ impl GraphicsDirty {
     /// RT control forces the texture owner to look up its current target slots.
     /// It does not eagerly dirty every individual attachment at admission.
     pub const RENDER_TARGET_CONTROL: u128 = 1 << 49;
-    pub const VERTEX_INPUT: u128 = 1 << 44;
+    pub const VERTEX_ATTRIBUTES: u128 = 1 << 44;
+    pub const VERTEX_INSTANCING: u128 = 1 << 79;
+    pub const VERTEX_INPUT: u128 = Self::VERTEX_ATTRIBUTES | Self::VERTEX_INSTANCING;
     pub const BLEND_EQUATIONS: u128 = 1 << 45;
     pub const BLEND_ENABLE: u128 = 1 << 56;
     pub const COLOR_MASK: u128 = 1 << 57;
@@ -96,7 +98,9 @@ impl GraphicsDirty {
     pub const DEPTH_BOUNDS_ENABLE: u128 = 1 << 75;
     /// Aggregate vertex-buffer changes consumed by dynamic vertex input. The
     /// buffer cache independently consumes the individual VERTICES slots.
-    pub const VERTEX_BUFFERS: u128 = 1 << 76;
+    pub const VERTEX_BUFFER_ADDRESSES: u128 = 1 << 76;
+    pub const VERTEX_STRIDES: u128 = 1 << 80;
+    pub const VERTEX_BUFFERS: u128 = Self::VERTEX_BUFFER_ADDRESSES | Self::VERTEX_STRIDES;
     pub const VIEWPORT_SWIZZLES: u128 = 1 << 77;
     pub const DEPTH_CLAMP_ENABLE: u128 = 1 << 78;
     pub const NATIVE_STATE: u128 = Self::VERTEX_INPUT

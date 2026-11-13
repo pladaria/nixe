@@ -1,6 +1,7 @@
 use super::{
     fold::arg,
-    texture_descriptors as descriptors,
+    handle_control_flow::Dominance,
+    handle_program, texture_descriptors as descriptors,
     texture_table::{indexed, storage},
     texture_tracking::{Address, Tracker, direct, sampled_limit, size_shift},
 };
@@ -97,19 +98,52 @@ pub fn texture_pass(
     caches: &mut EnvironmentCaches<InstId, Value>,
 ) -> Result<()> {
     let mut tracker = Tracker::new(env, caches, host);
+    let mut dominance = None;
     let mut replacements = Vec::<(BlockId, InstId, O, Address)>::new();
     for &block in &program.post_order {
+        tracker.block = Some(block);
+        tracker.caches.track_cache.clear();
         for &id in ir.block(block)?.instructions() {
             let Some((op, bindless)) = indexed(ir.inst(id)?.opcode()) else {
                 continue;
             };
             let address = if bindless {
-                tracker.track(ir, arg(ir, id, 0)?)?.ok_or_else(|| {
-                    CompileError::new(
+                let value = arg(ir, id, 0)?;
+                if let Some(address) = tracker.track(ir, value)? {
+                    address
+                } else {
+                    let mut computed = handle_program::compile(ir, value, block, false)?;
+                    let sampled = !storage(op)
+                        && TextureInstInfo(ir.inst(id)?.flags).texture_type() != T::Buffer;
+                    if computed.is_none() && sampled && host.support_handle_table_arrays {
+                        computed = handle_program::compile(ir, value, block, true)?;
+                    }
+                    let (code,index) = computed.ok_or_else(|| CompileError::new(
                         FailureCategory::Unsupported,
-                        "Failed to track bindless texture constant buffer",
-                    )
-                })?
+                        format!("Texture instruction {id:?}: handle is neither a constant-buffer descriptor nor a draw-uniform handle program"),
+                    ))?;
+                    let program_index = if let Some(i) =
+                        program.info.handle_programs.iter().position(|p| *p == code)
+                    {
+                        i
+                    } else {
+                        let i = program.info.handle_programs.len();
+                        program.info.handle_programs.push(code);
+                        i
+                    };
+                    let mut address = direct(crate::types::CbufIndex(0), ByteOffset(0));
+                    address.handle_program = Some(program_index as u32);
+                    if let Some(index) = index {
+                        if dominance.is_none() {
+                            dominance = Some(Dominance::new(ir, program)?);
+                        }
+                        if dominance.as_ref().unwrap().dominates(index, id) {
+                            address.count = 64;
+                            address.dynamic_offset = Value::Inst(index);
+                        }
+                    }
+                    address
+                }
             } else {
                 let Value::U32(offset) = arg(ir, id, 0)? else {
                     return Err(CompileError::new(
@@ -137,6 +171,18 @@ pub fn texture_pass(
         })
         .count() as u32;
     let cap = dynamic_cap(&program.info, host, arrays);
+    // Queries do not carry a dimension: use another instruction consuming the
+    // same computed handle, otherwise the defined 2D default.
+    let mut computed_types = std::collections::HashMap::new();
+    for (_, id, op, a) in &replacements {
+        if let Some(program) = a.handle_program
+            && *op != O::ImageQueryDimensions
+        {
+            computed_types
+                .entry(program)
+                .or_insert(TextureInstInfo(ir.inst(*id)?.flags).texture_type());
+        }
+    }
     let mut last_integer = None;
     for (block, id, op, a) in replacements {
         ir.replace_opcode(id, op)?;
@@ -144,11 +190,18 @@ pub fn texture_pass(
         let mut multisample = false;
         match op {
             O::ImageQueryDimensions => {
-                let handle = tracker.handle(&a)?;
-                flags.set_texture_type(tracker.env.read_texture_type(handle)?);
+                let kind = if let Some(program) = a.handle_program {
+                    computed_types.get(&program).copied().unwrap_or(T::Color2D)
+                } else {
+                    let handle = tracker.handle(&a)?;
+                    tracker.env.read_texture_type(handle)?
+                };
+                flags.set_texture_type(kind);
                 ir.inst_mut(id)?.flags = flags.0;
             }
-            O::ImageSampleImplicitLod if flags.texture_type() == T::Color2D => {
+            O::ImageSampleImplicitLod
+                if flags.texture_type() == T::Color2D && a.handle_program.is_none() =>
+            {
                 let handle = tracker.handle(&a)?;
                 if tracker.env.read_texture_type(handle)? == T::Color2DRect {
                     rectangle(ir, block, id)?;
@@ -163,7 +216,7 @@ pub fn texture_pass(
                 } else {
                     ir.set_arg(id, 4, Value::None)?;
                 }
-                if flags.texture_type() == T::Color1D {
+                if flags.texture_type() == T::Color1D && a.handle_program.is_none() {
                     let handle = tracker.handle(&a)?;
                     if tracker.env.read_texture_type(handle)? == T::Buffer {
                         flags.set_texture_type(T::Buffer);
@@ -172,7 +225,7 @@ pub fn texture_pass(
             }
             _ => (),
         }
-        let shift = if a.count > 1 {
+        let shift = if a.count > 1 && a.handle_program.is_none() {
             size_shift(ir, a.dynamic_offset)?
         } else {
             3
@@ -185,21 +238,22 @@ pub fn texture_pass(
                 "Storage image has a separate sampler",
             ));
         }
-        let integer = if is_storage || flags.texture_type() != T::Buffer {
-            if let Some((index, offset, integer)) = last_integer
-                && index == a.index
-                && offset == a.offset
-            {
-                integer
+        let integer =
+            if a.handle_program.is_none() && (is_storage || flags.texture_type() != T::Buffer) {
+                if let Some((index, offset, integer)) = last_integer
+                    && index == a.index
+                    && offset == a.offset
+                {
+                    integer
+                } else {
+                    let handle = tracker.handle(&a)?;
+                    let integer = tracker.env.is_texture_pixel_format_integer(handle)?;
+                    last_integer = Some((a.index, a.offset, integer));
+                    integer
+                }
             } else {
-                let handle = tracker.handle(&a)?;
-                let integer = tracker.env.is_texture_pixel_format_integer(handle)?;
-                last_integer = Some((a.index, a.offset, integer));
-                integer
-            }
-        } else {
-            false
-        };
+                false
+            };
         let index = if is_storage {
             let written = op != O::ImageRead;
             let read = op != O::ImageWrite;
@@ -215,6 +269,7 @@ pub fn texture_pass(
                         cbuf_offset: a.offset,
                         count,
                         size_shift: shift,
+                        handle_program: a.handle_program,
                     },
                 )
             } else {
@@ -230,6 +285,7 @@ pub fn texture_pass(
                         cbuf_offset: a.offset,
                         count,
                         size_shift: shift,
+                        handle_program: a.handle_program,
                     },
                 )
             }
@@ -246,6 +302,7 @@ pub fn texture_pass(
                     secondary_shift_left: a.secondary_shift_left,
                     count,
                     size_shift: shift,
+                    handle_program: a.handle_program,
                 },
             )
         } else {
@@ -267,6 +324,7 @@ pub fn texture_pass(
                     secondary_shift_left: a.secondary_shift_left,
                     count,
                     size_shift: shift,
+                    handle_program: a.handle_program,
                 },
             )
         };
@@ -274,11 +332,15 @@ pub fn texture_pass(
         ir.inst_mut(id)?.flags = flags.0;
         let array_index = if count > 1 {
             let mut e = Emitter::before(ir, block, id)?;
-            let index = e.emit(
-                O::ShiftRightLogical32,
-                &[a.dynamic_offset, Value::U32(shift)],
-                0,
-            )?;
+            let index = if a.handle_program.is_some() {
+                a.dynamic_offset
+            } else {
+                e.emit(
+                    O::ShiftRightLogical32,
+                    &[a.dynamic_offset, Value::U32(shift)],
+                    0,
+                )?
+            };
             e.emit(O::UMin32, &[index, Value::U32(count - 1)], 0)?
         } else {
             Value::None
@@ -288,8 +350,12 @@ pub fn texture_pass(
             && op == O::ImageFetch
             && flags.texture_type() == T::Buffer
         {
-            let handle = tracker.handle(&a)?;
-            let format = tracker.env.read_texture_pixel_format(handle)?;
+            let format = if a.handle_program.is_some() {
+                P::A8B8G8R8_UNORM
+            } else {
+                let handle = tracker.handle(&a)?;
+                tracker.env.read_texture_pixel_format(handle)?
+            };
             snorm(ir, block, id, format)?;
         }
     }

@@ -322,6 +322,7 @@ impl NativeExecution<'_> {
 }
 impl NativeGpuExecution {
     fn fence_caches(&mut self, action: Option<nixe_gpu::FenceAction>) -> Result<(), VulkanError> {
+        self.residency.caches.sync_guest_memory();
         let mut residency = self.residency.access();
         residency.commit_texture_downloads()?;
         residency.commit_buffer_downloads()?;
@@ -828,6 +829,8 @@ impl GpuExecution for NativeGpuExecution {
 
 impl nixe_gpu::OwnerMemory for NativeGpuExecution {
     fn invalidate_gpu_cache(&mut self) -> Result<(), Arc<nixe_memory::MemoryError>> {
+        // This applies known CPU writes by range. Guest synchronization belongs
+        // to the fence, method or external request that called it.
         let memory = self.residency.memory().clone();
         memory
             .gather_gpu_dirty_memory(|ranges| {

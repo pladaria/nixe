@@ -200,6 +200,11 @@ pub(crate) struct ChannelExecution<'a, L: MaxwellFrontend, H: MaxwellCommandHost
     pub(crate) host: &'a mut H,
     progress: &'a mut ExecutionProgress,
 }
+impl<L: MaxwellFrontend, H: MaxwellCommandHost> ChannelExecution<'_, L, H> {
+    pub(crate) fn sync_guest_memory(&self) {
+        self.cache.borrow_mut().sync_guest_memory();
+    }
+}
 #[derive(Default)]
 pub(crate) struct ExecutionProgress {
     prior_work_pending: bool,

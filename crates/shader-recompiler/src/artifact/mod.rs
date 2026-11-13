@@ -1,17 +1,20 @@
 //! Owned shader ABI. No artifact contains an IR ID, arena reference, or Vulkan object.
 
 mod descriptors;
+mod handle;
 mod info;
 mod varying;
 
 pub use descriptors::{BoundedDescriptors, DescriptorCount, num_descriptors};
+pub(crate) use handle::HandleOp;
+pub use handle::{HandleMemory, HandleProgram};
 pub use info::*;
 pub use varying::VaryingState;
 
 use crate::types::*;
 
 /// Version of the owned artifact contract; old SSA artifacts are not compatible.
-pub const ARTIFACT_ABI_VERSION: u32 = 3;
+pub const ARTIFACT_ABI_VERSION: u32 = 4;
 
 /// Pipeline-wide allocation state, shared by stage emitters.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

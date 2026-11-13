@@ -17,16 +17,39 @@ pub(crate) struct StorageSlot {
     pub(crate) written: bool,
     pub(crate) descriptor: usize,
 }
+#[derive(Clone, Copy)]
 pub(super) struct ImageHandle {
     pub(super) cbuf: u32,
     pub(super) offset: u32,
     pub(super) shift: u32,
 }
+pub(super) enum HandleSource {
+    Direct {
+        primary: ImageHandle,
+        secondary: Option<ImageHandle>,
+    },
+    Program {
+        index: usize,
+        element: u32,
+        slot: usize,
+    },
+}
+impl HandleSource {
+    pub(super) fn reference(
+        &self,
+        group: u8,
+    ) -> nixe_gpu_maxwell::engines::threed::MaxwellThreeDTextureReference {
+        let (cbuf, offset) = match self {
+            Self::Direct { primary, .. } => (primary.cbuf as u8, primary.offset),
+            Self::Program { index, .. } => (0, *index as u32),
+        };
+        nixe_gpu_maxwell::engines::threed::MaxwellThreeDTextureReference::new(group, cbuf, offset)
+    }
+}
 pub(super) struct ImageSlot {
     pub(super) rescaling_index: usize,
     pub(super) descriptor: usize,
-    pub(super) primary: ImageHandle,
-    pub(super) secondary: Option<ImageHandle>,
+    pub(super) handle: HandleSource,
     pub(super) dimension: MaxwellThreeDTextureDimension,
     pub(super) sampler: bool,
     pub(super) storage_format: Option<nixe_shader_recompiler::types::ImageFormat>,
@@ -36,9 +59,11 @@ pub(crate) struct StageResources {
     pub(crate) uniforms: Box<[UniformSlot]>,
     pub(crate) storage: Box<[StorageSlot]>,
     pub(in crate::native) images: Box<[ImageSlot]>,
+    pub(in crate::native) handle_info: Option<std::sync::Arc<crate::cache::GuestStageMetadata>>,
 }
 pub(crate) struct PipelineResources {
     pub(crate) uses_render_area: bool,
+    pub(crate) computed_handle_count: usize,
     pub(crate) uses_tessellation_levels: bool,
     pub(crate) stages: [StageResources; 6],
     pub(in crate::native) texture_count: usize,
@@ -51,6 +76,7 @@ impl PipelineResources {
         let mut uniforms: [Vec<UniformSlot>; 6] = std::array::from_fn(|_| Vec::new());
         let mut storage: [Vec<StorageSlot>; 6] = std::array::from_fn(|_| Vec::new());
         let mut images: [Vec<ImageSlot>; 6] = std::array::from_fn(|_| Vec::new());
+        let mut computed_handle_count = 0;
         let mut scale_bases = [[0usize; 2]; 6];
         let mut scale_counts = [0usize; 2];
         for stage in &shader.stages {
@@ -120,14 +146,14 @@ impl PipelineResources {
                         .element
                         .checked_shl(d.size_shift)
                         .ok_or(fail("texture descriptor array offset overflow"))?;
-                    let handle = |cbuf, base: u32, shift: u32| {
+                    let handle = |cbuf, base: u32, delta: u32, shift: u32| {
                         if shift >= 32 {
                             return Err(fail("texture handle shift overflow"));
                         }
                         Ok(ImageHandle {
                             cbuf,
                             offset: base
-                                .checked_add(offset)
+                                .checked_add(delta)
                                 .ok_or(fail("texture handle offset overflow"))?,
                             shift,
                         })
@@ -136,21 +162,36 @@ impl PipelineResources {
                         rescaling_index: scale_bases[stage][0]
                             + metadata.bindings[origin.descriptor].resource_index.0 as usize,
                         descriptor,
-                        primary: handle(
-                            d.cbuf_index.0,
-                            d.cbuf_offset.0,
-                            if d.has_secondary { d.shift_left } else { 0 },
-                        )?,
-                        secondary: d
-                            .has_secondary
-                            .then(|| {
-                                handle(
-                                    d.secondary_cbuf_index.0,
-                                    d.secondary_cbuf_offset.0,
-                                    d.secondary_shift_left,
-                                )
-                            })
-                            .transpose()?,
+                        handle: if let Some(index) = d.handle_program {
+                            let slot = computed_handle_count;
+                            computed_handle_count += 1;
+                            HandleSource::Program {
+                                index: index as usize,
+                                element: origin.element,
+                                slot,
+                            }
+                        } else {
+                            HandleSource::Direct {
+                                primary: handle(
+                                    d.cbuf_index.0,
+                                    d.cbuf_offset.0,
+                                    offset,
+                                    if d.has_secondary { d.shift_left } else { 0 },
+                                )?,
+                                // Every element shares the sampler word; only texture handles form the array.
+                                secondary: d
+                                    .has_secondary
+                                    .then(|| {
+                                        handle(
+                                            d.secondary_cbuf_index.0,
+                                            d.secondary_cbuf_offset.0,
+                                            0,
+                                            d.secondary_shift_left,
+                                        )
+                                    })
+                                    .transpose()?,
+                            }
+                        },
                         dimension: match d.texture_type {
                             T::Color1D => D::One,
                             T::ColorArray1D => D::OneArray,
@@ -179,12 +220,24 @@ impl PipelineResources {
                         rescaling_index: scale_bases[stage][1]
                             + metadata.bindings[origin.descriptor].resource_index.0 as usize,
                         descriptor,
-                        primary: ImageHandle {
-                            cbuf: d.cbuf_index.0,
-                            offset,
-                            shift: 0,
+                        handle: if let Some(index) = d.handle_program {
+                            let slot = computed_handle_count;
+                            computed_handle_count += 1;
+                            HandleSource::Program {
+                                index: index as usize,
+                                element: origin.element,
+                                slot,
+                            }
+                        } else {
+                            HandleSource::Direct {
+                                primary: ImageHandle {
+                                    cbuf: d.cbuf_index.0,
+                                    offset,
+                                    shift: 0,
+                                },
+                                secondary: None,
+                            }
                         },
-                        secondary: None,
                         dimension: match d.texture_type {
                             T::Color1D => D::One,
                             T::ColorArray1D => D::OneArray,
@@ -212,6 +265,7 @@ impl PipelineResources {
             }
         }
         Ok(Self {
+            computed_handle_count,
             uses_render_area: shader
                 .stages
                 .iter()
@@ -225,10 +279,18 @@ impl PipelineResources {
                 })
             }),
             texture_count: images.iter().map(Vec::len).sum(),
-            stages: std::array::from_fn(|stage| StageResources {
-                uniforms: std::mem::take(&mut uniforms[stage]).into_boxed_slice(),
-                storage: std::mem::take(&mut storage[stage]).into_boxed_slice(),
-                images: std::mem::take(&mut images[stage]).into_boxed_slice(),
+            stages: std::array::from_fn(|stage| {
+                let info = shader
+                    .stages
+                    .iter()
+                    .find(|s| s.stage as usize == stage)
+                    .and_then(|s| s.guest.as_ref());
+                StageResources {
+                    uniforms: std::mem::take(&mut uniforms[stage]).into_boxed_slice(),
+                    storage: std::mem::take(&mut storage[stage]).into_boxed_slice(),
+                    images: std::mem::take(&mut images[stage]).into_boxed_slice(),
+                    handle_info: info.filter(|i| !i.info.handle_programs.is_empty()).cloned(),
+                }
             }),
         })
     }

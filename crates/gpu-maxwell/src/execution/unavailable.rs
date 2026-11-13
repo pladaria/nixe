@@ -7,6 +7,7 @@ fn unavailable<T>() -> Result<T, MaxwellSubmissionExecutionError> {
     ))
 }
 impl MaxwellFrontend for MissingRenderer {
+    fn sync_guest_memory(&mut self) {}
     fn service_host_requests(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {
         Ok(())
     }

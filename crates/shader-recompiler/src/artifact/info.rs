@@ -48,6 +48,7 @@ pub struct TextureBufferDescriptor {
     pub secondary_shift_left: u32,
     pub count: u32,
     pub size_shift: u32,
+    pub handle_program: Option<u32>,
 }
 
 impl super::descriptors::DescriptorCount for TextureBufferDescriptor {
@@ -66,6 +67,7 @@ pub struct ImageBufferDescriptor {
     pub cbuf_offset: ByteOffset,
     pub count: u32,
     pub size_shift: u32,
+    pub handle_program: Option<u32>,
 }
 
 impl super::descriptors::DescriptorCount for ImageBufferDescriptor {
@@ -89,6 +91,7 @@ pub struct TextureDescriptor {
     pub secondary_shift_left: u32,
     pub count: u32,
     pub size_shift: u32,
+    pub handle_program: Option<u32>,
 }
 
 impl super::descriptors::DescriptorCount for TextureDescriptor {
@@ -108,6 +111,7 @@ pub struct ImageDescriptor {
     pub cbuf_offset: ByteOffset,
     pub count: u32,
     pub size_shift: u32,
+    pub handle_program: Option<u32>,
 }
 
 impl super::descriptors::DescriptorCount for ImageDescriptor {
@@ -198,4 +202,5 @@ pub struct ShaderInfo {
     pub image_buffer_descriptors: Vec<ImageBufferDescriptor>,
     pub texture_descriptors: Vec<TextureDescriptor>,
     pub image_descriptors: Vec<ImageDescriptor>,
+    pub handle_programs: Vec<super::HandleProgram>,
 }

@@ -40,6 +40,17 @@ impl crate::native::pipeline_cache::ComputePipeline {
             sampler
         });
         execution.synchronize_shader_descriptors(true, space, launch.texture_pool, sampler_pool);
+        let mut computed = smallvec::SmallVec::<[u32; 64]>::new();
+        computed.resize(self.resources.computed_handle_count, 0);
+        if !computed.is_empty() {
+            super::handles::HandleReader::new(
+                execution,
+                space,
+                &self.resources.stages[5],
+                super::handles::HandleBuffers::Compute(launch),
+            )
+            .evaluate(&mut computed)?;
+        }
         for slot in &self.resources.stages[5].uniforms {
             let (address, size) = launch.constant_buffer(slot.slot as u8).map_err(|reason| {
                 V::Compilation(format!("compute cbuf {}: {reason}", slot.slot).into())
@@ -70,29 +81,11 @@ impl crate::native::pipeline_cache::ComputePipeline {
             smallvec::SmallVec::<[super::textures::ShaderTexture; 64]>::with_capacity(
                 self.resources.texture_count,
             );
+        let buffers = super::handles::HandleBuffers::Compute(launch);
         for slot in &self.resources.stages[5].images {
-            let read_handle = |source: &crate::native::pipeline_resources::ImageHandle| {
-                let address = crate::native::NativeExecution::compute_constant_address(
-                    launch,
-                    space,
-                    source.cbuf,
-                    source.offset,
-                    4,
-                )?;
-                space
-                    .read_u32(address)
-                    .map(|value| value << source.shift)
-                    .map_err(|error| V::Compilation(error.to_string().into()))
-            };
-            let mut handle = read_handle(&slot.primary)?;
-            if let Some(secondary) = &slot.secondary {
-                handle |= read_handle(secondary)?;
-            }
-            let reference = model::engines::threed::MaxwellThreeDTextureReference::new(
-                0,
-                slot.primary.cbuf as u8,
-                slot.primary.offset,
-            );
+            let (handle, consumed) =
+                super::handles::read_handle(space, buffers, &slot.handle, &computed)?;
+            let reference = slot.handle.reference(0);
             let sampler = if slot.sampler {
                 Some(execution.shader_sampler(
                     true,
@@ -108,7 +101,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
                 None
             };
             textures.push(super::textures::ShaderTexture {
-                handle: None,
+                handle: consumed,
                 index: handle & 0xfffff,
                 reference,
                 dimension: slot.dimension,

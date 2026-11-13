@@ -198,6 +198,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         via_header: bool,
         textures: &mut smallvec::SmallVec<[super::textures::ShaderTexture; 64]>,
         read_images: bool,
+        computed: &[u32],
     ) -> Result<(), VulkanError> {
         let resources = &self.resources.stages[STAGE];
         if resources.storage.is_empty() && resources.images.is_empty() {
@@ -228,30 +229,11 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         if !read_images {
             return Ok(());
         }
+        let buffers = super::handles::HandleBuffers::Graphics(state, group);
         for slot in &resources.images {
-            let read_handle = |source: &crate::native::pipeline_resources::ImageHandle| {
-                let address = crate::native::NativeExecution::graphics_constant_address(
-                    state,
-                    space,
-                    group,
-                    source.cbuf,
-                    source.offset,
-                    4,
-                )?;
-                space
-                    .read_u32(address)
-                    .map(|value| (address.get(), value, value << source.shift))
-                    .map_err(|error| VulkanError::Compilation(error.to_string().into()))
-            };
-            let (address, raw, mut handle) = read_handle(&slot.primary)?;
-            if let Some(secondary) = &slot.secondary {
-                handle |= read_handle(secondary)?.2;
-            }
-            let reference = model::engines::threed::MaxwellThreeDTextureReference::new(
-                group,
-                slot.primary.cbuf as u8,
-                slot.primary.offset,
-            );
+            let (handle, consumed) =
+                super::handles::read_handle(space, buffers, &slot.handle, computed)?;
+            let reference = slot.handle.reference(group);
             let sampler = if slot.sampler {
                 Some(execution.shader_sampler(
                     false,
@@ -267,7 +249,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 None
             };
             textures.push(super::textures::ShaderTexture {
-                handle: Some((address, raw)),
+                handle: consumed,
                 index: handle & 0xfffff,
                 reference,
                 dimension: slot.dimension,
@@ -336,6 +318,27 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
             },
         );
         execution.synchronize_shader_descriptors(false, space, image_pool, sampler_pool);
+        // Resolve computed handles across every stage before binding resources
+        // or validating cached descriptor bytes that their producers could change.
+        if self.resources.computed_handle_count != 0 {
+            memo.computed_handles
+                .resize(self.resources.computed_handle_count, 0);
+            graphics_stages!(STAGES, |STAGE| {
+                let resources = &self.resources.stages[STAGE];
+                if resources.handle_info.is_some() {
+                    let group = groups[STAGE].ok_or(VulkanError::InvalidResource(
+                        "computed graphics handle has no constant-buffer group",
+                    ))?;
+                    super::handles::HandleReader::new(
+                        execution,
+                        space,
+                        resources,
+                        super::handles::HandleBuffers::Graphics(state, group),
+                    )
+                    .evaluate(&mut memo.computed_handles)?;
+                }
+            });
+        }
         use super::reuse::{DrawMiss, TextureMiss};
         let eligible = self.sampled_reuse;
         let mut reused = false;
@@ -388,6 +391,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 via_header,
                 &mut textures,
                 !reused,
+                &memo.computed_handles,
             )?;
         });
         if !reused {
@@ -418,9 +422,9 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         let previous = execution.state.last_draw.take();
         let candidate = if eligible {
             execution.state.statistics.reuse.eligible_draws += 1;
-            previous.ok_or(DrawMiss::Cold).and_then(|p| {
-                p.validate(execution, self.pipeline.identity(), registers, draw, space)
-            })
+            previous
+                .ok_or(DrawMiss::Cold)
+                .and_then(|p| p.validate(execution, self, registers, draw, space))
         } else {
             Err(DrawMiss::Kind)
         };
@@ -442,6 +446,19 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 delta = self.configure_resources::<STAGES, STORAGE>(
                     execution, registers, space, groups, &mut memo, delta,
                 )?;
+                // Computed handles can require an owner-side download. Its
+                // submission/render-pass changes invalidate the earlier draw.
+                if delta
+                    && self.resources.computed_handle_count != 0
+                    && let Err(reason) = previous.unwrap().validate_runtime(
+                        execution,
+                        self.pipeline.identity(),
+                        space,
+                    )
+                {
+                    execution.state.statistics.reuse.draw_misses[reason as usize] += 1;
+                    delta = false;
+                }
                 if !delta {
                     execution.resolve_render_targets(registers, space)?;
                 }
@@ -561,6 +578,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                             .import_guest_stage_storage::<STAGE>(&self.resources.stages[STAGE])?;
                     });
                 }
+                execution.residency.begin_graphics_uniforms(space, groups);
                 let mut image_index = 0;
                 graphics_stages!(STAGES, |STAGE| {
                     let resources = &self.resources.stages[STAGE];
@@ -605,12 +623,8 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 execution.state.statistics.reuse.draw_hits += 1;
             }
             if eligible {
-                execution.state.last_draw = Some(ResolvedDraw::capture(
-                    execution,
-                    pipeline.identity(),
-                    draw,
-                    space,
-                ));
+                execution.state.last_draw =
+                    Some(ResolvedDraw::capture(execution, self, draw, space));
             }
             return Ok(());
         }

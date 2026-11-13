@@ -33,6 +33,17 @@ pub(in crate::native) struct FixedPipelineState {
 // No padding may be observed by the byte comparisons or hashing below.
 const _: () = assert!(std::mem::size_of::<FixedPipelineState>() == 480);
 impl FixedPipelineState {
+    pub(in crate::native) fn dynamic_vertex_input(&self) -> bool {
+        self.raw1 & (1 << 5) != 0
+    }
+
+    pub(in crate::native) fn same_vertex_types(
+        &self,
+        registers: &MaxwellThreeDState,
+    ) -> Result<bool, VulkanError> {
+        Ok(self.attribute_types == super::vertex_input::attribute_types(registers)?)
+    }
+
     fn key_bytes(&self) -> &[u8] {
         let size = if self.raw1 & (1 << 5) != 0 {
             if self.raw1 & (1 << 3) != 0 {

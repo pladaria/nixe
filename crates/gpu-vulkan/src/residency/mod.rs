@@ -9,6 +9,7 @@ mod command_pages;
 mod multi_range;
 mod quad_indices;
 pub(crate) mod query;
+mod uniform_stream;
 mod virtual_range_cache;
 use cache_owners::{BufferCache, CacheOwners, TextureCache};
 pub(crate) mod commands;
@@ -202,6 +203,10 @@ pub struct ImageViewDescription {
 pub struct ResidencyStatistics {
     pub cpu_uploaded_bytes: u64,
     pub cpu_streamed_bytes: u64,
+    pub uniform_keeps: u64,
+    pub uniform_reuses: u64,
+    pub uniform_uploads: u64,
+    pub uniform_read_bytes: u64,
     pub gpu_copied_bytes: u64,
     pub dma_buffer_copies: u64,
     pub dma_image_uploads: u64,
@@ -497,6 +502,7 @@ impl Residency<'_> {
         }
         match resource {
             Resource::Buffer(id) => {
+                self.buffer_cache.uniform_streams.invalidate();
                 self.invalidate_bindings();
                 self.unlink_lru(resource);
                 self.drop_multi_range_owner(id)?;
@@ -658,6 +664,7 @@ impl Residency<'_> {
         short: bool,
         timestamp: u64,
     ) -> Result<(), VulkanError> {
+        self.caches.sync_guest_memory();
         let mapping = PhysicalMapping::new(target)?;
         let range = self.buffer_for_deferred_import(
             mapping,
