@@ -557,6 +557,8 @@ fn kernel_mapping(
         uncached: false,
         locked: false,
         permission_locked: false,
+        gpu_sharable: false,
+        gpu_shared: 0,
     }
 }
 

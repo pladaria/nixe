@@ -254,7 +254,9 @@ pub(super) async fn dispatch_control(
         }
         (
             CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
-            HorizonIpcObject::AudioOutManager(_)
+            HorizonIpcObject::NvDrv2(_)
+            | HorizonIpcObject::Csrng
+            | HorizonIpcObject::AudioOutManager(_)
             | HorizonIpcObject::AudioOut(_)
             | HorizonIpcObject::AudioRendererManager(_)
             | HorizonIpcObject::AudioRenderer(_)
@@ -285,7 +287,7 @@ pub(super) async fn dispatch_control(
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L77-L81
                 HorizonIpcObject::Hid(_) | HorizonIpcObject::Account(_) => 0x100,
                 HorizonIpcObject::OpusManager(_) => 0x120,
-                HorizonIpcObject::PlayReport(_) => 0x1000,
+                HorizonIpcObject::PlayReport(_) | HorizonIpcObject::Csrng => 0x1000,
                 HorizonIpcObject::Friends(_) => 0x1000,
                 HorizonIpcObject::Bcat(_) => 0x1000,
                 HorizonIpcObject::Nfp(_) => 0x1000,

@@ -141,7 +141,8 @@ impl ProcessMemoryLayout {
                     ));
                 }
 
-                let [_, stack, alias, heap] = layout_39_bit_regions(aslr, code_start, code_end)?;
+                let [_, stack, alias, heap] =
+                    layout_39_bit_regions(profile, aslr, code_start, code_end)?;
                 (aslr, alias, heap, stack)
             }
         };
@@ -234,13 +235,24 @@ const fn region(base: u64, size: u64) -> ProcessVirtualRegion {
 }
 
 fn layout_39_bit_regions(
+    profile: ProcessMemoryLayoutProfile,
     aslr: ProcessVirtualRegion,
     code_start: u64,
     code_end: u64,
 ) -> Result<[ProcessVirtualRegion; 4], ProcessBuildError> {
     // Region kinds use Horizon's deterministic no-ASLR ordering:
     // kernel-map, stack, alias, heap.
-    let sizes = [0x10_0000_0000, 0x8000_0000, 0x10_0000_0000, 0x2_0000_0000];
+    // @SPECULATIVE: Switch 2 needs a heap window larger than the 8 GiB
+    // Switch 1 reservation (Bananza requests 0x25e600000 bytes). Use the
+    // reference's 16 GiB virtual window without changing physical quotas or
+    // Switch 1 placement; the hardware kernel's exact dimension is unverified.
+    // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/kernel/k_address_space_info.cpp
+    let heap_size = if profile == ProcessMemoryLayoutProfile::Switch2 {
+        0x4_0000_0000
+    } else {
+        0x2_0000_0000
+    };
+    let sizes = [0x10_0000_0000, 0x8000_0000, 0x10_0000_0000, heap_size];
     let mut by_descending_size = [(0_usize, sizes[0]); 4];
     for (kind, entry) in by_descending_size.iter_mut().enumerate() {
         *entry = (kind, sizes[kind]);

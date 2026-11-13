@@ -260,7 +260,13 @@ impl Drop for DeviceMapping {
                 state.changed.insert(at, PAGE_SIZE);
             }
         }
-        if self.tracked {
+        if self.tracked
+            && state.sources.get(&self.address).is_some_and(|source| {
+                std::sync::Weak::ptr_eq(source, &Arc::downgrade(&self.physical))
+            })
+        {
+            // A split/replacement may already own this coordinate. Retiring
+            // the previous lease must not remove its successor's backing.
             state.sources.remove(&self.address);
         }
         if changed {

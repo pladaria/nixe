@@ -155,9 +155,67 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                     request.command_id,
                 );
             };
+            if matches!(
+                command,
+                ProxyCommand::GraphicsScalingParametersFunctions
+                    | ProxyCommand::PerformanceFunctions
+            ) && process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2
+            {
+                return unsupported_service_command(
+                    applet_object_name(&object),
+                    request.command_id,
+                );
+            }
             let child = command.child(kind);
             let name = applet_object_name(&child);
             applet_child(session, request.token, child, name)
+        }
+        AppletObject::PerformanceFunctions => {
+            if has_ipc_descriptors(hipc) {
+                return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            // https://switchbrew.org/wiki/Applet_Manager_services#IPerformanceFunctions
+            // @SPECULATIVE: the boolean ABI and initially disabled policy follow
+            // the command names. This tracks the guest request, not a host clock
+            // change; instruction execution is not throttled to a CPU frequency.
+            match request.command_id {
+                0 if request.data.is_empty() => {
+                    applet_data(request.token, &[u8::from(session.cpu_overclock_enabled())])
+                }
+                1 if request.has_payload_size(1) && request.data[0] <= 1 => {
+                    session.set_cpu_overclock_enabled(request.data[0] != 0);
+                    applet_data(request.token, &[])
+                }
+                0 | 1 => applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER),
+                _ => unsupported_service_command("IPerformanceFunctions", request.command_id),
+            }
+        }
+        AppletObject::GraphicsScalingParametersFunctions => {
+            if has_ipc_descriptors(hipc) {
+                return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            // https://switchbrew.org/wiki/Applet_Manager_services#IGraphicsScalingParametersFunctions
+            // @SPECULATIVE: the 12-byte scale reply follows
+            // SDK observations in the reference. Advertise the fixed native tier
+            // (10); the two remaining fields are provisionally reserved zeroes.
+            // This is a guest hardware tier, independent of host render scaling.
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/am/service/graphics_scale_controller.h
+            match request.command_id {
+                10 if request.data.is_empty() => {
+                    applet_data(request.token, &[10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                }
+                1050 if request.has_payload_size(1) && request.data[0] <= 1 => {
+                    // The advertised tier is immutable, so enabling notifications
+                    // cannot create a scale-change message during this session.
+                    session.set_graphics_scale_notifications(request.data[0] != 0);
+                    applet_data(request.token, &[])
+                }
+                10 | 1050 => applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER),
+                _ => unsupported_service_command(
+                    "IGraphicsScalingParametersFunctions",
+                    request.command_id,
+                ),
+            }
         }
         AppletObject::CommonStateGetter => {
             let Some(command) = CommonStateGetterCommand::decode(request.command_id) else {
@@ -259,6 +317,52 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 return unsupported_service_command("ISelfController", request.command_id);
             };
             match command {
+                SelfControllerCommand::SetRtcScreenSharingAudioEnabled => {
+                    // https://switchbrew.org/wiki/Applet_Manager_services#ISelfController
+                    if process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {
+                        return unsupported_service_command("ISelfController", request.command_id);
+                    }
+                    if !request.has_payload_size(1)
+                        || request.data[0] > 1
+                        || has_ipc_descriptors(hipc)
+                    {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    session.set_rtc_screen_sharing_audio_enabled(request.data[0] != 0);
+                    applet_data(request.token, &[])
+                }
+                SelfControllerCommand::GetGraphicsSupervisor => {
+                    // https://switchbrew.org/wiki/Applet_Manager_services#ISelfController
+                    // The returned handle is a raw TIPC session, even when AM is a domain.
+                    if process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {
+                        return unsupported_service_command("ISelfController", request.command_id);
+                    }
+                    if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    let handle = process
+                        .return_service(HorizonIpcObject::Gsv(crate::GsvSession::new(
+                            process.process_id(),
+                            session.operation_mode(),
+                        )))
+                        .map_err(|_| IpcWireError::HostResourceExhausted("creating GSV session"))?;
+                    Ok((
+                        encode_domain_response(
+                            request.token,
+                            HorizonIpcResult::SUCCESS,
+                            &[],
+                            &[handle],
+                            &[],
+                        )?,
+                        Some(handle),
+                    ))
+                }
                 // SelfExit is a no-I/O request. Once AM accepts it, libnx sleeps
                 // forever and relies on AM to terminate the process. The wire
                 // layer therefore returns a typed lifecycle action after writing
@@ -535,6 +639,34 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 return unsupported_service_command("IApplicationFunctions", request.command_id);
             };
             match command {
+                ApplicationFunctionsCommand::Query320 | ApplicationFunctionsCommand::Query321 => {
+                    if process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {
+                        return unsupported_service_command(
+                            "IApplicationFunctions",
+                            request.command_id,
+                        );
+                    }
+                    if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    // https://switchbrew.org/wiki/20.0.0
+                    // @SPECULATIVE: 320's u16 output is documented; the meaning
+                    // of its bits and 321's observed u8 output remain unknown.
+                    // Provisionally report no optional application flags, as
+                    // observed in the reference, with the exact output widths.
+                    // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/am/service/application_functions.cpp
+                    applet_data(
+                        request.token,
+                        if request.command_id == 320 {
+                            &[0, 0]
+                        } else {
+                            &[0]
+                        },
+                    )
+                }
                 // PopLaunchParameter consumes one AM launch-channel entry and
                 // returns it as an IStorage object in this same domain. libnx
                 // uses kind 2 during account initialization to obtain the
@@ -1399,6 +1531,8 @@ pub(in crate::ipc_wire) fn applet_object_name(object: &AppletObject) -> &'static
         AppletObject::SelfController => "ISelfController",
         AppletObject::WindowController => "IWindowController",
         AppletObject::AudioController(_) => "IAudioController",
+        AppletObject::PerformanceFunctions => "IPerformanceFunctions",
+        AppletObject::GraphicsScalingParametersFunctions => "IGraphicsScalingParametersFunctions",
         AppletObject::DisplayController => "IDisplayController",
         AppletObject::DebugFunctions => "IDebugFunctions",
         AppletObject::LibraryAppletAccessor { .. } => "ILibraryAppletAccessor",

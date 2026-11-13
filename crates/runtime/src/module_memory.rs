@@ -104,6 +104,8 @@ pub fn install_prepared_module(
                     uncached: false,
                     locked: false,
                     permission_locked: false,
+                    gpu_sharable: false,
+                    gpu_shared: 0,
                 },
             )
             .map_err(|error| {

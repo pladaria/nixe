@@ -64,6 +64,9 @@ pub enum HorizonIpcObject {
     TimeZone(TimeZoneServiceSession),
     Vi(ViSession),
     NvDrv(NvDrvSession),
+    Gsv(crate::GsvSession),
+    NvDrv2(crate::NvDrv2Session),
+    Csrng,
     LogManager(LogManagerSession),
     Logger(LoggerSession),
     /// Application writer for error contexts. Command semantics are dispatched
@@ -1651,6 +1654,8 @@ pub(crate) enum AppletObject {
     SelfController,
     WindowController,
     AudioController(Arc<Mutex<AppletAudioController>>),
+    GraphicsScalingParametersFunctions,
+    PerformanceFunctions,
     DisplayController,
     DebugFunctions,
     LibraryAppletAccessor {
@@ -1952,6 +1957,9 @@ struct AppletDomain {
     performance_mode_changed_notification: bool,
     cpu_boost_enabled: bool,
     vr_mode_enabled: bool,
+    rtc_screen_sharing_audio_enabled: bool,
+    graphics_scale_notifications: bool,
+    cpu_overclock_enabled: bool,
     game_play_recording_state: u32,
     restart_message_enabled: bool,
     idle_time_detection_extension: u32,
@@ -1984,6 +1992,20 @@ pub struct AppletSession {
 }
 
 impl AppletSession {
+    pub(crate) fn cpu_overclock_enabled(&self) -> bool {
+        self.domain.lock().unwrap().cpu_overclock_enabled
+    }
+    pub(crate) fn set_cpu_overclock_enabled(&self, enabled: bool) {
+        self.domain.lock().unwrap().cpu_overclock_enabled = enabled;
+    }
+    pub(crate) fn set_graphics_scale_notifications(&self, enabled: bool) {
+        self.domain.lock().unwrap().graphics_scale_notifications = enabled;
+    }
+
+    pub(crate) fn set_rtc_screen_sharing_audio_enabled(&self, enabled: bool) {
+        self.domain.lock().unwrap().rtc_screen_sharing_audio_enabled = enabled;
+    }
+
     pub(crate) fn new(
         kernel: &Arc<nixe_scheduler::SchedulerState>,
         operation_mode: OperationMode,
@@ -2020,6 +2042,9 @@ impl AppletSession {
                 performance_mode_changed_notification: false,
                 cpu_boost_enabled: false,
                 vr_mode_enabled: false,
+                rtc_screen_sharing_audio_enabled: false,
+                graphics_scale_notifications: false,
+                cpu_overclock_enabled: false,
                 game_play_recording_state: 0,
                 restart_message_enabled: false,
                 idle_time_detection_extension: 0,

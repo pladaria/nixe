@@ -7,6 +7,8 @@ const RW: Mapping = Mapping {
     uncached: false,
     locked: false,
     permission_locked: false,
+    gpu_sharable: false,
+    gpu_shared: 0,
 };
 fn address(page: usize) -> GuestVirtualAddress {
     GuestVirtualAddress::new(page as u64 * PAGE_SIZE)

@@ -36,6 +36,7 @@ impl ServiceManagerRequest<'_> {
                 encode_tipc_response(
                     result.raw(),
                     &[],
+                    &[],
                     if request.command_id == 1 {
                         &handles
                     } else {
@@ -54,6 +55,7 @@ enum ServiceKind {
     SystemSettings,
     Performance,
     Multimedia,
+    Csrng,
     Applet,
     Hid,
     Friends,
@@ -86,6 +88,7 @@ impl ServiceKind {
             b"set" => Some(Self::UserSettings),
             b"set:sys" => Some(Self::SystemSettings),
             b"apm" => Some(Self::Performance),
+            b"csrng" => Some(Self::Csrng),
             b"mm:u" => Some(Self::Multimedia),
             b"appletOE" => Some(Self::Applet),
             b"hid" => Some(Self::Hid),
@@ -216,6 +219,7 @@ fn connect_service(
         ServiceKind::Account | ServiceKind::Vi(_) | ServiceKind::NvDrv
     );
     let handle = match service {
+        ServiceKind::Csrng => process.return_service(HorizonIpcObject::Csrng),
         ServiceKind::UserSettings => process.return_service(HorizonIpcObject::UserSettings(
             UserSettingsSession::new(resources.system.settings.clone()),
         )),

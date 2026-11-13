@@ -46,6 +46,8 @@ pub struct Mapping {
     pub uncached: bool,
     pub locked: bool,
     pub permission_locked: bool,
+    pub gpu_sharable: bool,
+    pub gpu_shared: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryInfo {
@@ -384,6 +386,7 @@ impl ProcessMemory {
                 && !mapping.uncached
                 && !mapping.permission_locked
                 && !mapping.locked
+                && mapping.gpu_shared == 0
                 && mapping.permissions == MemoryPermissions::READ_WRITE
             {
                 Ok(())
@@ -476,7 +479,7 @@ impl ProcessMemory {
         Self::permissions(alias)?;
         let mut regions = self.regions.lock().unwrap();
         Self::covered(&regions, source.get(), end, |mapping| {
-            if mapping == before {
+            if mapping == before && mapping.gpu_shared == 0 {
                 Ok(())
             } else {
                 Err(MappingError::StateMismatch)
@@ -523,7 +526,7 @@ impl ProcessMemory {
         Self::permissions(restored)?;
         let mut regions = self.regions.lock().unwrap();
         Self::covered(&regions, source.get(), end, |mapping| {
-            if mapping == before {
+            if mapping == before && mapping.gpu_shared == 0 {
                 Ok(())
             } else {
                 Err(MappingError::StateMismatch)
@@ -564,7 +567,7 @@ impl ProcessMemory {
         }
         let mut regions = self.regions.lock().unwrap();
         Self::covered(&regions, start.get(), end, |mapping| {
-            if mapping.locked || mapping.permission_locked {
+            if mapping.locked || mapping.permission_locked || mapping.gpu_shared != 0 {
                 Err(MappingError::PermissionLocked)
             } else if mapping.uncached || !mapping.kind.mutable() {
                 Err(MappingError::StateMismatch)
@@ -579,6 +582,68 @@ impl ProcessMemory {
         });
         Ok(())
     }
+    /// Switch 2 GPU sharing is distinct from CPU cacheability and transfer locks.
+    /// https://switchbrew.org/wiki/SVC#MemoryAttribute
+    pub fn set_gpu_sharable(
+        &self,
+        start: GuestVirtualAddress,
+        bytes: u64,
+        enabled: Option<bool>,
+    ) -> Result<(), MappingError> {
+        let end = self.end(start, bytes)?;
+        let mut regions = self.regions.lock().unwrap();
+        Self::covered(&regions, start.get(), end, |mapping| {
+            // @SPECULATIVE: only normal/remote heap memory is accepted;
+            // the complete Switch 2 MemoryState permission mask is undocumented.
+            if mapping.locked
+                || mapping.gpu_shared != 0
+                || !matches!(mapping.kind, MemoryKind::Heap | MemoryKind::Remote)
+            {
+                Err(MappingError::StateMismatch)
+            } else {
+                Ok(())
+            }
+        })?;
+        Self::update(&mut regions, start.get(), end, |mut mapping| {
+            if let Some(enabled) = enabled {
+                mapping.gpu_sharable = enabled;
+            }
+            mapping
+        });
+        Ok(())
+    }
+
+    /// Pin sharing metadata and canonical physical backing under one mapping lock.
+    pub fn share_gpu(
+        self: &Arc<Self>,
+        start: GuestVirtualAddress,
+        bytes: u64,
+    ) -> Result<GpuMemoryLease, MappingError> {
+        let end = self.end(start, bytes)?;
+        let mut regions = self.regions.lock().unwrap();
+        Self::covered(&regions, start.get(), end, |mapping| {
+            if !mapping.gpu_sharable || mapping.locked || mapping.gpu_shared == u32::MAX {
+                Err(MappingError::StateMismatch)
+            } else {
+                Ok(())
+            }
+        })?;
+        let ranges = nixe_memory::CapturedMemory::new(self.space.capture(
+            start,
+            bytes,
+            MemoryPermissions::READ_WRITE,
+        )?)?;
+        Self::update(&mut regions, start.get(), end, |mut mapping| {
+            mapping.gpu_shared += 1;
+            mapping
+        });
+        Ok(GpuMemoryLease {
+            owner: self.clone(),
+            start,
+            bytes,
+            ranges,
+        })
+    }
     pub fn set_uncached(
         &self,
         start: GuestVirtualAddress,
@@ -588,6 +653,9 @@ impl ProcessMemory {
         let end = self.end(start, bytes)?;
         let mut regions = self.regions.lock().unwrap();
         Self::covered(&regions, start.get(), end, |mapping| {
+            // GPU sharing pins physical identity, not CPU cacheability. Native
+            // clients change cache attributes after registering GPU memory;
+            // the canonical coherent backing remains the same allocation.
             if mapping.locked {
                 Err(MappingError::PermissionLocked)
             } else if !mapping.kind.mutable() {
@@ -610,7 +678,7 @@ impl ProcessMemory {
         let end = self.end(start, bytes)?;
         let mut regions = self.regions.lock().unwrap();
         Self::covered(&regions, start.get(), end, |mapping| {
-            if mapping.locked {
+            if mapping.locked || mapping.gpu_shared != 0 {
                 Err(MappingError::PermissionLocked)
             } else if !matches!(
                 mapping.kind,
@@ -749,5 +817,47 @@ impl ProcessMemory {
         for (base, region) in changed {
             Self::insert(regions, base, region);
         }
+    }
+}
+
+/// Retains the accepted physical memory, even when the process is shutting down.
+pub struct GpuMemoryLease {
+    owner: Arc<ProcessMemory>,
+    start: GuestVirtualAddress,
+    bytes: u64,
+    ranges: nixe_memory::CapturedMemory,
+}
+impl GpuMemoryLease {
+    pub fn ranges(&self) -> &nixe_memory::CapturedMemory {
+        &self.ranges
+    }
+}
+impl Drop for GpuMemoryLease {
+    fn drop(&mut self) {
+        let mut regions = self.owner.regions.lock().unwrap();
+        if self.owner.closed.load(Ordering::Acquire) {
+            return;
+        }
+        ProcessMemory::update(
+            &mut regions,
+            self.start.get(),
+            self.start.get() + self.bytes,
+            |mut mapping| {
+                mapping.gpu_shared = mapping
+                    .gpu_shared
+                    .checked_sub(1)
+                    .expect("GPU memory sharing reference underflow");
+                mapping
+            },
+        );
+    }
+}
+
+impl fmt::Debug for GpuMemoryLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpuMemoryLease")
+            .field("start", &self.start)
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
     }
 }

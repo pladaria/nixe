@@ -42,6 +42,8 @@ pub(super) enum ProxyCommand {
     GlobalStateController,
     ApplicationCreator,
     AppletCommonFunctions,
+    GraphicsScalingParametersFunctions,
+    PerformanceFunctions,
 }
 
 impl ProxyCommand {
@@ -54,6 +56,10 @@ impl ProxyCommand {
             4 => Some(Self::DisplayController),
             11 => Some(Self::LibraryAppletCreator),
             20 => Some(Self::RoleFunctions),
+            40 if matches!(kind, AppletProxyKind::Application) => Some(Self::PerformanceFunctions),
+            60 if matches!(kind, AppletProxyKind::Application) => {
+                Some(Self::GraphicsScalingParametersFunctions)
+            }
             21 if matches!(kind, AppletProxyKind::SystemApplet) => {
                 Some(Self::GlobalStateController)
             }
@@ -74,6 +80,10 @@ impl ProxyCommand {
             Self::AudioController => AppletObject::AudioController(std::sync::Arc::new(
                 std::sync::Mutex::new(crate::object::AppletAudioController::default()),
             )),
+            Self::PerformanceFunctions => AppletObject::PerformanceFunctions,
+            Self::GraphicsScalingParametersFunctions => {
+                AppletObject::GraphicsScalingParametersFunctions
+            }
             Self::DisplayController => AppletObject::DisplayController,
             Self::LibraryAppletCreator => AppletObject::LibraryAppletCreator,
             Self::DebugFunctions => AppletObject::DebugFunctions,
@@ -139,6 +149,8 @@ command_enum!(SelfControllerCommand {
     63 => GetIdleTimeDetectionExtension,
     90 => GetAccumulatedSuspendedTickValue,
     91 => GetAccumulatedSuspendedTickChangedEvent,
+    2000 => GetGraphicsSupervisor,
+    2400 => SetRtcScreenSharingAudioEnabled,
 });
 
 command_enum!(WindowControllerCommand {
@@ -166,6 +178,8 @@ command_enum!(ApplicationFunctionsCommand {
     110 => QueryApplicationPlayStatistics,
     111 => QueryApplicationPlayStatisticsByUid,
     130 => GetGpuErrorDetectedSystemEvent,
+    320 => Query320,
+    321 => Query321,
 });
 
 command_enum!(LibraryAppletCreatorCommand {

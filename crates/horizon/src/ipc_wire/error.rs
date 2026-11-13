@@ -17,6 +17,7 @@ pub(crate) enum IpcWireError {
     Internal(&'static str),
     HostResourceExhausted(&'static str),
     GraphicsBackend(Box<str>),
+    GraphicsService(Box<str>),
     AudioBackend(Box<str>),
     AudioRenderer(Box<str>),
     PlayReport(Box<str>),
@@ -100,6 +101,9 @@ impl std::fmt::Display for HorizonIpcFault {
             }
             IpcWireError::GraphicsBackend(reason) => {
                 write!(formatter, "GPU presentation export failed: {reason}")
+            }
+            IpcWireError::GraphicsService(reason) => {
+                write!(formatter, "graphics service failed: {reason}")
             }
             IpcWireError::AudioBackend(reason) => {
                 write!(formatter, "audio output failed: {reason}")

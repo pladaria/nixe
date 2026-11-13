@@ -19,6 +19,8 @@ impl ProcessMemory {
             uncached: false,
             locked: false,
             permission_locked: false,
+            gpu_sharable: false,
+            gpu_shared: 0,
         };
         if bytes < old {
             self.unmap(base.checked_add(bytes).unwrap(), old - bytes, mapping)?;

@@ -96,8 +96,24 @@ impl HorizonSvcDispatcher {
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let bytes = read_register(context.thread().state(), 1);
+        log::trace!("SetHeapSize bytes={bytes:#x}");
+        // The SVC size guard follows physical capacity; virtual placement and
+        // the process account enforce their own limits in resize_heap.
+        // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/kernel/svc/svc_physical_memory.cpp
+        let maximum =
+            if context.process().cpu().platform() == nixe_cpu::platform::TargetPlatform::Switch2 {
+                context
+                    .process()
+                    .memory()
+                    .space()
+                    .machine()
+                    .arena()
+                    .capacity()
+            } else {
+                HORIZON_MAX_HEAP_SIZE
+            };
         if !bytes.is_multiple_of(HORIZON_HEAP_ALIGNMENT)
-            || bytes > HORIZON_MAX_HEAP_SIZE
+            || bytes > maximum
             || bytes > context.process().memory_layout().heap().size()
         {
             result(context, HorizonKernelResult::INVALID_SIZE);
@@ -200,6 +216,8 @@ impl HorizonSvcDispatcher {
             u32::from(mapping.locked)
                 | (u32::from(mapping.uncached) << 3)
                 | (u32::from(mapping.permission_locked) << 4)
+                | (u32::from(mapping.gpu_sharable) << 5)
+                | (u32::from(mapping.gpu_shared != 0) << 6)
         });
         let permissions = info
             .mapping

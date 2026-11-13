@@ -664,6 +664,9 @@ unsafe impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x70 => create_port(context),
             0x71 => self.manage_named_port(context),
             0x72 => connect_to_port(context),
+            0x80 if context.process().memory_layout().remote().is_some() => {
+                set_gpu_memory_attribute(context)
+            }
             0x84 if context.process().memory_layout().remote().is_some() => {
                 remote_memory(context, false)
             }

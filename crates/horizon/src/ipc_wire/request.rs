@@ -332,7 +332,7 @@ impl Request {
         output.copy_from_slice(&bytes);
         Ok(())
     }
-    fn retain_payload(&self, pending: &nixe_memory::PendingAccess) {
+    pub(super) fn retain_payload(&self, pending: &nixe_memory::PendingAccess) {
         if let Some(permit) = self.payload.get() {
             pending.retain_owner(permit.clone());
         }

@@ -229,6 +229,8 @@ impl ProcessMemory {
                 uncached: false,
                 locked: false,
                 permission_locked: false,
+                gpu_sharable: false,
+                gpu_shared: 0,
             };
             let mut offset = 0;
             for (index, hole) in holes.iter().enumerate() {
@@ -303,7 +305,12 @@ impl ProcessMemory {
                 continue;
             }
             let state = region.mapping;
-            if state.kind != kind || state.locked || state.uncached || state.permission_locked {
+            if state.kind != kind
+                || state.locked
+                || state.gpu_shared != 0
+                || state.uncached
+                || state.permission_locked
+            {
                 return Err(MappingError::StateMismatch);
             }
             mapped.push(base.max(start.get())..region.end.min(end));

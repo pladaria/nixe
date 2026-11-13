@@ -267,6 +267,7 @@ pub static HORIZON_SVC_REGISTRY: &[HorizonSvcDescriptor] = &[
     svc!(0x7d, "CreateResourceLimit"),
     svc!(0x7e, "SetResourceLimitLimitValue"),
     svc!(0x7f, Value => "CallSecureMonitor"),
+    svc!(0x80, "SetGpuMemoryAttribute"),
     svc!(0x84, "MapRemoteMemory"),
     svc!(0x85, "UnmapRemoteMemory"),
     svc!(0x90, "MapInsecurePhysicalMemory"),

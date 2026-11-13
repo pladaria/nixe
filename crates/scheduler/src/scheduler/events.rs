@@ -448,6 +448,9 @@ impl WritableEventObject {
 pub struct ReadableEventObject(EventObject);
 
 impl ReadableEventObject {
+    pub fn same_identity(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0.reference, &other.0.reference)
+    }
     pub fn kernel(&self) -> &Arc<SchedulerState> {
         self.0.kernel()
     }

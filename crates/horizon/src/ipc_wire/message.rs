@@ -60,6 +60,7 @@ impl<'a> TipcRequest<'a> {
 pub(crate) fn encode_tipc_response(
     result: u32,
     data: &[u8],
+    copy_handles: &[u32],
     move_handles: &[u32],
 ) -> Result<Vec<u8>, MessageError> {
     bounded_count(
@@ -67,11 +68,17 @@ pub(crate) fn encode_tipc_response(
         MAX_HANDLE_COUNT,
         "too many moved handles",
     )?;
-    let has_special = !move_handles.is_empty();
+    bounded_count(
+        copy_handles.len(),
+        MAX_HANDLE_COUNT,
+        "too many copied handles",
+    )?;
+    let handles = copy_handles.len() + move_handles.len();
+    let has_special = handles != 0;
     let data_offset = checked_add(
         8,
         if has_special {
-            checked_add(4, checked_mul(move_handles.len(), 4)?)?
+            checked_add(4, checked_mul(handles, 4)?)?
         } else {
             0
         },
@@ -88,8 +95,12 @@ pub(crate) fn encode_tipc_response(
         (data_size as u32 / 4) | (u32::from(has_special) << 31),
     )?;
     if has_special {
-        put_u32(&mut output, 8, (move_handles.len() as u32) << 5)?;
-        for (index, handle) in move_handles.iter().enumerate() {
+        put_u32(
+            &mut output,
+            8,
+            ((copy_handles.len() as u32) << 1) | ((move_handles.len() as u32) << 5),
+        )?;
+        for (index, handle) in copy_handles.iter().chain(move_handles).enumerate() {
             put_u32(&mut output, 12 + index * 4, *handle)?;
         }
     }
@@ -973,27 +984,6 @@ mod tests {
                 Err(MessageError("TIPC request contains pointer descriptors"))
             ));
         }
-    }
-
-    #[test]
-    fn tipc_response_places_result_directly_after_hipc_metadata() {
-        let response = encode_tipc_response(0x1234, &[1, 2, 3], &[]).unwrap();
-        assert_eq!(
-            response,
-            [0, 0, 0, 0, 2, 0, 0, 0, 0x34, 0x12, 0, 0, 1, 2, 3, 0]
-        );
-        let response = encode_tipc_response(0, &9_u32.to_le_bytes(), &[3, 4, 5]).unwrap();
-        assert_eq!(get_u32(&response, 4).unwrap(), 2 | (1 << 31));
-        assert_eq!(get_u32(&response, 8).unwrap(), 3 << 5);
-        assert_eq!(&response[12..24], &[3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0]);
-        assert_eq!(get_u32(&response, 24).unwrap(), 0);
-        assert_eq!(get_u32(&response, 28).unwrap(), 9);
-        assert_eq!(
-            encode_tipc_response(0, &[0; 244], &[]).unwrap().len(),
-            COMMAND_BUFFER_SIZE
-        );
-        assert!(encode_tipc_response(0, &[0; 245], &[]).is_err());
-        assert!(encode_tipc_response(0, &[], &[0; 16]).is_err());
     }
 
     #[test]

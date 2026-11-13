@@ -26,7 +26,7 @@ impl Domain {
     fn for_handler(handler: &HorizonIpcObject) -> Self {
         use HorizonIpcObject::*;
         match handler {
-            Vi(_) | NvDrv(_) => Self::Graphics,
+            Vi(_) | NvDrv(_) | NvDrv2(_) | Gsv(_) => Self::Graphics,
             AudioOutManager(_)
             | AudioOut(_)
             | AudioRendererManager(_)

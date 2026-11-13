@@ -61,6 +61,17 @@ impl Drop for KernelRequest {
 }
 
 impl RunnableProcess {
+    /// A persistent device worker reports failure without retaining an IPC
+    /// request, which would prevent process teardown from draining requests.
+    pub fn report_device_failure(&self, detail: impl Into<Box<str>>) {
+        if let Some(runtime) = self.runtime.get().and_then(std::sync::Weak::upgrade) {
+            runtime.fail(crate::RuntimeError::Execution {
+                process: nixe_scheduler::ProcessId::new(self.process_id()),
+                thread: nixe_scheduler::GuestThreadId::new(0),
+                diagnostic: detail.into(),
+            });
+        }
+    }
     pub(crate) fn has_active_requests(&self) -> bool {
         self.active_requests.load(Ordering::Acquire) != 0
     }

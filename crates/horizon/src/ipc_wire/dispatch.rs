@@ -127,6 +127,9 @@ impl HorizonIpcObject {
             Self::TimeZone(_) => "ITimeZoneService",
             Self::Vi(session) => services::vi_object_name(session.kind()),
             Self::NvDrv(_) => "nvdrv",
+            Self::NvDrv2(_) => "NvDrv2",
+            Self::Gsv(_) => "GSV UserSession",
+            Self::Csrng => "csrng",
             Self::LogManager(_) => "lm",
             Self::Logger(_) => "ILogger",
             Self::ErrorContextWriter(_) => "ectx:aw",
@@ -165,15 +168,6 @@ pub(crate) async fn execute_request(
     );
     process.begin_service()?;
     if hipc.command_type >= TIPC_COMMAND_CLOSE {
-        let HorizonIpcObject::ServiceManager(manager) = target else {
-            return Err(IpcWireError::UnsupportedService(
-                UnsupportedServiceOperation::CommandVariant {
-                    service: "TIPC transport",
-                    command_id: u32::from(hipc.command_type),
-                    detail: "TIPC is only implemented for sm:",
-                },
-            ));
-        };
         if hipc.command_type == TIPC_COMMAND_CLOSE {
             if hipc.data_word_bytes() != 0 || super::io::has_ipc_descriptors(hipc) {
                 return Err(IpcWireError::Malformed(
@@ -191,25 +185,47 @@ pub(crate) async fn execute_request(
             u64::from(handle),
             u64::from(request.command_id),
         );
-        if super::io::has_ipc_descriptors_other_than_pid(hipc) {
-            return Err(IpcWireError::Malformed(
-                "sm: TIPC request contains unexpected descriptors",
-            ));
-        }
         log::trace!(
-            "SendSyncRequest service=sm: transport=TIPC type={} command={} send_pid={} data_len={}",
+            "TIPC request handle={handle:#x} type={} command={} send_pid={} handles={}/{} buffers={}/{}/{} data={:02x?}",
             hipc.command_type,
             request.command_id,
             hipc.pid.is_some(),
-            request.data.len()
+            hipc.copy_handles.len(),
+            hipc.move_handles.len(),
+            hipc.send_buffers.len(),
+            hipc.receive_buffers.len(),
+            hipc.exchange_buffers.len(),
+            request.data
         );
-        let (response, _) = services::dispatch_service_manager(
-            process,
-            manager,
-            services::ServiceManagerRequest::Tipc(request),
-            hipc.pid.is_some(),
-            resources,
-        )?;
+        let response = match target {
+            HorizonIpcObject::ServiceManager(manager) => {
+                if super::io::has_ipc_descriptors_other_than_pid(hipc) {
+                    return Err(IpcWireError::Malformed(
+                        "sm: TIPC request contains unexpected descriptors",
+                    ));
+                }
+                services::dispatch_service_manager(
+                    process,
+                    manager,
+                    services::ServiceManagerRequest::Tipc(request),
+                    hipc.pid.is_some(),
+                    resources,
+                )?
+                .0
+            }
+            HorizonIpcObject::Gsv(session) => {
+                services::dispatch_gsv(process, session, request, hipc).await?
+            }
+            _ => {
+                return Err(IpcWireError::UnsupportedService(
+                    UnsupportedServiceOperation::CommandVariant {
+                        service: "TIPC transport",
+                        command_id: request.command_id,
+                        detail: "service does not implement TIPC",
+                    },
+                ));
+            }
+        };
         process.write_response(response).await?;
         process.publish_handles()?;
         return Ok(SyncRequestResult::Success);
@@ -419,6 +435,13 @@ pub(crate) async fn execute_request(
         HorizonIpcObject::SteadyClock(clock) => services::dispatch_steady_clock(clock, request)?,
         HorizonIpcObject::TimeZone(timezone) => services::dispatch_timezone(timezone, request)?,
         HorizonIpcObject::Vi(vi) => services::dispatch_vi(process, vi, request, hipc).await?,
+        HorizonIpcObject::Csrng => services::dispatch_csrng(process, request, hipc).await?,
+        HorizonIpcObject::Gsv(_) => {
+            return Err(IpcWireError::Malformed("GSV requires TIPC requests"));
+        }
+        HorizonIpcObject::NvDrv2(session) => {
+            services::dispatch_nvdrv2(process, session, request, hipc).await?
+        }
         HorizonIpcObject::NvDrv(nvdrv) => {
             services::dispatch_nvdrv(
                 process,

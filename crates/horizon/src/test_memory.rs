@@ -55,6 +55,8 @@ pub(crate) fn transfer(bytes: &[u8]) -> Arc<TransferMemoryObject> {
                 uncached: false,
                 locked: false,
                 permission_locked: false,
+                gpu_sharable: false,
+                gpu_shared: 0,
             },
         )
         .unwrap();

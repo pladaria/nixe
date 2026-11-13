@@ -224,6 +224,8 @@ fn mapping(kind: MemoryKind, permissions: MemoryPermissions) -> Mapping {
         uncached: false,
         locked: false,
         permission_locked: false,
+        gpu_sharable: false,
+        gpu_shared: 0,
     }
 }
 fn mapping_result(
@@ -621,5 +623,27 @@ pub(super) fn set_memory_attribute(
             );
         }
     };
+    mapping_result(context, outcome)
+}
+
+/// https://switchbrew.org/wiki/SVC#SetGpuMemoryAttribute
+pub(super) fn set_gpu_memory_attribute(
+    context: &mut ExceptionDispatchContext<'_>,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    let start = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
+    let size = read_register(context.thread().state(), 1);
+    let mask = read_register(context.thread().state(), 2) as u32;
+    let value = read_register(context.thread().state(), 3) as u32;
+    if mask & !0x20 != 0 || value & !mask != 0 {
+        return reject(
+            context,
+            HorizonSvcFault::InvalidMemoryAttribute { mask, value },
+        );
+    }
+    let outcome = context.process().memory().set_gpu_sharable(
+        start,
+        size,
+        (mask & 0x20 != 0).then_some(value & 0x20 != 0),
+    );
     mapping_result(context, outcome)
 }

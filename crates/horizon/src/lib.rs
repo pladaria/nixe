@@ -25,6 +25,8 @@ pub use audio::{AudioOutManagerSession, AudioOutSession};
 mod error_applet;
 mod friends;
 mod graphics;
+mod gsv;
+pub use gsv::{GsvSession, NvDrv2Session};
 mod graphics_event;
 mod hid;
 pub use friends::FriendSession;
