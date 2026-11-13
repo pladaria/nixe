@@ -42,7 +42,7 @@ mod system_memory;
 #[cfg(test)]
 mod test_memory;
 pub use shared_font::SharedFontSession;
-mod scheduler_profile;
+mod machine_profile;
 pub use save_data::SaveDataSystem;
 mod svc;
 mod svc_dispatch;
@@ -62,6 +62,9 @@ pub use ipc::{
 pub use ipc_result::HorizonIpcResult;
 pub use ipc_wire::ServiceSession;
 pub use ipc_wire::{HorizonIpcFault, UnsupportedServiceOperation};
+pub use machine_profile::{
+    GraphicsGeneration, HorizonMachineProfile, switch_1_machine_profile, switch_1_scheduler_profile,
+};
 pub use nvdrv::{
     NvDrvDescriptorLifecycle, NvDrvDescriptorOwner, NvDrvDeviceDescriptor, NvDrvDeviceKind,
     NvDrvErrorContext, NvDrvFileDescriptor, NvDrvPermissionProfile, NvDrvSession, NvDrvSessionId,
@@ -80,9 +83,6 @@ pub use object::{
     SettingsEnvironment, SslSession, SteadyClockSession, SystemClockKind, SystemClockSession,
     SystemLanguage, SystemSettingsSession, TimeEnvironment, TimeServiceSession,
     TimeZoneServiceSession, UserSettingsSession,
-};
-pub use scheduler_profile::{
-    HorizonMachineProfile, switch_1_machine_profile, switch_1_scheduler_profile,
 };
 pub use svc::{
     HORIZON_SVC_REGISTRY, HorizonSvcDescriptor, HorizonSvcReturnKind, UnsupportedHorizonSvc,

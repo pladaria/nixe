@@ -145,6 +145,7 @@ impl ProcessMemory {
                 .limit()
                 .checked_add(system_reservation)
                 .is_none_or(|limit| limit > account.machine().arena().capacity())
+            || !system_reservation.is_multiple_of(PAGE_SIZE)
         {
             return Err(MemoryError::Invalid(
                 "invalid process heap or physical resource budget",

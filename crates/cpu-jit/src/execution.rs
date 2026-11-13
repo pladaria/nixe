@@ -78,6 +78,7 @@ impl Core {
                 configuration.timer_frequency,
                 register(0xd53b0020),
                 register(0xd53b00e0),
+                configuration.cpu.platform() == nixe_cpu::platform::TargetPlatform::Switch2,
             )
         };
         if pointer.is_null() {

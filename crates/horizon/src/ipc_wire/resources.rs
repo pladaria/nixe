@@ -3,7 +3,25 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) struct GraphicsServices {
-    pub video: crate::VideoSystem,
+    pub video: Option<crate::VideoSystem>,
+}
+
+impl GraphicsServices {
+    pub fn require_video(
+        &self,
+        service: &'static str,
+        command_id: u32,
+    ) -> Result<&crate::VideoSystem, super::IpcWireError> {
+        self.video
+            .as_ref()
+            .ok_or(super::IpcWireError::UnsupportedService(
+                super::UnsupportedServiceOperation::CommandVariant {
+                    service,
+                    command_id,
+                    detail: "the selected platform's graphics services are not implemented",
+                },
+            ))
+    }
 }
 
 #[derive(Debug)]

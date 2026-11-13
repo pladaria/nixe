@@ -263,9 +263,6 @@ impl Machine {
             pressure: pressure::AllocationPressure::default(),
         })))
     }
-    pub fn switch_ram() -> Result<Self, MemoryError> {
-        Self::new(crate::DEFAULT_RAM_BYTES)
-    }
     pub fn identity(&self) -> MachineId {
         self.0.id
     }

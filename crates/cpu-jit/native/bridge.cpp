@@ -57,7 +57,8 @@ struct Core final : Dynarmic::A64::UserCallbacks {
   std::unique_ptr<Dynarmic::A64::Jit> jit;
 
   Core(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table, size_t address_bits,
-       std::uint32_t frequency, std::uint32_t ctr, std::uint32_t dczid)
+       std::uint32_t frequency, std::uint32_t ctr, std::uint32_t dczid,
+       bool strict_hints)
       : callbacks(cb) {
     Dynarmic::A64::UserConfig conf{};
     conf.callbacks = this;
@@ -70,6 +71,7 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.enable_cycle_counting = false;
     conf.check_halt_on_memory_access = false;
     conf.hook_hint_instructions = false;
+    conf.hook_unknown_hint_instructions = strict_hints;
     conf.hook_data_cache_operations = false;
     // Use Eden's defined choices for constrained-unpredictable encodings,
     // including overlapping status/data zero registers in STXR/STLXR.
@@ -215,9 +217,9 @@ bool nixe_dynarmic_resolve_fault(std::uint64_t pc, std::uint64_t *call,
 const char *nixe_dynarmic_error() noexcept { return last_error.c_str(); }
 void *nixe_dynarmic_create(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table,
                            size_t bits, std::uint32_t frequency, std::uint32_t ctr,
-                           std::uint32_t dczid) noexcept {
+                           std::uint32_t dczid, bool strict_hints) noexcept {
   try {
-    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid);
+    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid, strict_hints);
   } catch (const std::exception &e) {
     last_error = e.what();
     return nullptr;

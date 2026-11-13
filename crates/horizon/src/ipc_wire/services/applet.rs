@@ -28,7 +28,7 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
     system: &crate::ipc_wire::resources::SystemServices,
-    video_system: &VideoSystem,
+    graphics: &crate::ipc_wire::resources::GraphicsServices,
     save_data: Option<&crate::SaveDataSystem>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let application_language = system.application_language;
@@ -324,6 +324,8 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     }
+                    let video_system =
+                        graphics.require_video("ISelfController", request.command_id)?;
                     let Some(layer) = video_system.create_layer(1) else {
                         return applet_error(
                             request.token,

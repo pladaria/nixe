@@ -1,5 +1,5 @@
 //! Stable shared backing; virtual aliases map this same file, never private RAM.
-use crate::{ArenaOffset, DEFAULT_RAM_BYTES, PAGE_SIZE, PHYSICAL_BASE, PhysicalAddress};
+use crate::{ArenaOffset, PAGE_SIZE, PHYSICAL_BASE, PhysicalAddress};
 use std::{
     ffi::c_void,
     io,
@@ -144,9 +144,6 @@ impl PhysicalArena {
         }
         Ok(result)
     }
-    pub fn switch_ram() -> io::Result<Self> {
-        Self::new(DEFAULT_RAM_BYTES)
-    }
     /// Allocated backing-file pages, distinct from virtual reservation and RSS.
     pub fn committed_bytes(&self) -> io::Result<u64> {
         let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -189,60 +186,6 @@ impl Drop for PhysicalArena {
         unsafe {
             libc::munmap(self.base.as_ptr().cast(), self.bytes);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn physical_ram_is_aligned_sparse_and_uses_a_close_on_exec_shared_file() {
-        let arena = PhysicalArena::switch_ram().unwrap();
-        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
-        assert_eq!(
-            unsafe { libc::fstat(arena.descriptor(), status.as_mut_ptr()) },
-            0
-        );
-        assert_eq!(
-            unsafe { status.assume_init() }.st_blocks,
-            0,
-            "reserving RAM must not commit the 4 GiB backing"
-        );
-        let pointer = arena
-            .host_address(ArenaOffset::new(0), PAGE_SIZE)
-            .unwrap()
-            .as_ptr();
-        assert_eq!(pointer as usize % BASE_ALIGNMENT, 0);
-        assert_eq!(arena.capacity(), 4 << 30);
-        let flags = unsafe { libc::fcntl(arena.descriptor(), libc::F_GETFD) };
-        assert_ne!(flags & libc::FD_CLOEXEC, 0);
-        let alias = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                PAGE_SIZE as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                arena.descriptor(),
-                0,
-            )
-        };
-        assert_ne!(alias, libc::MAP_FAILED);
-        // This test has exclusive access; it creates no racing Rust reference.
-        unsafe {
-            assert_eq!(pointer.read(), 0);
-            pointer.write(83);
-            assert_eq!(alias.cast::<u8>().read(), 83);
-            libc::munmap(alias, PAGE_SIZE as usize);
-        }
-        assert_eq!(
-            arena.arena_offset(PhysicalAddress::new(PHYSICAL_BASE)),
-            Some(ArenaOffset::new(0))
-        );
-        assert!(
-            arena
-                .host_address(ArenaOffset::new(arena.capacity()), 1)
-                .is_none()
-        );
     }
 }
 

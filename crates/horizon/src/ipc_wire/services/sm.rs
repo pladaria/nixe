@@ -292,11 +292,17 @@ fn connect_service(
         }
         ServiceKind::Vi(kind) => process.return_service(HorizonIpcObject::Vi(ViSession::new(
             ViObjectKind::Root(kind),
-            resources.graphics.video.clone(),
+            resources
+                .graphics
+                .require_video("sm:GetService(vi)", 1)?
+                .clone(),
         ))),
-        ServiceKind::NvDrv => {
-            process.return_service(HorizonIpcObject::NvDrv(resources.graphics.video.nvdrv()))
-        }
+        ServiceKind::NvDrv => process.return_service(HorizonIpcObject::NvDrv(
+            resources
+                .graphics
+                .require_video("sm:GetService(nvdrv)", 1)?
+                .nvdrv(),
+        )),
         ServiceKind::LogManager => {
             process.return_service(HorizonIpcObject::LogManager(LogManagerSession::new()))
         }

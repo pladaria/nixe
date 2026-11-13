@@ -188,8 +188,6 @@ pub struct ProcessBuildConfig {
     pub image_base: GuestVirtualAddress,
     /// Physical-memory resource limit assigned to the emulated process.
     pub physical_memory_limit: u64,
-    /// Frequency exposed by architectural counter registers.
-    pub architectural_timer_frequency: u64,
 }
 
 impl Default for ProcessBuildConfig {
@@ -200,9 +198,6 @@ impl Default for ProcessBuildConfig {
             memory_layout_profile: ProcessMemoryLayoutProfile::Horizon2Plus,
             image_base: GuestVirtualAddress::new(DEFAULT_IMAGE_BASE),
             physical_memory_limit: DEFAULT_PHYSICAL_MEMORY_LIMIT,
-            // Horizon exposes the Switch 1 system counter at 19.2 MHz:
-            // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#svcGetSystemTick
-            architectural_timer_frequency: 19_200_000,
         }
     }
 }

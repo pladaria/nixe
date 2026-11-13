@@ -176,6 +176,9 @@ struct UserConfig {
     /// When set to true, UserCallbacks::ExceptionRaised will be called when any hint
     /// instruction is executed.
     bool hook_hint_instructions = false;
+    /// Stop at extension HINTs whose semantics the frontend does not implement.
+    /// Newer guest CPUs can assign architectural effects to these encodings.
+    bool hook_unknown_hint_instructions = false;
 
     /// Counter-timer frequency register. The value of the register is not interpreted by
     /// dynarmic.

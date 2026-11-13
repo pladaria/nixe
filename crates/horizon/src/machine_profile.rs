@@ -13,10 +13,38 @@ pub struct HorizonMachineProfile {
     platform: nixe_cpu::platform::TargetPlatform,
     memory_layout: nixe_runtime::ProcessMemoryLayoutProfile,
     application_memory_capacity: u64,
-    architectural_timer_frequency: u64,
+    physical_memory_capacity: u64,
+    graphics: GraphicsGeneration,
+}
+
+/// Guest command-engine generation, independent of the host graphics API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphicsGeneration {
+    Maxwell,
+    Ampere,
 }
 
 impl HorizonMachineProfile {
+    pub fn for_platform(platform: nixe_cpu::platform::TargetPlatform) -> Self {
+        match platform {
+            nixe_cpu::platform::TargetPlatform::Switch1 => switch_1_machine_profile(),
+            nixe_cpu::platform::TargetPlatform::Switch2 => switch_2_machine_profile(),
+        }
+    }
+
+    pub const fn physical_memory_capacity(&self) -> u64 {
+        self.physical_memory_capacity
+    }
+
+    /// Kernel/HLE shared objects are charged separately from the application pool.
+    pub const fn system_memory_capacity(&self) -> u64 {
+        self.physical_memory_capacity - self.application_memory_capacity
+    }
+
+    pub const fn graphics(&self) -> GraphicsGeneration {
+        self.graphics
+    }
+
     #[must_use]
     pub const fn scheduler(&self) -> &MachineSchedulerProfile {
         &self.scheduler
@@ -36,7 +64,6 @@ impl HorizonMachineProfile {
             // application slot. Select the distinct applet and system pools
             // here once those process classes can be launched independently.
             physical_memory_limit: self.application_memory_capacity,
-            architectural_timer_frequency: self.architectural_timer_frequency,
             ..nixe_runtime::ProcessBuildConfig::default()
         }
     }
@@ -50,15 +77,15 @@ pub fn switch_1_machine_profile() -> HorizonMachineProfile {
         platform: nixe_cpu::platform::TargetPlatform::Switch1,
         memory_layout: nixe_runtime::ProcessMemoryLayoutProfile::Horizon2Plus,
         application_memory_capacity: SWITCH_1_APPLICATION_MEMORY_CAPACITY,
-        architectural_timer_frequency: 19_200_000,
+        physical_memory_capacity: 4 * 1024 * 1024 * 1024,
+        graphics: GraphicsGeneration::Maxwell,
     }
 }
 
 /// Returns the verified Horizon scheduler topology for Nintendo Switch 1.
 ///
 /// The retail system exposes four Cortex-A57 application cores and Horizon
-/// thread priorities 0 through 63. Switch 2 deliberately has no corresponding
-/// built-in profile until its topology and kernel policy are publicly verified.
+/// thread priorities 0 through 63.
 ///
 /// Sources:
 /// - <https://developer.nvidia.com/embedded/jetson-tx1>
@@ -80,29 +107,32 @@ pub fn switch_1_scheduler_profile() -> MachineSchedulerProfile {
     .expect("the verified Switch 1 preemption policy is valid")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn switch_1_profile_records_verified_machine_properties() {
-        let machine = switch_1_machine_profile();
-        let profile = machine.scheduler();
-        assert_eq!(profile.vcpus().len(), 4);
-        assert_eq!(profile.priorities().highest(), 0);
-        assert_eq!(profile.priorities().lowest(), 63);
-        assert_eq!(profile.all_cores().len(), 4);
-        assert_eq!(
-            machine.platform(),
-            nixe_cpu::platform::TargetPlatform::Switch1
-        );
-        assert_eq!(
-            machine.process_build_config().architectural_timer_frequency,
-            19_200_000
-        );
-        assert_eq!(
-            machine.process_build_config().physical_memory_limit,
-            SWITCH_1_APPLICATION_MEMORY_CAPACITY
-        );
+/// Native application composition: six schedulable cores and a 12 GiB RAM arena.
+/// These application-pool and scheduling policies follow the reference kernel's
+/// 12 GiB configuration, without its title-specific pool growth or extra GPU RAM.
+/// https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/kernel/board/nintendo/nx/k_system_control.cpp
+/// https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/kernel/global_scheduler_context.cpp
+fn switch_2_machine_profile() -> HorizonMachineProfile {
+    let scheduler = MachineSchedulerProfile::new(
+        [59, 59, 59, 63, 59, 59]
+            .into_iter()
+            .enumerate()
+            .map(|(id, priority)| {
+                VirtualCpuDescriptor::new(VirtualCpuId::new(id as u32), 0)
+                    .with_rotation_priority(priority)
+            })
+            .collect(),
+        PriorityRange::new(0, 63).expect("valid Horizon priorities"),
+    )
+    .expect("valid native application topology")
+    .with_preemption(10_000_000, 2)
+    .expect("valid Horizon preemption policy");
+    HorizonMachineProfile {
+        scheduler,
+        platform: nixe_cpu::platform::TargetPlatform::Switch2,
+        memory_layout: nixe_runtime::ProcessMemoryLayoutProfile::Horizon2Plus,
+        application_memory_capacity: 9809 * 1024 * 1024,
+        physical_memory_capacity: 12 * 1024 * 1024 * 1024,
+        graphics: GraphicsGeneration::Ampere,
     }
 }

@@ -26,6 +26,7 @@ unsafe extern "C" {
         frequency: u32,
         ctr: u32,
         dczid: u32,
+        strict_hints: bool,
     ) -> *mut c_void;
     pub fn nixe_dynarmic_destroy(core: *mut c_void);
     pub fn nixe_dynarmic_halt(core: *mut c_void);

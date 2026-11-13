@@ -31,6 +31,9 @@ enum class SystemRegisterEncoding : u32 {
 };
 
 bool TranslatorVisitor::HINT([[maybe_unused]] Imm<4> CRm, [[maybe_unused]] Imm<3> op2) {
+    if (options.hook_unknown_hint_instructions) {
+        return InterpretThisInstruction();
+    }
     return true;
 }
 

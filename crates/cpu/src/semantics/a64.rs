@@ -220,9 +220,9 @@ pub const fn runtime_register_read(
 ) -> Option<RuntimeRegisterRead> {
     match system_key {
         // CTR_EL0 reports log2(cache-line words) in DminLine and IminLine.
-        // Switch 1's Cortex-A57 profile exposes 64-byte lines.
+        // Both profiles expose 64-byte lines; their instruction-coherence bits differ.
         // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CTR-EL0--Cache-Type-Register
-        0xd53b_0020 => Some(RuntimeRegisterRead::Constant(0x8444_c004)),
+        0xd53b_0020 => Some(RuntimeRegisterRead::Constant(platform.cache_type() as u64)),
         // DCZID_EL0 reports the guest zeroing block size, independently of the host.
         // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/DCZID-EL0--Data-Cache-Zero-ID-Register
         0xd53b_00e0 => {

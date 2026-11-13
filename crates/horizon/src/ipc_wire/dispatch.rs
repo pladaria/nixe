@@ -328,7 +328,7 @@ pub(crate) async fn execute_request(
                 request,
                 hipc,
                 &resources.system,
-                &resources.graphics.video,
+                &resources.graphics,
                 resources.files.save_data.as_ref(),
             )
             .await?

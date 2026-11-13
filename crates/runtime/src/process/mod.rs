@@ -73,6 +73,7 @@ pub struct RunnableProcess {
     memory_layout: ProcessMemoryLayout,
     random_entropy: [u64; 4],
     memory: std::sync::Arc<ProcessMemory>,
+    remote_memory: nixe_memory::MemoryAccount,
     modules: Box<[PreparedModule]>,
     entry_module: usize,
     main_thread_id: nixe_scheduler::GuestThreadId,
@@ -147,6 +148,12 @@ impl RunnableProcess {
     #[must_use]
     pub fn memory(&self) -> &std::sync::Arc<ProcessMemory> {
         &self.memory
+    }
+
+    /// NPDM remote-memory quota over the canonical physical allocator. The quota
+    /// is excluded from the ordinary heap budget; pages are committed on use.
+    pub fn remote_memory(&self) -> &nixe_memory::MemoryAccount {
+        &self.remote_memory
     }
 
     #[must_use]

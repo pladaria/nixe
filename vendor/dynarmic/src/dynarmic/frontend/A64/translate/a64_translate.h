@@ -35,6 +35,8 @@ struct TranslationOptions {
     /// If this is false, we treat the instruction as a NOP.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+    /// Unrecognized HINT encodings require the caller's newer-ISA semantics.
+    bool hook_unknown_hint_instructions = false;
 };
 
 /**

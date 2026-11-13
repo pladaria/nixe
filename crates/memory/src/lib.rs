@@ -51,7 +51,6 @@ pub use virtual_arena::{AddressWidth, MemoryPermissions, VirtualArena};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const PHYSICAL_BASE: u64 = 0x8000_0000;
-pub const DEFAULT_RAM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 macro_rules! address {
     ($name:ident) => {

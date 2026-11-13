@@ -57,12 +57,6 @@ impl ProcessBuilder {
     /// Packaged NSOs retain their dynamic relocations for the guest `rtld`.
     /// Standalone NROs likewise enter through their guest startup ABI.
     pub fn build(&self, plan: &LaunchPlan) -> Result<RunnableProcess, ProcessBuildError> {
-        if self.config.architectural_timer_frequency == 0 {
-            return Err(ProcessBuildError::new(
-                ProcessBuildStage::Metadata,
-                "architectural timer frequency must be nonzero",
-            ));
-        }
         if plan.platform() != self.config.target_platform {
             return Err(error(
                 ProcessBuildStage::Metadata,
@@ -75,14 +69,6 @@ impl ProcessBuilder {
         }
         if let Some(identity) = plan.packaged_identity() {
             let npdm = identity.npdm();
-            if npdm.remote_memory_size() != 0
-                || npdm.platform() == nixe_loader_executable::ProgramPlatform::Switch2
-            {
-                return Err(error(
-                    ProcessBuildStage::Metadata,
-                    "Switch 2 process memory and machine composition are not implemented",
-                ));
-            }
             if !npdm.flags().is_64_bit_instruction() {
                 return Err(error(
                     ProcessBuildStage::Metadata,
@@ -103,6 +89,21 @@ impl ProcessBuilder {
             }
         }
         let metadata = process_metadata(plan)?;
+        let scheduler = self.kernel.profile();
+        if !scheduler.contains(metadata.ideal_vcpu)
+            || !scheduler.priorities().contains(metadata.priority)
+            || metadata.thread_policy.is_some_and(|policy| {
+                !(policy.min_core..=policy.max_core)
+                    .all(|id| scheduler.contains(nixe_scheduler::VirtualCpuId::new(id)))
+                    || !scheduler.priorities().contains(policy.highest_priority)
+                    || !scheduler.priorities().contains(policy.lowest_priority)
+            })
+        {
+            return Err(error(
+                ProcessBuildStage::Metadata,
+                "NPDM thread capabilities exceed the selected machine topology or priority range",
+            ));
+        }
         let address_space = metadata.address_space;
         let stack_size = metadata.stack_size;
         let abi = metadata.abi;
@@ -139,19 +140,40 @@ impl ProcessBuilder {
             });
         let handles = Arc::new(handles);
 
+        // Remote memory is backed by the application pool, separately from the
+        // process's ordinary physical-memory allowance. Retain the NPDM quota;
+        // its virtual mappings and service operations have distinct owners.
+        // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/kernel/svc/svc_info.cpp#L21-L26
+        if self.config.physical_memory_limit > self.machine.arena().capacity() {
+            return Err(error(
+                ProcessBuildStage::Mapping,
+                "process RAM budget exceeds physical RAM capacity",
+            ));
+        }
         let user_limit = self
             .config
             .physical_memory_limit
             .checked_sub(metadata.system_resource_size)
+            .and_then(|limit| limit.checked_sub(metadata.remote_memory_size))
             .ok_or_else(|| {
                 error(
                     ProcessBuildStage::Mapping,
-                    "system resource reservation exceeds process RAM budget",
+                    "system and remote memory reservations exceed process RAM budget",
                 )
             })?;
         let account = self
             .machine
             .account(user_limit)
+            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
+        if !metadata.remote_memory_size.is_multiple_of(PAGE_SIZE) {
+            return Err(error(
+                ProcessBuildStage::Metadata,
+                "remote memory size is not page aligned",
+            ));
+        }
+        let remote_memory = self
+            .machine
+            .account(metadata.remote_memory_size)
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
         let memory = crate::memory::ProcessMemory::new(
             account,
@@ -306,7 +328,7 @@ impl ProcessBuilder {
         let execution = nixe_cpu_jit::JitProcess::new(
             cpu,
             Arc::clone(memory.space()),
-            self.config.architectural_timer_frequency,
+            u64::from(self.config.target_platform.counter_frequency()),
         )
         .map_err(|error| ProcessBuildError::new(ProcessBuildStage::CpuInitialization, error))?;
         let process = RunnableProcess {
@@ -327,6 +349,7 @@ impl ProcessBuilder {
             memory_layout,
             random_entropy,
             memory,
+            remote_memory,
             modules: modules.into_boxed_slice(),
             entry_module,
             main_thread_id,
@@ -378,6 +401,7 @@ struct ProcessMetadata {
     ideal_vcpu: nixe_scheduler::VirtualCpuId,
     thread_policy: Option<ThreadPolicy>,
     system_resource_size: u64,
+    remote_memory_size: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -441,6 +465,7 @@ fn process_metadata(plan: &LaunchPlan) -> Result<ProcessMetadata, ProcessBuildEr
                         max_core: u32::from(max_core),
                     }),
                 system_resource_size: u64::from(npdm.system_resource_size()),
+                remote_memory_size: u64::from(npdm.remote_memory_size()),
             }
         }
         LaunchKind::Homebrew(_) => ProcessMetadata {
@@ -451,6 +476,7 @@ fn process_metadata(plan: &LaunchPlan) -> Result<ProcessMetadata, ProcessBuildEr
             ideal_vcpu: nixe_scheduler::VirtualCpuId::new(0),
             thread_policy: None,
             system_resource_size: 0,
+            remote_memory_size: 0,
         },
     })
 }

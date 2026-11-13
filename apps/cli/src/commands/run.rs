@@ -9,8 +9,9 @@ use nixe_config::{DiagnosticsConfig, GuestLogsLevel, TimeMode, WindowState};
 use nixe_gpu::frame_metrics::FrameMetrics;
 use nixe_gpu_vulkan::cache::CacheMonitor;
 use nixe_horizon::{
-    GuestLogLevel, HorizonDiagnostics, HorizonSvcDispatcher, OperationMode, SaveDataSystem,
-    SettingsEnvironment, SystemLanguage, TimeEnvironment, VideoSystem, switch_1_machine_profile,
+    GraphicsGeneration, GuestLogLevel, HorizonDiagnostics, HorizonMachineProfile,
+    HorizonSvcDispatcher, OperationMode, SaveDataSystem, SettingsEnvironment, SystemLanguage,
+    TimeEnvironment, VideoSystem,
 };
 use nixe_input::{
     ControllerId, EmulatedButtonState, GamepadProfiles, InputReader, InputWorker,
@@ -52,12 +53,22 @@ pub fn run(mut arguments: Arguments) -> Result<(), String> {
     };
     #[cfg(feature = "execution-trace")]
     nixe_memory::trace::start().map_err(|e| format!("cannot start execution trace: {e}"))?;
-    let memory = nixe_memory::Machine::switch_ram().map_err(|error| error.to_string())?;
+    let launch = resolve_launch(&arguments.identifier, &config)?;
+    let machine_profile = HorizonMachineProfile::for_platform(launch.plan.platform());
+    let memory = nixe_memory::Machine::new(machine_profile.physical_memory_capacity())
+        .map_err(|error| error.to_string())?;
     #[cfg(feature = "performance-counters")]
     let capture = crate::performance::Capture::start(memory.clone()).map_err(|e| e.to_string())?;
     // Retain the extracted layer and its native code through GPU teardown,
     // independently of the window closing before the guest worker finishes.
-    let result = run_with_memory(arguments, memory, config, smooth_motion.clone());
+    let result = run_machine(
+        arguments,
+        memory,
+        config,
+        smooth_motion.clone(),
+        launch,
+        machine_profile,
+    );
     #[cfg(feature = "performance-counters")]
     if let Some(capture) = capture {
         capture.finish().map_err(|e| e.to_string())?;
@@ -65,46 +76,17 @@ pub fn run(mut arguments: Arguments) -> Result<(), String> {
     result
 }
 
-fn run_with_memory(
-    arguments: Arguments,
-    memory: nixe_memory::Machine,
-    config: nixe_config::NixeConfig,
-    smooth_motion: Option<nixe_gpu_vulkan::smooth_motion::SmoothMotion>,
-) -> Result<(), String> {
-    let Arguments {
-        config_path: _,
-        log_level_override: _,
-        identifier,
-        headless,
-        vulkan,
-        guest_logs_level_override,
-        file_system_access_log_override,
-    } = arguments;
-    let frontend_stop_requested = Arc::new(AtomicBool::new(false));
-    let (mut frontend, frontend_control, presenter, touch_screen) = if headless {
-        log::info!("headless presentation enabled; no host window will be created");
-        (None, None, None, None)
-    } else {
-        let mut frontend = WindowFrontend::new(Arc::clone(&frontend_stop_requested))
-            .map_err(|error| error.to_string())?
-            .with_smooth_motion(smooth_motion);
-        let control = frontend.control();
-        let mailbox = frontend.mailbox();
-        let touch_screen = frontend.take_touch_screen();
-        (
-            Some(frontend),
-            Some(control),
-            Some(mailbox),
-            Some(touch_screen),
-        )
-    };
-    let machine_profile = switch_1_machine_profile();
-    let scheduler_profile = machine_profile.scheduler().clone();
-    let diagnostics_configuration = effective_diagnostics_configuration(
-        config.diagnostics,
-        guest_logs_level_override,
-        file_system_access_log_override,
-    );
+struct ResolvedLaunch {
+    plan: nixe_runtime::LaunchPlan,
+    identifier: String,
+    name: String,
+    sd_card_root: PathBuf,
+}
+
+fn resolve_launch(
+    identifier: &str,
+    config: &nixe_config::NixeConfig,
+) -> Result<ResolvedLaunch, String> {
     log::info!("scanning configured title library");
     std::fs::create_dir_all(&config.filesystem.sd_card).map_err(|error| {
         format!(
@@ -120,14 +102,14 @@ fn run_with_memory(
     })?;
     log::debug!("SD card host directory: {}", sd_card_root.display());
     let scan_started = Instant::now();
-    let mut library = Library::scan(&config)?;
+    let mut library = Library::scan(config)?;
     log::debug!(
         "configured title library scanned in {:?}",
         scan_started.elapsed()
     );
-    library.prepare_for_launch(&identifier, &config.library)?;
+    library.prepare_for_launch(identifier, &config.library)?;
     let title = library
-        .find(&identifier)
+        .find(identifier)
         .ok_or_else(|| format!("unknown title ID or name: {identifier}"))?;
     log::info!("selected {}: {}", title.identifier, title.name);
 
@@ -165,6 +147,72 @@ fn run_with_memory(
         );
     }
 
+    Ok(ResolvedLaunch {
+        plan,
+        identifier: title.identifier.to_string(),
+        name: title.name.clone(),
+        sd_card_root,
+    })
+}
+
+fn run_machine(
+    arguments: Arguments,
+    memory: nixe_memory::Machine,
+    config: nixe_config::NixeConfig,
+    smooth_motion: Option<nixe_gpu_vulkan::smooth_motion::SmoothMotion>,
+    launch: ResolvedLaunch,
+    machine_profile: HorizonMachineProfile,
+) -> Result<(), String> {
+    let ResolvedLaunch {
+        plan,
+        identifier: title_identifier,
+        name: title_name,
+        sd_card_root,
+    } = launch;
+    let Arguments {
+        config_path: _,
+        log_level_override: _,
+        identifier: _,
+        headless,
+        vulkan,
+        guest_logs_level_override,
+        file_system_access_log_override,
+    } = arguments;
+    let frontend_stop_requested = Arc::new(AtomicBool::new(false));
+    let (mut frontend, frontend_control, presenter, touch_screen) =
+        if headless || machine_profile.graphics() == GraphicsGeneration::Ampere {
+            log::info!("headless presentation enabled; no host window will be created");
+            (None, None, None, None)
+        } else {
+            let mut frontend = WindowFrontend::new(Arc::clone(&frontend_stop_requested))
+                .map_err(|error| error.to_string())?
+                .with_smooth_motion(smooth_motion);
+            let control = frontend.control();
+            let mailbox = frontend.mailbox();
+            let touch_screen = frontend.take_touch_screen();
+            (
+                Some(frontend),
+                Some(control),
+                Some(mailbox),
+                Some(touch_screen),
+            )
+        };
+    let scheduler_profile = machine_profile.scheduler().clone();
+    log::info!(
+        "machine: platform={:?} cores={} counter_hz={} RAM={} MiB application_pool={} MiB graphics={:?}",
+        machine_profile.platform(),
+        scheduler_profile.vcpus().len(),
+        machine_profile.platform().counter_frequency(),
+        machine_profile.physical_memory_capacity() >> 20,
+        machine_profile.process_build_config().physical_memory_limit >> 20,
+        machine_profile.graphics(),
+    );
+    let diagnostics_configuration = effective_diagnostics_configuration(
+        config.diagnostics,
+        guest_logs_level_override,
+        file_system_access_log_override,
+    );
+
     log::info!("preparing process memory and initial thread state");
     let clock_mode = match config.system.time.mode {
         TimeMode::Realtime => VirtualClockMode::Realtime,
@@ -191,7 +239,7 @@ fn run_with_memory(
     });
     let process_started = Instant::now();
     let system_memory = memory
-        .account(nixe_memory::DEFAULT_RAM_BYTES)
+        .account(machine_profile.system_memory_capacity())
         .map_err(|error| error.to_string())?;
     let process_builder = ProcessBuilder::new(memory, system_memory, kernel.clone())
         .with_sd_card_root(sd_card_root)
@@ -294,7 +342,14 @@ fn run_with_memory(
         }
     };
     frontend = frontend.map(|frontend| frontend.with_window_state(saved_window_state));
-    let (video_system, gpu_diagnostics) = {
+    let (video_system, gpu_diagnostics) = if machine_profile.graphics()
+        == GraphicsGeneration::Ampere
+    {
+        log::info!(
+            "Ampere graphics services are not implemented; CPU initialization can proceed until a graphics request"
+        );
+        (None, None)
+    } else {
         let mut options = vulkan;
         options.scaling_filter = config.video.scaling_filter;
         options.anti_aliasing = config.video.anti_aliasing;
@@ -320,7 +375,7 @@ fn run_with_memory(
         let cache_directory = config
             .gpu
             .cache_directory
-            .join(title.identifier.to_string().to_ascii_lowercase());
+            .join(title_identifier.to_ascii_lowercase());
         let cache_configuration = nixe_gpu_vulkan::cache::CacheConfiguration {
             directory: Some(cache_directory.clone()),
             ..Default::default()
@@ -361,7 +416,7 @@ fn run_with_memory(
                 "interpreter"
             }
         );
-        VideoSystem::with_gpu_frontend(
+        let (video, diagnostics) = VideoSystem::with_gpu_frontend(
             device_memory,
             &kernel,
             presenter,
@@ -369,7 +424,8 @@ fn run_with_memory(
             initialize,
             maxwell,
         )
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        (Some(video), Some(diagnostics))
     };
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     // SDL initialization and final subsystem shutdown remain on the main thread.
@@ -414,8 +470,8 @@ fn run_with_memory(
     let volume_backend = Arc::clone(&audio_backend);
     let mut volume = config.audio.volume;
     let frontend = frontend
-        .with_game_title(title.name.clone())
-        .with_screenshots(title.name.clone(), config.filesystem.screenshots.clone())
+        .with_game_title(title_name.clone())
+        .with_screenshots(title_name, config.filesystem.screenshots.clone())
         .with_volume_handler(move |delta| {
             volume = volume.saturating_add_signed(delta).min(100);
             volume_backend
@@ -616,15 +672,14 @@ fn supervise_process(
     mut runtime: Runtime,
     process: RunnableProcess,
     horizon_environment: HorizonEnvironment,
-    video_system: VideoSystem,
+    video_system: Option<VideoSystem>,
     mut host_input: HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
-    gpu_diagnostics: (CacheMonitor, FrameMetrics),
+    mut gpu_diagnostics: Option<(CacheMonitor, FrameMetrics)>,
 ) -> RunOutcome {
-    let (mut gpu_caches, frame_metrics) = gpu_diagnostics;
     let process_id = runtime
         .register_process(process)
-        .expect("CLI process and verified Switch 1 scheduler profile are compatible");
+        .expect("process capabilities were validated against the selected scheduler");
     let execution_started = Instant::now();
     let execution_video = video_system.clone();
     let mut execution = execute(
@@ -634,7 +689,7 @@ fn supervise_process(
         execution_video,
         &mut host_input,
         audio_backend,
-        (&mut gpu_caches, &frame_metrics),
+        gpu_diagnostics.as_mut(),
     );
     log::debug!(
         "guest execution stopped after {:?}",
@@ -662,7 +717,10 @@ fn supervise_process(
     // Stop and join GPU work while its canonical memory transitions can still
     // reach the native owners. Removing
     // the process closes native admission and would reject those transitions.
-    let graphics_teardown = video_system.teardown();
+    let graphics_teardown = video_system
+        .as_ref()
+        .map(VideoSystem::teardown)
+        .unwrap_or_default();
     let teardown = match runtime.remove_process(process_id) {
         Ok(report) => report,
         Err(nixe_runtime::RuntimeError::ProcessTeardown { failure, .. }) => {
@@ -756,13 +814,12 @@ fn execute(
     runtime: &mut Runtime,
     process_id: ProcessId,
     horizon_environment: HorizonEnvironment,
-    video_system: VideoSystem,
+    video_system: Option<VideoSystem>,
     host_input: &mut HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
-    gpu_diagnostics: (&mut CacheMonitor, &FrameMetrics),
+    mut gpu_diagnostics: Option<&mut (CacheMonitor, FrameMetrics)>,
 ) -> Result<ExecutionSummary, String> {
-    let (gpu_caches, frame_metrics) = gpu_diagnostics;
-    let mut dispatcher = HorizonSvcDispatcher::new_with_video_and_settings(
+    let mut dispatcher = HorizonSvcDispatcher::new_with_services(
         horizon_environment.operation_mode,
         horizon_environment.time,
         horizon_environment.hid,
@@ -929,29 +986,31 @@ fn execute(
                     log::info!(
                         "guest CPU completion rate: completions_per_second={completions_per_second:.0}, completions={execution_completions}, elapsed={elapsed:?}"
                     );
-                    log::info!("{}", gpu_caches.sample());
-                    if let Some(frame) = frame_metrics.latest() {
-                        log::info!(
-                            "graphics frame timing (latest, excluding VSync): frame={} swap_interval={} cpu_ms={:.3} gpu_ms={} total_ms={} vsync_cpu_ms={:.3} vsync_total_ms={}",
-                            frame.frame,
-                            frame.swap_interval,
-                            frame.cpu.as_secs_f64() * 1000.0,
-                            frame.gpu.map_or_else(
-                                || "n/a".to_owned(),
-                                |time| format!("{:.3}", time.as_secs_f64() * 1000.0),
-                            ),
-                            frame.total.map_or_else(
-                                || "n/a".to_owned(),
-                                |time| format!("{:.3}", time.as_secs_f64() * 1000.0),
-                            ),
-                            frame.cpu_vsync.as_secs_f64() * 1000.0,
-                            frame.total_vsync.map_or_else(
-                                || "n/a".to_owned(),
-                                |time| format!("{:.3}", time.as_secs_f64() * 1000.0),
-                            ),
-                        );
-                    } else {
-                        log::info!("graphics frame timing: no completed frames");
+                    if let Some((gpu_caches, frame_metrics)) = gpu_diagnostics.as_mut() {
+                        log::info!("{}", gpu_caches.sample());
+                        if let Some(frame) = frame_metrics.latest() {
+                            log::info!(
+                                "graphics frame timing (latest, excluding VSync): frame={} swap_interval={} cpu_ms={:.3} gpu_ms={} total_ms={} vsync_cpu_ms={:.3} vsync_total_ms={}",
+                                frame.frame,
+                                frame.swap_interval,
+                                frame.cpu.as_secs_f64() * 1000.0,
+                                frame.gpu.map_or_else(
+                                    || "n/a".to_owned(),
+                                    |time| format!("{:.3}", time.as_secs_f64() * 1000.0),
+                                ),
+                                frame.total.map_or_else(
+                                    || "n/a".to_owned(),
+                                    |time| format!("{:.3}", time.as_secs_f64() * 1000.0),
+                                ),
+                                frame.cpu_vsync.as_secs_f64() * 1000.0,
+                                frame.total_vsync.map_or_else(
+                                    || "n/a".to_owned(),
+                                    |time| format!("{:.3}", time.as_secs_f64() * 1000.0),
+                                ),
+                            );
+                        } else {
+                            log::info!("graphics frame timing: no completed frames");
+                        }
                     }
                     if log::log_enabled!(log::Level::Trace)
                         && let Some(process) = runtime.process(process_id)

@@ -272,7 +272,7 @@ private:
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
         A64::Translate(ir_block, A64::LocationDescriptor{current_location}, get_code,
                        {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct,
-                        conf.hook_hint_instructions});
+                        conf.hook_hint_instructions, conf.hook_unknown_hint_instructions});
         Optimization::PolyfillPass(ir_block, polyfill_options);
         Optimization::A64CallbackConfigPass(ir_block, conf);
         Optimization::NamingPass(ir_block);

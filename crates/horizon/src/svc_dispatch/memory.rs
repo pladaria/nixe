@@ -107,9 +107,10 @@ pub(super) fn get_info(
         22 => process.used_non_system_user_physical_memory_size(),
         28 => 0,
         _ => {
-            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {
-                immediate: 0x29,
-                documented_name: "GetInfo",
+            return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedInfoType {
+                info_type,
+                handle,
+                subtype,
             });
         }
     };

@@ -134,6 +134,11 @@ pub enum HorizonSvcFault {
         immediate: u32,
         documented_name: &'static str,
     },
+    UnsupportedInfoType {
+        info_type: u32,
+        handle: u32,
+        subtype: u64,
+    },
     InvalidMemoryPermission {
         raw: u32,
     },
@@ -167,7 +172,9 @@ impl HorizonSvcFault {
     #[must_use]
     pub fn guest_result(&self) -> Option<HorizonKernelResult> {
         match self {
-            Self::Unknown(_) | Self::UnsupportedSemantics { .. } => None,
+            Self::Unknown(_)
+            | Self::UnsupportedSemantics { .. }
+            | Self::UnsupportedInfoType { .. } => None,
             Self::InvalidMemoryPermission { .. } | Self::InvalidMemoryAttribute { .. } => {
                 Some(HorizonKernelResult::INVALID_STATE)
             }
@@ -221,6 +228,14 @@ impl Display for HorizonSvcFault {
             } => write!(
                 formatter,
                 "Horizon SVC {immediate:#x} ({documented_name}) has no runtime semantics"
+            ),
+            Self::UnsupportedInfoType {
+                info_type,
+                handle,
+                subtype,
+            } => write!(
+                formatter,
+                "Horizon SVC 0x29 (GetInfo) has no runtime semantics for type={info_type} handle={handle:#x} subtype={subtype:#x}"
             ),
             Self::InvalidMemoryPermission { raw } => {
                 write!(formatter, "invalid Horizon memory permission {raw:#x}")
@@ -295,25 +310,25 @@ impl HorizonSvcDispatcher {
         shared_fonts: crate::SharedFontSession,
         video_system: crate::VideoSystem,
     ) -> std::sync::Arc<Self> {
-        Self::new_with_video_and_settings(
+        Self::new_with_services(
             initial_operation_mode,
             time_environment,
             hid_system,
             shared_fonts,
             crate::SettingsEnvironment::default(),
-            video_system,
+            Some(video_system),
         )
     }
 
     /// Creates a dispatcher with explicit guest locale and display systems.
     #[must_use]
-    pub fn new_with_video_and_settings(
+    pub fn new_with_services(
         initial_operation_mode: crate::OperationMode,
         time_environment: crate::TimeEnvironment,
         hid_system: crate::HidSystem,
         shared_fonts: crate::SharedFontSession,
         settings_environment: crate::SettingsEnvironment,
-        video_system: crate::VideoSystem,
+        video_system: Option<crate::VideoSystem>,
     ) -> std::sync::Arc<Self> {
         let virtual_clock = time_environment.clock().clone();
         let audio_renderers = crate::AudioRendererManagerSession::new(hid_system.kernel());
@@ -511,7 +526,7 @@ impl HorizonSvcDispatcher {
     }
 
     #[must_use]
-    pub fn video_system(self: &std::sync::Arc<Self>) -> crate::VideoSystem {
+    pub fn video_system(self: &std::sync::Arc<Self>) -> Option<crate::VideoSystem> {
         self.resources.graphics.video.clone()
     }
 
@@ -519,10 +534,18 @@ impl HorizonSvcDispatcher {
         self: &std::sync::Arc<Self>,
         events: nixe_runtime::ExternalEventSender,
     ) -> Result<(), crate::FramebufferError> {
-        self.resources.graphics.video.start_conductor(events)
+        self.resources
+            .graphics
+            .video
+            .as_ref()
+            .map_or(Ok(()), |video| video.start_conductor(events))
     }
     pub fn check_video(self: &std::sync::Arc<Self>) -> Result<(), crate::FramebufferError> {
-        self.resources.graphics.video.check_conductor()
+        self.resources
+            .graphics
+            .video
+            .as_ref()
+            .map_or(Ok(()), |video| video.check_conductor())
     }
 
     /// Parks audio command execution while preserving guest session state.
