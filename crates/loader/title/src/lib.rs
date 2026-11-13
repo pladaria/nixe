@@ -5,6 +5,7 @@ mod control;
 mod discovery;
 mod error;
 mod inspection;
+mod nup;
 mod package;
 mod package_content;
 mod resolved_title;
@@ -12,7 +13,7 @@ mod resolver;
 
 pub use catalog::TitleCatalog;
 pub use control::{ControlIcon, ControlMetadata};
-pub use discovery::{DirectoryScanOptions, PackageFormat};
+pub use discovery::{DirectoryScanOptions, PackageFormat, package_format};
 pub use error::TitleError;
 pub use inspection::{
     ContentMetaInspection, ContentRecordInspection, EntryInspection, EntryKind, InspectError,

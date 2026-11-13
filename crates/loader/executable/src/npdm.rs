@@ -12,6 +12,32 @@ const KNOWN_ACID_FLAGS: u32 = 0xff;
 #[derive(Debug)]
 pub struct NpdmLoader;
 
+impl NpdmLoader {
+    /// Reads catalog identity without interpreting or authorizing execution policy.
+    /// Both platforms store the program ID in the ACI0 header.
+    /// https://switchbrew.org/wiki/NPDM#ACI0
+    pub fn program_id_from_metadata(bytes: &[u8]) -> Result<u64, LoadError> {
+        if bytes.len() < META_SIZE
+            || bytes.len() as u64 > MAX_NPDM_SIZE
+            || bytes.get(..4) != Some(b"META")
+        {
+            return Err(invalid_at("META", 0, "invalid metadata header"));
+        }
+        let range = subregion(
+            bytes,
+            0,
+            read_u32(bytes, 0x70, "META")?,
+            read_u32(bytes, 0x74, "META")?,
+            ACI0_HEADER_SIZE,
+            "ACI0",
+        )?;
+        if range.start < META_SIZE || bytes.get(range.start..range.start + 4) != Some(b"ACI0") {
+            return Err(invalid_at("ACI0", range.start, "invalid identity header"));
+        }
+        read_u64(bytes, range.start + 0x10, "ACI0")
+    }
+}
+
 impl FormatLoader for NpdmLoader {
     type Output = Npdm;
 

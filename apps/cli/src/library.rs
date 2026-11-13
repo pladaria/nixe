@@ -11,7 +11,8 @@ use nixe_loader_content::{NacpLoader, NcaKeySet, prepare_nsz_for_random_access};
 use nixe_loader_executable::NroLoader;
 use nixe_loader_storage::{FileStorage, FormatLoader};
 use nixe_loader_title::{
-    ApplicationId, DirectoryScanOptions, ResolvedTitle, TitleCatalog, TitleResolver,
+    ApplicationId, DirectoryScanOptions, PackageFormat, ResolvedTitle, TitleCatalog, TitleResolver,
+    package_format,
 };
 use sha2::{Digest, Sha256};
 
@@ -30,13 +31,8 @@ impl Library {
             return Err("library.paths does not contain any directories".to_owned());
         }
 
-        let prod_keys = config.system.keys.join("prod.keys");
-        let title_keys_path = config.system.keys.join("title.keys");
-        let title_keys = title_keys_path.is_file().then_some(title_keys_path);
-        let keys_started = Instant::now();
-        let mut keys = NcaKeySet::from_files(&prod_keys, title_keys.as_deref())
-            .map_err(|error| error.to_string())?;
-        log::debug!("key set loaded in {:?}", keys_started.elapsed());
+        let mut keys = NcaKeySet::default();
+        let mut keys_loaded = false;
 
         let mut catalog = TitleCatalog::new();
         let mut homebrew = BTreeMap::new();
@@ -71,6 +67,17 @@ impl Library {
                     homebrew.entry(title.identifier.clone()).or_insert(title);
                 } else {
                     let package_started = Instant::now();
+                    if package_format(&path) != Some(PackageFormat::Nup) && !keys_loaded {
+                        let keys_started = Instant::now();
+                        let title_keys = config.system.keys.join("title.keys");
+                        keys = NcaKeySet::from_files(
+                            config.system.keys.join("prod.keys"),
+                            title_keys.is_file().then_some(title_keys.as_path()),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        keys_loaded = true;
+                        log::debug!("key set loaded in {:?}", keys_started.elapsed());
+                    }
                     let discovered = TitleCatalog::load_package_with_key_set(&path, &mut keys)
                         .map_err(|error| error.to_string())?;
                     log::trace!(
@@ -133,7 +140,9 @@ impl Library {
             return Ok(());
         };
         let mut sources = BTreeMap::new();
-        for package in std::iter::once(&mut title.base)
+        for package in title
+            .base
+            .iter_mut()
             .chain(title.patch.iter_mut())
             .chain(title.add_ons.iter_mut())
         {
@@ -191,7 +200,7 @@ impl Display for LibraryTitleId {
     }
 }
 
-/// One launchable title and the source required to run it.
+/// One catalogued title and the source used for a launch attempt.
 pub struct LibraryTitle {
     pub identifier: LibraryTitleId,
     pub name: String,
@@ -205,16 +214,9 @@ pub enum LibraryTitleSource {
 
 fn installed_title(title: ResolvedTitle, config: &NixeConfig) -> LibraryTitle {
     let name = title
-        .control_metadata()
-        .and_then(|control| {
-            control
-                .nacp
-                .preferred_title(&config.system.preferred_languages)
-        })
-        .map_or_else(
-            || title.application_id.to_string(),
-            |(_, title)| title.name.clone(),
-        );
+        .display_name(&config.system.preferred_languages)
+        .map(str::to_owned)
+        .unwrap_or_else(|| title.application_id.to_string());
     LibraryTitle {
         identifier: LibraryTitleId::Application(title.application_id),
         name,
@@ -300,9 +302,7 @@ fn directory_files(root: &Path, options: DirectoryScanOptions) -> Result<Vec<Pat
 }
 
 fn is_package(path: &Path) -> bool {
-    ["nsp", "nsz", "xci", "xcz"]
-        .into_iter()
-        .any(|extension| has_extension(path, extension))
+    package_format(path).is_some()
 }
 
 fn has_extension(path: &Path, expected: &str) -> bool {

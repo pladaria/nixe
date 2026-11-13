@@ -50,6 +50,8 @@ pub enum PackageFormat {
     Xci,
     /// Compressed XCI variant with logical NCZ entries.
     Xcz,
+    /// Unencrypted ExeFS/RomFS package trees.
+    Nup,
 }
 
 pub(crate) struct DirectoryDiscoveryError {
@@ -123,7 +125,7 @@ pub(crate) fn directory_files(
     Ok(files)
 }
 
-pub(crate) fn package_format(path: &Path) -> Option<PackageFormat> {
+pub fn package_format(path: &Path) -> Option<PackageFormat> {
     let extension = path.extension()?.to_str()?;
     if extension.eq_ignore_ascii_case("nsp") {
         Some(PackageFormat::Nsp)
@@ -133,6 +135,8 @@ pub(crate) fn package_format(path: &Path) -> Option<PackageFormat> {
         Some(PackageFormat::Xci)
     } else if extension.eq_ignore_ascii_case("xcz") {
         Some(PackageFormat::Xcz)
+    } else if extension.eq_ignore_ascii_case("nup") {
+        Some(PackageFormat::Nup)
     } else {
         None
     }

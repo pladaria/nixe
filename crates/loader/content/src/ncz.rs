@@ -1,11 +1,12 @@
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
-use nixe_loader_storage::{FormatLoader, LoadError, Storage, StorageError, StorageRef};
+use nixe_loader_storage::{FormatLoader, LoadError, Storage, StorageError, StorageRef, SubStorage};
 
 use crate::binary::{read_u32, read_u64};
 use crate::crypto::apply_ctr_at;
+use crate::zstd_stream::ProgressiveZstd;
 
 mod reblock;
 pub(crate) use reblock::{reblock_solid, verify_reblocked};
@@ -18,7 +19,6 @@ const MAX_SECTION_COUNT: u64 = 65_536;
 const MAX_BLOCK_COUNT: u64 = 4 * 1024 * 1024;
 const MAX_METADATA_SIZE: u64 = 64 * 1024 * 1024;
 const SOLID_BUFFER_SIZE: usize = 1024 * 1024;
-const MAX_ZSTD_WINDOW_LOG: u32 = 27;
 
 type CacheFileFactory = fn() -> std::io::Result<File>;
 
@@ -169,15 +169,8 @@ enum CacheMode {
         layout: BlockLayout,
         valid: Vec<bool>,
     },
-    Solid {
-        compressed_offset: u64,
-        compressed_end: u64,
-        decompressed_end: u64,
-        decoder: Option<SolidDecoder>,
-    },
+    Solid(ProgressiveZstd),
 }
-
-type SolidDecoder = zstd::stream::read::Decoder<'static, BufReader<StorageReader>>;
 
 struct CacheState {
     file: Option<File>,
@@ -282,30 +275,23 @@ impl NczCachedStorage {
                 start,
                 end,
             ),
-            CacheMode::Solid {
-                compressed_offset,
-                compressed_end,
-                decompressed_end,
-                decoder,
-            } => {
-                let cached_until = PREFIX_SIZE
-                    .checked_add(*decompressed_end)
-                    .ok_or(StorageError::OutOfBounds)?;
-                if end > cached_until {
+            CacheMode::Solid(stream) => {
+                let requested = end - PREFIX_SIZE;
+                if requested > stream.decoded() {
                     log::debug!(
-                        "NCZ solid decompression requested: offset={start} bytes, length={} bytes, cached_until={cached_until} bytes, decoding={} bytes",
+                        "NCZ solid decompression requested: offset={start} bytes, length={} bytes, decoding={} bytes",
                         end - start,
-                        end - cached_until
+                        requested - stream.decoded()
                     );
                 }
-                self.ensure_solid(
-                    state.file.as_mut().expect("cache initialized"),
-                    *compressed_offset,
-                    *compressed_end,
-                    decompressed_end,
-                    decoder,
-                    end,
-                )
+                let file = state.file.as_mut().expect("cache initialized");
+                stream.decode_until(requested, |offset, bytes| {
+                    let offset = PREFIX_SIZE + offset;
+                    reconstruct_sections(&self.sections, offset, bytes)?;
+                    file.seek(SeekFrom::Start(offset))?;
+                    file.write_all(bytes)?;
+                    Ok(())
+                })
             }
         }
     }
@@ -408,162 +394,20 @@ impl NczCachedStorage {
         expected_size: u64,
         index: usize,
     ) -> Result<(), StorageError> {
-        let source_end = source_offset
-            .checked_add(compressed_size)
-            .ok_or(StorageError::OutOfBounds)?;
-        let reader = StorageReader {
-            source: self.source.clone(),
-            position: source_offset,
-            end: source_end,
-        };
-        let mut decoder = zstd::stream::read::Decoder::new(reader)
-            .map_err(|error| invalid_data(format!("cannot start NCZ block {index}: {error}")))?
-            .single_frame();
-        decoder
-            .window_log_max(MAX_ZSTD_WINDOW_LOG)
-            .map_err(|error| {
-                invalid_data(format!("cannot limit NCZ block {index} window: {error}"))
-            })?;
-
-        let mut buffer = vec![0_u8; SOLID_BUFFER_SIZE];
-        let mut produced = 0_u64;
-        while produced < expected_size {
-            let count = usize::try_from((expected_size - produced).min(SOLID_BUFFER_SIZE as u64))
-                .expect("bounded decoded block chunk fits usize");
-            let output = &mut buffer[..count];
-            decoder.read_exact(output).map_err(|error| {
-                invalid_data(format!("cannot decode NCZ block {index}: {error}"))
-            })?;
-            reconstruct_sections(&self.sections, logical_offset + produced, output)?;
-            file.seek(SeekFrom::Start(logical_offset + produced))?;
-            file.write_all(output)?;
-            produced += count as u64;
-        }
-        let mut extra = [0_u8; 1];
-        if decoder
-            .read(&mut extra)
-            .map_err(|error| invalid_data(format!("cannot finish NCZ block {index}: {error}")))?
-            != 0
-        {
-            return Err(invalid_data(format!(
-                "NCZ block {index} produces more data than declared"
-            )));
-        }
-        let buffered = decoder.finish();
-        let consumed = buffered
-            .get_ref()
-            .position
-            .checked_sub(buffered.buffer().len() as u64)
-            .ok_or_else(|| {
-                invalid_data(format!("NCZ block {index} decoder position is invalid"))
-            })?;
-        if consumed != source_end {
-            return Err(invalid_data(format!(
-                "NCZ block {index} contains trailing data"
-            )));
-        }
-        Ok(())
-    }
-
-    fn ensure_solid(
-        &self,
-        file: &mut File,
-        compressed_offset: u64,
-        compressed_end: u64,
-        decompressed_end: &mut u64,
-        decoder: &mut Option<SolidDecoder>,
-        requested_end: u64,
-    ) -> Result<(), StorageError> {
-        let requested_tail_end = requested_end
-            .checked_sub(PREFIX_SIZE)
-            .ok_or(StorageError::OutOfBounds)?;
-        if *decompressed_end >= requested_tail_end {
-            return Ok(());
-        }
-        if decoder.is_none() {
-            let reader = StorageReader {
-                source: self.source.clone(),
-                position: compressed_offset,
-                end: compressed_end,
-            };
-            let mut stream = zstd::stream::read::Decoder::new(reader)
-                .map_err(|error| invalid_data(format!("cannot start NCZ stream: {error}")))?
-                .single_frame();
-            stream
-                .window_log_max(MAX_ZSTD_WINDOW_LOG)
-                .map_err(|error| {
-                    invalid_data(format!("cannot limit NCZ Zstandard window: {error}"))
-                })?;
-            *decoder = Some(stream);
-        }
-
-        let logical_tail_size = self.logical_size - PREFIX_SIZE;
-        let mut chunk = vec![0_u8; SOLID_BUFFER_SIZE];
-        while *decompressed_end < requested_tail_end {
-            let remaining = logical_tail_size - *decompressed_end;
-            let wanted = usize::try_from(
-                remaining
-                    .min(requested_tail_end - *decompressed_end)
-                    .min(SOLID_BUFFER_SIZE as u64),
-            )
-            .expect("bounded solid chunk fits usize");
-            let output = &mut chunk[..wanted];
-            decoder
-                .as_mut()
-                .expect("solid decoder initialized")
-                .read_exact(output)
-                .map_err(|error| invalid_data(format!("cannot decode NCZ stream: {error}")))?;
-            let logical_offset = PREFIX_SIZE
-                .checked_add(*decompressed_end)
-                .ok_or(StorageError::OutOfBounds)?;
-            reconstruct_sections(&self.sections, logical_offset, output)?;
-            file.seek(SeekFrom::Start(logical_offset))?;
-            file.write_all(output)?;
-            *decompressed_end += u64::try_from(wanted).expect("solid chunk length fits u64");
-        }
-
-        if *decompressed_end == logical_tail_size {
-            let mut extra = [0_u8; 1];
-            let count = decoder
-                .as_mut()
-                .expect("solid decoder initialized")
-                .read(&mut extra)
-                .map_err(|error| invalid_data(format!("cannot finish NCZ stream: {error}")))?;
-            if count != 0 {
-                return Err(invalid_data("NCZ stream produces more data than declared"));
-            }
-            let buffered = decoder.take().expect("solid decoder initialized").finish();
-            let consumed = buffered
-                .get_ref()
-                .position
-                .checked_sub(buffered.buffer().len() as u64)
-                .ok_or_else(|| invalid_data("NCZ stream decoder position is invalid"))?;
-            if consumed != compressed_end {
-                return Err(invalid_data("trailing data follows the NCZ stream"));
-            }
-        }
-        Ok(())
-    }
-}
-
-struct StorageReader {
-    source: StorageRef,
-    position: u64,
-    end: u64,
-}
-
-impl Read for StorageReader {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if self.position == self.end || buffer.is_empty() {
-            return Ok(0);
-        }
-        let count = usize::try_from((self.end - self.position).min(buffer.len() as u64))
-            .expect("bounded read length fits usize");
-        self.source
-            .read_at(self.position, &mut buffer[..count])
-            .map_err(std::io::Error::other)?;
-        self.position += u64::try_from(count).expect("read length fits u64");
-        Ok(count)
+        let source: StorageRef = Arc::new(SubStorage::new(
+            self.source.clone(),
+            source_offset,
+            compressed_size,
+        )?);
+        ProgressiveZstd::new(source, expected_size)
+            .decode_until(expected_size, |offset, bytes| {
+                let offset = logical_offset + offset;
+                reconstruct_sections(&self.sections, offset, bytes)?;
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(bytes)?;
+                Ok(())
+            })
+            .map_err(|error| invalid_data(format!("cannot decode NCZ block {index}: {error}")))
     }
 }
 
@@ -802,12 +646,14 @@ fn parse_ncz_with_cache_factory(
         (
             NczCompressionKind::Solid,
             None,
-            CacheMode::Solid {
-                compressed_offset: metadata_end,
-                compressed_end: source_len,
-                decompressed_end: 0,
-                decoder: None,
-            },
+            CacheMode::Solid(ProgressiveZstd::new(
+                Arc::new(SubStorage::new(
+                    storage.clone(),
+                    metadata_end,
+                    source_len - metadata_end,
+                )?),
+                logical_size - PREFIX_SIZE,
+            )),
         )
     };
 

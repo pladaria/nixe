@@ -353,6 +353,12 @@ pub(crate) fn open_canonical_content(
 ) -> Result<nixe_loader_content::NcaArchive, LoadError> {
     let expected_name = format!("{}.nca", hex(&content.content_id));
     let storage = match format {
+        PackageFormat::Nup => {
+            return Err(LoadError::invalid(
+                "NUP",
+                "tree packages do not contain NCA records",
+            ));
+        }
         PackageFormat::Nsp => {
             let archive = nixe_loader_content::NspLoader::load(package.source.clone())?;
             open_canonical_entry(&archive, &expected_name, content.size)?

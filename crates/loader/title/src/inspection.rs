@@ -30,6 +30,7 @@ impl Display for PackageFormat {
             Self::Nsz => formatter.write_str("NSZ (PFS0 + NCZ)"),
             Self::Xci => formatter.write_str("XCI (HFS0)"),
             Self::Xcz => formatter.write_str("XCZ (HFS0 + NCZ)"),
+            Self::Nup => formatter.write_str("NUP (unencrypted trees)"),
         }
     }
 }
@@ -293,6 +294,8 @@ pub struct PackageInspection {
     pub data_offset: u64,
     /// XCI-specific header and nested partition information.
     pub xci: Option<XciInspection>,
+    /// Native NUP package records; these are not CNMT records.
+    pub nup: Vec<nixe_loader_content::NupPackage>,
     /// Files stored in the package.
     pub entries: Vec<EntryInspection>,
     /// Every canonical CNMT found in deterministic container order.
@@ -482,6 +485,7 @@ impl TitleInspector {
                 Some(PackageFormat::Xcz) => {
                     packages.push(inspect_xcz(&candidate, keys.as_deref_mut())?)
                 }
+                Some(PackageFormat::Nup) => packages.push(inspect_nup(&candidate)?),
                 None if has_extension(&candidate, "nro") => nros.push(inspect_nro(&candidate)?),
                 None => ignored_files.push(candidate),
             }
@@ -985,7 +989,7 @@ fn inspect_package<C: PackageContent + ?Sized>(
                 match C::FORMAT {
                     PackageFormat::Xci => "XCI",
                     PackageFormat::Xcz => "XCZ",
-                    PackageFormat::Nsp | PackageFormat::Nsz => {
+                    PackageFormat::Nsp | PackageFormat::Nsz | PackageFormat::Nup => {
                         unreachable!("flat packages always provide their contents")
                     }
                 }
@@ -1018,6 +1022,7 @@ fn inspect_package<C: PackageContent + ?Sized>(
         size,
         data_offset,
         xci,
+        nup: Vec::new(),
         entries,
         canonical_content_metas,
         canonical_metadata_warning,
@@ -1028,6 +1033,48 @@ fn inspect_package<C: PackageContent + ?Sized>(
         metadata_warning,
         ticket_warnings,
     }
+}
+
+fn inspect_nup(path: &Path) -> Result<PackageInspection, InspectError> {
+    let (size, storage) = open_inspection_storage(path)?;
+    let archive =
+        nixe_loader_content::NupLoader::load(storage).map_err(|source| InspectError::Package {
+            path: path.to_owned(),
+            source,
+        })?;
+    let entries = archive
+        .files()
+        .iter()
+        .map(|file| EntryInspection {
+            name: file.name.clone(),
+            kind: EntryKind::Other,
+            offset: file.stored_offset,
+            size: file.size,
+            stored_name: None,
+            stored_size: Some(file.stored_size),
+            ncz: None,
+            hashed_region_size: None,
+            hash_valid: None,
+            nca: None,
+            nca_warning: None,
+        })
+        .collect();
+    Ok(PackageInspection {
+        path: path.to_owned(),
+        format: PackageFormat::Nup,
+        size,
+        data_offset: archive.blob_offset(),
+        xci: None,
+        nup: archive.packages().to_vec(),
+        entries,
+        canonical_content_metas: Vec::new(),
+        canonical_metadata_warning: None,
+        control_metadatas: Vec::new(),
+        control_metadata_warning: None,
+        content_meta: None,
+        metadata_warning: None,
+        ticket_warnings: Vec::new(),
+    })
 }
 
 fn inspect_standalone_ncz(

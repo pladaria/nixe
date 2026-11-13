@@ -1,5 +1,6 @@
 //! Shared, random-access storage and format-loading interfaces.
 
+mod bytes;
 mod file;
 mod sub;
 
@@ -7,6 +8,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+pub use bytes::BytesStorage;
 pub use file::FileStorage;
 pub use sub::SubStorage;
 

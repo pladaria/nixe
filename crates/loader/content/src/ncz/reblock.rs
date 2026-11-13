@@ -5,6 +5,7 @@
 use sha2::{Digest, Sha256};
 
 use super::*;
+use crate::zstd_stream::{MAX_WINDOW_LOG, StorageReader};
 
 const BLOCK_EXPONENT: u8 = 20;
 const BLOCK_SIZE: usize = 1 << BLOCK_EXPONENT;
@@ -60,9 +61,7 @@ pub(crate) fn reblock_solid(
         .map_err(StorageError::from)?
         .single_frame();
     decoder
-        .set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(
-            MAX_ZSTD_WINDOW_LOG,
-        ))
+        .set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(MAX_WINDOW_LOG))
         .map_err(StorageError::from)?;
     let mut compressor = zstd::bulk::Compressor::new(3).map_err(StorageError::from)?;
     let mut plain = vec![0; BLOCK_SIZE];
@@ -141,7 +140,7 @@ pub(crate) fn verify_reblocked(
     let mut plain = vec![0; BLOCK_SIZE];
     let mut decoder = zstd::bulk::Decompressor::new().map_err(StorageError::from)?;
     decoder
-        .window_log_max(MAX_ZSTD_WINDOW_LOG)
+        .window_log_max(MAX_WINDOW_LOG)
         .map_err(StorageError::from)?;
     let mut produced = 0;
     for size_slot in sizes.chunks_exact(4) {

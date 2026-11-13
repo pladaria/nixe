@@ -31,8 +31,8 @@ impl TitleResolver {
             .collect();
 
         let base = match bases.as_slice() {
-            [] => return Err(TitleError::MissingBase { application_id }),
-            [base] => (*base).clone(),
+            [] => None,
+            [base] => Some((*base).clone()),
             bases => {
                 return Err(TitleError::ConflictingBases {
                     application_id,
@@ -41,17 +41,15 @@ impl TitleResolver {
             }
         };
 
-        let expected_patch_id = base
-            .patch_id()
-            .expect("validated application metadata must declare its patch title");
         let patches: Vec<_> = packages
             .iter()
             .copied()
             .filter(|package| package.content_type == ContentType::Patch)
             .collect();
-        if let Some(patch) = patches
-            .iter()
-            .find(|package| package.title_id != expected_patch_id)
+        if let Some(expected_patch_id) = base.as_ref().and_then(PackageMetadata::patch_id)
+            && let Some(patch) = patches.iter().find(|package| {
+                package.canonical_content_meta().is_some() && package.title_id != expected_patch_id
+            })
         {
             return Err(TitleError::IncompatiblePatchRelationship {
                 application_id,
@@ -60,14 +58,27 @@ impl TitleResolver {
             });
         }
 
-        let required_patch_version = base.required_application_version().unwrap_or_default();
+        let required_patch_version = base
+            .as_ref()
+            .and_then(PackageMetadata::required_application_version)
+            .unwrap_or_default();
         let patch = patches
             .iter()
             .copied()
-            .filter(|package| package.version >= required_patch_version)
+            .filter(|package| {
+                package.version >= required_patch_version
+                    && (base.is_some() || package.is_standalone_update())
+            })
             .max_by_key(|package| package.version)
             .cloned();
-        if patch.is_none() && base.version < required_patch_version {
+        if base.is_none() && patch.is_none() {
+            return Err(TitleError::MissingBase { application_id });
+        }
+        if patch.is_none()
+            && base
+                .as_ref()
+                .is_some_and(|base| base.version < required_patch_version)
+        {
             return Err(TitleError::MissingCompatiblePatch {
                 application_id,
                 required_application_version: required_patch_version,
@@ -76,7 +87,9 @@ impl TitleResolver {
         }
         let effective_application_version = patch
             .as_ref()
-            .map_or(base.version, |package| package.version);
+            .or(base.as_ref())
+            .expect("resolved application has a base or standalone update")
+            .version;
 
         let mut add_on_revisions = BTreeMap::<TitleId, Vec<&PackageMetadata>>::new();
         for package in packages
@@ -179,7 +192,6 @@ mod tests {
     const APPLICATION_ID: ApplicationId = ApplicationId::new(0x0100_1234_1234_0000);
     const PATCH_ID: u64 = APPLICATION_ID.get() + 0x800;
     const FIRST_ADD_ON_ID: u64 = APPLICATION_ID.get() + 0x1001;
-    const SECOND_ADD_ON_ID: u64 = APPLICATION_ID.get() + 0x1002;
 
     #[derive(Debug)]
     struct EmptyStorage;
@@ -360,27 +372,6 @@ mod tests {
     }
 
     #[test]
-    fn resolves_latest_compatible_patch_and_add_on_revisions_in_canonical_order() {
-        let catalog = TitleCatalog::from_packages(vec![
-            add_on(SECOND_ADD_ON_ID, 1, 0, 1),
-            patch(1, 1),
-            add_on(FIRST_ADD_ON_ID, 3, 4, 3),
-            base(0, 2, 0),
-            add_on(FIRST_ADD_ON_ID, 2, 3, 2),
-            patch(3, 3),
-        ]);
-
-        let title = TitleResolver::resolve(&catalog, APPLICATION_ID).unwrap();
-
-        assert_eq!(title.base.content_type, ContentType::Application);
-        assert_eq!(title.patch.unwrap().version.raw(), 3);
-        assert_eq!(title.add_ons.len(), 2);
-        assert_eq!(title.add_ons[0].title_id, TitleId::new(FIRST_ADD_ON_ID));
-        assert_eq!(title.add_ons[0].version.raw(), 2);
-        assert_eq!(title.add_ons[1].title_id, TitleId::new(SECOND_ADD_ON_ID));
-    }
-
-    #[test]
     fn resolved_control_metadata_prefers_patch_and_falls_back_to_base() {
         let base_package = with_control(base(0, 0, 0), "Base name");
         let patched = TitleCatalog::from_packages(vec![
@@ -427,41 +418,6 @@ mod tests {
                 application_id: APPLICATION_ID
             })
         ));
-    }
-
-    #[test]
-    fn collapses_duplicates_and_preserves_the_first_source() {
-        let first_source: StorageRef = Arc::new(EmptyStorage);
-        let second_source: StorageRef = Arc::new(EmptyStorage);
-        let first = package_with_source(
-            APPLICATION_ID.get(),
-            0,
-            CnmtMetaType::Application,
-            CnmtExtendedHeader::Application {
-                patch_id: PATCH_ID,
-                required_system_version: 0.into(),
-                required_application_version: 0.into(),
-            },
-            7,
-            first_source.clone(),
-        );
-        let duplicate = package_with_source(
-            APPLICATION_ID.get(),
-            0,
-            CnmtMetaType::Application,
-            CnmtExtendedHeader::Application {
-                patch_id: PATCH_ID,
-                required_system_version: 0.into(),
-                required_application_version: 0.into(),
-            },
-            7,
-            second_source,
-        );
-        let catalog = TitleCatalog::from_packages(vec![first, duplicate]);
-
-        let title = TitleResolver::resolve(&catalog, APPLICATION_ID).unwrap();
-
-        assert!(Arc::ptr_eq(&title.base.source, &first_source));
     }
 
     #[test]

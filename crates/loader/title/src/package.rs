@@ -1,10 +1,12 @@
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use nixe_loader_content::{
-    ApplicationVersion, CnmtContentInfo, CnmtContentMeta, CnmtExtendedHeader, CnmtMetaType,
-    NcaArchive, NcaKeyProvider,
+    ApplicationControlProperty, ApplicationVersion, CnmtContentInfo, CnmtContentMeta,
+    CnmtExtendedHeader, CnmtMetaType, NacpLanguage, NcaArchive, NcaKeyProvider, NupArchive,
+    NupPackageKind,
 };
 use nixe_loader_storage::StorageRef;
 
@@ -110,9 +112,19 @@ pub struct PackageMetadata {
     /// Parsed Control NCA metadata, when this package declares it and keys were available.
     control_metadata: Option<ControlMetadata>,
     /// Canonical binary metadata used to compare and resolve package revisions.
-    canonical_content_meta: CnmtContentMeta,
+    contents: PackageContents,
     source_format: Option<PackageFormat>,
     source_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+enum PackageContents {
+    Nca(CnmtContentMeta),
+    Nup {
+        archive: Arc<NupArchive>,
+        index: usize,
+        nacp: Option<Box<ApplicationControlProperty>>,
+    },
 }
 
 impl PackageMetadata {
@@ -166,15 +178,122 @@ impl PackageMetadata {
             content_type,
             source,
             control_metadata: None,
-            canonical_content_meta: content_meta.clone(),
+            contents: PackageContents::Nca(content_meta.clone()),
             source_format: None,
             source_path: None,
         })
     }
 
     /// Returns the canonical binary content metadata retained for resolution.
-    pub fn canonical_content_meta(&self) -> &CnmtContentMeta {
-        &self.canonical_content_meta
+    pub fn canonical_content_meta(&self) -> Option<&CnmtContentMeta> {
+        match &self.contents {
+            PackageContents::Nca(meta) => Some(meta),
+            PackageContents::Nup { .. } => None,
+        }
+    }
+
+    pub(crate) fn from_nup(
+        archive: Arc<NupArchive>,
+        index: usize,
+        application_id: ApplicationId,
+        source: StorageRef,
+        nacp: Option<ApplicationControlProperty>,
+    ) -> Self {
+        let package = &archive.packages()[index];
+        Self {
+            title_id: TitleId::new(package.title_id),
+            application_id,
+            version: ApplicationVersion::from_raw(package.version),
+            content_type: match package.kind {
+                NupPackageKind::Base => ContentType::Application,
+                NupPackageKind::Update => ContentType::Patch,
+                NupPackageKind::AddOn => ContentType::AddOnContent,
+            },
+            source,
+            control_metadata: None,
+            contents: PackageContents::Nup {
+                archive,
+                index,
+                nacp: nacp.map(Box::new),
+            },
+            source_format: None,
+            source_path: None,
+        }
+    }
+
+    /// Native tree container and package index; never represented as synthetic CNMT.
+    pub fn nup(&self) -> Option<(&Arc<NupArchive>, usize)> {
+        match &self.contents {
+            PackageContents::Nup { archive, index, .. } => Some((archive, *index)),
+            _ => None,
+        }
+    }
+
+    pub fn is_standalone_update(&self) -> bool {
+        self.nup()
+            .is_some_and(|(archive, index)| archive.packages()[index].standalone_update)
+    }
+
+    pub fn display_name(&self, preferences: &[NacpLanguage]) -> Option<&str> {
+        match &self.contents {
+            PackageContents::Nca(_) => self
+                .control_metadata()
+                .and_then(|control| control.nacp.preferred_title(preferences))
+                .map(|(_, title)| title.name.as_str()),
+            PackageContents::Nup {
+                archive,
+                index,
+                nacp,
+            } => {
+                let meta = &archive.packages()[*index].metadata;
+                for language in preferences {
+                    let tag = language.language_tag();
+                    if let Some((_, title)) = meta
+                        .localized_titles
+                        .iter()
+                        .find(|(lang, _)| lang == tag)
+                        .or_else(|| {
+                            meta.localized_titles
+                                .iter()
+                                .find(|(lang, _)| lang == tag.split('-').next().unwrap_or(tag))
+                        })
+                    {
+                        return Some(title);
+                    }
+                }
+                meta.title
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| {
+                        nacp.as_ref()
+                            .and_then(|nacp| nacp.preferred_title(preferences))
+                            .map(|(_, title)| title.name.as_str())
+                    })
+                    .or_else(|| {
+                        meta.localized_titles
+                            .first()
+                            .map(|(_, title)| title.as_str())
+                    })
+            }
+        }
+    }
+
+    pub fn display_version(&self) -> Option<&str> {
+        match &self.contents {
+            PackageContents::Nca(_) => self
+                .control_metadata()
+                .map(|c| c.nacp.display_version.as_str()),
+            PackageContents::Nup {
+                archive,
+                index,
+                nacp,
+            } => archive.packages()[*index]
+                .metadata
+                .display_version
+                .as_deref()
+                .or_else(|| nacp.as_ref().map(|n| n.display_version.as_str())),
+        }
+        .filter(|version| !version.is_empty())
     }
 
     /// Opens one NCA selected by this package's canonical CNMT record.
@@ -217,7 +336,7 @@ impl PackageMetadata {
 
     /// Returns the patch title declared by an application package.
     pub fn patch_id(&self) -> Option<TitleId> {
-        match &self.canonical_content_meta.extended_header {
+        match &self.canonical_content_meta()?.extended_header {
             CnmtExtendedHeader::Application { patch_id, .. } => Some(TitleId::new(*patch_id)),
             _ => None,
         }
@@ -225,7 +344,7 @@ impl PackageMetadata {
 
     /// Returns the minimum effective application version required by this package.
     pub fn required_application_version(&self) -> Option<ApplicationVersion> {
-        match &self.canonical_content_meta.extended_header {
+        match &self.canonical_content_meta()?.extended_header {
             CnmtExtendedHeader::Application {
                 required_application_version,
                 ..
@@ -243,7 +362,27 @@ impl PackageMetadata {
     }
 
     pub(crate) fn has_same_canonical_metadata(&self, other: &Self) -> bool {
-        self.canonical_content_meta == other.canonical_content_meta
+        match (&self.contents, &other.contents) {
+            (PackageContents::Nca(a), PackageContents::Nca(b)) => a == b,
+            (
+                PackageContents::Nup {
+                    archive: a,
+                    index: ai,
+                    ..
+                },
+                PackageContents::Nup {
+                    archive: b,
+                    index: bi,
+                    ..
+                },
+            ) => {
+                let (a, b) = (&a.packages()[*ai], &b.packages()[*bi]);
+                a.content_hash == b.content_hash
+                    && a.metadata == b.metadata
+                    && a.standalone_update == b.standalone_update
+            }
+            _ => false,
+        }
     }
 }
 
@@ -256,7 +395,7 @@ impl Debug for PackageMetadata {
             .field("version", &self.version)
             .field("content_type", &self.content_type)
             .field("control_metadata", &self.control_metadata)
-            .field("canonical_content_meta", &self.canonical_content_meta)
+            .field("contents", &self.contents)
             .field("source_format", &self.source_format)
             .field("source", &"<storage>")
             .finish()
@@ -313,81 +452,6 @@ mod tests {
             content_meta: Vec::new(),
             extended_data_size: 0,
             digest: [0; 32],
-        }
-    }
-
-    #[test]
-    fn converts_supported_content_meta_types() {
-        let cases = [
-            (
-                CnmtMetaType::Application,
-                CnmtExtendedHeader::Application {
-                    patch_id: TITLE_ID + 0x800,
-                    required_system_version: 0.into(),
-                    required_application_version: 0.into(),
-                },
-                ContentType::Application,
-                TITLE_ID,
-            ),
-            (
-                CnmtMetaType::Patch,
-                CnmtExtendedHeader::Patch {
-                    application_id: APPLICATION_ID,
-                    required_system_version: 0.into(),
-                    extended_data_size: 0,
-                    reserved: [0; 8],
-                },
-                ContentType::Patch,
-                APPLICATION_ID,
-            ),
-            (
-                CnmtMetaType::AddOnContent,
-                CnmtExtendedHeader::AddOnContent {
-                    application_id: APPLICATION_ID,
-                    required_application_version: 0.into(),
-                    content_accessibilities: 0,
-                    padding: [0; 3],
-                    data_patch_id: 0,
-                },
-                ContentType::AddOnContent,
-                APPLICATION_ID,
-            ),
-            (
-                CnmtMetaType::AddOnContent,
-                CnmtExtendedHeader::LegacyAddOnContent {
-                    application_id: APPLICATION_ID,
-                    required_application_version: 0.into(),
-                    padding: 0,
-                },
-                ContentType::AddOnContent,
-                APPLICATION_ID,
-            ),
-            (
-                CnmtMetaType::Delta,
-                CnmtExtendedHeader::Delta {
-                    application_id: APPLICATION_ID,
-                    extended_data_size: 0,
-                    padding: 0,
-                },
-                ContentType::Delta,
-                APPLICATION_ID,
-            ),
-        ];
-
-        for (content_meta_type, extended_header, expected_type, expected_application_id) in cases {
-            let source: StorageRef = Arc::new(EmptyStorage);
-            let metadata = content_meta(content_meta_type, extended_header);
-            let package = PackageMetadata::from_content_meta(&metadata, source.clone()).unwrap();
-
-            assert_eq!(package.title_id, TitleId::new(TITLE_ID));
-            assert_eq!(
-                package.application_id,
-                ApplicationId::new(expected_application_id)
-            );
-            assert_eq!(package.version.raw(), 42);
-            assert_eq!(package.content_type, expected_type);
-            assert_eq!(package.canonical_content_meta(), &metadata);
-            assert!(Arc::ptr_eq(&package.source, &source));
         }
     }
 

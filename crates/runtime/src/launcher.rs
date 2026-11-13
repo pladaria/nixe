@@ -225,10 +225,7 @@ impl Launcher {
             .unwrap_or_default();
         if extension.eq_ignore_ascii_case("nro") {
             Self::build_homebrew(&input.path)
-        } else if ["nsp", "nsz", "xci", "xcz"]
-            .iter()
-            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-        {
+        } else if nixe_loader_title::package_format(&input.path).is_some() {
             let catalog = match input.keys.as_mut() {
                 Some(keys) => TitleCatalog::load_package_with_key_set(&input.path, keys),
                 None => TitleCatalog::load_package(&input.path),
@@ -354,6 +351,18 @@ fn build_packaged(
     resolved: ResolvedTitle,
     keys: Option<&dyn NcaKeyProvider>,
 ) -> Result<LaunchPlan, LaunchError> {
+    if resolved.packages().any(|package| package.nup().is_some()) {
+        return Err(LaunchError::invalid(LaunchStage::ProgramContent, path,
+            "NUP titles can be catalogued, but execution of ExeFS/RomFS trees is not implemented yet")
+            .application(resolved.application_id));
+    }
+    let base = resolved.base.as_ref().ok_or_else(|| {
+        LaunchError::invalid(
+            LaunchStage::ProgramContent,
+            path,
+            "NCA launch requires a base application",
+        )
+    })?;
     let build_started = Instant::now();
     if resolved.add_ons.len() > MAX_LAUNCH_ADD_ONS {
         return Err(LaunchError::invalid(
@@ -367,7 +376,7 @@ fn build_packaged(
         .patch
         .as_ref()
         .filter(|package| !records(package, CnmtContentType::Program).is_empty())
-        .unwrap_or(&resolved.base);
+        .unwrap_or(base);
     let program_record = exactly_one_record(effective, CnmtContentType::Program, "Program")
         .map_err(|reason| {
             LaunchError::invalid(LaunchStage::ProgramContent, path, reason)
@@ -585,6 +594,13 @@ fn load_primary_mount(
     program: &NcaArchive,
     keys: Option<&dyn NcaKeyProvider>,
 ) -> Result<Option<ReadOnlyMount>, LaunchError> {
+    let base = resolved.base.as_ref().ok_or_else(|| {
+        LaunchError::invalid(
+            LaunchStage::PrimaryFileSystem,
+            path,
+            "NCA filesystem requires a base application",
+        )
+    })?;
     let data = records(effective, CnmtContentType::Data);
     if data.len() > 1 {
         return Err(LaunchError::invalid(
@@ -603,8 +619,8 @@ fn load_primary_mount(
             .sections()
             .iter()
             .any(|section| section.section_type() == NcaSectionType::Bktr);
-        let base_nca = if is_bktr && effective.title_id != resolved.base.title_id {
-            let matching = records(&resolved.base, CnmtContentType::Data)
+        let base_nca = if is_bktr && effective.title_id != base.title_id {
+            let matching = records(base, CnmtContentType::Data)
                 .into_iter()
                 .filter(|base| base.id_offset == record.id_offset)
                 .collect::<Vec<_>>();
@@ -619,41 +635,34 @@ fn load_primary_mount(
                     .content(record.content_id));
                 }
             };
-            Some(
-                resolved
-                    .base
-                    .open_content(base_record, keys)
-                    .map_err(|error| {
-                        LaunchError::load(LaunchStage::PrimaryFileSystem, path, error)
-                            .title_id(resolved.base.title_id)
-                            .content(base_record.content_id)
-                    })?,
-            )
+            Some(base.open_content(base_record, keys).map_err(|error| {
+                LaunchError::load(LaunchStage::PrimaryFileSystem, path, error)
+                    .title_id(base.title_id)
+                    .content(base_record.content_id)
+            })?)
         } else {
             None
         };
         let provenance = if base_nca.is_some() {
             MountProvenance::BaseAndPatch
-        } else if effective.title_id == resolved.base.title_id {
+        } else if effective.title_id == base.title_id {
             MountProvenance::Base
         } else {
             MountProvenance::Patch
         };
         return mount_nca(path, &nca, base_nca.as_ref(), provenance, record.content_id).map(Some);
     }
-    let base_program = if effective.title_id != resolved.base.title_id
+    let base_program = if effective.title_id != base.title_id
         && program
             .sections()
             .iter()
             .any(|section| section.section_type() == NcaSectionType::Bktr)
     {
-        let record = exactly_one_record(&resolved.base, CnmtContentType::Program, "base Program")
-            .map_err(|reason| {
-            LaunchError::invalid(LaunchStage::PrimaryFileSystem, path, reason)
-        })?;
-        Some(resolved.base.open_content(record, keys).map_err(|error| {
+        let record = exactly_one_record(base, CnmtContentType::Program, "base Program")
+            .map_err(|reason| LaunchError::invalid(LaunchStage::PrimaryFileSystem, path, reason))?;
+        Some(base.open_content(record, keys).map_err(|error| {
             LaunchError::load(LaunchStage::PrimaryFileSystem, path, error)
-                .title_id(resolved.base.title_id)
+                .title_id(base.title_id)
                 .content(record.content_id)
         })?)
     } else {
@@ -661,7 +670,7 @@ fn load_primary_mount(
     };
     let provenance = if base_program.is_some() {
         MountProvenance::BaseAndPatch
-    } else if effective.title_id == resolved.base.title_id {
+    } else if effective.title_id == base.title_id {
         MountProvenance::Base
     } else {
         MountProvenance::Patch
@@ -775,8 +784,9 @@ fn load_add_ons(
     let mut content_ids = BTreeSet::new();
     let mut result = Vec::with_capacity(resolved.add_ons.len());
     for package in &resolved.add_ons {
-        if let CnmtExtendedHeader::AddOnContent { data_patch_id, .. } =
-            &package.canonical_content_meta().extended_header
+        if let Some(CnmtExtendedHeader::AddOnContent { data_patch_id, .. }) = package
+            .canonical_content_meta()
+            .map(|meta| &meta.extended_header)
             && *data_patch_id != 0
         {
             return Err(LaunchError::invalid(
@@ -863,8 +873,8 @@ fn load_add_ons(
 fn records(package: &PackageMetadata, content_type: CnmtContentType) -> Vec<&CnmtContentInfo> {
     package
         .canonical_content_meta()
-        .contents
-        .iter()
+        .into_iter()
+        .flat_map(|meta| &meta.contents)
         .filter(|record| record.content_type == content_type)
         .collect()
 }

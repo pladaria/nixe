@@ -197,6 +197,7 @@ fn add_package_path(
         source,
     };
     match format {
+        PackageFormat::Nup => crate::nup::add(catalog, path, storage).map_err(package_error),
         PackageFormat::Nsp => {
             let archive = NspLoader::load(storage.clone()).map_err(package_error)?;
             add_package_contents(catalog, path, storage, &archive, keys, false, format)

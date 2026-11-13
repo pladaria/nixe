@@ -99,23 +99,6 @@ Hotkeys:
 - <kbd>A</kbd>: cycle antialiasing through `none`, `FXAA` and `SMAA` for the current session
 - <kbd>1</kbd>: resize the window to the current render resolution
 
-## Testing
-
-Run
-
-```
-cargo test-all
-```
-
-### GPU tests
-
-GPU execution tests require a physical GPU; software rasterizers are excluded.
-When no physical GPU is available they print `SKIP:` (visible with `--nocapture`)
-and return. The standard Rust harness labels these returns `ok`, so they must
-not be counted as hardware validation. Errors after GPU initialization remain
-test failures. Opt-in native tests and their additional requirements are described
-in [the native Vulkan guide](crates/gpu-vulkan/README.md).
-
 ## Acknowledgements
 
 Nixe is grateful to the projects and communities whose work has helped make this emulator possible:

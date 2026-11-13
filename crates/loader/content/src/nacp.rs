@@ -73,6 +73,28 @@ impl NacpLanguage {
         Self::BrazilianPortuguese,
     ];
 
+    /// BCP-47 tag used by container-localized metadata.
+    pub const fn language_tag(self) -> &'static str {
+        match self {
+            Self::AmericanEnglish => "en-us",
+            Self::BritishEnglish => "en-gb",
+            Self::Japanese => "ja",
+            Self::French => "fr",
+            Self::German => "de",
+            Self::LatinAmericanSpanish => "es-419",
+            Self::Spanish => "es",
+            Self::Italian => "it",
+            Self::Dutch => "nl",
+            Self::CanadianFrench => "fr-ca",
+            Self::Portuguese => "pt",
+            Self::Russian => "ru",
+            Self::Korean => "ko",
+            Self::TraditionalChinese => "zh-hant",
+            Self::SimplifiedChinese => "zh-hans",
+            Self::BrazilianPortuguese => "pt-br",
+        }
+    }
+
     pub const fn index(self) -> usize {
         self as usize
     }

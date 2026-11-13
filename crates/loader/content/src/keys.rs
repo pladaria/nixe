@@ -50,6 +50,7 @@ pub trait NcaKeyProvider {
 
 /// User-supplied keys parsed from the conventional prod.keys and title.keys
 /// text formats.
+#[derive(Default)]
 pub struct NcaKeySet {
     header_key: Option<[u8; 32]>,
     key_area_keys: HashMap<(u8, KeyAreaKeyIndex), [u8; 16]>,
@@ -83,12 +84,7 @@ impl NcaKeySet {
 
     /// Parses caller-owned key text without retaining the source strings.
     pub fn from_text(prod_keys: &str, title_keys: Option<&str>) -> Result<Self, KeySetError> {
-        let mut key_set = Self {
-            header_key: None,
-            key_area_keys: HashMap::new(),
-            title_keks: HashMap::new(),
-            encrypted_title_keys: HashMap::new(),
-        };
+        let mut key_set = Self::default();
 
         for (line_index, line) in prod_keys.lines().enumerate() {
             let Some((name, value)) = assignment(line) else {
