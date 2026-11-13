@@ -301,7 +301,7 @@ impl VideoSystem {
     where
         L: nixe_gpu_maxwell::MaxwellFrontend,
         R: Send + 'static,
-        E: nixe_gpu::GpuExecution<
+        E: nixe_gpu::GpuPresentation<
                 Conversion = nixe_gpu::native::NativeNv12Conversion,
                 ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
             >,

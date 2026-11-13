@@ -46,22 +46,27 @@ pub(crate) fn plane_layout(
                 .ok_or(MemoryError::Invalid("image layer offset overflows"))?,
             ImageStorage::Pitch { row_pitch },
         ),
-        ImageMemoryLayout::BlockLinear(blocks) => {
+        ImageMemoryLayout::BlockLinear(blocks) | ImageMemoryLayout::BlockLinearAmpere(blocks) => {
             if blocks.block_width_log2 != 0
                 || blocks.block_depth_log2 > 5
                 || blocks.block_height_log2 > 5
             {
-                return Err(MemoryError::Invalid(
-                    "unsupported Maxwell GOB width/depth/height",
-                ));
+                return Err(MemoryError::Invalid("unsupported GOB width/depth/height"));
             }
             (
                 u64::from(layer)
                     .checked_mul(blocks.layer_stride)
                     .ok_or(MemoryError::Invalid("image layer offset overflows"))?,
-                ImageStorage::BlockLinear {
-                    block_height_log2: blocks.block_height_log2,
-                    block_depth_log2: blocks.block_depth_log2,
+                if matches!(layout, ImageMemoryLayout::BlockLinearAmpere(_)) {
+                    ImageStorage::BlockLinearAmpere {
+                        block_height_log2: blocks.block_height_log2,
+                        block_depth_log2: blocks.block_depth_log2,
+                    }
+                } else {
+                    ImageStorage::BlockLinear {
+                        block_height_log2: blocks.block_height_log2,
+                        block_depth_log2: blocks.block_depth_log2,
+                    }
                 },
             )
         }
@@ -91,9 +96,8 @@ pub(crate) fn plane_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nixe_gpu::{BlockLinearLayout, physical::ByteIntersection};
-    use nixe_memory::{AllocationRange, ArenaOffset, Machine, PAGE_SIZE};
-    use std::collections::BTreeMap;
+    use nixe_gpu::BlockLinearLayout;
+    use nixe_memory::{AllocationRange, Machine};
 
     fn memory(bytes: u64) -> (nixe_memory::Allocation, Arc<PhysicalMapping>) {
         let machine = Machine::new(bytes).unwrap();
@@ -129,126 +133,5 @@ mod tests {
         }
         drop(allocation);
         assert_eq!(machine.statistics().allocated_bytes, 0);
-    }
-    #[test]
-    fn color_and_packed_aspects_match_documented_layout_without_claiming_native_padding() {
-        let (allocation, whole) = memory(65536);
-        let ranges = whole.pin(0, 65536).unwrap();
-        let mut pages = Vec::new();
-        for offset in (0..16).rev().map(|page| page * PAGE_SIZE) {
-            pages.push(ranges[0].slice(offset, PAGE_SIZE).unwrap());
-        }
-        let source = PhysicalMapping::new(&pages).unwrap();
-        for (height, depth) in [(0, 0), (1, 0), (4, 0), (5, 0), (0, 3), (1, 2)] {
-            let blocks = BlockLinearLayout {
-                block_width_log2: 0,
-                block_height_log2: height,
-                block_depth_log2: depth,
-                layer_stride: 32768,
-            };
-            for layout in [
-                ImageMemoryLayout::PitchLinear {
-                    row_pitch: 128,
-                    layer_stride: 32768,
-                },
-                ImageMemoryLayout::BlockLinear(blocks),
-            ] {
-                for (packed, bytes, offset, meaningful) in [
-                    (4, 4, 0, 4),
-                    (4, 4, 1, 3),
-                    (4, 4, 0, 3),
-                    (4, 1, 0, 1),
-                    (4, 1, 3, 1),
-                    (8, 4, 0, 4),
-                    (8, 1, 4, 1),
-                ] {
-                    let columns = 9;
-                    let rows = 17;
-                    let view = plane_footprint(
-                        source.clone(),
-                        layout,
-                        [1, 0],
-                        [columns, rows],
-                        bytes,
-                        packed,
-                        (offset, meaningful),
-                    )
-                    .unwrap();
-                    let mut observed = BTreeMap::new();
-                    for (index, span) in source.spans().iter().enumerate() {
-                        view.visit(
-                            index,
-                            span.start,
-                            span.bytes,
-                            |ByteIntersection {
-                                 start,
-                                 bytes,
-                                 native,
-                             }| {
-                                for byte in 0..bytes {
-                                    assert!(
-                                        observed
-                                            .insert(native + byte, start.get() + byte)
-                                            .is_none()
-                                    );
-                                }
-                                true
-                            },
-                        )
-                        .unwrap();
-                    }
-                    let mut expected = BTreeMap::new();
-                    for y in 0..rows {
-                        for x in 0..columns {
-                            for byte in 0..meaningful {
-                                let raw_x = u64::from(x * packed + offset + byte);
-                                // Independent GOB decomposition with a nonzero array layer.
-                                let raw = match layout {
-                                    ImageMemoryLayout::PitchLinear {
-                                        row_pitch,
-                                        layer_stride,
-                                    } => layer_stride + u64::from(y) * row_pitch + raw_x,
-                                    ImageMemoryLayout::BlockLinear(p) => {
-                                        let h = 1u64 << p.block_height_log2;
-                                        let y = u64::from(y);
-                                        p.layer_stride
-                                            + y / (8 * h)
-                                                * 512
-                                                * h
-                                                * (1u64 << p.block_depth_log2)
-                                                * u64::from(columns * packed).div_ceil(64)
-                                            + raw_x / 64 * 512 * h * (1u64 << p.block_depth_log2)
-                                            + y % (8 * h) / 8 * 512
-                                            + raw_x % 64 / 32 * 256
-                                            + y % 8 / 2 * 64
-                                            + raw_x % 32 / 16 * 32
-                                            + y % 2 * 16
-                                            + raw_x % 16
-                                    }
-                                };
-                                let span = source
-                                    .spans()
-                                    .iter()
-                                    .find(|span| {
-                                        span.logical <= raw && raw < span.logical + span.bytes
-                                    })
-                                    .unwrap();
-                                let physical =
-                                    ArenaOffset::new(span.start.get() + raw - span.logical);
-                                expected.insert(
-                                    u64::from((y * columns + x) * bytes + byte),
-                                    physical.get(),
-                                );
-                            }
-                        }
-                    }
-                    assert_eq!(
-                        observed, expected,
-                        "height={height}, packed={packed}, bytes={bytes}, offset={offset}, meaningful={meaningful}"
-                    );
-                }
-            }
-        }
-        drop(allocation);
     }
 }

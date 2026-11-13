@@ -350,6 +350,9 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                         .return_service(HorizonIpcObject::Gsv(crate::GsvSession::new(
                             process.process_id(),
                             session.operation_mode(),
+                            graphics.ampere.clone().ok_or(IpcWireError::Malformed(
+                                "Ampere native graphics owner is not configured",
+                            ))?,
                         )))
                         .map_err(|_| IpcWireError::HostResourceExhausted("creating GSV session"))?;
                     Ok((
@@ -639,6 +642,33 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 return unsupported_service_command("IApplicationFunctions", request.command_id);
             };
             match command {
+                ApplicationFunctionsCommand::GetOperationModeRefreshEvent => {
+                    if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    // The ABI is documented: no input/output bytes, one copy handle.
+                    // https://switchbrew.org/wiki/20.0.0
+                    // @SPECULATIVE: the event's meaning is undocumented. Follow
+                    // the reference's operation-mode refresh event. It remains
+                    // idle while the application's launch-time mode is unchanged.
+                    // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/am/service/application_functions.cpp
+                    let handle = process
+                        .return_handle(session.operation_mode_refresh_event())
+                        .map_err(IpcWireError::Handle)?;
+                    Ok((
+                        encode_domain_response(
+                            request.token,
+                            HorizonIpcResult::SUCCESS,
+                            &[],
+                            &[handle],
+                            &[],
+                        )?,
+                        Some(handle),
+                    ))
+                }
                 ApplicationFunctionsCommand::Query320 | ApplicationFunctionsCommand::Query321 => {
                     if process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {
                         return unsupported_service_command(

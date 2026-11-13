@@ -257,6 +257,9 @@ pub(super) async fn dispatch_control(
             HorizonIpcObject::NvDrv2(_)
             | HorizonIpcObject::Csrng
             | HorizonIpcObject::AudioOutManager(_)
+            | HorizonIpcObject::AudioUser
+            | HorizonIpcObject::StreamPlay
+            | HorizonIpcObject::StreamPlayUser(_)
             | HorizonIpcObject::AudioOut(_)
             | HorizonIpcObject::AudioRendererManager(_)
             | HorizonIpcObject::AudioRenderer(_)

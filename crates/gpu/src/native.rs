@@ -4,9 +4,11 @@ use crate::physical::Footprint;
 use crate::*;
 use nixe_memory::AllocationRange;
 use std::sync::Arc;
+mod image;
+pub use image::{ImageAddressSpace, ImageInfo, ImagePacking};
 
-/// Framebuffer selected by its SMMU device address, as in Eden's FramebufferConfig.
-/// The console request retains the NvMap pin until the graphics owner consumes it.
+/// Framebuffer selected by its stable device address. The console request retains
+/// the original physical mapping until the graphics owner consumes the image.
 #[derive(Clone, Debug)]
 pub struct NativePresentationImage {
     pub crop: crate::FrameCrop,

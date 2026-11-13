@@ -269,18 +269,15 @@ pub fn sampled_image_info(
         layer_stride,
         maybe_unaligned_layer_stride: layer_size,
         size,
-        guest_format: if format == ImageFormat::Depth24UnormStencil8Uint {
-            // TIC Z24S8 and SET_ZT_FORMAT describe the same packed texels.
-            // Keep the storage encoding independent of texture selectors.
-            MaxwellThreeDGuestImageFormat::DepthStencil(
-                MaxwellThreeDDepthStencilFormat::Z24Stencil8,
-            )
-        } else if format == ImageFormat::Depth16Unorm {
-            MaxwellThreeDGuestImageFormat::DepthStencil(MaxwellThreeDDepthStencilFormat::Z16)
-        } else if format == ImageFormat::Depth32Float {
-            MaxwellThreeDGuestImageFormat::DepthStencil(MaxwellThreeDDepthStencilFormat::ZFloat32)
+        packing: if format == ImageFormat::Depth24UnormStencil8Uint {
+            ImagePacking::Depth24High
         } else {
-            MaxwellThreeDGuestImageFormat::Texture(format_word)
+            ImagePacking::Native
+        },
+        sample_grid: match description.samples() {
+            SampleCount::One => [1, 1],
+            SampleCount::Four => [2, 2],
+            _ => return Err(MaxwellThreeDResourceError::UnsupportedImageLayout { role }),
         },
     })
 }

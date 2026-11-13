@@ -15,6 +15,7 @@ use nixe_runtime::{
 
 mod console;
 use console::SevenSixAxis;
+mod jcms;
 
 const HID_SHARED_MEMORY_SIZE: usize = 0x40000;
 const TOUCH_SCREEN_OFFSET: usize = 0x400;
@@ -93,6 +94,7 @@ struct HidState {
     vibration_output: Mutex<Option<nixe_input::VibrationOutput>>,
     completion_events: Mutex<Option<nixe_runtime::ExternalEventSender>>,
     motion_settings: OnceLock<nixe_input::MotionSettings>,
+    jcms: Mutex<Option<Arc<nixe_runtime::TransferMemoryObject>>>,
 }
 
 impl Drop for HidState {
@@ -231,6 +233,7 @@ impl From<nixe_input::VibrationError> for HidInputError {
 struct HidConfiguration {
     debug_pad_active: bool,
     touch_screen_active: bool,
+    touch_screen_output_ranges: Option<[u32; 2]>,
     mouse_active: bool,
     keyboard_active: bool,
     console_six_axis_active: bool,
@@ -293,6 +296,7 @@ impl HidSystem {
                 vibration_output: Mutex::new(None),
                 completion_events: Mutex::new(None),
                 motion_settings: OnceLock::new(),
+                jcms: Mutex::new(None),
             }),
             producer: Arc::new(Mutex::new(HidProducer {
                 sampling_number: 0,
@@ -580,6 +584,15 @@ impl HidSystem {
             .touch_screen_active = true;
     }
 
+    pub(crate) fn set_touch_screen_output_ranges(&self, width: u32, height: u32) {
+        self.state
+            .configuration
+            .lock()
+            .unwrap()
+            .touch_screen_output_ranges = Some([width, height]);
+        log::debug!("hid touch-screen output ranges: {width}x{height}");
+    }
+
     pub(crate) fn activate_debug_pad(&self) {
         self.state
             .configuration
@@ -759,14 +772,15 @@ impl HidProducer {
         state: &EmulatedTouchScreenState,
         delta: Duration,
     ) {
-        if !system
-            .configuration
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .touch_screen_active
-        {
+        let configuration = system.configuration.lock().unwrap();
+        if !configuration.touch_screen_active {
             return;
         }
+        let [width, height] = configuration.touch_screen_output_ranges.unwrap_or([
+            nixe_input::TOUCH_SCREEN_WIDTH,
+            nixe_input::TOUCH_SCREEN_HEIGHT,
+        ]);
+        drop(configuration);
         self.touch_screen_sampling_number = self.touch_screen_sampling_number.saturating_add(1);
         let mut entry = [0_u8; TOUCH_SCREEN_ENTRY_SIZE];
         put_u64(
@@ -786,10 +800,40 @@ impl HidProducer {
             put_u64(&mut entry, offset, delta_time);
             put_u32(&mut entry, offset + 8, contact.attributes);
             put_u32(&mut entry, offset + 12, contact.finger_id);
-            put_u32(&mut entry, offset + 16, contact.x);
-            put_u32(&mut entry, offset + 20, contact.y);
-            put_u32(&mut entry, offset + 24, contact.diameter_x);
-            put_u32(&mut entry, offset + 28, contact.diameter_y);
+            // Host input is expressed in the canonical touch coordinate space.
+            // Convert only when publishing to the application's requested range.
+            // https://switchbrew.org/wiki/HID_services#SetTouchScreenOutputRanges
+            let scale = |value, range, source| {
+                (u64::from(value) * u64::from(range) / u64::from(source)) as u32
+            };
+            put_u32(
+                &mut entry,
+                offset + 16,
+                scale(
+                    contact.x.min(nixe_input::TOUCH_SCREEN_WIDTH - 1),
+                    width,
+                    nixe_input::TOUCH_SCREEN_WIDTH,
+                ),
+            );
+            put_u32(
+                &mut entry,
+                offset + 20,
+                scale(
+                    contact.y.min(nixe_input::TOUCH_SCREEN_HEIGHT - 1),
+                    height,
+                    nixe_input::TOUCH_SCREEN_HEIGHT,
+                ),
+            );
+            put_u32(
+                &mut entry,
+                offset + 24,
+                scale(contact.diameter_x, width, nixe_input::TOUCH_SCREEN_WIDTH),
+            );
+            put_u32(
+                &mut entry,
+                offset + 28,
+                scale(contact.diameter_y, height, nixe_input::TOUCH_SCREEN_HEIGHT),
+            );
             put_u32(&mut entry, offset + 32, contact.rotation_angle);
         }
         // Switch HID exposes a 17-entry atomic touchscreen LIFO at 0x400.

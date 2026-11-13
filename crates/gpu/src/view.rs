@@ -143,8 +143,13 @@ pub enum ImageMemoryKind {
 /// Memory kind and layout of one image subresource binding.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ImageMemoryLayout {
-    PitchLinear { row_pitch: u64, layer_stride: u64 },
+    PitchLinear {
+        row_pitch: u64,
+        layer_stride: u64,
+    },
     BlockLinear(BlockLinearLayout),
+    /// Native Switch 2 GOB order exchanges address bits 5 and 6.
+    BlockLinearAmpere(BlockLinearLayout),
 }
 
 impl ImageMemoryLayout {
@@ -153,7 +158,7 @@ impl ImageMemoryLayout {
     pub const fn kind(self) -> ImageMemoryKind {
         match self {
             Self::PitchLinear { .. } => ImageMemoryKind::PitchLinear,
-            Self::BlockLinear(_) => ImageMemoryKind::BlockLinear,
+            Self::BlockLinear(_) | Self::BlockLinearAmpere(_) => ImageMemoryKind::BlockLinear,
         }
     }
 }
@@ -356,7 +361,7 @@ fn validate_layout(
                 });
             }
         }
-        ImageMemoryLayout::BlockLinear(blocks) => {
+        ImageMemoryLayout::BlockLinear(blocks) | ImageMemoryLayout::BlockLinearAmpere(blocks) => {
             if blocks.block_width_log2 > 7
                 || blocks.block_height_log2 > 7
                 || blocks.block_depth_log2 > 7

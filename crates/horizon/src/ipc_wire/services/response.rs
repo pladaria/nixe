@@ -68,6 +68,14 @@ pub(super) async fn encode_semantic_response(
             &[],
             None,
         ),
+        IpcResponse::AddOnContentCount(count) => semantic_success(
+            request.token,
+            is_domain,
+            &count.to_le_bytes(),
+            &[],
+            &[],
+            None,
+        ),
         IpcResponse::AccessLogProgramIndex {
             version,
             program_index,

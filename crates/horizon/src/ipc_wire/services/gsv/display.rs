@@ -1,8 +1,15 @@
 //! Native display control ABI; presentation buffers have their own ownership.
 use super::*;
 use crate::gsv::display::DisplayEvent;
+use std::future::Future;
 const DEFAULT_DISPLAY: u64 = 0x00746c7561666564;
-pub(super) fn dispatch(
+fn client_slot(data: &[u8]) -> u32 {
+    // @SPECULATIVE: the native SDK writes only the low byte of this field.
+    // Subsequent presents leave previous IPC data (including SFCO bytes) in
+    // bytes 9..12. Those bytes are padding, not part of the slot identity.
+    u32::from(data[8])
+}
+pub(super) async fn dispatch(
     process: &mut Request,
     session: &crate::GsvSession,
     request: TipcRequest<'_>,
@@ -12,6 +19,9 @@ pub(super) fn dispatch(
         return Err(IpcWireError::Malformed(
             "unexpected native display descriptors",
         ));
+    }
+    if request.command_id == 229 {
+        return present(process, session, request.data).await;
     }
     let mut state = session.state.lock().unwrap();
     let display = state
@@ -85,6 +95,10 @@ pub(super) fn dispatch(
                 crate::gsv::display::DisplayLayer {
                     buffer_count,
                     attached: false,
+                    available: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                        (1 << buffer_count) - 1,
+                    )),
+                    next_present_ns: 0,
                 },
             );
         }
@@ -102,10 +116,27 @@ pub(super) fn dispatch(
                 .layers
                 .get(&request_u64(data, 0).unwrap())
                 .ok_or(IpcWireError::Malformed("unknown native display layer"))?;
-            // No frame can enter this layer until PresentClientBuffer is
-            // implemented with its fence/retention contract. Initial slots
-            // are available; this query never completes a pending frame.
-            output.extend_from_slice(&((1_u64 << layer.buffer_count) - 1).to_le_bytes());
+            output.extend_from_slice(
+                &u64::from(layer.available.load(std::sync::atomic::Ordering::Acquire))
+                    .to_le_bytes(),
+            );
+        }
+        (228, 12) => {
+            // @SPECULATIVE: cancel returns a client-owned slot without submitting
+            // an image. An in-flight slot cannot be cancelled by another request.
+            let layer = display
+                .layers
+                .get(&request_u64(data, 0).unwrap())
+                .ok_or(IpcWireError::Malformed("unknown native display layer"))?;
+            let slot = client_slot(data);
+            let available = layer.available.load(std::sync::atomic::Ordering::Acquire);
+            if slot >= layer.buffer_count || available & (1 << slot) == 0 {
+                return Err(IpcWireError::Malformed(
+                    "cannot cancel an in-flight native display buffer",
+                ));
+            }
+            output.extend_from_slice(&u64::from(available).to_le_bytes());
+            output.resize(24, 0);
         }
         (251 | 252, 16) if request_u64(data, 8) == Some(DEFAULT_DISPLAY) && display.opened => {
             // @SPECULATIVE: observed 251(layer token, display name) binds the
@@ -216,7 +247,39 @@ pub(super) fn dispatch(
                 _ => unreachable!(),
             }
         }
+        (107, 8) if request_u64(data, 0) == Some(DEFAULT_DISPLAY) => {
+            // @SPECULATIVE: only the command ID is documented. The observed
+            // request names the default display; its output semantics are
+            // unknown. Match the reference's explicit Unknown107 handler with
+            // success and 32 zeroed words. Do not change display state, publish
+            // buffers, or signal an event based on this provisional reply.
+            // https://switchbrew.org/wiki/Switch_2%3A_GSV_services#DisplaySession
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/nx2_gsv.h
+            static NOTICE: std::sync::Once = std::sync::Once::new();
+            NOTICE.call_once(|| {
+                log::warn!(
+                    "GSV DisplaySession command 107: speculative success with zeroed output; semantics undocumented"
+                );
+            });
+            output.resize(32 * 4, 0);
+        }
+        (351, 16) => {
+            // @SPECULATIVE: Switchbrew lists this command without a signature
+            // or semantics. The observed SDK request contains two u64 words.
+            // Match the reference's explicit Unknown351 zeroed reply; do not
+            // interpret either word as a buffer, event or GPU completion.
+            // https://switchbrew.org/wiki/Switch_2%3A_GSV_services#DisplaySession
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/nx2_gsv.h
+            static NOTICE: std::sync::Once = std::sync::Once::new();
+            NOTICE.call_once(|| log::warn!("GSV DisplaySession command 351: speculative success with zeroed output; semantics undocumented"));
+            output.resize(32 * 4, 0);
+        }
         _ => {
+            log::debug!(
+                "unimplemented GSV DisplaySession command={} input={:02x?}",
+                request.command_id,
+                data
+            );
             return Err(IpcWireError::UnsupportedService(
                 UnsupportedServiceOperation::Command {
                     service: "GSV DisplaySession",
@@ -226,4 +289,152 @@ pub(super) fn dispatch(
         }
     }
     Ok(encode_tipc_response(0, &output, &handles, &[])?)
+}
+
+async fn present(
+    process: &mut Request,
+    session: &crate::GsvSession,
+    data: &[u8],
+) -> Result<Vec<u8>, IpcWireError> {
+    // @SPECULATIVE: the native presentation packet is reconstructed from the
+    // reference's SDK observations: token/slot/image at 0/8/12, drawn size at
+    // 20, interval:refresh at 40, inverted counter ID/value at 80/88. Remaining
+    // metadata is undocumented. Only the observed 32-bit counter mode is accepted.
+    // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/nx2_gsv.h
+    if data.len() != 96 || request_u32(data, 84) != Some(0) || request_u32(data, 92) != Some(0) {
+        return Err(IpcWireError::Malformed(
+            "unsupported native presentation packet/counter mode",
+        ));
+    }
+    let token = request_u64(data, 0).unwrap();
+    let slot = client_slot(data);
+    let image_id = request_u32(data, 12).unwrap();
+    let shown = request_u32(data, 20).unwrap();
+    let rate = request_u32(data, 40).unwrap();
+    let interval = rate >> 16;
+    let refresh = rate & 0xffff;
+    if refresh != 60 {
+        return Err(IpcWireError::GraphicsService(
+            format!("unsupported native presentation refresh {refresh} Hz").into(),
+        ));
+    }
+    let counter_id = !request_u32(data, 80).unwrap();
+    let threshold = request_u32(data, 88).unwrap();
+    let queued = std::time::Instant::now();
+    let (frame, counter, executor, deadline) = {
+        let mut state = session.state.lock().unwrap();
+        let gpu = state
+            .gpu
+            .as_ref()
+            .ok_or(IpcWireError::Malformed("GPU context not initialized"))?;
+        let executor = gpu
+            .executor
+            .clone()
+            .ok_or(IpcWireError::Malformed("native GPU not running"))?;
+        let counter = if counter_id == u32::MAX {
+            None
+        } else {
+            Some(
+                state
+                    .syncpt
+                    .as_ref()
+                    .and_then(|context| context.timelines.get(&counter_id))
+                    .cloned()
+                    .ok_or(IpcWireError::Malformed("unknown native presentation fence"))?,
+            )
+        };
+        let (&first, pool) = state
+            .native_images
+            .window_pools
+            .range(..=image_id)
+            .next_back()
+            .filter(|(first, pool)| image_id - **first < pool.count)
+            .ok_or(IpcWireError::Malformed("unknown native presentation image"))?;
+        let pool = pool.clone();
+        let mut image = pool
+            .presentation(image_id - first, &gpu.spaces)
+            .map_err(IpcWireError::GraphicsService)?
+            .image
+            .clone();
+        if shown != 0 {
+            let [width, height] = [(shown & 0xffff) + 1, (shown >> 16) + 1];
+            if width > image.extent[0] || height > image.extent[1] {
+                return Err(IpcWireError::Malformed(
+                    "native presentation crop exceeds its image",
+                ));
+            }
+            image.crop.width = width;
+            image.crop.height = height;
+        }
+        let display = state
+            .display
+            .as_mut()
+            .filter(|d| d.initialized && d.opened && d.active_layer == Some(token))
+            .ok_or(IpcWireError::Malformed(
+                "native presentation requires an active display layer",
+            ))?;
+        let layer = display
+            .layers
+            .get_mut(&token)
+            .filter(|l| l.attached && slot < l.buffer_count)
+            .ok_or(IpcWireError::Malformed(
+                "invalid native presentation layer/slot",
+            ))?;
+        let bit = 1 << slot;
+        layer
+            .available
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |free| (free & bit != 0).then_some(free & !bit),
+            )
+            .map_err(|_| IpcWireError::Malformed("native presentation slot is still in flight"))?;
+        let now = process.kernel().clock().scheduler_time_ns();
+        let duration = u64::from(interval) * 1_000_000_000 / u64::from(refresh);
+        layer.next_present_ns = if layer.next_present_ns == 0 {
+            now + duration
+        } else {
+            layer.next_present_ns.saturating_add(duration).max(now)
+        };
+        let frame = crate::gsv::display::Frame {
+            image,
+            _pool: pool,
+            available: layer.available.clone(),
+            slot,
+            interval,
+            queued,
+        };
+        (frame, counter, executor, layer.next_present_ns)
+    };
+    if let Some(counter) = counter {
+        let mut wait = std::pin::pin!(crate::gsv::syncpt::CounterWait::new(counter, threshold));
+        std::future::poll_fn(|cx| {
+            process.lifetime().check()?;
+            wait.as_mut().poll(cx).map(Ok::<(), IpcWireError>)
+        })
+        .await?;
+    }
+    let available = frame.available.clone();
+    executor
+        .present(frame)
+        .map_err(IpcWireError::GraphicsService)?
+        .wait()
+        .await
+        // The owner reports the original device failure. A dropped reply
+        // cancels this waiter, rather than creating a second failure at teardown.
+        .map_err(|_| IpcWireError::Cancelled)?;
+    let mut pacing = std::pin::pin!(process.kernel().deadline(deadline));
+    std::future::poll_fn(|cx| {
+        process.lifetime().check()?;
+        pacing
+            .as_mut()
+            .poll(cx)
+            .map(|result| result.map_err(|_| IpcWireError::Cancelled))
+    })
+    .await?;
+    let mut output = u64::from(available.load(std::sync::atomic::Ordering::Acquire))
+        .to_le_bytes()
+        .to_vec();
+    output.resize(24, 0);
+    Ok(encode_tipc_response(0, &output, &[], &[])?)
 }

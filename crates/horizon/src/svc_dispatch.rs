@@ -339,6 +339,7 @@ impl HorizonSvcDispatcher {
                 payloads: Default::default(),
                 graphics: crate::ipc_wire::resources::GraphicsServices {
                     video: video_system,
+                    ampere: None,
                 },
                 audio: crate::ipc_wire::resources::AudioServices {
                     backend: None,
@@ -438,7 +439,7 @@ impl HorizonSvcDispatcher {
         self
     }
 
-    /// Installs the account-switch policy from the launched application's NACP.
+    /// Installs the launched application's selected account-switch policy.
     #[must_use]
     pub fn with_user_account_switch_lock(
         mut self: std::sync::Arc<Self>,
@@ -491,6 +492,18 @@ impl HorizonSvcDispatcher {
             .resources_mut()
             .system
             .diagnostics = diagnostics;
+        self
+    }
+
+    pub fn with_ampere_graphics(
+        mut self: std::sync::Arc<Self>,
+        graphics: std::sync::Arc<crate::AmpereGraphics>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::get_mut(&mut self)
+            .expect("configure before starting cores")
+            .resources_mut()
+            .graphics
+            .ampere = Some(graphics);
         self
     }
 

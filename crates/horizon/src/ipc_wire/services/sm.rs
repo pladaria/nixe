@@ -70,6 +70,8 @@ enum ServiceKind {
     Bsd,
     Ssl,
     AudioOut,
+    AudioUser,
+    StreamPlay,
     AudioRenderer,
     Opus,
     PlayReport,
@@ -104,6 +106,8 @@ impl ServiceKind {
             b"bsd:u" => Some(Self::Bsd),
             b"ssl" => Some(Self::Ssl),
             b"audout:u" => Some(Self::AudioOut),
+            b"aud:u" => Some(Self::AudioUser),
+            b"stpl:u" => Some(Self::StreamPlay),
             b"audren:u" => Some(Self::AudioRenderer),
             b"hwopus" => Some(Self::Opus),
             b"prepo:u" => Some(Self::PlayReport),
@@ -280,11 +284,28 @@ fn connect_service(
             )))
         }
         ServiceKind::AudioOut => process.return_service(HorizonIpcObject::AudioOutManager(
-            crate::AudioOutManagerSession {
-                backend: resources.audio.backend.clone(),
-                devices: resources.audio.renderers.devices.clone(),
-            },
+            resources.audio.output_manager(),
         )),
+        ServiceKind::AudioUser => {
+            if process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {
+                return Err(IpcWireError::UnsupportedService(
+                    UnsupportedServiceOperation::Connect {
+                        name: b"aud:u".as_slice().into(),
+                    },
+                ));
+            }
+            process.return_service(HorizonIpcObject::AudioUser)
+        }
+        ServiceKind::StreamPlay => {
+            if process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {
+                return Err(IpcWireError::UnsupportedService(
+                    UnsupportedServiceOperation::Connect {
+                        name: b"stpl:u".as_slice().into(),
+                    },
+                ));
+            }
+            process.return_service(HorizonIpcObject::StreamPlay)
+        }
         ServiceKind::AudioRenderer => process.return_service(
             HorizonIpcObject::AudioRendererManager(resources.audio.renderers.clone()),
         ),

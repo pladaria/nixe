@@ -4,6 +4,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub(crate) struct GraphicsServices {
     pub video: Option<crate::VideoSystem>,
+    pub ampere: Option<Arc<crate::AmpereGraphics>>,
 }
 
 impl GraphicsServices {
@@ -29,6 +30,14 @@ pub(crate) struct AudioServices {
     pub backend: Option<Arc<dyn nixe_audio::AudioBackend>>,
     pub renderers: crate::AudioRendererManagerSession,
     pub opus: crate::OpusManagerSession,
+}
+impl AudioServices {
+    pub fn output_manager(&self) -> crate::AudioOutManagerSession {
+        crate::AudioOutManagerSession {
+            backend: self.backend.clone(),
+            devices: self.renderers.devices.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]

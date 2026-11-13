@@ -5,7 +5,7 @@
 use super::*;
 pub(crate) struct TextureEntry {
     pub(crate) bytes: [u8; 32],
-    pub(crate) info: Option<nixe_gpu_maxwell::engines::threed::ImageInfo>,
+    pub(crate) info: Option<nixe_gpu::native::ImageInfo>,
 }
 /// Current TIC entries belong to the channel, not to a shader's descriptor ABI.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h

@@ -1,6 +1,8 @@
 use super::*;
 mod clear;
+mod masked_clear;
 pub(crate) use clear::{DeferredClear, RenderPassState};
+pub(crate) use masked_clear::MaskedClearPipelines;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VertexBuffer {
     pub binding: u32,

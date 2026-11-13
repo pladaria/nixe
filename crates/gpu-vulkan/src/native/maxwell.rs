@@ -305,7 +305,12 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             .borrow_mut()
             .as_mut()
             .expect("installed renderer")
-            .create_channel(channel.get());
+            .create_channel(
+                channel.get(),
+                model::MAXWELL_VERTEX_STREAM_COUNT,
+                model::MAXWELL_BIND_GROUP_COUNT,
+                model::MAXWELL_CONSTANT_BUFFER_SLOT_COUNT,
+            );
         assert!(
             self.channels.insert(channel, Some(true)).is_none(),
             "frontend channel already exists"

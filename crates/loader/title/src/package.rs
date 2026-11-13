@@ -27,6 +27,12 @@ impl ApplicationId {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// Returns the conventional add-on base ID for this application family.
+    /// https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/file_sys/common_funcs.h
+    pub const fn add_on_content_base_id(self) -> TitleId {
+        TitleId((self.0 & !0x1FFF) + 0x1000)
+    }
 }
 
 impl Display for ApplicationId {
@@ -48,6 +54,17 @@ impl TitleId {
     /// Returns the raw identifier value.
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    /// Returns the application family encoded in a program, patch or add-on ID.
+    /// https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/file_sys/common_funcs.h
+    pub const fn base_application_id(self) -> ApplicationId {
+        ApplicationId(self.0 & !0x1FFF)
+    }
+
+    /// Returns the AOC index encoded in an add-on title ID.
+    pub const fn add_on_content_index(self) -> u32 {
+        (self.0 & 0x7FF) as u32
     }
 }
 

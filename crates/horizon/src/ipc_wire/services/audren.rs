@@ -163,7 +163,9 @@ pub(in crate::ipc_wire) async fn dispatch_audio_renderer_manager(
                 request_u64(request.data, 8).unwrap(),
             )
         };
-        let Some(revision) = crate::audio_renderer::revision_number(revision) else {
+        let Some(revision) =
+            crate::audio_renderer::revision_for_platform(revision, process.cpu().platform())
+        else {
             return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_REVISION);
         };
         let backend = backend.ok_or_else(|| {
@@ -199,7 +201,13 @@ pub(in crate::ipc_wire) async fn dispatch_audio_renderer_manager(
         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
     }
     let params = RendererParameters::decode(request.data[..PARAMETER_SIZE].try_into().unwrap());
-    let Some(revision) = params.revision_number() else {
+    log::debug!(
+        "audio renderer configuration: command={command} revision={:#010x}",
+        params.revision
+    );
+    let Some(revision) =
+        crate::audio_renderer::revision_for_platform(params.revision, process.cpu().platform())
+    else {
         return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_REVISION);
     };
     let Some(size) = params.work_buffer_size(revision) else {

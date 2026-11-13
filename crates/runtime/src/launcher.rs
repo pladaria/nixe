@@ -831,14 +831,19 @@ fn load_add_ons(
     resolved: &ResolvedTitle,
     keys: Option<&dyn NcaKeyProvider>,
 ) -> Result<Vec<AddOnContent>, LaunchError> {
-    let base_id = resolved
-        .application_control()
-        .map(|control| control.add_on_content_base_id)
-        .filter(|value| *value != 0);
+    let application_id = TitleId::new(resolved.application_id.get()).base_application_id();
     let mut indices = BTreeSet::new();
     let mut content_ids = BTreeSet::new();
     let mut result = Vec::with_capacity(resolved.add_ons.len());
     for package in &resolved.add_ons {
+        if package.title_id.base_application_id() != application_id {
+            return Err(LaunchError::invalid(
+                LaunchStage::AddOnContent,
+                path,
+                "add-on title ID belongs to a different application family",
+            )
+            .title_id(package.title_id));
+        }
         if let Some(CnmtExtendedHeader::AddOnContent { data_patch_id, .. }) = package
             .canonical_content_meta()
             .map(|meta| &meta.extended_header)
@@ -896,26 +901,8 @@ fn load_add_ons(
             }
             mounts
         };
-        let horizon_index = base_id
-            .map(|base| {
-                package
-                    .title_id
-                    .get()
-                    .checked_sub(base)
-                    .and_then(|value| u32::try_from(value).ok())
-                    .ok_or_else(|| {
-                        LaunchError::invalid(
-                            LaunchStage::AddOnContent,
-                            path,
-                            "add-on title ID is incompatible with NACP add-on base ID",
-                        )
-                        .title_id(package.title_id)
-                    })
-            })
-            .transpose()?;
-        if let Some(index) = horizon_index
-            && !indices.insert(index)
-        {
+        let horizon_index = package.title_id.add_on_content_index();
+        if !indices.insert(horizon_index) {
             return Err(LaunchError::invalid(
                 LaunchStage::AddOnContent,
                 path,
@@ -923,12 +910,13 @@ fn load_add_ons(
             )
             .title_id(package.title_id));
         }
-        result.push(AddOnContent::new(
+        log::debug!(
+            "resolved add-on: title={} version={} index={horizon_index} mounts={}",
             package.title_id,
             package.version,
-            horizon_index,
-            mounts,
-        ));
+            mounts.len()
+        );
+        result.push(AddOnContent::new(package.title_id, package.version, mounts));
     }
     Ok(result)
 }

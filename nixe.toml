@@ -32,6 +32,9 @@ dictionary = "assets/dict.toml"
 # Languages tried for title metadata, in descending preference order. If a
 # title lacks the first language, the next available configured language is
 # used before the loader's deterministic fallback.
+# For the game's language, try these preferences among those declared in NACP,
+# then AmericanEnglish, then the first supported NACP slot. If control.nacp is
+# absent, use AmericanEnglish. NACP has no separate default-language field.
 preferred_languages = ["Spanish", "AmericanEnglish"]
 # Directory containing caller-owned prod.keys and, optionally, title.keys.
 # Relative paths are resolved from the directory containing this file.

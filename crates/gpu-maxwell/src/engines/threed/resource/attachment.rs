@@ -111,7 +111,19 @@ impl AttachmentInfo {
             layer_stride: array_pitch.unwrap_or(0),
             maybe_unaligned_layer_stride: array_pitch.unwrap_or(0),
             size,
-            guest_format,
+            packing: if guest_format
+                == MaxwellThreeDGuestImageFormat::DepthStencil(
+                    MaxwellThreeDDepthStencilFormat::Z24Stencil8,
+                ) {
+                ImagePacking::Depth24High
+            } else {
+                ImagePacking::Native
+            },
+            sample_grid: match samples {
+                SampleCount::One => [1, 1],
+                SampleCount::Four => [2, 2],
+                _ => return Err(MaxwellThreeDResourceError::UnsupportedImageLayout { role }),
+            },
         })
     }
 }

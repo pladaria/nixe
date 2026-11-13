@@ -111,8 +111,8 @@ pub use render_targets::{
 };
 pub use resource::texture::sampled_image_info;
 pub use resource::{
-    AttachmentInfo, ImageInfo, attachment_description, blit_image_infos, decode_sampler,
-    render_target_info, solid_image_info,
+    AttachmentInfo, attachment_description, blit_image_infos, decode_sampler, render_target_info,
+    solid_image_info,
 };
 pub use resource::{
     MaxwellThreeDGuestImageFormat, MaxwellThreeDResolvedSampler, MaxwellThreeDResourceError,

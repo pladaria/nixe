@@ -40,6 +40,9 @@ enum HidCommand {
     SendVibrationValue,
     SendVibrationValues,
     CreateActiveVibrationDeviceList,
+    InitializeJcms,
+    FinalizeJcms,
+    SetTouchScreenOutputRanges,
 }
 
 impl HidCommand {
@@ -83,6 +86,9 @@ impl HidCommand {
             201 => Some(Self::SendVibrationValue),
             203 => Some(Self::CreateActiveVibrationDeviceList),
             206 => Some(Self::SendVibrationValues),
+            3110 => Some(Self::InitializeJcms),
+            3111 => Some(Self::FinalizeJcms),
+            1004 => Some(Self::SetTouchScreenOutputRanges),
             _ => None,
         }
     }
@@ -114,6 +120,63 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
     };
 
     match command {
+        HidCommand::SetTouchScreenOutputRanges => {
+            // https://switchbrew.org/wiki/HID_services#SetTouchScreenOutputRanges
+            if hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+                || !request.has_payload_size(16)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let width = request_u32(request.data, 0).unwrap();
+            let height = request_u32(request.data, 4).unwrap();
+            if !(1..=u16::MAX as u32).contains(&width) || !(1..=u16::MAX as u32).contains(&height) {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            }
+            hid_system.set_touch_screen_output_ranges(width, height);
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        command @ (HidCommand::InitializeJcms | HidCommand::FinalizeJcms) => {
+            // https://switchbrew.org/wiki/HID_services#InitializeJcms
+            if process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {
+                return unsupported_service_command("hid", request.command_id);
+            }
+            let initialize = command == HidCommand::InitializeJcms;
+            if hipc.pid.is_none()
+                || hipc.copy_handles.len() != usize::from(initialize)
+                || !hipc.move_handles.is_empty()
+                || !hipc.send_statics.is_empty()
+                || !hipc.send_buffers.is_empty()
+                || !hipc.receive_buffers.is_empty()
+                || !hipc.exchange_buffers.is_empty()
+                || hipc.receive_statics != ReceiveStatics::None
+                || !request.has_payload_size(if initialize { 16 } else { 8 })
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            if initialize {
+                let Some(memory) = process.copy_handle::<TransferMemoryObject>(0) else {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                };
+                if memory.size() == 0
+                    || request_u64(request.data, 8) != Some(memory.size())
+                    || memory.permissions() != nixe_memory::MemoryPermissions::READ
+                {
+                    return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+                }
+                hid_system
+                    .initialize_jcms(memory.clone())
+                    .await
+                    .map_err(|fault| IpcWireError::GuestAccess {
+                        address: memory.address(),
+                        bytes: memory.size(),
+                        fault,
+                    })?;
+            } else {
+                hid_system.finalize_jcms();
+            }
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
         // The two amplitudes determine actuator force; with both zero the
         // operation stops vibration regardless of the carrier frequencies.
         // The configured input worker owns actuator output, including stops.
@@ -602,12 +665,11 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let revision = request_u32(request.data, 0).expect("validated HID revision payload");
-            // Revisions 0..=3 use the same FullKey LIFO representation that
-            // this producer publishes. Revision changes must not invent a
-            // different memory layout or enable unsupported controller styles.
-            // https://github.com/switchbrew/libnx/blob/v3.0.0/nx/include/switch/services/hid.h
-            // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c
-            if revision <= 3 {
+            // Revision 5 is requested since HOS 18.0.0. FullKey still uses
+            // the same LIFO; the producer advertises only that supported style.
+            // https://switchbrew.org/wiki/HID_services#ActivateNpadWithRevision
+            // https://github.com/switchbrew/libnx/blob/master/nx/source/services/hid.c
+            if matches!(revision, 0..=3 | 5) {
                 hid_system.activate_npad();
                 return semantic_success(request.token, false, &[], &[], &[], None);
             }
@@ -616,10 +678,7 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
                 UnsupportedServiceOperation::CommandVariant {
                     service: "hid",
                     command_id: request.command_id,
-                    detail: match revision {
-                        5 => "Npad shared-memory revision 5",
-                        _ => "unknown Npad shared-memory revision",
-                    },
+                    detail: "unknown Npad shared-memory revision",
                 },
             ))
         }

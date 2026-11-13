@@ -178,6 +178,7 @@ command_enum!(ApplicationFunctionsCommand {
     110 => QueryApplicationPlayStatistics,
     111 => QueryApplicationPlayStatisticsByUid,
     130 => GetGpuErrorDetectedSystemEvent,
+    210 => GetOperationModeRefreshEvent,
     320 => Query320,
     321 => Query321,
 });

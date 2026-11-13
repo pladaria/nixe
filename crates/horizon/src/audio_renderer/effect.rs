@@ -1,10 +1,12 @@
 //! Stateful renderer effects. Parameter updates are separate from DSP execution.
 mod aux;
 mod biquad;
+mod compressor;
 mod delay;
 mod fixed;
 mod i3dl2;
 mod limiter;
+mod mixer;
 mod reverb;
 use super::buffer::{Attachment, attach};
 use super::update::{MemoryPool, UpdateError, wide, word};
@@ -15,12 +17,14 @@ use nixe_memory::{AllocationRange, MemoryError};
 pub(super) enum Effect {
     #[default]
     Invalid,
+    Mix(Box<mixer::Mixer>),
     Reverb(Box<Reverb>),
     I3dl2(Box<I3dl2>),
     Biquad(Box<biquad::Biquad>),
     Aux(Box<aux::Aux>),
     Limiter(Box<limiter::Limiter>),
     Delay(Box<delay::Delay>),
+    Compressor(Box<compressor::Compressor>),
 }
 #[derive(Debug)]
 pub(super) struct Reverb {
@@ -54,7 +58,7 @@ impl Effect {
             Self::Invalid => false,
             Self::Reverb(effect) => effect.enabled && effect.work.pool == Some(pool),
             Self::I3dl2(effect) => effect.enabled && effect.work.pool == Some(pool),
-            Self::Biquad(_) => false,
+            Self::Biquad(_) | Self::Mix(_) | Self::Compressor(_) => false,
             Self::Aux(effect) => effect.uses_pool(pool),
             Self::Limiter(effect) => effect.uses_pool(pool),
             Self::Delay(effect) => effect.uses_pool(pool),
@@ -66,9 +70,11 @@ impl Effect {
             Self::Reverb(e) => Some((e.mix, e.order)),
             Self::I3dl2(e) => Some((e.mix, e.order)),
             Self::Biquad(e) => Some((e.mix, e.order)),
+            Self::Mix(e) => Some((e.mix, e.order)),
             Self::Aux(e) => Some((e.mix, e.order)),
             Self::Limiter(e) => Some((e.mix, e.order)),
             Self::Delay(e) => Some((e.mix, e.order)),
+            Self::Compressor(e) => Some((e.mix, e.order)),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -86,6 +92,24 @@ impl Effect {
         if raw[0] == 0 {
             *self = Self::Invalid;
             return Ok(4);
+        }
+        if raw[0] == 9 {
+            if raw[1] != 0 || !matches!(self, Self::Compressor(_)) {
+                *self = Self::Compressor(Box::default());
+            }
+            let Self::Compressor(effect) = self else {
+                unreachable!()
+            };
+            return Ok(effect.update(raw, started));
+        }
+        if raw[0] == 1 {
+            if raw[1] != 0 || !matches!(self, Self::Mix(_)) {
+                *self = Self::Mix(Box::new(mixer::Mixer::new(revision)));
+            }
+            let Self::Mix(effect) = self else {
+                unreachable!()
+            };
+            return effect.update(raw, started);
         }
         if raw[0] == 3 {
             if raw[1] != 0 || !matches!(self, Self::Delay(_)) {
@@ -227,6 +251,12 @@ impl Effect {
         samples: usize,
         count: usize,
     ) -> Result<(), RenderError> {
+        if let Self::Compressor(effect) = self {
+            return effect.process(buffers, samples, count).map_err(Into::into);
+        }
+        if let Self::Mix(effect) = self {
+            return effect.process(buffers, samples, count).map_err(Into::into);
+        }
         if let Self::Delay(effect) = self {
             return effect.process(buffers, samples, count).map_err(Into::into);
         }

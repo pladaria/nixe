@@ -1412,6 +1412,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nixe-gpu-ampere"
+version = "0.1.0"
+dependencies = [
+ "nixe-gpu",
+]
+
+[[package]]
 name = "nixe-gpu-maxwell"
 version = "0.1.0"
 dependencies = [
@@ -1437,6 +1444,7 @@ dependencies = [
  "libloading",
  "log",
  "nixe-gpu",
+ "nixe-gpu-ampere",
  "nixe-gpu-maxwell",
  "nixe-memory",
  "nixe-shader-recompiler",
@@ -1468,6 +1476,7 @@ dependencies = [
  "nixe-cpu-direct-memory",
  "nixe-cpu-jit",
  "nixe-gpu",
+ "nixe-gpu-ampere",
  "nixe-gpu-maxwell",
  "nixe-gpu-vulkan",
  "nixe-input",
@@ -1483,6 +1492,7 @@ dependencies = [
  "serde",
  "sha1",
  "sha2",
+ "smallvec",
  "tempfile",
  "toml",
 ]

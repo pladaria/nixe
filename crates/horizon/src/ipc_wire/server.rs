@@ -28,6 +28,7 @@ impl Domain {
         match handler {
             Vi(_) | NvDrv(_) | NvDrv2(_) | Gsv(_) => Self::Graphics,
             AudioOutManager(_)
+            | AudioUser
             | AudioOut(_)
             | AudioRendererManager(_)
             | AudioRenderer(_)

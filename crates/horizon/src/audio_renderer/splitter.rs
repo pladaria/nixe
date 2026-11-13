@@ -135,11 +135,6 @@ impl Splitters {
                     ));
                 }
             }
-            if in_use && revision >= 13 && data[flags + 1] != 0 {
-                return Err(UpdateError::Unsupported(
-                    "RequestUpdate: explicit splitter gain-history reset is not implemented".into(),
-                ));
-            }
             changed |= destination.mix != mix || destination.in_use != in_use;
             destination.mix = mix;
             for (i, volume) in destination.volumes.iter_mut().enumerate() {
@@ -148,7 +143,12 @@ impl Splitters {
                     return Err(UpdateError::Invalid);
                 }
             }
-            if !destination.in_use && in_use {
+            // @SPECULATIVE: REV13 documents previous-volume reset support, but
+            // not its DSP semantics. Treat it as reactivation: start the next
+            // ramp at the new gains instead of interpolating from stale gains.
+            // https://switchbrew.org/wiki/Audio_services#User_revision
+            let reset = revision >= 13 && data[flags + 1] != 0;
+            if in_use && (!destination.in_use || reset) {
                 destination.previous = destination.volumes;
                 destination.used = false;
             }

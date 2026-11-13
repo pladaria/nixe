@@ -27,8 +27,6 @@ pub enum MissingGpuExecution {}
 // An absent renderer has no constructible execution value. Loader/service-only
 // sessions can retain a typed None without linking any renderer implementation.
 impl GpuExecution for MissingGpuExecution {
-    type Conversion = nixe_gpu::native::NativeNv12Conversion;
-    type ImageRequest = crate::PresentationImageRequest;
     fn flush(&mut self) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
@@ -36,9 +34,6 @@ impl GpuExecution for MissingGpuExecution {
         match *self {}
     }
     fn end_command_list(&mut self) -> Result<(), BackendRuntimeError> {
-        match *self {}
-    }
-    fn convert_nv12(&mut self, _conversion: &Self::Conversion) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
 
@@ -105,14 +100,7 @@ impl GpuExecution for MissingGpuExecution {
     ) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
-    fn composite(
-        &mut self,
-        _request: Self::ImageRequest,
-        _swap_interval: u32,
-        _pacing: nixe_gpu::frame_metrics::FramePacing,
-    ) -> Result<ResidentImage, BackendRuntimeError> {
-        match *self {}
-    }
+
     fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
@@ -145,6 +133,22 @@ impl nixe_gpu::OwnerMemory for MissingGpuExecution {
         &mut self,
         _: &[nixe_gpu::native::GuestBufferRange],
     ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
+        match *self {}
+    }
+}
+
+impl nixe_gpu::GpuPresentation for MissingGpuExecution {
+    type Conversion = nixe_gpu::native::NativeNv12Conversion;
+    type ImageRequest = crate::PresentationImageRequest;
+    fn convert_nv12(&mut self, _conversion: &Self::Conversion) -> Result<(), BackendRuntimeError> {
+        match *self {}
+    }
+    fn composite(
+        &mut self,
+        _request: Self::ImageRequest,
+        _swap_interval: u32,
+        _pacing: nixe_gpu::frame_metrics::FramePacing,
+    ) -> Result<ResidentImage, BackendRuntimeError> {
         match *self {}
     }
 }

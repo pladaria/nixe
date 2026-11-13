@@ -22,6 +22,16 @@ fn same_storage(a: ImageFootprint, b: ImageFootprint) -> bool {
                 block_height_log2: bh,
                 block_depth_log2: bd,
             },
+        )
+        | (
+            ImageStorage::BlockLinearAmpere {
+                block_height_log2: ah,
+                block_depth_log2: ad,
+            },
+            ImageStorage::BlockLinearAmpere {
+                block_height_log2: bh,
+                block_depth_log2: bd,
+            },
         ) => {
             ah == bh
                 && ad == bd

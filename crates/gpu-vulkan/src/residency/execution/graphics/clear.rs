@@ -282,7 +282,7 @@ impl Residency<'_> {
         result
     }
 }
-fn contains_rect(area: vk::Rect2D, rect: vk::Rect2D) -> bool {
+pub(super) fn contains_rect(area: vk::Rect2D, rect: vk::Rect2D) -> bool {
     rect.offset.x >= area.offset.x
         && rect.offset.y >= area.offset.y
         && i64::from(rect.offset.x) + i64::from(rect.extent.width)

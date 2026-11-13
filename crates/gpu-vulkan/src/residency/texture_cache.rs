@@ -2,19 +2,20 @@
 //! Entries and views retire with the actual native image, including sparse maps.
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L1214-L1273
 use super::*;
+use nixe_gpu::native::ImageAddressSpace;
+use nixe_gpu::native::ImageInfo;
 use nixe_gpu::{ImageDimension, ImageMemoryLayout};
-use nixe_gpu_maxwell::engines::threed::ImageInfo;
-use nixe_gpu_maxwell::{MaxwellAddressSpaceId, MaxwellGpuMemory};
+use nixe_gpu_maxwell::MaxwellGpuMemory;
 const PAGE_BITS: u32 = 20;
 pub struct ImageRegistration {
     pub(super) info: ImageInfo,
-    pub(super) address_space: MaxwellAddressSpaceId,
+    pub(super) address_space: u64,
     pub(super) maps: Vec<(u64, u64)>,
     pub(super) cpu_address: u64,
 }
 pub(super) struct CachedImage {
     info: ImageInfo,
-    address_space: MaxwellAddressSpaceId,
+    address_space: u64,
     remapped: bool,
     picked: bool,
     cpu_address: u64,
@@ -33,22 +34,20 @@ fn image_type(dimension: ImageDimension) -> u8 {
 impl CachedImage {
     pub(super) fn can_rescale(&self, depth: bool) -> bool {
         let info = &self.info;
-        matches!(info.layout, ImageMemoryLayout::BlockLinear(block) if block.block_depth_log2 == 0)
+        matches!(info.layout, ImageMemoryLayout::BlockLinear(block) | ImageMemoryLayout::BlockLinearAmpere(block) if block.block_depth_log2 == 0)
             && info.description.dimension() == ImageDimension::Two
             && info.description.mip_levels() == 1
             && (info.description.extent().height > 288 || depth)
     }
-    pub(super) fn new(
-        info: ImageInfo,
-        address_space: MaxwellAddressSpaceId,
-        cpu_address: u64,
-    ) -> Self {
+    pub(super) fn new(info: ImageInfo, address_space: u64, cpu_address: u64) -> Self {
         let mut slices = smallvec::SmallVec::new();
         if info.description.dimension() == ImageDimension::Three {
             let [bw, bh] = info.description.format().block_extent();
             let bytes = u64::from(info.description.format().plane_bytes_per_block(0).unwrap());
             for (level, &(mip_offset, layout)) in info.mip_layouts.iter().enumerate() {
-                let ImageMemoryLayout::BlockLinear(block) = layout else {
+                let (ImageMemoryLayout::BlockLinear(block)
+                | ImageMemoryLayout::BlockLinearAmpere(block)) = layout
+                else {
                     unreachable!("volume layout")
                 };
                 let size = info.description.mip_extent(level as u8).unwrap();
@@ -131,7 +130,9 @@ impl CachedImage {
             ) => {
                 return (diff == 0 && x == y && a.extent() == b.extent()).then_some([0, 0]);
             }
-            (ImageMemoryLayout::BlockLinear(_), ImageMemoryLayout::BlockLinear(_)) => (),
+            (ImageMemoryLayout::BlockLinear(_), ImageMemoryLayout::BlockLinear(_))
+            | (ImageMemoryLayout::BlockLinearAmpere(_), ImageMemoryLayout::BlockLinearAmpere(_)) => {
+            }
             _ => return None,
         }
         let (level, layer) = if a.dimension() == ImageDimension::Three {
@@ -325,12 +326,7 @@ impl TextureCache {
     /// UnmapGPUMemory marks actual overlapping GPU images remapped and
     /// CPU-modified. Native producers and physical captures are not retired.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L681-L698
-    pub(super) fn modify_gpu_memory(
-        &mut self,
-        address_space: MaxwellAddressSpaceId,
-        address: u64,
-        bytes: u64,
-    ) {
+    pub(crate) fn modify_gpu_memory(&mut self, address_space: u64, address: u64, bytes: u64) {
         if bytes == 0 {
             return;
         }
@@ -436,7 +432,7 @@ impl Residency<'_> {
                 let Some(cached) = entry.cached.as_mut() else {
                     continue;
                 };
-                if cached.address_space != space.id() || cached.remapped {
+                if cached.address_space != space.id().get() || cached.remapped {
                     continue;
                 }
                 let Some(base) =
@@ -469,24 +465,27 @@ impl Residency<'_> {
     pub(crate) fn insert_guest_image(
         &mut self,
         info: &ImageInfo,
-        space: &MaxwellGpuMemory,
+        space: &(impl ImageAddressSpace + ?Sized),
     ) -> Result<ImageId, VulkanError> {
-        let start = space.address(info.address).map_err(failure)?;
         let mut parts = Vec::new();
         let mut maps = RangeSet::default();
         let mut first_cpu = None;
         for (gpu, bytes) in space
-            .get_submapped_range(start, info.size)
+            .image_mapped_ranges(info.address, info.size)
             .map_err(failure)?
         {
             // Like Eden InsertImage, resolve residency independently of the
             // image format and tiling, which come from ImageInfo's registers/TIC.
             // Compression PTE kinds do not select a different image layout here.
             // https://github.com/eden-emulator/mirror/blob/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/image_info.cpp
-            let cpu = space.device_address(gpu).map_err(failure)?;
+            let cpu = space
+                .image_device_address(gpu)?
+                .ok_or(VulkanError::InvalidResource(
+                    "mapped image span disappeared",
+                ))?;
             first_cpu.get_or_insert(cpu);
             let physical = self.runtime.device_memory.read_mapping(cpu, bytes)?;
-            parts.push((gpu.get() - info.address, physical));
+            parts.push((gpu - info.address, physical));
             maps.insert(cpu, bytes);
         }
         let mapping = if parts.len() == 1 && parts[0].0 == 0 && parts[0].1.bytes() == info.size {
@@ -494,7 +493,7 @@ impl Residency<'_> {
         } else {
             nixe_memory::PhysicalMapping::sparse(self.runtime.memory.identity(), info.size, &parts)?
         };
-        let (geometry, planes) = crate::native::maxwell::image::planes(info, mapping)?;
+        let (geometry, planes) = crate::native::image_planes::planes(info, mapping)?;
         let description = crate::native::images::description(info.description);
         let cpu_address = if let Some(cpu) = first_cpu {
             cpu
@@ -517,7 +516,7 @@ impl Residency<'_> {
         let registration = Some(ImageRegistration {
             cpu_address,
             info: info.clone(),
-            address_space: space.id(),
+            address_space: space.image_space_id(),
             maps: maps.iter().collect(),
         });
         if info.description.samples() != nixe_gpu::SampleCount::One {
@@ -525,8 +524,7 @@ impl Residency<'_> {
                 geometry,
                 description,
                 planes,
-                crate::native::maxwell::image::sample_grid(info.description.samples())
-                    .map_err(failure)?,
+                info.sample_grid,
                 registration,
             )
         } else if info.description.format().block_extent() == [1, 1] {
@@ -538,21 +536,21 @@ impl Residency<'_> {
     pub(crate) fn find_image(
         &mut self,
         info: &ImageInfo,
-        space: &MaxwellGpuMemory,
+        space: &(impl ImageAddressSpace + ?Sized),
     ) -> Result<Option<(ImageId, [u32; 2])>, VulkanError> {
-        let address = space.address(info.address).map_err(failure)?;
-        let cpu = match space.device_address(address) {
-            Ok(cpu) => cpu,
-            Err(nixe_gpu_maxwell::MaxwellGpuAccessError::UnmappedAddress { .. }) => {
-                let ranges = space
-                    .get_submapped_range(address, info.size)
-                    .map_err(failure)?;
-                let Some(&(first, _)) = ranges.first() else {
+        let cpu = match space.image_device_address(info.address)? {
+            Some(cpu) => cpu,
+            None => {
+                let mut ranges = space.image_mapped_ranges(info.address, info.size)?;
+                let Some((first, _)) = ranges.next() else {
                     return Ok(None);
                 };
-                space.device_address(first).map_err(failure)?
+                space
+                    .image_device_address(first)?
+                    .ok_or(VulkanError::InvalidResource(
+                        "mapped image span disappeared",
+                    ))?
             }
-            Err(error) => return Err(failure(error)),
         };
         let end = cpu
             .checked_add(info.size)
@@ -580,20 +578,15 @@ impl Residency<'_> {
                 }
                 cached.picked = true;
                 picked.push(id);
-                if cached.address_space != space.id() || cached.remapped {
+                if cached.address_space != space.image_space_id() || cached.remapped {
                     continue;
                 }
                 let Some(base) = cached.base(info) else {
                     continue;
                 };
-                // Preserve Maxwell's two distinct packed depth encodings.
-                // Their neutral Vulkan format is shared, their byte layout is not.
-                if matches!(
-                    cached.info.guest_format,
-                    nixe_gpu_maxwell::engines::threed::MaxwellThreeDGuestImageFormat::DepthStencil(
-                        _
-                    )
-                ) && cached.info.guest_format != info.guest_format
+                // A host view cannot reinterpret a different packed depth byte order.
+                if cached.info.packing != info.packing
+                    || cached.info.sample_grid != info.sample_grid
                 {
                     continue;
                 }

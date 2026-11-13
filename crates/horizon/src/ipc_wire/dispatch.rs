@@ -82,6 +82,9 @@ impl HorizonIpcObject {
             Self::Ssl(_) => "ssl",
             Self::Multimedia(_) => "mm:u",
             Self::AudioOutManager(_) => "audout:u",
+            Self::AudioUser => "aud:u",
+            Self::StreamPlay => "stpl:u",
+            Self::StreamPlayUser(_) => "IUserShimScopedObject",
             Self::AudioOut(_) => "IAudioOut",
             Self::AudioRendererManager(_) => "audren:u",
             Self::AudioRenderer(_) => "IAudioRenderer",
@@ -372,6 +375,12 @@ pub(crate) async fn execute_request(
         }
         HorizonIpcObject::AudioOutManager(session) => {
             services::dispatch_audio_out_manager(process, session, request, hipc).await?
+        }
+        HorizonIpcObject::AudioUser => {
+            services::dispatch_audio_user(process, &resources.audio, request, hipc)?
+        }
+        HorizonIpcObject::StreamPlay | HorizonIpcObject::StreamPlayUser(_) => {
+            services::dispatch_streamplay(process, target, request, hipc)?
         }
         HorizonIpcObject::OpusManager(session) => {
             services::dispatch_opus_manager(process, session, request, hipc).await?

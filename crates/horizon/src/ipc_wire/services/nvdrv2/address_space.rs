@@ -56,6 +56,14 @@ pub(super) fn ioctl(
             // with fabricated counter values. Engine completion must publish
             // counters here before it can release dependent GPU work.
             let mut owner = session.owner.state.lock().unwrap();
+            if owner.gpu.as_ref().is_some_and(|gpu| gpu.executor.is_some())
+                && owner
+                    .syncpt
+                    .as_ref()
+                    .is_some_and(|sync| sync.gpu_values.is_none())
+            {
+                return Err(IpcWireError::GraphicsService("late GPU syncpoint page initialization requires an ordered counter snapshot and is not implemented".into()));
+            }
             let account = match &owner.boot {
                 Some(crate::gsv::GsvBoot::Remote { account, .. }) => account.clone(),
                 _ => {
@@ -92,14 +100,13 @@ pub(super) fn ioctl(
                 .as_mut()
                 .and_then(|g| g.spaces.get_mut(&id))
                 .ok_or(IpcWireError::Malformed("GPU address space missing"))?;
+            let mut space = space.lock().unwrap();
             let address = crate::gsv::gpu::VA_END - nixe_memory::PAGE_SIZE;
             if space.sync_mapping.is_none() {
-                space.sync_mapping = Some(std::sync::Arc::new(
-                    space
-                        .memory
-                        .map(address, ranges.into(), true)
+                space.sync_mapping = Some(
+                    crate::gsv::gpu::PhysicalMap::new(&space.memory, ranges)
                         .map_err(|e| IpcWireError::SystemMemory(std::sync::Arc::new(e)))?,
-                ));
+                );
             }
             output[..8].copy_from_slice(&address.to_le_bytes());
             output[8..12].copy_from_slice(&4_u32.to_le_bytes());

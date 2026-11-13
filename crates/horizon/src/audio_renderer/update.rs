@@ -182,7 +182,7 @@ impl RendererUpdateState {
         put_word(
             &mut output,
             0,
-            u32::from_le_bytes(*b"REV0") + (super::CURRENT_REVISION << 24),
+            (params.revision & 0xffffff) | ((u32::from(b'0') + super::CURRENT_REVISION) << 24),
         );
         put_word(&mut output, 60, layout.output_size as u32);
         let pool_count = params.voices as usize * 4 + params.effects as usize;

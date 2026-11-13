@@ -23,9 +23,24 @@ pub(crate) const PARAMETER_SIZE: usize = 0x34;
 pub(crate) const CURRENT_REVISION: u32 = 15;
 
 pub(crate) fn revision_number(revision: u32) -> Option<u32> {
-    let revision = revision.checked_sub(u32::from_le_bytes(*b"REV0"))?;
-    (revision & 0x00ff_ffff == 0 && (1..=CURRENT_REVISION).contains(&(revision >> 24)))
-        .then_some(revision >> 24)
+    // Both platforms use the same revision numbers; Ounce distinguishes the
+    // ABI with a lowercase v. Higher revisions need their actual DSP features.
+    // https://switchbrew.org/wiki/Audio_services#BehaviorInfo_Revision
+    if !matches!(revision & 0xffffff, 0x564552 | 0x764552) {
+        return None;
+    }
+    let number = (revision >> 24).checked_sub(u32::from(b'0'))?;
+    (1..=CURRENT_REVISION).contains(&number).then_some(number)
+}
+
+pub(crate) fn revision_for_platform(
+    revision: u32,
+    platform: nixe_cpu::platform::TargetPlatform,
+) -> Option<u32> {
+    if revision & 0xffffff == 0x764552 && platform != nixe_cpu::platform::TargetPlatform::Switch2 {
+        return None;
+    }
+    revision_number(revision)
 }
 
 #[derive(Clone, Debug)]

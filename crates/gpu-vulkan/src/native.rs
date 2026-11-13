@@ -14,8 +14,11 @@ pub(crate) mod maxwell;
 pub(crate) use maxwell::blending::Blending;
 pub(crate) use maxwell::vertex_input::VertexInput;
 pub use maxwell::{MaxwellVulkanRasterizer, NativeFrontendStatistics};
+mod ampere;
+pub(crate) mod image_planes;
 pub(crate) mod images;
 mod state;
+mod targets;
 use crate::residency::color_blit_pipeline;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -51,6 +54,7 @@ struct NativeState {
     dynamic: maxwell::dynamic_state::DynamicState,
     current_context: Option<u64>,
     blit_pipelines: HashMap<vk::Format, NativePipeline>,
+    masked_clear_pipelines: crate::residency::execution::MaskedClearPipelines,
     blit_samplers: [Sampler; 2],
     video_pipelines: HashMap<vk::Format, NativePipeline>,
     video_inputs: Option<crate::residency::Nv12Inputs>,
@@ -135,6 +139,7 @@ impl NativeGpuExecution {
                 dynamic: Default::default(),
                 current_context: None,
                 blit_pipelines: HashMap::default(),
+                masked_clear_pipelines: Default::default(),
                 blit_samplers,
                 video_pipelines: HashMap::default(),
                 video_inputs: None,
@@ -343,7 +348,13 @@ impl NativeGpuExecution {
 // mutex. Current selections remain visible to CPU-side image deletion.
 // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/control/channel_state_cache.inc
 impl NativeGpuExecution {
-    fn create_channel(&mut self, channel: u64) {
+    fn create_channel(
+        &mut self,
+        channel: u64,
+        vertex_slots: usize,
+        stages: usize,
+        constant_slots: usize,
+    ) {
         self.residency
             .caches
             .texture_cache
@@ -353,9 +364,9 @@ impl NativeGpuExecution {
             .create_channel(channel);
         self.residency.runtime.buffer_bindings.create_channel(
             channel,
-            nixe_gpu_maxwell::MAXWELL_VERTEX_STREAM_COUNT,
-            nixe_gpu_maxwell::MAXWELL_BIND_GROUP_COUNT,
-            nixe_gpu_maxwell::MAXWELL_CONSTANT_BUFFER_SLOT_COUNT,
+            vertex_slots,
+            stages,
+            constant_slots,
         );
     }
     fn bind_channel(&mut self, context: u64) {
@@ -512,7 +523,7 @@ impl NativeExecution<'_> {
     }
     fn compose_frame(
         &mut self,
-        request: &nixe_gpu_maxwell::PresentationImageRequest,
+        request: NativePresentationImage,
     ) -> Result<ResidentImage, BackendRuntimeError> {
         self.residency
             .invalidate_device_mappings()
@@ -601,17 +612,6 @@ impl NativeExecution<'_> {
             .host
             .as_ref()
             .map_or(vk::Format::R8G8B8A8_UNORM, |h| h.output_format());
-        let request = NativePresentationImage {
-            crop: request.crop,
-            transform: request.transform,
-            address: request.mapping.address() + request.offset,
-            size: request.size,
-            layout: request.layout,
-            row_pitch: request.row_pitch,
-            extent: [request.width, request.height],
-            format: request.format,
-            allow_canonical_import: request.allow_canonical_import,
-        };
         let image = self
             .state
             .frames
@@ -660,8 +660,6 @@ impl NativeExecution<'_> {
 }
 
 impl GpuExecution for NativeGpuExecution {
-    type Conversion = NativeNv12Conversion;
-    type ImageRequest = nixe_gpu_maxwell::PresentationImageRequest;
     fn begin_frame_work(&mut self) {
         // Start before taking resource-cache locks so contention is measured.
         let device = &mut self.residency.runtime.device;
@@ -697,11 +695,6 @@ impl GpuExecution for NativeGpuExecution {
     }
     fn flush_deferred(&mut self) -> Result<(), BackendRuntimeError> {
         self.execution().flush_deferred()
-    }
-    fn convert_nv12(&mut self, conversion: &Self::Conversion) -> Result<(), BackendRuntimeError> {
-        self.execution().record(conversion.frontend, |native| {
-            native.record_conversion(conversion)
-        })
     }
 
     fn report_memory(
@@ -788,36 +781,7 @@ impl GpuExecution for NativeGpuExecution {
     ) -> Result<(), BackendRuntimeError> {
         self.execution().allocation_pressure(machine, allocation)
     }
-    fn composite(
-        &mut self,
-        request: nixe_gpu_maxwell::PresentationImageRequest,
-        swap_interval: u32,
-        pacing: nixe_gpu::frame_metrics::FramePacing,
-    ) -> Result<ResidentImage, BackendRuntimeError> {
-        let device = &mut self.residency.runtime.device;
-        device
-            .submission
-            .begin_composite(&mut device.dispatch, pacing);
-        let image = self.execution().compose_frame(&request)?;
-        // Composite/Present own this boundary outside resource-cache locks.
-        // Composition retains its actual native inputs and output.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/renderer_vulkan.cpp#L204-L248
-        self.residency
-            .runtime
-            .device
-            .dispatch
-            .wait_worker()
-            .map_err(runtime)?;
-        let mut residency = self.residency.access();
-        residency.tick_frame();
-        residency.maintain_budget(true).map_err(runtime)?;
-        // Recording-worker and cache-maintenance waits are production costs.
-        residency
-            .device_mut()
-            .submission
-            .end_frame(image.lease().producer().slot(), swap_interval);
-        Ok(image)
-    }
+
     fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
         // WaitPendingFences(true) commits a final cache prefix before waiting.
         self.fence_caches(None).map_err(runtime)?;
@@ -886,5 +850,66 @@ fn owner_memory_error(error: BackendRuntimeError) -> Arc<nixe_memory::MemoryErro
         other => Arc::new(nixe_memory::MemoryError::Execution(
             other.to_string().into(),
         )),
+    }
+}
+
+impl nixe_gpu::GpuPresentation for NativeGpuExecution {
+    type Conversion = NativeNv12Conversion;
+    type ImageRequest = nixe_gpu_maxwell::PresentationImageRequest;
+    fn convert_nv12(&mut self, conversion: &Self::Conversion) -> Result<(), BackendRuntimeError> {
+        self.execution().record(conversion.frontend, |native| {
+            native.record_conversion(conversion)
+        })
+    }
+    fn composite(
+        &mut self,
+        request: nixe_gpu_maxwell::PresentationImageRequest,
+        swap_interval: u32,
+        pacing: nixe_gpu::frame_metrics::FramePacing,
+    ) -> Result<ResidentImage, BackendRuntimeError> {
+        let image = NativePresentationImage {
+            crop: request.crop,
+            transform: request.transform,
+            address: request.mapping.address() + request.offset,
+            size: request.size,
+            layout: request.layout,
+            row_pitch: request.row_pitch,
+            extent: [request.width, request.height],
+            format: request.format,
+            allow_canonical_import: request.allow_canonical_import,
+        };
+        self.composite_image(image, swap_interval, pacing)
+    }
+}
+impl NativeGpuExecution {
+    pub(super) fn composite_image(
+        &mut self,
+        image: NativePresentationImage,
+        swap_interval: u32,
+        pacing: nixe_gpu::frame_metrics::FramePacing,
+    ) -> Result<ResidentImage, BackendRuntimeError> {
+        let device = &mut self.residency.runtime.device;
+        device
+            .submission
+            .begin_composite(&mut device.dispatch, pacing);
+        let image = self.execution().compose_frame(image)?;
+        // Composite/Present own this boundary outside resource-cache locks.
+        // Composition retains its actual native inputs and output.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/renderer_vulkan.cpp#L204-L248
+        self.residency
+            .runtime
+            .device
+            .dispatch
+            .wait_worker()
+            .map_err(runtime)?;
+        let mut residency = self.residency.access();
+        residency.tick_frame();
+        residency.maintain_budget(true).map_err(runtime)?;
+        // Recording-worker and cache-maintenance waits are production costs.
+        residency
+            .device_mut()
+            .submission
+            .end_frame(image.lease().producer().slot(), swap_interval);
+        Ok(image)
     }
 }

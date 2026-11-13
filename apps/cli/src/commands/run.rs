@@ -276,7 +276,8 @@ fn run_machine(
             .map(system_language)
             .unwrap_or(SystemLanguage::AmericanEnglish),
     );
-    let horizon_environment = HorizonEnvironment {
+    let mut horizon_environment = HorizonEnvironment {
+        ampere_graphics: None,
         operation_mode: initial_operation_mode,
         time: time_environment,
         settings: settings_environment,
@@ -287,33 +288,53 @@ fn run_machine(
             config.system.font.clone(),
         )?,
         system_archives: nixe_horizon::SystemArchives::new(config.system.dictionary.clone()),
-        application_language: plan.application_control().and_then(|control| {
-            desired_application_language(
+        application_language: match plan.application_control() {
+            Some(control) => desired_application_language(
                 control.supported_languages,
                 &config.system.preferred_languages,
-            )
-        }),
-        user_account_switch_locked: plan.application_control().and_then(|control| {
-            match control.user_account_switch_lock {
+            ),
+            None => {
+                log::warn!(
+                    "title has no control.nacp; application-control metadata is unavailable"
+                );
+                // @SPECULATIVE: without control.nacp the title's supported
+                // languages are unknown. Use American English as the explicit
+                // frontend fallback; this does not establish title support or
+                // synthesize other missing application-control properties.
+                log::warn!(
+                    "application language fallback: AmericanEnglish (en-US); reason: control.nacp is missing and the title's supported languages are unknown"
+                );
+                Some(SystemLanguage::AmericanEnglish)
+            }
+        },
+        user_account_switch_locked: match plan.application_control() {
+            Some(control) => match control.user_account_switch_lock {
                 UserAccountSwitchLock::Disable => Some(false),
                 UserAccountSwitchLock::Enable => Some(true),
                 UserAccountSwitchLock::Unknown(_) => None,
+            },
+            None => {
+                // @SPECULATIVE: absent control.nacp leaves the title's account
+                // policy unknown. Use an unlocked account-switch policy as the
+                // explicit frontend fallback, not as recovered title metadata.
+                // https://switchbrew.org/wiki/NACP_Format#UserAccountSwitchLock
+                log::warn!(
+                    "application account-switch fallback: unlocked (false); reason: control.nacp is missing and the title's account-switch policy is unknown"
+                );
+                Some(false)
             }
-        }),
+        },
         application_display_version: plan.display_version().map(str::to_owned),
         application_pseudo_device_seed: plan
             .application_control()
             .map(|control| control.seed_for_pseudo_device_id),
-        save_data: plan
-            .packaged_identity()
-            .zip(plan.application_control())
-            .map(|(identity, control)| {
-                SaveDataSystem::new(
-                    config.filesystem.save_data.clone(),
-                    identity.application_id().get(),
-                    control,
-                )
-            }),
+        save_data: plan.packaged_identity().map(|identity| {
+            SaveDataSystem::new(
+                config.filesystem.save_data.clone(),
+                identity.application_id().get(),
+                plan.application_control(),
+            )
+        }),
         diagnostics: horizon_diagnostics(diagnostics_configuration),
     };
     log::debug!(
@@ -342,19 +363,49 @@ fn run_machine(
         }
     };
     frontend = frontend.map(|frontend| frontend.with_window_state(saved_window_state));
+    let mut options = vulkan;
+    options.scaling_filter = config.video.scaling_filter;
+    options.anti_aliasing = config.video.anti_aliasing;
+    let (up_scale, down_shift) = config.gpu.resolution_scale.ratio();
+    options.resolution_scale = nixe_gpu_vulkan::ResolutionScaling::new(up_scale, down_shift);
     let (video_system, gpu_diagnostics) = if machine_profile.graphics()
         == GraphicsGeneration::Ampere
     {
+        let device =
+            nixe_gpu_vulkan::VulkanDevice::new(options, None).map_err(|e| e.to_string())?;
         log::info!(
-            "Ampere graphics services are not implemented; CPU initialization can proceed until a graphics request"
+            "GPU backend initialized: api=Vulkan native adapter={}",
+            device.profile().name
+        );
+        let memory = nixe_memory::device_memory::DeviceMemory::new(
+            process.memory().space().machine().clone(),
+            40,
+        );
+        let native_memory = memory.clone();
+        let cache_configuration = nixe_gpu_vulkan::cache::CacheConfiguration {
+            directory: Some(
+                config
+                    .gpu
+                    .cache_directory
+                    .join(title_identifier.to_ascii_lowercase()),
+            ),
+            ..Default::default()
+        };
+        horizon_environment.ampere_graphics =
+            Some(nixe_horizon::AmpereGraphics::new(memory, move || {
+                nixe_gpu_vulkan::NativeGpuExecution::new(
+                    native_memory,
+                    device,
+                    cache_configuration,
+                    u64::MAX,
+                )
+                .map_err(|e| nixe_gpu::BackendRuntimeError::Backend(e.to_string().into()))
+            }));
+        log::info!(
+            "Ampere command engines and native Vulkan targets enabled; shader translation is not implemented"
         );
         (None, None)
     } else {
-        let mut options = vulkan;
-        options.scaling_filter = config.video.scaling_filter;
-        options.anti_aliasing = config.video.anti_aliasing;
-        let (up_scale, down_shift) = config.gpu.resolution_scale.ratio();
-        options.resolution_scale = nixe_gpu_vulkan::ResolutionScaling::new(up_scale, down_shift);
         let (device, native_presentation) = if let Some(frontend) = frontend.as_mut() {
             let (device, client) = frontend
                 .create_vulkan_device(options)
@@ -525,16 +576,39 @@ fn desired_application_language(
     supported: SupportedLanguages,
     preferences: &[NacpLanguage],
 ) -> Option<SystemLanguage> {
-    // The configured preference order is frontend policy. AM receives a
-    // language the title actually declares; settings retain the system locale.
-    // https://switchbrew.org/wiki/NACP#Structure
-    preferences
+    // NACP declares supported languages, with no separate default-language
+    // field. Try configured preferences, then American English, then the first
+    // supported NACP slot. Settings retain the configured system locale.
+    // https://switchbrew.org/wiki/NACP_Format
+    if let Some((index, &language)) = preferences
         .iter()
-        .copied()
-        .chain([NacpLanguage::AmericanEnglish])
-        .chain(NacpLanguage::ALL)
-        .find(|language| supported.contains(*language))
-        .map(system_language)
+        .enumerate()
+        .find(|(_, language)| supported.contains(**language))
+    {
+        if index != 0 {
+            log::warn!(
+                "application language fallback: {language}; reason: earlier configured preferences {:?} are not supported by the title; using the next supported preference",
+                &preferences[..index]
+            );
+        }
+        return Some(system_language(language));
+    }
+    let reason = if preferences.is_empty() {
+        "no language preferences are configured"
+    } else {
+        "none of the configured language preferences is supported by the title"
+    };
+    let language = if supported.contains(NacpLanguage::AmericanEnglish) {
+        log::warn!("application language fallback: AmericanEnglish (en-US); reason: {reason}");
+        NacpLanguage::AmericanEnglish
+    } else {
+        let language = supported.iter().next()?;
+        log::warn!(
+            "application language fallback: {language}; reason: {reason}; AmericanEnglish is also unsupported; using the first supported NACP slot"
+        );
+        language
+    };
+    Some(system_language(language))
 }
 
 const fn system_language(language: NacpLanguage) -> SystemLanguage {
@@ -646,6 +720,7 @@ struct RunOutcome {
 }
 
 struct HorizonEnvironment {
+    ampere_graphics: Option<Arc<nixe_horizon::AmpereGraphics>>,
     operation_mode: OperationMode,
     time: TimeEnvironment,
     settings: SettingsEnvironment,
@@ -833,6 +908,9 @@ fn execute(
     .with_audio_backend(audio_backend.clone())
     .with_vibration_output(host_input.vibration.clone())
     .with_motion_settings(host_input.motion_settings.clone());
+    if let Some(graphics) = horizon_environment.ampere_graphics {
+        dispatcher = dispatcher.with_ampere_graphics(graphics);
+    }
     if let Some(host) = &host_input.keyboard {
         dispatcher = dispatcher.with_keyboard_host(host.clone());
     }

@@ -104,6 +104,43 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv2(
             let mut output = vec![0; output_size];
             let mut extra = vec![0; extra_size];
             match (&device, ioctl) {
+                (NvDrv2Device::ControlGpu, 0x402c4703 | 0xc0344704)
+                    if inline_size == 0
+                        && extra_size == 0
+                        && if ioctl == 0x402c4703 {
+                            input.len() == 44 && output.is_empty()
+                        } else {
+                            input.len() == 52 && output.len() == 52
+                        } =>
+                {
+                    // Identical ZBC table ABI for both console generations.
+                    // Retain registrations and reference counts for query calls.
+                    // https://switchbrew.org/wiki/NV_services#NVGPU_GPU_IOCTL_ZBC_SET_TABLE
+                    let result = {
+                        let mut state = session.state.lock().unwrap();
+                        if ioctl == 0x402c4703 {
+                            state.zbc_tables.set(&input)
+                        } else {
+                            state.zbc_tables.query(&input).map(|bytes| output = bytes)
+                        }
+                    };
+                    match result {
+                        Ok(()) => (),
+                        Err(crate::nvdrv::NvDrvCallError::GuestResult(code)) => {
+                            return semantic_success(
+                                request.token,
+                                false,
+                                &code.to_le_bytes(),
+                                &[],
+                                &[],
+                                None,
+                            );
+                        }
+                        Err(error) => {
+                            return Err(IpcWireError::GraphicsService(error.to_string().into()));
+                        }
+                    }
+                }
                 (NvDrv2Device::AddressSpaceGpu(binding), _) => {
                     address_space::ioctl(session, binding, ioctl, &input, &mut output, &mut extra)?
                 }
@@ -112,7 +149,8 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv2(
                     process
                         .read(&process.send_buffers()[1], 0, &mut entries)
                         .await?;
-                    channel::submit(process, session, fd, channel, &input, &entries).await?;
+                    channel::submit(process, session, fd, channel, &input, &entries, &mut output)
+                        .await?;
                 }
                 (NvDrv2Device::ChannelGpu(channel), _) => {
                     channel::ioctl(session, fd, channel, ioctl, &input, &mut output)?
@@ -272,13 +310,40 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv2(
             let fd = request_u32(request.data, 0).ok_or(IpcWireError::Malformed(
                 "NvDrv2 close requires a descriptor",
             ))?;
-            let mut state = session.state.lock().unwrap();
-            state.events.retain(|&(owner, _), _| owner != fd);
-            let error = if state.files.remove(&fd).is_some() {
+            let device = {
+                let mut state = session.state.lock().unwrap();
+                state.events.retain(|&(owner, _), _| owner != fd);
+                state.files.remove(&fd)
+            };
+            let error = if device.is_some() {
                 0_u32
             } else {
                 crate::nvdrv::NV_BAD_PARAMETER
             };
+            let completion = if let Some(NvDrv2Device::ChannelGpu(channel)) = device {
+                let mut channel = channel.lock().unwrap();
+                channel.closed = true;
+                let owner = session.owner.state.lock().unwrap();
+                match (
+                    channel.timeline.as_ref(),
+                    owner.gpu.as_ref().and_then(|g| g.executor.as_ref()),
+                ) {
+                    (Some(timeline), Some(executor)) => Some(
+                        executor
+                            .retire(timeline.lock().unwrap().timeline.instance().get())
+                            .map_err(IpcWireError::GraphicsService)?,
+                    ),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(completion) = completion {
+                completion
+                    .wait()
+                    .await
+                    .map_err(|_| IpcWireError::Cancelled)?;
+            }
             semantic_success(request.token, false, &error.to_le_bytes(), &[], &[], None)
         }
         4 => {

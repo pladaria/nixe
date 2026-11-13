@@ -998,3 +998,33 @@ impl MaxwellCommandMemory {
         Ok(CommandRead::Copied)
     }
 }
+
+impl nixe_gpu::native::ImageAddressSpace for MaxwellGpuMemory {
+    fn image_space_id(&self) -> u64 {
+        self.id().get()
+    }
+    fn image_device_address(&self, address: u64) -> Result<Option<u64>, nixe_memory::MemoryError> {
+        let address = self
+            .address(address)
+            .map_err(|e| nixe_memory::MemoryError::Execution(e.to_string().into()))?;
+        match self.device_address(address) {
+            Ok(address) => Ok(Some(address)),
+            Err(MaxwellGpuAccessError::UnmappedAddress { .. }) => Ok(None),
+            Err(e) => Err(nixe_memory::MemoryError::Execution(e.to_string().into())),
+        }
+    }
+    fn image_mapped_ranges(
+        &self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<impl Iterator<Item = (u64, u64)>, nixe_memory::MemoryError> {
+        let address = self
+            .address(address)
+            .map_err(|e| nixe_memory::MemoryError::Execution(e.to_string().into()))?;
+        Ok(self
+            .get_submapped_range(address, bytes)
+            .map_err(|e| nixe_memory::MemoryError::Execution(e.to_string().into()))?
+            .into_iter()
+            .map(|(a, b)| (a.get(), b)))
+    }
+}

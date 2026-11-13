@@ -83,31 +83,6 @@ impl RenderBuffers {
         self.mix_and_output(memory, state, params, pcm, volume)
     }
 
-    fn mix_add(
-        &mut self,
-        source: usize,
-        destination: usize,
-        samples: usize,
-        volume: f32,
-        precision: u32,
-    ) -> Result<(), Box<str>> {
-        if volume == 0.0 {
-            return Ok(());
-        }
-        let scaled = volume * (1_u64 << precision) as f32;
-        if !scaled.is_finite() || scaled.abs() >= (1_u64 << 63) as f32 {
-            return Err("rendering: mix gain cannot be represented in fixed point".into());
-        }
-        let gain = scaled as i64;
-        for sample in 0..samples {
-            let dst = destination * samples + sample;
-            let src = source * samples + sample;
-            self.samples[dst] =
-                self.samples[dst].wrapping_add(fixed_gain(self.samples[src], gain, precision));
-        }
-        Ok(())
-    }
-
     fn mix_and_output(
         &mut self,
         memory: &RenderMemory,
@@ -168,7 +143,8 @@ impl RenderBuffers {
                     };
                     let src = state.mix_offsets[id] + input % count;
                     for output in 0..word(target.as_slice(), 8) as usize {
-                        self.mix_add(
+                        mix_add(
+                            &mut self.samples,
                             src,
                             state.mix_offsets[destination.mix] + output,
                             samples,
@@ -186,7 +162,8 @@ impl RenderBuffers {
                                 mix.as_slice(),
                                 0x24 + (input * 24 + output) * 4,
                             ));
-                        self.mix_add(
+                        mix_add(
+                            &mut self.samples,
                             state.mix_offsets[id] + input,
                             state.mix_offsets[dest_id] + output,
                             samples,
@@ -256,6 +233,30 @@ impl RenderBuffers {
         }
         Ok(true)
     }
+}
+
+pub(super) fn mix_add(
+    buffers: &mut [i32],
+    source: usize,
+    destination: usize,
+    samples: usize,
+    volume: f32,
+    precision: u32,
+) -> Result<(), Box<str>> {
+    if volume == 0.0 {
+        return Ok(());
+    }
+    let scaled = volume * (1_u64 << precision) as f32;
+    if !scaled.is_finite() || scaled.abs() >= (1_u64 << 63) as f32 {
+        return Err("rendering: mix gain cannot be represented in fixed point".into());
+    }
+    let gain = scaled as i64;
+    for sample in 0..samples {
+        let dst = destination * samples + sample;
+        let src = source * samples + sample;
+        buffers[dst] = buffers[dst].wrapping_add(fixed_gain(buffers[src], gain, precision));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

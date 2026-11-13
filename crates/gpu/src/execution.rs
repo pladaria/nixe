@@ -55,8 +55,6 @@ pub type FenceAction = Box<
 /// Vulkan barriers belong to the renderer. Its fencing thread owns CPU actions
 /// and runs them after the requested cache prefix has been published.
 pub trait GpuExecution: OwnerMemory + 'static {
-    type Conversion: Send + 'static;
-    type ImageRequest: Send + 'static;
     /// Mark graphics command consumption, before frontend decoding. Repeated
     /// calls belong to the current image until composite.
     fn begin_frame_work(&mut self) {}
@@ -85,8 +83,6 @@ pub trait GpuExecution: OwnerMemory + 'static {
     fn device_uuid(&self) -> Option<[u8; 16]> {
         None
     }
-    /// Host conversion records directly; executable waits belong to native recording.
-    fn convert_nv12(&mut self, conversion: &Self::Conversion) -> Result<(), BackendRuntimeError>;
     /// Direct graphics-owner operations. Their arguments are consumed now;
     /// native resource retention and fence publication stay in the renderer.
     fn report_memory(
@@ -136,12 +132,21 @@ pub trait GpuExecution: OwnerMemory + 'static {
         machine: nixe_memory::MachineId,
         bytes: u64,
     ) -> Result<(), BackendRuntimeError>;
+    /// Drains accepted host uses; cancels unaccepted work without guest success.
+    fn teardown(&mut self) -> Result<(), BackendRuntimeError>;
+}
+
+/// Presentation and media requests have their own guest-facing ownership ABI.
+/// Resource synchronization and queue execution remain shared across engines.
+pub trait GpuPresentation: GpuExecution {
+    type Conversion: Send + 'static;
+    type ImageRequest: Send + 'static;
+    /// Host conversion records directly; executable waits belong to native recording.
+    fn convert_nv12(&mut self, conversion: &Self::Conversion) -> Result<(), BackendRuntimeError>;
     fn composite(
         &mut self,
         request: Self::ImageRequest,
         swap_interval: u32,
         pacing: crate::frame_metrics::FramePacing,
     ) -> Result<ResidentImage, BackendRuntimeError>;
-    /// Drains accepted host uses; cancels unaccepted work without guest success.
-    fn teardown(&mut self) -> Result<(), BackendRuntimeError>;
 }

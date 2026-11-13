@@ -306,8 +306,9 @@ async fn dispatch_account_root(
             session.initialize_application_info(process.process_id());
             account_response(session, request.token, HorizonIpcResult::SUCCESS)
         }
-        // This is the application's NACP UserAccountSwitchLock bit, not a
-        // consequence of how many local users happen to be configured.
+        // The frontend selects this application policy from NACP when present,
+        // or from its explicit missing-metadata policy. It is independent of
+        // how many local users are configured.
         // https://switchbrew.org/wiki/Account_services#acc:u0
         // https://switchbrew.org/wiki/NACP
         AccountCommand::IsUserAccountSwitchLocked => {

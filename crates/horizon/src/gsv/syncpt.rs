@@ -16,6 +16,9 @@ use std::{
 
 #[derive(Debug)]
 pub(crate) struct SyncptMirror {
+    pub counter_page: Arc<TransferMemoryObject>,
+    pub device_counter_page: Arc<super::gpu::PhysicalMap>,
+    pub notification: WritableEventObject,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -74,6 +77,7 @@ pub(crate) async fn write(
 impl SyncptMirror {
     pub(crate) async fn create(
         owner: &Arc<RunnableProcess>,
+        device_memory: &nixe_memory::device_memory::DeviceMemory,
         rw: Arc<TransferMemoryObject>,
         ro: Arc<TransferMemoryObject>,
         count: u32,
@@ -92,9 +96,20 @@ impl SyncptMirror {
         write(&machine, &ro, 0, initial)
             .await
             .map_err(|error| error.to_string().into_boxed_str())?;
+        let device_counter_page = Arc::new(
+            super::gpu::PhysicalMap::new(
+                device_memory,
+                ro.ranges()
+                    .capture(0, 0x2000)
+                    .map_err(|e| e.to_string().into_boxed_str())?,
+            )
+            .map_err(|e| e.to_string().into_boxed_str())?,
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let process = Arc::downgrade(owner);
+        let counter_page = ro.clone();
+        let notification = notify.clone();
         let worker = thread::Builder::new()
             .name("nixe-gsv-syncpt".into())
             .spawn(move || {
@@ -118,6 +133,9 @@ impl SyncptMirror {
             })
             .map_err(|error| error.to_string().into_boxed_str())?;
         Ok(Self {
+            counter_page,
+            device_counter_page,
+            notification,
             stop,
             worker: Some(worker),
         })
@@ -151,6 +169,172 @@ impl Drop for SyncptMirror {
         if let Some(worker) = self.worker.take() {
             worker.thread().unpark();
             worker.join().expect("GSV syncpoint mirror panicked");
+        }
+    }
+}
+
+/// Native counter state and event registrations share one publication lock.
+/// The event is signalled only after both CPU/GPU counter pages are written.
+#[derive(Debug)]
+pub(crate) struct Counter {
+    pub timeline: nixe_gpu::GuestTimeline,
+    pub value: u64,
+    pub consumed_value: u64,
+    slots: std::collections::BTreeMap<usize, Weak<std::sync::Mutex<Slot>>>,
+    waiters: std::collections::BTreeMap<u64, (u32, Waker)>,
+    next_waiter: u64,
+}
+#[derive(Debug)]
+pub(crate) struct Slot {
+    pub event: nixe_runtime::EventObject,
+    pending: Option<(u64, u64, bool)>,
+}
+impl Slot {
+    pub fn new(event: nixe_runtime::EventObject) -> Self {
+        Self {
+            event,
+            pending: None,
+        }
+    }
+    pub fn cancel(&mut self) {
+        self.pending = None;
+        self.event.signal();
+    }
+}
+impl Counter {
+    pub fn new(timeline: nixe_gpu::GuestTimeline, value: u64) -> Self {
+        Self {
+            timeline,
+            value,
+            consumed_value: value,
+            slots: Default::default(),
+            waiters: Default::default(),
+            next_waiter: 0,
+        }
+    }
+    pub fn has_waiters(&self) -> bool {
+        !self.waiters.is_empty()
+            || self.slots.values().any(|slot| {
+                slot.upgrade().is_some_and(|slot| {
+                    slot.lock()
+                        .unwrap()
+                        .pending
+                        .is_some_and(|(id, _, _)| id == self.timeline.instance().get())
+                })
+            })
+    }
+    fn reached(&self, threshold: u64, wide: bool) -> bool {
+        if wide {
+            self.value >= threshold
+        } else {
+            (self.value as u32).wrapping_sub(threshold as u32) as i32 >= 0
+        }
+    }
+    pub fn arm(
+        &mut self,
+        index: usize,
+        slot: &Arc<std::sync::Mutex<Slot>>,
+        threshold: u64,
+        wide: bool,
+    ) {
+        let mut state = slot.lock().unwrap();
+        state.event.clear();
+        state.pending = None;
+        if self.reached(threshold, wide) {
+            state.event.signal();
+            self.slots.remove(&index);
+        } else {
+            state.pending = Some((self.timeline.instance().get(), threshold, wide));
+            self.slots.insert(index, Arc::downgrade(slot));
+        }
+    }
+    pub fn notify(&mut self) {
+        let current = self.value as u32;
+        self.waiters.retain(|_, (threshold, wake)| {
+            let reached = current.wrapping_sub(*threshold) as i32 >= 0;
+            if reached {
+                wake.wake_by_ref();
+            }
+            !reached
+        });
+        let instance = self.timeline.instance().get();
+        let value = self.value;
+        self.slots.retain(|_, slot| {
+            let Some(slot) = slot.upgrade() else {
+                return false;
+            };
+            let mut slot = slot.lock().unwrap();
+            let Some((id, threshold, wide)) = slot.pending else {
+                return false;
+            };
+            if id != instance {
+                return false;
+            }
+            let reached = if wide {
+                value >= threshold
+            } else {
+                (value as u32).wrapping_sub(threshold as u32) as i32 >= 0
+            };
+            if reached {
+                slot.pending = None;
+                slot.event.signal();
+            }
+            !reached
+        });
+    }
+}
+
+/// Service waits use the same counter publication as guest event slots. Dropping
+/// the request unregisters its wakeup; no timer or polling worker is involved.
+pub(crate) struct CounterWait {
+    counter: Arc<std::sync::Mutex<Counter>>,
+    threshold: u32,
+    registration: Option<u64>,
+}
+impl CounterWait {
+    pub fn new(counter: Arc<std::sync::Mutex<Counter>>, threshold: u32) -> Self {
+        Self {
+            counter,
+            threshold,
+            registration: None,
+        }
+    }
+}
+impl Future for CounterWait {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let mut counter = this.counter.lock().unwrap();
+        if counter.reached(u64::from(this.threshold), false) {
+            if let Some(id) = this.registration.take() {
+                counter.waiters.remove(&id);
+            }
+            return Poll::Ready(());
+        }
+        let id = *this.registration.get_or_insert_with(|| {
+            counter.next_waiter = counter
+                .next_waiter
+                .checked_add(1)
+                .expect("counter wait identity overflow");
+            counter.next_waiter
+        });
+        match counter.waiters.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((this.threshold, context.waker().clone()));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if !entry.get().1.will_wake(context.waker()) {
+                    entry.get_mut().1.clone_from(context.waker());
+                }
+            }
+        }
+        Poll::Pending
+    }
+}
+impl Drop for CounterWait {
+    fn drop(&mut self) {
+        if let Some(id) = self.registration {
+            self.counter.lock().unwrap().waiters.remove(&id);
         }
     }
 }

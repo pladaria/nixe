@@ -461,7 +461,7 @@ impl NvDrvGpuExecutor {
     where
         L: MaxwellFrontend,
         R: Send + 'static,
-        E: GpuExecution<
+        E: nixe_gpu::GpuPresentation<
                 Conversion = nixe_gpu::native::NativeNv12Conversion,
                 ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
             >,

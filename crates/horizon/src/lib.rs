@@ -26,6 +26,7 @@ mod error_applet;
 mod friends;
 mod graphics;
 mod gsv;
+pub use gsv::execution::AmpereGraphics;
 pub use gsv::{GsvSession, NvDrv2Session};
 mod graphics_event;
 mod hid;

@@ -169,7 +169,7 @@ impl nixe_gpu_maxwell::MaxwellGpuMemoryInterface for CacheOwners {
         self.texture_cache
             .lock()
             .unwrap()
-            .modify_gpu_memory(address_space, address, bytes);
+            .modify_gpu_memory(address_space.get(), address, bytes);
         // UnmapGPUMemory only takes VirtualRangeCache's deferred mutex; the
         // caller does not lock BufferCache or mutate its GPU-owned entries.
         self.gpu_invalidations.unmap(address_space, address, bytes);
@@ -397,8 +397,7 @@ pub(crate) struct TextureCache {
     pub(crate) views: SlotVector<ImageView>,
     pub(super) attachments: SlotVector<attachment::AttachmentEntry>,
     pub(super) image_pages: HashMap<u64, Vec<ImageId>>,
-    pub(super) gpu_image_pages:
-        HashMap<(nixe_gpu_maxwell::MaxwellAddressSpaceId, u64), Vec<ImageId>>,
+    pub(super) gpu_image_pages: HashMap<(u64, u64), Vec<ImageId>>,
     pub(super) image_modification_tick: u64,
     pub(super) virtual_invalid_space: u64,
     pub(super) pending_downloads: Vec<texture_download::PendingDownload>,

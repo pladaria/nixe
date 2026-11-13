@@ -21,7 +21,7 @@ pub(super) fn run<L, E>(
 ) -> Result<(), GpuExecutorFailure>
 where
     L: MaxwellFrontend,
-    E: GpuExecution<
+    E: nixe_gpu::GpuPresentation<
             Conversion = nixe_gpu::native::NativeNv12Conversion,
             ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
         >,
@@ -67,7 +67,7 @@ struct ActiveSubmission {
 struct Owner<
     'a,
     L: MaxwellFrontend,
-    E: GpuExecution<
+    E: nixe_gpu::GpuPresentation<
             Conversion = nixe_gpu::native::NativeNv12Conversion,
             ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
         >,
@@ -98,7 +98,7 @@ struct Owner<
 impl<'a, L, E> Owner<'a, L, E>
 where
     L: MaxwellFrontend,
-    E: GpuExecution<
+    E: nixe_gpu::GpuPresentation<
             Conversion = nixe_gpu::native::NativeNv12Conversion,
             ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
         >,
@@ -770,7 +770,7 @@ struct CommandHost<
     'host,
     'owner,
     L: MaxwellFrontend,
-    E: GpuExecution<
+    E: nixe_gpu::GpuPresentation<
             Conversion = nixe_gpu::native::NativeNv12Conversion,
             ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
         >,
@@ -781,7 +781,7 @@ struct CommandHost<
 }
 impl<
     L: MaxwellFrontend,
-    E: GpuExecution<
+    E: nixe_gpu::GpuPresentation<
             Conversion = nixe_gpu::native::NativeNv12Conversion,
             ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
         >,
@@ -946,7 +946,7 @@ impl<
 
 impl<
     L: MaxwellFrontend,
-    E: GpuExecution<
+    E: nixe_gpu::GpuPresentation<
             Conversion = nixe_gpu::native::NativeNv12Conversion,
             ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
         >,

@@ -828,6 +828,9 @@ pub struct GpuMemoryLease {
     ranges: nixe_memory::CapturedMemory,
 }
 impl GpuMemoryLease {
+    pub fn cpu_address(&self) -> GuestVirtualAddress {
+        self.start
+    }
     pub fn ranges(&self) -> &nixe_memory::CapturedMemory {
         &self.ranges
     }

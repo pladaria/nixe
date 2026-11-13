@@ -10,6 +10,7 @@ members = [
     "crates/gpu",
     "crates/shader-recompiler",
     "crates/gpu-maxwell",
+    "crates/gpu-ampere",
     "crates/gpu-vulkan",
     "crates/horizon",
     "crates/input",
@@ -75,6 +76,7 @@ nixe-cpu-direct-memory = { path = "crates/cpu-direct-memory" }
 nixe-gpu = { path = "crates/gpu" }
 nixe-shader-recompiler = { path = "crates/shader-recompiler" }
 nixe-gpu-maxwell = { path = "crates/gpu-maxwell" }
+nixe-gpu-ampere = { path = "crates/gpu-ampere" }
 nixe-gpu-vulkan = { path = "crates/gpu-vulkan" }
 nixe-horizon = { path = "crates/horizon" }
 nixe-input = { path = "crates/input" }

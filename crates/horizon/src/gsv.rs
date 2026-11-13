@@ -4,8 +4,10 @@ use std::sync::{Arc, Mutex};
 pub(crate) mod channel;
 pub(crate) mod characteristics;
 pub(crate) mod display;
+pub(crate) mod execution;
 pub(crate) mod gpu;
-mod syncpt;
+pub(crate) mod image;
+pub(crate) mod syncpt;
 pub(crate) use syncpt::SyncptMirror;
 
 // @SPECULATIVE: counter capacity follows the observed reference driver profile.
@@ -16,6 +18,7 @@ pub(crate) const SYNCPOINT_COUNT: u32 = 192;
 pub struct GsvSession {
     pub(crate) process_id: u64,
     pub(crate) operation_mode: crate::OperationMode,
+    pub(crate) graphics: Arc<execution::AmpereGraphics>,
     pub(crate) interface: GsvInterface,
     pub(crate) state: Arc<Mutex<GsvState>>,
 }
@@ -26,6 +29,7 @@ pub(crate) struct GsvState {
     pub process: Option<Arc<nixe_runtime::RunnableProcess>>,
     pub context_created: bool,
     pub native_memory_features: Option<u64>,
+    pub native_images: image::Context,
     pub syncpt: Option<SyncptContext>,
     pub gpu: Option<gpu::GpuContext>,
     pub nvdrv: std::sync::Weak<Mutex<NvDrv2State>>,
@@ -50,10 +54,15 @@ pub(crate) enum GsvBoot {
 }
 
 impl GsvSession {
-    pub(crate) fn new(process_id: u64, operation_mode: crate::OperationMode) -> Self {
+    pub(crate) fn new(
+        process_id: u64,
+        operation_mode: crate::OperationMode,
+        graphics: Arc<execution::AmpereGraphics>,
+    ) -> Self {
         Self {
             process_id,
             operation_mode,
+            graphics,
             interface: GsvInterface::User,
             state: Arc::new(Mutex::new(GsvState::default())),
         }
@@ -83,6 +92,7 @@ pub struct NvDrv2Session {
 
 #[derive(Debug, Default)]
 pub(crate) struct NvDrv2State {
+    pub zbc_tables: crate::nvdrv::zbc::NvHostZbcTables,
     pub configuration: u64,
     pub next_fd: u32,
     pub files: std::collections::BTreeMap<u32, NvDrv2Device>,
@@ -116,10 +126,11 @@ pub(crate) enum GsvInterface {
 #[derive(Default)]
 pub(crate) struct SyncptContext {
     pub initialized: bool,
-    pub slots: Vec<Option<nixe_runtime::EventObject>>,
+    pub slots: Vec<Option<Arc<Mutex<syncpt::Slot>>>>,
     pub mirror: Option<SyncptMirror>,
+    pub mirror_initializing: bool,
     pub gpu_values: Option<nixe_memory::Allocation>,
-    pub timelines: std::collections::BTreeMap<u32, Arc<Mutex<nixe_gpu::GuestTimeline>>>,
+    pub timelines: std::collections::BTreeMap<u32, Arc<Mutex<crate::gsv::syncpt::Counter>>>,
     pub next_timeline: u64,
 }
 impl std::fmt::Debug for SyncptContext {
@@ -139,6 +150,7 @@ impl GsvSession {
             interface,
             process_id: self.process_id,
             operation_mode: self.operation_mode,
+            graphics: self.graphics.clone(),
             state: self.state.clone(),
         }
     }

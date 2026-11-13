@@ -40,6 +40,9 @@ pub enum HorizonIpcObject {
     AccountManagerForApplication(AccountManagerForApplicationSession),
     Bsd(BsdSession),
     Ssl(SslSession),
+    AudioUser,
+    StreamPlay,
+    StreamPlayUser(Arc<Mutex<Option<SharedMemoryObject>>>),
     AudioOutManager(crate::AudioOutManagerSession),
     AudioOut(crate::AudioOutSession),
     AudioRendererManager(crate::AudioRendererManagerSession),
@@ -1953,6 +1956,7 @@ struct AppletDomain {
     next_object_id: u32,
     objects: BTreeMap<u32, AppletObject>,
     operation_mode: OperationMode,
+    operation_mode_refresh_event: ReadableEventObject,
     operation_mode_changed_notification: bool,
     performance_mode_changed_notification: bool,
     cpu_boost_enabled: bool,
@@ -2031,6 +2035,9 @@ impl AppletSession {
         // Unsupported GPU behavior stops execution before it can be reported
         // as a hardware fault. No emulated GPU error is initially present.
         let (_, gpu_error_event_reader) = nixe_runtime::EventObject::create_pair(kernel);
+        // The operation mode is fixed at launch. Keep a distinct, stable event
+        // across session clones; no mode transition has occurred to signal it.
+        let (_, operation_mode_refresh_event) = nixe_runtime::EventObject::create_pair(kernel);
         let session = Self {
             kernel: kernel.clone(),
             domain: Arc::new(Mutex::new(AppletDomain {
@@ -2038,6 +2045,7 @@ impl AppletSession {
                 next_object_id: APPLET_ROOT_OBJECT_ID + 1,
                 objects,
                 operation_mode,
+                operation_mode_refresh_event,
                 operation_mode_changed_notification: false,
                 performance_mode_changed_notification: false,
                 cpu_boost_enabled: false,
@@ -2082,6 +2090,14 @@ impl AppletSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .operation_mode
+    }
+
+    pub(crate) fn operation_mode_refresh_event(&self) -> ReadableEventObject {
+        self.domain
+            .lock()
+            .unwrap()
+            .operation_mode_refresh_event
+            .clone()
     }
 
     /// Returns the applet-manager focus state exposed to the application.

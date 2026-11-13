@@ -20,6 +20,8 @@ pub(crate) struct DisplayContext {
 pub(crate) struct DisplayLayer {
     pub buffer_count: u32,
     pub attached: bool,
+    pub available: Arc<std::sync::atomic::AtomicU32>,
+    pub next_present_ns: u64,
 }
 #[derive(Debug)]
 pub(crate) struct DisplayEvent {
@@ -69,5 +71,23 @@ impl Drop for DisplayContext {
         if let Some(timer) = self.timer.take() {
             timer.cancel();
         }
+    }
+}
+
+/// The image and its original physical pin survive both queue admission and GPU
+/// consumption. Even if its service request is cancelled, the in-flight frame
+/// releases its slot only when the preparation owner drops this lease.
+pub(crate) struct Frame {
+    pub image: nixe_gpu::native::NativePresentationImage,
+    pub _pool: Arc<super::image::Pool>,
+    pub available: Arc<std::sync::atomic::AtomicU32>,
+    pub slot: u32,
+    pub interval: u32,
+    pub queued: std::time::Instant,
+}
+impl Drop for Frame {
+    fn drop(&mut self) {
+        self.available
+            .fetch_or(1 << self.slot, std::sync::atomic::Ordering::Release);
     }
 }

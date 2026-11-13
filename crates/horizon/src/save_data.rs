@@ -1,4 +1,4 @@
-//! Save-data access by application/user identity and creation from NACP declarations.
+//! Save-data access by application/user identity and selected creation sizes.
 
 use nixe_runtime::TransactionalDirectory;
 use std::collections::BTreeMap;
@@ -40,15 +40,38 @@ impl From<io::Error> for SaveDataError {
 }
 
 impl SaveDataSystem {
+    /// Uses NACP declarations when available, otherwise explicit fallback sizes
+    /// for account/device saves. Sizes are logical capacities, not preallocation.
     #[must_use]
-    pub fn new(root: PathBuf, program_id: u64, nacp: &ApplicationControlProperty) -> Self {
+    pub fn new(root: PathBuf, program_id: u64, nacp: Option<&ApplicationControlProperty>) -> Self {
+        let (account_size, account_journal, device_size, device_journal) = match nacp {
+            Some(nacp) => (
+                nacp.user_account_save_data_size,
+                nacp.user_account_save_data_journal_size,
+                nacp.device_save_data_size,
+                nacp.device_save_data_journal_size,
+            ),
+            None => {
+                // @SPECULATIVE: without control.nacp, save requirements are
+                // unknown. Allow account/device saves with 3.75 GiB for data
+                // and journal each; these are emulator policy, not title metadata.
+                // Existing volumes keep their persisted sizes and contents.
+                // Missing-metadata size policy reference:
+                // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/filesystem/save_data_controller.cpp
+                const FALLBACK_SIZE: i64 = 0xF000_0000;
+                log::warn!(
+                    "application save-data fallback: account/device data and journal sizes are each {FALLBACK_SIZE} bytes (logical capacity, no preallocation); reason: control.nacp is missing and the title's save requirements are unknown"
+                );
+                (FALLBACK_SIZE, FALLBACK_SIZE, FALLBACK_SIZE, FALLBACK_SIZE)
+            }
+        };
         Self {
             root,
             program_id,
-            account_size: nacp.user_account_save_data_size,
-            account_journal: nacp.user_account_save_data_journal_size,
-            device_size: nacp.device_save_data_size,
-            device_journal: nacp.device_save_data_journal_size,
+            account_size,
+            account_journal,
+            device_size,
+            device_journal,
             volumes: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -66,7 +89,7 @@ impl SaveDataSystem {
             .join("bcat")
     }
 
-    /// Prepares declared account/device saves for the selected launch user.
+    /// Prepares account/device saves using the selected creation sizes.
     /// The system launcher also ensures application saves; applications need
     /// not issue IApplicationFunctions::EnsureSaveData before mounting them.
     /// https://switchbrew.org/wiki/AM_services#EnsureSaveData
@@ -117,9 +140,9 @@ impl SaveDataSystem {
     }
 
     // EnsureSaveData creates the account save for the requested user, independently
-    // of BCAT/cache declarations. It preserves existing contents and reports no
-    // additional space needed, as Eden's IApplicationFunctions::EnsureSaveData.
-    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/am/service/application_functions.cpp
+    // of BCAT/cache declarations. It preserves existing contents and returns
+    // success with zero additional space only after ensuring the volume exists.
+    // https://switchbrew.org/wiki/AM_services#EnsureSaveData
     pub(crate) fn ensure(&self, user: u128) -> Result<u64, SaveDataError> {
         if self.account_size < 0 || self.account_journal < 0 {
             return Err(SaveDataError::Unsupported("negative NACP save-data size"));

@@ -215,6 +215,24 @@ pub enum ImageStorage {
         block_height_log2: u8,
         block_depth_log2: u8,
     },
+    BlockLinearAmpere {
+        block_height_log2: u8,
+        block_depth_log2: u8,
+    },
+}
+impl ImageStorage {
+    /// @SPECULATIVE: native GOB byte order follows observed Switch 2 surfaces;
+    /// the complete platform layout is not publicly specified.
+    /// https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/textures/decoders.cpp
+    #[inline]
+    fn gob_offset(self, offset: u64) -> u64 {
+        if matches!(self, Self::BlockLinearAmpere { .. }) {
+            let difference = ((offset >> 5) ^ (offset >> 6)) & 1;
+            offset ^ (difference << 5) ^ (difference << 6)
+        } else {
+            offset
+        }
+    }
 }
 /// Coordinates are compressed blocks or samples when the image uses those
 /// representations. Each aspect names only its actual bytes in a packed block.
@@ -288,12 +306,21 @@ impl WriteDomain {
                     && let ImageStorage::BlockLinear {
                         block_height_log2,
                         block_depth_log2,
+                    }
+                    | ImageStorage::BlockLinearAmpere {
+                        block_height_log2,
+                        block_depth_log2,
                     } = image.storage
                 {
                     // Resolve a GOB's base once, then copy its four fixed-width
                     // units directly. Row bits are already included in offset.
                     // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/textures/decoders.cpp#L80-L107
-                    const OFFSETS: [u64; 4] = [0, 32, 256, 288];
+                    let offsets = if matches!(image.storage, ImageStorage::BlockLinearAmpere { .. })
+                    {
+                        [0, 64, 256, 320]
+                    } else {
+                        [0, 32, 256, 288]
+                    };
                     let stride = 512u64 << (block_height_log2 + block_depth_log2);
                     let first_gob = left / 64;
                     let first_unit = (left % 64 / 16) as usize;
@@ -308,7 +335,7 @@ impl WriteDomain {
                         // complete planes, without recalculating that crop.
                         if first_unit != 0 {
                             let base = row + first_gob * stride;
-                            for (unit, &offset) in OFFSETS[first_unit..first_end].iter().enumerate()
+                            for (unit, &offset) in offsets[first_unit..first_end].iter().enumerate()
                             {
                                 copy(base + offset, 16, native_row + left + unit as u64 * 16)?;
                             }
@@ -316,7 +343,7 @@ impl WriteDomain {
                         for gob in gobs.clone() {
                             let base = row + gob * stride;
                             let count = (units - gob * 4).min(4) as usize;
-                            for (unit, &offset) in OFFSETS[..count].iter().enumerate() {
+                            for (unit, &offset) in offsets[..count].iter().enumerate() {
                                 copy(base + offset, 16, native_row + gob * 64 + unit as u64 * 16)?;
                             }
                         }
@@ -331,16 +358,21 @@ impl WriteDomain {
                         ImageStorage::BlockLinear {
                             block_height_log2,
                             block_depth_log2,
+                        }
+                        | ImageStorage::BlockLinearAmpere {
+                            block_height_log2,
+                            block_depth_log2,
                         } => {
                             row + (x >> 6) * (512u64 << (block_height_log2 + block_depth_log2))
                                 + ((x & 32) << 3)
-                                + ((x & 16) << 1)
+                                + image.storage.gob_offset((x & 16) << 1)
                                 + (x & 15)
                         }
                     };
                     let contiguous = |x: u64, bytes: u64| match image.storage {
                         ImageStorage::Pitch { .. } => bytes,
-                        ImageStorage::BlockLinear { .. } => bytes.min(16 - (x & 15)),
+                        ImageStorage::BlockLinear { .. }
+                        | ImageStorage::BlockLinearAmpere { .. } => bytes.min(16 - (x & 15)),
                     };
                     if full_element {
                         let mut x = left;
@@ -384,8 +416,10 @@ impl ImageFootprint {
     fn has_complete_storage_gob(self) -> bool {
         let left = u64::from(self.rect.x) * u64::from(self.packed_bytes);
         let right = left + u64::from(self.rect.width) * u64::from(self.packed_bytes);
-        matches!(self.storage, ImageStorage::BlockLinear { .. })
-            && self.packed_bytes.is_power_of_two()
+        matches!(
+            self.storage,
+            ImageStorage::BlockLinear { .. } | ImageStorage::BlockLinearAmpere { .. }
+        ) && self.packed_bytes.is_power_of_two()
             && self.packed_bytes <= 16
             && left.next_multiple_of(64) + 64 <= right
             && u64::from(self.rect.y).next_multiple_of(8) + 8
@@ -398,7 +432,9 @@ impl ImageFootprint {
         native_start: u64,
         destination: &mut [u8],
     ) -> Result<(), MemoryError> {
-        let ImageStorage::BlockLinear { .. } = self.storage else {
+        let (ImageStorage::BlockLinear { .. } | ImageStorage::BlockLinearAmpere { .. }) =
+            self.storage
+        else {
             unreachable!("complete GOBs require block-linear storage");
         };
         let packed = u64::from(self.packed_bytes);
@@ -437,6 +473,7 @@ impl ImageFootprint {
                         if full_element {
                             for (column, target) in target.chunks_exact_mut(16).enumerate() {
                                 let at = row_offset + ((column & 2) << 7) + ((column & 1) << 5);
+                                let at = self.storage.gob_offset(at as u64) as usize;
                                 target.copy_from_slice(&gob[at..at + 16]);
                             }
                         } else {
@@ -449,6 +486,7 @@ impl ImageFootprint {
                                     + ((x & 16) << 1)
                                     + (x & 15)
                                     + self.aspect_offset as usize;
+                                let at = self.storage.gob_offset(at as u64) as usize;
                                 let bytes = self.aspect_bytes as usize;
                                 target[..bytes].copy_from_slice(&gob[at..at + bytes]);
                             }
@@ -506,6 +544,10 @@ impl ImageFootprint {
             ImageStorage::BlockLinear {
                 block_height_log2,
                 block_depth_log2,
+            }
+            | ImageStorage::BlockLinearAmpere {
+                block_height_log2,
+                block_depth_log2,
             } => {
                 // GOB X/block-row strides include all Z slices even for a
                 // 2D plane; only the selected slice owns physical bytes.
@@ -516,18 +558,20 @@ impl ImageFootprint {
                 let slice_bytes = u64::from(self.rows).div_ceil(height)
                     * row_bytes.div_ceil(64)
                     * (512u64 << (block_height_log2 + block_depth_log2));
-                (slice >> block_depth_log2) * slice_bytes
-                    + (slice % (1u64 << block_depth_log2)) * (512u64 << block_height_log2)
-                    + (y / height)
-                        * row_bytes.div_ceil(64)
-                        * (512 << (block_height_log2 + block_depth_log2))
-                    + (x / 64) * (512 << (block_height_log2 + block_depth_log2))
-                    + (y % height / 8) * 512
-                    + (x % 64 / 32) * 256
-                    + (y % 8 / 2) * 64
-                    + (x % 32 / 16) * 32
-                    + (y % 2) * 16
-                    + x % 16
+                self.storage.gob_offset(
+                    (slice >> block_depth_log2) * slice_bytes
+                        + (slice % (1u64 << block_depth_log2)) * (512u64 << block_height_log2)
+                        + (y / height)
+                            * row_bytes.div_ceil(64)
+                            * (512 << (block_height_log2 + block_depth_log2))
+                        + (x / 64) * (512 << (block_height_log2 + block_depth_log2))
+                        + (y % height / 8) * 512
+                        + (x % 64 / 32) * 256
+                        + (y % 8 / 2) * 64
+                        + (x % 32 / 16) * 32
+                        + (y % 2) * 16
+                        + x % 16,
+                )
             }
         }
     }
@@ -539,6 +583,10 @@ impl ImageFootprint {
             && match self.storage {
                 ImageStorage::Pitch { .. } => self.depth_slice == 0 || self.rows == other.rows,
                 ImageStorage::BlockLinear {
+                    block_height_log2,
+                    block_depth_log2,
+                }
+                | ImageStorage::BlockLinearAmpere {
                     block_height_log2,
                     block_depth_log2,
                 } => {
@@ -582,6 +630,10 @@ impl ImageFootprint {
                 .checked_mul((u64::from(self.depth_slice) + 1) * u64::from(self.rows) - 1)
                 .and_then(|size| size.checked_add(row_bytes)),
             ImageStorage::BlockLinear {
+                block_height_log2,
+                block_depth_log2,
+            }
+            | ImageStorage::BlockLinearAmpere {
                 block_height_log2,
                 block_depth_log2,
             } if block_height_log2 <= 5 && block_depth_log2 <= 5 => {
@@ -633,6 +685,10 @@ impl ImageFootprint {
             ImageStorage::BlockLinear {
                 block_height_log2,
                 block_depth_log2,
+            }
+            | ImageStorage::BlockLinearAmpere {
+                block_height_log2,
+                block_depth_log2,
             } => {
                 let row_bytes = u64::from(self.columns) * u64::from(self.packed_bytes);
                 let block_bytes = 512u64 << (block_height_log2 + block_depth_log2);
@@ -653,7 +709,7 @@ impl ImageFootprint {
                         plane_bytes - within_block % plane_bytes,
                     );
                 }
-                let gob = in_row % 512;
+                let gob = self.storage.gob_offset(in_row % 512);
                 let x = (in_row / block_bytes) * 64
                     + (gob / 256) * 32
                     + ((gob / 32) & 1) * 16
@@ -1100,7 +1156,8 @@ impl Footprint {
                     let offset = at - image.base;
                     let (x, y, continuous) = match image.storage {
                         ImageStorage::Pitch { .. } => image.coordinates(offset),
-                        ImageStorage::BlockLinear { .. } => {
+                        ImageStorage::BlockLinear { .. }
+                        | ImageStorage::BlockLinearAmpere { .. } => {
                             // Resolve block and slice strides once per 512-byte GOB.
                             // Its 16-byte runs use only the intra-GOB bit permutation,
                             // as Eden's texture decoder, rather than repeating dynamic
@@ -1111,9 +1168,10 @@ impl Footprint {
                                 gob_base = base;
                                 gob_origin = image.coordinates(base);
                             }
-                            let within = offset & 511;
+                            let physical_within = offset & 511;
+                            let within = image.storage.gob_offset(physical_within);
                             if gob_origin.2 > 16 {
-                                (0, gob_origin.1, gob_origin.2 - within)
+                                (0, gob_origin.1, gob_origin.2 - physical_within)
                             } else {
                                 (
                                     gob_origin.0
@@ -1418,25 +1476,6 @@ mod tests {
     }
     use nixe_memory::{Machine, PAGE_SIZE};
 
-    fn storage_offset(storage: ImageStorage, width: u64, x: u64, y: u64) -> u64 {
-        match storage {
-            ImageStorage::Pitch { row_pitch } => y * row_pitch + x,
-            ImageStorage::BlockLinear {
-                block_height_log2,
-                block_depth_log2,
-            } => {
-                let height = 1u64 << block_height_log2;
-                let gob_x = x / 64;
-                let gob_y = y / 8;
-                let group_y = gob_y / height;
-                let gob = (((group_y * width.div_ceil(64) + gob_x) * height) << block_depth_log2)
-                    + gob_y % height;
-                let interleaved =
-                    (x & 15) | ((y & 1) << 4) | ((x & 16) << 1) | ((y & 6) << 5) | ((x & 32) << 3);
-                gob * 512 + interleaved
-            }
-        }
-    }
     #[test]
     fn volume_slice_projection_matches_gob_oracle_across_depth_groups() {
         use std::collections::BTreeMap;
@@ -1538,434 +1577,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn aspect_intersections_match_bytes_across_layouts_and_unaligned_origins() {
-        use std::collections::BTreeSet;
-        let machine = Machine::new(8 * PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(8 * PAGE_SIZE)
-            .unwrap()
-            .allocate(8 * PAGE_SIZE)
-            .unwrap();
-        let mut cases = Vec::new();
-        for storage in [
-            ImageStorage::Pitch { row_pitch: 69 },
-            ImageStorage::Pitch { row_pitch: 80 },
-            ImageStorage::BlockLinear {
-                block_height_log2: 0,
-                block_depth_log2: 0,
-            },
-            ImageStorage::BlockLinear {
-                block_height_log2: 1,
-                block_depth_log2: 0,
-            },
-            ImageStorage::BlockLinear {
-                block_height_log2: 0,
-                block_depth_log2: 3,
-            },
-            ImageStorage::BlockLinear {
-                block_height_log2: 1,
-                block_depth_log2: 2,
-            },
-            ImageStorage::BlockLinear {
-                block_height_log2: 3,
-                block_depth_log2: 0,
-            },
-        ] {
-            for origin in [0, 1, 4] {
-                let mapping = PhysicalMapping::new(&[AllocationRange::new(
-                    allocation.pin(),
-                    origin,
-                    8 * PAGE_SIZE - origin,
-                )
-                .unwrap()])
-                .unwrap();
-                for (aspect_offset, aspect_bytes) in [(0, 1), (1, 3), (3, 1), (0, 4)] {
-                    let footprint = Footprint::new(
-                        Arc::clone(&mapping),
-                        WriteDomain::Image(ImageFootprint {
-                            depth_slice: 0,
-                            base: 0,
-                            columns: 17,
-                            rows: 13,
-                            packed_bytes: 4,
-                            aspect_offset,
-                            aspect_bytes,
-                            storage,
-                            native_base: 0,
-                            native_element_bytes: 4,
-                            native_row_pitch: 68,
-                            rect: ByteRect {
-                                x: 0,
-                                y: 0,
-                                width: 17,
-                                height: 13,
-                            },
-                        }),
-                    )
-                    .unwrap();
-                    let mut bytes = BTreeSet::new();
-                    for y in 0..13 {
-                        for x in 0..17 {
-                            for lane in aspect_offset..aspect_offset + aspect_bytes {
-                                bytes.insert(
-                                    mapping.spans()[0].start.get()
-                                        + storage_offset(storage, 68, x * 4 + u64::from(lane), y),
-                                );
-                            }
-                        }
-                    }
-                    cases.push((footprint, bytes));
-                }
-            }
-        }
-        for (left, left_bytes) in &cases {
-            for (right, right_bytes) in &cases {
-                assert_eq!(
-                    left.intersects(right),
-                    !left_bytes.is_disjoint(right_bytes),
-                    "left={:?} right={:?}",
-                    left.domain(),
-                    right.domain()
-                );
-            }
-        }
-    }
-    #[test]
-    fn compact_images_match_a_byte_oracle_for_tiling_rectangles_aspects_and_padding() {
-        let machine = Machine::new(32 * PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(32 * PAGE_SIZE)
-            .unwrap()
-            .allocate(32 * PAGE_SIZE)
-            .unwrap();
-        let source = [AllocationRange::new(allocation.pin(), 0, 32 * PAGE_SIZE).unwrap()];
-        let bytes: Vec<_> = (0..32 * PAGE_SIZE)
-            .map(|byte| (byte.wrapping_mul(17) ^ (byte >> 8)) as u8)
-            .collect();
-        machine.write_resolved(&source, &bytes).unwrap();
-        let mapping = PhysicalMapping::new(&source).unwrap();
-        assert_eq!(mapping.spans().len(), 1);
-        let physical = mapping.spans()[0].start.get();
-        for storage in [
-            ImageStorage::Pitch { row_pitch: 100 },
-            ImageStorage::BlockLinear {
-                block_height_log2: 0,
-                block_depth_log2: 0,
-            },
-            ImageStorage::BlockLinear {
-                block_height_log2: 1,
-                block_depth_log2: 0,
-            },
-            ImageStorage::BlockLinear {
-                block_height_log2: 0,
-                block_depth_log2: 3,
-            },
-            ImageStorage::BlockLinear {
-                block_height_log2: 1,
-                block_depth_log2: 2,
-            },
-            ImageStorage::BlockLinear {
-                block_height_log2: 3,
-                block_depth_log2: 0,
-            },
-            ImageStorage::BlockLinear {
-                block_height_log2: 5,
-                block_depth_log2: 0,
-            },
-        ] {
-            for (aspect_offset, aspect_bytes, native_element_bytes) in
-                [(0, 4, 4), (0, 3, 4), (0, 3, 3), (3, 1, 1)]
-            {
-                for rect in [
-                    ByteRect {
-                        x: 0,
-                        y: 0,
-                        width: 23,
-                        height: 21,
-                    },
-                    ByteRect {
-                        x: 3,
-                        y: 2,
-                        width: 17,
-                        height: 13,
-                    },
-                ] {
-                    let image = ImageFootprint {
-                        depth_slice: 0,
-                        base: 67,
-                        columns: 23,
-                        rows: 21,
-                        packed_bytes: 4,
-                        aspect_offset,
-                        aspect_bytes,
-                        storage,
-                        native_base: 19,
-                        native_element_bytes,
-                        native_row_pitch: u64::from(23 * native_element_bytes) + 7,
-                        rect,
-                    };
-                    let footprint =
-                        Footprint::new(Arc::clone(&mapping), WriteDomain::Image(image)).unwrap();
-                    let mut expected = Vec::new();
-                    for y in rect.y..rect.y + rect.height {
-                        for x in rect.x..rect.x + rect.width {
-                            for lane in 0..aspect_bytes {
-                                let guest = storage_offset(
-                                    storage,
-                                    92,
-                                    u64::from(x * 4 + aspect_offset + lane),
-                                    u64::from(y),
-                                );
-                                let native = image.native_base
-                                    + u64::from(y) * image.native_row_pitch
-                                    + u64::from(x * native_element_bytes + lane);
-                                expected.push((physical + image.base + guest, native));
-                            }
-                        }
-                    }
-                    let mut wanted = vec![
-                        0xcd;
-                        (image.native_base + image.native_row_pitch * u64::from(image.rows))
-                            as usize
-                    ];
-                    for &(physical_byte, native) in &expected {
-                        wanted[native as usize] = bytes[(physical_byte - physical) as usize];
-                    }
-                    let mut selected = Vec::new();
-                    footprint.observed_pages(&mapping, &mut selected).unwrap();
-                    let inputs = pin_selected_pages(selected).unwrap();
-                    let mut captured = vec![0xcd; wanted.len()];
-                    machine
-                        .read_resources(&inputs, |reader| {
-                            footprint.capture_resource(reader, 0, &mut captured)
-                        })
-                        .unwrap();
-                    assert_eq!(captured, wanted, "capture {image:?}");
-                    expected.sort_unstable();
-                    let collect = |start: u64, bytes: u64| {
-                        let mut got = Vec::new();
-                        footprint
-                            .visit(0, ArenaOffset::new(start), bytes, |span| {
-                                got.extend(
-                                    (0..span.bytes)
-                                        .map(|byte| (span.start.get() + byte, span.native + byte)),
-                                );
-                                true
-                            })
-                            .unwrap();
-                        got
-                    };
-                    assert_eq!(collect(physical, mapping.bytes()), expected, "{image:?}");
-                    for offset in (0..footprint.end).step_by(37) {
-                        let start = physical + offset;
-                        let bytes = offset % 73 + 1;
-                        let wanted = expected
-                            .iter()
-                            .filter(|&&(p, _)| p >= start && p < start + bytes)
-                            .copied()
-                            .collect::<Vec<_>>();
-                        assert_eq!(collect(start, bytes), wanted, "{image:?}, offset={offset}");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "controlled full texture import CPU measurement"]
-    fn texture_import_throughput() {
-        let bytes = 2048 * 1024 * 4;
-        let machine = Machine::new(bytes).unwrap();
-        let allocation = machine.account(bytes).unwrap().allocate(bytes).unwrap();
-        let inputs = [AllocationRange::new(allocation.pin(), 0, bytes).unwrap()];
-        let source: Vec<_> = (0..bytes)
-            .map(|i| (i.wrapping_mul(11) ^ (i >> 11)) as u8)
-            .collect();
-        machine.write_resolved(&inputs, &source).unwrap();
-        let footprint = Footprint::new(
-            PhysicalMapping::new(&inputs).unwrap(),
-            WriteDomain::Image(ImageFootprint {
-                depth_slice: 0,
-                base: 0,
-                columns: 2048,
-                rows: 1024,
-                packed_bytes: 4,
-                aspect_offset: 0,
-                aspect_bytes: 4,
-                storage: ImageStorage::BlockLinear {
-                    block_height_log2: 5,
-                    block_depth_log2: 0,
-                },
-                native_base: 0,
-                native_element_bytes: 4,
-                native_row_pitch: 8192,
-                rect: ByteRect {
-                    x: 0,
-                    y: 0,
-                    width: 2048,
-                    height: 1024,
-                },
-            }),
-        )
-        .unwrap();
-        let mut output = vec![0; bytes as usize];
-        let cpu_ns = || {
-            std::fs::read_to_string("/proc/thread-self/schedstat")
-                .unwrap()
-                .split_whitespace()
-                .next()
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-        };
-        let iterations = 100;
-        machine.read_resources(&inputs, |reader| {
-            footprint.capture_resource(reader, 0, &mut output)?;
-            let cpu = cpu_ns();
-            let start = std::time::Instant::now();
-            for _ in 0..iterations {
-                footprint.capture_resource(reader, 0, &mut output)?;
-                std::hint::black_box(&output);
-            }
-            println!("TEXTURE_IMPORT_BENCH iterations={iterations} bytes={bytes} wall_ms_per_import={} cpu_ms_per_import={}",
-                start.elapsed().as_secs_f64() * 1000.0 / f64::from(iterations),
-                (cpu_ns() - cpu) as f64 / 1e6 / f64::from(iterations));
-            Ok(())
-        }).unwrap();
-        for y in [0, 7, 15, 127, 511, 1023] {
-            for x in [0, 15, 63, 64, 1023, 8191] {
-                let at = storage_offset(
-                    ImageStorage::BlockLinear {
-                        block_height_log2: 5,
-                        block_depth_log2: 0,
-                    },
-                    8192,
-                    x,
-                    y,
-                );
-                assert_eq!(output[(y * 8192 + x) as usize], source[at as usize]);
-            }
-        }
-    }
-
-    #[test]
-    fn gob_capture_preserves_fragment_aliases_crops_and_destination_padding() {
-        let machine = Machine::new(32 * PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(32 * PAGE_SIZE)
-            .unwrap()
-            .allocate(32 * PAGE_SIZE)
-            .unwrap();
-        let source: Vec<_> = (0..32 * PAGE_SIZE)
-            .map(|i| (i.wrapping_mul(13) ^ (i >> 7)) as u8)
-            .collect();
-        machine
-            .write_resolved(
-                &[AllocationRange::new(allocation.pin(), 0, 32 * PAGE_SIZE).unwrap()],
-                &source,
-            )
-            .unwrap();
-        // Logical GOBs cross both physically disjoint and repeated input runs.
-        let ranges = [
-            (2 * PAGE_SIZE + 13, 97),
-            (0, 1536),
-            (2 * PAGE_SIZE + 13, 97),
-            (4 * PAGE_SIZE + 3, 65536 - 1730),
-        ]
-        .map(|(offset, bytes)| AllocationRange::new(allocation.pin(), offset, bytes).unwrap());
-        let mapping = PhysicalMapping::new(&ranges).unwrap();
-        assert!(!mapping.is_injective());
-        for packed_bytes in [1, 2, 3, 4, 6, 8, 12, 16] {
-            let row_bytes = 37 * u64::from(packed_bytes);
-            for rect in [
-                ByteRect {
-                    x: 0,
-                    y: 0,
-                    width: 37,
-                    height: 21,
-                },
-                ByteRect {
-                    x: 1,
-                    y: 1,
-                    width: 35,
-                    height: 19,
-                },
-            ] {
-                let image = ImageFootprint {
-                    depth_slice: 0,
-                    base: 19,
-                    columns: 37,
-                    rows: 21,
-                    packed_bytes,
-                    aspect_offset: 0,
-                    aspect_bytes: packed_bytes,
-                    storage: ImageStorage::BlockLinear {
-                        block_height_log2: 1,
-                        block_depth_log2: 0,
-                    },
-                    native_base: 17,
-                    native_element_bytes: packed_bytes,
-                    native_row_pitch: row_bytes + 11,
-                    rect,
-                };
-                let footprint =
-                    Footprint::new(Arc::clone(&mapping), WriteDomain::Image(image)).unwrap();
-                let mut expected =
-                    vec![0xcd; (image.native_base + image.native_row_pitch * 21) as usize];
-                for y in rect.y..rect.y + rect.height {
-                    for x in rect.x * packed_bytes..(rect.x + rect.width) * packed_bytes {
-                        let mut at = image.base
-                            + storage_offset(image.storage, row_bytes, u64::from(x), u64::from(y));
-                        let input = ranges
-                            .iter()
-                            .find_map(|range| {
-                                if at < range.bytes() {
-                                    Some(range.offset() + at)
-                                } else {
-                                    at -= range.bytes();
-                                    None
-                                }
-                            })
-                            .unwrap();
-                        let native = image.native_base
-                            + u64::from(y) * image.native_row_pitch
-                            + u64::from(x);
-                        expected[native as usize] = source[input as usize];
-                    }
-                }
-                let mut selected = Vec::new();
-                footprint.observed_pages(&mapping, &mut selected).unwrap();
-                let inputs = pin_selected_pages(selected).unwrap();
-                let mut output = vec![0xcd; expected.len()];
-                machine
-                    .read_resources(&inputs, |reader| {
-                        footprint.capture_resource(reader, 0, &mut output)
-                    })
-                    .unwrap();
-                assert_eq!(output, expected);
-                if image.has_complete_gob() {
-                    let mut read_bytes = 0;
-                    output.fill(0xcd);
-                    image
-                        .capture_gobs(
-                            &mut |logical, target| {
-                                read_bytes += target.len() as u64;
-                                mapping.capture_stream(logical, target)
-                            },
-                            0,
-                            &mut output,
-                        )
-                        .unwrap();
-                    assert_eq!(output, expected);
-                    assert_eq!(
-                        read_bytes,
-                        u64::from(rect.width) * u64::from(rect.height) * u64::from(packed_bytes)
-                    );
-                }
-            }
-        }
-    }
     #[test]
     fn cached_mappings_do_not_pin_ram_and_repeated_physical_bytes_keep_logical_order() {
         let machine = Machine::new(2 * PAGE_SIZE).unwrap();

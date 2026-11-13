@@ -159,6 +159,10 @@ pub enum IpcRequest {
         horizon_index: u32,
     },
     GetAddOnContentListChangedEvent,
+    NotifyAddOnContentMount {
+        title_id: u64,
+        mounted: bool,
+    },
     CheckAddOnContentMountStatus,
 }
 
@@ -170,6 +174,7 @@ pub enum IpcResponse {
     Object(SemanticIpcObject),
     Event(ReadableEventObject),
     Size(u64),
+    AddOnContentCount(u32),
     EntryType(DirectoryEntryKind),
     FileSystemAttribute {
         name_length_max: u32,
@@ -277,13 +282,8 @@ pub(crate) fn dispatch_session(
                 .ok_or(IpcResultCode::INTERNAL_STATE)?,
         )),
         (IpcService::AddOnContent, IpcRequest::GetIndexedAddOnContentCount) => {
-            let count = mounts
-                .add_ons()
-                .iter()
-                .filter(|add_on| add_on.horizon_index().is_some())
-                .count();
-            Ok(IpcResponse::Size(
-                u64::try_from(count).map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
+            Ok(IpcResponse::AddOnContentCount(
+                u32::try_from(mounts.add_ons().len()).map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
             ))
         }
         (
@@ -301,7 +301,7 @@ pub(crate) fn dispatch_session(
             for index in mounts
                 .add_ons()
                 .iter()
-                .filter_map(|add_on| add_on.horizon_index())
+                .map(|add_on| add_on.horizon_index())
                 .skip(offset)
                 .take(max_entries)
             {
@@ -313,19 +313,28 @@ pub(crate) fn dispatch_session(
             if mounts
                 .add_ons()
                 .iter()
-                .any(|add_on| add_on.horizon_index() == Some(horizon_index))
+                .any(|add_on| add_on.horizon_index() == horizon_index)
             {
                 Ok(IpcResponse::None)
             } else {
                 Err(IpcResultCode::PATH_NOT_FOUND)
             }
         }
+        (IpcService::AddOnContent, IpcRequest::NotifyAddOnContentMount { title_id, mounted }) => {
+            // @SPECULATIVE: acknowledge notifications without changing backing
+            // lifetime, as the reference does. The process retains all resolved
+            // DLC for its lifetime, so guest mount/unmount cannot remove content
+            // or invalidate open FSP storage. Live catalog changes are unsupported.
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/aoc/addon_content_manager.cpp
+            log::debug!("aoc:u mount notification: title={title_id:016X} mounted={mounted}");
+            Ok(IpcResponse::None)
+        }
         (IpcService::AddOnContent, IpcRequest::CheckAddOnContentMountStatus) => {
             // This checks for loss of content mounted by the caller, rather
             // than requiring any DLC to be installed. The process namespace
             // owns immutable, resolved backing views for its entire lifetime;
-            // it cannot lose a mount. Mount/unmount notifications and live
-            // removal remain separate, unsupported commands.
+            // it cannot lose a mount. Notifications do not change that retention;
+            // live removal remains unsupported.
             // https://github.com/alula/Ryujinx/blob/master/src/Ryujinx.HLE/HOS/Services/Ns/Aoc/IAddOnContentManager.cs
             Ok(IpcResponse::None)
         }

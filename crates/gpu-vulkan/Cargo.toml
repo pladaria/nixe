@@ -17,6 +17,7 @@ nixe-video.workspace = true
 raw-window-handle.workspace = true
 nixe-gpu.workspace = true
 nixe-gpu-maxwell.workspace = true
+nixe-gpu-ampere.workspace = true
 nixe-shader-recompiler.workspace = true
 libloading = "0.8"
 tempfile.workspace = true

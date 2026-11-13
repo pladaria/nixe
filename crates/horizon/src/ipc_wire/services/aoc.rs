@@ -15,6 +15,8 @@ enum AddOnContentCommand {
     PrepareLegacy,
     Prepare,
     GetListChangedEvent,
+    NotifyMount,
+    NotifyUnmount,
     CheckMountStatus,
 }
 
@@ -29,6 +31,8 @@ impl AddOnContentCommand {
             6 => Some(Self::PrepareLegacy),
             7 => Some(Self::Prepare),
             8 => Some(Self::GetListChangedEvent),
+            11 => Some(Self::NotifyMount),
+            12 => Some(Self::NotifyUnmount),
             50 => Some(Self::CheckMountStatus),
             _ => None,
         }
@@ -69,6 +73,21 @@ pub(in crate::ipc_wire) fn decode_root_request(
                 return Ok(None);
             }
             Ok(Some(IpcRequest::CheckAddOnContentMountStatus))
+        }
+        command @ (AddOnContentCommand::NotifyMount | AddOnContentCommand::NotifyUnmount) => {
+            // PID descriptor and a u64 add-on title ID; no output payload.
+            // https://switchbrew.org/wiki/NS_services#aoc:u
+            // https://github.com/alula/Ryujinx/blob/master/src/Ryujinx.HLE/HOS/Services/Ns/Aoc/IAddOnContentManager.cs
+            if hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+                || !request.has_payload_size(8)
+            {
+                return Ok(None);
+            }
+            Ok(Some(IpcRequest::NotifyAddOnContentMount {
+                title_id: request_u64(request.data, 0).unwrap(),
+                mounted: command == AddOnContentCommand::NotifyMount,
+            }))
         }
         AddOnContentCommand::CountLegacy => Ok(Some(IpcRequest::GetIndexedAddOnContentCount)),
         AddOnContentCommand::Count => {

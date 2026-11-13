@@ -243,7 +243,6 @@ impl ReadOnlyMount {
 pub struct AddOnContent {
     title_id: TitleId,
     version: ApplicationVersion,
-    horizon_index: Option<u32>,
     mounts: Box<[ReadOnlyMount]>,
 }
 
@@ -251,13 +250,11 @@ impl AddOnContent {
     pub(crate) fn new(
         title_id: TitleId,
         version: ApplicationVersion,
-        horizon_index: Option<u32>,
         mounts: Vec<ReadOnlyMount>,
     ) -> Self {
         Self {
             title_id,
             version,
-            horizon_index,
             mounts: mounts.into_boxed_slice(),
         }
     }
@@ -267,8 +264,8 @@ impl AddOnContent {
     pub const fn version(&self) -> ApplicationVersion {
         self.version
     }
-    pub const fn horizon_index(&self) -> Option<u32> {
-        self.horizon_index
+    pub const fn horizon_index(&self) -> u32 {
+        self.title_id.add_on_content_index()
     }
     pub fn mounts(&self) -> &[ReadOnlyMount] {
         &self.mounts

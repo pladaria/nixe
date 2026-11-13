@@ -32,6 +32,31 @@ pub(in crate::ipc_wire) async fn dispatch_audio_device(
     hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let command = request.command_id;
+    if matches!(command, 19 | 20) {
+        if has_ipc_descriptors(hipc) || !request.has_payload_size(usize::from(command == 19)) {
+            return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+        }
+        // The host audio route applies the explicit device gain only; no
+        // automatic volume tuning is active. This query does not enable it.
+        // https://switchbrew.org/wiki/Audio_services#IAudioDevice
+        if command == 19 && request.data[0] != 0 {
+            // @SPECULATIVE: hardware auto-tuning is undocumented. Follow the
+            // reference's explicit disabled policy: acknowledge the request,
+            // keep reporting false, and preserve the client's device gains.
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/audio/audio_device.cpp
+            log::warn!(
+                "audio output auto-tuning requested but kept disabled: hardware tuning policy is undocumented; explicit device gains remain active"
+            );
+        }
+        return semantic_success(
+            request.token,
+            false,
+            if command == 20 { &[0] } else { &[] },
+            &[],
+            &[],
+            None,
+        );
+    }
     if !matches!(command, 0..=8 | 10..=14) {
         return unsupported_service_command("IAudioDevice", command);
     }

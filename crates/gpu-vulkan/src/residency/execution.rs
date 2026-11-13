@@ -9,12 +9,12 @@ mod graphics;
 mod guest;
 mod host;
 mod state;
-pub(crate) use graphics::NativeIndexBuffer;
 pub use graphics::{
     AttachmentSource, Draw, IndexBuffer, PreparedTargets, RenderAttachment, RenderingTargets,
     VertexBuffer,
 };
 pub(crate) use graphics::{DeferredClear, RenderPassState, ShaderImage};
+pub(crate) use graphics::{MaskedClearPipelines, NativeIndexBuffer};
 pub use state::{GraphicsParameters, HostGraphics};
 
 pub(crate) fn shader_accesses(

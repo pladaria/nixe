@@ -6,8 +6,7 @@
 //! No host layout, swizzle operation, or backend object crosses this boundary.
 
 mod attachment;
-mod info;
-pub use info::ImageInfo;
+use nixe_gpu::native::{ImageInfo, ImagePacking};
 mod targets;
 pub use attachment::{
     AttachmentInfo, attachment_description, blit_image_infos, render_target_info, solid_image_info,

@@ -143,25 +143,14 @@ async fn dispatch_command(
         return unsupported_service_command(name, request.command_id);
     };
 
-    let missing_add_on_metadata = match &decoded {
-        crate::IpcRequest::GetAddOnContentBaseId => {
-            process.mounts().add_on_content_base_id().is_none()
-        }
-        crate::IpcRequest::GetIndexedAddOnContentCount
-        | crate::IpcRequest::ListIndexedAddOnContent { .. }
-        | crate::IpcRequest::PrepareAddOnContent { .. } => process
-            .mounts()
-            .add_ons()
-            .iter()
-            .any(|addon| addon.horizon_index().is_none()),
-        _ => false,
-    };
-    if missing_add_on_metadata {
+    if matches!(&decoded, crate::IpcRequest::GetAddOnContentBaseId)
+        && process.mounts().add_on_content_base_id().is_none()
+    {
         return Err(IpcWireError::UnsupportedService(
             crate::ipc_wire::UnsupportedServiceOperation::CommandVariant {
                 service: "aoc:u",
                 command_id: request.command_id,
-                detail: "application NACP add-on base ID is unavailable",
+                detail: "application identity and NACP add-on base ID are unavailable",
             },
         ));
     }

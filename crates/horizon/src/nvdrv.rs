@@ -25,6 +25,7 @@ mod nvhost_ctrl_gpu;
 mod nvhost_gpu;
 mod nvmap;
 mod session;
+pub(crate) mod zbc;
 
 pub use device::{
     NvDrvDescriptorLifecycle, NvDrvDescriptorOwner, NvDrvDeviceDescriptor, NvDrvDeviceKind,
@@ -38,13 +39,14 @@ use ioctl::NvDrvIoctlResponse;
 pub(crate) use ioctl::{NvDrvInlineBuffer, NvDrvIoctlCaller, NvDrvIoctlOutcome, NvDrvIoctlRequest};
 use nvhost_as_gpu::decode_bind_channel;
 use nvhost_ctrl::{NvHostControl, NvHostCtrlIoctlOutcome};
-use nvhost_ctrl_gpu::{NvHostControlGpuEvents, NvHostZbcTables};
+use nvhost_ctrl_gpu::NvHostControlGpuEvents;
 use nvhost_gpu::{NvHostGpu, NvHostGpuIoctlResources, NvHostGpuSubmitResources};
 pub use nvmap::{
     NvMapAllocationMetadata, NvMapCpuMapping, NvMapExportedId, NvMapHandle, NvMapImageViewMetadata,
     NvMapObject, NvMapObjectId, NvMapPlaneMetadata, NvMapViewError,
 };
 use nvmap::{NvMapObjects, NvMapOwner, NvMapStateError};
+use zbc::NvHostZbcTables;
 
 pub(crate) const IOCTL_NVMAP_CREATE: u32 = 0xc008_0101;
 const IOCTL_NVMAP_FROM_ID: u32 = 0xc008_0103;
@@ -158,7 +160,7 @@ impl NvDrvSession {
     where
         L: nixe_gpu_maxwell::MaxwellFrontend,
         R: Send + 'static,
-        E: nixe_gpu::GpuExecution<
+        E: nixe_gpu::GpuPresentation<
                 Conversion = nixe_gpu::native::NativeNv12Conversion,
                 ImageRequest = nixe_gpu_maxwell::PresentationImageRequest,
             >,
@@ -1089,7 +1091,7 @@ fn ioctl_nvhost_ctrl_gpu(
 ) -> Result<Vec<u8>, NvDrvCallError> {
     debug_assert_eq!((profile.validate()).unwrap(), ());
     match request {
-        IOCTL_CTRL_GPU_ZBC_SET_TABLE => zbc_tables.set(input),
+        IOCTL_CTRL_GPU_ZBC_SET_TABLE => zbc_tables.set(input).map(|()| input.to_vec()),
         IOCTL_CTRL_GPU_ZBC_QUERY_TABLE => zbc_tables.query(input),
         IOCTL_CTRL_GPU_GET_GPU_TIME => {
             require_input_size(input, 16)?;

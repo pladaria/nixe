@@ -26,11 +26,21 @@ impl ProcessMountNamespace {
         // must not hide installed add-ons from aoc:u or prevent their access.
         // https://switchbrew.org/wiki/Filesystem_services#OpenDataStorageByDataId
         let add_ons = plan.add_ons().to_vec().into_boxed_slice();
-        // A missing control property is not an empty DLC namespace. Consumers
-        // requiring indices must report unavailable metadata rather than hide DLC.
         let add_on_content_base_id = plan
             .application_control()
-            .map(|control| control.add_on_content_base_id);
+            .map(|control| control.add_on_content_base_id)
+            .or_else(|| {
+                let identity = plan.packaged_identity()?;
+                // @SPECULATIVE: without NACP, a title-specific DLC base override
+                // is unknown. Use the conventional application-family + 0x1000
+                // layout; an actual NACP remains authoritative for this query.
+                // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/aoc/addon_content_manager.cpp
+                let base = identity.application_id().add_on_content_base_id();
+                log::warn!(
+                    "application add-on base ID fallback: {base}; reason: control.nacp is missing; using the conventional title-ID layout"
+                );
+                Some(base.get())
+            });
         Self {
             primary: plan.primary_file_system().cloned(),
             add_ons,
@@ -51,7 +61,7 @@ impl ProcessMountNamespace {
         &self.add_ons
     }
 
-    /// Returns this caller's add-on base title ID from its effective metadata.
+    /// Returns the NACP add-on base ID, or its fallback from application identity.
     pub const fn add_on_content_base_id(&self) -> Option<u64> {
         self.add_on_content_base_id
     }

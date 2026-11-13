@@ -80,11 +80,11 @@ impl QueryCache {
     }
     pub(super) fn invalidate_region(&mut self, address: u64, bytes: u64) {
         let end = address.saturating_add(bytes);
-        let start = address.saturating_sub(3);
+        let start = address.saturating_sub(15);
         let keys: Vec<_> = self
             .cached
             .range(start..end)
-            .filter_map(|(&at, _)| (at + 4 > address).then_some(at))
+            .filter_map(|(&at, query)| (at + query.bytes.len() as u64 > address).then_some(at))
             .collect();
         for key in keys {
             if let Some(query) = self.cached.remove(&key) {
@@ -130,8 +130,9 @@ impl QueryCache {
     }
     pub(super) fn flush_region(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
         let end = address.saturating_add(bytes);
-        for (&at, query) in self.cached.range(address.saturating_sub(3)..end) {
-            if at + 4 > address && !query.invalidated.load(Ordering::Relaxed) {
+        for (&at, query) in self.cached.range(address.saturating_sub(15)..end) {
+            if at + query.bytes.len() as u64 > address && !query.invalidated.load(Ordering::Relaxed)
+            {
                 query.write(query.value())?;
                 self.uniform_sync.fetch_add(1, Ordering::Release);
                 self.canonical_readback_bytes += query.value().len() as u64;
@@ -147,9 +148,9 @@ impl Residency<'_> {
         bytes: Arc<[u8]>,
     ) -> Result<nixe_gpu::FenceAction, VulkanError> {
         self.caches.sync_guest_memory();
-        if !matches!(bytes.len(), 4 | 16) {
+        if !matches!(bytes.len(), 4 | 8 | 16) {
             return Err(VulkanError::InvalidResource(
-                "query report requires four or sixteen bytes",
+                "report requires four, eight or sixteen bytes",
             ));
         }
         let mapping = PhysicalMapping::new(&target)?;

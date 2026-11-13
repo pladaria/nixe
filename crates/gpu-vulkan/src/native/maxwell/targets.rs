@@ -139,17 +139,6 @@ impl crate::native::NativeExecution<'_> {
         Ok(())
     }
 
-    pub(in crate::native) fn find_or_insert_image(
-        &mut self,
-        info: &model::engines::threed::ImageInfo,
-        space: &MaxwellGpuMemory,
-    ) -> Result<(crate::ImageId, [u32; 2]), crate::VulkanError> {
-        if let Some(found) = self.residency.find_image(info, space)? {
-            return Ok(found);
-        }
-        let image = self.residency.insert_guest_image(info, space)?;
-        Ok((image, [0, 0]))
-    }
     pub(in crate::native) fn render_target_view(
         &mut self,
         attachment: AttachmentInfo,
@@ -159,48 +148,7 @@ impl crate::native::NativeExecution<'_> {
         let info = attachment
             .image_info(role)
             .map_err(|e| crate::VulkanError::Compilation(e.to_string().into()))?;
-        let (image, [base_mip, base_layer]) = self.find_or_insert_image(&info, space)?;
-        let aspects = self
-            .residency
-            .texture_cache
-            .get(image)
-            .planes
-            .iter()
-            .fold(vk::ImageAspectFlags::empty(), |a, p| a | p.aspect);
-        self.residency.image_view(
-            image,
-            crate::ImageViewDescription {
-                size: {
-                    let e = info.description.extent();
-                    vk::Extent3D {
-                        width: e.width,
-                        height: e.height,
-                        depth: e.depth,
-                    }
-                },
-                format: super::super::images::format(info.description.format()),
-                // Eden RenderTargetImageViewType exposes all array layers or
-                // volume slices; CLEAR_SURFACE selects the layer at execution.
-                // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h
-                view_type: if info.description.dimension() == nixe_gpu::ImageDimension::Three
-                    || info.description.array_layers() > 1
-                {
-                    vk::ImageViewType::TYPE_2D_ARRAY
-                } else {
-                    vk::ImageViewType::TYPE_2D
-                },
-                aspects,
-                base_mip,
-                mip_count: 1,
-                base_layer,
-                layer_count: if info.description.dimension() == nixe_gpu::ImageDimension::Three {
-                    info.description.extent().depth
-                } else {
-                    u32::from(info.description.array_layers())
-                },
-                swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
-            },
-        )
+        self.image_target_view(&info, space)
     }
     pub(in crate::native) fn resolve_render_targets(
         &mut self,

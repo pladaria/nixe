@@ -257,6 +257,10 @@ impl Frames {
         let size = row_pitch * u64::from(source.extent[1]);
         let storage = match source.layout {
             ImageMemoryLayout::PitchLinear { row_pitch, .. } => ImageStorage::Pitch { row_pitch },
+            ImageMemoryLayout::BlockLinearAmpere(block) => ImageStorage::BlockLinearAmpere {
+                block_height_log2: block.block_height_log2,
+                block_depth_log2: block.block_depth_log2,
+            },
             ImageMemoryLayout::BlockLinear(block) => ImageStorage::BlockLinear {
                 block_height_log2: block.block_height_log2,
                 block_depth_log2: block.block_depth_log2,

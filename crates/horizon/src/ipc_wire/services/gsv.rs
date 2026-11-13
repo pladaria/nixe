@@ -2,6 +2,8 @@
 use super::prelude::*;
 mod display;
 mod gpu;
+mod image;
+mod sparse;
 mod syncpt;
 use crate::ipc_wire::message::{TipcRequest, encode_tipc_response};
 
@@ -19,16 +21,19 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
     match session.interface {
         crate::gsv::GsvInterface::User => {}
         crate::gsv::GsvInterface::Display => {
-            return display::dispatch(process, session, request, hipc);
+            return display::dispatch(process, session, request, hipc).await;
         }
         crate::gsv::GsvInterface::Gpu | crate::gsv::GsvInterface::Worker => {
-            return gpu::dispatch(process, session, request, hipc);
+            return gpu::dispatch(process, session, request, hipc).await;
         }
         crate::gsv::GsvInterface::Syncpt => {
             return syncpt::dispatch(process, session, request, hipc);
         }
     }
     match request.command_id {
+        111 | 112 | 314 | 315 | 423 | 429 | 430 | 434 | 435 | 1510 => {
+            image::dispatch(session, request, hipc)
+        }
         1 | 4 => {
             // https://switchbrew.org/wiki/Switch_2%3A_GSV_services#BootWithRemoteMemory
             let size = if request.command_id == 4 { 48 } else { 16 };
@@ -257,7 +262,9 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
                     session.child(crate::gsv::GsvInterface::Gpu),
                 ))
                 .map_err(IpcWireError::Handle)?;
-            state.gpu = Some(crate::gsv::gpu::GpuContext::default());
+            state.gpu = Some(crate::gsv::gpu::GpuContext::new(
+                session.graphics.memory.clone(),
+            ));
             Ok(encode_tipc_response(0, &[], &[handle], &[])?)
         }
         401..=403 => {
@@ -277,21 +284,6 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
                     gpu.created = false;
                 }
                 _ => return Err(IpcWireError::Malformed("invalid GPU context transition")),
-            }
-            Ok(encode_tipc_response(0, &[], &[], &[])?)
-        }
-        434 => {
-            if request.data.len() != 4 || has_ipc_descriptors(hipc) {
-                return Err(IpcWireError::Malformed("invalid GPU address-space query"));
-            }
-            let id = request_u32(request.data, 0).unwrap();
-            let state = session.state.lock().unwrap();
-            if !state
-                .gpu
-                .as_ref()
-                .is_some_and(|gpu| gpu.spaces.contains_key(&id))
-            {
-                return Err(IpcWireError::Malformed("unknown GPU address space"));
             }
             Ok(encode_tipc_response(0, &[], &[], &[])?)
         }
@@ -340,16 +332,18 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
                 return Err(IpcWireError::Malformed("empty syncpoint counter table"));
             }
             {
-                let state = session.state.lock().unwrap();
-                if !state
-                    .syncpt
-                    .as_ref()
-                    .is_some_and(|context| context.initialized && context.mirror.is_none())
-                {
+                let mut state = session.state.lock().unwrap();
+                if state.gpu.as_ref().is_some_and(|gpu| gpu.executor.is_some()) {
+                    return Err(IpcWireError::GraphicsService("late syncpoint mirror initialization requires an ordered counter snapshot and is not implemented".into()));
+                }
+                if !state.syncpt.as_ref().is_some_and(|context| {
+                    context.initialized && context.mirror.is_none() && !context.mirror_initializing
+                }) {
                     return Err(IpcWireError::Malformed(
                         "invalid syncpoint mirror lifecycle",
                     ));
                 }
+                state.syncpt.as_mut().unwrap().mirror_initializing = true;
             }
             let (request_write, request_read) =
                 nixe_runtime::EventObject::create_pair(process.kernel());
@@ -357,6 +351,7 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
                 nixe_runtime::EventObject::create_pair(process.kernel());
             let mirror = crate::gsv::SyncptMirror::create(
                 process.lifetime().client().process(),
+                &session.graphics.memory,
                 rw,
                 ro,
                 count,
@@ -375,14 +370,12 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
             let notify_handle = process
                 .return_handle(notify_read)
                 .map_err(IpcWireError::Handle)?;
-            session
-                .state
-                .lock()
-                .unwrap()
-                .syncpt
-                .as_mut()
-                .unwrap()
-                .mirror = Some(mirror);
+            {
+                let mut state = session.state.lock().unwrap();
+                let context = state.syncpt.as_mut().unwrap();
+                context.mirror = Some(mirror);
+                context.mirror_initializing = false;
+            }
             Ok(encode_tipc_response(
                 0,
                 &[],
