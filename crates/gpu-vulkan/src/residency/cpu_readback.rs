@@ -4,6 +4,37 @@ use super::*;
 use nixe_memory::{AccessOperation, AccessResult, AllocationRange, DeviceAccessRequest};
 
 impl Residency<'_> {
+    /// Read directly into owner-provided storage after resolving GPU authority.
+    /// The capture retains every physical span for the complete access.
+    pub(crate) fn read_captured_memory(
+        &mut self,
+        capture: &nixe_memory::CapturedMemory,
+        destination: &mut [u8],
+    ) -> Result<(), VulkanError> {
+        if capture.bytes() != destination.len() as u64 {
+            return Err(VulkanError::InvalidResource(
+                "owner read size differs from its capture",
+            ));
+        }
+        self.runtime.device.realize_deferred_clear()?;
+        for index in 0..capture.len() {
+            for extent in capture[index].physical_extents() {
+                for (address, bytes) in self.runtime.device_memory.device_ranges(extent) {
+                    self.flush_region(address, bytes)?;
+                }
+            }
+        }
+        let mut offset = 0;
+        for index in 0..capture.len() {
+            let range = &capture[index];
+            let end = offset + range.bytes() as usize;
+            self.runtime
+                .memory
+                .capture_stream(std::slice::from_ref(range), &mut destination[offset..end])?;
+            offset = end;
+        }
+        Ok(())
+    }
     pub(crate) fn flush_region(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
         self.runtime.device.realize_deferred_clear()?;
         self.download_texture_memory(address, bytes)?;

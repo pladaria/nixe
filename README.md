@@ -11,7 +11,6 @@ both platforms whenever technically appropriate.
 - Prepare an extensible foundation for Nintendo Switch 2 research and emulation.
 - Reuse CPU, memory, graphics, tooling, and other infrastructure when the underlying behavior is genuinely
   shared.
-- Favor testable, documented, and maintainable Rust code.
 
 ## Project Status
 

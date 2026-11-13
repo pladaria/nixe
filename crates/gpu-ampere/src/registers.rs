@@ -47,6 +47,24 @@ impl Registers {
             class,
             words: Box::new([0; 0xe00]),
         };
+        if class == Class::ThreeD {
+            // @SPECULATIVE: native context reset values are not published. These
+            // driver-required defaults match the reference's native context;
+            // the encodings themselves are defined by the C797 class header.
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/engines/maxwell_3d.cpp
+            for (method, value) in [
+                (0x37c, 1),
+                (0xdac, 0x1b02),
+                (0xdb0, 0x1b02),
+                (0x191c, 0x900),
+                (0x1920, 0x405),
+                (0xa18, 0x6420),
+                (0x13b0, 1f32.to_bits()),
+                (0x13b4, 1f32.to_bits()),
+            ] {
+                registers.set(method, value);
+            }
+        }
         if class == Class::TwoD {
             // The 2D context starts with one slice, as the driver's transfer
             // initialization assumes. Subsequent guest writes remain canonical.
@@ -87,6 +105,11 @@ pub(crate) fn method(class: Class, m: u32) -> Option<(&'static str, bool)> {
     // deliberately not admitted as state just because the bank has storage.
     let name = match class {
         Class::ThreeD => match m {
+            // @SPECULATIVE: GA10F's texture-data invalidation method is absent
+            // from the public C797 header. The reference identifies this address
+            // and executes cache invalidation followed by device ordering.
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/engines/maxwell_3d.h
+            0xf74 => return Some(("INVALIDATE_TEXTURE_DATA_CACHE", false)),
             0x240..=0x250 => "SET_ROOT_TABLE_VISIBILITY",
             0x380..=0x3f0 if (m - 0x380) % 32 <= 16 => "SET_STREAM_OUT_BUFFER",
             0x400..=0x4fc => "SET_POSITION_W_SCALED_OFFSET",

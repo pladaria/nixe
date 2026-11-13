@@ -15,7 +15,7 @@ pub(in crate::engines) mod registers;
 mod render_enable;
 mod render_targets;
 mod resource;
-pub use resource::texture::texture_address;
+
 mod shader_execution;
 pub mod state;
 pub(super) use registers::embedded_words;
@@ -109,14 +109,12 @@ pub use render_targets::{
     MaxwellThreeDRenderTargetLayerControl, MaxwellThreeDRenderTargetState,
     MaxwellThreeDSeparateFragmentData, MaxwellThreeDZCompressionMode,
 };
-pub use resource::texture::sampled_image_info;
+
 pub use resource::{
-    AttachmentInfo, attachment_description, blit_image_infos, decode_sampler, render_target_info,
-    solid_image_info,
+    AttachmentInfo, attachment_description, blit_image_infos, render_target_info, solid_image_info,
 };
 pub use resource::{
-    MaxwellThreeDGuestImageFormat, MaxwellThreeDResolvedSampler, MaxwellThreeDResourceError,
-    MaxwellThreeDResourceRole, MaxwellThreeDTextureDimension, MaxwellThreeDTextureReference,
+    MaxwellThreeDGuestImageFormat, MaxwellThreeDResourceError, MaxwellThreeDResourceRole,
 };
 pub use shader_execution::{
     MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,

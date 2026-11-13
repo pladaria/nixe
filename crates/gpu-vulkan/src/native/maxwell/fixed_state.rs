@@ -5,7 +5,7 @@ use super::*;
 use ash::vk;
 use nixe_gpu::TessellationState;
 
-use super::vertex_input::Attribute;
+use crate::native::vertex_format::Attribute;
 use std::hash::{Hash, Hasher};
 
 /// Integer-only packed state. Its feature-dependent prefix is both the equality

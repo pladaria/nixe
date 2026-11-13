@@ -92,3 +92,7 @@ pub mod shader_compilation;
 pub mod shader_encoding;
 pub mod shader_identity;
 pub mod shader_module;
+
+pub mod shader_memory;
+
+pub mod nvidia;

@@ -5,11 +5,9 @@ use crate::{
     artifact::Bindings,
     diagnostics::FailureCategory,
     environment::EnvironmentCaches,
+    frontend::{asl::build_asl, structure::StatementTree},
     ir::{Ir, Program, SyntaxNode, Value},
-    maxwell::{
-        asl::build_asl, flow::FlowGraph, location::Location, structure::StatementTree,
-        translate::MaxwellTranslator,
-    },
+    maxwell::{flow::FlowGraph, location::Location, translate::MaxwellTranslator},
     passes::{self, GraphicsRuntimeState},
     session::ProgramStore,
     types::OutputTopology,
@@ -78,17 +76,33 @@ impl Compiler {
         let mut host = host.clone();
         host.apply_descriptor_limit_policy();
         let stage = env.metadata().stage;
-        let entry = Location::new(env.metadata().entry_address()?)?;
-        let graph = FlowGraph::analyze(env, entry, stage == Stage::VertexA)?;
-        let mut tree = StatementTree::from_flow(&graph)?;
-        let syntax = build_asl(
-            env,
-            &mut self.ir,
-            &graph,
-            &mut tree,
-            &host,
-            &mut MaxwellTranslator,
-        )?;
+        let syntax = match env.metadata().isa {
+            crate::environment::ShaderIsa::Maxwell => {
+                let entry = Location::new(env.metadata().entry_address()?)?;
+                let graph = FlowGraph::analyze(env, entry, stage == Stage::VertexA)?;
+                let mut tree = StatementTree::from_flow(&graph)?;
+                build_asl(
+                    env,
+                    &mut self.ir,
+                    &graph,
+                    &mut tree,
+                    &host,
+                    &mut MaxwellTranslator,
+                )?
+            }
+            crate::environment::ShaderIsa::Ampere => {
+                let graph = crate::ampere::flow::analyze(env)?;
+                let mut tree = StatementTree::from_flow(&graph)?;
+                build_asl(
+                    env,
+                    &mut self.ir,
+                    &graph,
+                    &mut tree,
+                    &host,
+                    &mut crate::ampere::translate::AmpereTranslator,
+                )?
+            }
+        };
         let mut p = Program::new(stage);
         p.syntax = syntax;
         p.blocks = p

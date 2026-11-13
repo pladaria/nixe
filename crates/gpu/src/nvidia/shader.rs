@@ -1,4 +1,9 @@
-use super::invalid;
+fn invalid(detail: String) -> nixe_shader_recompiler::CompileError {
+    nixe_shader_recompiler::CompileError::new(
+        nixe_shader_recompiler::diagnostics::FailureCategory::Unsupported,
+        detail,
+    )
+}
 use nixe_shader_recompiler::{
     Result,
     types::{TexturePixelFormat as F, TextureType as T},
@@ -6,7 +11,7 @@ use nixe_shader_recompiler::{
 
 // Maxwell TIC layout:
 // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/texture_image_control_block.h
-pub(super) fn texture_type(words: [u32; 8]) -> Result<T> {
+pub fn texture_type(words: [u32; 8]) -> Result<T> {
     match (words[4] >> 23) & 15 {
         0 => Ok(T::Color1D),
         1 | 7 => Ok(if words[5] & (1 << 31) != 0 {
@@ -26,7 +31,7 @@ pub(super) fn texture_type(words: [u32; 8]) -> Result<T> {
 
 // Storage format classification does not depend on swizzles, image addresses,
 // dimensions or sampler state. Only the consumed format enters shader identity.
-pub(super) fn pixel_format(words: [u32; 8]) -> Result<F> {
+pub fn pixel_format(words: [u32; 8]) -> Result<F> {
     let format = words[0] & 0x7f;
     let component = (words[0] >> 7) & 7;
     let srgb = words[4] & (1 << 22) != 0;
@@ -190,7 +195,7 @@ pub(super) fn pixel_format(words: [u32; 8]) -> Result<F> {
     // Eden's format lookup classifies invalid/uninitialized entries as RGBA8;
     // VisitImageView resolves their out-of-range address to a null binding.
     // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/format_lookup_table.cpp#L274-L277
-    let address = crate::engines::threed::texture_address(words);
+    let address = super::texture_address(words);
     if address == 0 || address >= 1 << 40 {
         return Ok(F::A8B8G8R8_UNORM);
     }
@@ -199,7 +204,7 @@ pub(super) fn pixel_format(words: [u32; 8]) -> Result<F> {
     )))
 }
 
-pub(super) fn is_integer(format: F) -> bool {
+pub fn is_integer(format: F) -> bool {
     matches!(
         format,
         F::A8B8G8R8_SINT

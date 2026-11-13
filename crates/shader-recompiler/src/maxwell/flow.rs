@@ -8,7 +8,7 @@ use crate::{
     CompileError, Environment, Result,
     arena::{Arena, FlowBlockId},
     diagnostics::FailureCategory,
-    ir::{Condition, FlowTest, Pred, Reg},
+    ir::{Condition, FlowTest, Pred},
     session::SessionId,
     types::{ByteOffset, ProgramOffset},
 };
@@ -73,83 +73,11 @@ impl TokenStack {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EndClass {
-    Branch,
-    IndirectBranch,
-    Call,
-    Exit,
-    Return,
-    Kill,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FunctionId(pub usize);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IndirectBranch {
-    pub block: FlowBlockId,
-    pub address: ProgramOffset,
-}
-
-#[derive(Clone, Debug)]
-pub struct FlowBlock {
-    pub begin: FlowLocation,
-    pub end: FlowLocation,
-    pub end_class: EndClass,
-    pub condition: Condition,
-    pub stack: TokenStack,
-    pub branch_true: Option<FlowBlockId>,
-    pub branch_false: Option<FlowBlockId>,
-    pub function_call: Option<FunctionId>,
-    pub return_block: Option<FlowBlockId>,
-    pub branch_reg: Reg,
-    pub branch_offset: i32,
-    pub indirect_branches: Vec<IndirectBranch>,
-}
-
-impl FlowBlock {
-    fn at(location: Location, stack: TokenStack) -> Self {
-        Self {
-            begin: FlowLocation::Instruction(location),
-            end: FlowLocation::Instruction(location),
-            end_class: EndClass::Branch,
-            condition: Condition::always(true),
-            stack,
-            branch_true: None,
-            branch_false: None,
-            function_call: None,
-            return_block: None,
-            branch_reg: Reg(0),
-            branch_offset: 0,
-            indirect_branches: Vec::new(),
-        }
-    }
-    pub fn contains(&self, location: Location) -> bool {
-        let location = FlowLocation::Instruction(location);
-        self.begin <= location && location < self.end
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Label {
-    address: Location,
-    block: FlowBlockId,
-}
-
-#[derive(Debug)]
-pub struct Function {
-    pub entrypoint: Location,
-    pub blocks: BTreeMap<FlowLocation, FlowBlockId>,
-    labels: Vec<Label>,
-}
-
-pub struct FlowGraph {
-    blocks: Arena<FlowBlock, FlowBlockId>,
-    pub functions: Vec<Function>,
-    pub program_start: Location,
-    pub dispatcher: Option<FlowBlockId>,
-}
+pub use crate::frontend::flow::{EndClass, FunctionId, IndirectBranch};
+pub type FlowBlock = crate::frontend::flow::FlowBlock<Location, TokenStack>;
+type Label = crate::frontend::flow::Label<Location>;
+type Function = crate::frontend::flow::Function<Location>;
+pub type FlowGraph = crate::frontend::flow::FlowGraph<Location, TokenStack>;
 
 impl FlowGraph {
     pub fn analyze<E: Environment>(
@@ -191,13 +119,6 @@ impl FlowGraph {
                 .insert(FlowLocation::Instruction(end), dispatcher);
         }
         Ok(graph)
-    }
-
-    pub fn block(&self, id: FlowBlockId) -> Result<&FlowBlock> {
-        self.blocks.get(id)
-    }
-    fn block_mut(&mut self, id: FlowBlockId) -> Result<&mut FlowBlock> {
-        self.blocks.get_mut(id)
     }
 
     fn add_function(&mut self, entrypoint: Location) -> Result<FunctionId> {

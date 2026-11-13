@@ -457,7 +457,8 @@ impl PipelineCache {
             None => compiler.request(recipe),
         }
         .map_err(compilation)?;
-        let resources = PipelineResources::new(&shader, &pipeline.layout.key)?;
+        let resources =
+            PipelineResources::new(&shader, &pipeline.layout.key, [18, 18, 18, 18, 18, 8])?;
         let configure = GraphicsPipeline::configure_func(&shader, &resources);
         let sampled_reuse = maxwell::reuse::SampledTextures::eligible(&resources);
         Ok(GraphicsPipeline {
@@ -515,7 +516,7 @@ impl PipelineCache {
     pub(super) fn current_compute(
         &mut self,
         launch: &nixe_gpu_maxwell::MaxwellResolvedComputeLaunch,
-        shader: &nixe_gpu_maxwell::recompiler::ShaderInfo,
+        shader: &nixe_gpu::shader_memory::ShaderInfo,
         space: &nixe_gpu_maxwell::MaxwellGpuMemory,
         access: &mut nixe_gpu::MemoryAccess<'_>,
         statistics: &mut maxwell::NativeFrontendStatistics,
@@ -573,7 +574,8 @@ impl PipelineCache {
             None => compiler.request(recipe),
         }
         .map_err(compilation)?;
-        let resources = PipelineResources::new(&shader, &pipeline.layout.key)?;
+        let resources =
+            PipelineResources::new(&shader, &pipeline.layout.key, [18, 18, 18, 18, 18, 8])?;
         Ok(ComputePipeline {
             key,
             pipeline,

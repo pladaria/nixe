@@ -1416,6 +1416,7 @@ name = "nixe-gpu-ampere"
 version = "0.1.0"
 dependencies = [
  "nixe-gpu",
+ "nixe-memory",
 ]
 
 [[package]]

@@ -38,13 +38,13 @@ pub struct NativeFrontendStatistics {
 pub(in crate::native) struct GraphicsShaders {
     pub(in crate::native) hashes: [u64; model::MAXWELL_PIPELINE_SHADER_COUNT],
     pub(in crate::native) infos:
-        [Option<Arc<model::recompiler::ShaderInfo>>; model::MAXWELL_PIPELINE_SHADER_COUNT],
+        [Option<Arc<nixe_gpu::shader_memory::ShaderInfo>>; model::MAXWELL_PIPELINE_SHADER_COUNT],
     pub(in crate::native) groups: [Option<u8>; 5],
     pub(in crate::native) tessellation_enabled: bool,
 }
 pub struct MaxwellVulkanRasterizer {
     renderer: Rc<RefCell<Option<super::NativeGpuExecution>>>,
-    shader_cache: model::recompiler::ShaderCache,
+    shader_cache: nixe_gpu::shader_memory::ShaderCache,
     shaders: Option<GraphicsShaders>,
     pipelines: PipelineCache,
     profile: Arc<crate::DeviceProfile>,
@@ -149,13 +149,21 @@ impl MaxwellVulkanRasterizer {
             let source = model::recompiler::graphics_source(state, index).map_err(compilation)?;
             let gpu = space.address(source.address).map_err(compilation)?;
             let device = space.device_address(gpu).map_err(compilation)?;
-            let info = if let Some(info) = self.shader_cache.try_get(device) {
+            let info = if let Some(info) = self.shader_cache.try_get(
+                device,
+                nixe_shader_recompiler::environment::ShaderIsa::Maxwell,
+            ) {
                 info
             } else {
                 let request =
                     model::recompiler::graphics_request(state, index).map_err(compilation)?;
                 self.shader_cache
-                    .make_shader_info(space, device, &request, access)
+                    .register(
+                        device,
+                        nixe_shader_recompiler::environment::ShaderIsa::Maxwell,
+                        model::recompiler::analyze_code(space, &request, access)
+                            .map_err(compilation)?,
+                    )
                     .map_err(compilation)?
             };
             let stage = nixe_gpu::shader_compilation::neutral_stage(source.stage) as usize;
@@ -457,11 +465,19 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             .address(launch.shader_address())
             .map_err(compilation)?;
         let address = space.device_address(address).map_err(compilation)?;
-        let shader = if let Some(shader) = self.shader_cache.try_get(address) {
+        let shader = if let Some(shader) = self.shader_cache.try_get(
+            address,
+            nixe_shader_recompiler::environment::ShaderIsa::Maxwell,
+        ) {
             shader
         } else {
             self.shader_cache
-                .make_shader_info(space, address, &launch.capture_request(), access)
+                .register(
+                    address,
+                    nixe_shader_recompiler::environment::ShaderIsa::Maxwell,
+                    model::recompiler::analyze_code(space, &launch.capture_request(), access)
+                        .map_err(compilation)?,
+                )
                 .map_err(compilation)?
         };
         let slot = self

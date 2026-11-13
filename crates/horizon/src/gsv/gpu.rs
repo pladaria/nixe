@@ -51,6 +51,7 @@ impl GpuContext {
 pub(crate) struct GpuAddressSpace {
     pub memory: DeviceMemory,
     id: u64,
+    generation: u64,
     pub mappings: BTreeMap<u64, GpuMapping>,
     pub sync_mapping: Option<PhysicalMap>,
     regions: BTreeMap<u64, NativeRegion>,
@@ -135,6 +136,7 @@ impl GpuAddressSpace {
         Self {
             memory,
             id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            generation: 0,
             mappings: BTreeMap::new(),
             sync_mapping: None,
             regions: BTreeMap::new(),
@@ -198,6 +200,7 @@ impl GpuAddressSpace {
         }
         let ranges = source.capture(offset, bytes)?;
         let physical = Arc::new(PhysicalMap::new(&self.memory, ranges)?);
+        self.generation = self.generation.wrapping_add(1);
         self.mappings.insert(
             address,
             GpuMapping {
@@ -465,6 +468,7 @@ impl GpuAddressSpace {
                     },
                 ));
             }
+            self.generation = self.generation.wrapping_add(1);
             self.mappings.remove(&start);
             self.mappings.extend(survivors);
         }
@@ -560,6 +564,19 @@ impl nixe_gpu::native::ImageAddressSpace for GpuAddressSpace {
 }
 
 impl nixe_gpu_ampere::RenderMemory for GpuAddressSpace {
+    fn capture_memory(
+        &mut self,
+        address: u64,
+        bytes: u64,
+    ) -> nixe_gpu_ampere::Result<CapturedMemory> {
+        self.capture(address, bytes)
+            .map(|capture| capture.ranges)
+            .map_err(|e| e.to_string().into())
+    }
+    fn mapping_generation(&self) -> u64 {
+        self.generation
+    }
+
     fn prepare_image(&mut self, address: u64, bytes: u64) -> nixe_gpu_ampere::Result<()> {
         self.commit_native_pages(address, bytes)
             .map_err(|e| e.to_string().into())

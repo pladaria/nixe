@@ -1,9 +1,9 @@
 //! Versioned guest environment records. No compiled artifacts or cache identities.
 use nixe_shader_recompiler::{
-    artifact::ARTIFACT_ABI_VERSION, environment::*, maxwell::header::ProgramHeader, types::*,
+    artifact::ARTIFACT_ABI_VERSION, environment::*, header::ProgramHeader, types::*,
 };
 use std::collections::BTreeMap;
-const SCHEMA: u32 = 4;
+const SCHEMA: u32 = 5;
 trait Encode {
     fn encode(&self, out: &mut Vec<u8>);
 }
@@ -162,7 +162,13 @@ macro_rules! enumeration {
         impl Decode for $ty { fn decode(input: &mut Reader<'_>) -> Option<Self> { Self::try_from(u32::decode(input)?).ok() } }
     )*};
 }
-enumeration!(Stage, ReplaceConstant, TextureType, TexturePixelFormat);
+enumeration!(
+    ShaderIsa,
+    Stage,
+    ReplaceConstant,
+    TextureType,
+    TexturePixelFormat
+);
 impl Encode for ProgramHeader {
     fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.to_bytes());
@@ -198,6 +204,7 @@ record!(HandleKey {
 });
 
 record!(EnvironmentMetadata {
+    isa,
     sph,
     gp_passthrough_mask,
     stage,

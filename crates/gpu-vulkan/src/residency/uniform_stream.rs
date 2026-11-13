@@ -5,7 +5,7 @@ use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const STAGES: usize = 5;
-const SLOTS: usize = nixe_gpu_maxwell::MAXWELL_CONSTANT_BUFFER_SLOT_COUNT;
+const SLOTS: usize = nixe_shader_recompiler::artifact::MAX_CBUFS;
 const MAX_BYTES: usize = 4096;
 const MAX_WRITES: usize = 16;
 
@@ -196,7 +196,8 @@ impl Residency<'_> {
     }
     pub(crate) fn begin_graphics_uniforms(
         &mut self,
-        space: &nixe_gpu_maxwell::MaxwellGpuMemory,
+        space: u64,
+        mapping_generation: u64,
         groups: [Option<u8>; STAGES],
     ) {
         let binds = std::mem::take(&mut self.runtime.buffer_bindings.channel.uniform_bind_changes);
@@ -206,8 +207,8 @@ impl Residency<'_> {
                     .buffer_bindings
                     .current_channel()
                     .expect("bound graphics channel"),
-                space.id().get(),
-                space.mapping_generation().get(),
+                space,
+                mapping_generation,
                 self.runtime.device_memory.generation(),
             ],
             groups,

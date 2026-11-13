@@ -242,7 +242,7 @@ pub struct VulkanResidency {
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L236-L258
 pub struct Residency<'a> {
     caches: &'a Arc<CacheOwners>,
-    pub(crate) shader_cache: &'a nixe_gpu_maxwell::recompiler::ShaderCache,
+    pub(crate) shader_cache: &'a nixe_gpu::shader_memory::ShaderCache,
     pub(crate) buffer_cache: std::sync::MutexGuard<'a, BufferCache>,
     pub(crate) texture_cache: std::sync::MutexGuard<'a, TextureCache>,
     pub(crate) runtime: &'a mut ResidencyRuntime,
@@ -273,7 +273,7 @@ pub(crate) struct ResidencyRuntime {
     streamed_uses: Vec<usize>,
 }
 impl VulkanResidency {
-    pub(crate) fn shader_cache(&self) -> nixe_gpu_maxwell::recompiler::ShaderCache {
+    pub(crate) fn shader_cache(&self) -> nixe_gpu::shader_memory::ShaderCache {
         self.caches.shader_cache.clone()
     }
 

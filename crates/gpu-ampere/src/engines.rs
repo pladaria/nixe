@@ -3,6 +3,10 @@
 use crate::{Class, Registers, Result, Source, compute, registers};
 
 pub struct GraphicsState {
+    pub preparation_dirty: bool,
+    pub vertex_dirty: u32,
+    pub index_dirty: bool,
+    pub uniform_dirty: [u32; 5],
     pub targets_dirty: u16,
     /// (defined bits, values) of retained privileged configuration writes.
     /// Unwritten bits have no invented reset value.
@@ -14,6 +18,10 @@ impl Default for GraphicsState {
     fn default() -> Self {
         Self {
             targets_dirty: 0x1ff,
+            preparation_dirty: true,
+            vertex_dirty: u32::MAX,
+            index_dirty: true,
+            uniform_dirty: [u32::MAX; 5],
             privileged: Default::default(),
             roots: [[0; 64]; 8],
             constants: [[None; 32]; 5],
@@ -25,11 +33,18 @@ pub trait PreparationHost {
     fn write(&mut self, address: u64, bytes: Vec<u8>) -> Result<()>;
     fn report(&mut self, address: u64, bytes: Vec<u8>) -> Result<()>;
     fn barrier(&mut self) -> Result<()>;
+    fn fragment_barrier(&mut self, before_depth: bool) -> Result<()>;
+    fn invalidate_texture_data(&mut self) -> Result<()>;
     fn timestamp(&self) -> u64;
     fn stopped(&self) -> bool;
     fn blit(&mut self, source: Source, operation: &crate::blit::Blit) -> Result<()>;
     fn dispatch(&mut self, launch: &compute::Launch, registers: &Registers) -> Result<()>;
-    fn draw(&mut self, source: Source, registers: &Registers, state: &GraphicsState) -> Result<()>;
+    fn draw(
+        &mut self,
+        source: Source,
+        registers: &Registers,
+        state: &mut GraphicsState,
+    ) -> Result<()>;
     fn clear(
         &mut self,
         source: Source,
@@ -107,6 +122,21 @@ impl Preparation {
         if engine.regs.set(m, value)
             && let Some(graphics) = engine.graphics.as_mut()
         {
+            match m {
+                0x600..=0x6fc => graphics.vertex_dirty |= 1 << ((m - 0x600) / 8),
+                0x1c00..=0x1dfc => {
+                    graphics.vertex_dirty |= 1 << ((m - 0x1c00) / 16);
+                    if (m - 0x1c00).is_multiple_of(16) || (m - 0x1c00) % 16 == 12 {
+                        graphics.preparation_dirty = true;
+                    }
+                }
+                0x17c8..=0x17d8 => graphics.index_dirty = true,
+                // Draw arguments and resource contents do not change fixed state.
+                0x17dc..=0x17f8 | 0xd74..=0xd78 | 0x2380..=0x2490 => (),
+                0x1618 => graphics.preparation_dirty = true,
+                _ if plain => graphics.preparation_dirty = true,
+                _ => (),
+            }
             graphics.targets_dirty |= match m {
                 0x800..=0x9e4 => 1 << ((m - 0x800) / 0x40),
                 0xfe0..=0xff0 | 0x1228..=0x1230 | 0x1538 | 0x1594 => 0x100,
@@ -194,6 +224,22 @@ impl Preparation {
         if class == Class::ThreeD {
             let graphics = engine.graphics.as_mut().unwrap();
             match m {
+                0xde0 => {
+                    // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clc797.h
+                    // SYSMEMBAR requires a separate system-visibility contract.
+                    if value & !2 != 0 {
+                        return Err("unsupported pixel barrier system-visibility/flags".into());
+                    }
+                    return host.fragment_barrier(value & 2 != 0);
+                }
+                0xf74 => {
+                    // @SPECULATIVE: only the observed zero operand has a
+                    // reference-backed invalidation/order interpretation.
+                    if value != 0 {
+                        return Err("unsupported texture-data invalidation operand".into());
+                    }
+                    return host.invalidate_texture_data();
+                }
                 0x12c8 => {
                     // This resets hierarchical Z-cull metadata, not the depth/
                     // stencil surface. The host owns its own depth tests and
@@ -261,6 +307,8 @@ impl Preparation {
                     if value & !0x1f1 != 0 {
                         return Err("invalid constant-buffer binding".into());
                     }
+                    graphics.uniform_dirty[((m - 0x2410) / 32) as usize] |=
+                        1 << ((value >> 4) & 31);
                     graphics.constants[((m - 0x2410) / 32) as usize]
                         [((value >> 4) & 31) as usize] =
                         (value & 1 != 0).then(|| (regs.address(0x2384, 0x2388), regs.get(0x2380)));

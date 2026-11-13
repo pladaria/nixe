@@ -215,6 +215,9 @@ impl PipelineCompiler {
             }),
         })
     }
+    pub(crate) fn normalize_graphics(&self, state: GraphicsState) -> GraphicsState {
+        self.compiler.normalize(state)
+    }
     pub fn request(&self, recipe: PipelineRecipe) -> Result<NativePipeline, CompileError> {
         let pipeline = self.prepare(recipe)?;
         let compiler = Arc::clone(&self.compiler);

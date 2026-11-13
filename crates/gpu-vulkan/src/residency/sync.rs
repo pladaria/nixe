@@ -112,6 +112,34 @@ impl Barriers {
     }
 }
 impl Residency<'_> {
+    /// Order pixel producers without submitting or waiting on the host. Memory
+    /// stays GPU-resident; physical cache publication is owned by fences/accesses.
+    pub(crate) fn order_fragments(&mut self, before_depth: bool) -> Result<(), VulkanError> {
+        self.runtime.device.realize_deferred_clear()?;
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        let pixels = vk::PipelineStageFlags2::FRAGMENT_SHADER
+            | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
+            | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
+        let destination = if before_depth {
+            pixels
+        } else {
+            vk::PipelineStageFlags2::FRAGMENT_SHADER
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+        };
+        let barrier = vk::MemoryBarrier2::default()
+            .src_stage_mask(pixels)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(destination)
+            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
+        unsafe {
+            self.runtime.device.dispatch.barrier(
+                &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&barrier)),
+            );
+        }
+        Ok(())
+    }
     /// WFI sets and waits for the rasterizer's event outside render passes.
     /// Pixel output is excluded, while fragment storage writes remain ordered.
     /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L955-L975

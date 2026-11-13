@@ -12,7 +12,7 @@ pub(crate) struct TextureEntry {
 #[derive(Default)]
 pub(crate) struct ImageDescriptors {
     pub(crate) table: Option<u64>,
-    pub(crate) address_space: Option<nixe_gpu_maxwell::MaxwellAddressSpaceId>,
+    pub(crate) address_space: Option<u64>,
     pub(crate) maximum: u32,
     pub(crate) entries: Vec<Option<ImageDescriptor>>,
 }
@@ -23,7 +23,7 @@ pub(crate) struct ImageDescriptor {
 #[derive(Default)]
 pub(crate) struct SamplerDescriptors {
     pub(crate) table: Option<u64>,
-    pub(crate) address_space: Option<nixe_gpu_maxwell::MaxwellAddressSpaceId>,
+    pub(crate) address_space: Option<u64>,
     pub(crate) maximum: u32,
     pub(crate) entries: Vec<Option<SamplerDescriptor>>,
 }

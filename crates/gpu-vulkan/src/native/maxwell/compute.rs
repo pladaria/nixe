@@ -39,7 +39,12 @@ impl crate::native::pipeline_cache::ComputePipeline {
             }
             sampler
         });
-        execution.synchronize_shader_descriptors(true, space, launch.texture_pool, sampler_pool);
+        execution.synchronize_shader_descriptors(
+            true,
+            space.id().get(),
+            launch.texture_pool.map(|p| (p.address, p.maximum_index)),
+            sampler_pool.map(|p| (p.address, p.maximum_index)),
+        );
         let mut computed = smallvec::SmallVec::<[u32; 64]>::new();
         computed.resize(self.resources.computed_handle_count, 0);
         if !computed.is_empty() {
@@ -85,12 +90,10 @@ impl crate::native::pipeline_cache::ComputePipeline {
         for slot in &self.resources.stages[5].images {
             let (handle, consumed) =
                 super::handles::read_handle(space, buffers, &slot.handle, &computed)?;
-            let reference = slot.handle.reference(0);
             let sampler = if slot.sampler {
                 Some(execution.shader_sampler(
                     true,
                     space,
-                    reference,
                     if via_header {
                         handle & 0xfffff
                     } else {
@@ -103,7 +106,6 @@ impl crate::native::pipeline_cache::ComputePipeline {
             textures.push(super::textures::ShaderTexture {
                 handle: consumed,
                 index: handle & 0xfffff,
-                reference,
                 dimension: slot.dimension,
                 descriptor: slot.descriptor,
                 sampler,

@@ -8,7 +8,7 @@ pub use super::descriptors::BoundedDescriptors;
 pub use super::varying::VaryingState;
 
 pub const MAX_INDIRECT_CBUFS: usize = 14;
-pub const MAX_CBUFS: usize = 18;
+pub const MAX_CBUFS: usize = 32;
 pub const MAX_SSBOS: usize = 32;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

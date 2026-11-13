@@ -3,7 +3,8 @@ use nixe_shader_recompiler::{
     Compiler, CompilerSettings, Environment, HostTranslateInfo, Profile, Stage,
     artifact::Bindings,
     environment::{EnvironmentMetadata, Observations, SnapshotEnvironment},
-    maxwell::{bits::insert, decode::Opcode, header::ProgramHeader},
+    header::ProgramHeader,
+    maxwell::{bits::insert, decode::Opcode},
     passes::GraphicsRuntimeState,
     types::ProgramOffset,
 };

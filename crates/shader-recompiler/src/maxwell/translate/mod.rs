@@ -134,17 +134,17 @@ pub fn translate_instruction(
 
 pub struct MaxwellTranslator;
 
-impl<E: crate::Environment> super::asl::CodeTranslator<E> for MaxwellTranslator {
+impl<E: crate::Environment> crate::frontend::asl::CodeTranslator<E> for MaxwellTranslator {
     fn translate(
         &mut self,
         environment: &mut E,
         ir: &mut Ir,
         block: BlockId,
-        begin: super::location::Location,
-        end: super::location::Location,
+        begin: crate::types::ProgramOffset,
+        end: crate::types::ProgramOffset,
     ) -> Result<()> {
-        let mut location = begin;
-        while location < end {
+        let mut location = super::location::Location::new(begin)?;
+        while location.address() < end {
             let decoded = super::decode::fetch(environment, location)?;
             translate_instruction(environment.metadata(), ir, block, decoded).map_err(|error| {
                 error.at(

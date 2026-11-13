@@ -233,12 +233,10 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         for slot in &resources.images {
             let (handle, consumed) =
                 super::handles::read_handle(space, buffers, &slot.handle, computed)?;
-            let reference = slot.handle.reference(group);
             let sampler = if slot.sampler {
                 Some(execution.shader_sampler(
                     false,
                     space,
-                    reference,
                     if via_header {
                         handle & 0xfffff
                     } else {
@@ -251,7 +249,6 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
             textures.push(super::textures::ShaderTexture {
                 handle: consumed,
                 index: handle & 0xfffff,
-                reference,
                 dimension: slot.dimension,
                 descriptor: slot.descriptor,
                 sampler,
@@ -317,7 +314,12 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 bindings.samplers().maximum_index().value().copied()
             },
         );
-        execution.synchronize_shader_descriptors(false, space, image_pool, sampler_pool);
+        execution.synchronize_shader_descriptors(
+            false,
+            space.id().get(),
+            image_pool.map(|p| (p.address, p.maximum_index)),
+            sampler_pool.map(|p| (p.address, p.maximum_index)),
+        );
         // Resolve computed handles across every stage before binding resources
         // or validating cached descriptor bytes that their producers could change.
         if self.resources.computed_handle_count != 0 {
@@ -578,7 +580,11 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                             .import_guest_stage_storage::<STAGE>(&self.resources.stages[STAGE])?;
                     });
                 }
-                execution.residency.begin_graphics_uniforms(space, groups);
+                execution.residency.begin_graphics_uniforms(
+                    space.id().get(),
+                    space.mapping_generation().get(),
+                    groups,
+                );
                 let mut image_index = 0;
                 graphics_stages!(STAGES, |STAGE| {
                     let resources = &self.resources.stages[STAGE];

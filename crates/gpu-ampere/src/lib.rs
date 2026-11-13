@@ -61,9 +61,17 @@ pub fn writes_memory(source: Source) -> bool {
 /// Native preparation consumes generation-specific state with static dispatch.
 /// Canonical memory, cache ownership and queue/fence execution stay shared.
 pub trait Rasterizer: nixe_gpu::GpuExecution {
+    fn fragment_barrier(&mut self, source: Source, before_depth: bool) -> Result<()>;
     fn create_channel(&mut self, channel: u64);
     fn bind_channel(&mut self, channel: u64);
     fn close_channel(&mut self, channel: u64);
+    fn draw(
+        &mut self,
+        source: Source,
+        registers: &Registers,
+        state: &mut GraphicsState,
+        memory: &mut impl RenderMemory,
+    ) -> Result<()>;
     fn blit(
         &mut self,
         source: Source,
@@ -87,5 +95,7 @@ pub trait Rasterizer: nixe_gpu::GpuExecution {
 }
 /// Commit lazy native GPU backing only when a resource is consumed.
 pub trait RenderMemory: nixe_gpu::native::ImageAddressSpace {
+    fn capture_memory(&mut self, address: u64, bytes: u64) -> Result<nixe_memory::CapturedMemory>;
+    fn mapping_generation(&self) -> u64;
     fn prepare_image(&mut self, address: u64, bytes: u64) -> Result<()>;
 }

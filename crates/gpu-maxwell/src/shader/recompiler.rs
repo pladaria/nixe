@@ -3,10 +3,10 @@
 
 mod graphics;
 mod program;
-mod texture;
-pub use super::memory::{ShaderCache, ShaderInfo};
 pub use graphics::graphics_request;
 pub use graphics::{GraphicsSource, graphics_source};
+use nixe_gpu::nvidia::shader as texture;
+use nixe_gpu::shader_memory::ShaderInfo;
 pub use program::capture_program;
 
 use super::memory::ShaderMemory;
@@ -15,7 +15,7 @@ use nixe_shader_recompiler::{
     CompileError, Compiler, Result,
     diagnostics::FailureCategory,
     environment::{Environment, EnvironmentMetadata, RecordingEnvironment},
-    maxwell::header::ProgramHeader,
+    header::ProgramHeader,
     types::*,
 };
 use std::collections::BTreeMap;
@@ -260,7 +260,7 @@ impl Environment for CaptureEnvironment<'_, '_> {
 
 /// The raw-code cache hashes bytecode before pipeline translation, as Eden.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/shader_environment.cpp#L156-L163
-pub(super) fn analyze_code(
+pub fn analyze_code(
     space: &MaxwellGpuMemory,
     request: &CaptureRequest,
     access: &mut nixe_gpu::MemoryAccess<'_>,
@@ -289,10 +289,7 @@ pub(super) fn analyze_code(
                 None
             };
             if let Some(size) = size {
-                return Ok(ShaderInfo {
-                    unique_hash: city_hash64(&code[..size]),
-                    size_bytes: size + 8,
-                });
+                return Ok(ShaderInfo::new(city_hash64(&code[..size]), size + 8));
             }
         }
     }
@@ -311,8 +308,5 @@ pub(super) fn analyze_code(
     let code = source
         .memory
         .read_code(request.address + u64::from(offset), size)?;
-    Ok(ShaderInfo {
-        unique_hash: city_hash64(&code),
-        size_bytes: size,
-    })
+    Ok(ShaderInfo::new(city_hash64(&code), size))
 }

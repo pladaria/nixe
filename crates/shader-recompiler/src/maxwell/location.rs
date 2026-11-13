@@ -1,5 +1,4 @@
 use crate::{CompileError, Result, diagnostics::FailureCategory, types::ProgramOffset};
-use std::cmp::Ordering;
 
 /// Only executable bundle slots can be constructed. Scheduling words advance to
 /// the first instruction of their bundle; offsets are bytes, never ordinals.
@@ -56,39 +55,9 @@ impl Location {
     }
 }
 
-/// Synthetic predicate tests sort immediately before their real instruction but
-/// cannot be passed as an instruction-fetch address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FlowLocation {
-    Instruction(Location),
-    PredicateBefore(Location),
-}
-
-impl FlowLocation {
-    pub const fn ordering_offset(self) -> u32 {
-        match self {
-            Self::Instruction(pc) => pc.0.0,
-            Self::PredicateBefore(pc) => pc.0.0.wrapping_sub(4),
-        }
-    }
-    pub fn instruction(self) -> Result<Location> {
-        match self {
-            Self::Instruction(pc) => Ok(pc),
-            Self::PredicateBefore(_) => Err(CompileError::new(
-                FailureCategory::Internal,
-                "Cannot fetch a synthetic predicate block",
-            )),
-        }
+impl crate::frontend::flow::Address for Location {
+    fn address(self) -> ProgramOffset {
+        self.address()
     }
 }
-
-impl Ord for FlowLocation {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.ordering_offset().cmp(&other.ordering_offset())
-    }
-}
-impl PartialOrd for FlowLocation {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+pub type FlowLocation = crate::frontend::flow::FlowLocation<Location>;

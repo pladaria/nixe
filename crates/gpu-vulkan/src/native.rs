@@ -19,6 +19,7 @@ pub(crate) mod image_planes;
 pub(crate) mod images;
 mod state;
 mod targets;
+mod vertex_format;
 use crate::residency::color_blit_pipeline;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -51,6 +52,7 @@ struct NativeState {
     frames: crate::presentation::Frames,
     host: Option<crate::presentation::Host>,
     descriptors: DescriptorCache,
+    ampere: ampere::graphics::Cache,
     dynamic: maxwell::dynamic_state::DynamicState,
     current_context: Option<u64>,
     blit_pipelines: HashMap<vk::Format, NativePipeline>,
@@ -136,6 +138,7 @@ impl NativeGpuExecution {
                 frames: crate::presentation::Frames::new(residency.device())?,
                 host: None,
                 descriptors,
+                ampere: Default::default(),
                 dynamic: Default::default(),
                 current_context: None,
                 blit_pipelines: HashMap::default(),
@@ -151,7 +154,7 @@ impl NativeGpuExecution {
             residency,
         })
     }
-    pub(crate) fn shader_cache(&self) -> nixe_gpu_maxwell::recompiler::ShaderCache {
+    pub(crate) fn shader_cache(&self) -> nixe_gpu::shader_memory::ShaderCache {
         self.residency.shader_cache()
     }
     pub fn device_profile(&self) -> &DeviceProfile {
@@ -389,6 +392,7 @@ impl NativeGpuExecution {
         self.state.current_context = Some(context);
     }
     fn close_channel(&mut self, context: u64) {
+        self.state.ampere.close(context);
         self.residency
             .runtime
             .buffer_bindings
@@ -913,3 +917,5 @@ impl NativeGpuExecution {
         Ok(image)
     }
 }
+
+mod textures;

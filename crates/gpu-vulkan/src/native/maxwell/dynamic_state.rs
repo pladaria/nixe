@@ -14,6 +14,7 @@ pub(crate) struct DynamicState {
 /// All other setters consume their individual engine flags directly.
 #[derive(Default)]
 pub(crate) struct CommandState {
+    pub(crate) parameters_id: Option<u64>,
     rescaled: bool,
     initialized: bool,
     topology: Option<u32>,
@@ -25,6 +26,7 @@ pub(crate) struct CommandState {
 }
 impl CommandState {
     pub(crate) fn invalidate(&mut self) {
+        self.parameters_id = None;
         self.topology = None;
         self.stencil_reset = true;
     }
@@ -47,6 +49,7 @@ pub(in crate::native) fn record(
     let resolution = residency.resolution();
     let device = &mut residency.runtime.device;
     let command = &mut device.submission.slots[index].graphics_state;
+    command.parameters_id = None;
     let first = !command.initialized;
     let topology_changed = first || command.topology != Some(draw.topology);
     let vertex_buffers = if device.profile.dynamic_state.vertex_input {

@@ -1,12 +1,15 @@
-//! Maxwell shader compilation contracts, independent of guest memory and host graphics APIs.
+//! GPU shader compilation contracts, independent of guest memory and host graphics APIs.
 //! Completed artifacts own their data; environments expose compilation-local observations.
 
 #![forbid(unsafe_code)]
 
+pub mod ampere;
 pub mod arena;
 pub mod artifact;
 pub mod diagnostics;
 pub mod environment;
+pub mod frontend;
+pub mod header;
 pub mod ir;
 pub mod maxwell;
 pub mod passes;

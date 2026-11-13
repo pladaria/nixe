@@ -6,7 +6,7 @@ use nixe_shader_recompiler::{
         bits::*,
         decode::{self, Opcode},
         instruction::Instruction,
-        location::{FlowLocation, Location},
+        location::Location,
         operands::Operands,
         special_register::SpecialRegister,
     },
@@ -82,28 +82,6 @@ fn decoder_covers_every_prefix_and_preserves_first_match() {
         decode::decode(0).unwrap_err().category,
         FailureCategory::UnknownInstruction
     );
-}
-
-#[test]
-fn bundle_slots_and_synthetic_locations_are_distinct() {
-    assert_eq!(location(0), location(8));
-    assert_eq!(location(32), location(40));
-    let slots: Vec<_> = (0..6).map(|n| location(0).advance(n).address().0).collect();
-    assert_eq!(slots, [8, 16, 24, 40, 48, 56]);
-    for offset in [8, 16, 24, 40, 48, 56, 0xffff_fff8] {
-        let pc = location(offset);
-        assert_eq!(pc.next().previous(), pc);
-        assert_eq!(pc.previous().next(), pc);
-    }
-    assert_eq!(location(40).advance(-3), location(8));
-    assert_eq!(location(24).branch_relative(-24).unwrap(), location(8));
-    assert_eq!(location(24).branch_relative(0).unwrap(), location(40));
-    assert!(Location::new(ProgramOffset(4)).is_err());
-    let synthetic = FlowLocation::PredicateBefore(location(40));
-    assert_eq!(synthetic.ordering_offset(), 36);
-    assert!(synthetic.instruction().is_err());
-    assert!(FlowLocation::Instruction(location(24)) < synthetic);
-    assert!(synthetic < FlowLocation::Instruction(location(40)));
 }
 
 #[test]

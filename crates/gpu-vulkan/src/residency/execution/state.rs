@@ -156,14 +156,34 @@ impl Residency<'_> {
         }
         Ok(())
     }
+    pub(crate) fn graphics_state_cached(
+        &mut self,
+        pipeline: &NativePipeline,
+        parameters: &GraphicsParameters,
+        identity: u64,
+    ) -> Result<(), VulkanError> {
+        let index = self.runtime.device.recording_slot()?;
+        if self.runtime.device.submission.slots[index]
+            .graphics_state
+            .parameters_id
+            == Some(identity)
+        {
+            return Ok(());
+        }
+        self.graphics_state(pipeline, parameters)?;
+        self.runtime.device.submission.slots[index]
+            .graphics_state
+            .parameters_id = Some(identity);
+        Ok(())
+    }
     pub(crate) fn graphics_state(
         &mut self,
         pipeline: &NativePipeline,
         p: &GraphicsParameters,
     ) -> Result<(), VulkanError> {
         let index = self.runtime.device.recording_slot()?;
-        // Explicit host draws disturb the native context, as UI recording does
-        // in Eden. The next guest draw consumes its complete invalidation set.
+        // Explicit state emission replaces the previous native context. The
+        // next guest draw consumes its complete invalidation set.
         self.runtime.device.submission.slots[index].graphics_state = Default::default();
         let raw = &mut self.runtime.device.dispatch;
         unsafe {

@@ -3,7 +3,7 @@
 //! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 use crate::VulkanError;
 use crate::cache::{LayoutKey, ShaderArtifact, binding_origins};
-use nixe_gpu_maxwell::engines::threed::MaxwellThreeDTextureDimension;
+use nixe_gpu::nvidia::TextureDimension;
 
 pub(crate) struct UniformSlot {
     pub(crate) slot: usize,
@@ -34,23 +34,11 @@ pub(super) enum HandleSource {
         slot: usize,
     },
 }
-impl HandleSource {
-    pub(super) fn reference(
-        &self,
-        group: u8,
-    ) -> nixe_gpu_maxwell::engines::threed::MaxwellThreeDTextureReference {
-        let (cbuf, offset) = match self {
-            Self::Direct { primary, .. } => (primary.cbuf as u8, primary.offset),
-            Self::Program { index, .. } => (0, *index as u32),
-        };
-        nixe_gpu_maxwell::engines::threed::MaxwellThreeDTextureReference::new(group, cbuf, offset)
-    }
-}
 pub(super) struct ImageSlot {
     pub(super) rescaling_index: usize,
     pub(super) descriptor: usize,
     pub(super) handle: HandleSource,
-    pub(super) dimension: MaxwellThreeDTextureDimension,
+    pub(super) dimension: TextureDimension,
     pub(super) sampler: bool,
     pub(super) storage_format: Option<nixe_shader_recompiler::types::ImageFormat>,
 }
@@ -69,8 +57,12 @@ pub(crate) struct PipelineResources {
     pub(in crate::native) texture_count: usize,
 }
 impl PipelineResources {
-    pub(super) fn new(shader: &ShaderArtifact, layout: &LayoutKey) -> Result<Self, VulkanError> {
-        use MaxwellThreeDTextureDimension as D;
+    pub(super) fn new(
+        shader: &ShaderArtifact,
+        layout: &LayoutKey,
+        uniform_limits: [u32; 6],
+    ) -> Result<Self, VulkanError> {
+        use TextureDimension as D;
         use nixe_shader_recompiler::{artifact::ResourceSource as S, types::TextureType as T};
         let fail = VulkanError::InvalidResource;
         let mut uniforms: [Vec<UniformSlot>; 6] = std::array::from_fn(|_| Vec::new());
@@ -111,7 +103,7 @@ impl PipelineResources {
                 .ok_or(fail("guest pipeline requires guest shader metadata"))?;
             match &metadata.bindings[origin.descriptor].source {
                 S::ConstantBuffer(d) => {
-                    if d.index.0 >= if stage == 5 { 8 } else { 18 } {
+                    if d.index.0 >= uniform_limits[stage] {
                         return Err(fail("uniform slot exceeds the guest hardware stage bank"));
                     }
                     uniforms[stage].push(UniformSlot {

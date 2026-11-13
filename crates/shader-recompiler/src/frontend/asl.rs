@@ -1,6 +1,5 @@
 use super::{
-    flow::FlowGraph,
-    location::Location,
+    flow::{Address, FlowGraph},
     structure::{StatementKind, StatementTree},
 };
 use crate::{
@@ -25,8 +24,8 @@ pub trait CodeTranslator<E: Environment> {
         environment: &mut E,
         ir: &mut Ir,
         block: BlockId,
-        begin: Location,
-        end: Location,
+        begin: crate::types::ProgramOffset,
+        end: crate::types::ProgramOffset,
     ) -> Result<()>;
 }
 
@@ -55,17 +54,17 @@ fn emit_expression(
     }
 }
 
-struct Builder<'a, E, T> {
+struct Builder<'a, E, T, L: Address, S> {
     environment: &'a mut E,
     ir: &'a mut Ir,
-    graph: &'a FlowGraph,
+    graph: &'a FlowGraph<L, S>,
     tree: &'a mut StatementTree,
     translator: &'a mut T,
     syntax: Vec<SyntaxNode>,
     uses_demote: bool,
 }
 
-impl<E: Environment, T: CodeTranslator<E>> Builder<'_, E, T> {
+impl<E: Environment, T: CodeTranslator<E>, L: Address, S> Builder<'_, E, T, L, S> {
     fn ensure_block(&mut self, current: &mut Option<BlockId>) -> Result<BlockId> {
         if let Some(block) = *current {
             return Ok(block);
@@ -134,8 +133,8 @@ impl<E: Environment, T: CodeTranslator<E>> Builder<'_, E, T> {
                                 self.environment,
                                 self.ir,
                                 block,
-                                flow.begin.instruction()?,
-                                flow.end.instruction()?,
+                                flow.begin.instruction()?.address(),
+                                flow.end.instruction()?.address(),
                             )?;
                         }
                     }
@@ -380,10 +379,10 @@ impl<E: Environment, T: CodeTranslator<E>> Builder<'_, E, T> {
     }
 }
 
-pub fn build_asl<E: Environment, T: CodeTranslator<E>>(
+pub fn build_asl<E: Environment, T: CodeTranslator<E>, L: Address, S>(
     environment: &mut E,
     ir: &mut Ir,
-    graph: &FlowGraph,
+    graph: &FlowGraph<L, S>,
     tree: &mut StatementTree,
     host: &HostTranslateInfo,
     translator: &mut T,

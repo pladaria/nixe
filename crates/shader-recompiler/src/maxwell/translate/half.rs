@@ -372,7 +372,8 @@ impl Visitor<'_> {
                 .emit
                 .fp_abs_neg(inputs[0][index], self.bit::<44>(), self.bit::<43>())?;
             let b = self.emit.fp_abs_neg(inputs[1][index], abs_b, neg_b)?;
-            let comparison = self.float_compare(a, b, compare, control)?;
+            let comparison =
+                crate::frontend::float_compare(&mut self.emit, a, b, compare, control)?;
             results[index] = self.combine(comparison, pred, self.field::<45, 2>())?;
         }
         if predicates {

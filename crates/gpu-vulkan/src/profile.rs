@@ -384,7 +384,7 @@ impl FeatureSet {
             self.names
                 .retain(|name| *name != ash::ext::vertex_input_dynamic_state::NAME);
             log::info!(
-                "Eden renderer policy: disabled dynamic vertex input (driver={driver:?}, packed_version={driver_version:#010x})"
+                "Vulkan device policy: disabled dynamic vertex input (driver={driver:?}, packed_version={driver_version:#010x})"
             );
         }
         // Desktop Eden defaults to EDS1 + EDS2. Supporting EDS3 on the host
@@ -394,7 +394,7 @@ impl FeatureSet {
         self.names
             .retain(|name| *name != ash::ext::extended_dynamic_state3::NAME);
         log::info!(
-            "Eden renderer policy: EDS level=2, dynamic_vertex_input={}",
+            "Vulkan device policy: EDS level=2, dynamic_vertex_input={}",
             self.vertex_input.vertex_input_dynamic_state != 0
         );
     }

@@ -576,3 +576,42 @@ fn sampler_border(
         ),
     }
 }
+
+pub(crate) fn color_kind(format: vk::Format) -> u8 {
+    use vk::Format as F;
+    match format {
+        F::R8_UINT
+        | F::R8G8_UINT
+        | F::R8G8B8_UINT
+        | F::R8G8B8A8_UINT
+        | F::B8G8R8A8_UINT
+        | F::A8B8G8R8_UINT_PACK32
+        | F::A2R10G10B10_UINT_PACK32
+        | F::A2B10G10R10_UINT_PACK32
+        | F::R16_UINT
+        | F::R16G16_UINT
+        | F::R16G16B16_UINT
+        | F::R16G16B16A16_UINT
+        | F::R32_UINT
+        | F::R32G32_UINT
+        | F::R32G32B32_UINT
+        | F::R32G32B32A32_UINT => 1,
+        F::R8_SINT
+        | F::R8G8_SINT
+        | F::R8G8B8_SINT
+        | F::R8G8B8A8_SINT
+        | F::B8G8R8A8_SINT
+        | F::A8B8G8R8_SINT_PACK32
+        | F::A2R10G10B10_SINT_PACK32
+        | F::A2B10G10R10_SINT_PACK32
+        | F::R16_SINT
+        | F::R16G16_SINT
+        | F::R16G16B16_SINT
+        | F::R16G16B16A16_SINT
+        | F::R32_SINT
+        | F::R32G32_SINT
+        | F::R32G32B32_SINT
+        | F::R32G32B32A32_SINT => 2,
+        _ => 0,
+    }
+}

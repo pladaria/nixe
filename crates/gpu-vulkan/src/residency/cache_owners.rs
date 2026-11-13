@@ -5,7 +5,7 @@ use super::*;
 pub(crate) struct CacheOwners {
     uniform_sync: Arc<std::sync::atomic::AtomicU64>,
     pub(super) command_pages: Arc<command_pages::CommandPages>,
-    pub(crate) shader_cache: nixe_gpu_maxwell::recompiler::ShaderCache,
+    pub(crate) shader_cache: nixe_gpu::shader_memory::ShaderCache,
     device_memory: nixe_memory::device_memory::DeviceMemory,
     pub(super) progress: Arc<crate::queue::progress::SubmissionProgress>,
     pub(super) timeline: Arc<crate::queue::progress::Timeline>,
@@ -68,7 +68,7 @@ impl CacheOwners {
             command_pages,
             progress: Arc::clone(&progress),
             timeline,
-            shader_cache: nixe_gpu_maxwell::recompiler::ShaderCache::new(device.clone()),
+            shader_cache: nixe_gpu::shader_memory::ShaderCache::new(device.clone()),
             device_memory: device.clone(),
             query_cache: std::sync::Mutex::new(query::QueryCache::new(Arc::clone(&uniform_sync))),
             buffer_cache: std::sync::Mutex::new(buffer_cache),

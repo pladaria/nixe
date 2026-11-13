@@ -5,9 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::{
-    CompileError, Result, diagnostics::FailureCategory, maxwell::header::ProgramHeader, types::*,
-};
+use crate::{CompileError, Result, diagnostics::FailureCategory, header::ProgramHeader, types::*};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CbufWordKey {
@@ -69,10 +67,33 @@ impl<I, V> EnvironmentCaches<I, V> {
     }
 }
 
+/// Instruction encoding is part of every captured shader and cache identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum ShaderIsa {
+    #[default]
+    Maxwell = 0,
+    Ampere = 1,
+}
+impl TryFrom<u32> for ShaderIsa {
+    type Error = CompileError;
+    fn try_from(value: u32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Maxwell),
+            1 => Ok(Self::Ampere),
+            _ => Err(CompileError::new(
+                FailureCategory::InvalidArgument,
+                "Unknown shader ISA",
+            )),
+        }
+    }
+}
+
 /// Immutable header/QMD facts captured by the host adapter. Byte sizes already
 /// include CRS allocation; graphics entry offsets still include the header.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct EnvironmentMetadata {
+    pub isa: ShaderIsa,
     pub sph: ProgramHeader,
     pub gp_passthrough_mask: [u32; 8],
     pub stage: Stage,
@@ -90,7 +111,10 @@ impl EnvironmentMetadata {
         let header_size = if self.stage == Stage::Compute {
             0
         } else {
-            0x50
+            match self.isa {
+                ShaderIsa::Maxwell => 0x50,
+                ShaderIsa::Ampere => 0x80,
+            }
         };
         self.start_address
             .0
@@ -199,6 +223,9 @@ impl SnapshotEnvironment {
 
     pub fn observations(&self) -> &Observations {
         &self.observations
+    }
+    pub fn into_observations(self) -> Observations {
+        self.observations
     }
 
     fn missing(&self, description: String) -> CompileError {

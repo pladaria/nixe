@@ -70,28 +70,6 @@ impl Visitor<'_> {
             operands.write_f32(self.instruction.reg0(), value)
         }
     }
-    pub(super) fn float_compare(
-        &mut self,
-        a: Value,
-        b: Value,
-        op: u32,
-        control: FpControl,
-    ) -> Result<Value> {
-        let ordered = !matches!(op, 9..=14);
-        match op {
-            0 => Ok(Value::U1(false)),
-            1 | 9 => self.emit.fp_less_than(a, b, control, ordered),
-            2 | 10 => self.emit.fp_equal(a, b, control, ordered),
-            3 | 11 => self.emit.fp_less_than_equal(a, b, control, ordered),
-            4 | 12 => self.emit.fp_greater_than(a, b, control, ordered),
-            5 | 13 => self.emit.fp_not_equal(a, b, control, ordered),
-            6 | 14 => self.emit.fp_greater_than_equal(a, b, control, ordered),
-            7 => self.emit.fp_ordered(a, b),
-            8 => self.emit.fp_unordered(a, b),
-            15 => Ok(Value::U1(true)),
-            _ => Err(unsupported("Invalid floating comparison")),
-        }
-    }
     pub(super) fn fadd(&mut self, source: Source, double: bool, wide: bool) -> Result<()> {
         let b = self.float_source(source, double)?;
         let (sat, cc, flush, round, abs_a, neg_a, abs_b, neg_b) = if wide {
@@ -311,7 +289,9 @@ impl Visitor<'_> {
             fmz_mode: ftz(self.bit::<47>()),
             ..Default::default()
         };
-        let condition = self.float_compare(c, Value::F32(0), self.field::<48, 4>(), control)?;
+        let compare = self.field::<48, 4>();
+        let condition =
+            crate::frontend::float_compare(&mut self.emit, c, Value::F32(0), compare, control)?;
         let a = self.a()?;
         let result = self.emit.select(condition, a, b)?;
         self.write(result)
@@ -334,7 +314,8 @@ impl Visitor<'_> {
                 ..Default::default()
             }
         };
-        let condition = self.float_compare(a, b, self.field::<48, 4>(), control)?;
+        let compare = self.field::<48, 4>();
+        let condition = crate::frontend::float_compare(&mut self.emit, a, b, compare, control)?;
         if predicates {
             self.predicate_pair(condition)
         } else {

@@ -1,8 +1,34 @@
 //! Ampere state consumption uses the common physical caches and native recorder.
+pub(super) mod graphics;
+mod shader;
+mod state;
+mod textures;
 use super::*;
 use nixe_gpu_ampere::{self as model, Registers, RenderMemory};
 
 impl model::Rasterizer for NativeGpuExecution {
+    fn fragment_barrier(&mut self, source: model::Source, before_depth: bool) -> model::Result<()> {
+        self.execution()
+            .record(FrontendSubmissionId::new(source.submission), |native| {
+                native.flush_work()?;
+                native.residency.order_fragments(before_depth)
+            })
+            .map_err(|e| e.to_string().into())
+    }
+    fn draw(
+        &mut self,
+        source: model::Source,
+        registers: &Registers,
+        state: &mut model::GraphicsState,
+        memory: &mut impl RenderMemory,
+    ) -> model::Result<()> {
+        self.execution()
+            .record(FrontendSubmissionId::new(source.submission), |native| {
+                native.draw_ampere(source, registers, state, memory)
+            })
+            .map_err(|e| e.to_string().into())
+    }
+
     fn create_channel(&mut self, channel: u64) {
         // C797 has 32 vertex streams and five graphics constant-buffer stages.
         self.create_channel(channel, 32, 5, 32);

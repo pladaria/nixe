@@ -523,6 +523,15 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
             .order_device(nixe_gpu::FrontendSubmissionId::new(self.source.submission))
             .map_err(|e| e.to_string().into())
     }
+    fn fragment_barrier(&mut self, before_depth: bool) -> Result<()> {
+        self.renderer.fragment_barrier(self.source, before_depth)
+    }
+    fn invalidate_texture_data(&mut self) -> Result<()> {
+        self.renderer
+            .invalidate_gpu_cache()
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        self.barrier()
+    }
     fn timestamp(&self) -> u64 {
         // @SPECULATIVE: retain the current report-clock scale until GA10F's
         // guest timestamp conversion is documented. Scheduler time stays native.
@@ -550,25 +559,12 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
     }
     fn draw(
         &mut self,
-        _source: Source,
+        source: Source,
         regs: &ampere::Registers,
-        _state: &ampere::GraphicsState,
+        state: &mut ampere::GraphicsState,
     ) -> Result<()> {
-        // C797 supplies absolute program addresses. Native graphics programs
-        // begin with the 128-byte SPH v4 header, followed by 128-bit instructions.
-        // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/shader_environment.cpp
-        for slot in 0..6 {
-            let base = 0x2000 + slot * 64;
-            let shader = regs.get(base);
-            if shader & 1 == 0 {
-                continue;
-            }
-            let program = regs.address(base + 0x14, base + 0x18);
-            let bytes = self.read(program, 128 + 16)?;
-            return Err(format!("Ampere graphics shader compilation not implemented: slot={slot} stage={} program={program:#x} SPH-version={:#x} header_prefix={:02x?} first_instruction={:02x?}; draw not executed",
-                (shader >> 4) & 15, regs.get(0x16a4), &bytes[..16], &bytes[128..]).into());
-        }
-        Err("graphics draw has no enabled shader program".into())
+        self.renderer
+            .draw(source, regs, state, &mut *self.memory.space.lock().unwrap())
     }
 }
 fn read_owned(

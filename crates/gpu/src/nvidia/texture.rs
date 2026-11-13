@@ -10,21 +10,15 @@ pub fn texture_address(words: [u32; 8]) -> u64 {
 }
 
 pub fn sampled_image_info(
-    texture_reference: MaxwellThreeDTextureReference,
-    required_dimension: MaxwellThreeDTextureDimension,
+    required_dimension: TextureDimension,
     descriptor_index: u32,
     bytes: [u8; 32],
-    with_sampler: bool,
-) -> Result<ImageInfo, MaxwellThreeDResourceError> {
+    tiling: TextureTiling,
+) -> Result<ImageInfo, DescriptorError> {
     // Maxwell 2 TIC field placement follows deko3d's pinned public
     // descriptor definition, itself cross-referenced to envytools:
     // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/texture_image_control_block.h
     let words = descriptor_words(bytes);
-    let role = MaxwellThreeDResourceRole::SampledImage {
-        texture: texture_reference,
-        dimension: required_dimension,
-        with_sampler,
-    };
     let format_word = words[0];
     let image_format = (format_word & 0x7f) as u8;
     let components = [7, 10, 13, 16].map(|shift| ((format_word >> shift) & 7) as u8);
@@ -32,7 +26,7 @@ pub fn sampled_image_info(
     let srgb = words[4] & (1 << 22) != 0;
     let format =
         decode_sampled_texture_format(image_format, components, swizzle, srgb, format_word >> 31)
-            .ok_or(MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
+            .ok_or(DescriptorError {
             descriptor: descriptor_index,
             field: "format/component/swizzle",
             value: format_word,
@@ -74,57 +68,51 @@ pub fn sampled_image_info(
     let layer_base =
         ((words[4] >> 16) & 7) | (((words[2] >> 16) & 0x1f) << 3) | (((words[2] >> 29) & 7) << 8);
     let (required_texture_type, layers) = match required_dimension {
-        MaxwellThreeDTextureDimension::One => (0, 1),
-        MaxwellThreeDTextureDimension::OneArray => (
+        TextureDimension::One => (0, 1),
+        TextureDimension::OneArray => (
             4,
-            u16::try_from(depth).map_err(|_| {
-                MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
-                    descriptor: descriptor_index,
-                    field: "1D-array layer count",
-                    value: depth,
-                }
+            u16::try_from(depth).map_err(|_| DescriptorError {
+                descriptor: descriptor_index,
+                field: "1D-array layer count",
+                value: depth,
             })?,
         ),
-        MaxwellThreeDTextureDimension::Two => (1, 1_u16),
-        MaxwellThreeDTextureDimension::Three => (2, 1),
+        TextureDimension::Two => (1, 1_u16),
+        TextureDimension::Three => (2, 1),
         // A single TIC cubemap has depth one and six independent faces.
         // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/texture_cache/image_info.cpp
-        MaxwellThreeDTextureDimension::Cube => (3, 6),
-        MaxwellThreeDTextureDimension::CubeArray => (
+        TextureDimension::Cube => (3, 6),
+        TextureDimension::CubeArray => (
             8,
-            u16::try_from(depth * 6).map_err(|_| {
-                MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
-                    descriptor: descriptor_index,
-                    field: "cube-array face count",
-                    value: depth,
-                }
+            u16::try_from(depth * 6).map_err(|_| DescriptorError {
+                descriptor: descriptor_index,
+                field: "cube-array face count",
+                value: depth,
             })?,
         ),
-        MaxwellThreeDTextureDimension::TwoArray => (
+        TextureDimension::TwoArray => (
             5,
-            u16::try_from(depth).map_err(|_| {
-                MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
-                    descriptor: descriptor_index,
-                    field: "2D-array layer count",
-                    value: depth,
-                }
+            u16::try_from(depth).map_err(|_| DescriptorError {
+                descriptor: descriptor_index,
+                field: "2D-array layer count",
+                value: depth,
             })?,
         ),
     };
     let pitch_linear = header_version == 2;
     let cube = matches!(
         required_dimension,
-        MaxwellThreeDTextureDimension::Cube | MaxwellThreeDTextureDimension::CubeArray
+        TextureDimension::Cube | TextureDimension::CubeArray
     );
     let texture_type_matches = texture_type == required_texture_type
         || (texture_type == 7
             && matches!(
                 required_dimension,
-                MaxwellThreeDTextureDimension::Two | MaxwellThreeDTextureDimension::TwoArray
+                TextureDimension::Two | TextureDimension::TwoArray
             ))
-        || (required_dimension == MaxwellThreeDTextureDimension::CubeArray && texture_type == 3)
-        || (required_dimension == MaxwellThreeDTextureDimension::OneArray && texture_type == 0)
-        || (required_dimension == MaxwellThreeDTextureDimension::TwoArray && texture_type == 1);
+        || (required_dimension == TextureDimension::CubeArray && texture_type == 3)
+        || (required_dimension == TextureDimension::OneArray && texture_type == 0)
+        || (required_dimension == TextureDimension::TwoArray && texture_type == 1);
     // TEX's array coordinate does not require multiple storage layers. A
     // non-array TIC can be sampled through a one-layer array view, retaining
     // the instruction's coordinate layout and host layer clamping.
@@ -137,9 +125,9 @@ pub fn sampled_image_info(
         || (!matches!(texture_type, 2 | 4 | 5 | 8) && depth != 1)
         || (matches!(
             required_dimension,
-            MaxwellThreeDTextureDimension::One | MaxwellThreeDTextureDimension::OneArray
+            TextureDimension::One | TextureDimension::OneArray
         ) && (height != 1 || pitch_linear))
-        || (required_dimension == MaxwellThreeDTextureDimension::Two && depth != 1)
+        || (required_dimension == TextureDimension::Two && depth != 1)
         || (!pitch_linear
             && (block_width_log2 != 0 || block_depth_log2 > 5 || block_height_log2 > 5))
         || (pitch_linear && mip_max != 0)
@@ -151,10 +139,7 @@ pub fn sampled_image_info(
         || (!normalized && matches!(texture_type, 1 | 7))
         || layer_base != 0
     {
-        log::debug!(
-            "unsupported Maxwell TIC shape: descriptor={descriptor_index} dimension={required_dimension:?} words={words:08x?}"
-        );
-        return Err(MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
+        return Err(DescriptorError {
             descriptor: descriptor_index,
             field: "sampled texture shape",
             value: words[2] ^ words[3] ^ words[4] ^ words[5] ^ words[7],
@@ -163,7 +148,7 @@ pub fn sampled_image_info(
     // Width spacing changes Tegra GOB row alignment; the packed mip
     // layout below currently represents spacing zero only.
     if !pitch_linear && (words[3] >> 10) & 7 != 0 {
-        return Err(MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
+        return Err(DescriptorError {
             descriptor: descriptor_index,
             field: "tile-width spacing",
             value: words[3],
@@ -172,12 +157,12 @@ pub fn sampled_image_info(
     let description = ImageDescription::new(
         if matches!(
             required_dimension,
-            MaxwellThreeDTextureDimension::One | MaxwellThreeDTextureDimension::OneArray
+            TextureDimension::One | TextureDimension::OneArray
         ) {
             ImageDimension::One
         } else if cube {
             ImageDimension::Cube
-        } else if required_dimension == MaxwellThreeDTextureDimension::Three {
+        } else if required_dimension == TextureDimension::Three {
             ImageDimension::Three
         } else {
             ImageDimension::Two
@@ -185,7 +170,7 @@ pub fn sampled_image_info(
         ImageExtent {
             width,
             height,
-            depth: if required_dimension == MaxwellThreeDTextureDimension::Three {
+            depth: if required_dimension == TextureDimension::Three {
                 depth
             } else {
                 1
@@ -201,7 +186,11 @@ pub fn sampled_image_info(
         layers,
         SampleCount::One,
     )
-    .map_err(|_| MaxwellThreeDResourceError::ContradictoryState { role })?;
+    .map_err(|_| DescriptorError {
+        descriptor: descriptor_index,
+        field: "image geometry",
+        value: 0,
+    })?;
     let address = texture_address(words);
     let [block_width, block_height] = format.block_extent();
     let bytes_per_block = format
@@ -217,7 +206,7 @@ pub fn sampled_image_info(
         // are implicitly zero. Pitched storage has a single 2D layer.
         let row_pitch = u64::from(words[3] & 0xffff) << 5;
         if row_pitch < row_bytes {
-            return Err(MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
+            return Err(DescriptorError {
                 descriptor: descriptor_index,
                 field: "pitch smaller than texel row",
                 value: row_pitch as u32,
@@ -225,7 +214,11 @@ pub fn sampled_image_info(
         }
         let layer_stride = row_pitch
             .checked_mul(u64::from(height.div_ceil(block_height)))
-            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+            .ok_or(DescriptorError {
+                descriptor: descriptor_index,
+                field: "storage overflow",
+                value: 0,
+            })?;
         SampledMipChain {
             layouts: vec![(
                 0,
@@ -243,13 +236,15 @@ pub fn sampled_image_info(
             format,
             mip_max + 1,
             [block_height_log2, block_depth_log2],
-            role,
+            descriptor_index,
+            tiling,
         )?
     };
     let layout = match mip_layouts[0].1 {
-        ImageMemoryLayout::BlockLinear(mut blocks) => {
+        ImageMemoryLayout::BlockLinear(mut blocks)
+        | ImageMemoryLayout::BlockLinearAmpere(mut blocks) => {
             blocks.layer_stride = layer_stride;
-            ImageMemoryLayout::BlockLinear(blocks)
+            tiling.layout(blocks)
         }
         layout => layout,
     };
@@ -258,7 +253,11 @@ pub fn sampled_image_info(
     } else {
         layer_stride
             .checked_mul(u64::from(layers))
-            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?
+            .ok_or(DescriptorError {
+                descriptor: descriptor_index,
+                field: "storage overflow",
+                value: 0,
+            })?
     };
     Ok(ImageInfo {
         address,
@@ -277,7 +276,13 @@ pub fn sampled_image_info(
         sample_grid: match description.samples() {
             SampleCount::One => [1, 1],
             SampleCount::Four => [2, 2],
-            _ => return Err(MaxwellThreeDResourceError::UnsupportedImageLayout { role }),
+            _ => {
+                return Err(DescriptorError {
+                    descriptor: descriptor_index,
+                    field: "sample layout",
+                    value: 0,
+                });
+            }
         },
     })
 }
@@ -290,8 +295,9 @@ fn sampled_mip_layouts(
     format: ImageFormat,
     levels: u8,
     block: [u8; 2],
-    role: MaxwellThreeDResourceRole,
-) -> Result<SampledMipChain, MaxwellThreeDResourceError> {
+    descriptor_index: u32,
+    tiling: TextureTiling,
+) -> Result<SampledMipChain, DescriptorError> {
     let ImageExtent {
         width,
         height,
@@ -318,23 +324,33 @@ fn sampled_mip_layouts(
                 gob_depth -= 1;
             }
         }
-        let padded_slices = align_up(u64::from(slices), 1u64 << gob_depth, role)?;
-        let size = align_up(u64::from(columns) * bytes, 64, role)?
-            .checked_mul(align_up(u64::from(rows), 8_u64 << gob_height, role)?)
+        let padded_slices = align_up(u64::from(slices), 1u64 << gob_depth, descriptor_index)?;
+        let size = align_up(u64::from(columns) * bytes, 64, descriptor_index)?
+            .checked_mul(align_up(
+                u64::from(rows),
+                8_u64 << gob_height,
+                descriptor_index,
+            )?)
             .and_then(|size| size.checked_mul(padded_slices))
-            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+            .ok_or(DescriptorError {
+                descriptor: descriptor_index,
+                field: "storage overflow",
+                value: 0,
+            })?;
         layouts.push((
             offset,
-            ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+            tiling.layout(BlockLinearLayout {
                 block_width_log2: 0,
                 block_height_log2: gob_height,
                 block_depth_log2: gob_depth,
                 layer_stride: size,
             }),
         ));
-        offset = offset
-            .checked_add(size)
-            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+        offset = offset.checked_add(size).ok_or(DescriptorError {
+            descriptor: descriptor_index,
+            field: "storage overflow",
+            value: 0,
+        })?;
     }
     // Match Tegra's layer alignment, including compressed block-height rounding.
     let mut gob_height = block_height_log2;
@@ -346,10 +362,30 @@ fn sampled_mip_layouts(
     while gob_depth > 0 && u64::from(depth) <= (1u64 << (gob_depth - 1)) {
         gob_depth -= 1;
     }
-    let stride = align_up(offset, 512_u64 << (gob_height + gob_depth), role)?;
+    let stride = align_up(
+        offset,
+        512_u64 << (gob_height + gob_depth),
+        descriptor_index,
+    )?;
     Ok(SampledMipChain {
         layouts,
         layer_stride: stride,
         layer_size: offset,
     })
+}
+
+struct SampledMipChain {
+    layouts: Vec<(u64, ImageMemoryLayout)>,
+    layer_stride: u64,
+    layer_size: u64,
+}
+fn align_up(value: u64, alignment: u64, descriptor: u32) -> Result<u64, DescriptorError> {
+    value
+        .checked_add(alignment - 1)
+        .map(|v| v & !(alignment - 1))
+        .ok_or(DescriptorError {
+            descriptor,
+            field: "storage overflow",
+            value: 0,
+        })
 }

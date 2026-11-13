@@ -206,38 +206,7 @@ impl Visitor<'_> {
         self.write(value)
     }
     pub(super) fn exit(&mut self) -> Result<()> {
-        if self.metadata.stage != Stage::Fragment {
-            return Ok(());
-        }
-        let mut reg = Reg(0);
-        for target in 0..8 {
-            if !self.metadata.sph.has_output_components(target) {
-                continue;
-            }
-            for (component, enabled) in self
-                .metadata
-                .sph
-                .enabled_output_components(target)
-                .into_iter()
-                .enumerate()
-            {
-                if enabled {
-                    let value = self.read_float_reg(reg)?;
-                    self.emit
-                        .set_frag_color(target as u32, component as u32, value)?;
-                }
-                reg = reg.offset(1)?;
-            }
-        }
-        if self.metadata.sph.fragment_sample_mask() {
-            let value = self.emit.get_reg(reg)?;
-            self.emit.set_sample_mask(value)?;
-        }
-        if self.metadata.sph.fragment_depth() {
-            let value = self.read_float_reg(reg.offset(1)?)?;
-            self.emit.set_frag_depth(value)?;
-        }
-        Ok(())
+        crate::frontend::export_fragment(&mut self.emit, self.metadata)
     }
     pub(super) fn membar(&mut self) -> Result<()> {
         if self.field::<8, 2>() == 0 {

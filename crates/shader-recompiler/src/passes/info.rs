@@ -4,8 +4,8 @@ use crate::{
     arena::InstId,
     artifact::{ConstantBufferDescriptor, MAX_CBUFS, MAX_INDIRECT_CBUFS, ShaderInfo},
     diagnostics::FailureCategory,
+    header::{ProgramHeader, SystemValuesB, SystemValuesC},
     ir::{Attribute, FmzMode, FpControl, Ir, Opcode as O, Program, TextureInstInfo, Type, Value},
-    maxwell::header::{ProgramHeader, SystemValuesB, SystemValuesC},
     types::{CbufIndex, ImageFormat, PixelImap, Stage, TextureType},
 };
 fn add_cbuf(info: &mut ShaderInfo, index: u32) -> Result<()> {

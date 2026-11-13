@@ -6,7 +6,7 @@ use crate::{
 
 pub const PROGRAM_HEADER_SIZE: usize = 0x50;
 
-/// The 80-byte graphics header, decoded in little-endian word order. Raw storage
+/// The common 80-byte graphics-header prefix, decoded in little-endian order. Raw storage
 /// preserves reserved fields and the overlapping VTG and fragment interpretations.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ProgramHeader {

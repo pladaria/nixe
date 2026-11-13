@@ -1,4 +1,4 @@
-use super::flow::{EndClass, FlowGraph, FunctionId};
+use super::flow::{Address, EndClass, FlowGraph, FunctionId};
 use crate::{
     CompileError, Result,
     arena::{Arena, FlowBlockId, StatementId},
@@ -236,7 +236,7 @@ impl StatementTree {
         Ok(true)
     }
 
-    pub fn from_flow(graph: &FlowGraph) -> Result<Self> {
+    pub fn from_flow<L: Address, S>(graph: &FlowGraph<L, S>) -> Result<Self> {
         let mut tree = Self::new()?;
         let mut label_id = 0;
         let mut gotos = Vec::new();
@@ -256,9 +256,9 @@ impl StatementTree {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_function(
+    fn build_function<L: Address, S>(
         &mut self,
-        graph: &FlowGraph,
+        graph: &FlowGraph<L, S>,
         function: FunctionId,
         label_id: &mut u32,
         gotos: &mut Vec<StatementId>,
