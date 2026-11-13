@@ -130,7 +130,7 @@ fn switch_2_machine_profile() -> HorizonMachineProfile {
     HorizonMachineProfile {
         scheduler,
         platform: nixe_cpu::platform::TargetPlatform::Switch2,
-        memory_layout: nixe_runtime::ProcessMemoryLayoutProfile::Horizon2Plus,
+        memory_layout: nixe_runtime::ProcessMemoryLayoutProfile::Switch2,
         application_memory_capacity: 9809 * 1024 * 1024,
         physical_memory_capacity: 12 * 1024 * 1024 * 1024,
         graphics: GraphicsGeneration::Ampere,

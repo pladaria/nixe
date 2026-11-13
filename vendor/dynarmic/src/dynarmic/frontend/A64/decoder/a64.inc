@@ -1,3 +1,11 @@
+// RCpc acquire loads have a more specific encoding than the LSE RMW group.
+INST(LDAPR_sz,               "LDAPRB, LDAPRH, LDAPR",                      "zz11100010111111110000nnnnnttttt")
+
+// ARMv8.1 Large System Extensions.
+INST(AtomicMemOp,             "Atomic memory operation",                   "zz111000AR1sssssoooo00nnnnnttttt")
+INST(CompareAndSwap,          "Compare and swap",                          "zz0010001L1sssssO11111nnnnnttttt")
+INST(CompareAndSwapPair,      "Compare and swap pair",                     "0z0010000L1sssssO11111nnnnnttttt")
+
 // Data processing - Immediate - PC relative addressing
 INST(ADR,                    "ADR",                                       "0ii10000iiiiiiiiiiiiiiiiiiiddddd")
 INST(ADRP,                   "ADRP",                                      "1ii10000iiiiiiiiiiiiiiiiiiiddddd")
@@ -51,6 +59,14 @@ INST(BRK,                    "BRK",                                       "11010
 //INST(DCPS2,                  "DCPS2",                                     "11010100101iiiiiiiiiiiiiiii00010")
 //INST(DCPS3,                  "DCPS3",                                     "11010100101iiiiiiiiiiiiiiii00011")
 
+// Pointer authentication (ARMv8.3 and later).
+INST(PACAUT_reg, "PACIA/PACIB/PACDA/PACDB/AUTIA/AUTIB/AUTDA/AUTDB", "110110101100000100Zooonnnnnddddd")
+INST(XPAC_reg, "XPACI/XPACD", "110110101100000101000D11111ddddd")
+INST(PACGA, "PACGA", "10011010110mmmmm001100nnnnnddddd")
+INST(RETA, "RETAA/RETAB", "110101100101111100001M1111111111")
+INST(BRA_BLRA, "BRAA/BRAB/BLRAA/BLRAB", "1101011Z00L1111100001Mnnnnnmmmmm")
+INST(LDRA, "LDRAA/LDRAB", "11111000MS1iiiiiiiiiW1nnnnnttttt")
+
 // System
 //INST(MSR_imm,                "MSR (immediate)",                           "1101010100000ooo0100MMMMooo11111")
 INST(HINT,                   "HINT",                                      "11010101000000110010MMMMooo11111")
@@ -63,16 +79,6 @@ INST(SEVL,                   "SEVL",                                      "11010
 //INST(DGH,                    "DGH",                                       "11010101000000110010000011011111") // v8.6
 //INST(WFET,                   "WFET",                                      "110101010000001100010000000ddddd") // v8.7
 //INST(WFIT,                   "WFIT",                                      "110101010000001100010000001ddddd") // v8.7
-//INST(XPAC_1,                 "XPACD, XPACI, XPACLRI",                     "110110101100000101000D11111ddddd")
-//INST(XPAC_2,                 "XPACD, XPACI, XPACLRI",                     "11010101000000110010000011111111")
-//INST(PACIA_1,                "PACIA, PACIA1716, PACIASP, PACIAZ, PACIZA", "110110101100000100Z000nnnnnddddd")
-//INST(PACIA_2,                "PACIA, PACIA1716, PACIASP, PACIAZ, PACIZA", "1101010100000011001000-100-11111")
-//INST(PACIB_1,                "PACIB, PACIB1716, PACIBSP, PACIBZ, PACIZB", "110110101100000100Z001nnnnnddddd")
-//INST(PACIB_2,                "PACIB, PACIB1716, PACIBSP, PACIBZ, PACIZB", "1101010100000011001000-101-11111")
-//INST(AUTIA_1,                "AUTIA, AUTIA1716, AUTIASP, AUTIAZ, AUTIZA", "110110101100000100Z100nnnnnddddd")
-//INST(AUTIA_2,                "AUTIA, AUTIA1716, AUTIASP, AUTIAZ, AUTIZA", "1101010100000011001000-110-11111")
-//INST(AUTIB_1,                "AUTIB, AUTIB1716, AUTIBSP, AUTIBZ, AUTIZB", "110110101100000100Z101nnnnnddddd")
-//INST(AUTIB_2,                "AUTIB, AUTIB1716, AUTIBSP, AUTIBZ, AUTIZB", "1101010100000011001000-111-11111")
 //INST(BTI,                    "BTI",                                       "110101010000001100100100ii011111") // ARMv8.5
 //INST(ESB,                    "ESB",                                       "11010101000000110010001000011111")
 //INST(PSB,                    "PSB CSYNC",                                 "11010101000000110010001000111111")
@@ -122,10 +128,7 @@ INST(BR,                     "BR",                                        "11010
 //INST(DRPS,                   "DRPS",                                      "11010110101111110000001111100000")
 //INST(ERET,                   "ERET",                                      "11010110100111110000001111100000")
 INST(RET,                    "RET",                                       "1101011001011111000000nnnnn00000")
-//INST(BLRA,                   "BLRAA, BLRAAZ, BLRAB, BLRABZ",              "1101011Z0011111100001Mnnnnnmmmmm") // ARMv8.3
-//INST(BRA,                    "BRAA, BRAAZ, BRAB, BRABZ",                  "1101011Z0001111100001Mnnnnnmmmmm") // ARMv8.3
 //INST(ERETA,                  "ERETAA, ERETAB",                            "110101101001111100001M1111111111") // ARMv8.3
-//INST(RETA,                   "RETAA, RETAB",                              "110101100101111100001M1111111111") // ARMv8.3
 
 // Unconditional branch (immediate)
 INST(B_uncond,               "B",                                         "000101iiiiiiiiiiiiiiiiiiiiiiiiii")
@@ -297,9 +300,6 @@ INST(LDR_reg_fpsimd,         "LDR (register, SIMD&FP)",                   "zz111
 //INST(STZ2G_3,                "STZ2G (signed-offset)",                     "11011001111iiiiiiiii10nnnnn11111") // ARMv8.5
 //INST(LDGV,                   "LDGV",                                      "1101100111100000000000nnnnnttttt") // ARMv8.5
 
-// Loads and stores - Load/Store register (pointer authentication)
-//INST(LDRA,                   "LDRAA, LDRAB",                              "11111000MS1iiiiiiiiiW1nnnnnttttt")
-
 // Data Processing - Register - 2 source
 INST(UDIV,                   "UDIV",                                      "z0011010110mmmmm000010nnnnnddddd")
 INST(SDIV,                   "SDIV",                                      "z0011010110mmmmm000011nnnnnddddd")
@@ -309,7 +309,6 @@ INST(ASRV,                   "ASRV",                                      "z0011
 INST(RORV,                   "RORV",                                      "z0011010110mmmmm001011nnnnnddddd")
 INST(CRC32,                  "CRC32B, CRC32H, CRC32W, CRC32X",            "z0011010110mmmmm0100zznnnnnddddd")
 INST(CRC32C,                 "CRC32CB, CRC32CH, CRC32CW, CRC32CX",        "z0011010110mmmmm0101zznnnnnddddd")
-//INST(PACGA,                  "PACGA",                                     "10011010110mmmmm001100nnnnnddddd")
 //INST(SUBP,                   "SUBP",                                      "10011010110mmmmm000000nnnnnddddd") // ARMv8.5
 //INST(IRG,                    "IRG",                                       "10011010110mmmmm000100nnnnnddddd") // ARMv8.5
 //INST(GMI,                    "GMI",                                       "10011010110mmmmm000101nnnnnddddd") // ARMv8.5

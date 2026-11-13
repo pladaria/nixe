@@ -17,6 +17,8 @@ class Block;
 
 namespace A64 {
 
+struct PointerAuthentication;
+
 class LocationDescriptor;
 
 using MemoryReadCodeFuncType = std::function<std::optional<u32>(u64 vaddr)>;
@@ -37,6 +39,11 @@ struct TranslationOptions {
     bool hook_hint_instructions = true;
     /// Unrecognized HINT encodings require the caller's newer-ISA semantics.
     bool hook_unknown_hint_instructions = false;
+    /// ARMv8.1 Large System Extensions (atomic read-modify-write instructions).
+    bool enable_lse = false;
+    /// ARMv8.3 RCpc acquire loads.
+    bool enable_rcpc = false;
+    const PointerAuthentication* pointer_authentication = nullptr;
 };
 
 /**

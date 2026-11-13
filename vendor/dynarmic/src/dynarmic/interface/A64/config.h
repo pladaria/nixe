@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "dynarmic/interface/A64/pointer_authentication.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -179,6 +181,11 @@ struct UserConfig {
     /// Stop at extension HINTs whose semantics the frontend does not implement.
     /// Newer guest CPUs can assign architectural effects to these encodings.
     bool hook_unknown_hint_instructions = false;
+    /// ARMv8.1 Large System Extensions (atomic read-modify-write instructions).
+    bool enable_lse = false;
+    /// ARMv8.3 RCpc acquire loads.
+    bool enable_rcpc = false;
+    PointerAuthentication pointer_authentication{};
 
     /// Counter-timer frequency register. The value of the register is not interpreted by
     /// dynarmic.

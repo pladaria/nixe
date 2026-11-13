@@ -5,6 +5,7 @@ use crate::object::{AppletObject, AppletProxyKind};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RootCommand {
     OpenApplicationProxy,
+    OpenApplicationProxy2,
     OpenSystemAppletProxy,
 }
 
@@ -12,6 +13,7 @@ impl RootCommand {
     pub(super) const fn decode(command_id: u32) -> Option<Self> {
         match command_id {
             0 => Some(Self::OpenApplicationProxy),
+            10 => Some(Self::OpenApplicationProxy2),
             100 => Some(Self::OpenSystemAppletProxy),
             _ => None,
         }
@@ -19,7 +21,9 @@ impl RootCommand {
 
     pub(super) const fn proxy_kind(self) -> AppletProxyKind {
         match self {
-            Self::OpenApplicationProxy => AppletProxyKind::Application,
+            Self::OpenApplicationProxy | Self::OpenApplicationProxy2 => {
+                AppletProxyKind::Application
+            }
             Self::OpenSystemAppletProxy => AppletProxyKind::SystemApplet,
         }
     }

@@ -23,7 +23,7 @@ impl ProcessMemory {
         if bytes < old {
             self.unmap(base.checked_add(bytes).unwrap(), old - bytes, mapping)?;
         } else if bytes > old {
-            let allocation = physical.allocate(bytes - old).await?;
+            let allocation = physical.allocate(&self.account, bytes - old).await?;
             self.map(
                 base.checked_add(old).unwrap(),
                 allocation,

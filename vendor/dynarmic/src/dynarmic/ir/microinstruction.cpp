@@ -510,7 +510,8 @@ bool Inst::CausesCPUException() const {
         || op == Opcode::A32CallSupervisor
         || op == Opcode::A32ExceptionRaised
         || op == Opcode::A64CallSupervisor
-        || op == Opcode::A64ExceptionRaised;
+        || op == Opcode::A64ExceptionRaised
+        || op == Opcode::A64CheckMemoryAlignment;
 }
 
 bool Inst::AltersExclusiveState() const {

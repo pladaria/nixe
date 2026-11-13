@@ -85,6 +85,37 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
 
     match object {
         AppletObject::Root => {
+            let Some(command) = RootCommand::decode(request.command_id) else {
+                return unsupported_service_command(
+                    applet_object_name(&object),
+                    request.command_id,
+                );
+            };
+            let open_v2 = command == RootCommand::OpenApplicationProxy2;
+            if open_v2 && process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {
+                return unsupported_service_command(
+                    applet_object_name(&object),
+                    request.command_id,
+                );
+            }
+            // OpenApplicationProxy2 adds a u32 input alongside the reserved
+            // PID value, caller PID and copied process handle.
+            // https://switchbrew.org/wiki/AM_services#OpenApplicationProxy2
+            if !request.has_payload_size(if open_v2 { 16 } else { 8 }) {
+                return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            // @SPECULATIVE: the all-zero v2 input observed during startup selects
+            // the ordinary application proxy. The new u32 option's meaning is
+            // not documented; reject other inputs instead of ignoring them.
+            if open_v2 && request.data.iter().any(|byte| *byte != 0) {
+                return Err(IpcWireError::UnsupportedService(
+                    UnsupportedServiceOperation::CommandVariant {
+                        service: "IApplicationProxyService",
+                        command_id: request.command_id,
+                        detail: "OpenApplicationProxy2 nonzero option/reserved data",
+                    },
+                ));
+            }
             if hipc.pid.is_none()
                 || hipc.copy_handles.len() != 1
                 || process
@@ -106,12 +137,6 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
             // resulting proxies distinct because their child command graphs
             // diverge after the shared controller interfaces.
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L155-L182
-            let Some(command) = RootCommand::decode(request.command_id) else {
-                return unsupported_service_command(
-                    applet_object_name(&object),
-                    request.command_id,
-                );
-            };
             let kind = command.proxy_kind();
             applet_child(
                 session,

@@ -21,10 +21,12 @@ pub struct Core {
     context: CoreContext,
     code: CodeCache,
     control: CpuControl,
+    precise_memory_faults: bool,
 }
 pub struct Configuration {
     pub cpu: nixe_cpu::profile::ProcessCpuContext,
     pub timer_frequency: u32,
+    pub pointer_authentication_keys: Option<[[u64; 2]; 5]>,
 }
 /// Bridge event, decoded by the CPU execution loop after Run has returned.
 pub struct Event {
@@ -48,6 +50,7 @@ struct Callbacks<'a> {
     core: *mut c_void,
     code: Vec<CodeCapture>,
     error: Option<MemoryAccessFailure>,
+    precise_memory_faults: bool,
 }
 struct Invocation {
     core: *mut c_void,
@@ -79,6 +82,10 @@ impl Core {
                 register(0xd53b0020),
                 register(0xd53b00e0),
                 configuration.cpu.platform() == nixe_cpu::platform::TargetPlatform::Switch2,
+                configuration
+                    .pointer_authentication_keys
+                    .as_ref()
+                    .map_or(std::ptr::null(), |keys| keys.as_ptr().cast()),
             )
         };
         if pointer.is_null() {
@@ -103,6 +110,8 @@ impl Core {
             context,
             code: CodeCache::default(),
             control,
+            precise_memory_faults: configuration.cpu.platform()
+                == nixe_cpu::platform::TargetPlatform::Switch2,
         })
     }
     pub fn space(&self) -> &Arc<AddressSpace> {
@@ -195,6 +204,7 @@ impl Core {
             core: handle.pointer,
             code: Vec::new(),
             error: None,
+            precise_memory_faults: self.precise_memory_faults,
         };
         let mut call = Invocation {
             core: handle.pointer,
@@ -490,6 +500,11 @@ unsafe extern "C" fn memory(
     match capture {
         Ok(done) => done,
         Err(MemoryAccessFailure::Memory(error)) if error.is_access_fault() => {
+            if context.precise_memory_faults {
+                // Preserve the faulting PC and register state. In particular,
+                // failed pointer authentication must not turn into a zero load.
+                return false;
+            }
             // The normal callback policy does not abort or reconstruct an
             // invalid guest instruction. Match the reference default values.
             unsafe {

@@ -4,9 +4,8 @@
 //! <https://switchbrew.org/w/index.php?title=SVC&oldid=14679>, corroborated by
 //! libnx's public syscall declarations at
 //! <https://github.com/switchbrew/libnx/blob/master/nx/include/switch/kernel/svc.h>.
-//! Only the original Nintendo Switch Horizon profile is represented here;
-//! entries explicitly documented only for later hardware are not silently
-//! treated as compatible.
+//! Switch 2-only calls are named here for diagnostics; dispatch enables their
+//! semantics only for that platform.
 
 use std::fmt::{Display, Formatter};
 
@@ -268,6 +267,8 @@ pub static HORIZON_SVC_REGISTRY: &[HorizonSvcDescriptor] = &[
     svc!(0x7d, "CreateResourceLimit"),
     svc!(0x7e, "SetResourceLimitLimitValue"),
     svc!(0x7f, Value => "CallSecureMonitor"),
+    svc!(0x84, "MapRemoteMemory"),
+    svc!(0x85, "UnmapRemoteMemory"),
     svc!(0x90, "MapInsecurePhysicalMemory"),
     svc!(0x91, "UnmapInsecurePhysicalMemory"),
 ];

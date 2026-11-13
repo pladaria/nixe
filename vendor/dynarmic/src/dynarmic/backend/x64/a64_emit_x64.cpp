@@ -214,6 +214,7 @@ void A64EmitX64::ClearFastDispatchTable() {
 }
 
 void A64EmitX64::GenTerminalHandlers() {
+    Xbyak::Label invalid_pc;
     const auto check_exit = [this] {
         code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
         code.jne(code.GetForceReturnFromRunCodeAddress());
@@ -223,10 +224,17 @@ void A64EmitX64::GenTerminalHandlers() {
         }
     };
     // PC ends up in rbp, location_descriptor ends up in rbx
-    const auto calculate_location_descriptor = [this] {
+    const auto calculate_location_descriptor = [this, &invalid_pc] {
         // This calculation has to match up with A64::LocationDescriptor::UniqueHash
         // TODO: Optimization is available here based on known state of fpcr.
         code.mov(rbp, qword[r15 + offsetof(A64JitState, pc)]);
+        if (conf.pointer_authentication.address_bits != 0) {
+            // Validate before hashing masks PC bits: a failed authentication
+            // must not alias an already compiled block or a return-stack entry.
+            code.mov(rcx, rbp);
+            code.shr(rcx, conf.pointer_authentication.address_bits);
+            code.jnz(invalid_pc, code.T_NEAR);
+        }
         code.mov(rcx, A64::LocationDescriptor::pc_mask);
         code.and_(rcx, rbp);
         code.mov(ebx, dword[r15 + offsetof(A64JitState, fpcr)]);
@@ -288,6 +296,15 @@ void A64EmitX64::GenTerminalHandlers() {
         code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
         code.ret();
         PerfMapRegister(fast_dispatch_table_lookup, code.getCurr(), "a64_fast_dispatch_table_lookup");
+    }
+    if (conf.pointer_authentication.address_bits != 0) {
+        code.L(invalid_pc);
+        code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(conf.callbacks));
+        code.mov(code.ABI_PARAM2, rbp);
+        code.CallFunction(+[](A64::UserCallbacks* callbacks, u64 pc) {
+            callbacks->ExceptionRaised(pc, A64::Exception::NoExecuteFault);
+        });
+        code.jmp(code.GetForceReturnFromRunCodeAddress());
     }
 }
 
@@ -543,6 +560,20 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
     });
     // The kernel would have to execute ERET to get here, which would clear exclusive state.
     code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
+}
+
+void A64EmitX64::EmitA64CheckMemoryAlignment(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const auto address = ctx.reg_alloc.UseGpr(args[1]);
+    Xbyak::Label aligned;
+    code.test(address, static_cast<u32>(args[2].GetImmediateU64()));
+    code.jz(aligned, code.T_NEAR);
+    code.lock();
+    code.or_(code.dword[r15 + offsetof(A64JitState, halt_reason)], static_cast<u32>(HaltReason::MemoryAbort));
+    code.mov(rax, args[0].GetImmediateU64());
+    code.mov(code.qword[r15 + offsetof(A64JitState, pc)], rax);
+    code.ForceReturnFromRunCode();
+    code.L(aligned);
 }
 
 void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {

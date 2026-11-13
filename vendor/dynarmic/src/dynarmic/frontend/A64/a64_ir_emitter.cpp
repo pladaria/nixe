@@ -46,6 +46,10 @@ void IREmitter::CallSupervisor(u32 imm) {
     Inst(Opcode::A64CallSupervisor, Imm32(imm));
 }
 
+void IREmitter::CheckMemoryAlignment(const IR::U64& address, u64 mask) {
+    Inst(Opcode::A64CheckMemoryAlignment, Imm64(PC()), address, Imm64(mask));
+}
+
 void IREmitter::ExceptionRaised(Exception exception) {
     Inst(Opcode::A64ExceptionRaised, Imm64(PC()), Imm64(static_cast<u64>(exception)));
 }

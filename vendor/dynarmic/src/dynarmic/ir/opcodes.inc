@@ -65,6 +65,7 @@ A64OPC(SetFPCR,                                             Void,           U32 
 A64OPC(SetFPSR,                                             Void,           U32                                                             )
 A64OPC(SetPC,                                               Void,           U64                                                             )
 A64OPC(CallSupervisor,                                      Void,           U32                                                             )
+A64OPC(CheckMemoryAlignment,                                Void,           U64,            U64,            U64                             )
 A64OPC(ExceptionRaised,                                     Void,           U64,            U64                                             )
 A64OPC(DataCacheOperationRaised,                            Void,           U64,            U64,            U64                             )
 A64OPC(InstructionCacheOperationRaised,                     Void,           U64,            U64                                             )
@@ -263,6 +264,7 @@ OPCODE(CRC32ISO8,                                           U32,            U32,
 OPCODE(CRC32ISO16,                                          U32,            U32,            U32                                             )
 OPCODE(CRC32ISO32,                                          U32,            U32,            U32                                             )
 OPCODE(CRC32ISO64,                                          U32,            U32,            U64                                             )
+OPCODE(ComputePAC,                                          U64,            U64,            U64,            U64,            U64             )
 
 // AES instructions
 OPCODE(AESDecryptSingleRound,                               U128,           U128                                                            )

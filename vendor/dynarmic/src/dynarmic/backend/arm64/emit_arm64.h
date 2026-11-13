@@ -121,6 +121,7 @@ struct EmitConfig {
 
     // Memory
     bool check_halt_on_memory_access;
+    unsigned instruction_address_bits = 0;
 
     // Page table
     u64 page_table_pointer;

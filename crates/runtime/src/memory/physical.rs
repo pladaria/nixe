@@ -70,8 +70,12 @@ impl PhysicalMemoryLock {
             Poll::Pending
         }
     }
-    pub(super) async fn allocate(&self, bytes: u64) -> Result<Allocation, MappingError> {
-        let mut allocation = self.memory.account.allocate_async(bytes);
+    pub(super) async fn allocate(
+        &self,
+        account: &MemoryAccount,
+        bytes: u64,
+    ) -> Result<Allocation, MappingError> {
+        let mut allocation = account.allocate_async(bytes);
         poll_fn(|context| {
             self.check_open()?;
             match Pin::new(&mut allocation).poll(context) {
@@ -132,7 +136,12 @@ impl ProcessMemory {
         poll_fn(|context| lock.claim(context)).await?;
         Ok(lock)
     }
-    fn physical_holes(regions: &BTreeMap<u64, Region>, start: u64, end: u64) -> Vec<Range<u64>> {
+    fn physical_holes(
+        regions: &BTreeMap<u64, Region>,
+        start: u64,
+        end: u64,
+        required: Option<MemoryKind>,
+    ) -> Result<Vec<Range<u64>>, MappingError> {
         let mut cursor = start;
         let mut holes = Vec::new();
         let first = regions
@@ -143,6 +152,9 @@ impl ProcessMemory {
             if region.end <= cursor {
                 continue;
             }
+            if required.is_some_and(|kind| kind != region.mapping.kind) {
+                return Err(MappingError::StateMismatch);
+            }
             if base > cursor {
                 holes.push(cursor..base);
             }
@@ -151,7 +163,7 @@ impl ProcessMemory {
         if cursor < end {
             holes.push(cursor..end);
         }
-        holes
+        Ok(holes)
     }
     /// Fill only free pages; already mapped intervals keep their bytes, state,
     /// physical identity and permissions, as KPageTableBase::MapPhysicalMemory.
@@ -160,12 +172,36 @@ impl ProcessMemory {
         start: GuestVirtualAddress,
         bytes: u64,
     ) -> Result<(), MappingError> {
+        self.map_physical_from(start, bytes, &self.account, MemoryKind::Heap)
+            .await
+    }
+    // @SPECULATIVE: MapRemoteMemory commits zeroed RW pages from the NPDM
+    // remote quota, preserving existing remote pages. Reject backing owned by
+    // another mapping class. Page alignment, partial ranges and idempotence
+    // follow physical mappings until the remote kernel contract is documented.
+    pub(crate) async fn map_remote(
+        self: &Arc<Self>,
+        start: GuestVirtualAddress,
+        bytes: u64,
+        account: &MemoryAccount,
+    ) -> Result<(), MappingError> {
+        self.map_physical_from(start, bytes, account, MemoryKind::Remote)
+            .await
+    }
+    async fn map_physical_from(
+        self: &Arc<Self>,
+        start: GuestVirtualAddress,
+        bytes: u64,
+        account: &MemoryAccount,
+        kind: MemoryKind,
+    ) -> Result<(), MappingError> {
         let end = self.end(start, bytes)?;
         let physical = self.lock_physical().await?;
+        let required = (kind == MemoryKind::Remote).then_some(kind);
         loop {
             let needed: u64 = {
                 let regions = self.regions.lock().unwrap();
-                Self::physical_holes(&regions, start.get(), end)
+                Self::physical_holes(&regions, start.get(), end, required)?
                     .iter()
                     .map(|range| range.end - range.start)
                     .sum()
@@ -173,9 +209,10 @@ impl ProcessMemory {
             if needed == 0 {
                 return Ok(());
             }
-            let allocation = physical.allocate(needed).await?;
+            let allocation = physical.allocate(account, needed).await?;
             let mut regions = self.regions.lock().unwrap();
-            let holes = Self::physical_holes(&regions, start.get(), end);
+            physical.check_open()?;
+            let holes = Self::physical_holes(&regions, start.get(), end, required)?;
             if holes
                 .iter()
                 .map(|range| range.end - range.start)
@@ -187,7 +224,7 @@ impl ProcessMemory {
                 continue;
             }
             let mapping = Mapping {
-                kind: MemoryKind::Heap,
+                kind,
                 permissions: MemoryPermissions::READ_WRITE,
                 uncached: false,
                 locked: false,
@@ -234,6 +271,25 @@ impl ProcessMemory {
         start: GuestVirtualAddress,
         bytes: u64,
     ) -> Result<(), MappingError> {
+        self.unmap_physical_kind(start, bytes, MemoryKind::Heap)
+            .await
+    }
+    // @SPECULATIVE: remote unmapping allows holes and partial ranges but only
+    // releases unlocked remote pages. Ordinary alias/heap backing is retained.
+    pub(crate) async fn unmap_remote(
+        self: &Arc<Self>,
+        start: GuestVirtualAddress,
+        bytes: u64,
+    ) -> Result<(), MappingError> {
+        self.unmap_physical_kind(start, bytes, MemoryKind::Remote)
+            .await
+    }
+    async fn unmap_physical_kind(
+        self: &Arc<Self>,
+        start: GuestVirtualAddress,
+        bytes: u64,
+        kind: MemoryKind,
+    ) -> Result<(), MappingError> {
         let end = self.end(start, bytes)?;
         let _physical = self.lock_physical().await?;
         let mut regions = self.regions.lock().unwrap();
@@ -247,11 +303,7 @@ impl ProcessMemory {
                 continue;
             }
             let state = region.mapping;
-            if state.kind != MemoryKind::Heap
-                || state.locked
-                || state.uncached
-                || state.permission_locked
-            {
+            if state.kind != kind || state.locked || state.uncached || state.permission_locked {
                 return Err(MappingError::StateMismatch);
             }
             mapped.push(base.max(start.get())..region.end.min(end));

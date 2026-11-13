@@ -13,10 +13,20 @@
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/microinstruction.h"
 #include "dynarmic/ir/opcodes.h"
+#include "dynarmic/common/crypto/qarma.h"
 
 namespace Dynarmic::Backend::Arm64 {
 
 using namespace oaknut::util;
+
+template<>
+void EmitIR<IR::Opcode::ComputePAC>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ctx.reg_alloc.PrepareForCall(args[0], args[1], args[2], args[3]);
+    code.MOV(Xscratch0, reinterpret_cast<uintptr_t>(&Common::Crypto::ComputePAC));
+    code.BLR(Xscratch0);
+    ctx.reg_alloc.DefineAsRegister(inst, X0);
+}
 
 template<size_t bitsize, typename EmitFn>
 static void EmitCRC(oaknut::CodeGenerator&, EmitContext& ctx, IR::Inst* inst, EmitFn emit_fn) {

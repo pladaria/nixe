@@ -150,6 +150,7 @@ pub struct MemoryAccount {
 struct Ledger {
     limit: u64,
     used: AtomicU64,
+    peak: AtomicU64,
 }
 struct AllocationRecord {
     machine: Machine,
@@ -283,6 +284,7 @@ impl Machine {
             ledger: Arc::new(Ledger {
                 limit,
                 used: AtomicU64::new(0),
+                peak: AtomicU64::new(0),
             }),
         })
     }
@@ -354,6 +356,9 @@ impl MemoryAccount {
     }
     pub fn used_bytes(&self) -> u64 {
         self.ledger.used.load(Ordering::Acquire)
+    }
+    pub fn peak_bytes(&self) -> u64 {
+        self.ledger.peak.load(Ordering::Acquire)
     }
     pub fn limit(&self) -> u64 {
         self.ledger.limit
@@ -485,7 +490,8 @@ impl MemoryAccount {
                     }
                 }
             }
-            self.ledger.used.fetch_add(bytes, Ordering::Release);
+            let used = self.ledger.used.fetch_add(bytes, Ordering::Release) + bytes;
+            self.ledger.peak.fetch_max(used, Ordering::Release);
             self.machine
                 .0
                 .guest_bytes

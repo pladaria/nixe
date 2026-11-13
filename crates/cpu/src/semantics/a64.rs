@@ -194,9 +194,8 @@ pub const fn hint_operation(platform: TargetPlatform, immediate: u8) -> Option<H
         5 => Some(HintOperation::SendEventLocal),
         // These backwards-compatible Pointer Authentication aliases occupy
         // HINT space and therefore execute as NOP on Switch 1's Cortex-A57,
-        // which predates FEAT_PAuth. Keep Switch 2 explicit until its CPU
-        // feature profile and PAC state are modeled instead of silently
-        // discarding an operation that may alter X30 there.
+        // which predates FEAT_PAuth. Switch 2 executes them with its process
+        // key bank in the JIT; they must never enter this no-op classification.
         7 | 8 | 10 | 12 | 14 | 24..=31 if matches!(platform, TargetPlatform::Switch1) => {
             Some(HintOperation::NoOperation)
         }

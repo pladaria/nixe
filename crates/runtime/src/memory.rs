@@ -26,13 +26,16 @@ pub enum MemoryKind {
     ThreadLocal,
     Stack,
     Heap,
+    Remote,
     Shared,
 }
 impl MemoryKind {
     fn mutable(self) -> bool {
+        // @SPECULATIVE: remote backing supports ordinary data permission/cache
+        // changes; its precise kernel state flags have not been verified.
         matches!(
             self,
-            Self::MutableCode | Self::MutableModuleCode | Self::Heap
+            Self::MutableCode | Self::MutableModuleCode | Self::Heap | Self::Remote
         )
     }
 }

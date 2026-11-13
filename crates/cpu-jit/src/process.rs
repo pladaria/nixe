@@ -22,6 +22,7 @@ pub struct Process {
     cpu: ProcessCpuContext,
     space: Arc<AddressSpace>,
     frequency: u32,
+    pointer_authentication_keys: Option<[[u64; 2]; 5]>,
     stopped: AtomicBool,
     controls: Mutex<Vec<CpuControl>>,
     waits: Mutex<Vec<Weak<Notification>>>,
@@ -91,10 +92,31 @@ impl Process {
             .ok_or_else(|| {
                 JitError::Failure("architectural timer frequency must fit a nonzero u32".into())
             })?;
+        // @SPECULATIVE: use one random EL0 key bank per process, shared across
+        // threads and host migration. ARM defines the operations, but Horizon's
+        // exact key initialization/sharing policy has not been verified.
+        let pointer_authentication_keys =
+            if cpu.platform() == nixe_cpu::platform::TargetPlatform::Switch2 {
+                let mut bytes = [0_u8; 80];
+                getrandom::fill(&mut bytes).map_err(|error| {
+                    JitError::Failure(
+                        format!("cannot initialize process authentication keys: {error}").into(),
+                    )
+                })?;
+                Some(std::array::from_fn(|key| {
+                    std::array::from_fn(|half| {
+                        let offset = key * 16 + half * 8;
+                        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+                    })
+                }))
+            } else {
+                None
+            };
         Ok(Arc::new(Self {
             cpu,
             space,
             frequency,
+            pointer_authentication_keys,
             stopped: AtomicBool::new(false),
             controls: Mutex::new(Vec::new()),
             waits: Mutex::new(Vec::new()),
@@ -113,6 +135,7 @@ impl Process {
             Configuration {
                 cpu: self.cpu,
                 timer_frequency: self.frequency,
+                pointer_authentication_keys: self.pointer_authentication_keys,
             },
         )?;
         let mut controls = self.controls.lock().unwrap();
@@ -360,6 +383,11 @@ impl Thread {
                 2 => CpuExit::SupervisorCall {
                     source,
                     immediate: event.detail,
+                },
+                4 => CpuExit::ArchitecturalException {
+                    source,
+                    kind: ExceptionKind::DataAbort,
+                    syndrome: None,
                 },
                 3 => match event.detail {
                     8 => CpuExit::ArchitecturalException {

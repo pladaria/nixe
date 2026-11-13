@@ -156,6 +156,51 @@ impl RunnableProcess {
         &self.remote_memory
     }
 
+    fn validate_remote_range(
+        &self,
+        start: GuestVirtualAddress,
+        bytes: u64,
+    ) -> Result<(), crate::memory::MappingError> {
+        let region = self
+            .memory_layout
+            .remote()
+            .ok_or(crate::memory::MappingError::InvalidRange)?;
+        // @SPECULATIVE: remote SVCs operate only inside RemoteRegionAddress/Size;
+        // a nonzero NPDM quota is required to commit pages, not to expose the VA window.
+        if bytes == 0
+            || !bytes.is_multiple_of(nixe_memory::PAGE_SIZE)
+            || !start.is_aligned_to(nixe_memory::PAGE_SIZE)
+            || start.get() < region.base().get()
+            || start
+                .get()
+                .checked_add(bytes)
+                .is_none_or(|end| end > region.end())
+        {
+            return Err(crate::memory::MappingError::InvalidRange);
+        }
+        Ok(())
+    }
+
+    pub async fn map_remote_memory(
+        &self,
+        start: GuestVirtualAddress,
+        bytes: u64,
+    ) -> Result<(), crate::memory::MappingError> {
+        self.validate_remote_range(start, bytes)?;
+        self.memory
+            .map_remote(start, bytes, &self.remote_memory)
+            .await
+    }
+
+    pub async fn unmap_remote_memory(
+        &self,
+        start: GuestVirtualAddress,
+        bytes: u64,
+    ) -> Result<(), crate::memory::MappingError> {
+        self.validate_remote_range(start, bytes)?;
+        self.memory.unmap_remote(start, bytes).await
+    }
+
     #[must_use]
     pub fn modules(&self) -> &[PreparedModule] {
         &self.modules

@@ -34,6 +34,8 @@ recovery when direct execution is sufficient and guest-visible semantics do not 
 
 Do not classify removal of an emulator-critical bottleneck as premature optimization.
 
+Anotate speculative code paths with a "@SPECULATIVE" comment and description.
+
 ## Testing
 
 Add focused tests for behavior that benefits from regression coverage. Use Rust's conventional unit tests for

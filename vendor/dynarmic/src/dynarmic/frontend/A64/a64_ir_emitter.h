@@ -42,6 +42,7 @@ public:
 
     void CallSupervisor(u32 imm);
     void ExceptionRaised(Exception exception);
+    void CheckMemoryAlignment(const IR::U64& address, u64 mask);
     void DataCacheOperationRaised(DataCacheOperation op, const IR::U64& value);
     void InstructionCacheOperationRaised(InstructionCacheOperation op, const IR::U64& value);
     void DataSynchronizationBarrier();

@@ -31,6 +31,17 @@ struct TranslatorVisitor final {
     bool UnallocatedEncoding();
     bool RaiseException(Exception exception);
 
+    bool HasPAuth() const;
+    IR::U64 StripPAC(const IR::U64& pointer);
+    IR::U64 PointerAuth(const IR::U64& pointer, const IR::U64& modifier, unsigned key, bool authenticate);
+    bool PAuthHint(unsigned immediate);
+    bool PACAUT_reg(bool Z, Imm<3> op, Reg Rn, Reg Rd);
+    bool XPAC_reg(bool D, Reg Rd);
+    bool PACGA(Reg Rm, Reg Rn, Reg Rd);
+    bool RETA(bool M);
+    bool BRA_BLRA(bool Z, bool L, bool M, Reg Rn, Reg Rm);
+    bool LDRA(bool M, bool S, Imm<9> imm9, bool W, Reg Rn, Reg Rt);
+
     struct BitMasks {
         u64 wmask, tmask;
     };
@@ -127,16 +138,6 @@ struct TranslatorVisitor final {
     bool WFI();
     bool SEV();
     bool SEVL();
-    bool XPAC_1(bool D, Reg Rd);
-    bool XPAC_2();
-    bool PACIA_1(bool Z, Reg Rn, Reg Rd);
-    bool PACIA_2();
-    bool PACIB_1(bool Z, Reg Rn, Reg Rd);
-    bool PACIB_2();
-    bool AUTIA_1(bool Z, Reg Rn, Reg Rd);
-    bool AUTIA_2();
-    bool AUTIB_1(bool Z, Reg Rn, Reg Rd);
-    bool AUTIB_2();
     bool BTI(Imm<2> upper_op2);
     bool ESB();
     bool PSB();
@@ -182,11 +183,8 @@ struct TranslatorVisitor final {
 
     // Unconditional branch (Register)
     bool BR(Reg Rn);
-    bool BRA(bool Z, bool M, Reg Rn, Reg Rm);
     bool BLR(Reg Rn);
-    bool BLRA(bool Z, bool M, Reg Rn, Reg Rm);
     bool RET(Reg Rn);
-    bool RETA(bool M);
     bool ERET();
     bool ERETA(bool M);
     bool DRPS();
@@ -234,6 +232,10 @@ struct TranslatorVisitor final {
     bool LD4R_2(bool Q, Reg Rm, Imm<2> size, Reg Rn, Vec Vt);
 
     // Loads and stores - Load/Store Exclusive
+    bool LDAPR_sz(Imm<2> size, Reg Rn, Reg Rt);
+    bool AtomicMemOp(Imm<2> size, bool A, bool R, Reg Rs, Imm<4> op, Reg Rn, Reg Rt);
+    bool CompareAndSwap(Imm<2> size, bool L, Reg Rs, bool o0, Reg Rn, Reg Rt);
+    bool CompareAndSwapPair(bool sz, bool L, Reg Rs, bool o0, Reg Rn, Reg Rt);
     bool STXR(Imm<2> size, Reg Rs, Reg Rn, Reg Rt);
     bool STLXR(Imm<2> size, Reg Rs, Reg Rn, Reg Rt);
     bool STXP(Imm<1> size, Reg Rs, Reg Rt2, Reg Rn, Reg Rt);
@@ -347,9 +349,6 @@ struct TranslatorVisitor final {
     bool STZ2G_3(Imm<9> offset_imm, Reg Rn);
     bool LDGV(Reg Rn, Reg Rt);
 
-    // Loads and stores - Load/Store register (pointer authentication)
-    bool LDRA(bool M, bool S, Imm<9> imm9, bool W, Reg Rn, Reg Rt);
-
     // Data Processing - Register - 2 source
     bool UDIV(bool sf, Reg Rm, Reg Rn, Reg Rd);
     bool SDIV(bool sf, Reg Rm, Reg Rn, Reg Rd);
@@ -359,7 +358,6 @@ struct TranslatorVisitor final {
     bool RORV(bool sf, Reg Rm, Reg Rn, Reg Rd);
     bool CRC32(bool sf, Reg Rm, Imm<2> sz, Reg Rn, Reg Rd);
     bool CRC32C(bool sf, Reg Rm, Imm<2> sz, Reg Rn, Reg Rd);
-    bool PACGA(Reg Rm, Reg Rn, Reg Rd);
     bool SUBP(Reg Rm, Reg Rn, Reg Rd);
     bool IRG(Reg Rm, Reg Rn, Reg Rd);
     bool GMI(Reg Rm, Reg Rn, Reg Rd);

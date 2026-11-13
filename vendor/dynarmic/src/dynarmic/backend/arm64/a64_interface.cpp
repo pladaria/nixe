@@ -30,6 +30,11 @@ struct Jit::Impl final {
 
     HaltReason Run() {
         ASSERT(!is_executing);
+        if (conf.pointer_authentication.address_bits != 0 &&
+            (current_state.pc >> conf.pointer_authentication.address_bits) != 0) {
+            conf.callbacks->ExceptionRaised(current_state.pc, A64::Exception::NoExecuteFault);
+            return static_cast<HaltReason>(Atomic::Load(&halt_reason));
+        }
         PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&halt_reason)));
 
         is_executing = true;
@@ -46,6 +51,11 @@ struct Jit::Impl final {
 
     HaltReason Step() {
         ASSERT(!is_executing);
+        if (conf.pointer_authentication.address_bits != 0 &&
+            (current_state.pc >> conf.pointer_authentication.address_bits) != 0) {
+            conf.callbacks->ExceptionRaised(current_state.pc, A64::Exception::NoExecuteFault);
+            return static_cast<HaltReason>(Atomic::Load(&halt_reason));
+        }
         PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&halt_reason)));
 
         is_executing = true;

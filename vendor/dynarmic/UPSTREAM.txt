@@ -12,8 +12,32 @@ Nixe adaptations:
 - frontend/A64/translate/impl/sys_dc.cpp: end blocks after cache operations;
   nixe applies ownership transitions after dropping its execution lease.
 - ir/opt/a64_get_set_elimination_pass.cpp, ir/opt/passes.h and
-  backend/x64/a64_interface.cpp: retain setters visible at memory-abort exits
+  both A64 backends: retain setters visible at memory-abort exits
   while still forwarding register values and eliminating redundant accesses.
+- interface/A64/config.h, frontend/A64/translate and both A64 backends:
+  optionally stop at unknown extension HINTs instead of silently dropping their
+  semantics on newer guest CPUs.
+- interface/A64/pointer_authentication.h, A64 decoding/translation, IR and host
+  crypto emitters: implement QARMA5-based FEAT_PAuth2 with immutable process keys,
+  PAC/AUT/XPAC, PACGA, authenticated branches/returns and authenticated loads.
+  Pointer widths match the execution address space, with TBI=0 and no FPAC.
+- A64 host entry points, indirect dispatch and return handlers: validate execution
+  addresses before the location hash drops high PC bits, including cached
+  indirect branches, returns and entry from the host.
+- common/crypto/qarma.{cpp,h}: QARMA5 helper adapted from QEMU's
+  target/arm/tcg/pauth_helper.c (Linaro copyright, LGPL-2.1-or-later).
+  Its license is retained in LICENSE.qarma.txt; the original vendored files keep
+  their existing licenses.
+- frontend/A64/translate/impl/load_store_atomic.cpp: LSE atomic operations
+  adapted from Lichii revision 21d62e43caa178aeb04e74585b3aad622b278b84
+  (src/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_atomic.cpp).
+  The file retains its GPL-3.0-or-later notice. CPU feature selection enables
+  LSE at translation time; exclusive IR implements CAS/CASP, SWP and atomic ALU
+  operations, including acquire/release and retries without partial register
+  updates. LDAPR uses the existing limited-order acquire memory operations,
+  gated by the RCpc CPU feature. A64CheckMemoryAlignment in both host backends
+  faults before a misaligned atomic operation; precise memory exits preserve
+  earlier setters.
 
 The Rust/C ABI integration is in crates/cpu-jit. The generic native fault
 capture implementation is shared with the interpreter in cpu-direct-memory.

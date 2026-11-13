@@ -187,6 +187,9 @@ impl HorizonSvcDispatcher {
             MemoryKind::Code => 3,
             MemoryKind::MutableCode => 4,
             MemoryKind::Heap => 5,
+            // @SPECULATIVE: expose remote backing as Normal memory. Its exact
+            // kernel MemoryState flags and allowed transitions remain unknown.
+            MemoryKind::Remote => 5,
             MemoryKind::Shared => 6,
             MemoryKind::ModuleCode => 8,
             MemoryKind::MutableModuleCode => 9,

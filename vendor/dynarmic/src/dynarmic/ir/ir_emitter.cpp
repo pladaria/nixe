@@ -896,6 +896,10 @@ U32 IREmitter::CRC32ISO64(const U32& a, const U64& b) {
     return Inst<U32>(Opcode::CRC32ISO64, a, b);
 }
 
+U64 IREmitter::ComputePAC(const U64& pointer, const U64& modifier, const U64& key_hi, const U64& key_lo) {
+    return Inst<U64>(Opcode::ComputePAC, pointer, modifier, key_hi, key_lo);
+}
+
 U128 IREmitter::AESDecryptSingleRound(const U128& a) {
     return Inst<U128>(Opcode::AESDecryptSingleRound, a);
 }

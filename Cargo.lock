@@ -1390,6 +1390,7 @@ name = "nixe-cpu-jit"
 version = "0.1.0"
 dependencies = [
  "cmake",
+ "getrandom 0.4.3",
  "nixe-cpu",
  "nixe-cpu-direct-memory",
  "nixe-memory",

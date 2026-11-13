@@ -106,6 +106,23 @@ pub(super) fn get_info(
         21 => process.total_non_system_user_physical_memory_size(),
         22 => process.used_non_system_user_physical_memory_size(),
         28 => 0,
+        // https://switchbrew.org/wiki/SVC#InfoType
+        29 | 30 if layout.remote().is_some() => {
+            let region = layout.remote().unwrap();
+            if info_type == 29 {
+                region.base().get()
+            } else {
+                region.size()
+            }
+        }
+        // @SPECULATIVE: usage/peak count the guest-owned physical allocations
+        // charged to the remote account, including allocations by remote HLE
+        // owners. The kernel's precise charging rules are not documented.
+        31 if layout.remote().is_some() => process.remote_memory().used_bytes(),
+        32 if layout.remote().is_some() => process.remote_memory().peak_bytes(),
+        // @SPECULATIVE: expose our 4 KiB process granule. Switchbrew identifies
+        // this as ProcessPageSize but does not specify S2 granule selection.
+        33 if layout.remote().is_some() => nixe_memory::PAGE_SIZE,
         _ => {
             return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedInfoType {
                 info_type,
@@ -268,6 +285,58 @@ pub(super) fn physical_memory(
     };
     mapping_result(context, completed)
 }
+// ABI: https://switchbrew.org/wiki/SVC (MapRemoteMemory / UnmapRemoteMemory).
+pub(super) fn remote_memory(
+    context: &mut ExceptionDispatchContext<'_>,
+    unmap: bool,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    let handle = read_register(context.thread().state(), 0) as u32;
+    let start = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
+    let size = read_register(context.thread().state(), 2);
+    // @SPECULATIVE: resolve a normal process handle or current-process
+    // pseudohandle. Validate ranges and report the same error classes as
+    // MapPhysicalMemory; remote-specific access policy is not documented.
+    let process = if handle == CURRENT_PROCESS_HANDLE {
+        context.process().clone()
+    } else {
+        match context
+            .process()
+            .handles()
+            .lookup_as::<nixe_runtime::RunnableProcess>(handle)
+        {
+            Some(process) => process,
+            None => {
+                result(context, HorizonKernelResult::INVALID_HANDLE);
+                return resume();
+            }
+        }
+    };
+    if !start.is_aligned_to(nixe_memory::PAGE_SIZE) {
+        result(context, HorizonKernelResult::INVALID_ADDRESS);
+        return resume();
+    }
+    if size == 0 || !size.is_multiple_of(nixe_memory::PAGE_SIZE) {
+        result(context, HorizonKernelResult::INVALID_SIZE);
+        return resume();
+    }
+    if process.memory_layout().remote().is_none_or(|region| {
+        start.get() < region.base().get()
+            || start
+                .get()
+                .checked_add(size)
+                .is_none_or(|end| end > region.base().get() + region.size())
+    }) {
+        result(context, HorizonKernelResult::INVALID_MEMORY_REGION);
+        return resume();
+    }
+    let completed = if unmap {
+        super::access::wait_io(context, process.unmap_remote_memory(start, size))
+    } else {
+        super::access::wait_io(context, process.map_remote_memory(start, size))
+    };
+    mapping_result(context, completed)
+}
+
 pub(super) fn set_memory_permission(
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {

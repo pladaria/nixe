@@ -664,6 +664,12 @@ unsafe impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x70 => create_port(context),
             0x71 => self.manage_named_port(context),
             0x72 => connect_to_port(context),
+            0x84 if context.process().memory_layout().remote().is_some() => {
+                remote_memory(context, false)
+            }
+            0x85 if context.process().memory_layout().remote().is_some() => {
+                remote_memory(context, true)
+            }
             _ => {
                 let descriptor = match decode_horizon_svc(immediate) {
                     Ok(descriptor) => descriptor,

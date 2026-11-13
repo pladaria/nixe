@@ -140,7 +140,8 @@ impl ProcessBuilder {
             });
         let handles = Arc::new(handles);
 
-        // Remote memory is backed by the application pool, separately from the
+        // @SPECULATIVE: interpret NPDM RemoteMemorySize as a hard physical quota
+        // backed by the application pool, separately from the
         // process's ordinary physical-memory allowance. Retain the NPDM quota;
         // its virtual mappings and service operations have distinct owners.
         // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/kernel/svc/svc_info.cpp#L21-L26

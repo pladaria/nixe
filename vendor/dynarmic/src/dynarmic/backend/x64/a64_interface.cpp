@@ -69,6 +69,11 @@ public:
 
     HaltReason Run() {
         ASSERT(!is_executing);
+        if (conf.pointer_authentication.address_bits != 0 &&
+            (jit_state.pc >> conf.pointer_authentication.address_bits) != 0) {
+            conf.callbacks->ExceptionRaised(jit_state.pc, A64::Exception::NoExecuteFault);
+            return static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason));
+        }
         PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
 
         is_executing = true;
@@ -98,6 +103,11 @@ public:
 
     HaltReason Step() {
         ASSERT(!is_executing);
+        if (conf.pointer_authentication.address_bits != 0 &&
+            (jit_state.pc >> conf.pointer_authentication.address_bits) != 0) {
+            conf.callbacks->ExceptionRaised(jit_state.pc, A64::Exception::NoExecuteFault);
+            return static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason));
+        }
         PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
 
         is_executing = true;
@@ -272,12 +282,13 @@ private:
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
         A64::Translate(ir_block, A64::LocationDescriptor{current_location}, get_code,
                        {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct,
-                        conf.hook_hint_instructions, conf.hook_unknown_hint_instructions});
+                        conf.hook_hint_instructions, conf.hook_unknown_hint_instructions, conf.enable_lse, conf.enable_rcpc,
+                        &conf.pointer_authentication});
         Optimization::PolyfillPass(ir_block, polyfill_options);
         Optimization::A64CallbackConfigPass(ir_block, conf);
         Optimization::NamingPass(ir_block);
         if (conf.HasOptimization(OptimizationFlag::GetSetElimination)) {
-            Optimization::A64GetSetElimination(ir_block);
+            Optimization::A64GetSetElimination(ir_block, conf.check_halt_on_memory_access);
             Optimization::DeadCodeElimination(ir_block);
         }
         if (conf.HasOptimization(OptimizationFlag::ConstProp)) {

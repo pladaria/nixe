@@ -58,7 +58,7 @@ struct Core final : Dynarmic::A64::UserCallbacks {
 
   Core(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table, size_t address_bits,
        std::uint32_t frequency, std::uint32_t ctr, std::uint32_t dczid,
-       bool strict_hints)
+       bool strict_architecture, const std::uint64_t* pointer_authentication_keys)
       : callbacks(cb) {
     Dynarmic::A64::UserConfig conf{};
     conf.callbacks = this;
@@ -69,9 +69,21 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.dczid_el0 = dczid;
     conf.wall_clock_cntpct = true;
     conf.enable_cycle_counting = false;
-    conf.check_halt_on_memory_access = false;
+    conf.check_halt_on_memory_access = strict_architecture;
     conf.hook_hint_instructions = false;
-    conf.hook_unknown_hint_instructions = strict_hints;
+    conf.hook_unknown_hint_instructions = strict_architecture;
+    conf.enable_lse = strict_architecture;
+    conf.enable_rcpc = strict_architecture;
+    if (pointer_authentication_keys) {
+      // @SPECULATIVE: enable the EL0 instruction/data keys and use this process's
+      // VA width with TBI disabled. Horizon's exact key-enable and translation
+      // control configuration on Switch 2 is not documented.
+      conf.pointer_authentication.address_bits = static_cast<unsigned>(address_bits);
+      for (size_t key = 0; key < 5; ++key) {
+        conf.pointer_authentication.keys[key] = {pointer_authentication_keys[key * 2],
+                                                pointer_authentication_keys[key * 2 + 1]};
+      }
+    }
     conf.hook_data_cache_operations = false;
     // Use Eden's defined choices for constrained-unpredictable encodings,
     // including overlapping status/data zero registers in STXR/STLXR.
@@ -217,9 +229,11 @@ bool nixe_dynarmic_resolve_fault(std::uint64_t pc, std::uint64_t *call,
 const char *nixe_dynarmic_error() noexcept { return last_error.c_str(); }
 void *nixe_dynarmic_create(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table,
                            size_t bits, std::uint32_t frequency, std::uint32_t ctr,
-                           std::uint32_t dczid, bool strict_hints) noexcept {
+                           std::uint32_t dczid, bool strict_architecture,
+                           const std::uint64_t* pointer_authentication_keys) noexcept {
   try {
-    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid, strict_hints);
+    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid, strict_architecture,
+                    pointer_authentication_keys);
   } catch (const std::exception &e) {
     last_error = e.what();
     return nullptr;
@@ -363,7 +377,10 @@ bool nixe_dynarmic_run(Core *core, void *context, NixeExit *result) noexcept {
   try {
     core->context = context;
     core->exit = {};
-    core->jit->Run();
+    const auto halt = core->jit->Run();
+    if (Dynarmic::Has(halt, HaltReason::MemoryAbort) && core->exit.kind == 0) {
+      core->exit = {4, 0, core->jit->GetPC()};
+    }
     // Return with the faulting/SVC instruction selected. Runtime applies the
     // service continuation once; normalize here without a second FFI call.
     if (core->exit.kind == 1 || core->exit.kind == 2 ||

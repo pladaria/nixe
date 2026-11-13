@@ -15,6 +15,7 @@ pub enum ProcessMemoryLayoutProfile {
     Horizon1,
     #[default]
     Horizon2Plus,
+    Switch2,
 }
 
 impl ProcessAddressSpace {
@@ -90,6 +91,7 @@ pub struct ProcessMemoryLayout {
     heap: ProcessVirtualRegion,
     alias: ProcessVirtualRegion,
     stack: ProcessVirtualRegion,
+    remote: Option<ProcessVirtualRegion>,
     memory_capacity: u64,
 }
 
@@ -143,11 +145,32 @@ impl ProcessMemoryLayout {
                 (aslr, alias, heap, stack)
             }
         };
+        let remote = if profile == ProcessMemoryLayoutProfile::Switch2 {
+            if address_space != ProcessAddressSpace::Bit64 {
+                return Err(error(
+                    ProcessBuildStage::Metadata,
+                    "Switch 2 remote regions currently require a 39-bit address space",
+                ));
+            }
+            // @SPECULATIVE: the remote VA window occupies the upper half of the
+            // alias reservation, matching the observed SDK VAMM usage in Lichii.
+            // It remains inside Alias so MapPhysicalMemory can back VAMM ranges
+            // from ordinary RAM. Its extent is independent of the NPDM quota.
+            // Real kernel placement and region overlap rules are not documented.
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/kernel/svc/svc_info.cpp#L85-L98
+            Some(region(
+                alias.base().get() + alias.size() / 2,
+                alias.size() / 2,
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             aslr,
             heap,
             alias,
             stack,
+            remote,
             memory_capacity,
         })
     }
@@ -170,6 +193,10 @@ impl ProcessMemoryLayout {
     #[must_use]
     pub const fn stack(self) -> ProcessVirtualRegion {
         self.stack
+    }
+
+    pub const fn remote(self) -> Option<ProcessVirtualRegion> {
+        self.remote
     }
 
     /// Returns the process commit limit used for memory accounting.

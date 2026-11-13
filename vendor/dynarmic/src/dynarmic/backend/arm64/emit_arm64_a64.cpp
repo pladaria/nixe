@@ -83,6 +83,10 @@ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Po
         code.MOV(Wscratch0, A64::LocationDescriptor::fpcr_mask);
         code.LDR(W0, Xstate, offsetof(A64JitState, fpcr));
         code.LDR(X1, Xstate, offsetof(A64JitState, pc));
+        if (ctx.conf.instruction_address_bits != 0) {
+            code.LSR(Xscratch1, X1, ctx.conf.instruction_address_bits);
+            code.CBNZ(Xscratch1, fail);
+        }
         code.AND(W0, W0, Wscratch0);
         code.AND(X1, X1, A64::LocationDescriptor::pc_mask);
         code.LSL(X0, X0, A64::LocationDescriptor::fpcr_shift);
@@ -406,6 +410,25 @@ void EmitIR<IR::Opcode::A64CallSupervisor>(oaknut::CodeGenerator& code, EmitCont
         code.STR(X0, SP, offsetof(StackLayout, cycles_to_run));
         code.MOV(Xticks, X0);
     }
+}
+
+template<>
+void EmitIR<IR::Opcode::A64CheckMemoryAlignment>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto address = ctx.reg_alloc.ReadX(args[1]);
+    RegAlloc::Realize(address);
+    oaknut::Label aligned, retry;
+    code.TST(address, args[2].GetImmediateU64());
+    code.B(EQ, aligned);
+    code.l(retry);
+    code.LDAXR(Wscratch0, Xhalt);
+    code.ORR(Wscratch0, Wscratch0, static_cast<u32>(HaltReason::MemoryAbort));
+    code.STLXR(Wscratch1, Wscratch0, Xhalt);
+    code.CBNZ(Wscratch1, retry);
+    code.MOV(Xscratch0, args[0].GetImmediateU64());
+    code.STR(Xscratch0, Xstate, offsetof(A64JitState, pc));
+    EmitRelocation(code, ctx, LinkTarget::ReturnFromRunCode);
+    code.l(aligned);
 }
 
 template<>

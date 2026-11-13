@@ -330,12 +330,12 @@ A64AddressSpace::A64AddressSpace(const A64::UserConfig& conf)
 IR::Block A64AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
     const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
     IR::Block ir_block = A64::Translate(A64::LocationDescriptor{descriptor}, get_code,
-                                        {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, conf.hook_hint_instructions, conf.hook_unknown_hint_instructions});
+                                        {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, conf.hook_hint_instructions, conf.hook_unknown_hint_instructions, conf.enable_lse, conf.enable_rcpc, &conf.pointer_authentication});
 
     Optimization::A64CallbackConfigPass(ir_block, conf);
     Optimization::NamingPass(ir_block);
-    if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
-        Optimization::A64GetSetElimination(ir_block);
+    if (conf.HasOptimization(OptimizationFlag::GetSetElimination)) {
+        Optimization::A64GetSetElimination(ir_block, conf.check_halt_on_memory_access);
         Optimization::DeadCodeElimination(ir_block);
     }
     if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
@@ -499,6 +499,11 @@ void A64AddressSpace::EmitPrelude() {
         code.BR(X0);
 
         const auto fn = [](A64AddressSpace& self, A64JitState& context) -> CodePtr {
+            if (self.conf.pointer_authentication.address_bits != 0 &&
+                (context.pc >> self.conf.pointer_authentication.address_bits) != 0) {
+                self.conf.callbacks->ExceptionRaised(context.pc, A64::Exception::NoExecuteFault);
+                return static_cast<CodePtr>(self.prelude_info.return_from_run_code);
+            }
             return self.GetOrEmit(context.GetLocationDescriptor());
         };
 
@@ -555,6 +560,7 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
         .tpidr_el0 = conf.tpidr_el0,
 
         .check_halt_on_memory_access = conf.check_halt_on_memory_access,
+        .instruction_address_bits = conf.pointer_authentication.address_bits,
 
         .page_table_pointer = mcl::bit_cast<u64>(conf.page_table),
         .page_table_address_space_bits = conf.page_table_address_space_bits,

@@ -15,7 +15,7 @@
 
 namespace Dynarmic::Optimization {
 
-void A64GetSetElimination(IR::Block& block) {
+void A64GetSetElimination(IR::Block& block, bool precise_memory_abort) {
     using Iterator = IR::Block::iterator;
 
     enum class TrackingType {
@@ -72,6 +72,15 @@ void A64GetSetElimination(IR::Block& block) {
     };
 
     for (auto inst = block.begin(); inst != block.end(); ++inst) {
+        if ((precise_memory_abort && (inst->IsMemoryRead() || inst->IsMemoryWrite())) ||
+            inst->GetOpcode() == IR::Opcode::A64CheckMemoryAlignment) {
+            // Setters preceding a possible fault must remain visible. Keep values
+            // available for forwarding, but do not delete these earlier setters.
+            for (auto& info : reg_info) info.set_instruction_present = false;
+            for (auto& info : vec_info) info.set_instruction_present = false;
+            sp_info.set_instruction_present = false;
+            nzcv_info.set_instruction_present = false;
+        }
         switch (inst->GetOpcode()) {
         case IR::Opcode::A64GetW: {
             const size_t index = A64::RegNumber(inst->GetArg(0).GetA64RegRef());
