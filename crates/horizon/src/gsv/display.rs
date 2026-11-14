@@ -83,7 +83,6 @@ pub(crate) struct Frame {
     pub available: Arc<std::sync::atomic::AtomicU32>,
     pub slot: u32,
     pub interval: u32,
-    pub queued: std::time::Instant,
 }
 impl Drop for Frame {
     fn drop(&mut self) {

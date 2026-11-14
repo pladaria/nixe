@@ -4,9 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The display buffer was queued before this VI tick. Only idle time inside
-/// this interval can be attributed to display pacing, not registration or
-/// acquire-fence waits after the tick.
+/// Display pacing that preceded composition. Only idle time inside this
+/// interval can be attributed to pacing, not registration or acquire-fence
+/// waits after the tick. When composition precedes the display wait, the CPU
+/// measurement is already sealed and no pacing interval is needed.
 #[derive(Clone, Copy, Debug)]
 pub struct FramePacing {
     pub queued: Instant,

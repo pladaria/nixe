@@ -409,18 +409,18 @@ impl Link<'_> {
                 .read_clean(request, sync.is_none())
                 .map_err(|e| MaxwellFrontendDispatchError::CommandSource(Box::new(e)))?
             {
-                nixe_gpu_maxwell::CommandRead::Copied => {
+                nixe_gpu::command_memory::CommandRead::Copied => {
                     self.fetch_state = FetchState::New;
                     return Ok(true);
                 }
-                nixe_gpu_maxwell::CommandRead::Pending(tick) => {
+                nixe_gpu::command_memory::CommandRead::Pending(tick) => {
                     self.fetch_state = FetchState::Native {
                         tick: Some(tick),
                         sync,
                     };
                     return Ok(false);
                 }
-                nixe_gpu_maxwell::CommandRead::NeedsSync => {
+                nixe_gpu::command_memory::CommandRead::NeedsSync => {
                     self.sender
                         .wait_until(sync.take().expect("pending host sync"))
                         .map_err(|_| {
@@ -432,10 +432,10 @@ impl Link<'_> {
                         })?;
                     self.fetch_state = FetchState::Native { tick, sync };
                 }
-                nixe_gpu_maxwell::CommandRead::Synced => {
+                nixe_gpu::command_memory::CommandRead::Synced => {
                     unreachable!("RAM is copied by the command reader")
                 }
-                nixe_gpu_maxwell::CommandRead::Unknown => {
+                nixe_gpu::command_memory::CommandRead::Unknown => {
                     self.send(GpuMessage::CommandFetch {
                         request: request.take_storage(),
                         reply: self.read_reply.clone(),

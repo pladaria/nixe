@@ -2,7 +2,7 @@
 //! https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/common/sdk/nvidia/inc/class/clc797.h
 use super::*;
 use crate::{
-    native::pipeline_resources::{HandleSource, ImageHandle, PipelineResources},
+    native::pipeline_resources::{HandleSource, ImageHandle},
     residency::execution::ShaderImage,
 };
 use nixe_gpu::nvidia::TextureTiling;
@@ -14,7 +14,7 @@ pub(super) fn graphics_linked(r: &Registers) -> Result<bool, VulkanError> {
         _ => Err(compilation("invalid native sampler binding")),
     }
 }
-fn indices(linked: bool, handle: u32) -> (u32, u32) {
+pub(super) fn indices(linked: bool, handle: u32) -> (u32, u32) {
     if linked {
         (handle, handle)
     } else {
@@ -63,6 +63,15 @@ pub(super) fn constant_word(
     constants: &[Option<(u64, u32)>],
     word: ImageHandle,
 ) -> Result<u32, VulkanError> {
+    let address = constant_address(constants, word)?;
+    let bytes = shader::read::<4>(residency, memory, address)?;
+    Ok(u32::from_le_bytes(bytes) << word.shift)
+}
+
+pub(super) fn constant_address(
+    constants: &[Option<(u64, u32)>],
+    word: ImageHandle,
+) -> Result<u64, VulkanError> {
     let (base, size) = constants
         .get(word.cbuf as usize)
         .copied()
@@ -76,8 +85,7 @@ pub(super) fn constant_word(
     let address = base
         .checked_add(u64::from(word.offset))
         .ok_or_else(|| compilation("native texture handle address overflow"))?;
-    let bytes = shader::read::<4>(residency, memory, address)?;
-    Ok(u32::from_le_bytes(bytes) << word.shift)
+    Ok(address)
 }
 
 pub(super) fn observations_match(
@@ -134,37 +142,6 @@ pub(super) fn observations_match(
 }
 
 impl NativeExecution<'_> {
-    pub(super) fn ampere_shader_images(
-        &mut self,
-        memory: &mut impl RenderMemory,
-        r: &Registers,
-        constants: &[[Option<(u64, u32)>; 32]; 5],
-        groups: [Option<u8>; 5],
-        resources: &PipelineResources,
-        images: &mut smallvec::SmallVec<[ShaderImage; 16]>,
-    ) -> Result<(), VulkanError> {
-        images.clear();
-        let linked = graphics_linked(r)?;
-        self.ampere_image_pools(memory.image_space_id(), r, false, linked);
-        for (stage, group) in groups.into_iter().enumerate() {
-            let Some(group) = group else {
-                continue;
-            };
-            self.ampere_stage_images(
-                memory,
-                r,
-                &constants[group as usize],
-                &resources.stages[stage],
-                false,
-                linked,
-                images,
-            )?;
-            if self.residency.texture_cache.bindings.has_deleted_images {
-                break;
-            }
-        }
-        Ok(())
-    }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn ampere_stage_images(
         &mut self,
@@ -194,70 +171,90 @@ impl NativeExecution<'_> {
                 r.get(0x157c),
                 tic,
             )?;
-            let kind = self.admit_shader_texture(
-                compute,
-                slot.dimension,
-                tic,
-                bytes,
-                TextureTiling::Ampere,
-            )?;
-            let view = if let Some(kind) = kind {
-                // Retain translated pages before the physical cache consumes the
-                // descriptor. Its geometry is decoded only when the bytes change.
-                let info = self
-                    .residency
-                    .texture_cache
-                    .bindings
-                    .channel
-                    .image_descriptors[usize::from(compute)]
-                .entries[tic as usize]
-                    .as_ref()
-                    .unwrap()
-                    .raw
-                    .info
-                    .as_ref()
-                    .unwrap();
-                memory
-                    .prepare_image(info.address, info.size)
-                    .map_err(|e| compilation(format!("native sampled image {info:?}: {e}")))?;
-                Some(self.resolve_shader_texture(compute, memory, tic, kind, slot.depth)?)
-            } else {
-                None
-            };
-            if self.residency.texture_cache.bindings.has_deleted_images {
-                return Ok(());
-            }
-            let view = if let Some(format) = slot.storage_format {
-                view.map(|view| self.residency.storage_image_view(view, format))
-                    .transpose()?
-            } else {
-                view
-            };
-            let sampler = if slot.sampler {
-                let bytes = descriptor(
+            let sampler_bytes = if slot.sampler {
+                Some(descriptor(
                     &mut self.residency,
                     memory,
                     r.address(0x155c, 0x1560),
                     if linked { r.get(0x157c) } else { r.get(0x1564) },
                     tsc,
-                )?;
-                self.resolve_shader_sampler(compute, tsc, bytes)?;
-                self.sampler_for_view(compute, tsc, view, slot.depth)?
+                )?)
             } else {
-                vk::Sampler::null()
+                None
             };
-            images.push(ShaderImage {
-                view,
-                descriptor: slot.descriptor,
-                native: vk::DescriptorImageInfo::default()
-                    .image_view(view.map_or(vk::ImageView::null(), |v| {
-                        self.residency.texture_cache.views[v].native.handle
-                    }))
-                    .image_layout(vk::ImageLayout::GENERAL)
-                    .sampler(sampler),
-            });
+            if let Some(image) =
+                self.resolve_ampere_texture(memory, slot, compute, tic, tsc, bytes, sampler_bytes)?
+            {
+                images.push(image);
+            }
+            if self.residency.texture_cache.bindings.has_deleted_images {
+                return Ok(());
+            }
         }
         Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn resolve_ampere_texture(
+        &mut self,
+        memory: &mut impl RenderMemory,
+        slot: &crate::native::pipeline_resources::ImageSlot,
+        compute: bool,
+        tic: u32,
+        tsc: u32,
+        bytes: [u8; 32],
+        sampler_bytes: Option<[u8; 32]>,
+    ) -> Result<Option<ShaderImage>, VulkanError> {
+        let kind =
+            self.admit_shader_texture(compute, slot.dimension, tic, bytes, TextureTiling::Ampere)?;
+        let view = if let Some(kind) = kind {
+            // Retain translated pages before the physical cache consumes the
+            // descriptor. Its geometry is decoded only when the bytes change.
+            let info = self
+                .residency
+                .texture_cache
+                .bindings
+                .channel
+                .image_descriptors[usize::from(compute)]
+            .entries[tic as usize]
+                .as_ref()
+                .unwrap()
+                .raw
+                .info
+                .as_ref()
+                .unwrap();
+            memory
+                .prepare_image(info.address, info.size)
+                .map_err(|e| compilation(format!("native sampled image {info:?}: {e}")))?;
+            Some(self.resolve_shader_texture(compute, memory, tic, kind, slot.depth)?)
+        } else {
+            None
+        };
+        if self.residency.texture_cache.bindings.has_deleted_images {
+            return Ok(None);
+        }
+        let view = if let Some(format) = slot.storage_format {
+            view.map(|view| self.residency.storage_image_view(view, format))
+                .transpose()?
+        } else {
+            view
+        };
+        let sampler = if slot.sampler {
+            let bytes = sampler_bytes.expect("sampled slot has sampler bytes");
+            self.resolve_shader_sampler(compute, tsc, bytes)?;
+            self.sampler_for_view(compute, tsc, view, slot.depth)?
+        } else {
+            vk::Sampler::null()
+        };
+        Ok(Some(ShaderImage {
+            view,
+            descriptor: slot.descriptor,
+            native: vk::DescriptorImageInfo::default()
+                .image_view(view.map_or(vk::ImageView::null(), |v| {
+                    self.residency.texture_cache.views[v].native.handle
+                }))
+                .image_layout(vk::ImageLayout::GENERAL)
+                .sampler(sampler),
+        }))
     }
     pub(super) fn ampere_image_pools(
         &mut self,

@@ -8,7 +8,7 @@ use crate::{
 use std::collections::VecDeque;
 
 pub trait FrontendHost {
-    fn method(&mut self, source: Source) -> Result<()>;
+    fn method(&mut self, source: Source, writes: crate::MemoryWrites) -> Result<()>;
     /// Drain prior methods, including their memory effects, before coherent reads.
     fn barrier(&mut self) -> Result<()>;
     fn read(&mut self, address: u64, bytes: usize) -> Result<Vec<u8>>;
@@ -19,6 +19,7 @@ struct Engine {
     shadow: Box<[u32; 0xe00]>,
     macro_call: Option<u32>,
     parameters: VecDeque<u32>,
+    upload_writes: crate::MemoryWrites,
 }
 impl Engine {
     fn new(class: Class) -> Self {
@@ -27,6 +28,7 @@ impl Engine {
             shadow: Box::new([0; 0xe00]),
             macro_call: None,
             parameters: VecDeque::new(),
+            upload_writes: crate::MemoryWrites::None,
         }
     }
 }
@@ -141,7 +143,7 @@ impl Channel {
             let class = Class::from_id(value)?;
             self.bindings[source.subchannel as usize] = Some(class);
             source.class = value;
-            return host.method(source);
+            return host.method(source, crate::MemoryWrites::None);
         }
         if m < 0x100 {
             if matches!(m, 0x10 | 0x14 | 0x18) {
@@ -165,7 +167,17 @@ impl Channel {
                 });
                 return Ok(());
             }
-            return host.method(source);
+            let writes = if matches!(m, 0x34 | 0x78) {
+                crate::MemoryWrites::Sync
+            } else if m == 0x1c {
+                crate::MemoryWrites::Range {
+                    address: (u64::from(self.semaphore[0]) << 32) | u64::from(self.semaphore[1]),
+                    bytes: 16,
+                }
+            } else {
+                crate::MemoryWrites::None
+            };
+            return host.method(source, writes);
         }
         let class = self.bindings[source.subchannel as usize].ok_or("method has no bound class")?;
         let engine = &mut self.engines[class.index()];
@@ -196,11 +208,13 @@ impl Channel {
                 regs,
                 shadow,
                 parameters,
+                upload_writes,
                 ..
             } = engine;
             let mut callback = MacroHost {
                 regs,
                 shadow,
+                upload_writes,
                 source,
                 host,
             };
@@ -235,6 +249,7 @@ impl Channel {
         let mut callback = MacroHost {
             regs: &mut engine.regs,
             shadow: &mut engine.shadow,
+            upload_writes: &mut engine.upload_writes,
             source,
             host,
         };
@@ -245,6 +260,7 @@ struct MacroHost<'a, H> {
     regs: &'a mut Registers,
     shadow: &'a mut [u32; 0xe00],
     source: Source,
+    upload_writes: &'a mut crate::MemoryWrites,
     host: &'a mut H,
 }
 impl<H: FrontendHost> mme::Host for MacroHost<'_, H> {
@@ -289,7 +305,6 @@ impl<H: FrontendHost> mme::Host for MacroHost<'_, H> {
             {
                 return Err("MME DMA read exceeds data RAM/FIFO".into());
             }
-            self.host.barrier()?;
             if count != 0 {
                 let data = self.host.read(self.regs.address(0x550, 0x554), count * 4)?;
                 for (i, b) in data.chunks_exact(4).enumerate() {
@@ -312,14 +327,26 @@ impl<H: FrontendHost> mme::Host for MacroHost<'_, H> {
             // as value/mask, then polls scratch[0] for 1. Lichii acknowledges
             // every call; retain the identified configuration writes instead.
             // No DMA, shader or guest fence is completed by this mailbox.
-            self.host.method(Source {
-                method: m,
-                argument: value,
-                ..self.source
-            })?;
+            self.host.method(
+                Source {
+                    method: m,
+                    argument: value,
+                    ..self.source
+                },
+                crate::MemoryWrites::None,
+            )?;
             self.regs.set(0x3400, 1);
             return Ok(());
         }
+        if m == 0x1b0 && matches!(class, Class::ThreeD | Class::Compute | Class::Inline) {
+            *self.upload_writes = crate::writes::method(self.regs, 0x1b4);
+        }
+        let writes =
+            if m == 0x1b4 && matches!(class, Class::ThreeD | Class::Compute | Class::Inline) {
+                *self.upload_writes
+            } else {
+                crate::writes::method(self.regs, m)
+            };
         if class == Class::ThreeD && (0x2390..=0x23cc).contains(&m) {
             let offset = self.regs.get(0x238c);
             self.regs.set(
@@ -338,7 +365,7 @@ impl<H: FrontendHost> mme::Host for MacroHost<'_, H> {
             argument: value,
             ..self.source
         };
-        self.host.method(source)
+        self.host.method(source, writes)
     }
 }
 use mme::Host as _;

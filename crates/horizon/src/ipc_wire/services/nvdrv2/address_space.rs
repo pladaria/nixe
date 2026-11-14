@@ -100,7 +100,7 @@ pub(super) fn ioctl(
                 .as_mut()
                 .and_then(|g| g.spaces.get_mut(&id))
                 .ok_or(IpcWireError::Malformed("GPU address space missing"))?;
-            let mut space = space.lock().unwrap();
+            let mut space = space.write().unwrap();
             let address = crate::gsv::gpu::VA_END - nixe_memory::PAGE_SIZE;
             if space.sync_mapping.is_none() {
                 space.sync_mapping = Some(

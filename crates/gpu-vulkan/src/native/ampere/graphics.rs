@@ -1,9 +1,15 @@
 //! Native graphics pipelines retain stage programs and physical cache slots.
+mod delta;
+mod disk;
+mod inputs;
 use super::super::pipeline_resources::PipelineResources;
 use super::*;
+use crate::native::draw_reuse::{DrawMiss, DrawScope};
+pub(super) use disk::compute_key;
 use nixe_shader_recompiler::{
     self as compiler, environment::*, passes::GraphicsRuntimeState, types::*,
 };
+use std::rc::Rc;
 
 #[derive(Default)]
 pub(in crate::native) struct Cache {
@@ -11,9 +17,13 @@ pub(in crate::native) struct Cache {
     pub(super) compute: super::compute::Cache,
     pub(super) semaphore: Option<NativePipeline>,
     programs: HashMap<(u64, Stage), Arc<shader::Program>>,
-    pipelines: HashMap<Key, Vec<Arc<Pipeline>>>,
+    pipelines: HashMap<Key, Vec<Rc<Pipeline>>>,
     channels: HashMap<u64, Selection>,
     next_parameters: u64,
+    pub(super) constant_writes: Vec<(u64, u64)>,
+    pub(super) constants: HashMap<u64, super::constants::Binding>,
+    last_draw: Option<(DrawScope, usize, bool)>,
+    pub(super) archive: Option<crate::cache::archive::EnvironmentArchive>,
 }
 struct Selection {
     parameters: crate::GraphicsParameters,
@@ -22,8 +32,24 @@ struct Selection {
     revision: u64,
     framebuffer: Arc<PreparedTargets>,
     scale: [u32; 3],
+    current: Option<Current>,
+    geometry: Option<(u32, u32)>,
 }
-#[derive(Clone, PartialEq, Eq, Hash)]
+struct Current {
+    pipeline: Rc<Pipeline>,
+    programs: smallvec::SmallVec<[(Arc<shader::Program>, u64, u8); 6]>,
+    groups: [Option<u8>; 5],
+    mapping: [u64; 3],
+    inputs: std::cell::RefCell<inputs::Inputs>,
+}
+fn memory_identity(residency: &Residency<'_>, memory: &impl RenderMemory) -> [u64; 3] {
+    [
+        memory.image_space_id(),
+        memory.mapping_generation(),
+        residency.device_memory().generation(),
+    ]
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
     shaders: [u64; 6],
     gp_passthrough_mask: [u32; 8],
@@ -39,11 +65,14 @@ struct Pipeline {
     pipeline: NativePipeline,
     resources: PipelineResources,
     observations: Vec<(u8, Observations)>,
-    vertex_bindings: u32,
+    vertex_attributes: u32,
+    textures: std::cell::RefCell<super::sampled::SampledTextures>,
+    delta_images: std::cell::RefCell<delta::Images>,
 }
 impl Cache {
     pub(in crate::native) fn close(&mut self, channel: u64) {
         self.channels.remove(&channel);
+        self.constants.remove(&channel);
     }
 }
 
@@ -110,26 +139,50 @@ impl NativeExecution<'_> {
         if draw.is_empty() {
             return Ok(());
         }
+        let previous = cache.last_draw.take();
+        let indexed = matches!(draw, Draw::Indexed { .. });
+        self.state.statistics.reuse.eligible_draws += 1;
+        let mut miss = match previous {
+            None => Some(DrawMiss::Cold),
+            Some((_, _, kind)) if kind != indexed => Some(DrawMiss::Kind),
+            Some((scope, pipeline, _)) => {
+                if state.targets_dirty != 0
+                    || cache.channels.get(&source.channel).is_none_or(|s| {
+                        let resolution = self.residency.resolution();
+                        s.scale[..2] != [resolution.up_scale, resolution.down_shift]
+                    })
+                {
+                    Some(DrawMiss::State)
+                } else {
+                    scope
+                        .validate(self, pipeline, memory_identity(&self.residency, memory))
+                        .err()
+                }
+            }
+        };
+        let mut delta = miss.is_none();
         'draw: loop {
-            loop {
-                self.residency.texture_cache.bindings.has_deleted_images = false;
-                self.resolve_ampere_targets(r, state, memory)?;
-                let views = self
-                    .residency
-                    .texture_cache
-                    .bindings
-                    .channel
-                    .render_targets
-                    .views;
-                for view in views.into_iter().flatten() {
-                    let image = self.residency.texture_cache.views[view].image;
-                    self.residency.prepare_image(image, false, false)?;
-                    if self.residency.texture_cache.bindings.has_deleted_images {
+            if !delta {
+                loop {
+                    self.residency.texture_cache.bindings.has_deleted_images = false;
+                    self.resolve_ampere_targets(r, state, memory)?;
+                    let views = self
+                        .residency
+                        .texture_cache
+                        .bindings
+                        .channel
+                        .render_targets
+                        .views;
+                    for view in views.into_iter().flatten() {
+                        let image = self.residency.texture_cache.views[view].image;
+                        self.residency.prepare_image(image, false, false)?;
+                        if self.residency.texture_cache.bindings.has_deleted_images {
+                            break;
+                        }
+                    }
+                    if !self.residency.texture_cache.bindings.has_deleted_images {
                         break;
                     }
-                }
-                if !self.residency.texture_cache.bindings.has_deleted_images {
-                    break;
                 }
             }
             let targets = self.residency.current_framebuffer()?;
@@ -150,275 +203,406 @@ impl NativeExecution<'_> {
                     .next_parameters
                     .checked_add(1)
                     .expect("native state identity exhausted");
+                let fixed = self.compiler.normalize_graphics(parameters.state.clone());
+                let current = cache.channels.get_mut(&source.channel).and_then(|old| {
+                    (!state.shader_dirty
+                        && old.fixed == fixed
+                        && old.runtime == runtime
+                        && old.scale == scale)
+                        .then(|| old.current.take())
+                        .flatten()
+                });
                 cache.channels.insert(
                     source.channel,
                     Selection {
-                        fixed: self.compiler.normalize_graphics(parameters.state.clone()),
+                        fixed,
                         parameters,
                         runtime,
                         revision: cache.next_parameters,
                         framebuffer: Arc::clone(&targets),
                         scale,
+                        current,
+                        geometry: None,
                     },
                 );
                 state.preparation_dirty = false;
+                state.dynamic_dirty = false;
+                state.vertex_input_dirty = false;
+                state.shader_dirty = false;
+            } else if state.dynamic_dirty || state.vertex_input_dirty {
+                let selection = cache.channels.get_mut(&source.channel).unwrap();
+                if state.vertex_input_dirty {
+                    selection.geometry = None;
+                    let types = selection.runtime.vertex_input_types;
+                    state::update_vertex_input(
+                        r,
+                        &self.residency,
+                        &mut selection.parameters,
+                        &mut selection.runtime,
+                    )?;
+                    let fixed = self
+                        .compiler
+                        .normalize_graphics(selection.parameters.state.clone());
+                    if types != selection.runtime.vertex_input_types || fixed != selection.fixed {
+                        selection.current = None;
+                    }
+                    selection.fixed = fixed;
+                    state.vertex_input_dirty = false;
+                }
+                if state.dynamic_dirty {
+                    state::update_dynamic(
+                        r,
+                        &self.residency,
+                        &mut selection.parameters,
+                        &selection.runtime,
+                    )?;
+                    state.dynamic_dirty = false;
+                }
+                cache.next_parameters = cache
+                    .next_parameters
+                    .checked_add(1)
+                    .expect("native state identity exhausted");
+                selection.revision = cache.next_parameters;
             }
             let selection = &cache.channels[&source.channel];
-            let mut hashes = [0; 6];
-            let mut programs = smallvec::SmallVec::<[(Arc<shader::Program>, u64, u8); 6]>::new();
-            for slot in 0..6u32 {
-                let selector = r.get(0x2000 + slot * 64);
-                if selector & 1 == 0 {
-                    continue;
-                }
-                let stage = match selector >> 4 {
-                    1 => Stage::VertexB,
-                    4 => Stage::Geometry,
-                    5 => Stage::Fragment,
-                    _ => {
-                        return Err(compilation(format!(
-                            "native shader stage selector {selector:#x} is not implemented"
-                        )));
-                    }
-                };
-                if selector & !0xf1 != 0 || (selector >> 4) != slot {
-                    return Err(compilation("invalid native pipeline stage selector"));
-                }
-                // SET_BIND_GROUP_CONSTANT_BUFFER indexes the five shader stages:
-                // vertex, tessellation control/evaluation, geometry, and fragment.
-                // PIPELINE_BINDING is a separate legacy binding selector.
-                if r.get(0x2010 + slot * 64) != 0 {
-                    return Err(compilation(
-                        "native legacy pipeline binding selector is not implemented",
-                    ));
-                }
-                let group = slot - 1;
-                let address = r.address(0x2014 + slot * 64, 0x2018 + slot * 64);
-                let physical = memory
-                    .image_device_address(address)?
-                    .ok_or_else(|| compilation("unmapped native shader address"))?;
-                let key = (physical, stage);
-                let valid = if let Some(program) = cache.programs.get(&key) {
-                    program.info.is_valid()
-                        && shader::constants_match(
-                            &mut self.residency,
-                            memory,
-                            &state.constants[group as usize],
-                            &program.flow_constants,
-                        )?
-                } else {
-                    false
-                };
-                if !valid {
-                    if let Some(program) = cache.programs.get(&key).filter(|p| p.info.is_valid()) {
-                        // A changed branch table may expose new code pages. Retire
-                        // the old capture before registering the new physical range.
-                        self.residency
-                            .shader_cache
-                            .invalidate_region(physical, program.info.size_bytes as u64);
-                    }
-                    let program = shader::capture(
+            let mut prepared_textures = None;
+            let mut kept = None;
+            if let Some(current) = &selection.current
+                && current.mapping == memory_identity(&self.residency, memory)
+            {
+                let valid = current
+                    .programs
+                    .iter()
+                    .all(|(program, _, _)| program.info.is_valid())
+                    && current.inputs.borrow_mut().matches(
                         &mut self.residency,
                         memory,
-                        r,
-                        address,
-                        stage,
-                        &state.constants[group as usize],
+                        &state.constants,
                     )?;
-                    cache.programs.insert(key, Arc::new(program));
+                if valid {
+                    let same = current.pipeline.textures.borrow_mut().prepare(
+                        self,
+                        memory,
+                        r,
+                        &state.constants,
+                        current.groups,
+                        &current.pipeline.resources,
+                    )?;
+                    if let Some(same) = same {
+                        prepared_textures = Some((Rc::as_ptr(&current.pipeline), same));
+                        kept = Some((Rc::clone(&current.pipeline), current.groups));
+                        self.state.statistics.reuse.pipeline_hits += 1;
+                    }
                 }
-                let program = Arc::clone(&cache.programs[&key]);
-                hashes[slot as usize] = program.unique_hash;
-                programs.push((program, address, group as u8));
             }
-            if !programs
-                .iter()
-                .any(|(p, _, _)| p.metadata.stage == Stage::VertexB)
-            {
-                return Err(compilation("native draw has no vertex program"));
-            }
-            let groups: [Option<u8>; 5] = std::array::from_fn(|stage| {
-                programs
-                    .iter()
-                    .find(|(p, _, _)| {
-                        nixe_gpu::shader_compilation::neutral_stage(p.metadata.stage) as usize
-                            == stage
-                    })
-                    .map(|(_, _, g)| *g)
-            });
-            let key = Key {
-                shaders: hashes,
-                gp_passthrough_mask: std::array::from_fn(|i| r.get(0x1240 + i as u32 * 4)),
-                graphics: selection.fixed.clone(),
-                types: selection.runtime.vertex_input_types,
-                topology: selection.runtime.input_topology,
-                ndc: selection.runtime.ndc_minus_one_to_one,
-                viewport: r.get(0x192c),
-                point_size: selection.runtime.point_size.to_bits(),
-                scale: [resolution.up_scale, resolution.down_shift],
-            };
-            let mut pipeline = None;
-            if let Some(candidates) = cache.pipelines.get(&key) {
-                for candidate in candidates {
-                    let mut matches = true;
-                    for (stage, observations) in &candidate.observations {
-                        let group = groups[*stage as usize].expect("active pipeline stage");
-                        matches = shader::constants_match(
+            let (pipeline, groups) = if let Some(kept) = kept {
+                kept
+            } else {
+                let mut hashes = [0; 6];
+                let mut programs =
+                    smallvec::SmallVec::<[(Arc<shader::Program>, u64, u8); 6]>::new();
+                for slot in 0..6u32 {
+                    let selector = r.get(0x2000 + slot * 64);
+                    if selector & 1 == 0 {
+                        continue;
+                    }
+                    let stage = match selector >> 4 {
+                        1 => Stage::VertexB,
+                        4 => Stage::Geometry,
+                        5 => Stage::Fragment,
+                        _ => {
+                            return Err(compilation(format!(
+                                "native shader stage selector {selector:#x} is not implemented"
+                            )));
+                        }
+                    };
+                    if selector & !0xf1 != 0 || (selector >> 4) != slot {
+                        return Err(compilation("invalid native pipeline stage selector"));
+                    }
+                    // SET_BIND_GROUP_CONSTANT_BUFFER indexes the five shader stages:
+                    // vertex, tessellation control/evaluation, geometry, and fragment.
+                    // PIPELINE_BINDING is a separate legacy binding selector.
+                    if r.get(0x2010 + slot * 64) != 0 {
+                        return Err(compilation(
+                            "native legacy pipeline binding selector is not implemented",
+                        ));
+                    }
+                    let group = slot - 1;
+                    let address = r.address(0x2014 + slot * 64, 0x2018 + slot * 64);
+                    let physical = memory
+                        .image_device_address(address)?
+                        .ok_or_else(|| compilation("unmapped native shader address"))?;
+                    let key = (physical, stage);
+                    let valid = if let Some(program) = cache.programs.get(&key) {
+                        program.info.is_valid()
+                            && shader::constants_match(
+                                &mut self.residency,
+                                memory,
+                                &state.constants[group as usize],
+                                &program.flow_constants,
+                            )?
+                    } else {
+                        false
+                    };
+                    if !valid {
+                        if let Some(program) =
+                            cache.programs.get(&key).filter(|p| p.info.is_valid())
+                        {
+                            // A changed branch table may expose new code pages. Retire
+                            // the old capture before registering the new physical range.
+                            self.residency
+                                .shader_cache
+                                .invalidate_region(physical, program.info.size_bytes as u64);
+                        }
+                        let program = shader::capture(
                             &mut self.residency,
                             memory,
+                            r,
+                            address,
+                            stage,
                             &state.constants[group as usize],
-                            &observations.cbuf_words,
                         )?;
-                        if matches {
-                            matches = shader::pointer_types_match(
+                        cache.programs.insert(key, Arc::new(program));
+                    }
+                    let program = Arc::clone(&cache.programs[&key]);
+                    hashes[slot as usize] = program.unique_hash;
+                    programs.push((program, address, group as u8));
+                }
+                if !programs
+                    .iter()
+                    .any(|(p, _, _)| p.metadata.stage == Stage::VertexB)
+                {
+                    return Err(compilation("native draw has no vertex program"));
+                }
+                let groups: [Option<u8>; 5] = std::array::from_fn(|stage| {
+                    programs
+                        .iter()
+                        .find(|(p, _, _)| {
+                            nixe_gpu::shader_compilation::neutral_stage(p.metadata.stage) as usize
+                                == stage
+                        })
+                        .map(|(_, _, g)| *g)
+                });
+                let key = Key {
+                    shaders: hashes,
+                    gp_passthrough_mask: std::array::from_fn(|i| r.get(0x1240 + i as u32 * 4)),
+                    graphics: selection.fixed.clone(),
+                    types: selection.runtime.vertex_input_types,
+                    topology: selection.runtime.input_topology,
+                    ndc: selection.runtime.ndc_minus_one_to_one,
+                    viewport: r.get(0x192c),
+                    point_size: selection.runtime.point_size.to_bits(),
+                    scale: [resolution.up_scale, resolution.down_shift],
+                };
+                let mut pipeline = None;
+                if let Some(candidates) = cache.pipelines.get(&key) {
+                    for candidate in candidates {
+                        let mut matches = true;
+                        for (stage, observations) in &candidate.observations {
+                            let group = groups[*stage as usize].expect("active pipeline stage");
+                            matches = shader::constants_match(
                                 &mut self.residency,
                                 memory,
                                 &state.constants[group as usize],
-                                observations,
+                                &observations.cbuf_words,
                             )?;
+                            if matches {
+                                matches = shader::pointer_types_match(
+                                    &mut self.residency,
+                                    memory,
+                                    &state.constants[group as usize],
+                                    observations,
+                                )?;
+                            }
+                            if !matches {
+                                break;
+                            }
                         }
-                        if matches {
-                            matches = textures::observations_match(
-                                &mut self.residency,
+                        if matches
+                            && let Some(same) = candidate.textures.borrow_mut().prepare(
+                                self,
                                 memory,
                                 r,
-                                &state.constants[group as usize],
-                                observations,
-                                textures::graphics_linked(r)?,
-                            )?;
-                        }
-                        if !matches {
+                                &state.constants,
+                                groups,
+                                &candidate.resources,
+                            )?
+                        {
+                            prepared_textures = Some((Rc::as_ptr(candidate), same));
+                            pipeline = Some(Rc::clone(candidate));
                             break;
                         }
                     }
-                    if matches {
-                        pipeline = Some(Arc::clone(candidate));
-                        break;
-                    }
                 }
-            }
-            let pipeline = if let Some(pipeline) = pipeline {
-                pipeline
-            } else {
-                if cache.compiler.is_none() {
-                    cache.compiler = Some(compiler::Compiler::new().map_err(compilation)?);
-                }
-                let pools = cache.compiler.as_mut().unwrap();
-                pools.reset().map_err(compilation)?;
-                let mut configuration = self.residency.device().profile().shader_compiler.clone();
-                configuration.settings.resolution_info = resolution;
-                let mut ids = Vec::with_capacity(programs.len());
-                let mut observations = Vec::with_capacity(programs.len());
-                for (program, base, group) in &programs {
-                    let mut metadata = program.metadata.clone();
-                    if metadata.stage == Stage::Geometry {
-                        metadata.gp_passthrough_mask = key.gp_passthrough_mask;
-                    }
-                    let mut reader = shader::EnvironmentReader {
-                        metadata,
-                        code: std::borrow::Cow::Borrowed(&program.instructions),
-                        base: *base,
-                        constants: &state.constants[*group as usize],
-                        registers: r,
-                        linked: textures::graphics_linked(r)?,
-                        memory,
-                        residency: &mut self.residency,
-                    };
-                    let mut recorded = RecordingEnvironment::new(&mut reader);
-                    let translated = pools.translate(
-                        &mut recorded,
-                        &configuration.host,
-                        &configuration.settings,
+                let pipeline = if let Some(pipeline) = pipeline {
+                    pipeline
+                } else {
+                    #[cfg(feature = "performance-counters")]
+                    let started = std::time::Instant::now();
+                    #[cfg(feature = "performance-counters")]
+                    log::debug!(
+                        "Ampere pipeline miss: candidates={} key={key:?}",
+                        cache.pipelines.get(&key).map_or(0, Vec::len)
                     );
-                    let mut dependencies = recorded.into_snapshot().into_observations();
-                    ids.push(translated.map_err(compilation)?);
-                    dependencies.instructions.clear();
-                    dependencies
-                        .cbuf_words
-                        .retain(|word, _| !program.flow_constants.contains_key(word));
-                    observations.push((
-                        nixe_gpu::shader_compilation::neutral_stage(program.metadata.stage) as u8,
-                        dependencies,
-                    ));
-                }
-                let shader = crate::cache::compile_guest(
-                    pools,
-                    &ids,
-                    &configuration,
-                    Some(&selection.runtime),
-                )
-                .map_err(compilation)?;
-
-                let vertex = shader
-                    .stages
-                    .iter()
-                    .find(|stage| stage.stage == nixe_gpu::ShaderStage::Vertex)
-                    .and_then(|stage| stage.guest.as_ref())
-                    .expect("native vertex shader metadata");
-                let mut graphics = selection.parameters.state.clone();
-                graphics.vertex_attributes = graphics
-                    .vertex_attributes
-                    .iter()
-                    .filter(|attribute| vertex.info.loads.generic(attribute.location as usize))
-                    .cloned()
-                    .collect();
-                let vertex_bindings = graphics
-                    .vertex_attributes
-                    .iter()
-                    .fold(0, |mask, attribute| mask | (1 << attribute.binding));
-                graphics.vertex_bindings = graphics
-                    .vertex_bindings
-                    .iter()
-                    .filter(|binding| vertex_bindings & (1 << binding.binding) != 0)
-                    .cloned()
-                    .collect();
-                graphics.vertex_divisors = graphics
-                    .vertex_divisors
-                    .iter()
-                    .filter(|(binding, _)| vertex_bindings & (1 << binding) != 0)
-                    .copied()
-                    .collect();
-                let native = self
-                    .compiler
-                    .request(PipelineRecipe::Graphics {
-                        shader: Arc::clone(&shader),
-                        state: graphics,
-                    })
-                    .map_err(compilation)?;
-                let resources = PipelineResources::new(&shader, &native.layout.key, [32; 6])?;
-                if resources.uses_tessellation_levels || resources.computed_handle_count != 0 {
-                    return Err(compilation(
-                        "native shader resource class is not implemented",
-                    ));
-                }
-                let pipeline = Arc::new(Pipeline {
-                    pipeline: native,
-                    resources,
-                    observations,
-                    vertex_bindings,
+                    if cache.compiler.is_none() {
+                        cache.compiler = Some(compiler::Compiler::new().map_err(compilation)?);
+                    }
+                    let pools = cache.compiler.as_mut().unwrap();
+                    pools.reset().map_err(compilation)?;
+                    let mut configuration =
+                        self.residency.device().profile().shader_compiler.clone();
+                    configuration.settings.resolution_info = resolution;
+                    let mut ids = Vec::with_capacity(programs.len());
+                    let mut observations = Vec::with_capacity(programs.len());
+                    let mut snapshots = Vec::new();
+                    for (program, base, group) in &programs {
+                        let mut metadata = program.metadata.clone();
+                        if metadata.stage == Stage::Geometry {
+                            metadata.gp_passthrough_mask = key.gp_passthrough_mask;
+                        }
+                        let mut reader = shader::EnvironmentReader {
+                            metadata,
+                            code: std::borrow::Cow::Borrowed(&program.instructions),
+                            base: *base,
+                            constants: &state.constants[*group as usize],
+                            registers: r,
+                            linked: textures::graphics_linked(r)?,
+                            memory,
+                            residency: &mut self.residency,
+                        };
+                        let mut recorded = RecordingEnvironment::new(&mut reader);
+                        let translated = pools.translate(
+                            &mut recorded,
+                            &configuration.host,
+                            &configuration.settings,
+                        );
+                        let snapshot = recorded.into_snapshot();
+                        let mut dependencies = if cache.archive.is_some() {
+                            let dependencies = shader::dependencies(&snapshot);
+                            snapshots.push(snapshot);
+                            dependencies
+                        } else {
+                            snapshot.into_observations()
+                        };
+                        ids.push(translated.map_err(compilation)?);
+                        dependencies.instructions.clear();
+                        dependencies
+                            .cbuf_words
+                            .retain(|word, _| !program.flow_constants.contains_key(word));
+                        observations.push((
+                            nixe_gpu::shader_compilation::neutral_stage(program.metadata.stage)
+                                as u8,
+                            dependencies,
+                        ));
+                    }
+                    let pipeline = Rc::new(Pipeline::build(
+                        self.compiler,
+                        pools,
+                        &configuration,
+                        &key,
+                        &ids,
+                        observations,
+                        None,
+                    )?);
+                    if let Some(archive) = &mut cache.archive {
+                        archive.serialize(
+                            key.encode(self.residency.device().profile()),
+                            Arc::new(nixe_gpu::shader_compilation::ShaderInputs {
+                                stages: snapshots.into_boxed_slice(),
+                                serializable: true,
+                            }),
+                        );
+                    }
+                    #[cfg(feature = "performance-counters")]
+                    log::debug!(
+                        "Ampere pipeline preparation: elapsed_us={} dependencies={:?}",
+                        started.elapsed().as_micros(),
+                        pipeline.observations
+                    );
+                    cache
+                        .pipelines
+                        .entry(key)
+                        .or_default()
+                        .push(Rc::clone(&pipeline));
+                    log::debug!(
+                        "compiled native graphics pipeline: vertex={:#x} fragment={:#x}",
+                        hashes[1],
+                        hashes[5]
+                    );
+                    pipeline
+                };
+                cache.channels.get_mut(&source.channel).unwrap().current = Some(Current {
+                    pipeline: Rc::clone(&pipeline),
+                    inputs: std::cell::RefCell::new(inputs::Inputs::new(
+                        &programs, &pipeline, groups,
+                    )),
+                    programs,
+                    groups,
+                    mapping: memory_identity(&self.residency, memory),
                 });
-                cache
-                    .pipelines
-                    .entry(key)
-                    .or_default()
-                    .push(Arc::clone(&pipeline));
-                log::debug!(
-                    "compiled native graphics pipeline: vertex={:#x} fragment={:#x}",
-                    hashes[1],
-                    hashes[5]
-                );
-                pipeline
+                (pipeline, groups)
             };
-            let mut images = smallvec::SmallVec::new();
-            self.ampere_shader_images(
-                memory,
-                r,
-                &state.constants,
-                groups,
-                &pipeline.resources,
-                &mut images,
-            )?;
+            let selection = cache.channels.get_mut(&source.channel).unwrap();
+            let wanted = if let Some((attributes, mask)) = selection.geometry
+                && attributes == pipeline.vertex_attributes
+            {
+                mask
+            } else {
+                let mask = selection
+                    .parameters
+                    .state
+                    .vertex_attributes
+                    .iter()
+                    .filter(|attribute| pipeline.vertex_attributes & (1 << attribute.location) != 0)
+                    .fold(0, |mask, attribute| mask | (1 << attribute.binding));
+                selection.geometry = Some((pipeline.vertex_attributes, mask));
+                mask
+            };
+            let selection = &cache.channels[&source.channel];
+            let mut textures = pipeline.textures.borrow_mut();
+            self.state.statistics.reuse.texture_attempts += 1;
+            let reused_textures = if let Some((_, same)) =
+                prepared_textures.filter(|(prepared, _)| *prepared == Rc::as_ptr(&pipeline))
+            {
+                same
+            } else {
+                let Some(same) = textures.prepare(
+                    self,
+                    memory,
+                    r,
+                    &state.constants,
+                    groups,
+                    &pipeline.resources,
+                )?
+                else {
+                    // Guest descriptors changed while this pipeline was compiled.
+                    cache.channels.get_mut(&source.channel).unwrap().current = None;
+                    delta = false;
+                    continue 'draw;
+                };
+                same
+            };
+            if reused_textures {
+                self.state.statistics.reuse.texture_hits += 1;
+            }
+            if delta {
+                if !reused_textures {
+                    miss = Some(DrawMiss::Texture);
+                } else if let Some((scope, native, _)) = previous {
+                    miss = if native != pipeline.pipeline.identity() {
+                        Some(DrawMiss::State)
+                    } else {
+                        scope
+                            .validate(self, native, memory_identity(&self.residency, memory))
+                            .err()
+                    };
+                }
+                delta = miss.is_none();
+            }
+            let images = &textures.images;
             if self.residency.texture_cache.bindings.has_deleted_images {
+                miss.get_or_insert(DrawMiss::Content);
+                delta = false;
                 continue 'draw;
             }
             let bank = &mut self.residency.runtime.buffer_bindings.channel;
@@ -437,7 +621,6 @@ impl NativeExecution<'_> {
                     .buffer_bindings
                     .channel
                     .has_deleted_buffers = false;
-                let wanted = pipeline.vertex_bindings;
                 let mut disabled = self
                     .residency
                     .runtime
@@ -603,6 +786,8 @@ impl NativeExecution<'_> {
                 .channel
                 .enabled_vertex_buffers;
             if self.residency.texture_cache.bindings.has_deleted_images {
+                miss.get_or_insert(DrawMiss::Content);
+                delta = false;
                 continue 'draw;
             }
             self.residency.bind_host_geometry_buffers(
@@ -629,21 +814,30 @@ impl NativeExecution<'_> {
             graphics_stages!(stages, |STAGE| {
                 let resources = &pipeline.resources.stages[STAGE];
                 let end = image_index + resources.images.len();
-                self.residency.configure_guest_stage::<STAGE, true>(
+                self.residency.configure_guest_buffers::<STAGE, true>(
                     &pipeline.pipeline,
                     resources,
                     groups[STAGE],
-                    &images[image_index..end],
                 )?;
                 image_index = end;
             });
             debug_assert_eq!(image_index, images.len());
+            if self.residency.texture_cache.bindings.has_deleted_images {
+                miss.get_or_insert(DrawMiss::Content);
+                delta = false;
+                continue 'draw;
+            }
+            if delta && let Some((scope, native, _)) = previous {
+                miss = scope
+                    .validate(self, native, memory_identity(&self.residency, memory))
+                    .err();
+                delta = miss.is_none();
+            }
             let descriptors = self.residency.guest_descriptor_update();
-            let mut push = super::super::state::ShaderConstants::resources(
-                &pipeline.resources,
-                &images,
-                &self.residency,
-            );
+            let mut push = pipeline
+                .delta_images
+                .borrow_mut()
+                .prepare(self, &pipeline, images, delta)?;
             push.set_instance_offset(primitive.first_instance);
             if pipeline.resources.uses_render_area {
                 return Err(compilation(
@@ -651,6 +845,8 @@ impl NativeExecution<'_> {
                 ));
             }
             if self.residency.texture_cache.bindings.has_deleted_images {
+                miss.get_or_insert(DrawMiss::Content);
+                delta = false;
                 continue 'draw;
             }
             // Attachment writes participate in the same alias and CPU-publication
@@ -669,6 +865,7 @@ impl NativeExecution<'_> {
                 self.residency
                     .prepare_image(image, !draw.is_empty(), false)?;
                 if self.residency.texture_cache.bindings.has_deleted_images {
+                    delta = false;
                     continue 'draw;
                 }
             }
@@ -676,7 +873,7 @@ impl NativeExecution<'_> {
             self.residency.record_draw_inner(
                 &pipeline.pipeline,
                 &targets,
-                &images,
+                images,
                 descriptors,
                 draw,
                 push.as_bytes(),
@@ -700,6 +897,23 @@ impl NativeExecution<'_> {
                     .finish_guest_writes(&pipeline.pipeline, &pipeline.resources)?;
             }
 
+            if delta && let Some((scope, native, _)) = previous {
+                miss = scope
+                    .validate(self, native, memory_identity(&self.residency, memory))
+                    .err();
+                delta = miss.is_none();
+            }
+            if delta {
+                self.state.statistics.reuse.draw_hits += 1;
+            } else {
+                self.state.statistics.reuse.draw_misses
+                    [miss.unwrap_or(DrawMiss::Content) as usize] += 1;
+            }
+            cache.last_draw = Some((
+                DrawScope::capture(self, memory_identity(&self.residency, memory)),
+                pipeline.pipeline.identity(),
+                indexed,
+            ));
             self.state.statistics.draws += 1;
             return Ok(());
         }
@@ -739,5 +953,102 @@ impl NativeExecution<'_> {
             .constructing
             .push(Resource::Buffer(range.buffer));
         Ok(range)
+    }
+}
+
+impl Key {
+    fn runtime(&self) -> GraphicsRuntimeState {
+        GraphicsRuntimeState {
+            instance_offset: true,
+            vertex_input_types: self.types,
+            input_topology: self.topology,
+            point_size: f32::from_bits(self.point_size),
+            ndc_minus_one_to_one: self.ndc,
+            use_integer_fragment_outputs: true,
+            color_output_types: std::array::from_fn(|slot| {
+                match self
+                    .graphics
+                    .colors
+                    .get(slot)
+                    .map(|(format, _)| super::super::images::color_kind(*format))
+                {
+                    Some(1) => AttributeType::UnsignedInt,
+                    Some(2) => AttributeType::SignedInt,
+                    _ => AttributeType::Float,
+                }
+            }),
+            ..Default::default()
+        }
+    }
+}
+impl Pipeline {
+    fn build(
+        compiler: &crate::cache::PipelineCompiler,
+        pools: &mut compiler::Compiler,
+        configuration: &nixe_gpu::shader_compilation::Configuration,
+        key: &Key,
+        programs: &[compiler::ProgramId],
+        observations: Vec<(u8, Observations)>,
+        worker: Option<usize>,
+    ) -> Result<Self, VulkanError> {
+        let shader =
+            crate::cache::compile_guest(pools, programs, configuration, Some(&key.runtime()))
+                .map_err(compilation)?;
+        let vertex = shader
+            .stages
+            .iter()
+            .find(|stage| stage.stage == nixe_gpu::ShaderStage::Vertex)
+            .and_then(|stage| stage.guest.as_ref())
+            .ok_or_else(|| compilation("native pipeline has no vertex shader"))?;
+        let vertex_attributes = (0..32).fold(0, |mask, i| {
+            mask | (u32::from(vertex.info.loads.generic(i)) << i)
+        });
+        let mut graphics = key.graphics.clone();
+        graphics.vertex_attributes = graphics
+            .vertex_attributes
+            .iter()
+            .filter(|a| vertex_attributes & (1 << a.location) != 0)
+            .cloned()
+            .collect();
+        let bindings = graphics
+            .vertex_attributes
+            .iter()
+            .fold(0, |mask, a| mask | (1 << a.binding));
+        graphics.vertex_bindings = graphics
+            .vertex_bindings
+            .iter()
+            .filter(|b| bindings & (1 << b.binding) != 0)
+            .cloned()
+            .collect();
+        graphics.vertex_divisors = graphics
+            .vertex_divisors
+            .iter()
+            .filter(|(b, _)| bindings & (1 << b) != 0)
+            .copied()
+            .collect();
+        let recipe = PipelineRecipe::Graphics {
+            shader: Arc::clone(&shader),
+            state: graphics,
+        };
+        let pipeline = match worker {
+            Some(worker) => compiler.build_immediate(recipe, worker),
+            None => compiler.request(recipe),
+        }
+        .map_err(compilation)?;
+        let resources = PipelineResources::new(&shader, &pipeline.layout.key, [32; 6])?;
+        if resources.uses_tessellation_levels || resources.computed_handle_count != 0 {
+            return Err(compilation(
+                "native shader resource class is not implemented",
+            ));
+        }
+        let textures = super::sampled::SampledTextures::new(&resources, &observations)?;
+        Ok(Self {
+            pipeline,
+            resources,
+            observations,
+            vertex_attributes,
+            textures: std::cell::RefCell::new(textures),
+            delta_images: Default::default(),
+        })
     }
 }

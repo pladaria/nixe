@@ -4,6 +4,107 @@ use super::*;
 use nixe_memory::{AccessOperation, AccessResult, AllocationRange, DeviceAccessRequest};
 
 impl Residency<'_> {
+    pub(crate) fn write_constant_span(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), VulkanError> {
+        let memory = self.runtime.device_memory.clone();
+        if memory.may_be_gpu_written(address, bytes.len() as u64) {
+            let mut ranges = RangeSet::from_range(address, bytes.len() as u64);
+            memory.apply_device_aliases(address, bytes.len() as u64, |a, b| ranges.insert(a, b));
+            for (a, b) in ranges.iter() {
+                self.finish_buffer_reads(a, b)?;
+            }
+            self.preserve_texture_writes(&ranges)?;
+            {
+                // Fence callbacks publish query values independently of the owner.
+                // Cancel older reports before exposing the replacement RAM bytes.
+                let mut queries = self.caches.query_cache.lock().unwrap();
+                for (a, b) in ranges.iter() {
+                    queries.invalidate_region(a, b);
+                }
+            }
+            // Retire old pending publications before the RAM store can be seen.
+            // Invalidating the native bindings remains deferred to consumption.
+            for (a, b) in ranges.iter() {
+                self.buffer_cache.claim_cpu_write(a, b);
+            }
+        }
+        memory.write_contiguous(address, nixe_memory::WriteSource::Bytes(bytes))?;
+        Ok(())
+    }
+    pub(crate) fn write_constant_region(
+        &mut self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<(), VulkanError> {
+        self.write_memory(address, bytes)?;
+        let memory = self.runtime.device_memory.clone();
+        let mut result = Ok(());
+        memory.apply_device_aliases(address, bytes, |a, b| {
+            if result.is_ok() {
+                result = self.write_memory(a, b);
+            }
+        });
+        result
+    }
+
+    pub(crate) fn flush_read_span(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
+        if !self
+            .runtime
+            .device_memory
+            .may_be_gpu_written(address, bytes)
+        {
+            return Ok(());
+        }
+        self.flush_region(address, bytes)?;
+        let memory = self.runtime.device_memory.clone();
+        let mut result = Ok(());
+        memory.apply_device_aliases(address, bytes, |alias, size| {
+            if result.is_ok() {
+                result = self.flush_region(alias, size);
+            }
+        });
+        result
+    }
+    /// Synchronous owner writes borrow the upload and its physical leases.
+    pub(crate) fn write_captured_memory(
+        &mut self,
+        capture: &nixe_memory::CapturedMemory,
+        bytes: &[u8],
+    ) -> Result<(), VulkanError> {
+        if capture.bytes() != bytes.len() as u64 {
+            return Err(VulkanError::InvalidResource(
+                "owner write size differs from capture",
+            ));
+        }
+        self.runtime.device.realize_deferred_clear()?;
+        let mut ranges = RangeSet::default();
+        for i in 0..capture.len() {
+            for extent in capture[i].physical_extents() {
+                for (address, bytes) in self.runtime.device_memory.device_ranges(extent) {
+                    ranges.insert(address, bytes);
+                }
+            }
+        }
+        self.preserve_texture_writes(&ranges)?;
+        {
+            let mut queries = self.caches.query_cache.lock().unwrap();
+            for (address, bytes) in ranges.iter() {
+                queries.invalidate_region(address, bytes);
+            }
+        }
+        let mut offset = 0;
+        for i in 0..capture.len() {
+            let end = offset + capture[i].bytes() as usize;
+            self.runtime
+                .memory
+                .write_resolved(std::slice::from_ref(&capture[i]), &bytes[offset..end])?;
+            offset = end;
+        }
+        self.write_cpu_ranges(ranges.iter())
+    }
     /// Read directly into owner-provided storage after resolving GPU authority.
     /// The capture retains every physical span for the complete access.
     pub(crate) fn read_captured_memory(

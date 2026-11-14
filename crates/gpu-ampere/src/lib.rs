@@ -10,11 +10,13 @@ pub mod ordered;
 mod packet;
 mod registers;
 pub mod targets;
+mod writes;
 
 pub use channel::{Channel, FrontendHost, Progress, SemaphoreAcquire};
 pub use engines::{Draw, GraphicsState, Preparation, PreparationHost};
 pub use packet::{GpfifoEntry, decode_entries};
 pub use registers::{Class, Registers};
+pub use writes::MemoryWrites;
 
 pub type Result<T> = std::result::Result<T, Box<str>>;
 
@@ -39,29 +41,20 @@ impl Source {
     }
 }
 
-/// Effects that can modify input memory must finish before the command owner
-/// captures a subsequent pushbuffer. Unsupported effects fail on consumption.
-pub fn writes_memory(source: Source) -> bool {
-    if source.method < 0x100 {
-        return source.method == 0x1c;
-    }
-    let Ok(class) = Class::from_id(source.class) else {
-        return false;
-    };
-    match class {
-        Class::ThreeD => {
-            matches!(source.method, 0x1614 | 0x1b4 | 0x26c | 0x274 | 0x304 | 0xd78 | 0x1214 | 0x1218 | 0x123c | 0x17e0..=0x17f8 | 0x19d0 | 0x1b0c | 0x2390..=0x23cc)
-        }
-        Class::Compute => matches!(source.method, 0x1b4 | 0x2b8..=0x2c0 | 0x41c | 0x1b0c),
-        Class::Inline => source.method == 0x1b4,
-        Class::Copy => source.method == 0x300,
-        Class::TwoD => matches!(source.method, 0x860 | 0x8dc | 0x918),
-    }
-}
-
 /// Native preparation consumes generation-specific state with static dispatch.
 /// Canonical memory, cache ownership and queue/fence execution stay shared.
 pub trait Rasterizer: nixe_gpu::GpuExecution {
+    fn command_memory(&self) -> std::sync::Arc<dyn nixe_gpu::command_memory::CommandMemory>;
+    fn write_constants(
+        &mut self,
+        source: Source,
+        registers: &Registers,
+        offset: u32,
+        bytes: &[u8],
+        memory: &mut impl RenderMemory,
+    ) -> Result<()>;
+    fn flush_constants(&mut self) -> Result<()>;
+    fn write_memory(&mut self, capture: &nixe_memory::CapturedMemory, bytes: &[u8]) -> Result<()>;
     fn reduce_report(
         &mut self,
         source: Source,
@@ -108,7 +101,6 @@ pub trait Rasterizer: nixe_gpu::GpuExecution {
         &mut self,
         image: nixe_gpu::native::NativePresentationImage,
         swap_interval: u32,
-        pacing: nixe_gpu::frame_metrics::FramePacing,
     ) -> Result<nixe_gpu::ResidentImage>;
     fn clear(
         &mut self,
@@ -120,6 +112,14 @@ pub trait Rasterizer: nixe_gpu::GpuExecution {
 }
 /// Commit lazy native GPU backing only when a resource is consumed.
 pub trait RenderMemory: nixe_gpu::native::ImageAddressSpace {
+    /// A numeric address, not a Rust borrow. Valid while the address-space owner
+    /// retains its mappings. Retained selections must check mapping generations
+    /// before reuse and resolve device coherence before dereferencing it.
+    fn read_span(
+        &mut self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<Option<(u64, nixe_memory::HostAddress)>>;
     /// Same-layout virtual extent, including reserved native backing. Physical
     /// fragmentation is resolved separately when the resource is consumed.
     fn buffer_layout_size(&self, address: u64) -> Result<u64>;

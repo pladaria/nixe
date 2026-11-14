@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -383,9 +383,10 @@ fn run_machine(
         device.profile().name
     );
     let vsync = config.video.vsync;
-    let (video_system, gpu_diagnostics) = if machine_profile.graphics()
-        == GraphicsGeneration::Ampere
-    {
+    // Ampere initializes its renderer on the first guest GPU request. Publish
+    // only diagnostic handles at startup; sampling never calls the GPU owner.
+    let (diagnostics_sender, gpu_diagnostics) = mpsc::channel();
+    let video_system = if machine_profile.graphics() == GraphicsGeneration::Ampere {
         let memory = nixe_memory::device_memory::DeviceMemory::new(
             process.memory().space().machine().clone(),
             40,
@@ -400,6 +401,8 @@ fn run_machine(
             ),
             ..Default::default()
         };
+        let cache_load_stop = Arc::clone(&frontend_stop_requested);
+        let ampere_cache_directory = cache_configuration.directory.clone();
         horizon_environment.ampere_graphics = Some(nixe_horizon::AmpereGraphics::new(
             memory,
             presenter,
@@ -411,16 +414,21 @@ fn run_machine(
                     u64::MAX,
                 )
                 .map_err(|e| nixe_gpu::BackendRuntimeError::Backend(e.to_string().into()))?;
+                if let Some(directory) = &ampere_cache_directory {
+                    renderer.load_ampere_disk_resources(directory, &cache_load_stop);
+                }
                 if let Some(client) = native_presentation {
                     renderer.attach_presentation(client, vsync).map_err(|e| {
                         nixe_gpu::BackendRuntimeError::Backend(e.to_string().into())
                     })?;
                 }
+                let _ =
+                    diagnostics_sender.send((renderer.cache_monitor(), renderer.frame_metrics()));
                 Ok(renderer)
             },
         ));
         log::info!("Ampere command engines, native shaders and Vulkan presentation enabled");
-        (None, None)
+        None
     } else {
         let device_memory =
             nixe_gpu_maxwell::MaxwellDeviceMemory::new(process.memory().space().machine().clone());
@@ -456,8 +464,8 @@ fn run_machine(
                         nixe_gpu::BackendRuntimeError::Backend(error.to_string().into())
                     })?;
             }
-            let diagnostics = (renderer.cache_monitor(), renderer.frame_metrics());
-            Ok((renderer, diagnostics))
+            let _ = diagnostics_sender.send((renderer.cache_monitor(), renderer.frame_metrics()));
+            Ok((renderer, ()))
         };
         log::info!(
             "MME execution: {}",
@@ -467,7 +475,7 @@ fn run_machine(
                 "interpreter"
             }
         );
-        let (video, diagnostics) = VideoSystem::with_gpu_frontend(
+        let (video, ()) = VideoSystem::with_gpu_frontend(
             device_memory,
             &kernel,
             presenter,
@@ -476,7 +484,7 @@ fn run_machine(
             maxwell,
         )
         .map_err(|error| error.to_string())?;
-        (Some(video), Some(diagnostics))
+        Some(video)
     };
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     // SDL initialization and final subsystem shutdown remain on the main thread.
@@ -750,7 +758,7 @@ fn supervise_process(
     video_system: Option<VideoSystem>,
     mut host_input: HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
-    mut gpu_diagnostics: Option<(CacheMonitor, FrameMetrics)>,
+    gpu_diagnostics: mpsc::Receiver<(CacheMonitor, FrameMetrics)>,
 ) -> RunOutcome {
     let process_id = runtime
         .register_process(process)
@@ -764,7 +772,7 @@ fn supervise_process(
         execution_video,
         &mut host_input,
         audio_backend,
-        gpu_diagnostics.as_mut(),
+        gpu_diagnostics,
     );
     log::debug!(
         "guest execution stopped after {:?}",
@@ -892,8 +900,9 @@ fn execute(
     video_system: Option<VideoSystem>,
     host_input: &mut HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
-    mut gpu_diagnostics: Option<&mut (CacheMonitor, FrameMetrics)>,
+    gpu_diagnostics: mpsc::Receiver<(CacheMonitor, FrameMetrics)>,
 ) -> Result<ExecutionSummary, String> {
+    let mut diagnostics = None;
     let mut dispatcher = HorizonSvcDispatcher::new_with_services(
         horizon_environment.operation_mode,
         horizon_environment.time,
@@ -1064,7 +1073,10 @@ fn execute(
                     log::info!(
                         "guest CPU completion rate: completions_per_second={completions_per_second:.0}, completions={execution_completions}, elapsed={elapsed:?}"
                     );
-                    if let Some((gpu_caches, frame_metrics)) = gpu_diagnostics.as_mut() {
+                    if diagnostics.is_none() {
+                        diagnostics = gpu_diagnostics.try_recv().ok();
+                    }
+                    if let Some((gpu_caches, frame_metrics)) = diagnostics.as_mut() {
                         log::info!("{}", gpu_caches.sample());
                         if let Some(frame) = frame_metrics.latest() {
                             log::info!(

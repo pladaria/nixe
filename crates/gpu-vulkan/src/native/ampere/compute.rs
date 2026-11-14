@@ -7,9 +7,9 @@ use nixe_shader_recompiler::{self as compiler, environment::*, types::*};
 #[derive(Default)]
 pub(super) struct Cache {
     programs: HashMap<(u64, EnvironmentMetadata), Arc<shader::Program>>,
-    pipelines: HashMap<(u64, u32, u32), Vec<Arc<Pipeline>>>,
+    pub(super) pipelines: HashMap<(u64, u32, u32), Vec<Arc<Pipeline>>>,
 }
-struct Pipeline {
+pub(super) struct Pipeline {
     native: NativePipeline,
     resources: PipelineResources,
     observations: Observations,
@@ -149,29 +149,30 @@ impl NativeExecution<'_> {
             let mut recorded = RecordingEnvironment::new(&mut reader);
             let translated =
                 compiler.translate(&mut recorded, &configuration.host, &configuration.settings);
-            let mut observations = recorded.into_snapshot().into_observations();
+            let snapshot = recorded.into_snapshot();
+            let mut observations = shader::dependencies(&snapshot);
             let id = translated.map_err(compilation)?;
             observations.instructions.clear();
             observations
                 .cbuf_words
                 .retain(|word, _| !program.flow_constants.contains_key(word));
-            let shader = crate::cache::compile_guest(compiler, &[id], &configuration, None)
-                .map_err(compilation)?;
-            let native = self
-                .compiler
-                .request(PipelineRecipe::Compute(Arc::clone(&shader)))
-                .map_err(compilation)?;
-            let resources = PipelineResources::new(&shader, &native.layout.key, [8; 6])?;
-            if resources.computed_handle_count != 0 {
-                return Err(compilation(
-                    "native compute image resource class is not implemented",
-                ));
-            }
-            let pipeline = Arc::new(Pipeline {
-                native,
-                resources,
+            let pipeline = Arc::new(Pipeline::build(
+                self.compiler,
+                compiler,
+                &configuration,
+                id,
                 observations,
-            });
+                None,
+            )?);
+            if let Some(archive) = &mut cache.archive {
+                archive.serialize(
+                    graphics::compute_key(hash, self.residency.device().profile()),
+                    Arc::new(nixe_gpu::shader_compilation::ShaderInputs {
+                        stages: Box::new([snapshot]),
+                        serializable: true,
+                    }),
+                );
+            }
             cache
                 .compute
                 .pipelines
@@ -260,5 +261,36 @@ impl NativeExecution<'_> {
             self.state.statistics.dispatches += 1;
             return Ok(());
         }
+    }
+}
+
+impl Pipeline {
+    pub(super) fn build(
+        compiler: &crate::cache::PipelineCompiler,
+        pools: &mut compiler::Compiler,
+        configuration: &nixe_gpu::shader_compilation::Configuration,
+        program: compiler::ProgramId,
+        observations: Observations,
+        worker: Option<usize>,
+    ) -> Result<Self, VulkanError> {
+        let shader = crate::cache::compile_guest(pools, &[program], configuration, None)
+            .map_err(compilation)?;
+        let recipe = PipelineRecipe::Compute(Arc::clone(&shader));
+        let native = match worker {
+            Some(worker) => compiler.build_immediate(recipe, worker),
+            None => compiler.request(recipe),
+        }
+        .map_err(compilation)?;
+        let resources = PipelineResources::new(&shader, &native.layout.key, [8; 6])?;
+        if resources.computed_handle_count != 0 {
+            return Err(compilation(
+                "native compute image resource class is not implemented",
+            ));
+        }
+        Ok(Self {
+            native,
+            resources,
+            observations,
+        })
     }
 }

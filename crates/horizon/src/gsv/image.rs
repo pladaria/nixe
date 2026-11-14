@@ -2,7 +2,7 @@
 //! https://switchbrew.org/wiki/Switch_2%3A_GSV_services
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
 };
 
 #[derive(Debug, Default)]
@@ -11,7 +11,7 @@ pub(crate) struct Context {
     pub next_memory: u32,
     pub pools: BTreeMap<u32, Arc<Pool>>,
     pub window_pools: BTreeMap<u32, Arc<Pool>>,
-    pub spaces: BTreeMap<u32, Arc<Mutex<super::gpu::GpuAddressSpace>>>,
+    pub spaces: BTreeMap<u32, Arc<RwLock<super::gpu::GpuAddressSpace>>>,
     pub next_image: u32,
 }
 
@@ -93,7 +93,7 @@ impl Pool {
     pub fn presentation(
         &self,
         index: u32,
-        spaces: &BTreeMap<u32, Arc<Mutex<super::gpu::GpuAddressSpace>>>,
+        spaces: &BTreeMap<u32, Arc<RwLock<super::gpu::GpuAddressSpace>>>,
     ) -> Result<&Presentation, Box<str>> {
         let slot = self
             .images
@@ -119,7 +119,7 @@ impl Pool {
             }
         };
         for space in spaces.values() {
-            let space = space.lock().unwrap();
+            let space = space.read().unwrap();
             for (&start, mapping) in &space.mappings {
                 let super::gpu::Backing::Cpu(source) = &mapping.source else {
                     continue;

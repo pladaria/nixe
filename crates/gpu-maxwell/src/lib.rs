@@ -23,7 +23,7 @@ mod shader;
 mod shader_stage;
 
 pub use address_space::{
-    CommandRead, MAX_MAPPING_DUMP_ENTRIES, MaxwellAddressSpaceError, MaxwellAddressSpaceId,
+    MAX_MAPPING_DUMP_ENTRIES, MaxwellAddressSpaceError, MaxwellAddressSpaceId,
     MaxwellAddressSpaceInitialization, MaxwellAllocationId, MaxwellCommandMemory,
     MaxwellGpuAccessError, MaxwellGpuAddressSpace, MaxwellGpuMapping, MaxwellGpuMemory,
     MaxwellGpuMemoryHandle, MaxwellGpuMemoryInterface, MaxwellMapRequest, MaxwellMappingDiagnostic,

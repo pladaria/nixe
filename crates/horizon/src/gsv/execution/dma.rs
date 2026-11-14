@@ -9,7 +9,7 @@ fn failure(error: impl std::fmt::Display) -> Box<str> {
 impl<E: ampere::Rasterizer> Back<'_, E> {
     pub(super) fn copy_memory(&mut self, copy: &ampere::dma::Copy) -> Result<()> {
         let (source, destination) = {
-            let mut space = self.memory.space.lock().unwrap();
+            let mut space = GpuMemory::new(self.memory.space);
             (
                 space
                     .capture(copy.source.address, copy.source.bytes)

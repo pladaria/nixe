@@ -12,6 +12,7 @@ use std::{
     sync::{Arc, Condvar, Mutex, OnceLock},
     time::Instant,
 };
+pub(crate) mod encoding;
 mod state;
 pub use state::*;
 mod create;
@@ -326,9 +327,6 @@ impl PipelineCompiler {
     }
     pub(crate) fn serialization(&self) -> Arc<CompilePool> {
         Arc::clone(&self.serialization)
-    }
-    pub(crate) fn wait_for_requests(&self) {
-        self.pool.wait_for_requests();
     }
     pub(crate) fn graphics_counters(&self) -> nixe_gpu::cache_counters::CacheCounters {
         self.graphics.clone()

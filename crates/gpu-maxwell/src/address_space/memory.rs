@@ -7,27 +7,12 @@ use std::sync::{
 
 /// Connect GPU mapping changes and ordered RAM writes to the actual cache owners.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/rasterizer_interface.h
-pub trait MaxwellGpuMemoryInterface: Send + Sync + std::fmt::Debug {
+pub trait MaxwellGpuMemoryInterface: nixe_gpu::command_memory::CommandMemory {
     fn modify_gpu_memory(&self, address_space: MaxwellAddressSpaceId, address: u64, bytes: u64);
     fn unmap_memory(&self, address: u64, bytes: u64);
-    fn must_flush_region(&self, address: u64, bytes: u64) -> bool;
     fn finish_read(&self, address: u64, bytes: u64) -> Result<(), Arc<nixe_memory::MemoryError>>;
-    fn command_tick_done(&self, tick: u64) -> Result<bool, Arc<nixe_memory::MemoryError>>;
-    fn read_command(
-        &self,
-        address: u64,
-        output: &mut [u8],
-        past_sync: bool,
-    ) -> Result<CommandRead, Arc<nixe_memory::MemoryError>>;
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CommandRead {
-    Unknown,
-    NeedsSync,
-    Synced,
-    Copied,
-    Pending(u64),
-}
+use nixe_gpu::command_memory::CommandRead;
 
 #[derive(Debug)]
 struct RasterizerBinding {

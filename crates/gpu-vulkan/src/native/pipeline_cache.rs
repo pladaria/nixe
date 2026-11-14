@@ -4,7 +4,7 @@
 use super::pipeline_resources::PipelineResources;
 use super::*;
 use maxwell::fixed_state::FixedPipelineState;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 pub(super) type ConfigureGraphics = fn(
     &GraphicsPipeline,
@@ -73,11 +73,6 @@ enum DiskPipeline {
     Graphics(GraphicsPipeline),
     Compute(ComputePipeline),
 }
-#[derive(Default)]
-struct FlushStatus {
-    in_flight: AtomicBool,
-    bytes: AtomicUsize,
-}
 pub(super) struct PipelineCache {
     pub(super) compiler: Arc<PipelineCompiler>,
     graphics: HashMap<([u32; 2], FixedPipelineState), usize>,
@@ -90,9 +85,6 @@ pub(super) struct PipelineCache {
     configuration: Arc<nixe_gpu::shader_compilation::Configuration>,
     main_compiler: Option<nixe_shader_recompiler::Compiler>,
     archive: Option<crate::cache::archive::EnvironmentArchive>,
-    flush: Arc<FlushStatus>,
-    pipelines_since_flush: usize,
-    last_flush: Option<Instant>,
 }
 impl PipelineCache {
     pub(super) fn new(
@@ -111,9 +103,6 @@ impl PipelineCache {
             configuration: Arc::new(configuration.clone()),
             main_compiler: None,
             archive: None,
-            flush: Arc::default(),
-            pipelines_since_flush: 0,
-            last_flush: None,
         }
     }
     fn scale_key(&self) -> [u32; 2] {
@@ -135,9 +124,9 @@ impl PipelineCache {
     ) {
         let started = Instant::now();
         log::info!("loading shader and pipeline cache: {}", directory.display());
-        let archive = match crate::cache::archive::EnvironmentArchive::open(
+        let mut archive = match crate::cache::archive::EnvironmentArchive::open(
             directory,
-            self.compiler.serialization(),
+            Arc::clone(&self.compiler),
         ) {
             Ok(archive) => archive,
             Err(error) => {
@@ -202,7 +191,6 @@ impl PipelineCache {
             "read and queued {total} pipeline environments in {:?}",
             started.elapsed()
         );
-        self.archive = Some(archive);
         drop(sender);
         let mut loaded = 0;
         for result in receiver {
@@ -229,47 +217,16 @@ impl PipelineCache {
                 Err(error) => log::warn!("cached pipeline construction: {error}"),
             }
         }
-        self.compiler.wait_for_requests();
-        match self.compiler.checkpoint() {
-            Ok(size) => {
-                self.flush.bytes.store(size, Ordering::Relaxed);
-                self.last_flush = Some(Instant::now());
-            }
-            Err(error) => log::warn!("Vulkan driver cache write: {error}"),
-        }
+        archive.checkpoint();
+        self.archive = Some(archive);
         log::info!(
             "loaded {loaded}/{total} native pipeline environments before guest execution in {:?}",
             started.elapsed()
         );
     }
     fn serialize(&mut self, key: Vec<u8>, inputs: Arc<GuestShaderCode>) {
-        let Some(archive) = &self.archive else {
-            return;
-        };
-        archive.serialize(key, inputs);
-        self.pipelines_since_flush += 1;
-        if self.pipelines_since_flush < 128 {
-            return;
-        }
-        let interval = Duration::from_secs(
-            (self.flush.bytes.load(Ordering::Relaxed) / (1024 * 1024)).max(30) as u64,
-        );
-        if self
-            .last_flush
-            .is_some_and(|time| time.elapsed() < interval)
-            || self.flush.in_flight.swap(true, Ordering::AcqRel)
-        {
-            return;
-        }
-        self.pipelines_since_flush = 0;
-        self.last_flush = Some(Instant::now());
-        let flush = Arc::clone(&self.flush);
-        if let Err(error) = self.compiler.queue_checkpoint(move |bytes| {
-            flush.bytes.store(bytes, Ordering::Relaxed);
-            flush.in_flight.store(false, Ordering::Release);
-        }) {
-            self.flush.in_flight.store(false, Ordering::Release);
-            log::warn!("Vulkan driver cache serialization: {error}");
+        if let Some(archive) = &mut self.archive {
+            archive.serialize(key, inputs);
         }
     }
     #[allow(clippy::type_complexity)]

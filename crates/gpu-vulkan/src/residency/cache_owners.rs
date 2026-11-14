@@ -111,52 +111,6 @@ impl nixe_gpu_maxwell::MaxwellGpuMemoryInterface for CacheOwners {
             ))
         })
     }
-    fn command_tick_done(&self, tick: u64) -> Result<bool, Arc<nixe_memory::MemoryError>> {
-        self.timeline
-            .is_done(&self.progress, tick)
-            .map_err(|e| Arc::new(nixe_memory::MemoryError::Execution(e.to_string().into())))
-    }
-    fn read_command(
-        &self,
-        address: u64,
-        output: &mut [u8],
-        past_sync: bool,
-    ) -> Result<nixe_gpu_maxwell::CommandRead, Arc<nixe_memory::MemoryError>> {
-        self.command_pages
-            .read(&self.device_memory, address, output, past_sync)
-            .map_err(|e| Arc::new(nixe_memory::MemoryError::Execution(e.to_string().into())))
-    }
-    fn must_flush_region(&self, address: u64, bytes: u64) -> bool {
-        // Lock each owner once for the range and all its physical aliases.
-        // Never-written pages were rejected by the command reader already.
-        let mut aliases = smallvec::SmallVec::<[(u64, u64); 4]>::new();
-        aliases.push((address, bytes));
-        self.device_memory
-            .apply_device_aliases(address, bytes, |at, size| aliases.push((at, size)));
-        {
-            let cache = self.buffer_cache.lock().unwrap();
-            if aliases
-                .iter()
-                .any(|&(at, size)| cache.memory_tracker.gpu_modified(at, size))
-            {
-                return true;
-            }
-        }
-        {
-            let cache = self.texture_cache.lock().unwrap();
-            if aliases
-                .iter()
-                .any(|&(at, size)| cache.region_gpu_modified(at, size))
-            {
-                return true;
-            }
-        }
-        let cache = self.query_cache.lock().unwrap();
-        aliases
-            .iter()
-            .any(|&(at, size)| cache.must_flush_region(at, size))
-    }
-
     fn unmap_memory(&self, address: u64, bytes: u64) {
         self.unmap_memory(address, bytes);
     }
@@ -488,5 +442,54 @@ impl CacheOwners {
         let mut textures = self.texture_cache.lock().unwrap();
         textures.pop_async_flush(&mut buffers)?;
         buffers.pop_async_flush()
+    }
+}
+
+impl nixe_gpu::command_memory::CommandMemory for CacheOwners {
+    fn must_flush_region(&self, address: u64, bytes: u64) -> bool {
+        // Lock each owner once for the range and all its physical aliases.
+        // Never-written pages were rejected by the command reader already.
+        let mut aliases = smallvec::SmallVec::<[(u64, u64); 4]>::new();
+        aliases.push((address, bytes));
+        self.device_memory
+            .apply_device_aliases(address, bytes, |at, size| aliases.push((at, size)));
+        {
+            let cache = self.buffer_cache.lock().unwrap();
+            if aliases
+                .iter()
+                .any(|&(at, size)| cache.memory_tracker.gpu_modified(at, size))
+            {
+                return true;
+            }
+        }
+        {
+            let cache = self.texture_cache.lock().unwrap();
+            if aliases
+                .iter()
+                .any(|&(at, size)| cache.region_gpu_modified(at, size))
+            {
+                return true;
+            }
+        }
+        let cache = self.query_cache.lock().unwrap();
+        aliases
+            .iter()
+            .any(|&(at, size)| cache.must_flush_region(at, size))
+    }
+
+    fn command_tick_done(&self, tick: u64) -> Result<bool, Arc<nixe_memory::MemoryError>> {
+        self.timeline
+            .is_done(&self.progress, tick)
+            .map_err(|e| Arc::new(nixe_memory::MemoryError::Execution(e.to_string().into())))
+    }
+    fn read_command(
+        &self,
+        address: u64,
+        output: &mut [u8],
+        past_sync: bool,
+    ) -> Result<nixe_gpu::command_memory::CommandRead, Arc<nixe_memory::MemoryError>> {
+        self.command_pages
+            .read(&self.device_memory, address, output, past_sync)
+            .map_err(|e| Arc::new(nixe_memory::MemoryError::Execution(e.to_string().into())))
     }
 }

@@ -1,6 +1,9 @@
 //! Ampere state consumption uses the common physical caches and native recorder.
 mod compute;
+mod constants;
 pub(super) mod graphics;
+mod reads;
+mod sampled;
 mod shader;
 mod state;
 mod storage;
@@ -8,7 +11,55 @@ mod textures;
 use super::*;
 use nixe_gpu_ampere::{self as model, Registers, RenderMemory};
 
+impl NativeGpuExecution {
+    pub fn load_ampere_disk_resources(
+        &mut self,
+        directory: &std::path::Path,
+        stop: &std::sync::atomic::AtomicBool,
+    ) {
+        let mut configuration = self.residency.device().profile().shader_compiler.clone();
+        configuration.settings.resolution_info = self.residency.access().resolution();
+        self.state.ampere.load(
+            directory,
+            &self.compiler,
+            self.residency.device().profile(),
+            configuration,
+            stop,
+        );
+    }
+}
+
 impl model::Rasterizer for NativeGpuExecution {
+    fn command_memory(&self) -> Arc<dyn nixe_gpu::command_memory::CommandMemory> {
+        self.residency.caches.clone()
+    }
+    fn write_constants(
+        &mut self,
+        source: model::Source,
+        registers: &Registers,
+        offset: u32,
+        bytes: &[u8],
+        memory: &mut impl RenderMemory,
+    ) -> model::Result<()> {
+        self.write_ampere_constants(source, registers, offset, bytes, memory)
+            .map_err(|e| e.to_string().into())
+    }
+    fn flush_constants(&mut self) -> model::Result<()> {
+        self.flush_ampere_constants()
+            .map_err(|e| e.to_string().into())
+    }
+    fn write_memory(
+        &mut self,
+        capture: &nixe_memory::CapturedMemory,
+        bytes: &[u8],
+    ) -> model::Result<()> {
+        nixe_gpu::OwnerMemory::invalidate_gpu_cache(self)
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        self.residency
+            .access()
+            .write_captured_memory(capture, bytes)
+            .map_err(|e| e.to_string().into())
+    }
     fn reduce_report(
         &mut self,
         source: model::Source,
@@ -128,9 +179,9 @@ impl model::Rasterizer for NativeGpuExecution {
         &mut self,
         image: nixe_gpu::native::NativePresentationImage,
         swap_interval: u32,
-        pacing: nixe_gpu::frame_metrics::FramePacing,
     ) -> model::Result<nixe_gpu::ResidentImage> {
-        self.composite_image(image, swap_interval, pacing)
+        // Display pacing starts after composition, outside the CPU measurement.
+        self.composite_image(image, swap_interval, None)
             .map_err(|e| e.to_string().into())
     }
     fn clear(

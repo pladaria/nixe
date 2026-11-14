@@ -321,7 +321,6 @@ async fn present(
     }
     let counter_id = !request_u32(data, 80).unwrap();
     let threshold = request_u32(data, 88).unwrap();
-    let queued = std::time::Instant::now();
     let (frame, counter, executor, deadline) = {
         let mut state = session.state.lock().unwrap();
         let gpu = state
@@ -403,7 +402,6 @@ async fn present(
             available: layer.available.clone(),
             slot,
             interval,
-            queued,
         };
         (frame, counter, executor, layer.next_present_ns)
     };
@@ -424,6 +422,8 @@ async fn present(
         // The owner reports the original device failure. A dropped reply
         // cancels this waiter, rather than creating a second failure at teardown.
         .map_err(|_| IpcWireError::Cancelled)?;
+    // Composition has sealed its CPU measurement before this display-only wait.
+    // Producer-fence and composition waits above remain part of frame delivery.
     let mut pacing = std::pin::pin!(process.kernel().deadline(deadline));
     std::future::poll_fn(|cx| {
         process.lifetime().check()?;

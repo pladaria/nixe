@@ -17,6 +17,7 @@ mod objects;
 pub use objects::NativeObject;
 pub(crate) use objects::{NativeObjects, NativeReference};
 mod pipeline;
+pub(crate) use pipeline::encoding;
 pub use pipeline::{
     BlendState, GraphicsState, NativePipeline, PipelineCompiler, PipelineMetrics, PipelineRecipe,
     StencilState, VertexAttribute, VertexBinding,

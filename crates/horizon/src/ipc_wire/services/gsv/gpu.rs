@@ -106,7 +106,7 @@ pub(super) async fn dispatch(
                 let id = gpu.next_space;
                 gpu.spaces.insert(
                     id,
-                    Arc::new(std::sync::Mutex::new(GpuAddressSpace::new(
+                    Arc::new(std::sync::RwLock::new(GpuAddressSpace::new(
                         gpu.memory.clone(),
                     ))),
                 );

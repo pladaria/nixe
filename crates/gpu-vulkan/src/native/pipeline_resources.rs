@@ -19,7 +19,7 @@ pub(crate) struct StorageSlot {
     pub(crate) has_declared_size: bool,
     pub(crate) descriptor: usize,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct ImageHandle {
     pub(super) cbuf: u32,
     pub(super) offset: u32,

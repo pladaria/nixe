@@ -4,6 +4,9 @@ use crate::{Class, Registers, Result, Source, compute, registers};
 
 pub struct GraphicsState {
     pub preparation_dirty: bool,
+    pub dynamic_dirty: bool,
+    pub vertex_input_dirty: bool,
+    pub shader_dirty: bool,
     pub vertex_dirty: u32,
     pub index_dirty: bool,
     pub uniform_dirty: [u32; 5],
@@ -19,6 +22,9 @@ impl Default for GraphicsState {
         Self {
             targets_dirty: 0x1ff,
             preparation_dirty: true,
+            dynamic_dirty: true,
+            vertex_input_dirty: true,
+            shader_dirty: true,
             vertex_dirty: u32::MAX,
             index_dirty: true,
             uniform_dirty: [u32::MAX; 5],
@@ -38,7 +44,9 @@ pub struct Draw {
 pub trait PreparationHost {
     fn copy(&mut self, operation: &crate::dma::Copy) -> Result<()>;
     fn read(&mut self, address: u64, bytes: usize) -> Result<Vec<u8>>;
-    fn write(&mut self, address: u64, bytes: Vec<u8>) -> Result<()>;
+    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()>;
+    fn constants(&mut self, registers: &Registers, offset: u32, bytes: &[u8]) -> Result<()>;
+    fn flush_constants(&mut self) -> Result<()>;
     fn report(&mut self, address: u64, bytes: Vec<u8>) -> Result<()>;
     fn reduce_report(
         &mut self,
@@ -101,6 +109,7 @@ impl Engine {
     }
     fn flush(&mut self, host: &mut impl PreparationHost) -> Result<()> {
         if let Some(draw) = self.pending.take() {
+            host.flush_constants()?;
             host.draw(draw, &self.regs, self.graphics.as_mut().unwrap())
                 .map_err(|error| draw.source.error(error))?;
         }
@@ -148,10 +157,43 @@ impl Default for Preparation {
     }
 }
 impl Preparation {
+    pub fn constants(
+        &mut self,
+        source: Source,
+        words: &[crate::ordered::ConstantWord],
+        host: &mut impl PreparationHost,
+    ) -> Result<()> {
+        let engine = &mut self.engines[Class::ThreeD.index()];
+        engine.flush(host)?;
+        let regs = &mut engine.regs;
+        let offset = regs.get(0x238c);
+        let end = u64::from(offset) + words.len() as u64 * 4;
+        if end > u64::from(regs.get(0x2380)) {
+            let failed =
+                ((u64::from(regs.get(0x2380)).saturating_sub(u64::from(offset))) / 4) as usize;
+            let word = words[failed.min(words.len() - 1)];
+            return Err(Source {
+                method: word.method,
+                argument: word.value,
+                offset: word.offset,
+                ..source
+            }
+            .error("constant-buffer upload outside selected buffer"));
+        }
+        let mut bytes = [0u8; 256];
+        for (i, word) in words.iter().enumerate() {
+            regs.set(word.method, word.value);
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&word.value.to_le_bytes());
+        }
+        host.constants(regs, offset, &bytes[..words.len() * 4])?;
+        regs.set(0x238c, end as u32);
+        Ok(())
+    }
     /// Drain before coherent frontend dependencies, channel switches and host access.
     /// BEGIN/END state and the instance counter survive a split command stream.
     pub fn flush(&mut self, host: &mut impl PreparationHost) -> Result<()> {
-        self.engines[Class::ThreeD.index()].flush(host)
+        self.engines[Class::ThreeD.index()].flush(host)?;
+        host.flush_constants()
     }
     pub fn execute(
         &mut self,
@@ -174,6 +216,9 @@ impl Preparation {
         }
         let engine = &mut self.engines[class.index()];
         let (name, plain) = registers::method(class, m).ok_or("unknown prepared method")?;
+        if !plain {
+            host.flush_constants()?;
+        }
         let previous = engine.regs.get(m);
         if class == Class::ThreeD {
             let continuing = match m {
@@ -188,25 +233,39 @@ impl Preparation {
         if engine.regs.set(m, value)
             && let Some(graphics) = engine.graphics.as_mut()
         {
+            if matches!(m, 0x2000..=0x217c | 0x1240..=0x125c | 0x16a4 | 0x192c) {
+                graphics.shader_dirty = true;
+                graphics.preparation_dirty = true;
+            }
             match m {
+                0xa00..=0xa1c
+                | 0xe00..=0xe08
+                | 0x131c..=0x1328
+                | 0x1394..=0x139c
+                | 0xf54..=0xf5c
+                | 0x13b0..=0x13b4
+                | 0x20c
+                | 0x15bc
+                | 0x187c
+                | 0x156c => graphics.dynamic_dirty = true,
+                0x1160..=0x11dc | 0x1880..=0x18fc => graphics.vertex_input_dirty = true,
                 0x600..=0x6fc => graphics.vertex_dirty |= 1 << ((m - 0x600) / 8),
                 0x1c00..=0x1dfc => {
                     graphics.vertex_dirty |= 1 << ((m - 0x1c00) / 16);
                     if (m - 0x1c00).is_multiple_of(16) || (m - 0x1c00) % 16 == 12 {
-                        graphics.preparation_dirty = true;
+                        graphics.vertex_input_dirty = true;
                     }
                 }
                 0x17c8..=0x17d8 => graphics.index_dirty = true,
                 // Draw arguments and resource contents do not change fixed state.
                 0x17dc..=0x17f8 | 0xd74..=0xd78 | 0x2380..=0x2490 => (),
                 0x1618 => graphics.preparation_dirty |= (previous ^ value) & 0xffff != 0,
-                _ if plain => graphics.preparation_dirty = true,
-                _ => (),
+                _ => graphics.preparation_dirty |= registers::fixed_graphics_method(m),
             }
             graphics.targets_dirty |= match m {
                 0x800..=0x9e4 => 1 << ((m - 0x800) / 0x40),
                 0xfe0..=0xff0 | 0x1228..=0x1230 | 0x1538 => 0x100,
-                0xfb8 | 0x121c => 0x1ff,
+                0xfb8 | 0xff4 | 0xff8 | 0x121c => 0x1ff,
                 _ => 0,
             };
         }
@@ -252,11 +311,11 @@ impl Preparation {
                         .address(0x318, 0x31c)
                         .checked_mul(256)
                         .ok_or("inline QMD address overflow")?;
-                    let bytes = (0x320..=0x41c)
+                    let bytes: Vec<u8> = (0x320..=0x41c)
                         .step_by(4)
                         .flat_map(|m| regs.get(m).to_le_bytes())
                         .collect();
-                    host.write(address, bytes)?;
+                    host.write(address, &bytes)?;
                     if regs.get(0x29c) & (1 << 24) != 0 || regs.get(0x330) & (1 << 12) == 0 {
                         scheduler.signal(address, 3, regs, host)?;
                     }
@@ -461,21 +520,6 @@ impl Preparation {
                 0x26c | 0x274 | 0x304 | 0x1214 | 0x1218 | 0x123c | 0x17e4..=0x17f8 => {
                     return Err(format!("native draw method {m:#x} is not implemented").into());
                 }
-                0x2390..=0x23cc => {
-                    let offset = regs.get(0x238c);
-                    let size = regs.get(0x2380);
-                    if u64::from(offset) + 4 > u64::from(size) {
-                        return Err("constant-buffer upload outside selected buffer".into());
-                    }
-                    host.write(
-                        regs.address(0x2384, 0x2388)
-                            .checked_add(u64::from(offset))
-                            .ok_or("constant-buffer address overflow")?,
-                        value.to_le_bytes().to_vec(),
-                    )?;
-                    regs.set(0x238c, offset + 4);
-                    return Ok(());
-                }
                 _ => (),
             }
         }
@@ -530,7 +574,7 @@ impl Preparation {
                         }
                         // Transfer ownership of contiguous data directly to
                         // coherent publication, without copying it row by row.
-                        host.write(upload.address, std::mem::take(&mut upload.bytes))?;
+                        host.write(upload.address, &upload.bytes)?;
                     } else {
                         for row in 0..upload.rows {
                             if host.stopped() {
@@ -542,7 +586,7 @@ impl Preparation {
                                     .address
                                     .checked_add(u64::from(row) * u64::from(upload.pitch))
                                     .ok_or("inline DMA address overflow")?,
-                                upload.bytes[at..at + upload.row_bytes as usize].to_vec(),
+                                &upload.bytes[at..at + upload.row_bytes as usize],
                             )?;
                         }
                     }

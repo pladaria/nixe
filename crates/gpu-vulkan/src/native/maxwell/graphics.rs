@@ -565,12 +565,14 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                     let end = image_index + resources.images.len();
                     execution
                         .residency
-                        .configure_guest_stage::<STAGE, STORAGE>(
+                        .configure_guest_buffers::<STAGE, STORAGE>(
                             pipeline,
                             resources,
                             groups[STAGE],
-                            &images[image_index..end],
                         )?;
+                    execution
+                        .residency
+                        .configure_guest_images(pipeline, &images[image_index..end])?;
                     image_index = end;
                 });
                 debug_assert_eq!(image_index, images.len());

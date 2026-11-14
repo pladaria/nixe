@@ -46,19 +46,9 @@ pub(in crate::native) enum TextureMiss {
     Image,
     Unsupported,
 }
-#[derive(Clone, Copy, Debug)]
-#[repr(usize)]
-pub(in crate::native) enum DrawMiss {
-    Cold,
-    Kind,
-    State,
-    Mapping,
-    Operation,
-    Submission,
-    RenderPass,
-    Texture,
-    Content,
-}
+pub(in crate::native) use crate::native::draw_reuse::DrawMiss;
+use crate::native::draw_reuse::DrawScope;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReuseStatistics {
     pub eligible_draws: u64,
@@ -328,15 +318,7 @@ impl SampledTextures {
 #[derive(Clone, Copy)]
 pub(in crate::native) struct ResolvedDraw {
     pipeline: u64,
-    channel: Option<u64>,
-    space: u64,
-    mapping: u64,
-    device_mapping: u64,
-    revision: u64,
-    batch: u64,
-    tick: u64,
-    render_pass: u64,
-    targets: u64,
+    scope: DrawScope,
     topology: u32,
     indexed: bool,
 }
@@ -349,24 +331,14 @@ impl ResolvedDraw {
     ) -> Self {
         Self {
             pipeline: pipeline.identity,
-            channel: execution.state.current_context,
-            space: space.id().get(),
-            mapping: space.mapping_generation().get(),
-            device_mapping: space.device_memory().device().generation(),
-            revision: execution.residency.texture_cache.binding_revision,
-            batch: execution.state.statistics.batches + 1,
-            tick: execution.residency.device().current_work().tick(),
-            render_pass: execution
-                .residency
-                .device()
-                .recording_statistics()
-                .rendering_scopes,
-            targets: execution
-                .residency
-                .texture_cache
-                .bindings
-                .channel
-                .render_targets_serial,
+            scope: DrawScope::capture(
+                execution,
+                [
+                    space.id().get(),
+                    space.mapping_generation().get(),
+                    space.device_memory().device().generation(),
+                ],
+            ),
             topology: draw.topology,
             indexed: draw.indexed,
         }
@@ -393,7 +365,6 @@ impl ResolvedDraw {
                 0
             };
         if self.pipeline != pipeline.identity
-            || self.channel != execution.state.current_context
             || state.graphics_dirty().is_dirty(GraphicsDirty::ALL & !light)
         {
             return Err(DrawMiss::State);
@@ -406,42 +377,14 @@ impl ResolvedDraw {
         pipeline: usize,
         space: &MaxwellGpuMemory,
     ) -> Result<(), DrawMiss> {
-        if self.space != space.id().get()
-            || self.mapping != space.mapping_generation().get()
-            || self.device_mapping != space.device_memory().device().generation()
-            || self.revision != execution.residency.texture_cache.binding_revision
-        {
-            return Err(DrawMiss::Mapping);
-        }
-        if self.batch != execution.state.statistics.batches {
-            return Err(DrawMiss::Operation);
-        }
-        if self.tick != execution.residency.device().current_work().tick() {
-            return Err(DrawMiss::Submission);
-        }
-        let device = execution.residency.device();
-        if self.render_pass != device.recording_statistics().rendering_scopes
-            || self.targets
-                != execution
-                    .residency
-                    .texture_cache
-                    .bindings
-                    .channel
-                    .render_targets_serial
-            || execution
-                .residency
-                .texture_cache
-                .bindings
-                .channel
-                .invalidated_targets
-                != 0
-            || device.submission.recording.is_none_or(|slot| {
-                let slot = &device.submission.slots[slot];
-                slot.active_render_pass.is_none() || slot.bound_graphics != pipeline
-            })
-        {
-            return Err(DrawMiss::RenderPass);
-        }
-        Ok(())
+        self.scope.validate(
+            execution,
+            pipeline,
+            [
+                space.id().get(),
+                space.mapping_generation().get(),
+                space.device_memory().device().generation(),
+            ],
+        )
     }
 }

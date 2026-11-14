@@ -32,6 +32,7 @@ macro_rules! graphics_stages {
     };
 }
 mod completion;
+mod draw_reuse;
 mod pipeline_cache;
 pub(crate) mod pipeline_resources;
 
@@ -907,7 +908,7 @@ impl nixe_gpu::GpuPresentation for NativeGpuExecution {
             format: request.format,
             allow_canonical_import: request.allow_canonical_import,
         };
-        self.composite_image(image, swap_interval, pacing)
+        self.composite_image(image, swap_interval, Some(pacing))
     }
 }
 impl NativeGpuExecution {
@@ -915,7 +916,7 @@ impl NativeGpuExecution {
         &mut self,
         image: NativePresentationImage,
         swap_interval: u32,
-        pacing: nixe_gpu::frame_metrics::FramePacing,
+        pacing: Option<nixe_gpu::frame_metrics::FramePacing>,
     ) -> Result<ResidentImage, BackendRuntimeError> {
         let device = &mut self.residency.runtime.device;
         device
@@ -934,6 +935,7 @@ impl NativeGpuExecution {
         let mut residency = self.residency.access();
         residency.tick_frame();
         residency.maintain_budget(true).map_err(runtime)?;
+        // Stop the CPU clock before publication or any following display wait.
         // Recording-worker and cache-maintenance waits are production costs.
         residency
             .device_mut()

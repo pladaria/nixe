@@ -1,7 +1,17 @@
 //! Ampere uses the same ordered word ring and method/location records as the
 //! Maxwell frontend. Only engine identities and the consumers are ISA-specific.
 use crate::{Result, Source};
-use nixe_gpu::ordered::{self, ENGINE, LOCATION, METHOD, ORIGIN};
+use nixe_gpu::ordered::{self, ENGINE, LOCATION, MACRO_END, METHOD, ORIGIN};
+pub enum Operation {
+    Method(Source),
+    Flush,
+}
+#[derive(Clone, Copy, Default)]
+pub struct ConstantWord {
+    pub method: u32,
+    pub value: u32,
+    pub offset: u32,
+}
 pub struct Writer<T> {
     pub ring: ordered::Sender<T>,
     previous: Option<Source>,
@@ -61,7 +71,7 @@ impl<T> Writer<T> {
 pub fn consume<T>(
     words: &mut ordered::Words<'_, T>,
     source: &mut Source,
-    mut method: impl FnMut(Source) -> Result<()>,
+    mut method: impl FnMut(Operation, &[ConstantWord]) -> Result<()>,
 ) -> Result<()> {
     while !words.remaining().is_empty() {
         let batch = words.remaining();
@@ -82,8 +92,52 @@ pub fn consume<T>(
                 source.method = ((value >> 8) & 0xffff) as u32;
                 source.argument = (value >> 32) as u32;
                 source.subchannel = ((value >> 3) & 7) as u8;
-                method(*source).map_err(|e| source.error(e))?;
+                if source.class == crate::Class::ThreeD as u32
+                    && (0x2390..=0x23cc).contains(&source.method)
+                {
+                    let mut data = [ConstantWord::default(); 64];
+                    let mut count = 1;
+                    data[0] = ConstantWord {
+                        method: source.method,
+                        value: source.argument,
+                        offset: source.offset,
+                    };
+                    let mut offset = source.offset;
+                    while count < data.len() && consumed < batch.len() {
+                        let mut next = consumed;
+                        if batch[next] & 7 == LOCATION {
+                            offset = (batch[next] >> 32) as u32;
+                            next += 1;
+                        }
+                        let Some(&word) = batch.get(next) else {
+                            break;
+                        };
+                        let m = ((word >> 8) & 0xffff) as u32;
+                        if word & 7 != METHOD
+                            || ((word >> 3) & 7) as u8 != source.subchannel
+                            || !(0x2390..=0x23cc).contains(&m)
+                        {
+                            break;
+                        }
+                        data[count] = ConstantWord {
+                            method: m,
+                            value: (word >> 32) as u32,
+                            offset,
+                        };
+                        count += 1;
+                        consumed = next + 1;
+                    }
+                    method(Operation::Method(*source), &data[..count])
+                        .map_err(|e| source.error(e))?;
+                    let last = data[count - 1];
+                    source.offset = last.offset;
+                    source.method = last.method;
+                    source.argument = last.value;
+                } else {
+                    method(Operation::Method(*source), &[]).map_err(|e| source.error(e))?;
+                }
             }
+            MACRO_END => method(Operation::Flush, &[])?,
             _ => unreachable!("admitted ordered method record"),
         }
         words.advance(consumed);

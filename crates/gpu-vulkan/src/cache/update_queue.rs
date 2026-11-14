@@ -98,6 +98,18 @@ impl UpdateDescriptorQueue {
         // native captures; its complete union entry is initialized at once.
         unsafe { self.payload[self.upload_start + index].get().write(entry) };
     }
+    pub(crate) fn write_entries(&mut self, first: usize, entries: &[DescriptorEntry]) {
+        assert!(first <= self.entries && entries.len() <= self.entries - first);
+        // The acquired payload is disjoint from all captures still being recorded.
+        // UnsafeCell permits these writes without borrowing queued descriptor data.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                entries.as_ptr(),
+                self.payload[self.upload_start + first].get(),
+                entries.len(),
+            );
+        }
+    }
     pub(crate) fn update_data(&self) -> DescriptorUpdate {
         DescriptorUpdate {
             data: NonNull::new(self.payload[self.upload_start].get()).unwrap(),

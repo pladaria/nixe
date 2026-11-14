@@ -9,6 +9,8 @@ struct Work {
     entry: usize,
     offset: usize,
     wait: Option<Arc<semaphore::Wait>>,
+    fetch: commands::Fetch,
+    started: Option<std::time::Instant>,
 }
 enum Pending {
     Submit(Work),
@@ -22,6 +24,8 @@ fn admit(message: Ingress, pending: &mut VecDeque<Pending>) -> bool {
             entry: 0,
             offset: 0,
             wait: None,
+            fetch: Default::default(),
+            started: None,
         }),
         Ingress::Memory(job, reply) => Pending::Memory(job, reply),
         Ingress::Retire(channel, reply) => Pending::Retire(channel, reply),
@@ -36,11 +40,12 @@ pub(super) fn run(
     machine: Machine,
     stop: &AtomicBool,
     waiters: &semaphore::Waiters,
+    commands: Arc<dyn nixe_gpu::command_memory::CommandMemory>,
 ) -> Result<()> {
     let mut writer = ampere::ordered::Writer::new(output);
     let mut channels = BTreeMap::<u64, ampere::Channel>::new();
     let mut pending = VecDeque::new();
-    let mut writers = false;
+    let mut dependencies = dependencies::Dependencies::default();
     let result: Result<()> = (|| {
         while !stop.load(Ordering::Acquire) {
             if pending.is_empty() {
@@ -99,6 +104,9 @@ pub(super) fn run(
                     waiters.remove(work.job.channel);
                     work.wait = None;
                 }
+                if !work.fetch.ready(&*commands)? {
+                    continue;
+                }
                 selected = Some(index);
                 break;
             }
@@ -118,7 +126,7 @@ pub(super) fn run(
                         .ring
                         .wait_until(writer.ring.position())
                         .map_err(|_| "native mapping operation failed")?;
-                    writers = false;
+                    dependencies.pending_draw = false;
                 }
                 Pending::Retire(channel, reply) => {
                     channels.remove(&channel);
@@ -132,7 +140,10 @@ pub(super) fn run(
                     let job = &work.job;
                     writer
                         .ring
-                        .send(Control::Begin(job.clone()))
+                        .send(Control::Begin(
+                            job.clone(),
+                            *work.started.get_or_insert_with(std::time::Instant::now),
+                        ))
                         .map_err(|_| "native preparation stopped")?;
                     writer.reset();
                     let channel = channels.entry(job.channel).or_default();
@@ -144,7 +155,9 @@ pub(super) fn run(
                             stop,
                             waiters,
                         },
-                        writers: &mut writers,
+                        dependencies: &mut dependencies,
+                        pending_write: None,
+                        commands: &*commands,
                     };
                     while work.entry < job.entries.len() {
                         let entry = &job.entries[work.entry];
@@ -153,15 +166,12 @@ pub(super) fn run(
                             work.offset = 0;
                             continue;
                         }
-                        if *host.writers || entry.sync_wait {
-                            host.barrier()?;
+                        if entry.sync_wait && !work.fetch.started() {
+                            host.finish_draws()?;
+                            host.dependencies.sync(host.writer.ring.position());
                         }
                         // Re-fetch only the unconsumed tail after an acquire:
                         // a CPU release may publish new command words there.
-                        let data = host.memory.read(
-                            entry.address + work.offset as u64 * 4,
-                            (entry.words as usize - work.offset) * 4,
-                        )?;
                         let source = Source {
                             channel: job.channel,
                             submission: job.id,
@@ -169,6 +179,16 @@ pub(super) fn run(
                             pushbuffer: entry.address,
                             offset: work.offset as u32,
                             ..Source::default()
+                        };
+                        let Some(data) = host
+                            .read_commands(
+                                &mut work.fetch,
+                                entry.address + work.offset as u64 * 4,
+                                (entry.words as usize - work.offset) * 4,
+                            )
+                            .map_err(|error| source.error(error))?
+                        else {
+                            break;
                         };
                         let progress = channel.execute(source, &data, &mut host)?;
                         work.offset += progress.words;
@@ -188,13 +208,18 @@ pub(super) fn run(
                             break;
                         }
                     }
-                    if work.wait.is_some() {
+                    host.finish_writes();
+                    if work.wait.is_some() || work.fetch.started() {
                         pending.insert(index, Pending::Submit(work));
                     } else {
                         host.writer
                             .ring
                             .send(Control::End)
                             .map_err(|_| "native preparation stopped")?;
+                        host.dependencies.pending_draw = false;
+                        if job.completion.is_some() {
+                            host.dependencies.any(host.writer.ring.position());
+                        }
                     }
                 }
             }

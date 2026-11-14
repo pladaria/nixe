@@ -15,6 +15,7 @@ pub(super) fn compare(value: C) -> vk::CompareOp {
 
 /// Fixed SPIR-V host parameters. No reflected layouts are interpreted at draw time.
 /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp#L527-L528
+#[derive(Clone, Copy)]
 pub(super) struct ShaderConstants(
     [u32; nixe_shader_recompiler::host_abi::PUSH_CONSTANT_BYTES as usize / 4],
 );

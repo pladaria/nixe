@@ -281,78 +281,36 @@ pub(super) fn prepare(
         }),
         ..Default::default()
     };
-    let mut attributes = Vec::new();
-    let mut bindings = Vec::new();
-    let mut divisors = Vec::new();
-    let mut used = 0u32;
-    for location in 0..32u32 {
-        let word = r.get(0x1160 + location * 4);
-        if word & 64 != 0 {
-            runtime.vertex_input_types[location as usize] = AttributeType::Disabled;
-            continue;
-        }
-        if word >> 31 != 0 {
-            return Err(fail(
-                r,
-                0x1160 + location * 4,
-                "vertex red/blue exchange is not implemented",
-            ));
-        }
-        let attr = crate::native::vertex_format::Attribute::from_guest(word);
-        let binding = attr.buffer();
-        runtime.vertex_input_types[location as usize] = match attr.kind() {
-            3 => AttributeType::SignedInt,
-            4 => AttributeType::UnsignedInt,
-            5 if residency.device().profile().emulate_scaled_formats => {
-                AttributeType::UnsignedScaled
-            }
-            6 if residency.device().profile().emulate_scaled_formats => AttributeType::SignedScaled,
-            _ => AttributeType::Float,
-        };
-        attributes.push(VertexAttribute {
-            location,
-            binding,
-            format: attr.format(residency.device().profile(), location)?,
-            offset: attr.offset(),
-        });
-        if used & (1 << binding) == 0 {
-            let instance = boolean(r, 0x1880 + binding * 4)?;
-            let word = r.get(0x1c00 + binding * 16);
-            if word & 0x1000 == 0 {
-                return Err(fail(
-                    r,
-                    0x1c00 + binding * 16,
-                    "active attribute has a disabled vertex stream",
-                ));
-            }
-            bindings.push(VertexBinding {
-                binding,
-                stride: word & 0xfff,
-                rate: if instance {
-                    vk::VertexInputRate::INSTANCE
-                } else {
-                    vk::VertexInputRate::VERTEX
-                },
-            });
-            if instance {
-                divisors.push((binding, r.get(0x1c0c + binding * 16)));
-            }
-            used |= 1 << binding;
-        }
-    }
-    state.vertex_attributes = attributes.into();
-    state.vertex_bindings = bindings.into();
-    state.vertex_divisors = divisors.into();
+    vertex_input(r, residency, &mut state, &mut runtime)?;
     let extent = vk::Extent2D {
         width: bank.size[0],
         height: bank.size[1],
     };
     let mut params = GraphicsParameters::new(state, extent);
+    update_dynamic(r, residency, &mut params, &runtime)?;
+    params.vertex_input.validate(residency.device().profile())?;
+    params
+        .blending
+        .validate(residency.device().profile(), &params.state)?;
+    Ok((params, runtime))
+}
+
+pub(super) fn update_dynamic(
+    r: &Registers,
+    residency: &Residency<'_>,
+    params: &mut GraphicsParameters,
+    runtime: &GraphicsRuntimeState,
+) -> Result<(), VulkanError> {
+    let size = residency.texture_cache.bindings.channel.render_targets.size;
+    let extent = vk::Extent2D {
+        width: size[0],
+        height: size[1],
+    };
     if params.state.stencil_test {
         params.stencil_reference = [r.get(0x1394); 2];
         params.stencil_compare_mask = [r.get(0x1398); 2];
         params.stencil_write_mask = [r.get(0x139c); 2];
-        if two_sided_stencil {
+        if boolean(r, 0x1594)? {
             params.stencil_reference[1] = r.get(0xf54);
             params.stencil_compare_mask[1] = r.get(0xf5c);
             params.stencil_write_mask[1] = r.get(0xf58);
@@ -361,7 +319,9 @@ pub(super) fn prepare(
     if r.get(0x13ac) & !0x11 != 0 {
         return Err(fail(r, 0x13ac, "invalid window origin mode"));
     }
-    if input_topology == InputTopology::Lines || params.state.polygon == vk::PolygonMode::LINE {
+    if runtime.input_topology == InputTopology::Lines
+        || params.state.polygon == vk::PolygonMode::LINE
+    {
         let method = if boolean(r, 0x20c)? { 0x13b4 } else { 0x13b0 };
         params.line_width = f32::from_bits(r.get(method));
     }
@@ -448,10 +408,87 @@ pub(super) fn prepare(
             },
         };
     }
-    params.vertex_input.validate(residency.device().profile())?;
-    params
-        .blending
-        .validate(residency.device().profile(), &params.state)?;
-    residency.validate_dynamic_parameters(&params)?;
-    Ok((params, runtime))
+    residency.validate_dynamic_parameters(params)?;
+    Ok(())
+}
+
+fn vertex_input(
+    r: &Registers,
+    residency: &Residency<'_>,
+    state: &mut GraphicsState,
+    runtime: &mut GraphicsRuntimeState,
+) -> Result<(), VulkanError> {
+    let mut attributes = Vec::new();
+    let mut bindings = Vec::new();
+    let mut divisors = Vec::new();
+    let mut used = 0u32;
+    for location in 0..32u32 {
+        let word = r.get(0x1160 + location * 4);
+        if word & 64 != 0 {
+            runtime.vertex_input_types[location as usize] = AttributeType::Disabled;
+            continue;
+        }
+        if word >> 31 != 0 {
+            return Err(fail(
+                r,
+                0x1160 + location * 4,
+                "vertex red/blue exchange is not implemented",
+            ));
+        }
+        let attr = crate::native::vertex_format::Attribute::from_guest(word);
+        let binding = attr.buffer();
+        runtime.vertex_input_types[location as usize] = match attr.kind() {
+            3 => AttributeType::SignedInt,
+            4 => AttributeType::UnsignedInt,
+            5 if residency.device().profile().emulate_scaled_formats => {
+                AttributeType::UnsignedScaled
+            }
+            6 if residency.device().profile().emulate_scaled_formats => AttributeType::SignedScaled,
+            _ => AttributeType::Float,
+        };
+        attributes.push(VertexAttribute {
+            location,
+            binding,
+            format: attr.format(residency.device().profile(), location)?,
+            offset: attr.offset(),
+        });
+        if used & (1 << binding) == 0 {
+            let instance = boolean(r, 0x1880 + binding * 4)?;
+            let word = r.get(0x1c00 + binding * 16);
+            if word & 0x1000 == 0 {
+                return Err(fail(
+                    r,
+                    0x1c00 + binding * 16,
+                    "active attribute has a disabled vertex stream",
+                ));
+            }
+            bindings.push(VertexBinding {
+                binding,
+                stride: word & 0xfff,
+                rate: if instance {
+                    vk::VertexInputRate::INSTANCE
+                } else {
+                    vk::VertexInputRate::VERTEX
+                },
+            });
+            if instance {
+                divisors.push((binding, r.get(0x1c0c + binding * 16)));
+            }
+            used |= 1 << binding;
+        }
+    }
+    state.vertex_attributes = attributes.into();
+    state.vertex_bindings = bindings.into();
+    state.vertex_divisors = divisors.into();
+    Ok(())
+}
+pub(super) fn update_vertex_input(
+    r: &Registers,
+    residency: &Residency<'_>,
+    params: &mut GraphicsParameters,
+    runtime: &mut GraphicsRuntimeState,
+) -> Result<(), VulkanError> {
+    vertex_input(r, residency, &mut params.state, runtime)?;
+    params.vertex_input = crate::native::VertexInput::host(&params.state);
+    params.vertex_input.validate(residency.device().profile())
 }

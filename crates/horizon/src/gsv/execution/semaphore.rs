@@ -28,16 +28,16 @@ pub(super) struct Waiters {
     slots: Mutex<BTreeMap<u64, Arc<Wait>>>,
 }
 impl Waiters {
+    pub fn active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
     pub fn register(
         &self,
         acquire: ampere::SemaphoreAcquire,
         memory: &Memory<'_>,
     ) -> Result<Arc<Wait>> {
         let capture = Arc::new(
-            memory
-                .space
-                .lock()
-                .unwrap()
+            GpuMemory::new(memory.space)
                 .capture(acquire.address, 4)
                 .map_err(|e| acquire.source.error(e))?,
         );

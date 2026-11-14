@@ -12,8 +12,7 @@ mod kinds;
 mod memory;
 mod table;
 pub use memory::{
-    CommandRead, MaxwellCommandMemory, MaxwellGpuMemory, MaxwellGpuMemoryHandle,
-    MaxwellGpuMemoryInterface,
+    MaxwellCommandMemory, MaxwellGpuMemory, MaxwellGpuMemoryHandle, MaxwellGpuMemoryInterface,
 };
 use nixe_gpu::MappingGeneration;
 use nixe_gpu::MappingGenerationExhausted;

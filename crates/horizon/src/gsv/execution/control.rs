@@ -103,14 +103,7 @@ impl Endpoint {
             match request {
                 Request::Access(request) => renderer.queue_device_access(request),
                 Request::Present(frame, reply) => {
-                    let image = renderer.composite(
-                        frame.image.clone(),
-                        frame.interval,
-                        nixe_gpu::frame_metrics::FramePacing {
-                            queued: frame.queued,
-                            vsync: frame.queued,
-                        },
-                    )?;
+                    let image = renderer.composite(frame.image.clone(), frame.interval)?;
                     if let Some(presenter) = &self.presenter {
                         let sequence = self.frame_sequence.fetch_add(1, Ordering::Relaxed);
                         presenter.publish(Arc::new(nixe_video::PresentationFrame::new(

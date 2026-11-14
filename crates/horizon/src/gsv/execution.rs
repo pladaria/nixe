@@ -1,6 +1,6 @@
 //! Native command/MME owner and ordered graphics-preparation owner. IPC only
 //! admits retained inputs; neither worker retains an accepted kernel request.
-use super::gpu::{GpuAddressSpace, GpuCapture};
+use super::gpu::{GpuAddressSpace, GpuCapture, GpuMemory};
 use nixe_gpu::native::ImageAddressSpace;
 use nixe_gpu_ampere::{self as ampere, FrontendHost, PreparationHost, Result, Source};
 use nixe_memory::{Access, AccessResult, Machine, PendingAccess};
@@ -8,14 +8,16 @@ use nixe_runtime::RunnableProcess;
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     task::{Poll, Waker},
     thread::{self, JoinHandle},
 };
+mod commands;
 mod control;
+mod dependencies;
 mod dma;
 mod frontend;
 mod semaphore;
@@ -75,7 +77,7 @@ pub(crate) struct Submission {
     pub id: u64,
     pub channel: u64,
     pub space_id: u64,
-    pub space: Arc<Mutex<GpuAddressSpace>>,
+    pub space: Arc<RwLock<GpuAddressSpace>>,
     pub entries: Vec<ampere::GpfifoEntry>,
     pub timeline: Arc<Mutex<crate::gsv::syncpt::Counter>>,
     pub completion: Option<nixe_gpu::ReservedTimelinePoint>,
@@ -154,9 +156,8 @@ enum Ingress {
     Stop,
 }
 enum Control {
-    Drain,
     Failure(Box<str>),
-    Begin(Arc<Submission>),
+    Begin(Arc<Submission>, std::time::Instant),
     End,
     Memory(MemoryJob, Reply),
     Retire(u64, Reply),
@@ -209,11 +210,23 @@ impl Executor {
         let front_stop = stop.clone();
         let front_machine = machine.clone();
         let front_process = weak.clone();
+        let (command_send, command_receive) = mpsc::sync_channel(1);
         let front = thread::Builder::new()
             .name("nixe-ampere-mme".into())
             .spawn(move || {
-                let result =
-                    frontend::run(receive, send, front_machine, &front_stop, &front_waiters);
+                let result = command_receive
+                    .recv()
+                    .map_err(|_| "GPU initialization failed".into())
+                    .and_then(|commands| {
+                        frontend::run(
+                            receive,
+                            send,
+                            front_machine,
+                            &front_stop,
+                            &front_waiters,
+                            commands,
+                        )
+                    });
                 if let Err(e) = result
                     && !front_stop.swap(true, Ordering::AcqRel)
                     && let Some(p) = front_process.upgrade()
@@ -231,6 +244,9 @@ impl Executor {
             .spawn(move || {
                 let result = (|| {
                     let mut renderer = initialize().map_err(|e| e.to_string().into_boxed_str())?;
+                    command_send
+                        .send(renderer.command_memory())
+                        .map_err(|_| "GPU command owner stopped")?;
                     let _ = back_uuid.set(renderer.device_uuid());
                     back_endpoint.bind(&mut renderer)?;
                     let result = preparation(
@@ -286,14 +302,14 @@ impl Executor {
     }
     pub fn submission(
         &self,
-        space: Arc<Mutex<GpuAddressSpace>>,
+        space: Arc<RwLock<GpuAddressSpace>>,
         entries: Vec<ampere::GpfifoEntry>,
         timeline: Arc<Mutex<crate::gsv::syncpt::Counter>>,
         completion: Option<nixe_gpu::ReservedTimelinePoint>,
         publication: Option<Publication>,
     ) -> Result<Submission> {
         let channel = timeline.lock().unwrap().timeline.instance().get();
-        let space_id = space.lock().unwrap().image_space_id();
+        let space_id = space.read().unwrap().image_space_id();
         let bytes = entries
             .iter()
             .try_fold(0_usize, |sum, e| sum.checked_add(e.words as usize * 4))
@@ -372,7 +388,7 @@ impl Drop for Executor {
 }
 struct Memory<'a> {
     machine: &'a Machine,
-    space: &'a Arc<Mutex<GpuAddressSpace>>,
+    space: &'a Arc<RwLock<GpuAddressSpace>>,
     stop: &'a AtomicBool,
     waiters: &'a semaphore::Waiters,
 }
@@ -411,9 +427,7 @@ impl Memory<'_> {
             return Ok(Vec::new());
         }
         let capture = Arc::new(
-            self.space
-                .lock()
-                .unwrap()
+            GpuMemory::new(self.space)
                 .capture(address, bytes as u64)
                 .map_err(|e| {
                     format!("GPU read address={address:#x} bytes={bytes:#x}: {e}").into_boxed_str()
@@ -425,30 +439,93 @@ impl Memory<'_> {
 struct Front<'a> {
     writer: &'a mut ampere::ordered::Writer<Control>,
     memory: Memory<'a>,
-    writers: &'a mut bool,
+    dependencies: &'a mut dependencies::Dependencies,
+    pending_write: Option<(u64, u64, u64)>,
+    commands: &'a dyn nixe_gpu::command_memory::CommandMemory,
+}
+impl Front<'_> {
+    fn finish_writes(&mut self) {
+        if let Some((address, bytes, position)) = self.pending_write.take() {
+            self.dependencies
+                .note(&self.memory.space.read().unwrap(), address, bytes, position);
+        }
+    }
+    fn finish_draws(&mut self) -> Result<()> {
+        self.finish_writes();
+        if self.dependencies.pending_draw {
+            self.writer
+                .ring
+                .write(&[nixe_gpu::ordered::MACRO_END], &[])
+                .map_err(|_| "native preparation stopped before draw boundary")?;
+            self.dependencies.any(self.writer.ring.position());
+            self.dependencies.pending_draw = false;
+        }
+        Ok(())
+    }
 }
 impl FrontendHost for Front<'_> {
-    fn method(&mut self, source: Source) -> Result<()> {
-        // Ordinary register writes cannot change command/MME input memory.
-        // Effects are ordered before the next input fetch; no per-word waits.
-        if ampere::writes_memory(source) {
-            *self.writers = true;
+    fn method(&mut self, source: Source, writes: ampere::MemoryWrites) -> Result<()> {
+        self.writer.method(source)?;
+        let position = self.writer.ring.position();
+        if !matches!(
+            writes,
+            ampere::MemoryWrites::None | ampere::MemoryWrites::Sync
+        ) && (source.class != ampere::Class::ThreeD as u32 || source.method == 0x1b4)
+        {
+            self.dependencies.writer = position;
         }
-        self.writer.method(source)
+        match writes {
+            ampere::MemoryWrites::None => (),
+            ampere::MemoryWrites::Sync => {
+                self.finish_writes();
+                self.dependencies.sync(position);
+                // The host operation itself flushes deferred draws on the back.
+                self.dependencies.pending_draw = false;
+            }
+            ampere::MemoryWrites::Any => {
+                self.pending_write = None;
+                self.dependencies.any(position);
+            }
+            ampere::MemoryWrites::Draw => {
+                self.pending_write = None;
+                self.dependencies.any(position);
+                self.dependencies.pending_draw = true;
+            }
+            ampere::MemoryWrites::Range { address, bytes } => {
+                if let Some((start, size, old_position)) = self.pending_write.as_mut()
+                    && address >= *start
+                    && address <= start.saturating_add(*size)
+                    && let Some(end) = address.checked_add(bytes)
+                    && end.saturating_sub(*start) <= 0x4000
+                {
+                    *size = (*size).max(end - *start);
+                    *old_position = position;
+                } else {
+                    self.finish_writes();
+                    self.pending_write = Some((address, bytes, position));
+                }
+            }
+        }
+        Ok(())
     }
     fn barrier(&mut self) -> Result<()> {
-        self.writer
-            .ring
-            .send(Control::Drain)
-            .map_err(|_| "native preparation stopped before dependency drain")?;
+        self.finish_draws()?;
         self.writer
             .ring
             .wait_until(self.writer.ring.position())
             .map_err(|_| "native preparation stopped before coherent dependency")?;
-        *self.writers = false;
+        self.dependencies.sync(self.writer.ring.position());
         Ok(())
     }
     fn read(&mut self, address: u64, bytes: usize) -> Result<Vec<u8>> {
+        self.finish_draws()?;
+        let target =
+            self.dependencies
+                .target(&self.memory.space.read().unwrap(), address, bytes as u64);
+        self.writer
+            .ring
+            .wait_until(target)
+            .map_err(|_| "native preparation stopped before memory producer")?;
         self.memory.read(address, bytes)
     }
     fn stopped(&self) -> bool {
@@ -462,6 +539,40 @@ struct Back<'a, E> {
     clock: &'a nixe_scheduler::VirtualClock,
 }
 impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
+    fn constants(
+        &mut self,
+        registers: &ampere::Registers,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.renderer.write_constants(
+            self.source,
+            registers,
+            offset,
+            bytes,
+            &mut GpuMemory::new(self.memory.space),
+        )?;
+        if self.memory.waiters.active() {
+            self.renderer.flush_constants()?;
+            let address = registers
+                .address(0x2384, 0x2388)
+                .checked_add(u64::from(offset))
+                .ok_or("constant-buffer address overflow")?;
+            let capture = GpuMemory::new(self.memory.space)
+                .capture(address, bytes.len() as u64)
+                .map_err(|e| e.to_string().into_boxed_str())?;
+            self.memory
+                .waiters
+                .written(&capture.ranges, 0, bytes, |source| {
+                    read_owned(self.renderer, &source.ranges, 4)
+                })?;
+        }
+        Ok(())
+    }
+    fn flush_constants(&mut self) -> Result<()> {
+        self.renderer.flush_constants()
+    }
+
     fn copy(&mut self, operation: &ampere::dma::Copy) -> Result<()> {
         self.copy_memory(operation)
     }
@@ -475,11 +586,7 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
         if address & 3 != 0 {
             return Err("unaligned native semaphore reduction".into());
         }
-        let capture = self
-            .memory
-            .space
-            .lock()
-            .unwrap()
+        let capture = GpuMemory::new(self.memory.space)
             .capture(address, 4)
             .map_err(|e| e.to_string().into_boxed_str())?;
         let ranges = capture
@@ -500,11 +607,7 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
     }
     fn report_samples_passed(&mut self, address: u64, short: bool) -> Result<()> {
         let bytes = if short { 4 } else { 16 };
-        let capture = self
-            .memory
-            .space
-            .lock()
-            .unwrap()
+        let capture = GpuMemory::new(self.memory.space)
             .capture(address, bytes)
             .map_err(|e| e.to_string().into_boxed_str())?;
         let ranges = capture
@@ -523,7 +626,7 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
     fn blit(&mut self, source: Source, operation: &ampere::blit::Blit) -> Result<()> {
         let accelerated =
             self.renderer
-                .blit(source, operation, &mut *self.memory.space.lock().unwrap())?;
+                .blit(source, operation, &mut GpuMemory::new(self.memory.space))?;
         if accelerated {
             return Ok(());
         }
@@ -536,50 +639,27 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
         if bytes == 0 {
             return Ok(Vec::new());
         }
-        let capture = self
-            .memory
-            .space
-            .lock()
-            .unwrap()
+        let capture = GpuMemory::new(self.memory.space)
             .capture(address, bytes as u64)
             .map_err(|e| e.to_string().into_boxed_str())?;
         read_owned(self.renderer, &capture.ranges, bytes)
     }
-    fn write(&mut self, address: u64, bytes: Vec<u8>) -> Result<()> {
+    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
-        let capture = self
-            .memory
-            .space
-            .lock()
-            .unwrap()
+        let capture = GpuMemory::new(self.memory.space)
             .capture(address, bytes.len() as u64)
             .map_err(|e| e.to_string().into_boxed_str())?;
-        let ranges = capture
-            .ranges
-            .capture(0, bytes.len() as u64)
-            .map_err(|e| e.to_string().into_boxed_str())?;
-        let written = match self
-            .renderer
-            .access_memory(ranges, nixe_memory::AccessOperation::Write(bytes))
-            .map_err(|e| e.to_string().into_boxed_str())?
-        {
-            AccessResult::Written(bytes) => bytes,
-            _ => return Err("invalid native GPU write completion".into()),
-        };
+        self.renderer.write_memory(&capture.ranges, bytes)?;
         self.memory
             .waiters
-            .written(&capture.ranges, 0, &written, |source| {
+            .written(&capture.ranges, 0, bytes, |source| {
                 read_owned(self.renderer, &source.ranges, 4)
             })
     }
     fn report(&mut self, address: u64, bytes: Vec<u8>) -> Result<()> {
-        let capture = self
-            .memory
-            .space
-            .lock()
-            .unwrap()
+        let capture = GpuMemory::new(self.memory.space)
             .capture(address, bytes.len() as u64)
             .map_err(|e| e.to_string().into_boxed_str())?;
         let ranges = capture
@@ -633,7 +713,7 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
             self.source,
             launch,
             registers,
-            &mut *self.memory.space.lock().unwrap(),
+            &mut GpuMemory::new(self.memory.space),
         )
     }
     fn clear(
@@ -643,7 +723,7 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
         state: &mut ampere::GraphicsState,
     ) -> Result<()> {
         self.renderer
-            .clear(source, regs, state, &mut *self.memory.space.lock().unwrap())
+            .clear(source, regs, state, &mut GpuMemory::new(self.memory.space))
     }
     fn draw(
         &mut self,
@@ -652,7 +732,7 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
         state: &mut ampere::GraphicsState,
     ) -> Result<()> {
         self.renderer
-            .draw(draw, regs, state, &mut *self.memory.space.lock().unwrap())
+            .draw(draw, regs, state, &mut GpuMemory::new(self.memory.space))
     }
 }
 fn read_owned(
@@ -702,9 +782,8 @@ fn preparation<E: ampere::Rasterizer>(
                 })?;
             }
             match message {
-                nixe_gpu::ordered::Read::Control(Control::Drain) => (),
                 nixe_gpu::ordered::Read::Control(Control::Failure(error)) => return Err(error),
-                nixe_gpu::ordered::Read::Control(Control::Begin(job)) => {
+                nixe_gpu::ordered::Read::Control(Control::Begin(job, started)) => {
                     source.channel = job.channel;
                     source.submission = job.id;
                     if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -714,7 +793,7 @@ fn preparation<E: ampere::Rasterizer>(
                         entry.insert(ampere::Preparation::default());
                     }
                     renderer.bind_channel(job.channel);
-                    renderer.begin_frame_work();
+                    renderer.begin_frame_work_at(started);
                     current = Some(job);
                 }
                 nixe_gpu::ordered::Read::Control(Control::End) => {
@@ -824,9 +903,18 @@ fn preparation<E: ampere::Rasterizer>(
                         },
                         clock: &clock,
                     };
-                    ampere::ordered::consume(&mut words, &mut source, |source| {
-                        host.source = source;
-                        channel.execute(source, scheduler, &mut host)
+                    ampere::ordered::consume(&mut words, &mut source, |operation, constants| {
+                        match operation {
+                            ampere::ordered::Operation::Method(source) => {
+                                host.source = source;
+                                if constants.is_empty() {
+                                    channel.execute(source, scheduler, &mut host)
+                                } else {
+                                    channel.constants(source, constants, &mut host)
+                                }
+                            }
+                            ampere::ordered::Operation::Flush => channel.flush(&mut host),
+                        }
                     })?;
                 }
             }
@@ -883,28 +971,28 @@ fn preparation<E: ampere::Rasterizer>(
 /// Captured mappings/sharing leases survive until ordered mutation completes.
 pub(crate) enum MemoryJob {
     Remap {
-        space: Arc<Mutex<GpuAddressSpace>>,
+        space: Arc<RwLock<GpuAddressSpace>>,
         tiles: Vec<super::gpu::TileMapping>,
     },
     NativeRegion {
-        space: Arc<Mutex<GpuAddressSpace>>,
+        space: Arc<RwLock<GpuAddressSpace>>,
         address: u64,
         bytes: u64,
         account: Option<nixe_memory::MemoryAccount>,
     },
     Unmap {
-        space: Arc<Mutex<GpuAddressSpace>>,
+        space: Arc<RwLock<GpuAddressSpace>>,
         address: u64,
         bytes: u64,
     },
     Kind {
-        space: Arc<Mutex<GpuAddressSpace>>,
+        space: Arc<RwLock<GpuAddressSpace>>,
         address: u64,
         bytes: u64,
         kind: u8,
     },
     Map {
-        space: Arc<Mutex<GpuAddressSpace>>,
+        space: Arc<RwLock<GpuAddressSpace>>,
         address: u64,
         bytes: u64,
         handle: u32,
@@ -913,7 +1001,7 @@ pub(crate) enum MemoryJob {
         kind: u8,
     },
     Retire {
-        spaces: Vec<Arc<Mutex<GpuAddressSpace>>>,
+        spaces: Vec<Arc<RwLock<GpuAddressSpace>>>,
         handle: u32,
         _source: Arc<nixe_runtime::memory::GpuMemoryLease>,
     },
@@ -925,7 +1013,7 @@ impl MemoryJob {
     ) -> Result<()> {
         match self {
             Self::Remap { space, tiles } => {
-                let mut space = space.lock().unwrap();
+                let mut space = space.write().unwrap();
                 for tile in tiles {
                     invalidate(space.image_space_id(), tile.address, tile.bytes, true)?;
                     space
@@ -940,7 +1028,7 @@ impl MemoryJob {
                 bytes,
                 account,
             } => {
-                let mut space = space.lock().unwrap();
+                let mut space = space.write().unwrap();
                 invalidate(space.image_space_id(), address, bytes, true)?;
                 if let Some(account) = account {
                     space.create_region(address, bytes, account)
@@ -954,7 +1042,7 @@ impl MemoryJob {
                 address,
                 bytes,
             } => {
-                let mut space = space.lock().unwrap();
+                let mut space = space.write().unwrap();
                 invalidate(space.image_space_id(), address, bytes, true)?;
                 space
                     .unmap(address, bytes)
@@ -966,7 +1054,7 @@ impl MemoryJob {
                 bytes,
                 kind,
             } => {
-                let mut space = space.lock().unwrap();
+                let mut space = space.write().unwrap();
                 // Kind has no compute scheduler effect; invalidate image selection.
                 invalidate(space.image_space_id(), address, bytes, false)?;
                 space
@@ -982,7 +1070,7 @@ impl MemoryJob {
                 offset,
                 kind,
             } => {
-                let mut space = space.lock().unwrap();
+                let mut space = space.write().unwrap();
                 invalidate(space.image_space_id(), address, bytes, true)?;
                 space
                     .map(address, bytes, handle, source, offset, kind)
@@ -990,7 +1078,7 @@ impl MemoryJob {
             }
             Self::Retire { spaces, handle, .. } => {
                 for space in spaces {
-                    let mut space = space.lock().unwrap();
+                    let mut space = space.write().unwrap();
                     let ranges: Vec<_> = space
                         .mappings
                         .iter()

@@ -125,9 +125,9 @@ impl Recorder {
             recorded,
         });
     }
-    pub fn composite(&mut self, pacing: FramePacing) {
+    pub fn composite(&mut self, pacing: Option<FramePacing>) {
         self.begin_cpu();
-        self.frame(self.current.unwrap()).unwrap().pacing = Some(pacing);
+        self.frame(self.current.unwrap()).unwrap().pacing = pacing;
     }
     pub fn begin_submission(&mut self) -> Option<u64> {
         let id = self.current?;

@@ -63,12 +63,11 @@ impl Residency<'_> {
         }
         Ok(())
     }
-    pub(crate) fn configure_guest_stage<const STAGE: usize, const STORAGE: bool>(
+    pub(crate) fn configure_guest_buffers<const STAGE: usize, const STORAGE: bool>(
         &mut self,
         pipeline: &NativePipeline,
         resources: &StageResources,
         group: Option<u8>,
-        images: &[ShaderImage],
     ) -> Result<(), VulkanError> {
         for slot in &resources.uniforms {
             let Some((address, range)) = self.guest_uniform::<STAGE>(slot, group) else {
@@ -226,6 +225,13 @@ impl Residency<'_> {
                 }
             }
         }
+        Ok(())
+    }
+    pub(crate) fn configure_guest_images(
+        &mut self,
+        pipeline: &NativePipeline,
+        images: &[ShaderImage],
+    ) -> Result<(), VulkanError> {
         for image in images {
             if let Some(view) = image.view {
                 let id = self.texture_cache.views[view].image;
@@ -247,6 +253,9 @@ impl Residency<'_> {
             );
         }
         Ok(())
+    }
+    pub(crate) fn replay_image_descriptors(&mut self, first: usize, entries: &[DescriptorEntry]) {
+        self.runtime.descriptor_queue.write_entries(first, entries);
     }
     pub(crate) fn guest_descriptor_update(&self) -> DescriptorQueue {
         DescriptorQueue {
@@ -341,7 +350,8 @@ impl Residency<'_> {
         }
         self.begin_guest_descriptors(pipeline)?;
         self.import_guest_stage_storage::<5>(&resources.stages[5])?;
-        self.configure_guest_stage::<5, true>(pipeline, &resources.stages[5], None, images)?;
+        self.configure_guest_buffers::<5, true>(pipeline, &resources.stages[5], None)?;
+        self.configure_guest_images(pipeline, images)?;
         let descriptors = self.guest_descriptor_update();
         self.runtime.barriers.emit(&mut self.runtime.device)?;
         self.runtime

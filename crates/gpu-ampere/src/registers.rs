@@ -180,3 +180,14 @@ pub(crate) fn method(class: Class, m: u32) -> Option<(&'static str, bool)> {
     };
     Some((name, true))
 }
+
+/// Registers consumed by fixed graphics state and shader runtime specialization.
+/// Resource addresses, draw arguments and effect operands have separate owners.
+pub(crate) const fn fixed_graphics_method(method: u32) -> bool {
+    matches!(method,
+        0x37c | 0xd7c | 0xdac | 0xdb0 | 0xdc0..=0xdc8 | 0xf90 | 0xfbc..=0xfc8
+        | 0x1148 | 0x12cc | 0x12e4 | 0x12e8 | 0x12ec | 0x130c
+        | 0x133c..=0x1390 | 0x13ac | 0x1518 | 0x1538 | 0x153c | 0x1594..=0x15a4
+        | 0x15d0 | 0x1644 | 0x1684 | 0x1918..=0x1920 | 0x193c | 0x194c
+        | 0x197c | 0x19bc | 0x19c4 | 0x1a00..=0x1a1c | 0x1e00..=0x1ef8)
+}

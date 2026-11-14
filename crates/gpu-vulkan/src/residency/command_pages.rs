@@ -2,7 +2,7 @@
 //! metadata lock, never the buffer/texture cache or the native recorder.
 //! https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/buffer_cache/buffer_cache.h#L3230-L3395
 use super::*;
-use nixe_gpu_maxwell::CommandRead;
+use nixe_gpu::command_memory::CommandRead;
 use std::sync::Mutex;
 const PAGE: u64 = 4096;
 #[derive(Default)]

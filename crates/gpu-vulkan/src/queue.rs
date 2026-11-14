@@ -453,7 +453,7 @@ impl QueueState {
     pub fn begin_composite(
         &mut self,
         dispatch: &mut crate::dispatch::Dispatch,
-        pacing: nixe_gpu::frame_metrics::FramePacing,
+        pacing: Option<nixe_gpu::frame_metrics::FramePacing>,
     ) {
         self.frame_metrics.composite(pacing);
         self.begin_frame_work(dispatch);

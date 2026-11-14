@@ -11,6 +11,7 @@ pub mod physical;
 mod working_set;
 pub use working_set::{Equivalent, WorkingSet};
 mod command;
+pub mod command_memory;
 mod conversion;
 pub use conversion::{ConversionImage, Nv12ColorTransform, Nv12Planes};
 mod diagnostics;

@@ -5,7 +5,7 @@ use nixe_memory::{CapturedMemory, MemoryError, PAGE_SIZE};
 use nixe_runtime::{EventObject, memory::GpuMemoryLease};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock, RwLockReadGuard},
 };
 
 // @SPECULATIVE: user VA partition limits follow the reference's observed SDK
@@ -21,7 +21,7 @@ pub(crate) struct GpuContext {
     pub initialized: bool,
     pub worker_ready: bool,
     pub events: [Option<EventObject>; 32],
-    pub spaces: BTreeMap<u32, Arc<Mutex<GpuAddressSpace>>>,
+    pub spaces: BTreeMap<u32, Arc<RwLock<GpuAddressSpace>>>,
     pub executor: Option<Arc<super::execution::Executor>>,
     pub memories: BTreeMap<u32, Arc<GpuMemoryLease>>,
     pub next_space: u32,
@@ -346,15 +346,69 @@ impl GpuAddressSpace {
         Ok(())
     }
 
+    /// Visit canonical RAM offsets, including aliases through other GPU VAs.
+    /// Mapping ownership is held by the caller; this inspection does not pin,
+    /// allocate, commit missing pages or read their contents.
+    pub(super) fn for_each_physical(
+        &self,
+        address: u64,
+        bytes: u64,
+        mut visit: impl FnMut(u64, u64),
+    ) -> bool {
+        let Some(end) = address.checked_add(bytes).filter(|&end| end <= VA_END) else {
+            return false;
+        };
+        let mut at = address;
+        while at < end {
+            let (base, map, high) = if at >= VA_END - PAGE_SIZE {
+                let Some(map) = &self.sync_mapping else {
+                    return false;
+                };
+                (VA_END - PAGE_SIZE, map, end)
+            } else {
+                let Some((&base, mapping)) = self
+                    .mappings
+                    .range(..=at)
+                    .next_back()
+                    .filter(|(_, m)| m.end > at)
+                else {
+                    return false;
+                };
+                (base, &*mapping.physical, end.min(mapping.end))
+            };
+            let low = at - base;
+            let stop = high - base;
+            let spans = map.pin.physical().spans();
+            let first = spans.partition_point(|s| s.logical + s.bytes <= low);
+            let mut covered = low;
+            for span in &spans[first..] {
+                if span.logical >= stop {
+                    break;
+                }
+                let begin = low.max(span.logical);
+                let finish = stop.min(span.logical + span.bytes);
+                if begin != covered {
+                    return false;
+                }
+                visit(span.start.get() + begin - span.logical, finish - begin);
+                covered = finish;
+            }
+            if covered != stop {
+                return false;
+            }
+            at = high;
+        }
+        true
+    }
+
     /// Retain physical bytes and CPU sharing independently of the virtual map.
     /// Remapping may retire its SMMU entry while an accepted read still owns
     /// the old backing; physical pins alone would allow premature CPU unsharing.
-    pub fn capture(&mut self, address: u64, bytes: u64) -> Result<GpuCapture, MemoryError> {
+    fn capture(&self, address: u64, bytes: u64) -> Result<GpuCapture, MemoryError> {
         let end = address
             .checked_add(bytes)
             .filter(|&end| bytes != 0 && end <= VA_END)
             .ok_or(MemoryError::Invalid("invalid GPU access range"))?;
-        self.commit_native_pages(address, bytes)?;
         let mut at = address;
         let mut leases = Vec::new();
         let mut ranges = Vec::new();
@@ -563,7 +617,87 @@ impl nixe_gpu::native::ImageAddressSpace for GpuAddressSpace {
     }
 }
 
-impl nixe_gpu_ampere::RenderMemory for GpuAddressSpace {
+/// Shared mapping ownership for a consuming operation. Frontend reads do not
+/// contend with graphics preparation. Mapping edits are ordered on the back;
+/// committing a previously unused native hole only excludes other map readers.
+pub(crate) struct GpuMemory<'a> {
+    space: &'a RwLock<GpuAddressSpace>,
+    guard: Option<RwLockReadGuard<'a, GpuAddressSpace>>,
+}
+impl<'a> GpuMemory<'a> {
+    pub fn new(space: &'a RwLock<GpuAddressSpace>) -> Self {
+        Self {
+            space,
+            guard: Some(space.read().unwrap()),
+        }
+    }
+    fn commit(&mut self, address: u64, bytes: u64) -> Result<(), MemoryError> {
+        if self.for_each_physical(address, bytes, |_, _| {}) {
+            return Ok(());
+        }
+        drop(self.guard.take());
+        let result = self
+            .space
+            .write()
+            .unwrap()
+            .commit_native_pages(address, bytes);
+        self.guard = Some(self.space.read().unwrap());
+        result
+    }
+    pub fn capture(&mut self, address: u64, bytes: u64) -> Result<GpuCapture, MemoryError> {
+        self.commit(address, bytes)?;
+        self.guard.as_ref().unwrap().capture(address, bytes)
+    }
+}
+impl std::ops::Deref for GpuMemory<'_> {
+    type Target = GpuAddressSpace;
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref().unwrap()
+    }
+}
+impl nixe_gpu::native::ImageAddressSpace for GpuMemory<'_> {
+    fn image_space_id(&self) -> u64 {
+        self.id
+    }
+    fn image_device_address(&self, address: u64) -> Result<Option<u64>, MemoryError> {
+        self.guard.as_ref().unwrap().image_device_address(address)
+    }
+    fn image_mapped_ranges(
+        &self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<impl Iterator<Item = (u64, u64)>, MemoryError> {
+        self.guard
+            .as_ref()
+            .unwrap()
+            .image_mapped_ranges(address, bytes)
+    }
+}
+impl nixe_gpu_ampere::RenderMemory for GpuMemory<'_> {
+    fn read_span(
+        &mut self,
+        address: u64,
+        bytes: u64,
+    ) -> nixe_gpu_ampere::Result<Option<(u64, nixe_memory::HostAddress)>> {
+        self.commit(address, bytes)
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        let end = address
+            .checked_add(bytes)
+            .filter(|&end| end <= VA_END)
+            .ok_or("native read overflow")?;
+        let device = if address >= VA_END - PAGE_SIZE {
+            self.sync_mapping
+                .as_ref()
+                .map(|m| m.pin.address() + address - (VA_END - PAGE_SIZE))
+        } else {
+            self.mappings
+                .range(..=address)
+                .next_back()
+                .filter(|(_, m)| m.end >= end)
+                .map(|(&start, m)| m.physical.pin.address() + address - start)
+        };
+        Ok(device.and_then(|device| self.memory.span(device, bytes).map(|host| (device, host))))
+    }
     fn buffer_layout_size(&self, address: u64) -> nixe_gpu_ampere::Result<u64> {
         if let Some((_, region)) = self.regions.range(..=address).next_back()
             && address < region.end
@@ -649,7 +783,7 @@ impl nixe_gpu_ampere::RenderMemory for GpuAddressSpace {
             };
             let low = at.max(start);
             let high = end.min(region.end);
-            self.commit_native_pages(low, high - low)
+            self.commit(low, high - low)
                 .map_err(|e| e.to_string().into_boxed_str())?;
             at = high;
         }

@@ -113,6 +113,18 @@ pub(super) fn read_into(
     bytes: &mut [u8],
 ) -> Result<(), VulkanError> {
     let count = bytes.len();
+    if let Some((device, host)) = memory
+        .read_span(address, count as u64)
+        .map_err(compilation)?
+    {
+        residency.flush_read_span(device, count as u64)?;
+        // The caller owns the GPU address space throughout consumption. Its
+        // mappings retain both physical RAM and CPU sharing, including aliases.
+        unsafe {
+            host.read_into(bytes);
+        }
+        return Ok(());
+    }
     let capture = memory
         .capture_memory(address, count as u64)
         .map_err(|error| {
@@ -358,4 +370,20 @@ pub(super) fn capture_program(
         instructions: env.code.into_owned(),
         flow_constants,
     })
+}
+
+/// Keep only compile dependencies in the live cache, not the captured code.
+pub(super) fn dependencies(snapshot: &SnapshotEnvironment) -> Observations {
+    let source = snapshot.observations();
+    Observations {
+        instructions: Default::default(),
+        cbuf_words: source.cbuf_words.clone(),
+        storage_pointer_types: source.storage_pointer_types.clone(),
+        texture_handles: source.texture_handles.clone(),
+        texture_types: source.texture_types.clone(),
+        texture_pixel_formats: source.texture_pixel_formats.clone(),
+        texture_integer_formats: source.texture_integer_formats.clone(),
+        viewport_transform_state: source.viewport_transform_state,
+        replacements: source.replacements.clone(),
+    }
 }

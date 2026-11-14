@@ -1,31 +1,45 @@
 //! Serialized guest environments and pipeline keys, never translated SPIR-V.
 //! Load and queue one record at a time, as VideoCommon::LoadPipelines.
 //! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/shader_environment.cpp
-use super::{CompilePool, PERSISTENCE_VERSION};
+use super::{CompilePool, PERSISTENCE_VERSION, PipelineCompiler};
 use nixe_gpu::{shader_compilation::ShaderInputs, shader_encoding};
 use std::{
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 const MAGIC: &[u8; 8] = b"NXVKENV1";
 pub(crate) struct FileEnvironment {
     pub key: Vec<u8>,
     pub inputs: ShaderInputs,
 }
+#[derive(Default)]
+struct FlushStatus {
+    in_flight: AtomicBool,
+    bytes: AtomicUsize,
+}
 pub(crate) struct EnvironmentArchive {
     path: PathBuf,
     serialization: Arc<CompilePool>,
+    compiler: Arc<PipelineCompiler>,
+    flush: Arc<FlushStatus>,
+    pending: usize,
+    last_flush: Instant,
 }
 impl EnvironmentArchive {
-    pub fn open(directory: &Path, serialization: Arc<CompilePool>) -> std::io::Result<Self> {
+    pub fn open(directory: &Path, compiler: Arc<PipelineCompiler>) -> std::io::Result<Self> {
         std::fs::create_dir_all(directory)?;
         Ok(Self {
             path: directory.join("vulkan.bin"),
-            serialization,
+            serialization: compiler.serialization(),
+            compiler,
+            flush: Arc::default(),
+            pending: 0,
+            last_flush: Instant::now(),
         })
     }
     pub fn load(&self, stop: &AtomicBool, mut load: impl FnMut(FileEnvironment)) {
@@ -77,7 +91,7 @@ impl EnvironmentArchive {
             remove_failed_file(&self.path);
         }
     }
-    pub fn serialize(&self, key: Vec<u8>, inputs: Arc<ShaderInputs>) {
+    pub fn serialize(&mut self, key: Vec<u8>, inputs: Arc<ShaderInputs>) {
         if !inputs.serializable {
             return;
         }
@@ -104,6 +118,36 @@ impl EnvironmentArchive {
             }
         }) {
             log::warn!("shader environment serialization: {error}");
+        }
+        self.pending += 1;
+        if self.pending < 128 {
+            return;
+        }
+        let interval = Duration::from_secs(
+            (self.flush.bytes.load(Ordering::Relaxed) / (1024 * 1024)).max(30) as u64,
+        );
+        if self.last_flush.elapsed() < interval || self.flush.in_flight.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.pending = 0;
+        self.last_flush = Instant::now();
+        let flush = Arc::clone(&self.flush);
+        if let Err(error) = self.compiler.queue_checkpoint(move |bytes| {
+            flush.bytes.store(bytes, Ordering::Relaxed);
+            flush.in_flight.store(false, Ordering::Release);
+        }) {
+            self.flush.in_flight.store(false, Ordering::Release);
+            log::warn!("Vulkan driver cache serialization: {error}");
+        }
+    }
+    pub fn checkpoint(&mut self) {
+        match self.compiler.checkpoint() {
+            Ok(bytes) => {
+                self.flush.bytes.store(bytes, Ordering::Relaxed);
+                self.last_flush = Instant::now();
+            }
+            Err(error) => log::warn!("Vulkan driver cache write: {error}"),
         }
     }
 }

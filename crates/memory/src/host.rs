@@ -38,6 +38,15 @@ impl HostAddress {
         unsafe { crate::raw::read_value(self.as_ptr().add(offset), 8) as u64 }
     }
 
+    /// Copy live guest bytes without forming references to concurrently written RAM.
+    ///
+    /// # Safety
+    /// The caller retains the readable backing for the whole destination length
+    /// and resolves device coherence before consuming it.
+    pub unsafe fn read_into(self, destination: &mut [u8]) {
+        unsafe { crate::raw::capture(self.as_ptr(), destination) }
+    }
+
     /// Copy admitted command words into disjoint owned host storage.
     ///
     /// # Safety
