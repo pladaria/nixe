@@ -3,18 +3,9 @@ use crate::ir::{FlowTest, Pred};
 
 impl Visitor<'_> {
     pub(super) fn compare(&mut self, a: Value, b: Value, op: u32, signed: bool) -> Result<Value> {
-        match op {
-            0 => Ok(Value::U1(false)),
-            1 => self.emit.i_less_than(a, b, signed),
-            2 => self.emit.i_equal(a, b),
-            3 => self.emit.i_less_than_equal(a, b, signed),
-            4 => self.emit.i_greater_than(a, b, signed),
-            5 => self.emit.i_not_equal(a, b),
-            6 => self.emit.i_greater_than_equal(a, b, signed),
-            7 => Ok(Value::U1(true)),
-            _ => Err(unsupported("Invalid integer comparison")),
-        }
+        crate::frontend::integer_compare(&mut self.emit, a, b, op, signed)
     }
+
     fn extended_compare(&mut self, a: Value, b: Value, op: u32, signed: bool) -> Result<Value> {
         let carry = self.emit.get_c_flag()?;
         let carry = self.emit.select(carry, Value::U32(1), Value::U32(0))?;
@@ -305,7 +296,7 @@ impl Visitor<'_> {
         } else {
             self.field::<48, 8>()
         };
-        let result = super::lut::apply(&mut self.emit, a, b, c, lut as u8)?;
+        let result = crate::frontend::lut::apply(&mut self.emit, a, b, c, lut as u8)?;
         self.write(result)?;
         if register_form {
             let pred = self.predicate_result(result, self.field::<36, 2>())?;

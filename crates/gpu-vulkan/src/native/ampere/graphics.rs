@@ -7,7 +7,9 @@ use nixe_shader_recompiler::{
 
 #[derive(Default)]
 pub(in crate::native) struct Cache {
-    compiler: Option<compiler::Compiler>,
+    pub(super) compiler: Option<compiler::Compiler>,
+    pub(super) compute: super::compute::Cache,
+    pub(super) semaphore: Option<NativePipeline>,
     programs: HashMap<(u64, Stage), Arc<shader::Program>>,
     pipelines: HashMap<Key, Vec<Arc<Pipeline>>>,
     channels: HashMap<u64, Selection>,
@@ -24,6 +26,7 @@ struct Selection {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
     shaders: [u64; 6],
+    gp_passthrough_mask: [u32; 8],
     graphics: crate::cache::GraphicsState,
     types: [AttributeType; 32],
     topology: InputTopology,
@@ -36,6 +39,7 @@ struct Pipeline {
     pipeline: NativePipeline,
     resources: PipelineResources,
     observations: Vec<(u8, Observations)>,
+    vertex_bindings: u32,
 }
 impl Cache {
     pub(in crate::native) fn close(&mut self, channel: u64) {
@@ -46,7 +50,7 @@ impl Cache {
 impl NativeExecution<'_> {
     pub(super) fn draw_ampere(
         &mut self,
-        source: model::Source,
+        primitive: model::Draw,
         registers: &Registers,
         state: &mut model::GraphicsState,
         memory: &mut impl RenderMemory,
@@ -54,7 +58,7 @@ impl NativeExecution<'_> {
         self.flush_work()?;
         let mut cache = std::mem::take(&mut self.state.ampere);
         let retained = self.residency.runtime.constructing.len();
-        let result = self.draw_ampere_inner(&mut cache, source, registers, state, memory);
+        let result = self.draw_ampere_inner(&mut cache, primitive, registers, state, memory);
         self.residency.runtime.constructing.truncate(retained);
         self.state.ampere = cache;
         result
@@ -62,11 +66,12 @@ impl NativeExecution<'_> {
     fn draw_ampere_inner(
         &mut self,
         cache: &mut Cache,
-        source: model::Source,
+        primitive: model::Draw,
         r: &Registers,
         state: &mut model::GraphicsState,
         memory: &mut impl RenderMemory,
     ) -> Result<(), VulkanError> {
+        let source = primitive.source;
         if r.get(0x16a4) != 0x40004 {
             return Err(compilation(
                 "native shader requires supported SPH version 4",
@@ -81,17 +86,17 @@ impl NativeExecution<'_> {
                 }
                 Draw::Indexed {
                     indices: source.argument,
-                    instances: 1,
+                    instances: primitive.instances,
                     first_index: r.get(0x17dc),
                     vertex_offset: r.get(0x1434) as i32,
-                    first_instance: r.get(0x1438),
+                    first_instance: r.get(0x1438).wrapping_add(primitive.first_instance),
                 }
             }
             0xd78 if r.get(0x1118) == 0 => Draw::Direct {
                 vertices: source.argument,
-                instances: 1,
+                instances: primitive.instances,
                 first_vertex: r.get(0xd74),
-                first_instance: r.get(0x1438),
+                first_instance: r.get(0x1438).wrapping_add(primitive.first_instance),
             },
             _ => {
                 return Err(compilation(format!(
@@ -100,11 +105,6 @@ impl NativeExecution<'_> {
                 )));
             }
         };
-        if r.get(0x1618) & !0xffff != 0 {
-            return Err(compilation(
-                "native instanced primitive sequence is not implemented",
-            ));
-        }
         'draw: loop {
             loop {
                 self.residency.texture_cache.bindings.has_deleted_images = false;
@@ -168,6 +168,7 @@ impl NativeExecution<'_> {
                 }
                 let stage = match selector >> 4 {
                     1 => Stage::VertexB,
+                    4 => Stage::Geometry,
                     5 => Stage::Fragment,
                     _ => {
                         return Err(compilation(format!(
@@ -192,7 +193,25 @@ impl NativeExecution<'_> {
                     .image_device_address(address)?
                     .ok_or_else(|| compilation("unmapped native shader address"))?;
                 let key = (physical, stage);
-                if cache.programs.get(&key).is_none_or(|p| !p.info.is_valid()) {
+                let valid = if let Some(program) = cache.programs.get(&key) {
+                    program.info.is_valid()
+                        && shader::constants_match(
+                            &mut self.residency,
+                            memory,
+                            &state.constants[group as usize],
+                            &program.flow_constants,
+                        )?
+                } else {
+                    false
+                };
+                if !valid {
+                    if let Some(program) = cache.programs.get(&key).filter(|p| p.info.is_valid()) {
+                        // A changed branch table may expose new code pages. Retire
+                        // the old capture before registering the new physical range.
+                        self.residency
+                            .shader_cache
+                            .invalidate_region(physical, program.info.size_bytes as u64);
+                    }
                     let program = shader::capture(
                         &mut self.residency,
                         memory,
@@ -204,7 +223,7 @@ impl NativeExecution<'_> {
                     cache.programs.insert(key, Arc::new(program));
                 }
                 let program = Arc::clone(&cache.programs[&key]);
-                hashes[slot as usize] = program.info.unique_hash;
+                hashes[slot as usize] = program.unique_hash;
                 programs.push((program, address, group as u8));
             }
             if !programs
@@ -224,6 +243,7 @@ impl NativeExecution<'_> {
             });
             let key = Key {
                 shaders: hashes,
+                gp_passthrough_mask: std::array::from_fn(|i| r.get(0x1240 + i as u32 * 4)),
                 graphics: selection.fixed.clone(),
                 types: selection.runtime.vertex_input_types,
                 topology: selection.runtime.input_topology,
@@ -238,25 +258,19 @@ impl NativeExecution<'_> {
                     let mut matches = true;
                     for (stage, observations) in &candidate.observations {
                         let group = groups[*stage as usize].expect("active pipeline stage");
-                        for (word, expected) in &observations.cbuf_words {
-                            let Some((base, size)) =
-                                state.constants[group as usize][word.index.0 as usize]
-                            else {
-                                matches = false;
-                                break;
-                            };
-                            if word.offset.0 as u64 + 4 > size as u64 {
-                                matches = false;
-                                break;
-                            }
-                            let address = base
-                                .checked_add(word.offset.0 as u64)
-                                .ok_or_else(|| compilation("constant address overflow"))?;
-                            let actual = shader::read::<4>(&mut self.residency, memory, address)?;
-                            if u32::from_le_bytes(actual) != *expected {
-                                matches = false;
-                                break;
-                            }
+                        matches = shader::constants_match(
+                            &mut self.residency,
+                            memory,
+                            &state.constants[group as usize],
+                            &observations.cbuf_words,
+                        )?;
+                        if matches {
+                            matches = shader::pointer_types_match(
+                                &mut self.residency,
+                                memory,
+                                &state.constants[group as usize],
+                                observations,
+                            )?;
                         }
                         if matches {
                             matches = textures::observations_match(
@@ -265,6 +279,7 @@ impl NativeExecution<'_> {
                                 r,
                                 &state.constants[group as usize],
                                 observations,
+                                textures::graphics_linked(r)?,
                             )?;
                         }
                         if !matches {
@@ -290,23 +305,32 @@ impl NativeExecution<'_> {
                 let mut ids = Vec::with_capacity(programs.len());
                 let mut observations = Vec::with_capacity(programs.len());
                 for (program, base, group) in &programs {
+                    let mut metadata = program.metadata.clone();
+                    if metadata.stage == Stage::Geometry {
+                        metadata.gp_passthrough_mask = key.gp_passthrough_mask;
+                    }
                     let mut reader = shader::EnvironmentReader {
-                        metadata: program.metadata.clone(),
+                        metadata,
                         code: std::borrow::Cow::Borrowed(&program.instructions),
                         base: *base,
                         constants: &state.constants[*group as usize],
                         registers: r,
+                        linked: textures::graphics_linked(r)?,
                         memory,
                         residency: &mut self.residency,
                     };
                     let mut recorded = RecordingEnvironment::new(&mut reader);
-                    ids.push(
-                        pools
-                            .translate(&mut recorded, &configuration.host, &configuration.settings)
-                            .map_err(compilation)?,
+                    let translated = pools.translate(
+                        &mut recorded,
+                        &configuration.host,
+                        &configuration.settings,
                     );
                     let mut dependencies = recorded.into_snapshot().into_observations();
+                    ids.push(translated.map_err(compilation)?);
                     dependencies.instructions.clear();
+                    dependencies
+                        .cbuf_words
+                        .retain(|word, _| !program.flow_constants.contains_key(word));
                     observations.push((
                         nixe_gpu::shader_compilation::neutral_stage(program.metadata.stage) as u8,
                         dependencies,
@@ -320,19 +344,44 @@ impl NativeExecution<'_> {
                 )
                 .map_err(compilation)?;
 
+                let vertex = shader
+                    .stages
+                    .iter()
+                    .find(|stage| stage.stage == nixe_gpu::ShaderStage::Vertex)
+                    .and_then(|stage| stage.guest.as_ref())
+                    .expect("native vertex shader metadata");
+                let mut graphics = selection.parameters.state.clone();
+                graphics.vertex_attributes = graphics
+                    .vertex_attributes
+                    .iter()
+                    .filter(|attribute| vertex.info.loads.generic(attribute.location as usize))
+                    .cloned()
+                    .collect();
+                let vertex_bindings = graphics
+                    .vertex_attributes
+                    .iter()
+                    .fold(0, |mask, attribute| mask | (1 << attribute.binding));
+                graphics.vertex_bindings = graphics
+                    .vertex_bindings
+                    .iter()
+                    .filter(|binding| vertex_bindings & (1 << binding.binding) != 0)
+                    .cloned()
+                    .collect();
+                graphics.vertex_divisors = graphics
+                    .vertex_divisors
+                    .iter()
+                    .filter(|(binding, _)| vertex_bindings & (1 << binding) != 0)
+                    .copied()
+                    .collect();
                 let native = self
                     .compiler
                     .request(PipelineRecipe::Graphics {
                         shader: Arc::clone(&shader),
-                        state: selection.parameters.state.clone(),
+                        state: graphics,
                     })
                     .map_err(compilation)?;
                 let resources = PipelineResources::new(&shader, &native.layout.key, [32; 6])?;
-                if resources.stages.iter().any(|s| {
-                    !s.storage.is_empty() || s.images.iter().any(|i| i.storage_format.is_some())
-                }) || resources.uses_tessellation_levels
-                    || resources.computed_handle_count != 0
-                {
+                if resources.uses_tessellation_levels || resources.computed_handle_count != 0 {
                     return Err(compilation(
                         "native shader resource class is not implemented",
                     ));
@@ -341,6 +390,7 @@ impl NativeExecution<'_> {
                     pipeline: native,
                     resources,
                     observations,
+                    vertex_bindings,
                 });
                 cache
                     .pipelines
@@ -382,12 +432,7 @@ impl NativeExecution<'_> {
                     .buffer_bindings
                     .channel
                     .has_deleted_buffers = false;
-                let wanted = selection
-                    .parameters
-                    .state
-                    .vertex_bindings
-                    .iter()
-                    .fold(0u32, |m, b| m | (1 << b.binding));
+                let wanted = pipeline.vertex_bindings;
                 let mut disabled = self
                     .residency
                     .runtime
@@ -402,6 +447,9 @@ impl NativeExecution<'_> {
                 }
                 for binding in selection.parameters.state.vertex_bindings.iter() {
                     let slot = binding.binding;
+                    if wanted & (1 << slot) == 0 {
+                        continue;
+                    }
                     if state.vertex_dirty & (1 << slot) == 0
                         && self
                             .residency
@@ -414,6 +462,7 @@ impl NativeExecution<'_> {
                         continue;
                     }
                     let address = r.address(0x1c04 + slot * 16, 0x1c08 + slot * 16);
+                    // Native stream sizes are byte bounds, not end addresses.
                     let size = r.address(0x600 + slot * 8, 0x604 + slot * 8);
                     let range = self.ampere_buffer(
                         memory,
@@ -480,10 +529,26 @@ impl NativeExecution<'_> {
                         continue;
                     };
                     for uniform in &pipeline.resources.stages[stage].uniforms {
-                        if state.uniform_dirty[group as usize] & (1 << uniform.slot) != 0 {
+                        let required = state.constants[group as usize][uniform.slot]
+                            .map_or(0, |(_, size)| u64::from(size.min(uniform.size)));
+                        let current = self
+                            .residency
+                            .runtime
+                            .buffer_bindings
+                            .channel
+                            .uniform_buffers[group as usize][uniform.slot];
+                        if state.uniform_dirty[group as usize] & (1 << uniform.slot) != 0
+                            || (required != 0
+                                && current.is_none_or(|binding| binding.resolved_size < required))
+                        {
                             let source = state.constants[group as usize][uniform.slot]
-                                .map(|(address, size)| {
-                                    let size = size as u64;
+                                .map(|(address, _)| {
+                                    // The declared native bank size is an upper limit;
+                                    // code-adjacent tables can end at the mapping boundary.
+                                    // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/buffer_cache/buffer_cache.h#L2605-L2620
+                                    let size = required.min(
+                                        memory.buffer_layout_size(address).map_err(compilation)?,
+                                    );
                                     self.ampere_address(memory, address, size).map(|address| {
                                         nixe_gpu::native::GuestBufferRange { address, size }
                                     })
@@ -493,9 +558,27 @@ impl NativeExecution<'_> {
                                 .runtime
                                 .buffer_bindings
                                 .bind_graphics_uniform(group, uniform.slot as u8, source);
+                            if let Some(binding) = self
+                                .residency
+                                .runtime
+                                .buffer_bindings
+                                .channel
+                                .uniform_buffers[group as usize][uniform.slot]
+                                .as_mut()
+                            {
+                                binding.resolved_size = required;
+                            }
                             state.uniform_dirty[group as usize] &= !(1 << uniform.slot);
                         }
                         self.residency.graphics_uniform(group, uniform.slot as u8)?;
+                    }
+                    for storage in &pipeline.resources.stages[stage].storage {
+                        self.ampere_storage(
+                            memory,
+                            &state.constants[group as usize],
+                            stage,
+                            storage,
+                        )?;
                     }
                 }
                 if !self
@@ -524,32 +607,39 @@ impl NativeExecution<'_> {
                 None,
                 |slot| r.get(0x1c00 + slot * 16) & 0xfff,
             )?;
+            self.residency.begin_guest_descriptors(&pipeline.pipeline)?;
+            let stages = groups.iter().enumerate().fold(0, |mask, (index, group)| {
+                mask | if group.is_some() { 1 << index } else { 0 }
+            });
+            graphics_stages!(stages, |STAGE| {
+                self.residency
+                    .import_guest_stage_storage::<STAGE>(&pipeline.resources.stages[STAGE])?;
+            });
             self.residency.begin_graphics_uniforms(
                 memory.image_space_id(),
                 memory.mapping_generation(),
                 groups,
             );
-            self.residency.begin_guest_descriptors(&pipeline.pipeline)?;
-            self.residency.configure_guest_stage::<0, false>(
-                &pipeline.pipeline,
-                &pipeline.resources.stages[0],
-                groups[0],
-                &images[..pipeline.resources.stages[0].images.len()],
-            )?;
-            if groups[4].is_some() {
-                self.residency.configure_guest_stage::<4, false>(
+            let mut image_index = 0;
+            graphics_stages!(stages, |STAGE| {
+                let resources = &pipeline.resources.stages[STAGE];
+                let end = image_index + resources.images.len();
+                self.residency.configure_guest_stage::<STAGE, true>(
                     &pipeline.pipeline,
-                    &pipeline.resources.stages[4],
-                    groups[4],
-                    &images[pipeline.resources.stages[0].images.len()..],
+                    resources,
+                    groups[STAGE],
+                    &images[image_index..end],
                 )?;
-            }
+                image_index = end;
+            });
+            debug_assert_eq!(image_index, images.len());
             let descriptors = self.residency.guest_descriptor_update();
-            let push = super::super::state::ShaderConstants::resources(
+            let mut push = super::super::state::ShaderConstants::resources(
                 &pipeline.resources,
                 &images,
                 &self.residency,
             );
+            push.set_instance_offset(primitive.first_instance);
             if pipeline.resources.uses_render_area {
                 return Err(compilation(
                     "native render-area shader parameters are not implemented",
@@ -587,9 +677,10 @@ impl NativeExecution<'_> {
                 push.as_bytes(),
                 r.get(0x1514) != 0,
                 |aspect| {
-                    Ok(aspect == vk::ImageAspectFlags::STENCIL
-                        || (aspect == vk::ImageAspectFlags::DEPTH
-                            && !selection.parameters.state.depth_write))
+                    Ok(crate::residency::execution::attachment_read_only(
+                        aspect,
+                        &selection.parameters.state,
+                    ))
                 },
                 |residency| {
                     residency.graphics_state_cached(
@@ -608,7 +699,7 @@ impl NativeExecution<'_> {
             return Ok(());
         }
     }
-    fn ampere_address(
+    pub(super) fn ampere_address(
         &mut self,
         memory: &mut impl RenderMemory,
         address: u64,
@@ -632,7 +723,9 @@ impl NativeExecution<'_> {
         size: u64,
         usage: vk::BufferUsageFlags,
     ) -> Result<crate::BufferRange, VulkanError> {
-        let address = self.ampere_address(memory, address, size)?;
+        let address = self
+            .ampere_address(memory, address, size)
+            .map_err(|e| compilation(format!("native buffer usage={usage:?}: {e}")))?;
         let range = self
             .residency
             .device_buffer(address, size, usage, false, false)?;

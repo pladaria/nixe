@@ -93,7 +93,7 @@ pub(crate) fn compile_guest(
     runtime: Option<&nixe_shader_recompiler::passes::GraphicsRuntimeState>,
 ) -> Result<Arc<ShaderArtifact>, CompileError> {
     let prepared = if let Some(runtime) = runtime {
-        compiler.prepare_graphics(programs, runtime)
+        compiler.prepare_graphics(programs, runtime, &configuration.profile)
     } else if programs.len() == 1 {
         compiler
             .prepare_stage(programs[0], nixe_shader_recompiler::RuntimeInfo::default())

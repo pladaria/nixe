@@ -15,6 +15,7 @@ pub(crate) struct StorageSlot {
     pub(crate) cbuf: u32,
     pub(crate) offset: u32,
     pub(crate) written: bool,
+    pub(crate) has_declared_size: bool,
     pub(crate) descriptor: usize,
 }
 #[derive(Clone, Copy)]
@@ -84,7 +85,10 @@ impl PipelineResources {
         for stage in &shader.stages {
             if let Some(metadata) = &stage.guest {
                 for descriptor in metadata.info.constant_buffer_descriptors.iter() {
-                    if descriptor.count != 1 || descriptor.index.0 >= 32 {
+                    if descriptor.count != 1
+                        || descriptor.index.0 as usize
+                            >= nixe_shader_recompiler::artifact::MAX_CBUFS
+                    {
                         return Err(fail("invalid hardware uniform descriptor"));
                     }
                 }
@@ -119,7 +123,7 @@ impl PipelineResources {
                         ));
                     }
                     let slot = storage[stage].len();
-                    if slot >= 16 {
+                    if slot >= nixe_shader_recompiler::artifact::MAX_SSBOS {
                         return Err(fail("too many storage buffer bindings in one stage"));
                     }
                     storage[stage].push(StorageSlot {
@@ -127,6 +131,7 @@ impl PipelineResources {
                         cbuf: d.cbuf_index.0,
                         offset: d.cbuf_offset.0,
                         written: d.is_written,
+                        has_declared_size: metadata.info.uses_nvn_descriptor(d),
                         descriptor,
                     });
                 }

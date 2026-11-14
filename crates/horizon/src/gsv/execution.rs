@@ -38,6 +38,7 @@ impl std::fmt::Debug for AmpereGraphics {
 impl AmpereGraphics {
     pub fn new<E: ampere::Rasterizer>(
         memory: nixe_memory::device_memory::DeviceMemory,
+        presenter: Option<nixe_video::FrameMailbox>,
         initialize: impl FnOnce() -> std::result::Result<E, nixe_gpu::BackendRuntimeError>
         + Send
         + 'static,
@@ -46,7 +47,9 @@ impl AmpereGraphics {
             memory,
             owner: Mutex::new(Owner {
                 executor: None,
-                initialize: Some(Box::new(move |process| Executor::new(process, initialize))),
+                initialize: Some(Box::new(move |process| {
+                    Executor::new(process, presenter, initialize)
+                })),
             }),
         })
     }
@@ -150,6 +153,7 @@ enum Ingress {
     Stop,
 }
 enum Control {
+    Drain,
     Failure(Box<str>),
     Begin(Arc<Submission>),
     End,
@@ -179,6 +183,7 @@ pub(crate) struct Publication {
 impl Executor {
     pub fn new<E: ampere::Rasterizer>(
         process: &Arc<RunnableProcess>,
+        presenter: Option<nixe_video::FrameMailbox>,
         initialize: impl FnOnce() -> std::result::Result<E, nixe_gpu::BackendRuntimeError>
         + Send
         + 'static,
@@ -189,7 +194,7 @@ impl Executor {
         let machine = process.memory().space().machine().clone();
         let clock = process.scheduler().clock().clone();
         let weak = Arc::downgrade(process);
-        let endpoint = Arc::new(control::Endpoint::default());
+        let endpoint = Arc::new(control::Endpoint::new(presenter));
         let route: Arc<dyn nixe_memory::DeviceAccessEndpoint> = endpoint.clone();
         machine.set_device_endpoint(&route);
         let back_endpoint = endpoint.clone();
@@ -422,7 +427,10 @@ impl FrontendHost for Front<'_> {
         self.writer.method(source)
     }
     fn barrier(&mut self) -> Result<()> {
-        self.writer.ring.flush();
+        self.writer
+            .ring
+            .send(Control::Drain)
+            .map_err(|_| "native preparation stopped before dependency drain")?;
         self.writer
             .ring
             .wait_until(self.writer.ring.position())
@@ -444,6 +452,61 @@ struct Back<'a, E> {
     clock: &'a nixe_scheduler::VirtualClock,
 }
 impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
+    fn reduce_report(
+        &mut self,
+        address: u64,
+        payload: u32,
+        operation: u32,
+        signed: bool,
+    ) -> Result<()> {
+        if address & 3 != 0 {
+            return Err("unaligned native semaphore reduction".into());
+        }
+        let capture = self
+            .memory
+            .space
+            .lock()
+            .unwrap()
+            .capture(address, 4)
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        let ranges = capture
+            .ranges
+            .capture(0, 4)
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        self.renderer
+            .reduce_report(self.source, &ranges, payload, operation, signed)?;
+        self.renderer
+            .signal_fence(Some(Box::new(move |result| {
+                drop(capture);
+                result
+            })))
+            .map_err(|e| e.to_string().into())
+    }
+    fn reset_samples_passed(&mut self) -> Result<()> {
+        self.renderer.reset_samples_passed(self.source)
+    }
+    fn report_samples_passed(&mut self, address: u64, short: bool) -> Result<()> {
+        let bytes = if short { 4 } else { 16 };
+        let capture = self
+            .memory
+            .space
+            .lock()
+            .unwrap()
+            .capture(address, bytes)
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        let ranges = capture
+            .ranges
+            .capture(0, bytes)
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        self.renderer
+            .report_samples_passed(self.source, &ranges, short, self.timestamp())?;
+        self.renderer
+            .signal_fence(Some(Box::new(move |result| {
+                drop(capture);
+                result
+            })))
+            .map_err(|e| e.to_string().into())
+    }
     fn blit(&mut self, source: Source, operation: &ampere::blit::Blit) -> Result<()> {
         self.renderer
             .blit(source, operation, &mut *self.memory.space.lock().unwrap())
@@ -543,10 +606,14 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
     fn dispatch(
         &mut self,
         launch: &ampere::compute::Launch,
-        _registers: &ampere::Registers,
+        registers: &ampere::Registers,
     ) -> Result<()> {
-        let code = self.read(launch.program, 16)?;
-        Err(format!("Ampere shader compilation not implemented: QMD={:#x} program={:#x} grid={:?} block={:?} shared_bytes={} first_instruction={:02x?}; dispatch and releases not executed", launch.address, launch.program, launch.grid, launch.block, launch.shared_bytes, code).into())
+        self.renderer.dispatch(
+            self.source,
+            launch,
+            registers,
+            &mut *self.memory.space.lock().unwrap(),
+        )
     }
     fn clear(
         &mut self,
@@ -559,12 +626,12 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
     }
     fn draw(
         &mut self,
-        source: Source,
+        draw: ampere::Draw,
         regs: &ampere::Registers,
         state: &mut ampere::GraphicsState,
     ) -> Result<()> {
         self.renderer
-            .draw(source, regs, state, &mut *self.memory.space.lock().unwrap())
+            .draw(draw, regs, state, &mut *self.memory.space.lock().unwrap())
     }
 }
 fn read_owned(
@@ -598,7 +665,23 @@ fn preparation<E: ampere::Rasterizer>(
     let mut source = Source::default();
     while !stop.load(Ordering::Acquire) {
         while let Some(message) = input.try_recv() {
+            if matches!(&message, nixe_gpu::ordered::Read::Control(_))
+                && let Some(job) = &current
+            {
+                channels.get_mut(&job.channel).unwrap().flush(&mut Back {
+                    renderer,
+                    source,
+                    memory: Memory {
+                        machine: &machine,
+                        space: &job.space,
+                        stop,
+                        waiters,
+                    },
+                    clock: &clock,
+                })?;
+            }
             match message {
+                nixe_gpu::ordered::Read::Control(Control::Drain) => (),
                 nixe_gpu::ordered::Read::Control(Control::Failure(error)) => return Err(error),
                 nixe_gpu::ordered::Read::Control(Control::Begin(job)) => {
                     source.channel = job.channel;
@@ -727,6 +810,19 @@ fn preparation<E: ampere::Rasterizer>(
                 }
             }
             if endpoint.requested.load(Ordering::Acquire) {
+                if let Some(job) = &current {
+                    channels.get_mut(&job.channel).unwrap().flush(&mut Back {
+                        renderer,
+                        source,
+                        memory: Memory {
+                            machine: &machine,
+                            space: &job.space,
+                            stop,
+                            waiters,
+                        },
+                        clock: &clock,
+                    })?;
+                }
                 endpoint.progress(renderer)?;
             }
             if stop.load(Ordering::Acquire) {
@@ -737,6 +833,19 @@ fn preparation<E: ampere::Rasterizer>(
             || stop.load(Ordering::Acquire),
             || endpoint.requested.load(Ordering::Acquire),
             || {
+                if let Some(job) = &current {
+                    channels.get_mut(&job.channel).unwrap().flush(&mut Back {
+                        renderer,
+                        source,
+                        memory: Memory {
+                            machine: &machine,
+                            space: &job.space,
+                            stop,
+                            waiters,
+                        },
+                        clock: &clock,
+                    })?;
+                }
                 renderer
                     .flush_deferred()
                     .map_err(|e| e.to_string().into_boxed_str())?;
@@ -761,6 +870,11 @@ pub(crate) enum MemoryJob {
         address: u64,
         bytes: u64,
         account: Option<nixe_memory::MemoryAccount>,
+    },
+    Unmap {
+        space: Arc<Mutex<GpuAddressSpace>>,
+        address: u64,
+        bytes: u64,
     },
     Kind {
         space: Arc<Mutex<GpuAddressSpace>>,
@@ -813,6 +927,17 @@ impl MemoryJob {
                     space.destroy_region(address, bytes)
                 }
                 .map_err(|e| e.to_string().into())
+            }
+            Self::Unmap {
+                space,
+                address,
+                bytes,
+            } => {
+                let mut space = space.lock().unwrap();
+                invalidate(space.image_space_id(), address, bytes, true)?;
+                space
+                    .unmap(address, bytes)
+                    .map_err(|e| e.to_string().into())
             }
             Self::Kind {
                 space,

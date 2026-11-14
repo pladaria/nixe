@@ -24,7 +24,9 @@ impl EmitContext<'_> {
         };
         self.builder.new_label()?;
         for (index, descriptor) in info.storage_buffers_descriptors.iter().enumerate() {
-            if index >= 16 || info.nvn_buffer_used & (1 << index) == 0 {
+            // Descriptor indices also include directly tracked bare pointers.
+            // The NVN mask indexes guest table slots, not that compacted list.
+            if !info.uses_nvn_descriptor(descriptor) {
                 continue;
             }
             let bank = descriptor.cbuf_index.0 as usize;

@@ -804,6 +804,17 @@ impl Emitter<'_> {
     pub fn i_mul(&mut self, a: Value, b: Value) -> Result<Value> {
         self.emit(Opcode::IMul32, &[a, b], 0)
     }
+    pub fn i_mul_extended(&mut self, a: Value, b: Value, signed: bool) -> Result<Value> {
+        self.emit(
+            if signed {
+                Opcode::SMulExtended32
+            } else {
+                Opcode::UMulExtended32
+            },
+            &[a, b],
+            0,
+        )
+    }
 
     pub fn i_div(&mut self, a: Value, b: Value, is_signed: bool) -> Result<Value> {
         self.emit(

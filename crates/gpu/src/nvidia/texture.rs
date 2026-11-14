@@ -65,8 +65,17 @@ pub fn sampled_image_info(
     let msaa = ((words[7] >> 8) & 0xf) as u8;
     // Sparse residency is represented by actual GPU map views, not a different texel layout.
     let normalized = words[5] & (1 << 31) != 0;
-    let layer_base =
-        ((words[4] >> 16) & 7) | (((words[2] >> 16) & 0x1f) << 3) | (((words[2] >> 29) & 7) << 8);
+    let layer_base = match tiling {
+        TextureTiling::Maxwell => {
+            ((words[4] >> 16) & 7)
+                | (((words[2] >> 16) & 0x1f) << 3)
+                | (((words[2] >> 29) & 7) << 8)
+        }
+        // @SPECULATIVE: native descriptors address the selected view directly;
+        // the legacy layer-base fields do not describe an additional prefix.
+        // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/texture_cache/image_info.h#L16-L26
+        TextureTiling::Ampere => 0,
+    };
     let (required_texture_type, layers) = match required_dimension {
         TextureDimension::One => (0, 1),
         TextureDimension::OneArray => (

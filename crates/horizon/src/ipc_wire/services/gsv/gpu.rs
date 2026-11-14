@@ -293,6 +293,43 @@ pub(super) async fn dispatch(
                     _source: source,
                 });
             }
+            (GsvInterface::Worker, 213, 28) => {
+                // NormalUnmapGpuMemory4K retires the VA mapping in command order.
+                // Existing captures retain physical storage until their users finish.
+                // https://switchbrew.org/wiki/Switch_2%3A_GSV_services#KUserWorkerSession
+                // @SPECULATIVE: the inclusive range, padded policy byte and
+                // event index follow the reference's SDK request observations.
+                // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/nx2_gsv.h#L594-L609
+                if data[20] != 1 {
+                    return Err(IpcWireError::GraphicsService(
+                        format!("unsupported native unmap policy: data={data:02x?}").into(),
+                    ));
+                }
+                let id = request_u32(data, 0).unwrap();
+                let address = request_u64(data, 4).unwrap();
+                let bytes = request_u64(data, 12)
+                    .unwrap()
+                    .checked_sub(address)
+                    .and_then(|size| size.checked_add(1))
+                    .ok_or(IpcWireError::Malformed("native GPU unmap range overflow"))?;
+                let event = request_u32(data, 24).unwrap() as usize;
+                signal = Some(
+                    gpu.events
+                        .get(event)
+                        .and_then(Option::as_ref)
+                        .ok_or(IpcWireError::Malformed("GPU unmap event not created"))?
+                        .clone(),
+                );
+                memory_job = Some(crate::gsv::execution::MemoryJob::Unmap {
+                    space: gpu
+                        .spaces
+                        .get(&id)
+                        .cloned()
+                        .ok_or(IpcWireError::Malformed("unknown GPU address space"))?,
+                    address,
+                    bytes,
+                });
+            }
             (GsvInterface::Worker, 212, 36) => {
                 // @SPECULATIVE: native ModifyMemoryKind4K fields follow SDK
                 // observations in the reference. Only its synchronous policy

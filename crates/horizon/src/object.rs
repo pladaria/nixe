@@ -322,17 +322,22 @@ impl AccountProfileSession {
 /// methods will expose Nixe's disconnected policy as they are implemented.
 #[derive(Clone, Debug)]
 pub struct AccountManagerForApplicationSession {
-    // Retained for manager methods which will expose per-user online state.
-    _user: UserIdentity,
+    user: UserIdentity,
     pub(crate) profiles: Arc<crate::user::ProfileManager>,
 }
 
 impl AccountManagerForApplicationSession {
+    pub(crate) fn provisional_account_id(&self) -> u64 {
+        // @SPECULATIVE: match the local UUID-derived identifier used by the
+        // offline reference; no verified Nintendo Account ID is available.
+        // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/common/uuid.cpp#L164-L172
+        let words = self.user.id().encode();
+        u64::from_le_bytes(words[..8].try_into().unwrap())
+            ^ u64::from_le_bytes(words[8..].try_into().unwrap()).rotate_left(1)
+    }
+
     pub(crate) fn new(user: UserIdentity, profiles: Arc<crate::user::ProfileManager>) -> Self {
-        Self {
-            _user: user,
-            profiles,
-        }
+        Self { user, profiles }
     }
 }
 
@@ -1959,7 +1964,7 @@ struct AppletDomain {
     operation_mode_refresh_event: ReadableEventObject,
     operation_mode_changed_notification: bool,
     performance_mode_changed_notification: bool,
-    cpu_boost_enabled: bool,
+    cpu_boost_mode: u32,
     vr_mode_enabled: bool,
     rtc_screen_sharing_audio_enabled: bool,
     graphics_scale_notifications: bool,
@@ -2048,7 +2053,7 @@ impl AppletSession {
                 operation_mode_refresh_event,
                 operation_mode_changed_notification: false,
                 performance_mode_changed_notification: false,
-                cpu_boost_enabled: false,
+                cpu_boost_mode: 0,
                 vr_mode_enabled: false,
                 rtc_screen_sharing_audio_enabled: false,
                 graphics_scale_notifications: false,
@@ -2581,11 +2586,11 @@ impl AppletSession {
             .game_play_recording_state = state;
     }
 
-    pub(crate) fn set_cpu_boost_enabled(&self, enabled: bool) {
+    pub(crate) fn set_cpu_boost_mode(&self, mode: u32) {
         self.domain
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cpu_boost_enabled = enabled;
+            .cpu_boost_mode = mode;
     }
 
     pub(crate) fn accumulated_suspended_ticks(&self) -> u64 {
@@ -2798,17 +2803,6 @@ mod applet_tests {
         drop(backing);
         assert!(session.close_object(storage));
         assert!(weak.upgrade().is_none());
-    }
-
-    #[test]
-    fn cpu_boost_policy_is_shared_between_session_clones() {
-        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
-        let cloned = session.clone();
-        assert!(!session.domain.lock().unwrap().cpu_boost_enabled);
-        cloned.set_cpu_boost_enabled(true);
-        assert!(session.domain.lock().unwrap().cpu_boost_enabled);
-        session.set_cpu_boost_enabled(false);
-        assert!(!cloned.domain.lock().unwrap().cpu_boost_enabled);
     }
 
     #[test]

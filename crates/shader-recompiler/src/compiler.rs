@@ -136,7 +136,7 @@ impl Compiler {
         passes::early_passes(&mut self.ir, &p, &host)?;
         passes::constant_propagation(env, &mut self.ir, &p)?;
         passes::position(env, &mut self.ir, &mut p)?;
-        passes::global_memory_to_storage(&mut self.ir, &mut p, &host)?;
+        passes::global_memory_to_storage(&mut self.ir, &mut p, &host, env)?;
         passes::geometry_compaction(&mut self.ir, &p, &host)?;
         passes::texture_pass(&mut self.ir, &mut p, env, &host, &mut self.caches)?;
         if settings.resolution_info.active {
@@ -151,6 +151,24 @@ impl Compiler {
         passes::layer(&mut self.ir, &mut p, &host)?;
         passes::vendor_workaround(&mut self.ir, &p)?;
         passes::collect_interpolation(env, &mut p)?;
+        if env.metadata().isa == crate::environment::ShaderIsa::Ampere && p.info.uses_global_memory
+        {
+            if p.info.nvn_buffer_used == 0 {
+                return Err(CompileError::new(
+                    FailureCategory::Unsupported,
+                    "Native global address has neither a tracked pointer pair nor NVN bounds",
+                ));
+            }
+            if !host.support_int64 {
+                return Err(CompileError::new(
+                    FailureCategory::Unsupported,
+                    "Native indirect global addresses require host 64-bit integer arithmetic",
+                ));
+            }
+        }
+        // The NVN address/size table is also used by native programs that load
+        // pointers dynamically from memory. It is distinct from bare pointers
+        // discovered by the address pass; only consumed table slots participate.
         passes::add_nvn_storage_buffers(&mut p)?;
         self.programs.insert(Some(p))
     }
@@ -197,7 +215,7 @@ impl Compiler {
         settings: &CompilerSettings,
         bindings: &mut Bindings,
     ) -> Result<Vec<StageArtifact>> {
-        self.prepare_graphics(ids, state)?
+        self.prepare_graphics(ids, state, profile)?
             .into_iter()
             .map(|stage| self.emit_prepared(stage, profile, settings, bindings))
             .collect()
@@ -247,6 +265,7 @@ impl Compiler {
         &mut self,
         ids: &[ProgramId],
         state: &GraphicsRuntimeState,
+        profile: &Profile,
     ) -> Result<Vec<PreparedStage>> {
         let mut programs = Vec::with_capacity(ids.len() + 1);
         let mut previous_stage = None;
@@ -282,6 +301,18 @@ impl Compiler {
                 .position(|p| p.stage == Stage::Fragment)
                 .unwrap_or(programs.len());
             programs.insert(position, generated);
+        }
+        if let Some(fragment) = programs.iter().position(|p| p.stage == Stage::Fragment) {
+            let (before, after) = programs.split_at_mut(fragment);
+            if let Some(geometry) = before.iter_mut().find(|p| p.stage == Stage::Geometry) {
+                passes::prune_geometry_outputs(
+                    &mut self.ir,
+                    geometry,
+                    &after[0],
+                    profile.support_geometry_shader_passthrough,
+                    state.xfb_enabled,
+                )?;
+            }
         }
         let mut runtimes = Vec::with_capacity(programs.len());
         for i in 0..programs.len() {

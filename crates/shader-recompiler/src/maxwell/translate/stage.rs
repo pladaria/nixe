@@ -2,7 +2,7 @@ use super::{Operands, Result, Source, Value, Visitor, unsupported};
 use crate::{
     ir::{Attribute, FpControl, Patch, Reg},
     maxwell::bits::extract_signed,
-    types::{PixelImap, Stage},
+    types::PixelImap,
 };
 
 impl Visitor<'_> {
@@ -257,34 +257,14 @@ impl Visitor<'_> {
         };
         let mode = self.field::<30, 2>();
         let input = self.a()?;
-        if self.metadata.stage == Stage::Fragment
-            && mask == Value::U32((28 << 8) | 3)
-            && let Value::U32(index) = index
-        {
-            let value = match (mode, index) {
-                (0, 0..=3) => Some(self.emit.quad_broadcast(input, Value::U32(index))?),
-                (3, 1..=3) => Some(self.emit.quad_swap(input, Value::U32(index - 1))?),
-                _ => None,
-            };
-            if let Some(value) = value {
-                self.write(value)?;
-                self.set_predicate::<48>(Value::U1(true))?;
-                return Ok(());
-            }
-        }
-        let clamp = self
-            .emit
-            .bit_field_extract(mask, Value::U32(0), Value::U32(5), false)?;
-        let segment = self
-            .emit
-            .bit_field_extract(mask, Value::U32(8), Value::U32(5), false)?;
-        let value = match mode {
-            0 => self.emit.shuffle_index(input, index, clamp, segment)?,
-            1 => self.emit.shuffle_up(input, index, clamp, segment)?,
-            2 => self.emit.shuffle_down(input, index, clamp, segment)?,
-            _ => self.emit.shuffle_butterfly(input, index, clamp, segment)?,
-        };
-        let in_bounds = self.emit.get_in_bounds_from_op(value)?;
+        let (value, in_bounds) = crate::frontend::shuffle(
+            &mut self.emit,
+            self.metadata.stage,
+            mode,
+            input,
+            index,
+            mask,
+        )?;
         self.set_predicate::<48>(in_bounds)?;
         self.write(value)
     }

@@ -172,8 +172,24 @@ impl Scheduler {
                     } else {
                         0
                     };
-                if flags & (7 << 26) != 0 {
-                    return Err("QMD atomic reduction/interrupt not implemented".into());
+                if flags & (3 << 27) != 0 {
+                    return Err(format!(
+                        "QMD interrupt not implemented: qmd={address:#x} slot={base} flags={flags:#010x} destination={destination:#x} payload={payload:#x}"
+                    ).into());
+                }
+                if flags & (1 << 26) != 0 {
+                    if flags >> 30 != 1 || flags & (1 << 29) != 0 || (flags >> 24) & 3 > 1 {
+                        return Err(
+                            format!("unsupported QMD reduction format: {flags:#010x}").into()
+                        );
+                    }
+                    host.reduce_report(
+                        destination,
+                        payload as u32,
+                        (flags >> 20) & 7,
+                        flags & (1 << 24) != 0,
+                    )?;
+                    continue;
                 }
                 let bytes = match flags >> 30 {
                     0 => {

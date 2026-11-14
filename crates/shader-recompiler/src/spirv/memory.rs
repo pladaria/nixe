@@ -32,7 +32,7 @@ impl EmitContext<'_> {
         let element_pointer = self.builder.type_pointer(S::Workgroup, element)?;
         let id = self.builder.variable(pointer, S::Workgroup, None)?;
         self.builder.decorate(id, D::Aliased, &[])?;
-        self.interfaces.push(id);
+        self.global_interface(id);
         Ok((id, element_pointer, pointer))
     }
     pub(super) fn define_shared_memory(&mut self, p: &Program) -> Result<()> {
@@ -84,7 +84,7 @@ impl EmitContext<'_> {
             self.objects.shared_memory_u32_type = pointer;
             self.objects.shared_u32 = self.builder.type_pointer(S::Workgroup, self.types.u32[0])?;
             self.objects.shared_memory_u32 = self.builder.variable(pointer, S::Workgroup, None)?;
-            self.interfaces.push(self.objects.shared_memory_u32);
+            self.global_interface(self.objects.shared_memory_u32);
             if p.info.uses_int8 {
                 self.objects.shared_store_u8_func = self.shared_narrow_store(24, 8)?;
             }
@@ -148,7 +148,16 @@ impl EmitContext<'_> {
         Ok(function)
     }
     pub(super) fn define_host_uniforms(&mut self, info: &ShaderInfo) -> Result<()> {
-        if info.uses_rescaling_uniform {
+        let instance_offset = self.runtime.instance_offset
+            && (info.loads.get(crate::ir::Attribute::InstanceId)
+                || info.loads.get(crate::ir::Attribute::BaseInstance));
+        if instance_offset && !self.profile.unified_descriptor_binding {
+            return Err(crate::CompileError::new(
+                crate::diagnostics::FailureCategory::Unsupported,
+                "Instance offset requires the Vulkan push-constant ABI",
+            ));
+        }
+        if info.uses_rescaling_uniform || instance_offset {
             if self.profile.unified_descriptor_binding {
                 let four = self.const_u32(4)?;
                 let two = self.const_u32(2)?;
@@ -158,29 +167,40 @@ impl EmitContext<'_> {
                 self.builder.decorate(images, D::ArrayStride, &[4])?;
                 self.objects.rescaling_textures_type = textures;
                 self.objects.rescaling_images_type = images;
-                let mut members = vec![textures, images];
-                if self.stage != Stage::Compute {
-                    members.push(self.types.f32[0]);
+                let mut members = Vec::new();
+                let mut offsets = Vec::new();
+                if info.uses_rescaling_uniform {
+                    members.extend([textures, images]);
+                    offsets.extend([
+                        crate::host_abi::TEXTURE_MASK_OFFSET,
+                        crate::host_abi::IMAGE_MASK_OFFSET,
+                    ]);
+                    if self.stage != Stage::Compute {
+                        members.push(self.types.f32[0]);
+                        offsets.push(crate::host_abi::DOWN_FACTOR_OFFSET);
+                    }
+                }
+                if instance_offset {
+                    self.objects.instance_offset_member = self.const_u32(members.len() as u32)?;
+                    members.push(self.types.u32[0]);
+                    offsets.push(crate::host_abi::INSTANCE_OFFSET);
                 }
                 let structure = self.builder.type_struct(&members)?;
                 self.builder.decorate(structure, D::Block, &[])?;
-                for (i, offset) in [
-                    crate::host_abi::TEXTURE_MASK_OFFSET,
-                    crate::host_abi::IMAGE_MASK_OFFSET,
-                    crate::host_abi::DOWN_FACTOR_OFFSET,
-                ]
-                .into_iter()
-                .take(members.len())
-                .enumerate()
-                {
+                for (i, offset) in offsets.into_iter().enumerate() {
                     self.builder
                         .member_decorate(structure, i as u32, D::Offset, &[offset])?;
                 }
                 let pointer = self.builder.type_pointer(S::PushConstant, structure)?;
                 let id = self.builder.variable(pointer, S::PushConstant, None)?;
                 self.objects.rescaling_push_constants = id;
+                if instance_offset {
+                    self.objects.instance_offset_push_constants = id;
+                }
                 self.global_interface(id);
-                self.push_constant_bytes = if self.stage == Stage::Compute {
+                self.push_constant_bytes = if instance_offset {
+                    crate::host_abi::INSTANCE_OFFSET + 4
+                } else if self.stage == Stage::Compute {
                     crate::host_abi::RESCALING_COMPUTE_BYTES
                 } else {
                     crate::host_abi::RESCALING_GRAPHICS_BYTES

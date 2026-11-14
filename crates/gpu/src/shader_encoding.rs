@@ -3,7 +3,7 @@ use nixe_shader_recompiler::{
     artifact::ARTIFACT_ABI_VERSION, environment::*, header::ProgramHeader, types::*,
 };
 use std::collections::BTreeMap;
-const SCHEMA: u32 = 5;
+const SCHEMA: u32 = 6;
 trait Encode {
     fn encode(&self, out: &mut Vec<u8>);
 }
@@ -220,6 +220,7 @@ record!(EnvironmentMetadata {
 record!(Observations {
     instructions,
     cbuf_words,
+    storage_pointer_types,
     texture_handles,
     texture_types,
     texture_pixel_formats,

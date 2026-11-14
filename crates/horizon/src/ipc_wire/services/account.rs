@@ -107,7 +107,7 @@ pub(in crate::ipc_wire) async fn dispatch_account(
             dispatch_account_profile(process, profile, request, hipc, true).await
         }
         AccountTarget::BaasManagerForApplication(manager) => {
-            dispatch_account_manager_for_application(&manager, request, hipc, true)
+            dispatch_account_manager_for_application(process, &manager, request, hipc, true).await
         }
     }
 }
@@ -406,7 +406,8 @@ fn is_configured_user(session: &AccountSession, encoded_user_id: &[u8]) -> bool 
     encoded_user_id == session.user().id().encode()
 }
 
-pub(in crate::ipc_wire) fn dispatch_account_manager_for_application(
+pub(in crate::ipc_wire) async fn dispatch_account_manager_for_application(
+    process: &Request,
     manager: &AccountManagerForApplicationSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -416,13 +417,27 @@ pub(in crate::ipc_wire) fn dispatch_account_manager_for_application(
     // manager's Nintendo-account linkage or the current service session.
     // https://switchbrew.org/wiki/Account_services#IManagerForApplication
     // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/acc/acc.cpp
-    if request.command_id != 160 {
+    if request.command_id == 130 {
+        return account_resource_cache(process, manager, request, hipc, domain).await;
+    }
+    if !matches!(request.command_id, 0 | 160) {
         return unsupported_service_command("IManagerForApplication", request.command_id);
     }
     let result = if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
         HorizonIpcResult::CMIF_INVALID_IN_HEADER
     } else {
-        manager.profiles.store_opened_users();
+        if request.command_id == 160 {
+            manager.profiles.store_opened_users();
+        } else {
+            // @SPECULATIVE: CheckAvailability has no payload. Match the
+            // reference's success result for the local account manager until
+            // the offline/network-linkage result contract is established.
+            // This does not create network credentials or an authentication token.
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/acc/acc.cpp
+            log::debug!(
+                "IManagerForApplication::CheckAvailability: provisional local availability"
+            );
+        }
         HorizonIpcResult::SUCCESS
     };
     if domain {
@@ -433,6 +448,68 @@ pub(in crate::ipc_wire) fn dispatch_account_manager_for_application(
     } else {
         Ok((encode_response(request.token, result, &[], None)?, None))
     }
+}
+
+// https://switchbrew.org/wiki/Account_services#IManagerForApplication
+// https://reswitched.github.io/SwIPC/ifaces.html#nn::account::baas::IManagerForApplication
+async fn account_resource_cache(
+    process: &Request,
+    manager: &AccountManagerForApplicationSession,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+    domain: bool,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let shape = request.has_payload_size(0)
+        && hipc.pid.is_none()
+        && hipc.copy_handles.is_empty()
+        && hipc.move_handles.is_empty()
+        && hipc.send_statics.is_empty()
+        && hipc.send_buffers.is_empty()
+        && hipc.exchange_buffers.is_empty()
+        && matches!(&hipc.receive_statics, ReceiveStatics::Entries(entries) if entries.len() == 1 && entries[0].size == 0x68)
+        && hipc.receive_buffers.len() == 1;
+    if !shape {
+        return if domain {
+            Ok((
+                encode_domain_response(
+                    request.token,
+                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    &[],
+                    &[],
+                    &[],
+                )?,
+                None,
+            ))
+        } else {
+            cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER)
+        };
+    }
+    // @SPECULATIVE: the offline resource contents and Nintendo Account ID
+    // policy are undocumented. Supply the reference's empty 0x68-byte cache,
+    // zeroed auxiliary data and deterministic local-user ID. This is not a
+    // linked online account and creates no authentication token.
+    // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/acc/acc.cpp#L849-L864
+    process
+        .write(&process.receive_statics()[0], 0, &mut vec![0u8; 0x68])
+        .await?;
+    let auxiliary = &process.receive_buffers()[0];
+    let mut zeros = Vec::with_capacity(4096);
+    let mut offset = 0;
+    while offset < auxiliary.size {
+        let count = (auxiliary.size - offset).min(4096) as usize;
+        zeros.resize(count, 0);
+        process.write(auxiliary, offset, &mut zeros).await?;
+        offset += count as u64;
+    }
+    log::warn!("Nintendo Account resource cache: provisional empty offline profile");
+    semantic_success(
+        request.token,
+        domain,
+        &manager.provisional_account_id().to_le_bytes(),
+        &[],
+        &[],
+        None,
+    )
 }
 
 // IProfile::GetBase does not consume profile icon or Mii data.

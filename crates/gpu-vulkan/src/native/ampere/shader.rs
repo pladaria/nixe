@@ -10,8 +10,90 @@ use std::{
 
 pub(super) struct Program {
     pub info: Arc<ShaderInfo>,
+    pub unique_hash: u64,
     pub metadata: EnvironmentMetadata,
     pub instructions: BTreeMap<ProgramOffset, u64>,
+    pub flow_constants: BTreeMap<CbufWordKey, u32>,
+}
+
+pub(super) fn storage_pointer_type(
+    residency: &mut Residency<'_>,
+    memory: &mut impl RenderMemory,
+    constants: &[Option<(u64, u32)>],
+    key: CbufWordKey,
+) -> Result<bool, VulkanError> {
+    let Some((base, size)) = constants.get(key.index.0 as usize).copied().flatten() else {
+        return Ok(false);
+    };
+    if u64::from(key.offset.0) + 8 > u64::from(size) {
+        return Ok(false);
+    }
+    let address = base
+        .checked_add(u64::from(key.offset.0))
+        .ok_or_else(|| compilation("native pointer descriptor address overflow"))?;
+    let pointer = u64::from_le_bytes(read::<8>(residency, memory, address)?);
+    Ok(pointer != 0 && memory.image_device_address(pointer)?.is_some())
+}
+
+pub(super) fn pointer_types_match(
+    residency: &mut Residency<'_>,
+    memory: &mut impl RenderMemory,
+    constants: &[Option<(u64, u32)>],
+    observations: &Observations,
+) -> Result<bool, VulkanError> {
+    for (&key, &expected) in &observations.storage_pointer_types {
+        if storage_pointer_type(residency, memory, constants, key)? != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn constants_match(
+    residency: &mut Residency<'_>,
+    memory: &mut impl RenderMemory,
+    constants: &[Option<(u64, u32)>],
+    observations: &BTreeMap<CbufWordKey, u32>,
+) -> Result<bool, VulkanError> {
+    let mut words = observations.iter().peekable();
+    while let Some((word, &first)) = words.next() {
+        let Some((base, size)) = constants.get(word.index.0 as usize).copied().flatten() else {
+            return Ok(false);
+        };
+        let mut expected = [0u32; 64];
+        expected[0] = first;
+        let mut count = 1;
+        while count < expected.len() {
+            let Some(&(next, &value)) = words.peek() else {
+                break;
+            };
+            if next.index != word.index
+                || u64::from(next.offset.0) != u64::from(word.offset.0) + count as u64 * 4
+            {
+                break;
+            }
+            expected[count] = value;
+            count += 1;
+            words.next();
+        }
+        let bytes = count * 4;
+        if u64::from(word.offset.0) + bytes as u64 > u64::from(size) {
+            return Ok(false);
+        }
+        let address = base
+            .checked_add(u64::from(word.offset.0))
+            .ok_or_else(|| compilation("constant address overflow"))?;
+        let mut current = [0u8; 256];
+        read_into(residency, memory, address, &mut current[..bytes])?;
+        if current[..bytes]
+            .chunks_exact(4)
+            .zip(&expected[..count])
+            .any(|(bytes, expected)| u32::from_le_bytes(bytes.try_into().unwrap()) != *expected)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(super) fn read<const N: usize>(
@@ -19,12 +101,32 @@ pub(super) fn read<const N: usize>(
     memory: &mut impl RenderMemory,
     address: u64,
 ) -> Result<[u8; N], VulkanError> {
-    let capture = memory
-        .capture_memory(address, N as u64)
-        .map_err(compilation)?;
     let mut bytes = [0; N];
-    residency.read_captured_memory(&capture, &mut bytes)?;
+    read_into(residency, memory, address, &mut bytes)?;
     Ok(bytes)
+}
+
+fn read_into(
+    residency: &mut Residency<'_>,
+    memory: &mut impl RenderMemory,
+    address: u64,
+    bytes: &mut [u8],
+) -> Result<(), VulkanError> {
+    let count = bytes.len();
+    let capture = memory
+        .capture_memory(address, count as u64)
+        .map_err(|error| {
+            compilation(format!(
+                "native memory read at {address:#x}, {count} bytes: {error}"
+            ))
+        })?;
+    residency
+        .read_captured_memory(&capture, bytes)
+        .map_err(|error| {
+            compilation(format!(
+                "coherent native read at {address:#x}, {count} bytes: {error}"
+            ))
+        })
 }
 
 pub(super) struct EnvironmentReader<'a, 'b, M> {
@@ -32,7 +134,8 @@ pub(super) struct EnvironmentReader<'a, 'b, M> {
     pub code: Cow<'a, BTreeMap<ProgramOffset, u64>>,
     pub base: u64,
     pub registers: &'a Registers,
-    pub constants: &'a [Option<(u64, u32)>; 32],
+    pub linked: bool,
+    pub constants: &'a [Option<(u64, u32)>],
     pub memory: &'a mut M,
     pub residency: &'a mut Residency<'b>,
 }
@@ -43,12 +146,21 @@ fn error(detail: impl std::fmt::Display) -> shader::CompileError {
     )
 }
 impl<M: RenderMemory> Environment for EnvironmentReader<'_, '_, M> {
+    fn is_cbuf_storage_pointer(&mut self, key: CbufWordKey) -> shader::Result<bool> {
+        storage_pointer_type(self.residency, self.memory, self.constants, key).map_err(error)
+    }
     fn metadata(&self) -> &EnvironmentMetadata {
         &self.metadata
     }
     fn read_instruction(&mut self, offset: ProgramOffset) -> shader::Result<u64> {
         if let Some(&word) = self.code.get(&offset) {
             return Ok(word);
+        }
+        if matches!(self.code, Cow::Borrowed(_)) {
+            return Err(error(format!(
+                "native shader control flow escaped its captured code at {:#x}",
+                offset.0
+            )));
         }
         let instruction = offset.0 & !15;
         let address = self
@@ -92,8 +204,14 @@ impl<M: RenderMemory> Environment for EnvironmentReader<'_, '_, M> {
     }
     fn read_texture_type(&mut self, handle: TextureHandle) -> shader::Result<TextureType> {
         nixe_gpu::nvidia::shader::texture_type(
-            textures::texture_words(self.residency, self.memory, self.registers, handle.0)
-                .map_err(error)?,
+            textures::texture_words(
+                self.residency,
+                self.memory,
+                self.registers,
+                handle.0,
+                self.linked,
+            )
+            .map_err(error)?,
         )
     }
     fn read_texture_pixel_format(
@@ -101,8 +219,14 @@ impl<M: RenderMemory> Environment for EnvironmentReader<'_, '_, M> {
         handle: TextureHandle,
     ) -> shader::Result<TexturePixelFormat> {
         nixe_gpu::nvidia::shader::pixel_format(
-            textures::texture_words(self.residency, self.memory, self.registers, handle.0)
-                .map_err(error)?,
+            textures::texture_words(
+                self.residency,
+                self.memory,
+                self.registers,
+                handle.0,
+                self.linked,
+            )
+            .map_err(error)?,
         )
     }
     fn is_texture_pixel_format_integer(&mut self, handle: TextureHandle) -> shader::Result<bool> {
@@ -118,7 +242,7 @@ pub(super) fn capture(
     registers: &Registers,
     address: u64,
     stage: Stage,
-    constants: &[Option<(u64, u32)>; 32],
+    constants: &[Option<(u64, u32)>],
 ) -> Result<Program, VulkanError> {
     let header = read::<128>(residency, memory, address)?;
     let sph = shader::header::ProgramHeader::try_from(&header[..80]).map_err(compilation)?;
@@ -141,16 +265,40 @@ pub(super) fn capture(
         is_proprietary_driver: true,
         ..Default::default()
     };
+    capture_program(
+        residency,
+        memory,
+        registers,
+        address,
+        metadata,
+        constants,
+        textures::graphics_linked(registers)?,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) fn capture_program(
+    residency: &mut Residency<'_>,
+    memory: &mut impl RenderMemory,
+    registers: &Registers,
+    address: u64,
+    metadata: EnvironmentMetadata,
+    constants: &[Option<(u64, u32)>],
+    linked: bool,
+) -> Result<Program, VulkanError> {
     let mut env = EnvironmentReader {
         metadata,
         code: Cow::Owned(BTreeMap::new()),
         base: address,
         constants,
         registers,
+        linked,
         memory,
         residency,
     };
-    shader::ampere::flow::analyze(&mut env).map_err(compilation)?;
+    let mut recorded = RecordingEnvironment::new(&mut env);
+    let analyzed = shader::ampere::flow::analyze(&mut recorded);
+    let flow_constants = recorded.into_snapshot().into_observations().cbuf_words;
+    analyzed.map_err(compilation)?;
     let size = env
         .code
         .last_key_value()
@@ -173,20 +321,36 @@ pub(super) fn capture(
         .ok_or_else(|| compilation("unmapped native shader"))?;
     let mut hash = rustc_hash::FxHasher::default();
     ShaderIsa::Ampere.hash(&mut hash);
-    header.hash(&mut hash);
+    env.metadata.hash(&mut hash);
     env.code.hash(&mut hash);
+    flow_constants.hash(&mut hash);
+    let unique_hash = hash.finish();
+    // Physical invalidation is shared by captures with different launch state.
+    // Their compilation identities remain separate, including QMD dimensions.
+    if let Some(old) = env
+        .residency
+        .shader_cache
+        .try_get(physical, ShaderIsa::Ampere)
+        && old.size_bytes < size
+    {
+        env.residency
+            .shader_cache
+            .invalidate_region(physical, old.size_bytes as u64);
+    }
     let info = env
         .residency
         .shader_cache
         .register(
             physical,
             ShaderIsa::Ampere,
-            ShaderInfo::new(hash.finish(), size),
+            ShaderInfo::new(unique_hash, size),
         )
         .map_err(compilation)?;
     Ok(Program {
         info,
+        unique_hash,
         metadata: env.metadata,
         instructions: env.code.into_owned(),
+        flow_constants,
     })
 }

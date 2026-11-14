@@ -4,6 +4,7 @@ use crate::{RuntimeInfo, ir::Program, profile::TransformFeedbackVarying, types::
 /// and attribute types have already been converted from device register formats.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GraphicsRuntimeState {
+    pub instance_offset: bool,
     pub vertex_input_types: [AttributeType; 32],
     pub input_topology: InputTopology,
     pub point_size: f32,
@@ -26,6 +27,7 @@ pub struct GraphicsRuntimeState {
 impl Default for GraphicsRuntimeState {
     fn default() -> Self {
         Self {
+            instance_offset: false,
             vertex_input_types: [AttributeType::Float; 32],
             input_topology: InputTopology::Points,
             point_size: 1.0,
@@ -86,6 +88,7 @@ pub fn make_runtime_info(
                 info.convert_depth_mode = state.ndc_minus_one_to_one;
             }
             info.generic_input_types = state.vertex_input_types;
+            info.instance_offset = state.instance_offset;
         }
         Stage::TessellationEval => {
             info.tess_clockwise = state.tess_clockwise;

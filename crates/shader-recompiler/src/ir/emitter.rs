@@ -83,6 +83,23 @@ impl<'a> Emitter<'a> {
             Ok(value)
         }
     }
+    pub fn get_uniform_reg(&mut self, index: u32) -> Result<Value> {
+        match index {
+            0..=62 => self.emit(Opcode::GetUniformRegister, &[Value::U32(index)], 0),
+            63 => Ok(Value::U32(0)),
+            _ => Err(Self::invalid("Uniform register index exceeds 63")),
+        }
+    }
+    pub fn set_uniform_reg(&mut self, index: u32, value: Value) -> Result<()> {
+        match index {
+            0..=62 => {
+                self.emit(Opcode::SetUniformRegister, &[Value::U32(index), value], 0)?;
+            }
+            63 => {}
+            _ => return Err(Self::invalid("Uniform register index exceeds 63")),
+        }
+        Ok(())
+    }
     pub fn set_pred(&mut self, pred: Pred, value: Value) -> Result<()> {
         if pred != Pred::PT {
             self.emit(Opcode::SetPred, &[Value::Pred(pred), value], 0)?;

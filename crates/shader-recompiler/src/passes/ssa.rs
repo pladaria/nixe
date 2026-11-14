@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Variable {
     Register(u8),
+    UniformRegister(u8),
     Predicate(u8),
     Zero,
     Sign,
@@ -19,7 +20,10 @@ enum Variable {
 }
 impl Variable {
     fn ty(self) -> Type {
-        if matches!(self, Self::Register(_) | Self::Indirect) {
+        if matches!(
+            self,
+            Self::Register(_) | Self::UniformRegister(_) | Self::Indirect
+        ) {
             Type::U32
         } else {
             Type::U1
@@ -201,6 +205,17 @@ impl Pass {
         let inst = ir.inst(id)?;
         let op = inst.opcode();
         let (variable, write, value) = match op {
+            O::GetUniformRegister | O::SetUniformRegister => {
+                let Value::U32(index @ 0..=62) = inst.arg(0)? else {
+                    return Err(malformed());
+                };
+                let write = op == O::SetUniformRegister;
+                (
+                    Variable::UniformRegister(index as u8),
+                    write,
+                    if write { inst.arg(1)? } else { Value::None },
+                )
+            }
             O::GetRegister | O::SetRegister => {
                 let Value::Reg(reg) = inst.arg(0)? else {
                     return Err(malformed());

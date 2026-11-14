@@ -1,0 +1,24 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) buffer Semaphore { uint words[]; };
+layout(push_constant) uniform Parameters { uint index; uint payload; uint operation; uint signed_value; } p;
+
+void main() {
+    uint current = atomicAdd(words[p.index], 0);
+    for (;;) {
+        uint next;
+        switch (p.operation) {
+        case 0: next = current + p.payload; break;
+        case 1: next = p.signed_value != 0 ? uint(min(int(current), int(p.payload))) : min(current, p.payload); break;
+        case 2: next = p.signed_value != 0 ? uint(max(int(current), int(p.payload))) : max(current, p.payload); break;
+        case 3: next = current >= p.payload ? 0 : current + 1; break;
+        case 4: next = current == 0 || current > p.payload ? p.payload : current - 1; break;
+        case 5: next = current & p.payload; break;
+        case 6: next = current | p.payload; break;
+        default: next = current ^ p.payload; break;
+        }
+        uint observed = atomicCompSwap(words[p.index], current, next);
+        if (observed == current) break;
+        current = observed;
+    }
+}

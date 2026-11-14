@@ -196,6 +196,17 @@ pub fn configure_stage(
                     );
                 }
                 if !host.support_geometry_shader_passthrough {
+                    // Explicit copies only carry Position and generic varyings.
+                    // Other skip-mask bits are not geometry input built-ins.
+                    for index in 0..256 {
+                        if !(Attribute::PositionX.index()..=Attribute::Generic31W.index())
+                            .contains(&index)
+                        {
+                            p.info
+                                .passthrough
+                                .set(Attribute::from_index(index as u16).unwrap(), false);
+                        }
+                    }
                     p.execution.output_vertices =
                         topology_vertices(p.execution.output_topology.unwrap());
                     lower_geometry_passthrough(ir, p, host)?;
@@ -207,6 +218,68 @@ pub fn configure_stage(
             p.execution.shared_memory_size = m.shared_memory_size;
         }
         _ => (),
+    }
+    Ok(())
+}
+/// Remove outputs unobservable by the next stage before declaring Vulkan
+/// geometry interfaces. This also removes dead input copies from lowered
+/// passthrough programs, keeping both sides within component limits.
+// https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+pub fn prune_geometry_outputs(
+    ir: &mut Ir,
+    geometry: &mut Program,
+    fragment: &Program,
+    native_passthrough: bool,
+    xfb: bool,
+) -> Result<()> {
+    if xfb
+        || (geometry.execution.is_geometry_passthrough && native_passthrough)
+        || fragment.info.loads_indexed_attributes
+        || fragment.info.loads.legacy()
+        || geometry.info.stores.legacy()
+        || geometry.info.stores_indexed_attributes
+    {
+        return Ok(());
+    }
+    for &block in &geometry.blocks {
+        for id in ir.block(block)?.instructions().to_vec() {
+            if ir.inst(id)?.opcode() != O::SetAttribute {
+                continue;
+            }
+            let Value::Attribute(attribute) = ir.inst(id)?.arg(0)? else {
+                continue;
+            };
+            if attribute.is_generic()
+                && !fragment
+                    .info
+                    .loads
+                    .generic(attribute.generic_index()? as usize)
+            {
+                ir.invalidate(id)?;
+            }
+        }
+    }
+    for index in 0..32 {
+        if !fragment.info.loads.generic(index) {
+            for component in 0..4 {
+                let attribute = Attribute::generic(index, component).unwrap();
+                geometry.info.stores.set(attribute, false);
+                geometry.info.passthrough.set(attribute, false);
+            }
+        }
+    }
+    super::dead_code_elimination(ir, geometry)?;
+    if !geometry.info.loads_indexed_attributes {
+        geometry.info.loads = Default::default();
+        for &block in &geometry.blocks {
+            for &id in ir.block(block)?.instructions() {
+                if matches!(ir.inst(id)?.opcode(), O::GetAttribute | O::GetAttributeU32)
+                    && let Value::Attribute(attribute) = ir.inst(id)?.arg(0)?
+                {
+                    geometry.info.loads.set(attribute, true);
+                }
+            }
+        }
     }
     Ok(())
 }

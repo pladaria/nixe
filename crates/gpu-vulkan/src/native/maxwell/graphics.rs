@@ -59,7 +59,7 @@ impl crate::native::NativeExecution<'_> {
             .map_err(|error| VulkanError::Compilation(error.to_string().into()))?;
         let key = StorageBufferKey {
             descriptor: [target, space.read_u64(size_address).map_err(fail)?],
-            address_space: space.id(),
+            address_space: space.id().get(),
             mapping_generation: space.mapping_generation().get(),
             written,
         };
@@ -131,37 +131,10 @@ impl crate::native::NativeExecution<'_> {
                 address: device,
                 size: binding_size,
             },
-            gpu_address: aligned_gpu,
+            gpu_address: aligned_gpu.get(),
             native: None,
         }))
     }
-}
-
-// ConfigureImpl's enabled stages are compile-time choices, selected once when
-// the graphics pipeline is created, as in Eden's ConfigureFunc/FindSpec.
-macro_rules! graphics_stages {
-    ($mask:ident, |$stage:ident| $body:block) => {
-        if $mask & 1 != 0 {
-            const $stage: usize = 0;
-            $body
-        }
-        if $mask & 2 != 0 {
-            const $stage: usize = 1;
-            $body
-        }
-        if $mask & 4 != 0 {
-            const $stage: usize = 2;
-            $body
-        }
-        if $mask & 8 != 0 {
-            const $stage: usize = 3;
-            $body
-        }
-        if $mask & 16 != 0 {
-            const $stage: usize = 4;
-            $body
-        }
-    };
 }
 
 impl crate::native::pipeline_cache::GraphicsPipeline {

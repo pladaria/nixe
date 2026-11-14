@@ -2,7 +2,7 @@ use crate::{
     Result,
     ir::{Emitter, Value},
 };
-pub(super) fn apply(
+pub(crate) fn apply(
     ir: &mut Emitter<'_>,
     a: Value,
     b: Value,

@@ -283,7 +283,7 @@ impl PreparedTargets {
             .chain(self.stencil.iter())
     }
 }
-fn read_only_state(aspect: vk::ImageAspectFlags, state: &GraphicsState) -> bool {
+pub(crate) fn attachment_read_only(aspect: vk::ImageAspectFlags, state: &GraphicsState) -> bool {
     if aspect == vk::ImageAspectFlags::DEPTH {
         !state.depth_write
     } else if aspect == vk::ImageAspectFlags::STENCIL {
@@ -924,7 +924,7 @@ impl Residency<'_> {
                 draw,
                 push,
                 false,
-                |aspect| Ok(read_only_state(aspect, &graphics.parameters.state)),
+                |aspect| Ok(attachment_read_only(aspect, &graphics.parameters.state)),
                 |residency| {
                     residency.graphics_state(&graphics.program.pipeline, &graphics.parameters)
                 },

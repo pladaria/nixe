@@ -3,9 +3,9 @@
 //! the graphics owner consumes entries, under its existing buffer-cache guard.
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/virtual_range_cache.h
 use super::*;
-use nixe_gpu::GpuVirtualAddress;
 use nixe_gpu::native::GuestBufferRange;
-use nixe_gpu_maxwell::{MaxwellAddressSpaceId, MaxwellGpuMemory};
+use nixe_gpu::native::ImageAddressSpace;
+use nixe_gpu_maxwell::MaxwellAddressSpaceId;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, Ordering},
@@ -53,8 +53,9 @@ impl Invalidations {
     }
 }
 struct Entry {
-    address_space: MaxwellAddressSpaceId,
-    address: GpuVirtualAddress,
+    address_space: u64,
+    generation: u64,
+    address: u64,
     bytes: u64,
     segments: smallvec::SmallVec<[GuestBufferRange; 8]>,
 }
@@ -81,17 +82,18 @@ impl VirtualRangeCache {
         }
         self.entries.retain(|_, entry| {
             !pending.ranges.iter().any(|unmap| {
-                unmap.address_space == entry.address_space
-                    && entry.address.get() < unmap.address + unmap.bytes
-                    && unmap.address < entry.address.get() + entry.bytes
+                unmap.address_space.get() == entry.address_space
+                    && entry.address < unmap.address + unmap.bytes
+                    && unmap.address < entry.address + entry.bytes
             })
         });
     }
     pub(super) fn query(
         &mut self,
-        memory: &MaxwellGpuMemory,
-        address: GpuVirtualAddress,
+        memory: &impl ImageAddressSpace,
+        address: u64,
         bytes: u64,
+        generation: u64,
     ) -> Result<&[GuestBufferRange], VulkanError> {
         if self.invalidations.has_deferred.load(Ordering::Acquire) {
             self.apply_deferred();
@@ -99,8 +101,8 @@ impl VirtualRangeCache {
         if self.entries.len() > MAX_ENTRIES {
             self.entries.clear();
         }
-        let address_space = memory.id();
-        let key = (address_space.get() << 48) ^ address.get();
+        let address_space = memory.image_space_id();
+        let key = (address_space << 48) ^ address;
         use std::collections::hash_map::Entry as MapEntry;
         let entry = match self.entries.entry(key) {
             MapEntry::Occupied(occupied) => {
@@ -108,40 +110,41 @@ impl VirtualRangeCache {
                 if entry.address_space != address_space
                     || entry.address != address
                     || entry.bytes != bytes
+                    || entry.generation != generation
                 {
-                    *entry = Self::resolve(memory, address, bytes)?;
+                    *entry = Self::resolve(memory, address, bytes, generation)?;
                 }
                 entry
             }
-            MapEntry::Vacant(vacant) => vacant.insert(Self::resolve(memory, address, bytes)?),
+            MapEntry::Vacant(vacant) => {
+                vacant.insert(Self::resolve(memory, address, bytes, generation)?)
+            }
         };
         Ok(&entry.segments)
     }
     fn resolve(
-        memory: &MaxwellGpuMemory,
-        address: GpuVirtualAddress,
+        memory: &impl ImageAddressSpace,
+        address: u64,
         bytes: u64,
+        generation: u64,
     ) -> Result<Entry, VulkanError> {
-        let fail = |error: nixe_gpu_maxwell::MaxwellGpuAccessError| {
-            VulkanError::Compilation(error.to_string().into())
-        };
         let mut entry = Entry {
-            address_space: memory.id(),
+            address_space: memory.image_space_id(),
+            generation,
             address,
             bytes,
             segments: smallvec::SmallVec::new(),
         };
-        let mut expected = address.get();
-        for (gpu, size) in memory.get_submapped_range(address, bytes).map_err(fail)? {
-            if gpu.get() != expected || size == 0 || size > u64::from(u32::MAX) {
+        let mut expected = address;
+        for (gpu, size) in memory.image_mapped_ranges(address, bytes)? {
+            if gpu != expected || size == 0 || size > u64::from(u32::MAX) {
                 break;
             }
-            let device = match memory.device_address(gpu) {
-                Ok(device) if device != 0 => device,
-                Ok(_) | Err(nixe_gpu_maxwell::MaxwellGpuAccessError::UnmappedAddress { .. }) => {
-                    break;
-                }
-                Err(error) => return Err(fail(error)),
+            let Some(device) = memory
+                .image_device_address(gpu)?
+                .filter(|&device| device != 0)
+            else {
+                break;
             };
             entry.segments.push(GuestBufferRange {
                 address: device,
@@ -149,7 +152,7 @@ impl VirtualRangeCache {
             });
             expected += size;
         }
-        if expected != address.get() + bytes {
+        if expected != address + bytes {
             entry.segments.clear();
         }
         Ok(entry)

@@ -43,11 +43,9 @@ fn cbuf(info: &mut ShaderInfo, ir: &Ir, id: InstId) -> Result<()> {
         add_cbuf(info, index)?;
         info.used_constant_buffer_types |= ty;
         let used = &mut info.constant_buffer_used_sizes[index as usize];
-        *used = if let Value::U32(offset) = offset {
-            (*used).max(offset.wrapping_add(size)).wrapping_add(15) & !15
-        } else {
-            0x10000
-        };
+        let bound = unsigned_upper_bound(ir, offset, &mut 128)?;
+        let end = bound.saturating_add(size).min(0x10000);
+        *used = (*used).max(end.next_multiple_of(16));
     } else {
         info.uses_cbuf_indirect = true;
         info.used_indirect_cbuf_types |= ty;
@@ -66,6 +64,59 @@ fn cbuf(info: &mut ShaderInfo, ir: &Ir, id: InstId) -> Result<()> {
         _ => (),
     }
     Ok(())
+}
+
+/// Conservative U32 range propagation for indexed constant reads. Exhausted
+/// budgets, cycles and unrecognised operations retain the full hardware range.
+fn unsigned_upper_bound(ir: &Ir, value: Value, budget: &mut u32) -> Result<u32> {
+    if let Value::U32(value) = value {
+        return Ok(value);
+    }
+    let Value::Inst(id) = value else {
+        return Ok(u32::MAX);
+    };
+    if *budget == 0 {
+        return Ok(u32::MAX);
+    }
+    *budget -= 1;
+    let instruction = ir.inst(id)?;
+    let opcode = instruction.opcode();
+    if !matches!(
+        opcode,
+        O::Identity
+            | O::UMin32
+            | O::UMax32
+            | O::BitwiseAnd32
+            | O::IAdd32
+            | O::IMul32
+            | O::ShiftLeftLogical32
+            | O::ShiftRightLogical32
+            | O::SelectU32
+    ) {
+        return Ok(u32::MAX);
+    }
+    if opcode == O::SelectU32 {
+        let yes = unsigned_upper_bound(ir, arg(ir, id, 1)?, budget)?;
+        let no = unsigned_upper_bound(ir, arg(ir, id, 2)?, budget)?;
+        return Ok(yes.max(no));
+    }
+    let a = unsigned_upper_bound(ir, arg(ir, id, 0)?, budget)?;
+    if opcode == O::Identity {
+        return Ok(a);
+    }
+    let b_value = arg(ir, id, 1)?;
+    let b = unsigned_upper_bound(ir, b_value, budget)?;
+    Ok(match opcode {
+        O::UMin32 | O::BitwiseAnd32 => a.min(b),
+        O::UMax32 => a.max(b),
+        O::IAdd32 => a.saturating_add(b),
+        O::IMul32 => a.saturating_mul(b),
+        O::ShiftLeftLogical32 if matches!(b_value, Value::U32(0..32)) => {
+            u32::try_from(u64::from(a) << b).unwrap_or(u32::MAX)
+        }
+        O::ShiftRightLogical32 if matches!(b_value, Value::U32(0..32)) => a >> b,
+        _ => u32::MAX,
+    })
 }
 fn fp_control(info: &mut ShaderInfo, ir: &Ir, id: InstId) -> Result<()> {
     let width = match ir.inst(id)?.opcode() {

@@ -564,6 +564,53 @@ impl nixe_gpu::native::ImageAddressSpace for GpuAddressSpace {
 }
 
 impl nixe_gpu_ampere::RenderMemory for GpuAddressSpace {
+    fn buffer_layout_size(&self, address: u64) -> nixe_gpu_ampere::Result<u64> {
+        if let Some((_, region)) = self.regions.range(..=address).next_back()
+            && address < region.end
+        {
+            let preceding = self.mappings.range(..=address).next_back();
+            let kind = preceding
+                .filter(|(_, mapping)| address < mapping.end)
+                .map_or(0, |(_, mapping)| mapping.kind);
+            let begin = preceding.map_or(address, |(&start, _)| start);
+            let mut end = address;
+            for (&start, mapping) in self.mappings.range(begin..region.end) {
+                if mapping.end <= end {
+                    continue;
+                }
+                if start > end {
+                    if kind != 0 {
+                        return Ok(end - address);
+                    }
+                    end = start;
+                }
+                if mapping.kind != kind {
+                    return Ok(end - address);
+                }
+                end = mapping.end.min(region.end);
+            }
+            return Ok(if kind == 0 { region.end } else { end } - address);
+        }
+        let Some((&start, first)) = self
+            .mappings
+            .range(..=address)
+            .next_back()
+            .filter(|(_, mapping)| address < mapping.end)
+        else {
+            return Err("unmapped native buffer pointer".into());
+        };
+        let mut end = first.end;
+        for (&next, mapping) in self
+            .mappings
+            .range((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded))
+        {
+            if next != end || mapping.kind != first.kind {
+                break;
+            }
+            end = mapping.end;
+        }
+        Ok(end - address)
+    }
     fn capture_memory(
         &mut self,
         address: u64,
@@ -578,7 +625,34 @@ impl nixe_gpu_ampere::RenderMemory for GpuAddressSpace {
     }
 
     fn prepare_image(&mut self, address: u64, bytes: u64) -> nixe_gpu_ampere::Result<()> {
-        self.commit_native_pages(address, bytes)
-            .map_err(|e| e.to_string().into())
+        let end = address
+            .checked_add(bytes)
+            .filter(|&end| bytes != 0 && address >= VA_START && end <= VA_END)
+            .ok_or("invalid native image range")?;
+        // Image footprints include tile padding and may span holes. Commit only
+        // server-backed regions; existing CPU mappings retain their own pages.
+        // The physical image cache captures the mapped portions and represents
+        // the remaining footprint with its sparse mapping contract.
+        // @SPECULATIVE: native unmapped image bytes follow the reference's
+        // read-zero/discard-write policy; hardware fault semantics are undocumented.
+        // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/memory_manager.cpp#L470-L515
+        let mut at = address;
+        while at < end {
+            let region = self
+                .regions
+                .range(..=at)
+                .next_back()
+                .filter(|(_, region)| region.end > at)
+                .or_else(|| self.regions.range(at..end).next());
+            let Some((&start, region)) = region else {
+                break;
+            };
+            let low = at.max(start);
+            let high = end.min(region.end);
+            self.commit_native_pages(low, high - low)
+                .map_err(|e| e.to_string().into_boxed_str())?;
+            at = high;
+        }
+        Ok(())
     }
 }

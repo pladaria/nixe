@@ -245,6 +245,7 @@ pub struct TransformFeedbackVarying {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeInfo {
+    pub instance_offset: bool,
     pub generic_input_types: [AttributeType; 32],
     pub previous_stage_stores: VaryingState,
     pub previous_stage_legacy_stores_mapping: BTreeMap<Attribute, Attribute>,
@@ -269,6 +270,7 @@ pub struct RuntimeInfo {
 impl Default for RuntimeInfo {
     fn default() -> Self {
         Self {
+            instance_offset: false,
             generic_input_types: [AttributeType::Float; 32],
             previous_stage_stores: VaryingState::default(),
             previous_stage_legacy_stores_mapping: BTreeMap::new(),

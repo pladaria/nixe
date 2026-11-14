@@ -45,11 +45,11 @@ impl EmitContext<'_> {
                 .index
                 .0
                 .checked_add(d.count)
-                .filter(|&end| end <= 18)
+                .filter(|&end| end as usize <= self.cbufs.len())
                 .ok_or_else(|| {
                     CompileError::new(
                         FailureCategory::ResourceLimit,
-                        "Constant buffer descriptor range exceeds 18 banks",
+                        "Constant buffer descriptor range exceeds compiler capacity",
                     )
                 })?;
             for bank in d.index.0..end {
@@ -133,11 +133,11 @@ impl EmitContext<'_> {
             self.bind(id, binding)?;
             let end = index
                 .checked_add(d.count)
-                .filter(|&end| end <= 32)
+                .filter(|&end| end as usize <= self.ssbos.len())
                 .ok_or_else(|| {
                     CompileError::new(
                         FailureCategory::ResourceLimit,
-                        "Storage descriptor range exceeds 32 slots",
+                        "Storage descriptor range exceeds compiler capacity",
                     )
                 })?;
             for slot in index..end {

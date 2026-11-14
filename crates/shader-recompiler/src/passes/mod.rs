@@ -87,7 +87,8 @@ pub use stage::{
 mod geometry;
 pub use geometry::{
     configure_stage, generate_geometry_passthrough, geometry_compaction,
-    has_broken_shuffle_pattern, lower_geometry_passthrough, topology_vertices,
+    has_broken_shuffle_pattern, lower_geometry_passthrough, prune_geometry_outputs,
+    topology_vertices,
 };
 mod rescaling;
 mod vendor;

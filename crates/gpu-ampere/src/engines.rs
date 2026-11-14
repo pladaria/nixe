@@ -28,10 +28,26 @@ impl Default for GraphicsState {
         }
     }
 }
+/// A completed native primitive, with a consecutive range of hardware instance IDs.
+#[derive(Clone, Copy, Debug)]
+pub struct Draw {
+    pub source: Source,
+    pub first_instance: u32,
+    pub instances: u32,
+}
 pub trait PreparationHost {
     fn read(&mut self, address: u64, bytes: usize) -> Result<Vec<u8>>;
     fn write(&mut self, address: u64, bytes: Vec<u8>) -> Result<()>;
     fn report(&mut self, address: u64, bytes: Vec<u8>) -> Result<()>;
+    fn reduce_report(
+        &mut self,
+        address: u64,
+        payload: u32,
+        operation: u32,
+        signed: bool,
+    ) -> Result<()>;
+    fn reset_samples_passed(&mut self) -> Result<()>;
+    fn report_samples_passed(&mut self, address: u64, short: bool) -> Result<()>;
     fn barrier(&mut self) -> Result<()>;
     fn fragment_barrier(&mut self, before_depth: bool) -> Result<()>;
     fn invalidate_texture_data(&mut self) -> Result<()>;
@@ -39,12 +55,7 @@ pub trait PreparationHost {
     fn stopped(&self) -> bool;
     fn blit(&mut self, source: Source, operation: &crate::blit::Blit) -> Result<()>;
     fn dispatch(&mut self, launch: &compute::Launch, registers: &Registers) -> Result<()>;
-    fn draw(
-        &mut self,
-        source: Source,
-        registers: &Registers,
-        state: &mut GraphicsState,
-    ) -> Result<()>;
+    fn draw(&mut self, draw: Draw, registers: &Registers, state: &mut GraphicsState) -> Result<()>;
     fn clear(
         &mut self,
         source: Source,
@@ -69,6 +80,9 @@ struct Engine {
     root_table: usize,
     root_offset: usize,
     primitive: bool,
+    instance: u32,
+    count: Option<Source>,
+    pending: Option<Draw>,
 }
 impl Engine {
     fn new(class: Class) -> Self {
@@ -79,7 +93,38 @@ impl Engine {
             root_table: 0,
             root_offset: 0,
             primitive: false,
+            instance: 0,
+            count: None,
+            pending: None,
         }
+    }
+    fn flush(&mut self, host: &mut impl PreparationHost) -> Result<()> {
+        if let Some(draw) = self.pending.take() {
+            host.draw(draw, &self.regs, self.graphics.as_mut().unwrap())
+                .map_err(|error| draw.source.error(error))?;
+        }
+        Ok(())
+    }
+    fn end(&mut self, host: &mut impl PreparationHost) -> Result<()> {
+        let Some(source) = self.count.take() else {
+            return Err("primitive END without a supported vertex/index count".into());
+        };
+        if let Some(pending) = self.pending.as_mut()
+            && pending.source.method == source.method
+            && pending.source.argument == source.argument
+            && pending.first_instance.checked_add(pending.instances) == Some(self.instance)
+            && pending.instances != u32::MAX
+        {
+            pending.instances += 1;
+            return Ok(());
+        }
+        self.flush(host)?;
+        self.pending = Some(Draw {
+            source,
+            first_instance: self.instance,
+            instances: 1,
+        });
+        Ok(())
     }
 }
 pub struct Preparation {
@@ -102,6 +147,11 @@ impl Default for Preparation {
     }
 }
 impl Preparation {
+    /// Drain before coherent frontend dependencies, channel switches and host access.
+    /// BEGIN/END state and the instance counter survive a split command stream.
+    pub fn flush(&mut self, host: &mut impl PreparationHost) -> Result<()> {
+        self.engines[Class::ThreeD.index()].flush(host)
+    }
     pub fn execute(
         &mut self,
         source: Source,
@@ -114,11 +164,26 @@ impl Preparation {
             return Ok(());
         }
         if m < 0x100 {
+            self.flush(host)?;
             return self.host_method(m, value, host);
         }
         let class = Class::from_id(source.class)?;
+        if class != Class::ThreeD {
+            self.flush(host)?;
+        }
         let engine = &mut self.engines[class.index()];
         let (name, plain) = registers::method(class, m).ok_or("unknown prepared method")?;
+        let previous = engine.regs.get(m);
+        if class == Class::ThreeD {
+            let continuing = match m {
+                0x1618 => (value >> 26) & 3 != 0 && (previous ^ value) & 0xffff == 0,
+                0x1614 | 0xd78 | 0x17e0 => true,
+                _ => plain && previous == value,
+            };
+            if !continuing {
+                engine.flush(host)?;
+            }
+        }
         if engine.regs.set(m, value)
             && let Some(graphics) = engine.graphics.as_mut()
         {
@@ -133,13 +198,13 @@ impl Preparation {
                 0x17c8..=0x17d8 => graphics.index_dirty = true,
                 // Draw arguments and resource contents do not change fixed state.
                 0x17dc..=0x17f8 | 0xd74..=0xd78 | 0x2380..=0x2490 => (),
-                0x1618 => graphics.preparation_dirty = true,
+                0x1618 => graphics.preparation_dirty |= (previous ^ value) & 0xffff != 0,
                 _ if plain => graphics.preparation_dirty = true,
                 _ => (),
             }
             graphics.targets_dirty |= match m {
                 0x800..=0x9e4 => 1 << ((m - 0x800) / 0x40),
-                0xfe0..=0xff0 | 0x1228..=0x1230 | 0x1538 | 0x1594 => 0x100,
+                0xfe0..=0xff0 | 0x1228..=0x1230 | 0x1538 => 0x100,
                 0xfb8 | 0x121c => 0x1ff,
                 _ => 0,
             };
@@ -254,12 +319,25 @@ impl Preparation {
                 }
                 0x1b0c => {
                     // https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/common/sdk/nvidia/inc/class/clc797.h
-                    // C797 report semaphore: release or timestamp only; queries
-                    // and acquire/reduction modes require their own consumers.
+                    // C797 report semaphore: literal, timestamp and sample-count
+                    // results have separate publication paths. Acquire/reduction
+                    // modes require their own consumers.
                     if value & !0x1f80_f017 != 0 || !matches!(value & 3, 0 | 2) {
                         return Err("unsupported graphics semaphore operation/flags".into());
                     }
                     let report = (value >> 23) & 31;
+                    if report == 21 {
+                        if value & !0x1a80_f007 != 0 || value & 3 != 2 || (value >> 12) & 15 != 15 {
+                            return Err("unsupported sample-count report operation/location".into());
+                        }
+                        // DisableFlush changes cache maintenance, not the query
+                        // result or ordering. The shared query path already
+                        // establishes the result-buffer dependency explicitly.
+                        return host.report_samples_passed(
+                            regs.address(0x1b00, 0x1b04),
+                            value & (1 << 28) != 0,
+                        );
+                    }
                     if report != 0 && report != 20 {
                         return Err("graphics query report not implemented".into());
                     }
@@ -285,6 +363,16 @@ impl Preparation {
                         bytes
                     };
                     return host.report(address, bytes);
+                }
+                0x1530 => {
+                    // Clear the actual occlusion accumulator. Z-cull metadata
+                    // has no separate host representation to clear.
+                    // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clc797.h
+                    return match value {
+                        1 => host.reset_samples_passed(),
+                        2 => Ok(()),
+                        _ => Err(format!("unsupported graphics counter reset {value:#x}").into()),
+                    };
                 }
                 0x2310 => {
                     validate_firmware_write(value)?;
@@ -334,6 +422,20 @@ impl Preparation {
                     if engine.primitive {
                         return Err("nested primitive BEGIN".into());
                     }
+                    // Instance selection is stateful across BEGIN/END pairs;
+                    // each draw consumes the current index plus the global base.
+                    // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/engines/draw_manager.cpp#L233-L246
+                    if value & !0x0c00ffff != 0 {
+                        return Err(
+                            format!("unsupported primitive-ID/split BEGIN {value:#x}").into()
+                        );
+                    }
+                    engine.instance = match (value >> 26) & 3 {
+                        0 => 0,
+                        1 => engine.instance.wrapping_add(1),
+                        2 => engine.instance,
+                        _ => return Err("reserved primitive instance mode".into()),
+                    };
                     engine.primitive = true;
                     return Ok(());
                 }
@@ -341,18 +443,22 @@ impl Preparation {
                     if !engine.primitive {
                         return Err("END without BEGIN".into());
                     }
+                    if value > 1 {
+                        return Err("invalid primitive END argument".into());
+                    }
                     engine.primitive = false;
-                    return Ok(());
+                    return engine.end(host);
                 }
                 0xd78 | 0x17e0 => {
                     if !engine.primitive {
                         return Err("draw without BEGIN".into());
                     }
-                    return host.draw(source, regs, graphics);
+                    engine.count = Some(source);
+                    return Ok(());
                 }
                 0x19d0 => return host.clear(source, regs, graphics),
                 0x26c | 0x274 | 0x304 | 0x1214 | 0x1218 | 0x123c | 0x17e4..=0x17f8 => {
-                    return host.draw(source, regs, graphics);
+                    return Err(format!("native draw method {m:#x} is not implemented").into());
                 }
                 0x2390..=0x23cc => {
                     let offset = regs.get(0x238c);

@@ -251,14 +251,21 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c
                 CommonStateGetterCommand::SetCpuBoostMode => {
                     let mode = request_u32(request.data, 0).expect("validated u32 payload");
-                    if mode > 1 {
+                    let native = process.cpu().platform() == nixe_cpu::platform::TargetPlatform::Switch2;
+                    // @SPECULATIVE: native clients also request mode 2 (their
+                    // SDK validates 0/2). Retain that distinct policy, following
+                    // the reference's three-valued APM contract; its native
+                    // hardware clock configuration is not documented. Emulated
+                    // execution stays unthrottled and the counter is unchanged.
+                    // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/apm/apm_controller.h
+                    if mode > if native { 2 } else { 1 } {
                         return applet_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
                     }
-                    session.set_cpu_boost_enabled(mode == 1);
+                    session.set_cpu_boost_mode(mode);
                     applet_data(request.token, &[])
                 }
                 CommonStateGetterCommand::CancelCpuBoostMode => {
-                    session.set_cpu_boost_enabled(false);
+                    session.set_cpu_boost_mode(0);
                     applet_data(request.token, &[])
                 }
                 CommonStateGetterCommand::GetEventHandle => {

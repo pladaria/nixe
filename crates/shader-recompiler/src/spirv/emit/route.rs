@@ -16,15 +16,20 @@ pub enum EmissionRoute {
     Atomic,
     Image,
     Warp,
+    Matrix,
 }
 
 pub const fn emission_route(opcode: O) -> EmissionRoute {
     match opcode {
+        O::MatrixMultiplyF16 => EmissionRoute::Matrix,
         O::Phi => EmissionRoute::Phi,
         O::Identity | O::ConditionRef => EmissionRoute::Identity,
         O::Void | O::Reference => EmissionRoute::Noop,
         O::PhiMove
+        | O::VerifyReturn
         | O::GetRegister
+        | O::GetUniformRegister
+        | O::SetUniformRegister
         | O::SetRegister
         | O::GetPred
         | O::SetPred
@@ -426,6 +431,8 @@ pub const fn emission_route(opcode: O) -> EmissionRoute {
         | O::FPUnordGreaterThanEqual32
         | O::FPUnordGreaterThanEqual64
         | O::IAdd32
+        | O::UMulExtended32
+        | O::SMulExtended32
         | O::BitwiseAnd32
         | O::BitwiseOr32
         | O::BitwiseXor32

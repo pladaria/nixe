@@ -139,6 +139,12 @@ impl<E: Environment, T: CodeTranslator<E>, L: Address, S> Builder<'_, E, T, L, S
                         }
                     }
                 }
+                StatementKind::VerifyReturn { reg, target } => {
+                    let block = self.ensure_block(&mut current)?;
+                    let mut emit = Emitter::new(self.ir, block)?;
+                    let value = emit.get_reg(reg)?;
+                    emit.emit(Opcode::VerifyReturn, &[value, Value::U32(target)], 0)?;
+                }
                 StatementKind::SetVariable { id, value } => {
                     let block = self.ensure_block(&mut current)?;
                     let mut emit = Emitter::new(self.ir, block)?;

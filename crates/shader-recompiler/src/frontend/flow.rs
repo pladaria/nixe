@@ -75,6 +75,10 @@ pub struct FlowBlock<L, S> {
     pub branch_false: Option<FlowBlockId>,
     pub function_call: Option<FunctionId>,
     pub return_block: Option<FlowBlockId>,
+    /// Software link value at this call site, when the ISA has no return stack.
+    pub call_link: Option<u32>,
+    /// A software return must be proven to recover the caller's link value.
+    pub return_register: Option<Reg>,
     pub branch_reg: Reg,
     pub branch_offset: i32,
     pub indirect_branches: Vec<IndirectBranch>,
@@ -92,6 +96,8 @@ impl<L: Address, S> FlowBlock<L, S> {
             branch_false: None,
             function_call: None,
             return_block: None,
+            call_link: None,
+            return_register: None,
             branch_reg: Reg(0),
             branch_offset: 0,
             indirect_branches: Vec::new(),

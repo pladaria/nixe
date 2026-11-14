@@ -34,6 +34,16 @@ pub struct Pred(u8);
 
 impl Pred {
     pub const PT: Self = Self(7);
+    /// Uniform predicates occupy a separate SSA namespace. Both constant-true
+    /// predicates canonicalize to PT, so flow simplification remains shared.
+    pub fn uniform(index: u8) -> Result<Self> {
+        let pred = Self::new(index)?;
+        Ok(if pred == Self::PT {
+            pred
+        } else {
+            Self(index + 8)
+        })
+    }
     pub fn new(index: u8) -> Result<Self> {
         if index <= 7 {
             Ok(Self(index))

@@ -315,7 +315,11 @@ pub(super) fn simple_usages(info: &mut ShaderInfo, op: O) {
     }
     if matches!(
         op,
-        O::ShuffleIndex | O::ShuffleUp | O::ShuffleDown | O::ShuffleButterfly
+        O::ShuffleIndex
+            | O::ShuffleUp
+            | O::ShuffleDown
+            | O::ShuffleButterfly
+            | O::MatrixMultiplyF16
     ) {
         info.uses_subgroup_shuffles = true;
     }

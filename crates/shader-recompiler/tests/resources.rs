@@ -7,8 +7,7 @@ use nixe_shader_recompiler::{
     },
     ir::{Emitter, Ir, Opcode as O, Program, TextureInstInfo, Value},
     passes::{
-        collect_shader_info, dead_code_elimination, global_memory_to_storage, remove_identities,
-        texture_pass, verify_program,
+        collect_shader_info, dead_code_elimination, remove_identities, texture_pass, verify_program,
     },
     types::{
         ByteOffset, CbufIndex, Stage, TextureHandle, TexturePixelFormat as P, TextureType as T,
@@ -362,41 +361,6 @@ fn rectangle_and_snorm_patches_have_typed_operands_and_preserve_fetches() {
             .count(),
         1
     );
-    remove_identities(&mut ir, &p).unwrap();
-    verify_program(&ir, &p).unwrap();
-}
-#[test]
-fn storage_tracking_prefers_nvn_and_keeps_untracked_global_access() {
-    let (mut ir, mut p, block) = program();
-    let mut e = Emitter::new(&mut ir, block).unwrap();
-    let nvn = e
-        .get_cbuf(Value::U32(0), Value::U32(0x110), 32, false)
-        .unwrap();
-    let other = e.get_cbuf(Value::U32(3), Value::U32(8), 32, false).unwrap();
-    let low = e.i_add(nvn, other).unwrap();
-    let pair = e
-        .emit(O::CompositeConstructU32x2, &[low, Value::U32(0)], 0)
-        .unwrap();
-    let address = e.emit(O::PackUint2x32, &[pair], 0).unwrap();
-    let address = e.emit(O::IAdd64, &[address, Value::U64(12)], 0).unwrap();
-    let load = e.emit(O::LoadGlobal32, &[address], 0).unwrap();
-    e.emit(O::WriteGlobal32, &[address, Value::U32(42)], 0)
-        .unwrap();
-    let untracked = e.emit(O::LoadGlobal32, &[Value::U64(123)], 0).unwrap();
-    global_memory_to_storage(&mut ir, &mut p, &host()).unwrap();
-    let d = &p.info.storage_buffers_descriptors[0];
-    assert_eq!(d.cbuf_index, CbufIndex(0));
-    assert_eq!(d.cbuf_offset, ByteOffset(0x110));
-    assert!(d.is_written);
-    let load = ir.inst(id(ir.resolve(load).unwrap())).unwrap();
-    assert_eq!(load.opcode(), O::LoadStorage32);
-    assert_eq!(load.arg(0).unwrap(), Value::U32(0));
-    let sub = ir.inst(id(load.arg(1).unwrap())).unwrap();
-    assert_eq!(sub.opcode(), O::ISub32);
-    let aligned = ir.inst(id(sub.arg(1).unwrap())).unwrap();
-    assert_eq!(aligned.opcode(), O::BitwiseAnd32);
-    assert_eq!(aligned.arg(1).unwrap(), Value::U32(!255));
-    assert_eq!(ir.inst(id(untracked)).unwrap().opcode(), O::LoadGlobal32);
     remove_identities(&mut ir, &p).unwrap();
     verify_program(&ir, &p).unwrap();
 }

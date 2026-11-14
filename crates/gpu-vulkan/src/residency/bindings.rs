@@ -46,7 +46,9 @@ impl Default for BufferChannel {
             index_buffer: None,
             uniform_buffers: Vec::new(),
             uniform_bind_changes: [0; nixe_gpu_maxwell::MAXWELL_BIND_GROUP_COUNT],
-            storage_buffers: std::array::from_fn(|_| vec![None; 16].into_boxed_slice()),
+            storage_buffers: std::array::from_fn(|_| {
+                vec![None; nixe_shader_recompiler::artifact::MAX_SSBOS].into_boxed_slice()
+            }),
             compute_uniform_buffers: vec![None; 8].into_boxed_slice(),
             has_deleted_buffers: false,
             streamed_uniforms: [0; 6],
@@ -62,6 +64,9 @@ impl Default for BufferChannel {
 #[derive(Clone, Copy)]
 pub(crate) struct UniformBuffer {
     pub(crate) source: GuestBufferRange,
+    /// Shader coverage already resolved against the current guest mapping.
+    /// A hardware bank may declare more bytes than its backed extent.
+    pub(crate) resolved_size: u64,
     pub(crate) native: Option<BufferRange>,
 }
 /// Descriptor contents and virtual mappings identify a storage selection.
@@ -69,7 +74,7 @@ pub(crate) struct UniformBuffer {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StorageBufferKey {
     pub(crate) descriptor: [u64; 2],
-    pub(crate) address_space: nixe_gpu_maxwell::MaxwellAddressSpaceId,
+    pub(crate) address_space: u64,
     pub(crate) mapping_generation: u64,
     pub(crate) written: bool,
 }
@@ -77,7 +82,7 @@ pub(crate) struct StorageBufferKey {
 pub(crate) struct StorageBuffer {
     pub(crate) key: StorageBufferKey,
     pub(crate) source: GuestBufferRange,
-    pub(crate) gpu_address: nixe_gpu::GpuVirtualAddress,
+    pub(crate) gpu_address: u64,
     pub(crate) native: Option<StorageBufferBinding>,
 }
 #[derive(Clone)]
@@ -191,6 +196,7 @@ impl BufferBindings {
             return;
         }
         self.channel.compute_uniform_buffers[slot] = Some(UniformBuffer {
+            resolved_size: source.size,
             source,
             native: None,
         });
@@ -210,6 +216,7 @@ impl BufferBindings {
         }
         self.channel.uniform_buffers[group as usize][slot as usize] =
             source.map(|source| UniformBuffer {
+                resolved_size: source.size,
                 source,
                 native: None,
             });
@@ -451,7 +458,7 @@ impl Residency<'_> {
         &mut self,
         stage: usize,
         slot: usize,
-        space: &nixe_gpu_maxwell::MaxwellGpuMemory,
+        space: &impl nixe_gpu::native::ImageAddressSpace,
     ) -> Result<(), VulkanError> {
         self.invalidate_device_mappings()?;
         let Some(binding) =
@@ -465,29 +472,31 @@ impl Residency<'_> {
         let source = binding.source;
         let gpu_address = binding.gpu_address;
         let written = binding.key.written;
-        let ordinary = self.device_buffer(
-            source.address,
-            source.size,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            false,
-            false,
-        )?;
-        // UpdateStorageBuffers resolves the current ordinary buffer first,
-        // then consumes VirtualRangeCache, as ResolveMultiRangeStorage does.
-        // Copy only genuine scatter regions before FindBuffer can mutate slots.
-        let segments = self
-            .buffer_cache
-            .virtual_ranges
-            .query(space, gpu_address, source.size)?;
+        let generation = binding.key.mapping_generation;
+        // Resolve scatter geometry before allocating physical storage. A
+        // fragmented virtual span must not allocate an unused contiguous
+        // buffer across unrelated device addresses. Copy only scatter regions
+        // before buffer lookup can mutate the cache's slots.
+        let segments =
+            self.buffer_cache
+                .virtual_ranges
+                .query(space, gpu_address, source.size, generation)?;
         let multiple = (segments.len() >= 2)
             .then(|| smallvec::SmallVec::<[GuestBufferRange; 8]>::from_slice(segments));
         let native = if let Some(segments) = multiple {
             StorageBufferBinding::MultiRange(self.multi_range_storage(
-                (space.id().get() << 48) ^ gpu_address.get(),
+                (space.image_space_id() << 48) ^ gpu_address,
                 &segments,
                 written,
             )?)
         } else {
+            let ordinary = self.device_buffer(
+                source.address,
+                source.size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                false,
+                false,
+            )?;
             StorageBufferBinding::Buffer(ordinary)
         };
         self.runtime.buffer_bindings.channel.storage_buffers[stage][slot]

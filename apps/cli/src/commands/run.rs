@@ -179,24 +179,23 @@ fn run_machine(
         file_system_access_log_override,
     } = arguments;
     let frontend_stop_requested = Arc::new(AtomicBool::new(false));
-    let (mut frontend, frontend_control, presenter, touch_screen) =
-        if headless || machine_profile.graphics() == GraphicsGeneration::Ampere {
-            log::info!("headless presentation enabled; no host window will be created");
-            (None, None, None, None)
-        } else {
-            let mut frontend = WindowFrontend::new(Arc::clone(&frontend_stop_requested))
-                .map_err(|error| error.to_string())?
-                .with_smooth_motion(smooth_motion);
-            let control = frontend.control();
-            let mailbox = frontend.mailbox();
-            let touch_screen = frontend.take_touch_screen();
-            (
-                Some(frontend),
-                Some(control),
-                Some(mailbox),
-                Some(touch_screen),
-            )
-        };
+    let (mut frontend, frontend_control, presenter, touch_screen) = if headless {
+        log::info!("headless presentation enabled; no host window will be created");
+        (None, None, None, None)
+    } else {
+        let mut frontend = WindowFrontend::new(Arc::clone(&frontend_stop_requested))
+            .map_err(|error| error.to_string())?
+            .with_smooth_motion(smooth_motion);
+        let control = frontend.control();
+        let mailbox = frontend.mailbox();
+        let touch_screen = frontend.take_touch_screen();
+        (
+            Some(frontend),
+            Some(control),
+            Some(mailbox),
+            Some(touch_screen),
+        )
+    };
     let scheduler_profile = machine_profile.scheduler().clone();
     log::info!(
         "machine: platform={:?} cores={} counter_hz={} RAM={} MiB application_pool={} MiB graphics={:?}",
@@ -368,15 +367,25 @@ fn run_machine(
     options.anti_aliasing = config.video.anti_aliasing;
     let (up_scale, down_shift) = config.gpu.resolution_scale.ratio();
     options.resolution_scale = nixe_gpu_vulkan::ResolutionScaling::new(up_scale, down_shift);
+    let (device, native_presentation) = if let Some(frontend) = frontend.as_mut() {
+        let (device, client) = frontend
+            .create_vulkan_device(options)
+            .map_err(|e| e.to_string())?;
+        (device, Some(client))
+    } else {
+        (
+            nixe_gpu_vulkan::VulkanDevice::new(options, None).map_err(|e| e.to_string())?,
+            None,
+        )
+    };
+    log::info!(
+        "GPU backend initialized: api=Vulkan native adapter={}",
+        device.profile().name
+    );
+    let vsync = config.video.vsync;
     let (video_system, gpu_diagnostics) = if machine_profile.graphics()
         == GraphicsGeneration::Ampere
     {
-        let device =
-            nixe_gpu_vulkan::VulkanDevice::new(options, None).map_err(|e| e.to_string())?;
-        log::info!(
-            "GPU backend initialized: api=Vulkan native adapter={}",
-            device.profile().name
-        );
         let memory = nixe_memory::device_memory::DeviceMemory::new(
             process.memory().space().machine().clone(),
             40,
@@ -391,36 +400,28 @@ fn run_machine(
             ),
             ..Default::default()
         };
-        horizon_environment.ampere_graphics =
-            Some(nixe_horizon::AmpereGraphics::new(memory, move || {
-                nixe_gpu_vulkan::NativeGpuExecution::new(
+        horizon_environment.ampere_graphics = Some(nixe_horizon::AmpereGraphics::new(
+            memory,
+            presenter,
+            move || {
+                let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
                     native_memory,
                     device,
                     cache_configuration,
                     u64::MAX,
                 )
-                .map_err(|e| nixe_gpu::BackendRuntimeError::Backend(e.to_string().into()))
-            }));
-        log::info!(
-            "Ampere command engines and native Vulkan targets enabled; shader translation is not implemented"
-        );
+                .map_err(|e| nixe_gpu::BackendRuntimeError::Backend(e.to_string().into()))?;
+                if let Some(client) = native_presentation {
+                    renderer.attach_presentation(client, vsync).map_err(|e| {
+                        nixe_gpu::BackendRuntimeError::Backend(e.to_string().into())
+                    })?;
+                }
+                Ok(renderer)
+            },
+        ));
+        log::info!("Ampere command engines, native shaders and Vulkan presentation enabled");
         (None, None)
     } else {
-        let (device, native_presentation) = if let Some(frontend) = frontend.as_mut() {
-            let (device, client) = frontend
-                .create_vulkan_device(options)
-                .map_err(|e| e.to_string())?;
-            (device, Some(client))
-        } else {
-            (
-                nixe_gpu_vulkan::VulkanDevice::new(options, None).map_err(|e| e.to_string())?,
-                None,
-            )
-        };
-        log::info!(
-            "GPU backend initialized: api=Vulkan native adapter={}",
-            device.profile().name
-        );
         let device_memory =
             nixe_gpu_maxwell::MaxwellDeviceMemory::new(process.memory().space().machine().clone());
         let cache_directory = config
@@ -440,7 +441,6 @@ fn run_machine(
             frontend
         };
         let native_memory = device_memory.device().clone();
-        let vsync = config.video.vsync;
         let initialize = move || {
             let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
                 native_memory,

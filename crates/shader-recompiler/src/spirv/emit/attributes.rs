@@ -45,6 +45,35 @@ impl EmitContext<'_> {
         )
     }
     fn integer_attribute(&mut self, attr: A) -> Result<Id> {
+        let value = self.integer_attribute_unadjusted(attr)?;
+        if self.runtime.instance_offset && matches!(attr, A::InstanceId | A::BaseInstance) {
+            let pointer_type = self
+                .builder
+                .type_pointer(StorageClass::PushConstant, self.types.u32[0])?;
+            let pointer = self.op(
+                Op::AccessChain,
+                pointer_type,
+                &[
+                    self.objects.instance_offset_push_constants,
+                    self.objects.instance_offset_member,
+                ],
+            )?;
+            let offset = self.op(Op::Load, self.types.u32[0], &[pointer])?;
+            // Vulkan starts InstanceId at zero for each host draw. Keep the
+            // hardware counter and guest BaseInstance across split sequences.
+            return self.op(
+                if attr == A::InstanceId {
+                    Op::IAdd
+                } else {
+                    Op::ISub
+                },
+                self.types.u32[0],
+                &[value, offset],
+            );
+        }
+        Ok(value)
+    }
+    fn integer_attribute_unadjusted(&mut self, attr: A) -> Result<Id> {
         let object = match attr {
             A::PrimitiveId => self.objects.primitive_id,
             A::Layer => self.objects.layer,

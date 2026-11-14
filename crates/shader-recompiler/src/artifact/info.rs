@@ -204,3 +204,18 @@ pub struct ShaderInfo {
     pub image_descriptors: Vec<ImageDescriptor>,
     pub handle_programs: Vec<super::HandleProgram>,
 }
+
+impl ShaderInfo {
+    /// Only descriptors actually consumed by the runtime bounds search carry
+    /// NVN's address/size record. Other native pointers can occupy the same bank.
+    pub fn uses_nvn_descriptor(&self, descriptor: &StorageBufferDescriptor) -> bool {
+        let Some(offset) = descriptor.cbuf_offset.0.checked_sub(self.nvn_buffer_base) else {
+            return false;
+        };
+        self.uses_global_memory
+            && descriptor.cbuf_index.0 == 0
+            && offset < 16 * 16
+            && offset.is_multiple_of(16)
+            && self.nvn_buffer_used & (1 << (offset / 16)) != 0
+    }
+}

@@ -38,6 +38,10 @@ pub enum StatementKind {
         reg: Reg,
         offset: i32,
     },
+    VerifyReturn {
+        reg: Reg,
+        target: u32,
+    },
     Variable(u32),
     IndirectCondition(u32),
 }
@@ -263,7 +267,7 @@ impl StatementTree {
         label_id: &mut u32,
         gotos: &mut Vec<StatementId>,
         before: Option<StatementId>,
-        return_label: Option<StatementId>,
+        return_label: Option<(StatementId, Option<u32>)>,
         calls: &mut Vec<FunctionId>,
     ) -> Result<()> {
         if calls.contains(&function) {
@@ -383,7 +387,7 @@ impl StatementTree {
                         label_id,
                         gotos,
                         ip,
-                        Some(lookup(block.return_block)?),
+                        Some((lookup(block.return_block)?, block.call_link)),
                         calls,
                     )?;
                 }
@@ -392,8 +396,17 @@ impl StatementTree {
                 }
                 EndClass::Return => {
                     let condition = self.allocate(StatementKind::Identity(block.condition))?;
-                    let label = return_label
+                    let (label, link) = return_label
                         .ok_or_else(|| internal("Return outside a called shader function"))?;
+                    if let Some(reg) = block.return_register {
+                        let target =
+                            link.ok_or_else(|| internal("Software return lacks caller link"))?;
+                        self.insert_new(
+                            self.root,
+                            ip,
+                            StatementKind::VerifyReturn { reg, target },
+                        )?;
+                    }
                     gotos.push(self.insert_new(
                         self.root,
                         ip,

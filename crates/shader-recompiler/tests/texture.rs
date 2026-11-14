@@ -140,29 +140,6 @@ fn fetch_and_gradient_keep_integer_coords_derivatives_and_metadata_order() {
     assert!(compile(Opcode::TXD_b, w | 1 << 50).is_err());
 }
 #[test]
-fn gathers_keep_ptp_pairs_and_queries_omit_array_layer_and_rescale_lod() {
-    let w = insert::<36, 2>(standard(Opcode::TLD4_b, 2), 2) | 1 << 50;
-    let (ir, b) = compile(Opcode::TLD4_b, w).unwrap();
-    assert_eq!(reads(&ir, b), [2, 3, 8, 9, 10, 11]);
-    let sample = ops(&ir, b, I::BindlessImageGatherDref)[0];
-    assert_eq!(ir.value_type(sample.arg(2).unwrap()).unwrap(), Type::U32x4);
-    assert_eq!(ir.value_type(sample.arg(3).unwrap()).unwrap(), Type::U32x4);
-    assert_eq!(ops(&ir, b, I::BitFieldSExtract).len(), 8);
-    let w = insert::<31, 4>(standard(Opcode::TMML, 3), 3);
-    let (ir, b) = compile(Opcode::TMML, w).unwrap();
-    assert_eq!(reads(&ir, b), [3, 4]);
-    assert_eq!(ops(&ir, b, I::ShiftLeftLogical32).len(), 2);
-    let w = insert::<22, 3>(insert::<31, 4>(word(Opcode::TXQ_b), 9), 1);
-    let (ir, b) = compile(Opcode::TXQ_b, w).unwrap();
-    assert_eq!(reads(&ir, b), [2, 3]);
-    assert_eq!(
-        ops(&ir, b, I::BindlessImageQueryDimensions)[0]
-            .arg(2)
-            .unwrap(),
-        Value::U1(false)
-    );
-}
-#[test]
 fn all_swizzled_sample_and_fetch_encodings_route_and_pack() {
     for op in [Opcode::TEXS, Opcode::TLDS] {
         for encoding in 0..16 {

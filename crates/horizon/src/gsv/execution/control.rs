@@ -22,6 +22,8 @@ struct Inbox {
 #[derive(Default)]
 pub(super) struct Endpoint {
     inbox: Mutex<Inbox>,
+    presenter: Option<nixe_video::FrameMailbox>,
+    frame_sequence: std::sync::atomic::AtomicU64,
     pub requested: AtomicBool,
     submit: AtomicBool,
     thread: std::sync::OnceLock<thread::Thread>,
@@ -32,6 +34,12 @@ impl std::fmt::Debug for Endpoint {
     }
 }
 impl Endpoint {
+    pub fn new(presenter: Option<nixe_video::FrameMailbox>) -> Self {
+        Self {
+            presenter,
+            ..Self::default()
+        }
+    }
     pub fn wake(&self) {
         self.requested.store(true, Ordering::Release);
         if let Some(thread) = self.thread.get() {
@@ -103,9 +111,16 @@ impl Endpoint {
                             vsync: frame.queued,
                         },
                     )?;
+                    if let Some(presenter) = &self.presenter {
+                        let sequence = self.frame_sequence.fetch_add(1, Ordering::Relaxed);
+                        presenter.publish(Arc::new(nixe_video::PresentationFrame::new(
+                            image, sequence,
+                        )));
+                    }
+                    // Composition retains its source through submission. The
+                    // published host image owns independent native storage.
                     renderer.submit(Some(Box::new(move |result| {
                         result?;
-                        drop(image);
                         drop(frame);
                         reply.finish();
                         Ok(())

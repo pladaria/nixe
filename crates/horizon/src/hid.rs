@@ -38,6 +38,11 @@ const CAPTURE_BUTTON_LIFO_OFFSET: usize = 0x5000;
 // ConsoleSixAxisSensorSharedMemoryFormat follows the gesture region.
 // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/hid_core/resources/shared_memory_format.h
 const CONSOLE_SIX_AXIS_OFFSET: usize = 0x3c200;
+// @SPECULATIVE: this global NpadCondition layout is not publicly documented.
+// The native SDK reads its initialized/hold/valid fields at +4/+8/+12;
+// retain the configured hold mode instead of a disconnected/default response.
+// https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/hid_core/resources/shared_memory_format.h
+const NPAD_CONDITION_OFFSET: usize = 0x3e200;
 
 const LIFO_CAPACITY: u64 = 17;
 const COMMON_ENTRY_SIZE: usize = 0x30;
@@ -282,6 +287,20 @@ impl HidSystem {
         let shared_memory =
             SharedMemoryObject::new(allocation, HID_SHARED_MEMORY_SIZE, MemoryPermissions::READ)
                 .map_err(|e| Arc::new(MemoryError::Execution(e.to_string().into())))?;
+        let mut condition = [0; 16];
+        put_u32(&mut condition, 4, 1);
+        put_u32(&mut condition, 12, 1);
+        // Fresh shared memory has no guest mappings or device owners yet.
+        if !matches!(
+            shared_memory
+                .write(NPAD_CONDITION_OFFSET, &condition)
+                .map_err(Arc::new)?,
+            Access::Ready(())
+        ) {
+            return Err(Arc::new(MemoryError::Execution(
+                "fresh HID shared memory unexpectedly has a device owner".into(),
+            )));
+        }
         let infrared = crate::object::IrsSession::new(account)?;
         Ok(Self {
             state: Arc::new(HidState {
@@ -676,19 +695,35 @@ impl HidSystem {
         true
     }
 
-    pub(crate) fn set_npad_joy_hold_type(&self, hold_type: u64) -> bool {
+    pub(crate) async fn set_npad_joy_hold_type(
+        &self,
+        hold_type: u64,
+    ) -> Result<bool, Arc<MemoryError>> {
         // Vertical (0) is the default; horizontal (1) affects single Joy-Con
         // orientation. FullKey publication does not consume this setting.
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h
         if !matches!(hold_type, 0 | 1) {
-            return false;
+            return Ok(false);
+        }
+        // The SDK may read the mode directly from shared memory after this
+        // IPC completes. Finish its coherent write before returning success.
+        if let Access::Pending(pending) = self
+            .state
+            .shared_memory
+            .write(NPAD_CONDITION_OFFSET + 8, &(hold_type as u32).to_le_bytes())
+            .map_err(Arc::new)?
+            && !matches!(pending.await?, AccessResult::Written(_))
+        {
+            return Err(Arc::new(MemoryError::Execution(
+                "invalid Npad condition write completion".into(),
+            )));
         }
         self.state
             .configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .npad_joy_hold_type = hold_type;
-        true
+        Ok(true)
     }
 
     pub(crate) fn npad_joy_hold_type(&self) -> u64 {
@@ -973,7 +1008,6 @@ impl HidProducer {
         self.sampling_number = self.sampling_number.saturating_add(1);
         let style_changed = !self.connected;
         if style_changed {
-            writes.write_u32(NPAD_OFFSET, NPAD_STYLE_FULL_KEY);
             writes.write_u32(NPAD_OFFSET + 4, NPAD_JOY_ASSIGNMENT_DUAL);
             writes.write_u32(NPAD_OFFSET + 8, 0);
             writes.write_u32(NPAD_OFFSET + 0x4188, NPAD_DEVICE_TYPE_FULL_KEY);
@@ -1052,6 +1086,12 @@ impl HidProducer {
             false,
         );
         if style_changed {
+            // Publish the connected style only after its properties and first
+            // samples. A client polling the style may immediately read a LIFO
+            // without waiting for the style event.
+            writes
+                .writes
+                .push_back((NPAD_OFFSET, NPAD_STYLE_FULL_KEY.to_le_bytes().into(), true));
             writes.signal_style = true;
             writes.connected = Some(self.connected);
         }

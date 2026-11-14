@@ -1,5 +1,5 @@
-//! Verified NVIDIA TIC/TSC encoding shared by Maxwell and Ampere.
-//! Descriptor bytes have the same layout; texel GOB addressing remains generation-specific.
+//! NVIDIA TIC/TSC fields shared by Maxwell and Ampere. View addressing and
+//! texel GOB order remain generation-specific.
 //! https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/textures/texture.h
 mod format;
 mod sampler;

@@ -26,6 +26,9 @@ impl Default for ShaderConstants {
     }
 }
 impl ShaderConstants {
+    pub(super) fn set_instance_offset(&mut self, offset: u32) {
+        self.0[nixe_shader_recompiler::host_abi::INSTANCE_OFFSET as usize / 4] = offset;
+    }
     pub(super) fn resources(
         resources: &super::pipeline_resources::PipelineResources,
         images: &[crate::residency::execution::ShaderImage],

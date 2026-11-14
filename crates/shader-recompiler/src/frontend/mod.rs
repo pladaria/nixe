@@ -1,6 +1,23 @@
 pub mod asl;
 pub mod flow;
+pub(crate) mod half;
+pub(crate) mod lut;
 pub mod structure;
+
+/// LOD queries return unclamped and clamped levels as signed/unsigned 8.8
+/// fixed point. The host query orders those components in the opposite order.
+// https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/shader_recompiler/frontend/maxwell/translate/impl/texture_mipmap_level.cpp#L95-L106
+pub(crate) fn texture_lod_component(
+    emit: &mut crate::ir::Emitter<'_>,
+    query: crate::ir::Value,
+    component: usize,
+) -> crate::Result<crate::ir::Value> {
+    use crate::ir::{FpControl, Value};
+    let value = emit.composite_extract(query, component ^ 1)?;
+    let scaled = emit.fp_mul(value, Value::f32(256.0), FpControl::default())?;
+    let fixed = emit.convert_f_to_i(32, component == 0, scaled)?;
+    emit.bitwise_and(fixed, Value::U32(0xffff))
+}
 
 /// Fragment export register layout is shared by the graphics header versions.
 pub(crate) fn export_fragment(
@@ -66,4 +83,69 @@ pub(crate) fn float_compare(
             "Invalid floating comparison",
         )),
     }
+}
+
+pub(crate) fn integer_compare(
+    emit: &mut crate::ir::Emitter<'_>,
+    a: crate::ir::Value,
+    b: crate::ir::Value,
+    op: u32,
+    signed: bool,
+) -> crate::Result<crate::ir::Value> {
+    match op {
+        0 => Ok(crate::ir::Value::U1(false)),
+        1 => emit.i_less_than(a, b, signed),
+        2 => emit.i_equal(a, b),
+        3 => emit.i_less_than_equal(a, b, signed),
+        4 => emit.i_greater_than(a, b, signed),
+        5 => emit.i_not_equal(a, b),
+        6 => emit.i_greater_than_equal(a, b, signed),
+        7 => Ok(crate::ir::Value::U1(true)),
+        _ => Err(crate::CompileError::new(
+            crate::diagnostics::FailureCategory::InvalidArgument,
+            "Invalid integer comparison",
+        )),
+    }
+}
+
+/// Preserve fragment quad exchanges, including helper invocations, instead of
+/// expressing derivative shuffles as general active-lane subgroup operations.
+pub(crate) fn shuffle(
+    emit: &mut crate::ir::Emitter<'_>,
+    stage: crate::Stage,
+    mode: u32,
+    input: crate::ir::Value,
+    index: crate::ir::Value,
+    mask: crate::ir::Value,
+) -> crate::Result<(crate::ir::Value, crate::ir::Value)> {
+    use crate::ir::Value;
+    if stage == crate::Stage::Fragment
+        && mask == Value::U32((28 << 8) | 3)
+        && let Value::U32(index) = index
+    {
+        let quad = match (mode, index) {
+            (0, 0..=3) => Some(emit.quad_broadcast(input, Value::U32(index))?),
+            (3, 1..=3) => Some(emit.quad_swap(input, Value::U32(index - 1))?),
+            _ => None,
+        };
+        if let Some(value) = quad {
+            return Ok((value, Value::U1(true)));
+        }
+    }
+    let (clamp, segment) = if let Value::U32(mask) = mask {
+        (Value::U32(mask & 31), Value::U32((mask >> 8) & 31))
+    } else {
+        (
+            emit.bit_field_extract(mask, Value::U32(0), Value::U32(5), false)?,
+            emit.bit_field_extract(mask, Value::U32(8), Value::U32(5), false)?,
+        )
+    };
+    let value = match mode {
+        0 => emit.shuffle_index(input, index, clamp, segment)?,
+        1 => emit.shuffle_up(input, index, clamp, segment)?,
+        2 => emit.shuffle_down(input, index, clamp, segment)?,
+        _ => emit.shuffle_butterfly(input, index, clamp, segment)?,
+    };
+    let in_bounds = emit.get_in_bounds_from_op(value)?;
+    Ok((value, in_bounds))
 }

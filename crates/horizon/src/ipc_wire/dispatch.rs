@@ -366,7 +366,10 @@ pub(crate) async fn execute_request(
             services::dispatch_account_profile(process, *profile, request, hipc, false).await?
         }
         HorizonIpcObject::AccountManagerForApplication(manager) => {
-            services::dispatch_account_manager_for_application(manager, request, hipc, false)?
+            services::dispatch_account_manager_for_application(
+                process, manager, request, hipc, false,
+            )
+            .await?
         }
         HorizonIpcObject::Bsd(session) => services::dispatch_bsd(process, session, request, hipc)?,
         HorizonIpcObject::Ssl(session) => services::dispatch_ssl(session, request, hipc)?,

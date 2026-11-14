@@ -19,6 +19,7 @@ pub fn emit_spirv(
     ctx.fix_bloom_effects = settings.fix_bloom_effects;
     ctx.builder
         .memory_model(AddressingModel::Logical, MemoryModel::GLSL450)?;
+    ctx.define_matrix_functions(ir, &program)?;
     let main = ctx.emit_main(ir, &program, settings.disable_shader_loop_safety_checks)?;
     ctx.entry_point(&program, main)?;
     ctx.setup_capabilities(&program, main)?;

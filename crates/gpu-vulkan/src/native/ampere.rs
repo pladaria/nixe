@@ -1,12 +1,76 @@
 //! Ampere state consumption uses the common physical caches and native recorder.
+mod compute;
 pub(super) mod graphics;
 mod shader;
 mod state;
+mod storage;
 mod textures;
 use super::*;
 use nixe_gpu_ampere::{self as model, Registers, RenderMemory};
 
 impl model::Rasterizer for NativeGpuExecution {
+    fn reduce_report(
+        &mut self,
+        source: model::Source,
+        target: &[nixe_memory::AllocationRange],
+        payload: u32,
+        operation: u32,
+        signed: bool,
+    ) -> model::Result<()> {
+        self.execution()
+            .record(FrontendSubmissionId::new(source.submission), |native| {
+                native.flush_work()?;
+                if native.state.ampere.semaphore.is_none() {
+                    native.state.ampere.semaphore =
+                        Some(crate::residency::semaphore_pipeline(native.compiler)?);
+                }
+                native.residency.reduce_semaphore(
+                    native.state.ampere.semaphore.as_ref().unwrap(),
+                    target,
+                    payload,
+                    operation,
+                    signed,
+                )
+            })
+            .map_err(|e| e.to_string().into())
+    }
+    fn dispatch(
+        &mut self,
+        source: model::Source,
+        launch: &model::compute::Launch,
+        registers: &Registers,
+        memory: &mut impl RenderMemory,
+    ) -> model::Result<()> {
+        self.execution()
+            .record(FrontendSubmissionId::new(source.submission), |native| {
+                native.dispatch_ampere(launch, registers, memory)
+            })
+            .map_err(|e| e.to_string().into())
+    }
+    fn reset_samples_passed(&mut self, source: model::Source) -> model::Result<()> {
+        self.execution()
+            .record(FrontendSubmissionId::new(source.submission), |native| {
+                native.flush_work()?;
+                native.residency.device_mut().reset_samples_passed()
+            })
+            .map_err(|e| e.to_string().into())
+    }
+    fn report_samples_passed(
+        &mut self,
+        source: model::Source,
+        target: &[nixe_memory::AllocationRange],
+        short: bool,
+        timestamp: u64,
+    ) -> model::Result<()> {
+        self.execution()
+            .record(FrontendSubmissionId::new(source.submission), |native| {
+                native.flush_work()?;
+                native
+                    .residency
+                    .report_samples_passed(target, short, timestamp)
+            })
+            .map_err(|e| e.to_string().into())
+    }
     fn fragment_barrier(&mut self, source: model::Source, before_depth: bool) -> model::Result<()> {
         self.execution()
             .record(FrontendSubmissionId::new(source.submission), |native| {
@@ -17,15 +81,16 @@ impl model::Rasterizer for NativeGpuExecution {
     }
     fn draw(
         &mut self,
-        source: model::Source,
+        draw: model::Draw,
         registers: &Registers,
         state: &mut model::GraphicsState,
         memory: &mut impl RenderMemory,
     ) -> model::Result<()> {
         self.execution()
-            .record(FrontendSubmissionId::new(source.submission), |native| {
-                native.draw_ampere(source, registers, state, memory)
-            })
+            .record(
+                FrontendSubmissionId::new(draw.source.submission),
+                |native| native.draw_ampere(draw, registers, state, memory),
+            )
             .map_err(|e| e.to_string().into())
     }
 
@@ -158,9 +223,9 @@ impl NativeExecution<'_> {
                 dirty &= dirty - 1;
                 let view =
                     if let Some(info) = model::targets::target(r, slot).map_err(compilation)? {
-                        memory
-                            .prepare_image(info.address, info.size)
-                            .map_err(compilation)?;
+                        memory.prepare_image(info.address, info.size).map_err(|e| {
+                            compilation(format!("native attachment slot={slot} {info:?}: {e}"))
+                        })?;
                         Some(self.image_target_view(&info, memory)?)
                     } else {
                         None

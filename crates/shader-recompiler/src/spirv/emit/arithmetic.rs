@@ -19,6 +19,8 @@ impl EmitContext<'_> {
         if !matches!(
             opcode,
             O::IAdd32
+                | O::UMulExtended32
+                | O::SMulExtended32
                 | O::BitwiseAnd32
                 | O::BitwiseOr32
                 | O::BitwiseXor32
@@ -40,6 +42,25 @@ impl EmitContext<'_> {
         let b = self.types.bool;
         let zero = self.constants.u32_zero;
         let result = match opcode {
+            O::UMulExtended32 | O::SMulExtended32 => {
+                let ty = self.builder.type_struct(&[u, u])?;
+                // OpSMulExtended consumes signed values regardless of the
+                // integer type's signedness, preserving our U32 register bits.
+                // https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpSMulExtended
+                let op = if opcode == O::SMulExtended32 {
+                    Op::SMulExtended
+                } else {
+                    Op::UMulExtended
+                };
+                let product = self.op(op, ty, &a[..2])?;
+                let low = self.extract(u, product, 0)?;
+                let high = self.extract(u, product, 1)?;
+                return Ok(Some(self.op(
+                    Op::CompositeConstruct,
+                    self.types.u32[1],
+                    &[low, high],
+                )?));
+            }
             O::IAdd32 => {
                 let result = if ir.associated_pseudo(id, O::GetCarryFromOp)?.is_some() {
                     let ty = self.builder.type_struct(&[u, u])?;

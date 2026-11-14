@@ -34,6 +34,8 @@ opcodes! {
     Void: Void, [], false;
     ConditionRef: U1, [U1], true;
     Reference: Void, [Opaque], true;
+    // Compile-time proof of a software return; never reaches host emission.
+    VerifyReturn: Void, [U32, U32], true;
     PhiMove: Void, [Opaque, Opaque], true;
     Prologue: Void, [], true;
     Epilogue: Void, [], true;
@@ -46,6 +48,8 @@ opcodes! {
     DeviceMemoryBarrier: Void, [], true;
     GetRegister: U32, [Reg], false;
     SetRegister: Void, [Reg, U32], false;
+    GetUniformRegister: U32, [U32], false;
+    SetUniformRegister: Void, [U32, U32], false;
     GetPred: U1, [Pred], false;
     SetPred: Void, [Pred, U1], false;
     GetGotoVariable: U1, [U32], false;
@@ -288,7 +292,10 @@ opcodes! {
     IAdd64: U64, [U64, U64], false;
     ISub32: U32, [U32, U32], false;
     ISub64: U64, [U64, U64], false;
+    MatrixMultiplyF16: U32x2, [U32x4, U32x2, U32x2], false;
     IMul32: U32, [U32, U32], false;
+    UMulExtended32: U32x2, [U32, U32], false;
+    SMulExtended32: U32x2, [U32, U32], false;
     SDiv32: U32, [U32, U32], false;
     UDiv32: U32, [U32, U32], false;
     INeg32: U32, [U32], false;

@@ -4,7 +4,6 @@ mod dispatch;
 mod float;
 mod half;
 mod integer;
-mod lut;
 mod memory;
 mod predicate;
 mod special;

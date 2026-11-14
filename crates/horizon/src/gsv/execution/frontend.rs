@@ -184,13 +184,6 @@ pub(super) fn run(
                                 waiters.remove(job.channel);
                                 continue;
                             }
-                            log::debug!(
-                                "Ampere channel {} waiting on {:#x}: operation={} value={:#x}",
-                                job.channel,
-                                acquire.address,
-                                acquire.operation,
-                                acquire.value
-                            );
                             work.wait = Some(wait);
                             break;
                         }

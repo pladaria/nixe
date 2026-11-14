@@ -337,9 +337,7 @@ impl Visitor<'_> {
             if mask & (1 << component) == 0 {
                 continue;
             }
-            let value = self.emit.composite_extract(sample, component)?;
-            let value = self.emit.convert_f_to_i(32, false, value)?;
-            let value = self.emit.shift_left_logical(value, Value::U32(8))?;
+            let value = crate::frontend::texture_lod_component(&mut self.emit, sample, component)?;
             self.emit.set_reg(dest, value)?;
             dest = dest.offset(1)?;
         }

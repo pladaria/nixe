@@ -150,7 +150,7 @@ impl NativeExecution<'_> {
             .is_some_and(|raw| raw.bytes == bytes);
         if !current {
             let info = nixe_gpu::nvidia::sampled_image_info(dimension, index, bytes, tiling)
-                .map_err(failed)?;
+                .map_err(|error| failed(format_args!("{error}; TIC={words:08x?}")))?;
             let table = &mut self
                 .residency
                 .texture_cache

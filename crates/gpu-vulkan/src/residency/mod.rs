@@ -27,6 +27,8 @@ mod raster_transfer;
 mod recording;
 mod retirement;
 mod sample_readback;
+mod semaphore;
+pub(crate) use semaphore::semaphore_pipeline;
 mod scaling;
 mod texture_cache;
 mod texture_download;

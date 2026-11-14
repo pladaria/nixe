@@ -234,10 +234,8 @@ impl Attribute {
         }
     }
 
-    /// Preserves the reference's inclusive Generic31X bound, including its
-    /// exclusion of Generic31Y/Z/W. This is not the varying-mask range test.
     pub const fn is_generic(self) -> bool {
-        self.0 >= 32 && self.0 <= 156
+        self.0 >= Self::Generic0X.0 && self.0 <= Self::Generic31W.0
     }
 
     pub const fn is_legacy(self) -> bool {

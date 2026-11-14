@@ -39,6 +39,7 @@ enum HidCommand {
     GetVibrationDeviceInfo,
     SendVibrationValue,
     SendVibrationValues,
+    SendVibrationValuesInMode,
     CreateActiveVibrationDeviceList,
     InitializeJcms,
     FinalizeJcms,
@@ -86,6 +87,7 @@ impl HidCommand {
             201 => Some(Self::SendVibrationValue),
             203 => Some(Self::CreateActiveVibrationDeviceList),
             206 => Some(Self::SendVibrationValues),
+            214 => Some(Self::SendVibrationValuesInMode),
             3110 => Some(Self::InitializeJcms),
             3111 => Some(Self::FinalizeJcms),
             1004 => Some(Self::SetTouchScreenOutputRanges),
@@ -198,8 +200,9 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
         // ARUID and two pointer input arrays, without PID: handles (u32),
         // then values (four f32s). Both arrays must contain the same count.
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L1081-L1092
-        HidCommand::SendVibrationValues => {
-            if !request.has_payload_size(8)
+        command @ (HidCommand::SendVibrationValues | HidCommand::SendVibrationValuesInMode) => {
+            let with_mode = command == HidCommand::SendVibrationValuesInMode;
+            if !request.has_payload_size(if with_mode { 16 } else { 8 })
                 || hipc.pid.is_some()
                 || !hipc.copy_handles.is_empty()
                 || !hipc.move_handles.is_empty()
@@ -209,6 +212,18 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
                 || hipc.receive_statics != ReceiveStatics::None
             {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            if with_mode {
+                // @SPECULATIVE: command 214 prefixes the ARUID with a u64
+                // mode. The observed modes 0 and 2 use the same handle/value
+                // arrays and actuator output; the mode's remaining policy is
+                // undocumented. Preserve normal validation and host failures.
+                // https://switchbrew.org/wiki/HID_services
+                // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/hid/hid_server.cpp#L1119-L1138
+                let mode = request_u64(request.data, 0).unwrap();
+                if !matches!(mode, 0 | 2) {
+                    return Err(IpcWireError::Malformed("unsupported vibration output mode"));
+                }
             }
             let [handles, values] = hipc.send_statics.as_slice() else {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
@@ -533,7 +548,11 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
                 let Some(hold_type) = request_u64(request.data, 8) else {
                     return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                 };
-                if !hid_system.set_npad_joy_hold_type(hold_type) {
+                if !hid_system
+                    .set_npad_joy_hold_type(hold_type)
+                    .await
+                    .map_err(IpcWireError::SystemMemory)?
+                {
                     return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
                 }
                 semantic_success(request.token, false, &[], &[], &[], None)

@@ -3,6 +3,8 @@
 pub const TEXTURE_MASK_OFFSET: u32 = 0;
 pub const IMAGE_MASK_OFFSET: u32 = 16;
 pub const DOWN_FACTOR_OFFSET: u32 = 24;
+/// Start of a split instance sequence, independent of the guest base instance.
+pub const INSTANCE_OFFSET: u32 = 28;
 pub const RENDER_AREA_OFFSET: u32 = 0;
 pub const RESCALING_COMPUTE_BYTES: u32 = 24;
 pub const RESCALING_GRAPHICS_BYTES: u32 = 28;

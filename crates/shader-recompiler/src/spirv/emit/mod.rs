@@ -16,6 +16,7 @@ mod float;
 mod image;
 mod image_access;
 mod image_operands;
+mod matrix;
 mod route;
 mod shared;
 mod special;
@@ -144,6 +145,7 @@ impl EmitContext<'_> {
                     R::Attribute => self.attribute_instruction(ir, id)?,
                     R::Special => self.special_instruction(ir, id)?,
                     R::Atomic => self.atomic_instruction(ir, id)?,
+                    R::Matrix => self.matrix_instruction(ir, id)?,
                     R::Warp => self.warp_instruction(ir, id)?,
                     R::Image => self.image_instruction(ir, id)?,
                     _ => unreachable!(),

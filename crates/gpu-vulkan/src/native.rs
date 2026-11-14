@@ -6,6 +6,31 @@ use ash::vk;
 use nixe_gpu::{BackendRuntimeError, FrontendSubmissionId, GpuExecution, ResidentImage, native::*};
 use rustc_hash::FxHashMap as HashMap;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
+// Instantiate stage-specific buffer paths without runtime stage dispatch.
+macro_rules! graphics_stages {
+    ($mask:ident, |$stage:ident| $body:block) => {
+        if $mask & 1 != 0 {
+            const $stage: usize = 0;
+            $body
+        }
+        if $mask & 2 != 0 {
+            const $stage: usize = 1;
+            $body
+        }
+        if $mask & 4 != 0 {
+            const $stage: usize = 2;
+            $body
+        }
+        if $mask & 8 != 0 {
+            const $stage: usize = 3;
+            $body
+        }
+        if $mask & 16 != 0 {
+            const $stage: usize = 4;
+            $body
+        }
+    };
+}
 mod completion;
 mod pipeline_cache;
 pub(crate) mod pipeline_resources;

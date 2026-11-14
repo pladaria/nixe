@@ -29,17 +29,53 @@ impl Instruction {
         self.bits(0, 12)
     }
     pub fn condition(self) -> Result<Condition> {
+        // Reconvergence membership does not predicate an invocation effect.
+        if matches!(self.opcode(), 0x941 | 0x942 | 0x945) {
+            return Ok(Condition::always(true));
+        }
+        // R2UR's lane predicate selects the broadcast source; it must not
+        // exclude the other active lanes from the subgroup operation.
+        if self.opcode() == 0x3c2 {
+            return Ok(Condition::always(true));
+        }
+        let index = self.bits(12, 3) as u8;
         Ok(Condition {
             flow_test: FlowTest::T,
-            predicate: Pred::new(self.bits(12, 3) as u8)?,
+            predicate: if matches!(
+                self.opcode(),
+                0xc82
+                    | 0x882
+                    | 0x88c
+                    | 0x28c
+                    | 0x290
+                    | 0x890
+                    | 0x292
+                    | 0x892
+                    | 0x2a4
+                    | 0x4a4
+                    | 0x8a4
+                    | 0x2a5
+                    | 0x899
+                    | 0xab9
+                    | 0xabb
+            ) {
+                Pred::uniform(index)?
+            } else {
+                Pred::new(index)?
+            },
             negated: self.bits(15, 1) != 0,
         })
     }
     pub fn branch_target(self, pc: ProgramOffset) -> Result<ProgramOffset> {
         // Relative 50-bit byte displacement, from the following instruction.
         if self.bits(32, 2) != 0
-            || self.bits(82, 5) != 0
-            || self.bits(87, 4) != 7
+            || self.bits(82, 5)
+                != if matches!(self.opcode(), 0x944 | 0x950) {
+                    16
+                } else {
+                    0
+                }
+            || (self.opcode() != 0x947 && self.bits(87, 4) != 7)
             || self.bits(91, 1) != 0
         {
             return Err(unsupported(
@@ -53,6 +89,32 @@ impl Instruction {
             return Err(unsupported("Native branch target outside program offsets"));
         }
         Ok(ProgramOffset(target as u32))
+    }
+    /// Native BRA has an instruction predicate and a separate branch predicate.
+    /// Use the existing predicate-before block for their conjunction, without
+    /// inventing a temporary predicate register or rewriting shader instructions.
+    pub fn branch_predicates(self) -> Result<(Condition, Condition)> {
+        let primary = self.condition()?;
+        let secondary = if self.opcode() == 0x947 {
+            Condition {
+                flow_test: FlowTest::T,
+                predicate: Pred::new(self.bits(87, 3) as u8)?,
+                negated: self.bits(90, 1) != 0,
+            }
+        } else {
+            Condition::always(true)
+        };
+        Ok(
+            if primary == Condition::always(false) || secondary == Condition::always(false) {
+                (Condition::always(true), Condition::always(false))
+            } else if secondary == Condition::always(true) {
+                (Condition::always(true), primary)
+            } else if primary == Condition::always(true) {
+                (Condition::always(true), secondary)
+            } else {
+                (primary, secondary)
+            },
+        )
     }
 }
 pub(crate) fn unsupported(message: impl Into<String>) -> CompileError {

@@ -23,44 +23,6 @@ impl Visitor<'_> {
                 | (self.field::<56, 1>() << 31),
         )
     }
-    pub(super) fn half_extract(&mut self, value: Value, swizzle: u32) -> Result<[Value; 2]> {
-        if swizzle == 1 {
-            let scalar = self.emit.bit_cast(Type::F32, value)?;
-            return Ok([scalar; 2]);
-        }
-        let vector = self.emit.unpack_float2x16(value)?;
-        let first = self
-            .emit
-            .composite_extract(vector, usize::from(swizzle == 3))?;
-        let second = if swizzle == 0 {
-            self.emit.composite_extract(vector, 1)?
-        } else {
-            first
-        };
-        Ok([first, second])
-    }
-    fn promote_half_operands<const N: usize>(
-        &mut self,
-        operands: &mut [[Value; 2]; N],
-    ) -> Result<bool> {
-        let ty = self.emit.ir.value_type(operands[0][0])?;
-        let promotion = operands.iter().any(|pair| {
-            self.emit
-                .ir
-                .value_type(pair[0])
-                .is_ok_and(|other| other != ty)
-        });
-        if promotion {
-            for pair in operands {
-                if self.emit.ir.value_type(pair[0])? == Type::F16 {
-                    for value in pair {
-                        *value = self.emit.fp_convert(32, *value, FpControl::default())?;
-                    }
-                }
-            }
-        }
-        Ok(promotion)
-    }
     fn half_merge(&mut self, values: [Value; 2], merge: u32) -> Result<()> {
         if merge == 0
             && (self.emit.ir.value_type(values[0])? != Type::F16
@@ -164,10 +126,10 @@ impl Visitor<'_> {
         };
         let a = self.a()?;
         let mut inputs = [
-            self.half_extract(a, swizzle_a)?,
-            self.half_extract(b, swizzle_b)?,
+            crate::frontend::half::extract(&mut self.emit, a, swizzle_a)?,
+            crate::frontend::half::extract(&mut self.emit, b, swizzle_b)?,
         ];
-        let promotion = self.promote_half_operands(&mut inputs)?;
+        let promotion = crate::frontend::half::promote(&mut self.emit, &mut inputs)?;
         let control = FpControl {
             no_contraction: true,
             fmz_mode: precision(mode),
@@ -271,11 +233,11 @@ impl Visitor<'_> {
         let merge = if wide { 0 } else { self.field::<49, 2>() };
         let a = self.a()?;
         let mut inputs = [
-            self.half_extract(a, swizzle_a)?,
-            self.half_extract(b, swizzle_b)?,
-            self.half_extract(c, swizzle_c)?,
+            crate::frontend::half::extract(&mut self.emit, a, swizzle_a)?,
+            crate::frontend::half::extract(&mut self.emit, b, swizzle_b)?,
+            crate::frontend::half::extract(&mut self.emit, c, swizzle_c)?,
         ];
-        let promotion = self.promote_half_operands(&mut inputs)?;
+        let promotion = crate::frontend::half::promote(&mut self.emit, &mut inputs)?;
         let control = FpControl {
             no_contraction: true,
             fmz_mode: precision(mode),
@@ -356,11 +318,12 @@ impl Visitor<'_> {
             self.bit::<54>()
         };
         let a = self.a()?;
+        let swizzle_a = self.field::<47, 2>();
         let mut inputs = [
-            self.half_extract(a, self.field::<47, 2>())?,
-            self.half_extract(b, swizzle_b)?,
+            crate::frontend::half::extract(&mut self.emit, a, swizzle_a)?,
+            crate::frontend::half::extract(&mut self.emit, b, swizzle_b)?,
         ];
-        self.promote_half_operands(&mut inputs)?;
+        crate::frontend::half::promote(&mut self.emit, &mut inputs)?;
         let pred = self.predicate::<39, 42>()?;
         let control = FpControl {
             fmz_mode: super::float::ftz(flush),

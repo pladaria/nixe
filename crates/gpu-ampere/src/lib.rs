@@ -11,7 +11,7 @@ mod registers;
 pub mod targets;
 
 pub use channel::{Channel, FrontendHost, Progress, SemaphoreAcquire};
-pub use engines::{GraphicsState, Preparation, PreparationHost};
+pub use engines::{Draw, GraphicsState, Preparation, PreparationHost};
 pub use packet::{GpfifoEntry, decode_entries};
 pub use registers::{Class, Registers};
 
@@ -49,7 +49,7 @@ pub fn writes_memory(source: Source) -> bool {
     };
     match class {
         Class::ThreeD => {
-            matches!(source.method, 0x1b4 | 0x26c | 0x274 | 0x304 | 0xd78 | 0x1214 | 0x1218 | 0x123c | 0x17e0..=0x17f8 | 0x19d0 | 0x1b0c | 0x2390..=0x23cc)
+            matches!(source.method, 0x1614 | 0x1b4 | 0x26c | 0x274 | 0x304 | 0xd78 | 0x1214 | 0x1218 | 0x123c | 0x17e0..=0x17f8 | 0x19d0 | 0x1b0c | 0x2390..=0x23cc)
         }
         Class::Compute => matches!(source.method, 0x1b4 | 0x2b8..=0x2c0 | 0x41c | 0x1b0c),
         Class::Inline => source.method == 0x1b4,
@@ -61,13 +61,36 @@ pub fn writes_memory(source: Source) -> bool {
 /// Native preparation consumes generation-specific state with static dispatch.
 /// Canonical memory, cache ownership and queue/fence execution stay shared.
 pub trait Rasterizer: nixe_gpu::GpuExecution {
+    fn reduce_report(
+        &mut self,
+        source: Source,
+        target: &[nixe_memory::AllocationRange],
+        payload: u32,
+        operation: u32,
+        signed: bool,
+    ) -> Result<()>;
+    fn dispatch(
+        &mut self,
+        source: Source,
+        launch: &compute::Launch,
+        registers: &Registers,
+        memory: &mut impl RenderMemory,
+    ) -> Result<()>;
+    fn reset_samples_passed(&mut self, source: Source) -> Result<()>;
+    fn report_samples_passed(
+        &mut self,
+        source: Source,
+        target: &[nixe_memory::AllocationRange],
+        short: bool,
+        timestamp: u64,
+    ) -> Result<()>;
     fn fragment_barrier(&mut self, source: Source, before_depth: bool) -> Result<()>;
     fn create_channel(&mut self, channel: u64);
     fn bind_channel(&mut self, channel: u64);
     fn close_channel(&mut self, channel: u64);
     fn draw(
         &mut self,
-        source: Source,
+        draw: Draw,
         registers: &Registers,
         state: &mut GraphicsState,
         memory: &mut impl RenderMemory,
@@ -95,6 +118,9 @@ pub trait Rasterizer: nixe_gpu::GpuExecution {
 }
 /// Commit lazy native GPU backing only when a resource is consumed.
 pub trait RenderMemory: nixe_gpu::native::ImageAddressSpace {
+    /// Same-layout virtual extent, including reserved native backing. Physical
+    /// fragmentation is resolved separately when the resource is consumed.
+    fn buffer_layout_size(&self, address: u64) -> Result<u64>;
     fn capture_memory(&mut self, address: u64, bytes: u64) -> Result<nixe_memory::CapturedMemory>;
     fn mapping_generation(&self) -> u64;
     fn prepare_image(&mut self, address: u64, bytes: u64) -> Result<()>;

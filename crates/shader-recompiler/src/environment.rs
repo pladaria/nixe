@@ -153,6 +153,14 @@ pub trait Environment {
     fn metadata(&self) -> &EnvironmentMetadata;
     fn read_instruction(&mut self, address: ProgramOffset) -> Result<u64>;
     fn read_cbuf_value(&mut self, index: CbufIndex, byte_offset: ByteOffset) -> Result<u32>;
+    /// Classify a potential native pointer without specializing on its numeric
+    /// value. The host must read it coherently and consult the current mapping.
+    fn is_cbuf_storage_pointer(&mut self, _key: CbufWordKey) -> Result<bool> {
+        Err(CompileError::new(
+            FailureCategory::MissingObservation,
+            "Storage pointer classification is unavailable",
+        ))
+    }
     /// Resource handles select descriptor properties; their numeric values are
     /// distinct from constants folded into shader arithmetic or control flow.
     fn read_texture_handle(&mut self, key: HandleKey) -> Result<TextureHandle> {
@@ -198,6 +206,7 @@ pub trait Environment {
 pub struct Observations {
     pub instructions: BTreeMap<ProgramOffset, u64>,
     pub cbuf_words: BTreeMap<CbufWordKey, u32>,
+    pub storage_pointer_types: BTreeMap<CbufWordKey, bool>,
     pub texture_handles: BTreeMap<HandleKey, TextureHandle>,
     pub texture_types: BTreeMap<TextureHandle, TextureType>,
     pub texture_pixel_formats: BTreeMap<TextureHandle, TexturePixelFormat>,
@@ -236,6 +245,17 @@ impl SnapshotEnvironment {
 }
 
 impl Environment for SnapshotEnvironment {
+    fn is_cbuf_storage_pointer(&mut self, key: CbufWordKey) -> Result<bool> {
+        self.observations
+            .storage_pointer_types
+            .get(&key)
+            .copied()
+            .ok_or_else(|| {
+                self.missing(format!(
+                    "Storage pointer classification for {key:?} was not captured"
+                ))
+            })
+    }
     fn read_texture_handle(&mut self, key: HandleKey) -> Result<TextureHandle> {
         self.observations
             .texture_handles
@@ -383,6 +403,17 @@ macro_rules! record_texture {
 }
 
 impl<E: Environment> Environment for RecordingEnvironment<'_, E> {
+    fn is_cbuf_storage_pointer(&mut self, key: CbufWordKey) -> Result<bool> {
+        if let Some(&value) = self.snapshot.observations.storage_pointer_types.get(&key) {
+            return Ok(value);
+        }
+        let value = self.source.is_cbuf_storage_pointer(key)?;
+        self.snapshot
+            .observations
+            .storage_pointer_types
+            .insert(key, value);
+        Ok(value)
+    }
     fn read_texture_handle(&mut self, key: HandleKey) -> Result<TextureHandle> {
         if let Some(&value) = self.snapshot.observations.texture_handles.get(&key) {
             return Ok(value);

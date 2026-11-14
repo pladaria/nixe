@@ -13,7 +13,7 @@ pub use graphics::{
     AttachmentSource, Draw, IndexBuffer, PreparedTargets, RenderAttachment, RenderingTargets,
     VertexBuffer,
 };
-pub(crate) use graphics::{DeferredClear, RenderPassState, ShaderImage};
+pub(crate) use graphics::{DeferredClear, RenderPassState, ShaderImage, attachment_read_only};
 pub(crate) use graphics::{MaskedClearPipelines, NativeIndexBuffer};
 pub use state::{GraphicsParameters, HostGraphics};
 

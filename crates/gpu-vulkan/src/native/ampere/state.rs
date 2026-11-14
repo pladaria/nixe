@@ -4,7 +4,7 @@
 use super::*;
 use crate::{
     GraphicsParameters,
-    cache::{BlendState, GraphicsState, VertexAttribute, VertexBinding},
+    cache::{BlendState, GraphicsState, StencilState, VertexAttribute, VertexBinding},
 };
 use nixe_shader_recompiler::{
     passes::GraphicsRuntimeState,
@@ -20,6 +20,34 @@ fn boolean(r: &Registers, method: u32) -> Result<bool, VulkanError> {
         1 => Ok(true),
         _ => Err(fail(r, method, "invalid boolean")),
     }
+}
+fn compare(r: &Registers, method: u32) -> Result<vk::CompareOp, VulkanError> {
+    Ok(vk::CompareOp::from_raw(match r.get(method) {
+        1..=8 => r.get(method) - 1,
+        0x200..=0x207 => r.get(method) - 0x200,
+        _ => return Err(fail(r, method, "invalid comparison")),
+    } as i32))
+}
+fn stencil_op(r: &Registers, method: u32) -> Result<vk::StencilOp, VulkanError> {
+    Ok(match r.get(method) {
+        1 | 0x1e00 => vk::StencilOp::KEEP,
+        2 | 0 => vk::StencilOp::ZERO,
+        3 | 0x1e01 => vk::StencilOp::REPLACE,
+        4 | 0x1e02 => vk::StencilOp::INCREMENT_AND_CLAMP,
+        5 | 0x1e03 => vk::StencilOp::DECREMENT_AND_CLAMP,
+        6 | 0x150a => vk::StencilOp::INVERT,
+        7 | 0x8507 => vk::StencilOp::INCREMENT_AND_WRAP,
+        8 | 0x8508 => vk::StencilOp::DECREMENT_AND_WRAP,
+        _ => return Err(fail(r, method, "invalid stencil operation")),
+    })
+}
+fn stencil_face(r: &Registers, base: u32) -> Result<StencilState, VulkanError> {
+    Ok(StencilState {
+        fail: stencil_op(r, base)?,
+        depth_fail: stencil_op(r, base + 4)?,
+        pass: stencil_op(r, base + 8)?,
+        compare: compare(r, base + 12)?,
+    })
 }
 fn blend_op(raw: u32) -> Result<vk::BlendOp, VulkanError> {
     Ok(match raw {
@@ -107,9 +135,7 @@ pub(super) fn prepare(
 ) -> Result<(GraphicsParameters, GraphicsRuntimeState), VulkanError> {
     // Reject enabled effects before drawing until their complete contracts are
     // supported. Disabled state does not require interpreting dormant operands.
-    for method in [
-        0x0dc0, 0x0dc4, 0x0dc8, 0x1380, 0x153c, 0x194c, 0x197c, 0x19bc, 0x19c4, 0x1148, 0x12ec,
-    ] {
+    for method in [0x153c, 0x194c, 0x197c, 0x19bc, 0x19c4, 0x1148, 0x12ec] {
         if r.get(method) != 0 {
             return Err(fail(r, method, "native raster effect is not implemented"));
         }
@@ -148,14 +174,28 @@ pub(super) fn prepare(
         vk::ProvokingVertexModeEXT::FIRST_VERTEX
     };
     state.primitive_restart = boolean(r, 0x1644)?;
+    state.depth_bias = boolean(
+        r,
+        match input_topology {
+            InputTopology::Points => 0x0dc0,
+            InputTopology::Lines => 0x0dc4,
+            _ => 0x0dc8,
+        },
+    )?;
     state.depth_test = boolean(r, 0x1538)? && boolean(r, 0x12cc)?;
     state.depth_write = boolean(r, 0x1538)? && boolean(r, 0x12e8)?;
     if state.depth_test {
-        state.depth_compare = vk::CompareOp::from_raw(match r.get(0x130c) {
-            1..=8 => r.get(0x130c) - 1,
-            0x200..=0x207 => r.get(0x130c) - 0x200,
-            _ => return Err(fail(r, 0x130c, "invalid depth comparison")),
-        } as i32);
+        state.depth_compare = compare(r, 0x130c)?;
+    }
+    state.stencil_test = boolean(r, 0x1538)? && boolean(r, 0x1380)?;
+    let two_sided_stencil = state.stencil_test && boolean(r, 0x1594)?;
+    if state.stencil_test {
+        state.front = stencil_face(r, 0x1384)?;
+        state.back = if two_sided_stencil {
+            stencil_face(r, 0x1598)?
+        } else {
+            state.front
+        };
     }
     state.front_face = match r.get(0x191c) {
         0x900 => vk::FrontFace::CLOCKWISE,
@@ -223,6 +263,7 @@ pub(super) fn prepare(
         }
     }
     let mut runtime = GraphicsRuntimeState {
+        instance_offset: true,
         input_topology,
         ndc_minus_one_to_one: !boolean(r, 0xd7c)?,
         point_size: f32::from_bits(r.get(0x1518)),
@@ -307,6 +348,16 @@ pub(super) fn prepare(
         height: bank.size[1],
     };
     let mut params = GraphicsParameters::new(state, extent);
+    if params.state.stencil_test {
+        params.stencil_reference = [r.get(0x1394); 2];
+        params.stencil_compare_mask = [r.get(0x1398); 2];
+        params.stencil_write_mask = [r.get(0x139c); 2];
+        if two_sided_stencil {
+            params.stencil_reference[1] = r.get(0xf54);
+            params.stencil_compare_mask[1] = r.get(0xf5c);
+            params.stencil_write_mask[1] = r.get(0xf58);
+        }
+    }
     if r.get(0x13ac) & !0x11 != 0 {
         return Err(fail(r, 0x13ac, "invalid window origin mode"));
     }
@@ -374,6 +425,11 @@ pub(super) fn prepare(
     }
     params.scissors[0] = clip;
     params.blend_constants = [f(0x131c), f(0x1320), f(0x1324), f(0x1328)];
+    // The hardware constant bias uses half the host API's depth units.
+    // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L4192-L4220
+    if params.state.depth_bias {
+        params.depth_bias = [f(0x15bc) * 0.5, f(0x187c), f(0x156c)];
+    }
     if residency.is_rescaling() {
         let scaling = residency.resolution();
         let v = &mut params.viewports[0];

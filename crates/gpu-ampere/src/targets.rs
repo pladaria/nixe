@@ -180,9 +180,16 @@ pub fn target(r: &Registers, slot: usize) -> Result<Option<ImageInfo>> {
         mip_layouts: Arc::from([(0, layout)]),
         layer_stride: array_pitch,
         maybe_unaligned_layer_stride: array_pitch,
-        size: stride
-            .checked_mul(u64::from(layers))
-            .ok_or("target size overflow")?,
+        // A single layer occupies its own tile footprint, even when ARRAY_PITCH
+        // still describes the parent texture's complete mip chain.
+        // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/texture_cache/util.cpp#L583-L596
+        size: if layers == 1 {
+            minimum
+        } else {
+            stride
+                .checked_mul(u64::from(layers))
+                .ok_or("target size overflow")?
+        },
         packing,
         sample_grid,
     }))

@@ -166,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let prepared = if environments[0].metadata().stage == Stage::Compute {
                     vec![compiler.prepare_stage(ids[0], Default::default())?]
                 } else {
-                    compiler.prepare_graphics(&ids, &GraphicsRuntimeState::default())?
+                    compiler.prepare_graphics(&ids, &GraphicsRuntimeState::default(), &profile)?
                 };
                 let linked = Instant::now();
                 let mut bindings = Bindings::default();

@@ -334,6 +334,22 @@ fn fold<E: Environment>(
         return ir.replace_uses_with(id, value);
     }
     match op {
+        O::VerifyReturn => {
+            // Structured calls are valid only when the guest's software link
+            // is unchanged (or restored). SSA uses the actual instruction
+            // semantics, including copies, predicates and nested callees.
+            if matches!(args[0], Value::U32(_)) && args[0] == args[1] {
+                ir.invalidate(id)
+            } else {
+                Err(CompileError::new(
+                    FailureCategory::Unsupported,
+                    format!(
+                        "Cannot prove native shader return link: actual={:?}, expected={:?}",
+                        args[0], args[1]
+                    ),
+                ))
+            }
+        }
         O::GetRegister if args[0] == Value::Reg(crate::ir::Reg::RZ) => {
             ir.replace_uses_with(id, Value::U32(0))
         }
@@ -364,6 +380,42 @@ fn fold<E: Environment>(
             }
         }
         O::ISub32 => subtract(ir, id),
+        O::IMul32 if !ir.inst(id)?.has_associated_pseudo_operation() => {
+            for (constant, other) in [(args[0], args[1]), (args[1], args[0])] {
+                match constant {
+                    Value::U32(0) => return ir.replace_uses_with(id, constant),
+                    Value::U32(1) => return ir.replace_uses_with(id, other),
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        O::UMulExtended32 | O::SMulExtended32 => {
+            let signed = op == O::SMulExtended32;
+            let words = match (args[0], args[1]) {
+                (Value::U32(a), Value::U32(b)) => {
+                    let product = if signed {
+                        (i64::from(a as i32) * i64::from(b as i32)) as u64
+                    } else {
+                        u64::from(a) * u64::from(b)
+                    };
+                    Some([
+                        Value::U32(product as u32),
+                        Value::U32((product >> 32) as u32),
+                    ])
+                }
+                (Value::U32(0), _) | (_, Value::U32(0)) => Some([Value::U32(0); 2]),
+                (Value::U32(1), other) | (other, Value::U32(1)) if !signed => {
+                    Some([other, Value::U32(0)])
+                }
+                _ => None,
+            };
+            if let Some(words) = words {
+                let result = Emitter::before(ir, block, id)?.composite_construct(&words)?;
+                ir.replace_uses_with(id, result)?;
+            }
+            Ok(())
+        }
         O::SelectU1
         | O::SelectU8
         | O::SelectU16
