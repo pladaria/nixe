@@ -89,6 +89,7 @@ pub(crate) struct StorageBuffer {
 pub(crate) enum StorageBufferBinding {
     Buffer(BufferRange),
     MultiRange(super::multi_range::MultiRangeBinding),
+    PointerTable(Arc<super::pointer_table::PointerTableBinding>),
 }
 impl BufferBindings {
     pub(super) fn current_channel(&self) -> Option<u64> {
@@ -143,6 +144,9 @@ impl BufferBindings {
         {
             if storage.native.as_ref().is_some_and(|native| match native {
                 StorageBufferBinding::Buffer(range) => range.buffer == id,
+                StorageBufferBinding::PointerTable(binding) => {
+                    binding.targets.iter().any(|r| r.buffer == id)
+                }
                 StorageBufferBinding::MultiRange(binding) => {
                     binding.sources.iter().any(|s| s.buffer == id)
                 }

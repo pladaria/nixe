@@ -431,6 +431,24 @@ impl VulkanDevice {
     pub fn validation_monitor(&self) -> ValidationMonitor {
         ValidationMonitor(Arc::clone(&self.owner.instance.validation))
     }
+    pub(crate) fn supports_depth_comparison(&self, format: vk::Format) -> bool {
+        let mut features = vk::FormatProperties3::default();
+        let mut properties = vk::FormatProperties2::default().push_next(&mut features);
+        // SAFETY: the instance and physical device outlive this query.
+        unsafe {
+            self.owner
+                .instance
+                .instance
+                .get_physical_device_format_properties2(
+                    self.owner.physical,
+                    format,
+                    &mut properties,
+                );
+        }
+        features
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags2::SAMPLED_IMAGE_DEPTH_COMPARISON)
+    }
     pub fn format_properties(&self, format: vk::Format) -> vk::FormatProperties {
         // SAFETY: the owning instance and selected physical identity remain live.
         unsafe {

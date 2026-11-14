@@ -149,7 +149,9 @@ impl FenceManager {
                                 if counter >= work.tick() {
                                     break;
                                 }
-                                if work.tick() > pending.submitted() {
+                                // A sealed tick already queued for recording needs
+                                // no further flush, even if vkQueueSubmit is slow.
+                                if work.tick() > pending.scheduled() {
                                     let submit = queue.queue.lock().unwrap().submit.clone();
                                     if let Some(submit) = submit {
                                         submit();

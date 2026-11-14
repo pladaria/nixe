@@ -6,6 +6,56 @@ pub(super) fn dispatch(
     hipc: &HipcRequest<'_>,
 ) -> Result<Vec<u8>, IpcWireError> {
     match request.command_id {
+        114 => {
+            // @SPECULATIVE: SDK requests bind (id, process address, size,
+            // flags, offset). Flags 0/2 use the same coherent process backing;
+            // their cache-policy distinction is undocumented. Offset must be zero.
+            // Captured physical ranges retain storage independently of CPU VA.
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/nx2_gsv.h
+            if request.data.len() != 36
+                || has_ipc_descriptors(hipc)
+                || !matches!(request_u64(request.data, 20), Some(0 | 2))
+                || request_u64(request.data, 28) != Some(0)
+            {
+                return Err(IpcWireError::GraphicsService(
+                    format!(
+                        "unsupported native process memory bind: {:02x?}",
+                        request.data
+                    )
+                    .into(),
+                ));
+            }
+            let id = request_u32(request.data, 0).unwrap();
+            let address =
+                nixe_memory::GuestVirtualAddress::new(request_u64(request.data, 4).unwrap());
+            let size = request_u64(request.data, 12).unwrap();
+            let mut state = session.state.lock().unwrap();
+            let process = state
+                .process
+                .as_ref()
+                .ok_or(IpcWireError::Malformed("GSV process is not registered"))?;
+            let ranges = process
+                .memory()
+                .space()
+                .capture(address, size, nixe_memory::MemoryPermissions::READ_WRITE)
+                .and_then(nixe_memory::CapturedMemory::new)
+                .map_err(|e| IpcWireError::GraphicsService(e.to_string().into()))?;
+            let memory = state
+                .native_images
+                .memories
+                .get_mut(&id)
+                .ok_or(IpcWireError::Malformed("unknown native memory object"))?;
+            if memory.backing.is_some() || size != memory.size {
+                return Err(IpcWireError::Malformed(
+                    "native process memory size/lifecycle mismatch",
+                ));
+            }
+            memory.backing = Some(std::sync::Arc::new(crate::gsv::image::Backing {
+                ranges,
+                gpu: None,
+            }));
+            Ok(encode_tipc_response(0, &[], &[], &[])?)
+        }
         423 => {
             // @SPECULATIVE: observed SDK bind layout: memory, CPU address,
             // bytes, parent GPU memory, parent offset, then two zero options.
@@ -52,8 +102,7 @@ pub(super) fn dispatch(
                 .map_err(|e| IpcWireError::GraphicsService(e.to_string().into()))?;
             memory.backing = Some(std::sync::Arc::new(crate::gsv::image::Backing {
                 ranges,
-                source,
-                offset,
+                gpu: Some(crate::gsv::image::GpuBacking { source, offset }),
             }));
             Ok(encode_tipc_response(0, &[], &[], &[])?)
         }

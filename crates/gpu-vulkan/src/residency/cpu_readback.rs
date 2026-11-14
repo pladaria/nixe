@@ -120,11 +120,20 @@ impl Residency<'_> {
         }
         // Scalar CPU reads use GetFlushArea above. Other coherent reads share
         // the texture, buffer and query publication order.
-        if !matches!(operation, AccessOperation::Write(_)) {
-            for extent in ranges.iter().flat_map(AllocationRange::physical_extents) {
-                for (address, bytes) in self.runtime.device_memory.device_ranges(extent) {
-                    self.flush_region(address, bytes)?;
-                }
+        let mut device_ranges = RangeSet::default();
+        for extent in ranges.iter().flat_map(AllocationRange::physical_extents) {
+            for (address, bytes) in self.runtime.device_memory.device_ranges(extent) {
+                device_ranges.insert(address, bytes);
+            }
+        }
+        if matches!(operation, AccessOperation::Write(_)) {
+            // Texture invalidation replaces a whole representation. Preserve
+            // its untouched bytes before a partial canonical write. Buffer
+            // invalidation already retains exact unwritten native intervals.
+            self.preserve_texture_writes(&device_ranges)?;
+        } else {
+            for (address, bytes) in device_ranges.iter() {
+                self.flush_region(address, bytes)?;
             }
         }
         let result = self
@@ -135,11 +144,7 @@ impl Residency<'_> {
             result,
             AccessResult::Written(_) | AccessResult::Atomic { written: true, .. }
         ) {
-            for extent in ranges.iter().flat_map(AllocationRange::physical_extents) {
-                for (address, bytes) in self.runtime.device_memory.device_ranges(extent) {
-                    self.write_memory(address, bytes)?;
-                }
-            }
+            self.write_cpu_ranges(device_ranges.iter())?;
         }
         Ok(result)
     }

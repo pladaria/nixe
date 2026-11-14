@@ -17,8 +17,26 @@ pub fn emit_spirv(
 ) -> Result<StageArtifact> {
     let mut ctx = EmitContext::new(profile, runtime, &program, bindings)?;
     ctx.fix_bloom_effects = settings.fix_bloom_effects;
-    ctx.builder
-        .memory_model(AddressingModel::Logical, MemoryModel::GLSL450)?;
+    let physical = program
+        .info
+        .storage_buffers_descriptors
+        .iter()
+        .any(|d| d.pointer_table.is_some());
+    if physical && !profile.support_buffer_device_address {
+        return Err(CompileError::new(
+            FailureCategory::Unsupported,
+            "Indirect pointer tables require buffer device addresses",
+        ));
+    }
+    let addressing = if physical {
+        ctx.builder
+            .capability(spirv::Capability::PhysicalStorageBufferAddresses)?;
+        ctx.builder.extension("SPV_KHR_physical_storage_buffer")?;
+        AddressingModel::PhysicalStorageBuffer64
+    } else {
+        AddressingModel::Logical
+    };
+    ctx.builder.memory_model(addressing, MemoryModel::GLSL450)?;
     ctx.define_matrix_functions(ir, &program)?;
     let main = ctx.emit_main(ir, &program, settings.disable_shader_loop_safety_checks)?;
     ctx.entry_point(&program, main)?;

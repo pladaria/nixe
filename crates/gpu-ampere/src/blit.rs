@@ -15,6 +15,79 @@ pub struct Blit {
     pub linear: bool,
 }
 
+impl Blit {
+    /// Same-format, unit-step copies preserve texel bits, including compressed
+    /// blocks carried in a 128-bit surface. Sampling them as floating-point
+    /// colors can change NaNs and loses their encoded-storage identity.
+    /// https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/engines/sw_blitter/blitter.cpp
+    pub fn copy_source_rect(&self) -> Option<ScissorRect> {
+        let [src, dst] = &self.images;
+        if src.description.format() != dst.description.format()
+            || self.step != [1 << 32; 2]
+            || self.linear && self.first.iter().any(|&v| v as u32 != 0x8000_0000)
+        {
+            return None;
+        }
+        Some(ScissorRect {
+            x: (self.first[0] >> 32) as u32,
+            y: (self.first[1] >> 32) as u32,
+            ..self.destination
+        })
+    }
+    pub fn byte_copy(&self) -> Result<Option<crate::dma::Copy>> {
+        let Some(rect) = self.copy_source_rect() else {
+            return Ok(None);
+        };
+        let [src, dst] = &self.images;
+        Ok(Some(crate::dma::Copy {
+            source: copy_surface(src, rect)?,
+            destination: copy_surface(dst, self.destination)?,
+        }))
+    }
+}
+
+fn copy_surface(info: &ImageInfo, rect: ScissorRect) -> Result<crate::dma::Surface> {
+    use nixe_gpu::physical::{ByteRect, ImageFootprint, ImageStorage};
+    let bpp = u32::from(
+        info.description
+            .format()
+            .plane_bytes_per_texel(0)
+            .ok_or("invalid copy format")?,
+    );
+    let extent = info.description.extent();
+    let storage = match info.layout {
+        ImageMemoryLayout::PitchLinear { row_pitch, .. } => ImageStorage::Pitch { row_pitch },
+        ImageMemoryLayout::BlockLinearAmpere(block) => ImageStorage::BlockLinearAmpere {
+            block_height_log2: block.block_height_log2,
+            block_depth_log2: block.block_depth_log2,
+        },
+        _ => return Err("invalid native 2D copy layout".into()),
+    };
+    let columns = extent.width.checked_mul(bpp).ok_or("copy width overflow")?;
+    crate::dma::Surface::new(
+        info.address,
+        ImageFootprint {
+            depth_slice: 0,
+            base: 0,
+            columns,
+            rows: extent.height,
+            packed_bytes: 1,
+            aspect_offset: 0,
+            aspect_bytes: 1,
+            storage,
+            native_base: 0,
+            native_element_bytes: 1,
+            native_row_pitch: u64::from(columns),
+            rect: ByteRect {
+                x: rect.x.checked_mul(bpp).ok_or("copy origin overflow")?,
+                y: rect.y,
+                width: rect.width.checked_mul(bpp).ok_or("copy width overflow")?,
+                height: rect.height,
+            },
+        },
+    )
+}
+
 pub(crate) fn decode(r: &Registers) -> Result<Option<Blit>> {
     if r.get(0x2ac) != 3 || r.get(0x29c) != 0 || r.get(0x870) != 0 {
         return Err("2D blit requires SRCCOPY without color key or endian conversion".into());

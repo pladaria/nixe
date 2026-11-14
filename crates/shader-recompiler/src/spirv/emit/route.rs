@@ -184,6 +184,12 @@ pub const fn emission_route(opcode: O) -> EmissionRoute {
         | O::GetCbufU32
         | O::GetCbufF32
         | O::GetCbufU32x2
+        | O::LoadPhysical32
+        | O::LoadPhysical64
+        | O::LoadPhysical128
+        | O::WritePhysical32
+        | O::WritePhysical64
+        | O::WritePhysical128
         | O::LoadGlobal32
         | O::LoadGlobal64
         | O::LoadGlobal128

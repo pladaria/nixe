@@ -338,3 +338,57 @@ impl Drop for CounterWait {
         }
     }
 }
+
+impl super::SyncptContext {
+    pub fn allocate(&mut self, owner: u64) -> Result<Arc<std::sync::Mutex<Counter>>, Box<str>> {
+        let id = (1..super::SYNCPOINT_COUNT)
+            .find(|id| {
+                self.timelines
+                    .get(id)
+                    .is_none_or(|t| Arc::strong_count(t) == 1 && !t.lock().unwrap().has_waiters())
+            })
+            .ok_or("native counters exhausted")?;
+        let value = self
+            .timelines
+            .get(&id)
+            .map_or(0, |t| t.lock().unwrap().value);
+        self.next_timeline = self
+            .next_timeline
+            .checked_add(1)
+            .ok_or("native timeline lifetime overflow")?;
+        let counter = Arc::new(std::sync::Mutex::new(Counter::new(
+            nixe_gpu::GuestTimeline::new(
+                nixe_gpu::GuestSyncpointId::new(id),
+                nixe_gpu::TimelineInstanceId::new(self.next_timeline),
+                nixe_gpu::TimelineOwnerId::new(owner),
+                nixe_gpu::GuestSyncpointValue::new(value as u32),
+            ),
+            value,
+        )));
+        self.timelines.insert(id, counter.clone());
+        Ok(counter)
+    }
+    pub fn publication(&self) -> Result<super::execution::Publication, nixe_memory::MemoryError> {
+        let gpu = self
+            .gpu_values
+            .as_ref()
+            .map(|a| {
+                nixe_memory::CapturedMemory::new(vec![nixe_memory::AllocationRange::new(
+                    a.pin_range(0, nixe_memory::PAGE_SIZE)?,
+                    0,
+                    nixe_memory::PAGE_SIZE,
+                )?])
+            })
+            .transpose()?;
+        Ok(super::execution::Publication {
+            gpu,
+            cpu: self.mirror.as_ref().map(|m| {
+                (
+                    m.counter_page.clone(),
+                    m.notification.clone(),
+                    m.device_counter_page.clone(),
+                )
+            }),
+        })
+    }
+}

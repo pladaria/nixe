@@ -45,6 +45,7 @@ impl Shader {
                 cbuf_offset: ByteOffset(0),
                 count: 1,
                 is_written: true,
+                pointer_table: None,
             })
             .unwrap();
     }

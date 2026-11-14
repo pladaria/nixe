@@ -82,6 +82,13 @@ impl Registers {
         self.words[(method / 4) as usize]
     }
     pub(crate) fn set(&mut self, method: u32, value: u32) -> bool {
+        // Packed and full-width DMA origins name the same coordinates.
+        // https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/common/sdk/nvidia/inc/class/clc7b5.h
+        if self.class == Class::Copy && matches!(method, 0x720 | 0x73c) {
+            let base = if method == 0x73c { 0x744 } else { 0x74c };
+            self.words[base / 4] = value & 0xffff;
+            self.words[(base + 4) / 4] = value >> 16;
+        }
         let index = (method / 4) as usize;
         if self.words[index] == value {
             return false;

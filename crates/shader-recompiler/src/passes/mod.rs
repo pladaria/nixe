@@ -5,11 +5,13 @@ mod info;
 mod info_usage;
 
 pub use info::collect_shader_info;
+mod indirect_storage;
 mod lowering;
 mod lowering_tables;
 mod ssa;
 mod storage;
 mod storage_table;
+pub use indirect_storage::{compact_storage, lower_pointer_tables};
 
 pub use storage::{add_nvn_storage_buffers, global_memory_to_storage};
 

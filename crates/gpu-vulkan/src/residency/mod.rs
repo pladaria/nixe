@@ -7,6 +7,7 @@ mod buffer_download;
 pub(crate) mod cache_owners;
 mod command_pages;
 mod multi_range;
+mod pointer_table;
 mod quad_indices;
 pub(crate) mod query;
 mod uniform_stream;
@@ -126,6 +127,9 @@ pub(crate) struct ImageEntry {
     decoded: Option<decoded_texture::DecodedImage>,
 }
 impl ImageEntry {
+    pub(crate) fn gpu_modified(&self) -> bool {
+        self.gpu_modified
+    }
     fn untrack_cpu(&mut self, device: &nixe_memory::device_memory::DeviceMemory) {
         if !self.cpu_tracked {
             return;
@@ -232,7 +236,7 @@ pub struct ResidencyStatistics {
 /// Concrete single-owner storage, selected once at startup. No generic backend
 /// handle registry, virtual resource dispatch or guest-ISA branch in its hot path.
 mod bindings;
-pub(crate) use bindings::{StorageBuffer, StorageBufferKey};
+pub(crate) use bindings::{StorageBuffer, StorageBufferBinding, StorageBufferKey};
 pub(crate) mod texture_bindings;
 pub struct VulkanResidency {
     pub(crate) caches: Arc<CacheOwners>,

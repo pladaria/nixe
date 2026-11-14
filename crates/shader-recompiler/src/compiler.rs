@@ -137,12 +137,18 @@ impl Compiler {
         passes::constant_propagation(env, &mut self.ir, &p)?;
         passes::position(env, &mut self.ir, &mut p)?;
         passes::global_memory_to_storage(&mut self.ir, &mut p, &host, env)?;
+        // Native pointer tables require the Ampere resource owner, which
+        // translates and retains their physical targets before submission.
+        if env.metadata().isa == crate::environment::ShaderIsa::Ampere {
+            passes::lower_pointer_tables(&mut self.ir, &mut p, &host)?;
+        }
         passes::geometry_compaction(&mut self.ir, &p, &host)?;
         passes::texture_pass(&mut self.ir, &mut p, env, &host, &mut self.caches)?;
         if settings.resolution_info.active {
             passes::rescaling(&mut self.ir, &p, &settings.resolution_info)?;
         }
         passes::dead_code_elimination(&mut self.ir, &p)?;
+        passes::compact_storage(&mut self.ir, &mut p)?;
         passes::tighten_output_vertices(&self.ir, &mut p)?;
         if settings.renderer_debug {
             passes::verify_program(&self.ir, &p)?;

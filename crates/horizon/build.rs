@@ -14,7 +14,10 @@ fn main() {
     build
         .file("native/nvdec/vp9.cpp")
         .file("native/nvdec/decoder.cpp")
+        .file("native/video/decoder.cpp")
         .compile("nixe_nvdec");
+    println!("cargo:rerun-if-changed=native/video/decoder.cpp");
+    println!("cargo:rerun-if-changed=native/video/decoder.h");
     for file in [
         "vp9.cpp",
         "vp9.h",

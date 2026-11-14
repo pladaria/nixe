@@ -109,7 +109,7 @@ impl model::Rasterizer for NativeGpuExecution {
         source: model::Source,
         operation: &model::blit::Blit,
         memory: &mut impl RenderMemory,
-    ) -> model::Result<()> {
+    ) -> model::Result<bool> {
         self.execution()
             .record(FrontendSubmissionId::new(source.submission), |native| {
                 native.blit_ampere(operation, memory)
@@ -156,9 +156,25 @@ impl NativeExecution<'_> {
         &mut self,
         operation: &model::blit::Blit,
         memory: &mut impl RenderMemory,
-    ) -> Result<(), VulkanError> {
+    ) -> Result<bool, VulkanError> {
         let [source, destination] = &operation.images;
-        self.ensure_blit_pipeline(images::format(destination.description.format()))?;
+        let copy_rect = operation.copy_source_rect();
+        if copy_rect.is_some() {
+            // Raw uploads should update encoded storage directly. Retain native
+            // copies when a compatible surface already owns GPU-produced pixels.
+            // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/texture_cache/texture_cache.h
+            let mut native = false;
+            for info in &operation.images {
+                if let Some((image, _)) = self.residency.find_image(info, memory)? {
+                    native |= self.residency.texture_cache.get(image).gpu_modified();
+                }
+            }
+            if !native {
+                return Ok(false);
+            }
+        } else {
+            self.ensure_blit_pipeline(images::format(destination.description.format()))?;
+        }
         self.flush_work()?;
         self.residency.runtime.device.realize_deferred_clear()?;
         let retained = self.residency.runtime.constructing.len();
@@ -173,6 +189,24 @@ impl NativeExecution<'_> {
                     self.residency.texture_cache.views[view].image,
                 ));
                 views[index] = view;
+            }
+            if let Some(rect) = copy_rect {
+                let src = self.residency.texture_cache.views[views[0]].image;
+                let dst = self.residency.texture_cache.views[views[1]].image;
+                let src_plane = self
+                    .residency
+                    .image_view_plane(views[0], vk::ImageAspectFlags::COLOR)?;
+                let dst_plane = self
+                    .residency
+                    .image_view_plane(views[1], vk::ImageAspectFlags::COLOR)?;
+                self.residency.copy_image_regions(
+                    src,
+                    dst,
+                    &[(src_plane, dst_plane)],
+                    images::rect(rect),
+                    images::rect(operation.destination).offset,
+                )?;
+                return Ok(true);
             }
             if self.residency.texture_cache.views[views[0]].image
                 == self.residency.texture_cache.views[views[1]].image
@@ -195,7 +229,8 @@ impl NativeExecution<'_> {
                 operation.linear,
                 false,
                 Some((operation.first, operation.step)),
-            )
+            )?;
+            Ok(true)
         })();
         self.residency.runtime.constructing.truncate(retained);
         result

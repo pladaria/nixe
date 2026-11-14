@@ -17,7 +17,8 @@ pub(crate) struct ImageDescriptors {
     pub(crate) entries: Vec<Option<ImageDescriptor>>,
 }
 pub(crate) struct ImageDescriptor {
-    pub(crate) views: [Option<ImageViewId>; 2],
+    /// Array/non-array selections for ordinary and depth-comparison sampling.
+    pub(crate) views: [Option<ImageViewId>; 4],
     pub(crate) raw: TextureEntry,
 }
 #[derive(Default)]
@@ -29,8 +30,8 @@ pub(crate) struct SamplerDescriptors {
 }
 pub(crate) struct SamplerDescriptor {
     pub(crate) description: nixe_gpu::SamplerDescription,
-    /// Original reduction and the variant for views without min/max filtering.
-    pub(crate) variants: [Option<vk::Sampler>; 2],
+    /// Independent reduction and comparison-disable variants.
+    pub(crate) variants: [Option<vk::Sampler>; 4],
     pub(crate) bytes: [u8; 32],
 }
 /// Channel selections and texture contents share the actual texture-cache

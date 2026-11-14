@@ -36,6 +36,7 @@ pub struct Draw {
     pub instances: u32,
 }
 pub trait PreparationHost {
+    fn copy(&mut self, operation: &crate::dma::Copy) -> Result<()>;
     fn read(&mut self, address: u64, bytes: usize) -> Result<Vec<u8>>;
     fn write(&mut self, address: u64, bytes: Vec<u8>) -> Result<()>;
     fn report(&mut self, address: u64, bytes: Vec<u8>) -> Result<()>;
@@ -598,37 +599,10 @@ fn copy(regs: &Registers, flags: u32, host: &mut impl PreparationHost) -> Result
         return Err("unsupported DMA launch flags".into());
     }
     if flags & 3 != 0 {
-        if flags & 0x180 != 0x180 {
-            return Err("block-linear DMA copy not implemented".into());
+        if host.stopped() {
+            return Err("DMA copy cancelled".into());
         }
-        let source = regs.address(0x400, 0x404);
-        let destination = regs.address(0x408, 0x40c);
-        let width = regs.get(0x418) as usize;
-        let rows = if flags & 0x200 != 0 {
-            regs.get(0x41c)
-        } else {
-            1
-        };
-        if width > 64 * 1024 * 1024 {
-            return Err("DMA row exceeds transfer limit".into());
-        }
-        for row in 0..rows {
-            if host.stopped() {
-                return Err("DMA copy cancelled".into());
-            }
-            let data = host.read(
-                source
-                    .checked_add(u64::from(row) * u64::from(regs.get(0x410)))
-                    .ok_or("DMA source address overflow")?,
-                width,
-            )?;
-            host.write(
-                destination
-                    .checked_add(u64::from(row) * u64::from(regs.get(0x414)))
-                    .ok_or("DMA destination address overflow")?,
-                data,
-            )?;
-        }
+        host.copy(&crate::dma::Copy::decode(regs, flags)?)?;
     }
     host.barrier()?;
     if flags & 0x18 != 0 {

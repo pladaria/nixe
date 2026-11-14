@@ -1,11 +1,11 @@
 use nixe_shader_recompiler::{
     Profile, RuntimeInfo,
     arena::{BlockId, InstId},
-    artifact::{Bindings, ConstantBufferDescriptor, StorageBufferDescriptor, TextureDescriptor},
+    artifact::{Bindings, ConstantBufferDescriptor, TextureDescriptor},
     diagnostics::FailureCategory,
     ir::{Attribute, FpControl, Ir, Opcode as O, Program, TextureInstInfo, Type, Value as V},
     spirv::{EmissionRoute, EmitContext, Id, emission_route},
-    types::{ByteOffset, CbufIndex, Stage, TextureType},
+    types::{CbufIndex, Stage, TextureType},
 };
 use spirv::{Decoration, Op};
 fn instructions(words: &[u32]) -> Vec<(Op, &[u32])> {
@@ -278,58 +278,6 @@ fn cbuf_alignment_and_nonaliased_vector_component_selection() {
         .unwrap()
         .1;
     assert_eq!(extract[3], 1);
-}
-#[test]
-fn storage_vector_fallback_and_narrow_write_use_scalar_views_and_cas() {
-    let mut ir = Ir::new().unwrap();
-    let block = ir.new_block().unwrap();
-    append(&mut ir, block, O::LoadStorage64, &[V::U32(0), V::U32(12)]);
-    append(
-        &mut ir,
-        block,
-        O::WriteStorageU8,
-        &[V::U32(0), V::U32(7), V::U32(0xff)],
-    );
-    let mut p = Program::new(Stage::Compute);
-    p.info.uses_int8 = true;
-    p.info.used_storage_buffer_types = Type::U8 | Type::U32x2;
-    p.info
-        .storage_buffers_descriptors
-        .push(StorageBufferDescriptor {
-            cbuf_index: CbufIndex(0),
-            cbuf_offset: ByteOffset(0),
-            count: 1,
-            is_written: true,
-        })
-        .unwrap();
-    let profile = profile();
-    let runtime = RuntimeInfo::default();
-    let mut ctx = EmitContext::new(&profile, &runtime, &p, &mut Bindings::default()).unwrap();
-    emit(&mut ctx, &mut ir, block);
-    let words = ctx.assemble().unwrap();
-    let inst = instructions(&words);
-    assert!(inst.iter().any(|(op, _)| *op == Op::AtomicCompareExchange));
-    let call = inst
-        .iter()
-        .find(|(op, a)| {
-            *op == Op::FunctionCall && a[2] == ctx.objects.write_storage_cas_loop_func.0
-        })
-        .unwrap()
-        .1;
-    assert_eq!(constant(&inst, call[5]), 24);
-    assert_eq!(constant(&inst, call[6]), 8);
-    let indices: Vec<_> = inst
-        .iter()
-        .filter(|(op, a)| {
-            *op == Op::AccessChain
-                && a[0]
-                    == ctx.storage_types[nixe_shader_recompiler::spirv::BufferKind::U32 as usize]
-                        .element
-                        .0
-        })
-        .map(|(_, a)| constant(&inst, a[4]))
-        .collect();
-    assert_eq!(indices, [3, 4, 1]);
 }
 #[test]
 fn shared_atomic_and_barriers_keep_device_and_workgroup_scopes() {

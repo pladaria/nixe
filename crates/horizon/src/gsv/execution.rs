@@ -16,6 +16,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 mod control;
+mod dma;
 mod frontend;
 mod semaphore;
 
@@ -169,9 +170,11 @@ pub(crate) struct Executor {
     budget: Arc<AtomicUsize>,
     next: std::sync::atomic::AtomicU64,
     endpoint: Arc<control::Endpoint>,
+    device_uuid: Arc<std::sync::OnceLock<Option<[u8; 16]>>>,
 }
 /// Counter pages are retained separately from the service context. Workers do
 /// not re-enter a session lock during completion or process teardown.
+#[derive(Clone)]
 pub(crate) struct Publication {
     pub cpu: Option<(
         Arc<nixe_runtime::TransferMemoryObject>,
@@ -181,6 +184,9 @@ pub(crate) struct Publication {
     pub gpu: Option<nixe_memory::CapturedMemory>,
 }
 impl Executor {
+    pub fn device_uuid(&self) -> Option<[u8; 16]> {
+        self.device_uuid.get().copied().flatten()
+    }
     pub fn new<E: ampere::Rasterizer>(
         process: &Arc<RunnableProcess>,
         presenter: Option<nixe_video::FrameMailbox>,
@@ -217,12 +223,15 @@ impl Executor {
                 }
             })
             .map_err(|e| e.to_string().into_boxed_str())?;
+        let device_uuid = Arc::new(std::sync::OnceLock::new());
+        let back_uuid = device_uuid.clone();
         let back_stop = stop.clone();
         let back = match thread::Builder::new()
             .name("nixe-ampere-gpu".into())
             .spawn(move || {
                 let result = (|| {
                     let mut renderer = initialize().map_err(|e| e.to_string().into_boxed_str())?;
+                    let _ = back_uuid.set(renderer.device_uuid());
                     back_endpoint.bind(&mut renderer)?;
                     let result = preparation(
                         &mut recv,
@@ -272,6 +281,7 @@ impl Executor {
             budget: Arc::new(AtomicUsize::new(0)),
             next: std::sync::atomic::AtomicU64::new(1),
             endpoint,
+            device_uuid,
         }))
     }
     pub fn submission(
@@ -452,6 +462,9 @@ struct Back<'a, E> {
     clock: &'a nixe_scheduler::VirtualClock,
 }
 impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
+    fn copy(&mut self, operation: &ampere::dma::Copy) -> Result<()> {
+        self.copy_memory(operation)
+    }
     fn reduce_report(
         &mut self,
         address: u64,
@@ -508,8 +521,16 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
             .map_err(|e| e.to_string().into())
     }
     fn blit(&mut self, source: Source, operation: &ampere::blit::Blit) -> Result<()> {
-        self.renderer
-            .blit(source, operation, &mut *self.memory.space.lock().unwrap())
+        let accelerated =
+            self.renderer
+                .blit(source, operation, &mut *self.memory.space.lock().unwrap())?;
+        if accelerated {
+            return Ok(());
+        }
+        let copy = operation
+            .byte_copy()?
+            .ok_or("unsupported byte-copy fallback")?;
+        self.copy_memory(&copy)
     }
     fn read(&mut self, address: u64, bytes: usize) -> Result<Vec<u8>> {
         if bytes == 0 {

@@ -70,9 +70,16 @@ pub(super) fn dispatch(
             let index = request_u32(request.data, 0).unwrap() as usize;
             let id = !request_u32(request.data, 4).unwrap();
             let value = request_u64(request.data, 8).unwrap();
-            let mode = request_u32(request.data, 16).unwrap();
+            // The client writes SyncValueMode with STRB. The trailing three
+            // bytes belong to TIPC word padding and may retain earlier data.
+            let mode = request.data[16];
             if mode > 1 {
-                return Err(IpcWireError::Malformed("invalid native counter comparison"));
+                return Err(IpcWireError::GraphicsService(
+                    format!(
+                        "unsupported native counter comparison: slot={index} counter={id} value={value:#x} mode={mode:#04x}"
+                    )
+                    .into(),
+                ));
             }
             let slot = context
                 .slots

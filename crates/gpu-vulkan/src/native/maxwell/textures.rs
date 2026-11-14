@@ -14,6 +14,7 @@ pub(in crate::native) struct ShaderTexture {
     pub(in crate::native) dimension: Dimension,
     pub(in crate::native) descriptor: usize,
     pub(in crate::native) sampler: Option<u32>,
+    pub(in crate::native) depth: bool,
     pub(in crate::native) storage_format: Option<nixe_shader_recompiler::types::ImageFormat>,
 }
 
@@ -50,8 +51,13 @@ impl super::super::NativeExecution<'_> {
             self.residency.texture_cache.bindings.has_deleted_images = false;
             images.clear();
             for texture in textures {
-                let view =
-                    self.shader_texture_view(compute, space, texture.dimension, texture.index)?;
+                let view = self.shader_texture_view(
+                    compute,
+                    space,
+                    texture.dimension,
+                    texture.index,
+                    texture.depth,
+                )?;
                 let view = if let Some(format) = texture.storage_format {
                     view.map(|view| self.residency.storage_image_view(view, format))
                         .transpose()?
@@ -60,7 +66,7 @@ impl super::super::NativeExecution<'_> {
                 };
                 let sampler = texture
                     .sampler
-                    .map(|index| self.sampler_for_view(compute, index, view))
+                    .map(|index| self.sampler_for_view(compute, index, view, texture.depth))
                     .transpose()?;
                 images.push(crate::residency::execution::ShaderImage {
                     view,
@@ -84,6 +90,7 @@ impl super::super::NativeExecution<'_> {
         space: &MaxwellGpuMemory,
         required: Dimension,
         index: u32,
+        depth: bool,
     ) -> Result<Option<ImageViewId>, VulkanError> {
         let bank = usize::from(compute);
         let table = &self
@@ -106,7 +113,7 @@ impl super::super::NativeExecution<'_> {
             bytes,
             nixe_gpu::nvidia::TextureTiling::Maxwell,
         )?;
-        kind.map(|kind| self.resolve_shader_texture(compute, space, index, kind))
+        kind.map(|kind| self.resolve_shader_texture(compute, space, index, kind, depth))
             .transpose()
     }
     pub(in crate::native) fn shader_sampler(

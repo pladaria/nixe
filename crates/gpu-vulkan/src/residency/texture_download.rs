@@ -327,6 +327,30 @@ impl Residency<'_> {
                 }
             }
         }
+        self.download_images(ids)
+    }
+    pub(super) fn preserve_texture_writes(&mut self, writes: &RangeSet) -> Result<(), VulkanError> {
+        let mut ids = Vec::new();
+        for (address, bytes) in writes.iter() {
+            for page in address >> 20..=(address + bytes - 1) >> 20 {
+                if let Some(entries) = self.texture_cache.image_pages.get(&page) {
+                    for &id in entries {
+                        let entry = self.texture_cache.get(id);
+                        if entry.gpu_modified
+                            && entry.synchronized
+                            && !ids.contains(&id)
+                            && entry.maps.iter().any(|&(a, b)| writes.intersects(a, b))
+                            && !entry.maps.iter().all(|&(a, b)| writes.contains(a, b))
+                        {
+                            ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        self.download_images(ids)
+    }
+    fn download_images(&mut self, mut ids: Vec<ImageId>) -> Result<(), VulkanError> {
         ids.sort_by_key(|&id| self.texture_cache.get(id).modification_tick);
         for &id in &ids {
             self.texture_cache.images[id].gpu_modified = false;

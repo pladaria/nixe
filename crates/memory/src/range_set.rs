@@ -24,7 +24,7 @@ impl RangeSet {
         self.ranges.clear();
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + Clone + '_ {
         self.ranges
             .iter()
             .map(|(&start, &end)| (start, end - start))

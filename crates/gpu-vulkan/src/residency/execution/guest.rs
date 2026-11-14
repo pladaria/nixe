@@ -49,8 +49,16 @@ impl Residency<'_> {
         // Finish imports before registering scopes: importing an overlapping
         // physical resource may replace a cache entry's prior reader scopes.
         for slot in &resources.storage {
-            if let Some(StorageBufferBinding::Buffer(range)) = self.guest_storage(STAGE, slot) {
-                self.ensure_buffer_range(range.buffer, range.offset, range.size)?;
+            match self.guest_storage(STAGE, slot) {
+                Some(StorageBufferBinding::Buffer(range)) => {
+                    self.ensure_buffer_range(range.buffer, range.offset, range.size)?
+                }
+                Some(StorageBufferBinding::PointerTable(binding)) => {
+                    for range in &binding.targets {
+                        self.ensure_buffer_range(range.buffer, range.offset, range.size)?;
+                    }
+                }
+                _ => (),
             }
         }
         Ok(())
@@ -173,6 +181,20 @@ impl Residency<'_> {
                             },
                         );
                     }
+                    Some(StorageBufferBinding::PointerTable(binding)) => {
+                        for range in &binding.targets {
+                            self.use_buffer(range.buffer, range.offset, range.size)?;
+                        }
+                        self.runtime.descriptor_queue.write(
+                            slot.descriptor,
+                            DescriptorEntry {
+                                buffer: vk::DescriptorBufferInfo::default()
+                                    .buffer(binding.table.handle)
+                                    .offset(binding.offset)
+                                    .range(binding.size),
+                            },
+                        );
+                    }
                     Some(StorageBufferBinding::MultiRange(binding)) => {
                         if binding.sparse {
                             for &source in binding.sources.iter() {
@@ -247,6 +269,11 @@ impl Residency<'_> {
                 match self.guest_storage(stage, slot) {
                     Some(StorageBufferBinding::Buffer(range)) => {
                         if scope.writes() {
+                            self.finish_buffer_write(range.buffer, range.offset, range.size)?;
+                        }
+                    }
+                    Some(StorageBufferBinding::PointerTable(binding)) if scope.writes() => {
+                        for range in &binding.targets {
                             self.finish_buffer_write(range.buffer, range.offset, range.size)?;
                         }
                     }

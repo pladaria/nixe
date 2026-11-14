@@ -90,7 +90,7 @@ impl NativeExecution<'_> {
                 .is_none_or(|entry| entry.raw.bytes != bytes)
             {
                 table.entries[index as usize] = Some(ImageDescriptor {
-                    views: [None; 2],
+                    views: [None; 4],
                     raw: TextureEntry { bytes, info: None },
                 });
             }
@@ -161,7 +161,7 @@ impl NativeExecution<'_> {
                 table.entries.resize_with(index as usize + 1, || None);
             }
             table.entries[index as usize] = Some(ImageDescriptor {
-                views: [None; 2],
+                views: [None; 4],
                 raw: TextureEntry {
                     bytes,
                     info: Some(info),
@@ -176,8 +176,10 @@ impl NativeExecution<'_> {
         space: &impl nixe_gpu::native::ImageAddressSpace,
         index: u32,
         view_kind: usize,
+        depth: bool,
     ) -> Result<ImageViewId, VulkanError> {
         let bank = usize::from(compute);
+        let view_kind = view_kind | (usize::from(depth) << 1);
         if let Some(view) = self
             .residency
             .texture_cache
@@ -191,7 +193,7 @@ impl NativeExecution<'_> {
         {
             return self.prepare_shader_texture_view(view);
         }
-        let info = self
+        let mut info = self
             .residency
             .texture_cache
             .bindings
@@ -205,9 +207,45 @@ impl NativeExecution<'_> {
             .as_ref()
             .unwrap()
             .clone();
+        // The guest can compare single-channel color texels. Vulkan requires
+        // depth-comparison format support. Select an equal-bit depth alias;
+        // the physical cache synchronizes it with prior GPU/CPU producers.
+        // https://github.com/Lucas-blip-png/dkb-pc-recomp/blob/fac48bcdc5ec0edd6296bc3672bdebb540d5958d/runtime/vk_exec_draw.c#L1993
+        if depth {
+            use nixe_gpu::{ImageDescription, ImageFormat as F, ImageKind};
+            let d = info.description;
+            let native = super::images::format(d.format());
+            if !self.residency.device().supports_depth_comparison(native) {
+                let format = match d.format() {
+                    F::R32Float => F::Depth32Float,
+                    F::R16Unorm => F::Depth16Unorm,
+                    _ => {
+                        return Err(failed(format_args!(
+                            "unsupported comparison image format {:?}",
+                            d.format()
+                        )));
+                    }
+                };
+                info.description = ImageDescription::new(
+                    d.dimension(),
+                    d.extent(),
+                    format,
+                    ImageKind::DepthStencil,
+                    d.mip_levels(),
+                    d.array_layers(),
+                    d.samples(),
+                )
+                .map_err(failed)?;
+            }
+        }
         let (image, base) = self.find_or_insert_image(&info, space)?;
-        let view =
-            self.sampled_view(image, info.description, info.swizzle, base, view_kind != 0)?;
+        let view = self.sampled_view(
+            image,
+            info.description,
+            info.swizzle,
+            base,
+            view_kind & 1 != 0,
+        )?;
         self.residency
             .texture_cache
             .bindings
@@ -249,7 +287,7 @@ impl NativeExecution<'_> {
             }
             table.entries[index as usize] = Some(SamplerDescriptor {
                 description,
-                variants: [None; 2],
+                variants: [None; 4],
                 bytes,
             });
         }
@@ -260,6 +298,7 @@ impl NativeExecution<'_> {
         compute: bool,
         index: u32,
         view: Option<ImageViewId>,
+        depth: bool,
     ) -> Result<vk::Sampler, VulkanError> {
         // Sampler::MakeKey / HandleFor in Eden drops min/max reduction for
         // views whose native format cannot filter it. Keep both variants in
@@ -281,12 +320,16 @@ impl NativeExecution<'_> {
                 || view.is_none_or(|view| {
                     !self.residency.texture_cache.views[view].supports_minmax_filter
                 }));
-        let variant = usize::from(drop_reduction);
+        let drop_compare = description.compare.is_some() && !depth;
+        let variant = usize::from(drop_reduction) | (usize::from(drop_compare) << 1);
         if let Some(native) = entry.variants[variant] {
             return Ok(native);
         }
         if drop_reduction {
             description.reduction = nixe_gpu::SamplerReduction::WeightedAverage;
+        }
+        if drop_compare {
+            description.compare = None;
         }
         let native = self.guest_sampler(&description)?;
         self.residency

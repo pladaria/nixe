@@ -220,7 +220,7 @@ impl NativeExecution<'_> {
                 memory
                     .prepare_image(info.address, info.size)
                     .map_err(|e| compilation(format!("native sampled image {info:?}: {e}")))?;
-                Some(self.resolve_shader_texture(compute, memory, tic, kind)?)
+                Some(self.resolve_shader_texture(compute, memory, tic, kind, slot.depth)?)
             } else {
                 None
             };
@@ -242,7 +242,7 @@ impl NativeExecution<'_> {
                     tsc,
                 )?;
                 self.resolve_shader_sampler(compute, tsc, bytes)?;
-                self.sampler_for_view(compute, tsc, view)?
+                self.sampler_for_view(compute, tsc, view, slot.depth)?
             } else {
                 vk::Sampler::null()
             };

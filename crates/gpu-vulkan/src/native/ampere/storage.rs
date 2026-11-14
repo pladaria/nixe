@@ -13,6 +13,9 @@ impl NativeExecution<'_> {
         stage: usize,
         slot: &StorageSlot,
     ) -> Result<(), VulkanError> {
+        if slot.pointer_table.is_some() {
+            return self.ampere_pointer_table(memory, constants, stage, slot);
+        }
         let (base, size) = constants
             .get(slot.cbuf as usize)
             .copied()
@@ -122,5 +125,125 @@ impl NativeExecution<'_> {
         }
         self.residency
             .update_storage_buffer(stage, slot.slot, memory)
+    }
+}
+
+impl NativeExecution<'_> {
+    fn ampere_pointer_table(
+        &mut self,
+        memory: &mut impl RenderMemory,
+        constants: &[Option<(u64, u32)>],
+        stage: usize,
+        slot: &StorageSlot,
+    ) -> Result<(), VulkanError> {
+        let span = slot.pointer_table.as_ref().unwrap();
+        let (base, size) = constants
+            .get(slot.cbuf as usize)
+            .copied()
+            .flatten()
+            .ok_or_else(|| compilation("indirect pointer table uses an unbound constant buffer"))?;
+        if u64::from(slot.offset) + 12 > u64::from(size) {
+            return Err(compilation(
+                "indirect pointer table descriptor exceeds its constant buffer",
+            ));
+        }
+        let address = base
+            .checked_add(u64::from(slot.offset))
+            .ok_or_else(|| compilation("indirect pointer table descriptor address overflow"))?;
+        let descriptor = shader::read::<12>(&mut self.residency, memory, address)?;
+        let target = u64::from_le_bytes(descriptor[..8].try_into().unwrap());
+        let size = u32::from_le_bytes(descriptor[8..].try_into().unwrap()) as u64;
+        if target == 0 || size == 0 {
+            return Err(compilation("indirect pointer table is unbound"));
+        }
+        let alignment = self
+            .residency
+            .device()
+            .profile()
+            .limits
+            .min_storage_buffer_offset_alignment
+            .max(8);
+        let padding = target % alignment;
+        if !target.is_multiple_of(8)
+            || !size.is_multiple_of(8)
+            || size + padding
+                > u64::from(
+                    self.residency
+                        .device()
+                        .profile()
+                        .limits
+                        .max_storage_buffer_range,
+                )
+        {
+            return Err(compilation(
+                "indirect pointer table has invalid alignment or exceeds host storage limits",
+            ));
+        }
+        let mut bytes = vec![0u8; size as usize];
+        shader::read_into(&mut self.residency, memory, target, &mut bytes)?;
+        let mut source_ranges = Vec::new();
+        for (gpu, bytes) in memory.image_mapped_ranges(target, size)? {
+            let address = memory
+                .image_device_address(gpu)?
+                .ok_or_else(|| compilation("unmapped indirect pointer table"))?;
+            source_ranges.push(nixe_gpu::native::GuestBufferRange {
+                address,
+                size: bytes,
+            });
+        }
+        let source = source_ranges
+            .first()
+            .copied()
+            .ok_or_else(|| compilation("unmapped indirect pointer table"))?;
+        let width = (i64::from(span.end) - i64::from(span.start)) as u64;
+        let mut targets = Vec::with_capacity(bytes.len() / 8);
+        for pointer in bytes.chunks_exact(8) {
+            let pointer = u64::from_le_bytes(pointer.try_into().unwrap());
+            targets.push(if pointer == 0 {
+                None
+            } else {
+                let begin = pointer
+                    .checked_add_signed(i64::from(span.start))
+                    .ok_or_else(|| compilation("indirect pointer target address overflow"))?;
+                if !begin.is_multiple_of(4) {
+                    return Err(compilation("unaligned indirect pointer target"));
+                }
+                let address = self.ampere_address(memory, begin, width)?;
+                if slot.written
+                    && source_ranges
+                        .iter()
+                        .any(|r| address < r.address + r.size && r.address < address + width)
+                {
+                    return Err(compilation(
+                        "indirect shader writes alias their pointer table",
+                    ));
+                }
+                Some(nixe_gpu::native::GuestBufferRange {
+                    address,
+                    size: width,
+                })
+            });
+        }
+        let binding = self
+            .residency
+            .pointer_table(&targets, padding, span.start)?;
+        self.residency
+            .runtime
+            .buffer_bindings
+            .channel
+            .storage_buffers[stage][slot.slot] = Some(StorageBuffer {
+            key: StorageBufferKey {
+                descriptor: [target, size],
+                address_space: memory.image_space_id(),
+                mapping_generation: memory.mapping_generation(),
+                written: slot.written,
+            },
+            source,
+            gpu_address: target,
+            native: Some(crate::residency::StorageBufferBinding::PointerTable(
+                Arc::new(binding),
+            )),
+        });
+        Ok(())
     }
 }

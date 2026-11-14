@@ -114,6 +114,37 @@ impl EmitContext<'_> {
     }
     pub(super) fn buffer_instruction(&mut self, ir: &Ir, id: InstId) -> Result<Option<Id>> {
         let opcode = ir.inst(id)?.opcode();
+        let physical = match opcode {
+            O::LoadPhysical32 => Some((32, false)),
+            O::LoadPhysical64 => Some((64, false)),
+            O::LoadPhysical128 => Some((128, false)),
+            O::WritePhysical32 => Some((32, true)),
+            O::WritePhysical64 => Some((64, true)),
+            O::WritePhysical128 => Some((128, true)),
+            _ => None,
+        };
+        if let Some((width, store)) = physical {
+            let ty = self.types.u32[width / 32 - 1];
+            let pointer_type = self
+                .builder
+                .type_pointer(spirv::StorageClass::PhysicalStorageBuffer, ty)?;
+            let address = self.def(ir, ir.inst(id)?.arg(0)?)?;
+            let pointer = self.op(Op::ConvertUToPtr, pointer_type, &[address])?;
+            // Physical pointers require an explicit alignment operand. Pointer
+            // contents are checked for scalar alignment during resource preparation.
+            // https://docs.vulkan.org/guide/latest/buffer_device_address_alignment.html
+            let alignment = 4;
+            let aligned = spirv::MemoryAccess::ALIGNED.bits();
+            return Ok(Some(if store {
+                let value = self.def(ir, ir.inst(id)?.arg(1)?)?;
+                self.builder
+                    .instruction(Op::Store, &[pointer.0, value.0, aligned, alignment])?;
+                Id::NONE
+            } else {
+                self.builder
+                    .result(Op::Load, ty, &[pointer.0, aligned, alignment])?
+            }));
+        }
         // (address space: constant/storage/global/local, width, signed, store)
         let (space, width, signed, store) = match opcode {
             O::GetCbufU8 => (0, 8, false, false),

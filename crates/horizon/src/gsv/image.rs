@@ -24,6 +24,11 @@ pub(crate) struct Memory {
 #[derive(Debug)]
 pub(crate) struct Backing {
     pub ranges: nixe_memory::CapturedMemory,
+    pub gpu: Option<GpuBacking>,
+}
+
+#[derive(Debug)]
+pub(crate) struct GpuBacking {
     pub source: Arc<nixe_runtime::memory::GpuMemoryLease>,
     pub offset: u64,
 }
@@ -98,8 +103,13 @@ impl Pool {
             return Ok(image);
         }
         let p = self.preference;
+        let gpu = self
+            .backing
+            .gpu
+            .as_ref()
+            .ok_or("presentation requires GPU-backed native memory")?;
         let (size, _) = requirements(p, 1)?;
-        let offset = self.backing.offset + size * u64::from(index);
+        let offset = gpu.offset + size * u64::from(index);
         let format = match p[6] {
             1 => nixe_gpu::PresentationImageFormat::Rgba8,
             other => {
@@ -114,7 +124,7 @@ impl Pool {
                 let super::gpu::Backing::Cpu(source) = &mapping.source else {
                     continue;
                 };
-                if !Arc::ptr_eq(source, &self.backing.source)
+                if !Arc::ptr_eq(source, &gpu.source)
                     || offset < mapping.offset
                     || offset + size > mapping.offset + mapping.end - start
                 {
@@ -142,7 +152,9 @@ impl Pool {
                     },
                     transform: nixe_gpu::FrameTransform::default(),
                     format,
-                    allow_canonical_import: false,
+                    // The pool supplies the format, pitch and native GOB layout.
+                    // CPU/DMA-written images need not have a resident draw producer.
+                    allow_canonical_import: true,
                 };
                 let _ = slot.set(Presentation {
                     image,

@@ -24,11 +24,19 @@ impl super::descriptors::DescriptorCount for ConstantBufferDescriptor {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PointerTableSpan {
+    /// Byte interval accessed relative to each pointer loaded from the table.
+    pub start: i32,
+    pub end: i32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StorageBufferDescriptor {
     pub cbuf_index: CbufIndex,
     pub cbuf_offset: ByteOffset,
     pub count: u32,
     pub is_written: bool,
+    pub pointer_table: Option<PointerTableSpan>,
 }
 
 impl super::descriptors::DescriptorCount for StorageBufferDescriptor {
@@ -212,7 +220,8 @@ impl ShaderInfo {
         let Some(offset) = descriptor.cbuf_offset.0.checked_sub(self.nvn_buffer_base) else {
             return false;
         };
-        self.uses_global_memory
+        descriptor.pointer_table.is_none()
+            && self.uses_global_memory
             && descriptor.cbuf_index.0 == 0
             && offset < 16 * 16
             && offset.is_multiple_of(16)

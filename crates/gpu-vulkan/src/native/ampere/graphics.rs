@@ -105,6 +105,11 @@ impl NativeExecution<'_> {
                 )));
             }
         };
+        // Empty draws invoke no shaders and consume no index/vertex storage.
+        // MME side effects have already executed before reaching this boundary.
+        if draw.is_empty() {
+            return Ok(());
+        }
         'draw: loop {
             loop {
                 self.residency.texture_cache.bindings.has_deleted_images = false;

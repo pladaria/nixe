@@ -44,6 +44,7 @@ mod shared_font;
 mod system_memory;
 #[cfg(test)]
 mod test_memory;
+mod video_codec;
 pub use shared_font::SharedFontSession;
 mod machine_profile;
 pub use save_data::SaveDataSystem;

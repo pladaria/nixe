@@ -742,6 +742,7 @@ impl QueueState {
         }
         self.in_flight.push_back(index);
         self.scheduled = tick;
+        self.progress.scheduled_successfully(tick);
         self.last_flush = Some(Instant::now());
         self.flush_pending = false;
         self.recording = None;

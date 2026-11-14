@@ -15,6 +15,7 @@ pub(crate) struct StorageSlot {
     pub(crate) cbuf: u32,
     pub(crate) offset: u32,
     pub(crate) written: bool,
+    pub(crate) pointer_table: Option<nixe_shader_recompiler::artifact::PointerTableSpan>,
     pub(crate) has_declared_size: bool,
     pub(crate) descriptor: usize,
 }
@@ -41,6 +42,7 @@ pub(super) struct ImageSlot {
     pub(super) handle: HandleSource,
     pub(super) dimension: TextureDimension,
     pub(super) sampler: bool,
+    pub(super) depth: bool,
     pub(super) storage_format: Option<nixe_shader_recompiler::types::ImageFormat>,
 }
 #[derive(Default)]
@@ -131,6 +133,7 @@ impl PipelineResources {
                         cbuf: d.cbuf_index.0,
                         offset: d.cbuf_offset.0,
                         written: d.is_written,
+                        pointer_table: d.pointer_table.clone(),
                         has_declared_size: metadata.info.uses_nvn_descriptor(d),
                         descriptor,
                     });
@@ -204,6 +207,7 @@ impl PipelineResources {
                             }
                         },
                         sampler: origin.sampler.is_some(),
+                        depth: d.is_depth,
                         storage_format: None,
                     });
                 }
@@ -251,6 +255,7 @@ impl PipelineResources {
                             }
                         },
                         sampler: false,
+                        depth: false,
                         storage_format: Some(d.format),
                     });
                 }

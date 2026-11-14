@@ -107,6 +107,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
                 handle: consumed,
                 index: handle & 0xfffff,
                 dimension: slot.dimension,
+                depth: slot.depth,
                 descriptor: slot.descriptor,
                 sampler,
                 storage_format: slot.storage_format,

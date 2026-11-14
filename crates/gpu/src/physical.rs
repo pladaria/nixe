@@ -269,6 +269,11 @@ pub struct ByteIntersection {
     pub bytes: u64,
     pub native: u64,
 }
+/// Bytes packed in the same order as exact logical destination runs.
+pub struct PackedWrite {
+    pub ranges: Vec<std::ops::Range<u64>>,
+    pub bytes: Vec<u8>,
+}
 impl WriteDomain {
     /// Copy encoded storage into native byte order from the selected memory reader.
     pub fn capture(
@@ -407,6 +412,10 @@ impl WriteDomain {
     }
 }
 impl ImageFootprint {
+    /// Validate the layout and return the required storage extent from its base.
+    pub fn storage_bytes(self) -> Result<u64, MemoryError> {
+        self.dimensions().map(|(_, bytes)| bytes)
+    }
     fn has_complete_gob(self) -> bool {
         self.aspect_bytes == self.packed_bytes
             && self.native_element_bytes == self.packed_bytes
@@ -724,6 +733,77 @@ impl ImageFootprint {
     }
 }
 impl Footprint {
+    /// Reorder a byte-addressed rectangular copy into destination storage order.
+    /// The returned runs exclude padding; adjacent runs share one memory access.
+    /// Taking the source snapshot first also preserves overlapping-copy semantics.
+    pub fn repack_bytes(
+        &self,
+        source: &Self,
+        source_start: u64,
+        bytes: &[u8],
+    ) -> Result<PackedWrite, MemoryError> {
+        let (WriteDomain::Image(dst), WriteDomain::Image(src)) = (self.domain, source.domain)
+        else {
+            return Err(MemoryError::Invalid(
+                "rectangular copy requires image footprints",
+            ));
+        };
+        if [
+            src.packed_bytes,
+            dst.packed_bytes,
+            src.aspect_bytes,
+            dst.aspect_bytes,
+            src.native_element_bytes,
+            dst.native_element_bytes,
+        ] != [1; 6]
+            || src.rect.width != dst.rect.width
+            || src.rect.height != dst.rect.height
+        {
+            return Err(MemoryError::Invalid("incompatible byte-copy footprints"));
+        }
+        let mut result = PackedWrite {
+            ranges: Vec::new(),
+            bytes: Vec::with_capacity(src.rect.width as usize * src.rect.height as usize),
+        };
+        for (index, span) in self.mapping.spans().iter().enumerate() {
+            let mut error = None;
+            self.visit(index, span.start, span.bytes, |copy| {
+                let y = (copy.native - dst.native_base) / dst.native_row_pitch;
+                let x = (copy.native - dst.native_base) % dst.native_row_pitch;
+                let mut sx = x - u64::from(dst.rect.x) + u64::from(src.rect.x);
+                let sy = y - u64::from(dst.rect.y) + u64::from(src.rect.y);
+                let mut remaining = copy.bytes;
+                while remaining != 0 {
+                    let count = match src.storage {
+                        ImageStorage::Pitch { .. } => remaining,
+                        _ => remaining.min(16 - sx % 16),
+                    };
+                    let offset = src.base + src.offset(sx, sy);
+                    let data = offset
+                        .checked_sub(source_start)
+                        .and_then(|offset| bytes.get(offset as usize..(offset + count) as usize));
+                    let Some(data) = data else {
+                        error = Some(MemoryError::Invalid("copy source snapshot is incomplete"));
+                        return false;
+                    };
+                    result.bytes.extend_from_slice(data);
+                    remaining -= count;
+                    sx += count;
+                }
+                let start = span.logical + copy.start.get() - span.start.get();
+                if let Some(last) = result.ranges.last_mut().filter(|r| r.end == start) {
+                    last.end += copy.bytes;
+                } else {
+                    result.ranges.push(start..start + copy.bytes);
+                }
+                true
+            })?;
+            if let Some(error) = error {
+                return Err(error);
+            }
+        }
+        Ok(result)
+    }
     pub fn new(
         mapping: Arc<PhysicalMapping>,
         domain: WriteDomain,

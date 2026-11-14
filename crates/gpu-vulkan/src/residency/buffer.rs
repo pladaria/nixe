@@ -99,7 +99,12 @@ impl Residency<'_> {
     }
 }
 impl Residency<'_> {
-    fn ordinary_buffer_usage(usage: vk::BufferUsageFlags) -> vk::BufferUsageFlags {
+    fn ordinary_buffer_usage(&self, usage: vk::BufferUsageFlags) -> vk::BufferUsageFlags {
+        let usage = if self.runtime.device.profile().buffer_device_address {
+            usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+        } else {
+            usage
+        };
         usage
             | vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::INDEX_BUFFER
@@ -205,12 +210,8 @@ impl Residency<'_> {
             mapping,
             nixe_gpu::physical::WriteDomain::Buffer { start: 0, bytes },
         )?;
-        let id = self.allocate_buffer_entry(
-            footprint,
-            bytes,
-            Self::ordinary_buffer_usage(usage),
-            false,
-        )?;
+        let id =
+            self.allocate_buffer_entry(footprint, bytes, self.ordinary_buffer_usage(usage), false)?;
         if initialize {
             self.ensure_buffer_range(id, offset, requested_bytes)?;
         }
@@ -229,7 +230,7 @@ impl Residency<'_> {
         sparse_compatible: bool,
     ) -> Result<BufferRange, VulkanError> {
         self.invalidate_device_mappings()?;
-        let usage = Self::ordinary_buffer_usage(usage);
+        let usage = self.ordinary_buffer_usage(usage);
         let requested_end = address
             .checked_add(requested_bytes)
             .filter(|&end| {

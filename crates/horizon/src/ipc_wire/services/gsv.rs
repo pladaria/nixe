@@ -5,6 +5,7 @@ mod gpu;
 mod image;
 mod sparse;
 mod syncpt;
+mod video;
 use crate::ipc_wire::message::{TipcRequest, encode_tipc_response};
 
 pub(in crate::ipc_wire) async fn dispatch_gsv(
@@ -29,9 +30,18 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
         crate::gsv::GsvInterface::Syncpt => {
             return syncpt::dispatch(process, session, request, hipc);
         }
+        crate::gsv::GsvInterface::VideoDecoderCreator
+        | crate::gsv::GsvInterface::VideoEncoderCreator => {
+            return video::creator(process, session, request, hipc);
+        }
+        crate::gsv::GsvInterface::VideoDecoder(ref decoder) => {
+            return video::dispatch(process, session, decoder, request, hipc).await;
+        }
     }
     match request.command_id {
-        111 | 112 | 314 | 315 | 423 | 429 | 430 | 434 | 435 | 1510 => {
+        901..=903 | 1001..=1003 => video::context(process, session, request, hipc),
+        911 | 912 | 961 | 991 => video::images(session, request, hipc),
+        111 | 112 | 114 | 314 | 315 | 423 | 429 | 430 | 434 | 435 | 1510 => {
             image::dispatch(session, request, hipc)
         }
         1 | 4 => {

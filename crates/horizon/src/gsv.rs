@@ -8,6 +8,8 @@ pub(crate) mod execution;
 pub(crate) mod gpu;
 pub(crate) mod image;
 pub(crate) mod syncpt;
+pub(crate) mod video;
+pub(crate) mod video_image;
 pub(crate) use syncpt::SyncptMirror;
 
 // @SPECULATIVE: counter capacity follows the observed reference driver profile.
@@ -36,6 +38,14 @@ pub(crate) struct GsvState {
     pub inter_module_images: Option<InterModuleImages>,
     pub frame: Option<GraphicsFrame>,
     pub display: Option<display::DisplayContext>,
+    pub video_decoder: Option<VideoContext>,
+    pub video_encoder: Option<VideoContext>,
+    pub video_images: std::collections::BTreeMap<u32, Arc<video_image::Image>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct VideoContext {
+    pub initialized: bool,
 }
 
 /// Lifetime of the image-exchange context. Native pools are registered only
@@ -114,13 +124,16 @@ pub(crate) struct Tsg {
     pub interleave: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum GsvInterface {
     User,
     Syncpt,
     Gpu,
     Worker,
     Display,
+    VideoDecoderCreator,
+    VideoEncoderCreator,
+    VideoDecoder(Arc<video::Session>),
 }
 
 #[derive(Default)]

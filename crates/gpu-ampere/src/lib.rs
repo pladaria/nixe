@@ -3,6 +3,7 @@
 pub mod blit;
 mod channel;
 pub mod compute;
+pub mod dma;
 mod engines;
 mod mme;
 pub mod ordered;
@@ -95,12 +96,13 @@ pub trait Rasterizer: nixe_gpu::GpuExecution {
         state: &mut GraphicsState,
         memory: &mut impl RenderMemory,
     ) -> Result<()>;
+    /// Return false only for an exact byte copy that can use coherent RAM.
     fn blit(
         &mut self,
         source: Source,
         operation: &blit::Blit,
         memory: &mut impl RenderMemory,
-    ) -> Result<()>;
+    ) -> Result<bool>;
     fn invalidate_space(&mut self, space: u64, address: u64, bytes: u64);
     fn composite(
         &mut self,

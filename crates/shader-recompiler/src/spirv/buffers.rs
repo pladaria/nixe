@@ -130,6 +130,9 @@ impl EmitContext<'_> {
         let mut index = 0u32;
         for d in info.storage_buffers_descriptors.iter() {
             let id = self.builder.variable(pointer, S::StorageBuffer, None)?;
+            if d.pointer_table.is_some() {
+                self.builder.decorate(id, D::NonWritable, &[])?;
+            }
             self.bind(id, binding)?;
             let end = index
                 .checked_add(d.count)

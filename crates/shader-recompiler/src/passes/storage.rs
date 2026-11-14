@@ -12,7 +12,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-fn low_address(ir: &Ir, id: InstId) -> Result<Option<(Value, Value, u32)>> {
+pub(super) fn low_address(ir: &Ir, id: InstId) -> Result<Option<(Value, Value, u32)>> {
     let mut address = arg(ir, id, 0)?;
     let mut offset = 0;
     if let Some(add) = node(ir, address, O::IAdd64)? {
@@ -185,6 +185,7 @@ pub fn global_memory_to_storage(
                 cbuf_offset: ByteOffset(offset),
                 count: 1,
                 is_written,
+                pointer_table: None,
             })?;
     }
     // The indices are local to this pass's sorted descriptor set.
@@ -234,6 +235,7 @@ pub(super) fn join_storage_info(base: &mut ShaderInfo, source: &ShaderInfo) -> R
             d.cbuf_index == descriptor.cbuf_index
                 && d.cbuf_offset == descriptor.cbuf_offset
                 && d.count == descriptor.count
+                && d.pointer_table == descriptor.pointer_table
         });
         indices.push(if let Some(index) = index {
             base.storage_buffers_descriptors[index].is_written |= descriptor.is_written;
@@ -268,7 +270,9 @@ pub fn add_nvn_storage_buffers(program: &mut Program) -> Result<()> {
             .info
             .storage_buffers_descriptors
             .iter_mut()
-            .find(|d| d.cbuf_index == CbufIndex(0) && d.cbuf_offset == offset)
+            .find(|d| {
+                d.pointer_table.is_none() && d.cbuf_index == CbufIndex(0) && d.cbuf_offset == offset
+            })
         {
             existing.is_written |= program.info.stores_global_memory;
         } else {
@@ -280,6 +284,7 @@ pub fn add_nvn_storage_buffers(program: &mut Program) -> Result<()> {
                     cbuf_offset: offset,
                     count: 1,
                     is_written: program.info.stores_global_memory,
+                    pointer_table: None,
                 })?;
         }
     }

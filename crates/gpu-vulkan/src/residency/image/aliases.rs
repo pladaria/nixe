@@ -108,13 +108,22 @@ impl Residency<'_> {
                     let WriteDomain::Image(source_domain) = source_geometry.domain() else {
                         unreachable!("image geometry");
                     };
-                    if from.aspect != destination.aspect
-                        || from.block_extent != destination.block_extent
-                        || !format::copy_compatible(
+                    let direct = from.aspect == destination.aspect
+                        && format::copy_compatible(
                             source.description.format,
                             target.description.format,
                             from.aspect,
-                        )
+                        );
+                    let depth_alias = source.description.samples == vk::SampleCountFlags::TYPE_1
+                        && matches!(
+                            (source.description.format, target.description.format),
+                            (vk::Format::R32_SFLOAT, vk::Format::D32_SFLOAT)
+                                | (vk::Format::D32_SFLOAT, vk::Format::R32_SFLOAT)
+                                | (vk::Format::R16_UNORM, vk::Format::D16_UNORM)
+                                | (vk::Format::D16_UNORM, vk::Format::R16_UNORM)
+                        );
+                    if (!direct && !depth_alias)
+                        || from.block_extent != destination.block_extent
                         || !same_storage(target_domain, source_domain)
                     {
                         continue;
@@ -258,13 +267,79 @@ impl Residency<'_> {
                 copy.extent.height = scale.scale(copy.extent.height);
             }
         }
-        unsafe {
-            self.runtime
-                .device
-                .dispatch
-                .copy_image(native, layout, target, target_layout, &copies);
+        if planes
+            .iter()
+            .any(|plane| plane.source.aspect != plane.destination.aspect)
+        {
+            // Color/depth formats have equal texel bits but cannot use
+            // vkCmdCopyImage. A device-local buffer preserves those bits, with
+            // no CPU readback or wait. The staging pool retains it to completion.
+            // https://docs.vulkan.org/spec/latest/chapters/copies.html#copies-images
+            let mut size = 0u64;
+            let mut reads = smallvec::SmallVec::<[vk::BufferImageCopy; 16]>::new();
+            let mut writes = smallvec::SmallVec::<[vk::BufferImageCopy; 16]>::new();
+            for copy in &copies {
+                let bytes_per_texel = planes[0].source.bytes_per_block;
+                let offset = crate::queue::align_up(size, 4).ok_or(
+                    VulkanError::InvalidResource("alias copy alignment overflow"),
+                )?;
+                let bytes = u64::from(copy.extent.width)
+                    .checked_mul(u64::from(copy.extent.height))
+                    .and_then(|v| v.checked_mul(u64::from(bytes_per_texel)))
+                    .ok_or(VulkanError::InvalidResource("alias copy size overflow"))?;
+                size = offset
+                    .checked_add(bytes)
+                    .ok_or(VulkanError::InvalidResource("alias copy size overflow"))?;
+                reads.push(
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
+                        .image_subresource(copy.src_subresource)
+                        .image_offset(copy.src_offset)
+                        .image_extent(copy.extent),
+                );
+                writes.push(
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
+                        .image_subresource(copy.dst_subresource)
+                        .image_offset(copy.dst_offset)
+                        .image_extent(copy.extent),
+                );
+            }
+            let scratch = self.runtime.device.submission.reserve_slice(
+                size,
+                crate::queue::staging::Usage::DeviceLocal,
+                4,
+            )?;
+            for region in reads.iter_mut().chain(writes.iter_mut()) {
+                region.buffer_offset += scratch.offset;
+            }
+            unsafe {
+                self.runtime.device.dispatch.copy_image_to_buffer(
+                    native,
+                    layout,
+                    scratch.buffer,
+                    &reads,
+                );
+                self.runtime.device.dispatch.copy_buffer_to_image(
+                    scratch.buffer,
+                    target,
+                    target_layout,
+                    &writes,
+                );
+            }
+            self.runtime.statistics.alias_copy_commands += 2;
+        } else {
+            unsafe {
+                self.runtime.device.dispatch.copy_image(
+                    native,
+                    layout,
+                    target,
+                    target_layout,
+                    &copies,
+                );
+            }
+            self.runtime.statistics.alias_copy_commands += 1;
         }
-        self.runtime.statistics.alias_copy_commands += 1;
         self.runtime.statistics.alias_copy_regions += copies.len() as u64;
         for plane in planes {
             let dst = plane.destination;

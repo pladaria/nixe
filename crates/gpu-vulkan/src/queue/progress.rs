@@ -144,6 +144,7 @@ struct Notification {
 
 #[derive(Default)]
 pub(crate) struct SubmissionProgress {
+    scheduled: AtomicU64,
     submitted: AtomicU64,
     completed: AtomicU64,
     cancelled: AtomicBool,
@@ -152,6 +153,12 @@ pub(crate) struct SubmissionProgress {
     changed: Condvar,
 }
 impl SubmissionProgress {
+    pub fn scheduled(&self) -> u64 {
+        self.scheduled.load(Ordering::Acquire)
+    }
+    pub fn scheduled_successfully(&self, tick: u64) {
+        self.scheduled.store(tick, Ordering::Release);
+    }
     pub fn submitted(&self) -> u64 {
         self.submitted.load(Ordering::Acquire)
     }

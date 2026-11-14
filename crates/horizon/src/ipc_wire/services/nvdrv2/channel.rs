@@ -66,29 +66,7 @@ pub(super) async fn submit(
     let publication = owner
         .syncpt
         .as_ref()
-        .map(|sync| {
-            let gpu = sync
-                .gpu_values
-                .as_ref()
-                .map(|allocation| {
-                    nixe_memory::CapturedMemory::new(vec![nixe_memory::AllocationRange::new(
-                        allocation.pin_range(0, nixe_memory::PAGE_SIZE)?,
-                        0,
-                        nixe_memory::PAGE_SIZE,
-                    )?])
-                })
-                .transpose();
-            gpu.map(|gpu| crate::gsv::execution::Publication {
-                gpu,
-                cpu: sync.mirror.as_ref().map(|m| {
-                    (
-                        m.counter_page.clone(),
-                        m.notification.clone(),
-                        m.device_counter_page.clone(),
-                    )
-                }),
-            })
-        })
+        .map(crate::gsv::SyncptContext::publication)
         .transpose()
         .map_err(|e| IpcWireError::SystemMemory(Arc::new(e)))?;
     let gpu = owner
@@ -197,34 +175,16 @@ pub(super) fn ioctl(
                 .syncpt
                 .as_mut()
                 .ok_or(IpcWireError::Malformed("syncpoint context missing"))?;
-            let id = (1..crate::gsv::SYNCPOINT_COUNT)
-                .find(|id| {
-                    sync.timelines.get(id).is_none_or(|t| {
-                        Arc::strong_count(t) == 1 && !t.lock().unwrap().has_waiters()
-                    })
-                })
-                .ok_or(IpcWireError::HostResourceExhausted("GPU channel counters"))?;
-            let value = sync
-                .timelines
-                .get(&id)
-                .map_or(0, |t| t.lock().unwrap().value);
-            let raw_value = nixe_gpu::GuestSyncpointValue::new(value as u32);
-            sync.next_timeline =
-                sync.next_timeline
-                    .checked_add(1)
-                    .ok_or(IpcWireError::HostResourceExhausted(
-                        "GPU timeline lifetimes",
-                    ))?;
-            let timeline = Arc::new(Mutex::new(crate::gsv::syncpt::Counter::new(
-                nixe_gpu::GuestTimeline::new(
-                    nixe_gpu::GuestSyncpointId::new(id),
-                    nixe_gpu::TimelineInstanceId::new(sync.next_timeline),
-                    nixe_gpu::TimelineOwnerId::new(u64::from(fd)),
-                    raw_value,
-                ),
-                value,
-            )));
-            sync.timelines.insert(id, timeline.clone());
+            let timeline = sync
+                .allocate(u64::from(fd))
+                .map_err(IpcWireError::GraphicsService)?;
+            let (id, raw_value) = {
+                let counter = timeline.lock().unwrap();
+                (
+                    counter.timeline.syncpoint().get(),
+                    nixe_gpu::GuestSyncpointValue::new(counter.value as u32),
+                )
+            };
             channel.timeline = Some(timeline);
             channel.entries = Some(entries);
             channel.inflight_jobs = jobs;

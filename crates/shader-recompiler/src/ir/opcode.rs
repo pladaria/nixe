@@ -111,6 +111,12 @@ opcodes! {
     WriteGlobal32: Void, [Opaque, U32], true;
     WriteGlobal64: Void, [Opaque, U32x2], true;
     WriteGlobal128: Void, [Opaque, U32x4], true;
+    LoadPhysical32: U32, [U64], false;
+    WritePhysical32: Void, [U64, U32], true;
+    LoadPhysical64: U32x2, [U64], false;
+    WritePhysical64: Void, [U64, U32x2], true;
+    LoadPhysical128: U32x4, [U64], false;
+    WritePhysical128: Void, [U64, U32x4], true;
     LoadStorageU8: U32, [U32, U32], false;
     LoadStorageS8: U32, [U32, U32], false;
     LoadStorageU16: U32, [U32, U32], false;

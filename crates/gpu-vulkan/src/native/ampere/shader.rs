@@ -106,7 +106,7 @@ pub(super) fn read<const N: usize>(
     Ok(bytes)
 }
 
-fn read_into(
+pub(super) fn read_into(
     residency: &mut Residency<'_>,
     memory: &mut impl RenderMemory,
     address: u64,
@@ -298,7 +298,12 @@ pub(super) fn capture_program(
     let mut recorded = RecordingEnvironment::new(&mut env);
     let analyzed = shader::ampere::flow::analyze(&mut recorded);
     let flow_constants = recorded.into_snapshot().into_observations().cbuf_words;
-    analyzed.map_err(compilation)?;
+    analyzed.map_err(|e| {
+        compilation(format!(
+            "native shader={address:#x} stage={:?}: {e}",
+            env.metadata.stage
+        ))
+    })?;
     let size = env
         .code
         .last_key_value()

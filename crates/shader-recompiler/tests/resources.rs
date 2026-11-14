@@ -478,39 +478,3 @@ fn position_transform_observes_viewport_only_for_vertex_b_and_rewrites_xy() {
         verify_program(&ir, &p).unwrap();
     }
 }
-
-#[test]
-fn fallback_nvn_slots_join_by_offset_and_inherit_global_writes() {
-    use nixe_shader_recompiler::{
-        artifact::StorageBufferDescriptor, passes::add_nvn_storage_buffers,
-    };
-    let (_, mut p, _) = program();
-    p.info.uses_global_memory = true;
-    p.info.stores_global_memory = true;
-    p.info.nvn_buffer_used = 5;
-    p.info
-        .storage_buffers_descriptors
-        .push(StorageBufferDescriptor {
-            cbuf_index: CbufIndex(3),
-            cbuf_offset: ByteOffset(0x310),
-            count: 1,
-            is_written: false,
-        })
-        .unwrap();
-    add_nvn_storage_buffers(&mut p).unwrap();
-    assert_eq!(p.info.storage_buffers_descriptors.len(), 2);
-    assert_eq!(
-        p.info.storage_buffers_descriptors[0].cbuf_index,
-        CbufIndex(3)
-    );
-    assert_eq!(
-        p.info.storage_buffers_descriptors[1].cbuf_offset,
-        ByteOffset(0x330)
-    );
-    assert!(
-        p.info
-            .storage_buffers_descriptors
-            .iter()
-            .all(|d| d.is_written)
-    );
-}

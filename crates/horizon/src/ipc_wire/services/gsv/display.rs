@@ -301,7 +301,8 @@ async fn present(
     // 20, interval:refresh at 40, inverted counter ID/value at 80/88. Remaining
     // metadata is undocumented. Only the observed 32-bit counter mode is accepted.
     // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/core/hle/service/nx2_gsv.h
-    if data.len() != 96 || request_u32(data, 84) != Some(0) || request_u32(data, 92) != Some(0) {
+    // NativeSyncHandle's mode is a byte, followed by three padding bytes.
+    if data.len() != 96 || data[84] != 0 || request_u32(data, 92) != Some(0) {
         return Err(IpcWireError::Malformed(
             "unsupported native presentation packet/counter mode",
         ));

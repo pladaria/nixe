@@ -30,7 +30,7 @@ pub(super) async fn dispatch(
         let mut handles = Vec::new();
         let mut signal = None;
         let mut memory_job = None;
-        match (session.interface, request.command_id, data.len()) {
+        match (&session.interface, request.command_id, data.len()) {
             (GsvInterface::Gpu, 0, 8) => output.extend_from_slice(data),
             (GsvInterface::Gpu, 11, 0) => {
                 output.extend_from_slice(&0_u32.to_le_bytes());

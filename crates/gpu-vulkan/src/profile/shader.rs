@@ -64,6 +64,7 @@ impl FeatureSet {
                 != 0,
             support_storage_buffer_16bit: self.v11.storage_buffer16_bit_access != 0,
             support_int64: self.core.shader_int64 != 0,
+            support_buffer_device_address: self.v12.buffer_device_address != 0,
             support_float_controls: true,
             support_separate_denorm_behavior: floats.denorm_behavior_independence
                 == vk::ShaderFloatControlsIndependence::ALL,
@@ -170,6 +171,7 @@ impl FeatureSet {
             support_float64: self.core.shader_float64 != 0,
             support_float16: self.v12.shader_float16 != 0,
             support_int64: self.core.shader_int64 != 0,
+            support_buffer_device_address: self.v12.buffer_device_address != 0,
             needs_demote_reorder: matches!(
                 driver,
                 vk::DriverId::AMD_PROPRIETARY
