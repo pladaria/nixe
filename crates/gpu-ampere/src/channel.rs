@@ -3,11 +3,10 @@ use crate::{
     Class, Registers, Result, Source,
     mme::{self, Mme},
     packet::{Packet, Word},
-    registers,
 };
-use std::collections::VecDeque;
 
 pub trait FrontendHost {
+    fn state(&mut self, source: Source, dirty: crate::DirtyFlags) -> Result<()>;
     fn method(&mut self, source: Source, writes: crate::MemoryWrites) -> Result<()>;
     /// Drain prior methods, including their memory effects, before coherent reads.
     fn barrier(&mut self) -> Result<()>;
@@ -18,7 +17,7 @@ struct Engine {
     regs: Registers,
     shadow: Box<[u32; 0xe00]>,
     macro_call: Option<u32>,
-    parameters: VecDeque<u32>,
+    parameters: mme::Parameters,
     upload_writes: crate::MemoryWrites,
 }
 impl Engine {
@@ -27,7 +26,7 @@ impl Engine {
             regs: Registers::new(class),
             shadow: Box::new([0; 0xe00]),
             macro_call: None,
-            parameters: VecDeque::new(),
+            parameters: mme::Parameters::default(),
             upload_writes: crate::MemoryWrites::None,
         }
     }
@@ -37,6 +36,7 @@ pub struct Channel {
     bindings: [Option<Class>; 8],
     engines: [Engine; 5],
     graphics_mme: Mme,
+    mme_jit: bool,
     compute_mme: Option<Mme>,
     dram: Box<[u32]>,
     semaphore: [u32; 3],
@@ -64,8 +64,8 @@ pub struct Progress {
     pub words: usize,
     pub acquire: Option<SemaphoreAcquire>,
 }
-impl Default for Channel {
-    fn default() -> Self {
+impl Channel {
+    pub fn new(mme_jit: bool) -> Self {
         Self {
             packet: Packet::default(),
             bindings: [None; 8],
@@ -77,7 +77,8 @@ impl Default for Channel {
                 Class::Copy,
             ]
             .map(Engine::new),
-            graphics_mme: Mme::default(),
+            graphics_mme: Mme::new(mme_jit),
+            mme_jit,
             compute_mme: None,
             dram: vec![0; mme::DRAM_WORDS].into_boxed_slice(),
             semaphore: [0; 3],
@@ -191,7 +192,7 @@ impl Channel {
                 }
                 engine.macro_call = Some(m);
             }
-            engine.parameters.push_back(value);
+            engine.parameters.push(value);
             if !last {
                 return Ok(());
             }
@@ -226,7 +227,7 @@ impl Channel {
         }
         if class.mme() && matches!(m, 0x114..=0x120) {
             if class == Class::Compute && self.compute_mme.is_none() {
-                self.compute_mme = Some(Mme::default());
+                self.compute_mme = Some(Mme::new(self.mme_jit));
             }
             let mme = if class == Class::Compute {
                 self.compute_mme.as_mut().unwrap()
@@ -264,8 +265,12 @@ struct MacroHost<'a, H> {
     host: &'a mut H,
 }
 impl<H: FrontendHost> mme::Host for MacroHost<'_, H> {
+    #[cfg(target_arch = "x86_64")]
+    fn bank(&mut self) -> (*mut u32, *const u32) {
+        self.regs.mme_bank()
+    }
     fn state(&mut self, method: u32) -> Result<u32> {
-        if registers::method(self.regs.class, method).is_none() {
+        if self.regs.method(method).is_none() {
             return Err(format!("MME STATE reads unknown method {method:#x}").into());
         }
         Ok(self.regs.get(method))
@@ -278,10 +283,10 @@ impl<H: FrontendHost> mme::Host for MacroHost<'_, H> {
         m: u32,
         mut value: u32,
         dram: &mut [u32],
-        fifo: &mut VecDeque<u32>,
+        fifo: &mut mme::Parameters,
     ) -> Result<()> {
         let class = self.regs.class;
-        let (_, plain) = registers::method(class, m).ok_or_else(|| {
+        let info = self.regs.method(m).ok_or_else(|| {
             format!("unknown method {m:#x}, emitted argument={value:#x}").into_boxed_str()
         })?;
         if class.mme() && m == 0x124 {
@@ -297,6 +302,23 @@ impl<H: FrontendHost> mme::Host for MacroHost<'_, H> {
             }
         }
         let changed = self.regs.set(m, value);
+        if class.mme() && matches!(m, 0x114..=0x120) {
+            return Err("MME self-modifying code upload unsupported".into());
+        }
+        if info.ordinary() {
+            return if changed {
+                self.host.state(
+                    Source {
+                        method: m,
+                        argument: value,
+                        ..self.source
+                    },
+                    info.dirty(),
+                )
+            } else {
+                Ok(())
+            };
+        }
         if class.mme() && matches!(m, 0x55c | 0x560) {
             let count = value as usize;
             let start = self.regs.get(0x558) as usize;
@@ -312,14 +334,11 @@ impl<H: FrontendHost> mme::Host for MacroHost<'_, H> {
                     if m == 0x55c {
                         dram[start + i] = word;
                     } else {
-                        fifo.push_back(word);
+                        fifo.push(word);
                     }
                 }
             }
             return Ok(());
-        }
-        if class.mme() && matches!(m, 0x114..=0x120) {
-            return Err("MME self-modifying code upload unsupported".into());
         }
         if class == Class::ThreeD && m == 0x2310 {
             super::engines::validate_firmware_write(value)?;
@@ -357,9 +376,6 @@ impl<H: FrontendHost> mme::Host for MacroHost<'_, H> {
             );
         }
 
-        if plain && !changed {
-            return Ok(());
-        }
         let source = Source {
             method: m,
             argument: value,

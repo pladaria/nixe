@@ -1,6 +1,6 @@
 //! Preparation consumes resolved methods in order, retaining canonical native
 //! state and performing memory effects through the coherent owner.
-use crate::{Class, Registers, Result, Source, compute, registers};
+use crate::{Class, DirtyFlags, Registers, Result, Source, compute, registers};
 
 pub struct GraphicsState {
     pub preparation_dirty: bool,
@@ -32,6 +32,17 @@ impl Default for GraphicsState {
             roots: [[0; 64]; 8],
             constants: [[None; 32]; 5],
         }
+    }
+}
+impl GraphicsState {
+    fn dirty(&mut self, flags: DirtyFlags) {
+        self.vertex_dirty |= flags.0 as u32;
+        self.index_dirty |= flags.0 & DirtyFlags::INDEX != 0;
+        self.targets_dirty |= ((flags.0 >> DirtyFlags::TARGETS) & 0x1ff) as u16;
+        self.preparation_dirty |= flags.0 & DirtyFlags::PREPARATION != 0;
+        self.dynamic_dirty |= flags.0 & DirtyFlags::DYNAMIC != 0;
+        self.vertex_input_dirty |= flags.0 & DirtyFlags::VERTEX_INPUT != 0;
+        self.shader_dirty |= flags.0 & DirtyFlags::SHADER != 0;
     }
 }
 /// A completed native primitive, with a consecutive range of hardware instance IDs.
@@ -157,6 +168,25 @@ impl Default for Preparation {
     }
 }
 impl Preparation {
+    /// The frontend resolves shadow replay and suppresses unchanged ordinary
+    /// writes before admission. Flush a primitive with its old state, then store
+    /// the entire block and apply its aggregated dirty domains once.
+    pub fn state(
+        &mut self,
+        source: Source,
+        dirty: DirtyFlags,
+        writes: &[u64],
+        host: &mut impl PreparationHost,
+    ) -> Result<()> {
+        let class = Class::from_id(source.class)?;
+        self.engines[Class::ThreeD.index()].flush(host)?;
+        let engine = &mut self.engines[class.index()];
+        engine.regs.store_state(writes);
+        if let Some(graphics) = engine.graphics.as_mut() {
+            graphics.dirty(dirty);
+        }
+        Ok(())
+    }
     pub fn constants(
         &mut self,
         source: Source,
@@ -215,16 +245,15 @@ impl Preparation {
             self.flush(host)?;
         }
         let engine = &mut self.engines[class.index()];
-        let (name, plain) = registers::method(class, m).ok_or("unknown prepared method")?;
-        if !plain {
-            host.flush_constants()?;
-        }
+        let info = engine.regs.method(m).ok_or("unknown prepared method")?;
+        debug_assert!(!info.ordinary(), "ordinary writes use state blocks");
+        host.flush_constants()?;
         let previous = engine.regs.get(m);
         if class == Class::ThreeD {
             let continuing = match m {
                 0x1618 => (value >> 26) & 3 != 0 && (previous ^ value) & 0xffff == 0,
                 0x1614 | 0xd78 | 0x17e0 => true,
-                _ => plain && previous == value,
+                _ => false,
             };
             if !continuing {
                 engine.flush(host)?;
@@ -233,41 +262,10 @@ impl Preparation {
         if engine.regs.set(m, value)
             && let Some(graphics) = engine.graphics.as_mut()
         {
-            if matches!(m, 0x2000..=0x217c | 0x1240..=0x125c | 0x16a4 | 0x192c) {
-                graphics.shader_dirty = true;
-                graphics.preparation_dirty = true;
+            graphics.dirty(info.dirty());
+            if m == 0x1618 {
+                graphics.preparation_dirty |= (previous ^ value) & 0xffff != 0;
             }
-            match m {
-                0xa00..=0xa1c
-                | 0xe00..=0xe08
-                | 0x131c..=0x1328
-                | 0x1394..=0x139c
-                | 0xf54..=0xf5c
-                | 0x13b0..=0x13b4
-                | 0x20c
-                | 0x15bc
-                | 0x187c
-                | 0x156c => graphics.dynamic_dirty = true,
-                0x1160..=0x11dc | 0x1880..=0x18fc => graphics.vertex_input_dirty = true,
-                0x600..=0x6fc => graphics.vertex_dirty |= 1 << ((m - 0x600) / 8),
-                0x1c00..=0x1dfc => {
-                    graphics.vertex_dirty |= 1 << ((m - 0x1c00) / 16);
-                    if (m - 0x1c00).is_multiple_of(16) || (m - 0x1c00) % 16 == 12 {
-                        graphics.vertex_input_dirty = true;
-                    }
-                }
-                0x17c8..=0x17d8 => graphics.index_dirty = true,
-                // Draw arguments and resource contents do not change fixed state.
-                0x17dc..=0x17f8 | 0xd74..=0xd78 | 0x2380..=0x2490 => (),
-                0x1618 => graphics.preparation_dirty |= (previous ^ value) & 0xffff != 0,
-                _ => graphics.preparation_dirty |= registers::fixed_graphics_method(m),
-            }
-            graphics.targets_dirty |= match m {
-                0x800..=0x9e4 => 1 << ((m - 0x800) / 0x40),
-                0xfe0..=0xff0 | 0x1228..=0x1230 | 0x1538 => 0x100,
-                0xfb8 | 0xff4 | 0xff8 | 0x121c => 0x1ff,
-                _ => 0,
-            };
         }
         let regs = &mut engine.regs;
         if class == Class::TwoD && m == 0x8dc {
@@ -527,9 +525,7 @@ impl Preparation {
             0x100 | 0x1a2c => Ok(()),
             0x110 | 0x13c | 0x1144 | 0x11f4 | 0x56c | 0x570 | 0xdec => host.barrier(),
             0x148 | 0x14c => Ok(()), // One ordered owner; no intra-channel interleaving.
-            0x21c | 0x1288 | 0x1330 | 0x1334 | 0x1338 | 0x1424 | 0x1428 | 0x244
-                if class.mme() && !plain =>
-            {
+            0x21c | 0x1288 | 0x1330 | 0x1334 | 0x1338 | 0x1424 | 0x1428 | 0x244 if class.mme() => {
                 host.barrier()
             }
             0xda4 if class == Class::ThreeD => host.barrier(),
@@ -608,8 +604,10 @@ impl Preparation {
                 }
                 Ok(())
             }
-            _ if plain => Ok(()),
-            _ => Err(format!("unsupported {class:?} effect {name}").into()),
+            _ => {
+                let (name, _) = registers::describe(class, m).expect("admitted effect");
+                Err(format!("unsupported {class:?} effect {name}").into())
+            }
         }
     }
     fn host_method(&mut self, m: u32, value: u32, host: &mut impl PreparationHost) -> Result<()> {

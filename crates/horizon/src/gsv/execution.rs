@@ -42,6 +42,7 @@ impl AmpereGraphics {
     pub fn new<E: ampere::Rasterizer>(
         memory: nixe_memory::device_memory::DeviceMemory,
         presenter: Option<nixe_video::FrameMailbox>,
+        mme_jit: bool,
         initialize: impl FnOnce() -> std::result::Result<E, nixe_gpu::BackendRuntimeError>
         + Send
         + 'static,
@@ -51,7 +52,7 @@ impl AmpereGraphics {
             owner: Mutex::new(Owner {
                 executor: None,
                 initialize: Some(Box::new(move |process| {
-                    Executor::new(process, presenter, initialize)
+                    Executor::new(process, presenter, mme_jit, initialize)
                 })),
             }),
         })
@@ -191,6 +192,7 @@ impl Executor {
     pub fn new<E: ampere::Rasterizer>(
         process: &Arc<RunnableProcess>,
         presenter: Option<nixe_video::FrameMailbox>,
+        mme_jit: bool,
         initialize: impl FnOnce() -> std::result::Result<E, nixe_gpu::BackendRuntimeError>
         + Send
         + 'static,
@@ -225,6 +227,7 @@ impl Executor {
                             &front_stop,
                             &front_waiters,
                             commands,
+                            mme_jit,
                         )
                     });
                 if let Err(e) = result
@@ -452,21 +455,24 @@ impl Front<'_> {
     }
     fn finish_draws(&mut self) -> Result<()> {
         self.finish_writes();
+        self.writer.flush_state()?;
         if self.dependencies.pending_draw {
             self.writer
-                .ring
-                .write(&[nixe_gpu::ordered::MACRO_END], &[])
+                .draw_boundary()
                 .map_err(|_| "native preparation stopped before draw boundary")?;
-            self.dependencies.any(self.writer.ring.position());
+            self.dependencies.any(self.writer.position());
             self.dependencies.pending_draw = false;
         }
         Ok(())
     }
 }
 impl FrontendHost for Front<'_> {
+    fn state(&mut self, source: Source, dirty: ampere::DirtyFlags) -> Result<()> {
+        self.writer.state(source, dirty)
+    }
     fn method(&mut self, source: Source, writes: ampere::MemoryWrites) -> Result<()> {
         self.writer.method(source)?;
-        let position = self.writer.ring.position();
+        let position = self.writer.position();
         if !matches!(
             writes,
             ampere::MemoryWrites::None | ampere::MemoryWrites::Sync
@@ -511,10 +517,9 @@ impl FrontendHost for Front<'_> {
     fn barrier(&mut self) -> Result<()> {
         self.finish_draws()?;
         self.writer
-            .ring
-            .wait_until(self.writer.ring.position())
+            .wait_until(self.writer.position())
             .map_err(|_| "native preparation stopped before coherent dependency")?;
-        self.dependencies.sync(self.writer.ring.position());
+        self.dependencies.sync(self.writer.position());
         Ok(())
     }
     fn read(&mut self, address: u64, bytes: usize) -> Result<Vec<u8>> {
@@ -523,7 +528,6 @@ impl FrontendHost for Front<'_> {
             self.dependencies
                 .target(&self.memory.space.read().unwrap(), address, bytes as u64);
         self.writer
-            .ring
             .wait_until(target)
             .map_err(|_| "native preparation stopped before memory producer")?;
         self.memory.read(address, bytes)
@@ -903,19 +907,25 @@ fn preparation<E: ampere::Rasterizer>(
                         },
                         clock: &clock,
                     };
-                    ampere::ordered::consume(&mut words, &mut source, |operation, constants| {
-                        match operation {
+                    ampere::ordered::consume(
+                        &mut words,
+                        &mut source,
+                        |operation| match operation {
                             ampere::ordered::Operation::Method(source) => {
                                 host.source = source;
-                                if constants.is_empty() {
-                                    channel.execute(source, scheduler, &mut host)
-                                } else {
-                                    channel.constants(source, constants, &mut host)
-                                }
+                                channel.execute(source, scheduler, &mut host)
+                            }
+                            ampere::ordered::Operation::Constants(source, constants) => {
+                                host.source = source;
+                                channel.constants(source, constants, &mut host)
+                            }
+                            ampere::ordered::Operation::State(source, dirty, writes) => {
+                                host.source = source;
+                                channel.state(source, dirty, writes, &mut host)
                             }
                             ampere::ordered::Operation::Flush => channel.flush(&mut host),
-                        }
-                    })?;
+                        },
+                    )?;
                 }
             }
             if endpoint.requested.load(Ordering::Acquire) {

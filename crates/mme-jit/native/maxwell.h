@@ -2,6 +2,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include "runtime.h"
 
 constexpr uint32_t NIXE_MME_BANK_WORDS = 0xe00;
 using NixeMmeEmit = uint32_t (*)(void *, uint32_t, uint32_t);
@@ -18,14 +19,7 @@ struct NixeMmeState {
 };
 using NixeMmeProgram = void (*)(NixeMmeState *, const uint32_t *,
                                 const uint32_t *);
-struct NixeMmeCompileError {
-  uint32_t pc;
-  char message[256];
-};
 extern "C" {
-void *nixe_mme_runtime_new() noexcept;
-void nixe_mme_runtime_delete(void *) noexcept;
 bool nixe_mme_compile(void *, const uint32_t *, size_t, NixeMmeProgram *,
                       NixeMmeCompileError *) noexcept;
-void nixe_mme_release(void *, NixeMmeProgram) noexcept;
 }

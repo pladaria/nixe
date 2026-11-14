@@ -4,7 +4,44 @@
 // Instruction semantics derived from Mesa (Copyright 2022 Collabora Ltd., MIT).
 // See MESA-LICENSE for the original permission notice.
 use crate::Result;
-use std::collections::VecDeque;
+#[cfg(target_arch = "x86_64")]
+mod jit;
+
+/// Invocation FIFO retains capacity and permits DMA to append while executing.
+#[derive(Default)]
+pub(crate) struct Parameters {
+    values: Vec<u32>,
+    consumed: usize,
+}
+impl Parameters {
+    pub fn push(&mut self, value: u32) {
+        if self.consumed == self.values.len() {
+            self.clear();
+        } else if self.values.len() == self.values.capacity()
+            && self.consumed >= self.values.len().div_ceil(2)
+        {
+            // Reclaim a large consumed prefix only when space is needed. Each
+            // moved word is amortized by at least one consumed word; retaining
+            // small prefixes avoids repeatedly moving a nearly full FIFO.
+            self.values.copy_within(self.consumed.., 0);
+            self.values.truncate(self.len());
+            self.consumed = 0;
+        }
+        self.values.push(value);
+    }
+    fn pop(&mut self) -> Option<u32> {
+        let value = *self.values.get(self.consumed)?;
+        self.consumed += 1;
+        Some(value)
+    }
+    fn len(&self) -> usize {
+        self.values.len() - self.consumed
+    }
+    fn clear(&mut self) {
+        self.values.clear();
+        self.consumed = 0;
+    }
+}
 
 const INSTRUCTIONS: usize = 0x1000;
 pub(crate) const DRAM_WORDS: usize = 0xc00;
@@ -13,6 +50,7 @@ const PREDICATES: [&[u8; 4]; 16] = [
     b"UUTU", b"UUFT", b"UUFF", b"UUFU", b"UUUT", b"UUUF",
 ];
 
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Alu {
     op: u8,
@@ -21,6 +59,7 @@ struct Alu {
     y: u8,
     imm: u16,
 }
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Instruction {
     end: bool,
@@ -72,25 +111,34 @@ pub(crate) trait Host {
         method: u32,
         value: u32,
         dram: &mut [u32],
-        fifo: &mut VecDeque<u32>,
+        fifo: &mut Parameters,
     ) -> Result<()>;
     fn stopped(&self) -> bool;
+    /// Canonical bank storage, refreshed after every method callback.
+    #[cfg(target_arch = "x86_64")]
+    fn bank(&mut self) -> (*mut u32, *const u32);
 }
 
 pub(crate) struct Mme {
     code: Box<[[u32; 3]]>,
     uploaded: Box<[u8]>,
-    decoded: Box<[Option<Instruction>]>,
+    decoded: Box<[Instruction]>,
+    #[cfg(target_arch = "x86_64")]
+    compiled: Option<jit::Cache>,
     starts: [Option<u32>; 256],
     upload_word: usize,
     bind: usize,
 }
-impl Default for Mme {
-    fn default() -> Self {
+impl Mme {
+    pub fn new(mme_jit: bool) -> Self {
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = mme_jit;
         Self {
             code: vec![[0; 3]; INSTRUCTIONS].into_boxed_slice(),
             uploaded: vec![0; INSTRUCTIONS].into_boxed_slice(),
-            decoded: vec![None; INSTRUCTIONS].into_boxed_slice(),
+            decoded: vec![Instruction::default(); INSTRUCTIONS].into_boxed_slice(),
+            #[cfg(target_arch = "x86_64")]
+            compiled: mme_jit.then(jit::Cache::default),
             starts: [None; 256],
             upload_word: 0,
             bind: 0,
@@ -112,9 +160,18 @@ impl Mme {
             .code
             .get_mut(index)
             .ok_or("MME instruction RAM overflow")?;
+        let changed = code[word] != value || self.uploaded[index] & (1 << word) == 0;
         code[word] = value;
         self.uploaded[index] |= 1 << word;
-        self.decoded[index] = None;
+        if changed {
+            if self.uploaded[index] == 7 {
+                self.decoded[index] = Instruction::decode(*code);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if let Some(cache) = &mut self.compiled {
+                cache.invalidate();
+            }
+        }
         self.upload_word += 1;
         Ok(())
     }
@@ -139,7 +196,7 @@ impl Mme {
     pub fn execute(
         &mut self,
         index: usize,
-        fifo: &mut VecDeque<u32>,
+        fifo: &mut Parameters,
         dram: &mut [u32],
         host: &mut impl Host,
     ) -> Result<()> {
@@ -149,6 +206,12 @@ impl Mme {
             .copied()
             .flatten()
             .ok_or("unbound MME macro")?;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(cache) = &mut self.compiled {
+            cache.execute(&self.decoded, &self.uploaded, start, fifo, dram, host)?;
+            fifo.clear();
+            return Ok(());
+        }
         let mut run = Run {
             pc: start as usize,
             ..Run::default()
@@ -162,11 +225,11 @@ impl Mme {
                 if self.uploaded.get(pc) != Some(&7) {
                     return Err("MME fetch outside uploaded instruction RAM".into());
                 }
-                let d = *self.decoded[pc].get_or_insert_with(|| Instruction::decode(self.code[pc]));
+                let d = self.decoded[pc];
                 let mut loads = [0; 2];
                 for (i, load) in loads.iter_mut().enumerate() {
                     if d.loads[i] {
-                        *load = fifo.pop_front().ok_or("MME parameter FIFO underflow")?;
+                        *load = fifo.pop().ok_or("MME parameter FIFO underflow")?;
                     }
                 }
                 let mask = if d.predicate == 0 {
@@ -310,11 +373,15 @@ impl Mme {
                                     next = pc
                                         .checked_add_signed(offset)
                                         .ok_or("MME branch before code RAM")?;
+                                    // @SPECULATIVE: bit 14 cancels this instruction's
+                                    // END, with the last taken conditional branch
+                                    // deciding cancellation. A previously pending END
+                                    // still retires after this instruction's outputs.
+                                    // Mesa does not model bit 14; follow the native
+                                    // reference until hardware evidence is available.
+                                    // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/macro_turing.h#L203
+                                    cancel_end = a.imm & 0x4000 != 0;
                                 }
-                                // @SPECULATIVE: bit 14 suppresses the newly
-                                // armed END on a taken back edge (native SDK
-                                // observation in Lichii, absent in Mesa's model).
-                                cancel_end |= a.imm & 0x4000 != 0;
                             }
                             0
                         }

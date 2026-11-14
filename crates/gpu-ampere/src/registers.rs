@@ -1,7 +1,9 @@
 //! Native register banks. Ordinary writes are interpreted when consumed by an
 //! effect; method validity does not depend on a Maxwell structure's layout.
+mod metadata;
 mod methods;
 use crate::Result;
+pub use metadata::DirtyFlags;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -40,12 +42,14 @@ impl Class {
 pub struct Registers {
     pub class: Class,
     words: Box<[u32; 0xe00]>,
+    metadata: &'static metadata::Table,
 }
 impl Registers {
     pub fn new(class: Class) -> Self {
         let mut registers = Self {
             class,
             words: Box::new([0; 0xe00]),
+            metadata: metadata::table(class),
         };
         if class == Class::ThreeD {
             // @SPECULATIVE: native context reset values are not published. These
@@ -78,20 +82,31 @@ impl Registers {
         }
         registers
     }
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn mme_bank(&mut self) -> (*mut u32, *const u32) {
+        (self.words.as_mut_ptr(), self.metadata.valid.as_ptr())
+    }
+    #[inline]
+    pub(crate) fn method(&self, method: u32) -> Option<metadata::Method> {
+        self.metadata.method(method)
+    }
     pub fn get(&self, method: u32) -> u32 {
         self.words[(method / 4) as usize]
     }
     pub(crate) fn set(&mut self, method: u32, value: u32) -> bool {
         // Packed and full-width DMA origins name the same coordinates.
         // https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/common/sdk/nvidia/inc/class/clc7b5.h
+        let mut changed = false;
         if self.class == Class::Copy && matches!(method, 0x720 | 0x73c) {
             let base = if method == 0x73c { 0x744 } else { 0x74c };
+            changed =
+                self.words[base / 4] != value & 0xffff || self.words[(base + 4) / 4] != value >> 16;
             self.words[base / 4] = value & 0xffff;
             self.words[(base + 4) / 4] = value >> 16;
         }
         let index = (method / 4) as usize;
         if self.words[index] == value {
-            return false;
+            return changed;
         }
         self.words[index] = value;
         true
@@ -99,9 +114,24 @@ impl Registers {
     pub fn address(&self, high: u32, low: u32) -> u64 {
         (u64::from(self.get(high)) << 32) | u64::from(self.get(low))
     }
+    /// Apply admitted state without repeating classification or same-value
+    /// checks. Packed DMA origins still update their full-width aliases.
+    pub(crate) fn store_state(&mut self, writes: &[u64]) {
+        if self.class == Class::Copy {
+            for &write in writes {
+                self.set(write as u32, (write >> 32) as u32);
+            }
+        } else {
+            for &write in writes {
+                self.words[write as u32 as usize / 4] = (write >> 32) as u32;
+            }
+        }
+    }
 }
 
-pub(crate) fn method(class: Class, m: u32) -> Option<(&'static str, bool)> {
+/// The class definitions build the indexed tables at compile time; names are
+/// otherwise resolved only when diagnosing an unsupported effect.
+pub(crate) const fn describe(class: Class, m: u32) -> Option<(&'static str, bool)> {
     if m & 3 != 0 || m >= 0x3800 {
         return None;
     }

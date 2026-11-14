@@ -15,7 +15,7 @@ mod writes;
 pub use channel::{Channel, FrontendHost, Progress, SemaphoreAcquire};
 pub use engines::{Draw, GraphicsState, Preparation, PreparationHost};
 pub use packet::{GpfifoEntry, decode_entries};
-pub use registers::{Class, Registers};
+pub use registers::{Class, DirtyFlags, Registers};
 pub use writes::MemoryWrites;
 
 pub type Result<T> = std::result::Result<T, Box<str>>;

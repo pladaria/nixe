@@ -99,7 +99,8 @@ nvidia_smooth_motion = false
 # 2.0: 720p => 1440p, 1080p => 2160p
 # 3.0: 720p => 2160p, 1080p => 3240p
 resolution_scale = 1.0
-# Compile MME macros to native AMD64 code; selected once per channel. Defaults to true.
+# Compile Maxwell/Ampere MME macros to native AMD64 code. Defaults to true.
+# Selected once per channel; false or a non-AMD64 host uses the interpreter.
 mme_jit = true
 # Per-title shader environments and Vulkan driver caches, relative to this file.
 cache_directory = "./storage/cache/gpu"

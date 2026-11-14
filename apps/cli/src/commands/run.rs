@@ -406,6 +406,7 @@ fn run_machine(
         horizon_environment.ampere_graphics = Some(nixe_horizon::AmpereGraphics::new(
             memory,
             presenter,
+            config.gpu.mme_jit,
             move || {
                 let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
                     native_memory,
@@ -467,14 +468,6 @@ fn run_machine(
             let _ = diagnostics_sender.send((renderer.cache_monitor(), renderer.frame_metrics()));
             Ok((renderer, ()))
         };
-        log::info!(
-            "MME execution: {}",
-            if config.gpu.mme_jit && cfg!(target_arch = "x86_64") {
-                "AMD64 JIT (AsmJit)"
-            } else {
-                "interpreter"
-            }
-        );
         let (video, ()) = VideoSystem::with_gpu_frontend(
             device_memory,
             &kernel,
@@ -486,6 +479,14 @@ fn run_machine(
         .map_err(|error| error.to_string())?;
         Some(video)
     };
+    log::info!(
+        "MME execution: {}",
+        if config.gpu.mme_jit && cfg!(target_arch = "x86_64") {
+            "AMD64 JIT (AsmJit)"
+        } else {
+            "interpreter"
+        }
+    );
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     // SDL initialization and final subsystem shutdown remain on the main thread.
     // The owners outlive guest execution in both windowed and headless modes.

@@ -1415,18 +1415,20 @@ dependencies = [
 name = "nixe-gpu-ampere"
 version = "0.1.0"
 dependencies = [
+ "log",
  "nixe-gpu",
  "nixe-memory",
+ "nixe-mme-jit",
 ]
 
 [[package]]
 name = "nixe-gpu-maxwell"
 version = "0.1.0"
 dependencies = [
- "cmake",
  "log",
  "nixe-gpu",
  "nixe-memory",
+ "nixe-mme-jit",
  "nixe-shader-recompiler",
  "rustc-hash",
  "smallvec",
@@ -1555,6 +1557,13 @@ dependencies = [
  "libc",
  "rustc-hash",
  "smallvec",
+]
+
+[[package]]
+name = "nixe-mme-jit"
+version = "0.1.0"
+dependencies = [
+ "cmake",
 ]
 
 [[package]]

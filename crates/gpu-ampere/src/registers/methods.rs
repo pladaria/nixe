@@ -2,7 +2,7 @@
 //! https://github.com/NVIDIA/open-gpu-kernel-modules/tree/main/src/common/sdk/nvidia/inc/class
 // Address/name definitions derived from NVIDIA class headers; see NVIDIA-LICENSE.
 use super::Class;
-pub(super) fn scalar(class: Class, method: u32) -> Option<(&'static str, bool)> {
+pub(super) const fn scalar(class: Class, method: u32) -> Option<(&'static str, bool)> {
     match class {
         Class::ThreeD => match method {
             0x0100 => Some(("NO_OPERATION", false)),

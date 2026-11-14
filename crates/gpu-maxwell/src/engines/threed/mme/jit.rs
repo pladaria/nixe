@@ -3,7 +3,6 @@
 use super::*;
 use std::{
     ffi::{CStr, c_char, c_void},
-    ptr::NonNull,
     rc::Rc,
 };
 
@@ -28,8 +27,6 @@ struct CompileError {
     message: [c_char; 256],
 }
 unsafe extern "C" {
-    fn nixe_mme_runtime_new() -> *mut c_void;
-    fn nixe_mme_runtime_delete(runtime: *mut c_void);
     fn nixe_mme_compile(
         runtime: *mut c_void,
         words: *const u32,
@@ -37,15 +34,14 @@ unsafe extern "C" {
         result: *mut Option<NativeProgram>,
         error: *mut CompileError,
     ) -> bool;
-    fn nixe_mme_release(runtime: *mut c_void, program: NativeProgram);
 }
 
 #[derive(Debug)]
-pub(super) struct Runtime(NonNull<c_void>);
+pub(super) struct Runtime(nixe_mme_jit::Runtime);
 impl Runtime {
     pub(super) fn new() -> Result<Rc<Self>, MaxwellThreeDMmeExecutionError> {
         // SAFETY: creates an allocator owned exclusively by this GPU channel.
-        NonNull::new(unsafe { nixe_mme_runtime_new() })
+        nixe_mme_jit::Runtime::new()
             .map(|p| Rc::new(Self(p)))
             .ok_or_else(|| MaxwellThreeDMmeExecutionError::Compilation {
                 address: MaxwellThreeDMmeRamAddress::new(0),
@@ -93,12 +89,6 @@ impl Runtime {
         }))
     }
 }
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        // SAFETY: compiled functions retain this Rc until after their release.
-        unsafe { nixe_mme_runtime_delete(self.0.as_ptr()) };
-    }
-}
 #[derive(Debug)]
 pub(in crate::engines::threed) struct Program {
     function: NativeProgram,
@@ -108,7 +98,7 @@ pub(in crate::engines::threed) struct Program {
 impl Drop for Program {
     fn drop(&mut self) {
         // SAFETY: the channel allocator outlives this immutable function.
-        unsafe { nixe_mme_release(self.runtime.0.as_ptr(), self.function) };
+        unsafe { self.runtime.0.release(self.function as *const c_void) };
     }
 }
 struct Host<'a, H: MaxwellThreeDMmeHost> {

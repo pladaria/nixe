@@ -77,7 +77,6 @@ impl Front<'_> {
                 self.dependencies.synced_writer
             };
             self.writer
-                .ring
                 .wait_until(target)
                 .map_err(|_| "GPU stopped before command producer")?;
             // Recheck after synchronized producers: this can be a page's first GPU write.
@@ -85,7 +84,6 @@ impl Front<'_> {
                 let written = self.commands_written(address, size)?;
                 if written {
                     self.writer
-                        .ring
                         .wait_until(self.dependencies.writer)
                         .map_err(|_| "GPU stopped before command producer")?;
                 }
@@ -156,7 +154,6 @@ impl Front<'_> {
                         .take()
                         .expect("command read requested host sync twice");
                     self.writer
-                        .ring
                         .wait_until(target)
                         .map_err(|_| "GPU stopped before command host sync")?;
                 }
@@ -165,8 +162,7 @@ impl Front<'_> {
                     // the coherent access can then park this channel while other work runs.
                     self.finish_draws()?;
                     self.writer
-                        .ring
-                        .wait_until(self.writer.ring.position())
+                        .wait_until(self.writer.position())
                         .map_err(|_| "GPU stopped before command publication")?;
                     let capture = Arc::new(
                         GpuMemory::new(self.memory.space)

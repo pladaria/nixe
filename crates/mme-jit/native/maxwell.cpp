@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // MME instruction lowering and ABI strategy follow MacroJITx64Impl.
 // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/macro.cpp
-#include "mme.h"
+#include "maxwell.h"
 #include <array>
 #include <asmjit/x86.h>
 #include <bit>
@@ -37,9 +37,7 @@ struct FatalError : asmjit::ErrorHandler {
     check(e);
   }
 };
-struct Runtime {
-  asmjit::JitRuntime jit;
-};
+using Runtime = NixeMmeRuntime;
 struct Label {
   asmjit::Label id;
 };
@@ -729,16 +727,6 @@ Macro::Opcode Compiler::GetOpCode() const {
 }
 
 } // namespace
-extern "C" void *nixe_mme_runtime_new() noexcept {
-  try {
-    return new Runtime;
-  } catch (...) {
-    return nullptr;
-  }
-}
-extern "C" void nixe_mme_runtime_delete(void *runtime) noexcept {
-  delete static_cast<Runtime *>(runtime);
-}
 extern "C" bool nixe_mme_compile(void *runtime, const u32 *words, size_t count,
                                  NixeMmeProgram *result,
                                  NixeMmeCompileError *error) noexcept {
@@ -759,8 +747,4 @@ extern "C" bool nixe_mme_compile(void *runtime, const u32 *words, size_t count,
     std::snprintf(error->message, sizeof(error->message), "%s", e.what());
   }
   return false;
-}
-extern "C" void nixe_mme_release(void *runtime,
-                                 NixeMmeProgram program) noexcept {
-  static_cast<Runtime *>(runtime)->jit.release(program);
 }

@@ -41,6 +41,7 @@ pub(super) fn run(
     stop: &AtomicBool,
     waiters: &semaphore::Waiters,
     commands: Arc<dyn nixe_gpu::command_memory::CommandMemory>,
+    mme_jit: bool,
 ) -> Result<()> {
     let mut writer = ampere::ordered::Writer::new(output);
     let mut channels = BTreeMap::<u64, ampere::Channel>::new();
@@ -119,12 +120,10 @@ pub(super) fn run(
             match pending.remove(index).unwrap() {
                 Pending::Memory(job, reply) => {
                     writer
-                        .ring
                         .send(Control::Memory(job, reply))
                         .map_err(|_| "native preparation stopped")?;
                     writer
-                        .ring
-                        .wait_until(writer.ring.position())
+                        .wait_until(writer.position())
                         .map_err(|_| "native mapping operation failed")?;
                     dependencies.pending_draw = false;
                 }
@@ -132,21 +131,21 @@ pub(super) fn run(
                     channels.remove(&channel);
                     waiters.remove(channel);
                     writer
-                        .ring
                         .send(Control::Retire(channel, reply))
                         .map_err(|_| "native preparation stopped")?;
                 }
                 Pending::Submit(mut work) => {
                     let job = &work.job;
                     writer
-                        .ring
                         .send(Control::Begin(
                             job.clone(),
                             *work.started.get_or_insert_with(std::time::Instant::now),
                         ))
                         .map_err(|_| "native preparation stopped")?;
                     writer.reset();
-                    let channel = channels.entry(job.channel).or_default();
+                    let channel = channels
+                        .entry(job.channel)
+                        .or_insert_with(|| ampere::Channel::new(mme_jit));
                     let mut host = Front {
                         writer: &mut writer,
                         memory: Memory {
@@ -168,7 +167,7 @@ pub(super) fn run(
                         }
                         if entry.sync_wait && !work.fetch.started() {
                             host.finish_draws()?;
-                            host.dependencies.sync(host.writer.ring.position());
+                            host.dependencies.sync(host.writer.position());
                         }
                         // Re-fetch only the unconsumed tail after an acquire:
                         // a CPU release may publish new command words there.
@@ -210,15 +209,15 @@ pub(super) fn run(
                     }
                     host.finish_writes();
                     if work.wait.is_some() || work.fetch.started() {
+                        host.writer.flush()?;
                         pending.insert(index, Pending::Submit(work));
                     } else {
                         host.writer
-                            .ring
                             .send(Control::End)
                             .map_err(|_| "native preparation stopped")?;
                         host.dependencies.pending_draw = false;
                         if job.completion.is_some() {
-                            host.dependencies.any(host.writer.ring.position());
+                            host.dependencies.any(host.writer.position());
                         }
                     }
                 }
@@ -228,10 +227,9 @@ pub(super) fn run(
     })();
     if let Err(error) = result {
         writer
-            .ring
             .send(Control::Failure(error))
             .map_err(|_| "native preparation stopped")?;
-        let _ = writer.ring.wait_until(writer.ring.position());
+        let _ = writer.wait_until(writer.position());
     }
-    Ok(())
+    writer.finish()
 }

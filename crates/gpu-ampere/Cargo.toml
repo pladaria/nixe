@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+performance-counters = ["nixe-gpu/performance-counters"]
+
 [dependencies]
 nixe-gpu.workspace = true
 nixe-memory.workspace = true
+log.workspace = true
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+nixe-mme-jit.workspace = true
