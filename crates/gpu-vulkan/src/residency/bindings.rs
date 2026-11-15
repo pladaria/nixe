@@ -88,6 +88,17 @@ pub(crate) struct StorageBuffer {
     pub(crate) write_bytes: u64,
     pub(crate) native: Option<StorageBufferBinding>,
 }
+impl StorageBuffer {
+    pub(crate) fn set_write_extent(&mut self, extent: Option<u64>) {
+        // The proof starts at the guest pointer; native bindings start at its
+        // aligned address. Keep the complete readable range and bound only writes.
+        self.write_bytes = extent.map_or(self.source.size, |bytes| {
+            (self.key.descriptor[0] - self.gpu_address)
+                .saturating_add(bytes)
+                .min(self.source.size)
+        });
+    }
+}
 #[derive(Clone)]
 pub(crate) enum StorageBufferBinding {
     Buffer(BufferRange),

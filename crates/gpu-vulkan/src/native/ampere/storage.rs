@@ -135,11 +135,7 @@ impl NativeExecution<'_> {
             .storage_buffers[stage][slot.slot]
             .as_mut()
             .unwrap();
-        binding.write_bytes = write_extent.map_or(binding.source.size, |extent| {
-            (target - binding.gpu_address)
-                .saturating_add(extent)
-                .min(binding.source.size)
-        });
+        binding.set_write_extent(write_extent);
         self.residency
             .update_storage_buffer(stage, slot.slot, memory)
     }

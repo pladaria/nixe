@@ -29,6 +29,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
         execution: &mut crate::native::NativeExecution<'_>,
         launch: &model::MaxwellResolvedComputeLaunch,
         space: &MaxwellGpuMemory,
+        groups: [u32; 3],
         images: &mut smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>,
     ) -> Result<(), crate::VulkanError> {
         use crate::VulkanError as V;
@@ -81,6 +82,21 @@ impl crate::native::pipeline_cache::ComputePipeline {
                 16,
             )?;
             execution.bind_guest_storage_buffer(space, descriptor, slot.written, 5, slot.slot)?;
+            // A reused descriptor can belong to a different shader or dispatch
+            // size. Its writable prefix must reflect this dispatch every time.
+            if let Some(binding) = execution
+                .residency
+                .runtime
+                .buffer_bindings
+                .channel
+                .storage_buffers[5][slot.slot]
+                .as_mut()
+            {
+                binding.set_write_extent(
+                    slot.write_extent
+                        .resolve(launch.workgroup_size(), Some(groups)),
+                );
+            }
         }
         let mut textures =
             smallvec::SmallVec::<[super::textures::ShaderTexture; 64]>::with_capacity(
@@ -130,7 +146,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
             .device
             .realize_deferred_clear()?;
         let mut images = smallvec::SmallVec::new();
-        self.configure_resources(execution, launch, space, &mut images)?;
+        self.configure_resources(execution, launch, space, groups, &mut images)?;
         execution
             .residency
             .update_compute_buffers(&self.resources.stages[5], space)?;

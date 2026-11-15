@@ -457,7 +457,7 @@ fn run_machine(
                 device,
                 cache_configuration,
                 u64::MAX, // Residency derives headroom from the device heap budget.
-                nixe_gpu_vulkan::BufferDownloadPolicy::AtFence,
+                nixe_gpu_vulkan::BufferDownloadPolicy::OnRead,
             )
             .map_err(|error| nixe_gpu::BackendRuntimeError::Backend(error.to_string().into()))?;
             if let Some(client) = native_presentation {
