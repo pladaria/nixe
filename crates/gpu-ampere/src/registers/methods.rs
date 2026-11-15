@@ -404,7 +404,7 @@ pub(super) const fn scalar(class: Class, method: u32) -> Option<(&'static str, b
             0x153c => Some(("SET_ANTI_ALIAS_ALPHA_CONTROL", true)),
             0x1550 => Some(("SET_RENDER_ENABLE_A", true)),
             0x1554 => Some(("SET_RENDER_ENABLE_B", true)),
-            0x1558 => Some(("SET_RENDER_ENABLE_C", true)),
+            0x1558 => Some(("SET_RENDER_ENABLE_C", false)),
             0x155c => Some(("SET_TEX_SAMPLER_POOL_A", true)),
             0x1560 => Some(("SET_TEX_SAMPLER_POOL_B", true)),
             0x1564 => Some(("SET_TEX_SAMPLER_POOL_C", true)),

@@ -1,6 +1,9 @@
 //! Preparation consumes resolved methods in order, retaining canonical native
 //! state and performing memory effects through the coherent owner.
+mod condition;
+mod macros;
 use crate::{Class, DirtyFlags, Registers, Result, Source, compute, registers};
+use std::sync::Arc;
 
 pub struct GraphicsState {
     pub preparation_dirty: bool,
@@ -55,6 +58,7 @@ pub struct Draw {
 pub trait PreparationHost {
     fn copy(&mut self, operation: &crate::dma::Copy) -> Result<()>;
     fn read(&mut self, address: u64, bytes: usize) -> Result<Vec<u8>>;
+    fn read_into(&mut self, address: u64, destination: &mut [u8]) -> Result<()>;
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()>;
     fn constants(&mut self, registers: &Registers, offset: u32, bytes: &[u8]) -> Result<()>;
     fn flush_constants(&mut self) -> Result<()>;
@@ -103,11 +107,16 @@ struct Engine {
     instance: u32,
     count: Option<Source>,
     pending: Option<Draw>,
+    condition: condition::Condition,
 }
 impl Engine {
     fn new(class: Class) -> Self {
+        Self::with_registers(Registers::new(class))
+    }
+    fn with_registers(regs: Registers) -> Self {
+        let class = regs.class;
         Self {
-            regs: Registers::new(class),
+            regs,
             upload: Upload::default(),
             graphics: (class == Class::ThreeD).then(|| Box::new(GraphicsState::default())),
             root_table: 0,
@@ -116,13 +125,16 @@ impl Engine {
             instance: 0,
             count: None,
             pending: None,
+            condition: Default::default(),
         }
     }
     fn flush(&mut self, host: &mut impl PreparationHost) -> Result<()> {
         if let Some(draw) = self.pending.take() {
             host.flush_constants()?;
-            host.draw(draw, &self.regs, self.graphics.as_mut().unwrap())
-                .map_err(|error| draw.source.error(error))?;
+            if self.condition.draw(draw.instances) {
+                host.draw(draw, &self.regs, self.graphics.as_mut().unwrap())
+                    .map_err(|error| draw.source.error(error))?;
+            }
         }
         Ok(())
     }
@@ -148,23 +160,67 @@ impl Engine {
         Ok(())
     }
 }
+pub struct BackState {
+    pub(crate) registers: Registers,
+    pub(crate) shadow: Arc<registers::Bank>,
+    mme_jit: bool,
+}
+impl BackState {
+    pub(crate) fn new(mme_jit: bool) -> Self {
+        Self {
+            registers: Registers::new(Class::ThreeD),
+            shadow: registers::Bank::new(),
+            mme_jit,
+        }
+    }
+}
 pub struct Preparation {
     engines: [Engine; 5],
     host: [u32; 64],
+    shadow: Arc<registers::Bank>,
+    macros: Option<macros::Execution>,
 }
-impl Default for Preparation {
-    fn default() -> Self {
+impl Preparation {
+    pub fn new(back: BackState) -> Self {
+        let engines = [
+            Engine::with_registers(back.registers),
+            Engine::new(Class::Compute),
+            Engine::new(Class::Inline),
+            Engine::new(Class::TwoD),
+            Engine::new(Class::Copy),
+        ];
         Self {
-            engines: [
-                Class::ThreeD,
-                Class::Compute,
-                Class::Inline,
-                Class::TwoD,
-                Class::Copy,
-            ]
-            .map(Engine::new),
+            engines,
             host: [0; 64],
+            shadow: back.shadow,
+            macros: Some(macros::Execution::new(back.mme_jit)),
         }
+    }
+    fn track(&self, method: u32, value: u32) {
+        if method != 0x124 && self.engines[0].regs.get(0x124) <= 1 {
+            self.shadow.set(method as usize / 4, value);
+        }
+    }
+    pub fn reconcile(&mut self, source: Source, host: &mut impl PreparationHost) -> Result<()> {
+        let class = Class::from_id(source.class)?;
+        if self.engines[class.index()].regs.get(source.method) == source.argument {
+            if class == Class::ThreeD {
+                self.track(source.method, source.argument);
+            }
+            return Ok(());
+        }
+        let engine = &mut self.engines[class.index()];
+        let dirty = engine
+            .regs
+            .method(source.method)
+            .ok_or("unknown reconciled state")?
+            .dirty();
+        self.state(
+            source,
+            dirty,
+            &[u64::from(source.method) | (u64::from(source.argument) << 32)],
+            host,
+        )
     }
 }
 impl Preparation {
@@ -180,8 +236,9 @@ impl Preparation {
     ) -> Result<()> {
         let class = Class::from_id(source.class)?;
         self.engines[Class::ThreeD.index()].flush(host)?;
+        let shadow = (class == Class::ThreeD).then_some(&*self.shadow);
         let engine = &mut self.engines[class.index()];
-        engine.regs.store_state(writes);
+        engine.regs.store_state(writes, shadow);
         if let Some(graphics) = engine.graphics.as_mut() {
             graphics.dirty(dirty);
         }
@@ -193,6 +250,9 @@ impl Preparation {
         words: &[crate::ordered::ConstantWord],
         host: &mut impl PreparationHost,
     ) -> Result<()> {
+        for word in words {
+            self.track(word.method, word.value);
+        }
         let engine = &mut self.engines[Class::ThreeD.index()];
         engine.flush(host)?;
         let regs = &mut engine.regs;
@@ -244,9 +304,17 @@ impl Preparation {
         if class != Class::ThreeD {
             self.flush(host)?;
         }
+        if class == Class::ThreeD {
+            self.track(m, value);
+        }
         let engine = &mut self.engines[class.index()];
         let info = engine.regs.method(m).ok_or("unknown prepared method")?;
         debug_assert!(!info.ordinary(), "ordinary writes use state blocks");
+        if class.mme() && m == 0x120 {
+            engine.regs.set(m, value);
+            engine.regs.set(0x11c, engine.regs.get(0x11c) + 1);
+            return Ok(());
+        }
         host.flush_constants()?;
         let previous = engine.regs.get(m);
         if class == Class::ThreeD {
@@ -514,7 +582,14 @@ impl Preparation {
                     engine.count = Some(source);
                     return Ok(());
                 }
-                0x19d0 => return host.clear(source, regs, graphics),
+                0x1558 => return engine.condition.evaluate(regs, host),
+                0x19d0 => {
+                    return if engine.condition.clear() {
+                        host.clear(source, regs, graphics)
+                    } else {
+                        Ok(())
+                    };
+                }
                 0x26c | 0x274 | 0x304 | 0x1214 | 0x1218 | 0x123c | 0x17e4..=0x17f8 => {
                     return Err(format!("native draw method {m:#x} is not implemented").into());
                 }

@@ -3,6 +3,28 @@
 mod metadata;
 mod methods;
 use crate::Result;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
+
+// The backend is the sole writer of its bank. Frontend observers load a cell
+// only after its last producing ring position has completed. Atomic cells avoid
+// cross-thread aliasing of the bank while unrelated registers are being written;
+// ordering comes from the ring's release/acquire, not a per-register fence.
+pub(crate) struct Bank([AtomicU32; 0xe00]);
+impl Bank {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self(std::array::from_fn(|_| AtomicU32::new(0))))
+    }
+    pub(crate) fn get(&self, index: usize) -> u32 {
+        self.0[index].load(Ordering::Relaxed)
+    }
+    pub(crate) fn set(&self, index: usize, value: u32) {
+        self.0[index].store(value, Ordering::Relaxed);
+    }
+}
+
 pub use metadata::DirtyFlags;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,14 +63,14 @@ impl Class {
 
 pub struct Registers {
     pub class: Class,
-    words: Box<[u32; 0xe00]>,
+    pub(crate) words: Arc<Bank>,
     metadata: &'static metadata::Table,
 }
 impl Registers {
     pub fn new(class: Class) -> Self {
         let mut registers = Self {
             class,
-            words: Box::new([0; 0xe00]),
+            words: Bank::new(),
             metadata: metadata::table(class),
         };
         if class == Class::ThreeD {
@@ -83,15 +105,15 @@ impl Registers {
         registers
     }
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn mme_bank(&mut self) -> (*mut u32, *const u32) {
-        (self.words.as_mut_ptr(), self.metadata.valid.as_ptr())
+    pub(crate) fn mme_bank(&self) -> (*const u32, *const u32) {
+        (self.words.0.as_ptr().cast(), self.metadata.valid.as_ptr())
     }
     #[inline]
     pub(crate) fn method(&self, method: u32) -> Option<metadata::Method> {
         self.metadata.method(method)
     }
     pub fn get(&self, method: u32) -> u32 {
-        self.words[(method / 4) as usize]
+        self.words.get((method / 4) as usize)
     }
     pub(crate) fn set(&mut self, method: u32, value: u32) -> bool {
         // Packed and full-width DMA origins name the same coordinates.
@@ -99,16 +121,16 @@ impl Registers {
         let mut changed = false;
         if self.class == Class::Copy && matches!(method, 0x720 | 0x73c) {
             let base = if method == 0x73c { 0x744 } else { 0x74c };
-            changed =
-                self.words[base / 4] != value & 0xffff || self.words[(base + 4) / 4] != value >> 16;
-            self.words[base / 4] = value & 0xffff;
-            self.words[(base + 4) / 4] = value >> 16;
+            changed = self.words.get(base / 4) != value & 0xffff
+                || self.words.get((base + 4) / 4) != value >> 16;
+            self.words.set(base / 4, value & 0xffff);
+            self.words.set((base + 4) / 4, value >> 16);
         }
         let index = (method / 4) as usize;
-        if self.words[index] == value {
+        if self.words.get(index) == value {
             return changed;
         }
-        self.words[index] = value;
+        self.words.set(index, value);
         true
     }
     pub fn address(&self, high: u32, low: u32) -> u64 {
@@ -116,14 +138,27 @@ impl Registers {
     }
     /// Apply admitted state without repeating classification or same-value
     /// checks. Packed DMA origins still update their full-width aliases.
-    pub(crate) fn store_state(&mut self, writes: &[u64]) {
+    pub(crate) fn store_state(&mut self, writes: &[u64], shadow: Option<&Bank>) {
         if self.class == Class::Copy {
             for &write in writes {
                 self.set(write as u32, (write >> 32) as u32);
             }
+        } else if let Some(shadow) = shadow {
+            let mut mode = self.get(0x124);
+            for &write in writes {
+                let method = write as u32;
+                let value = (write >> 32) as u32;
+                if method == 0x124 {
+                    mode = value;
+                } else if mode <= 1 {
+                    shadow.set(method as usize / 4, value);
+                }
+                self.words.set(method as usize / 4, value);
+            }
         } else {
             for &write in writes {
-                self.words[write as u32 as usize / 4] = (write >> 32) as u32;
+                self.words
+                    .set(write as u32 as usize / 4, (write >> 32) as u32);
             }
         }
     }

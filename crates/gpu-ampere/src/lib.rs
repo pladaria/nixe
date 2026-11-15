@@ -13,7 +13,9 @@ pub mod targets;
 mod writes;
 
 pub use channel::{Channel, FrontendHost, Progress, SemaphoreAcquire};
+pub use engines::BackState;
 pub use engines::{Draw, GraphicsState, Preparation, PreparationHost};
+pub use mme::MacroProgram;
 pub use packet::{GpfifoEntry, decode_entries};
 pub use registers::{Class, DirtyFlags, Registers};
 pub use writes::MemoryWrites;
@@ -54,6 +56,11 @@ pub trait Rasterizer: nixe_gpu::GpuExecution {
         memory: &mut impl RenderMemory,
     ) -> Result<()>;
     fn flush_constants(&mut self) -> Result<()>;
+    fn read_memory_into(
+        &mut self,
+        capture: &nixe_memory::CapturedMemory,
+        destination: &mut [u8],
+    ) -> Result<()>;
     fn write_memory(&mut self, capture: &nixe_memory::CapturedMemory, bytes: &[u8]) -> Result<()>;
     fn reduce_report(
         &mut self,

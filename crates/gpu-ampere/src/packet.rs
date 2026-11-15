@@ -60,6 +60,41 @@ pub(crate) enum Word {
     },
 }
 impl Packet {
+    /// A macro argument run cannot contain an acquire or other engine effect.
+    /// Consume it once, preserving packet mode and continuation across entries.
+    pub fn macro_run(&mut self, available: usize) -> Option<MacroRun> {
+        if self.remaining == 0 || !(0x3800..0x4000).contains(&self.method) || available == 0 {
+            return None;
+        }
+        let mut count = available.min(self.remaining as usize);
+        if self.mode == 1 {
+            count = count.min(((0x4000 - self.method) / 4) as usize);
+        } else if self.mode == 5 && self.method == 0x3ffc {
+            count = 1;
+        }
+        let first = self.method;
+        let last_method = match self.mode {
+            1 => first + (count as u32 - 1) * 4,
+            5 if count > 1 => first + 4,
+            _ => first,
+        };
+        match self.mode {
+            1 => self.method += count as u32 * 4,
+            5 => {
+                self.method += 4;
+                self.mode = 3;
+            }
+            _ => (),
+        }
+        self.remaining -= count as u32;
+        Some(MacroRun {
+            first,
+            last_method,
+            subchannel: self.subchannel,
+            count,
+            last: self.remaining == 0,
+        })
+    }
     pub fn word(&mut self, word: u32) -> Result<Word> {
         if self.remaining != 0 {
             let method = self.method;
@@ -106,4 +141,12 @@ impl Packet {
             Ok(Word::Header)
         }
     }
+}
+
+pub(crate) struct MacroRun {
+    pub first: u32,
+    pub last_method: u32,
+    pub subchannel: u8,
+    pub count: usize,
+    pub last: bool,
 }

@@ -136,6 +136,13 @@ pub(super) fn run(
                 }
                 Pending::Submit(mut work) => {
                     let job = &work.job;
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        channels.entry(job.channel)
+                    {
+                        let (channel, back) = ampere::Channel::new(mme_jit);
+                        writer.send(Control::InstallChannel(job.channel, back))?;
+                        entry.insert(channel);
+                    }
                     writer
                         .send(Control::Begin(
                             job.clone(),
@@ -143,9 +150,7 @@ pub(super) fn run(
                         ))
                         .map_err(|_| "native preparation stopped")?;
                     writer.reset();
-                    let channel = channels
-                        .entry(job.channel)
-                        .or_insert_with(|| ampere::Channel::new(mme_jit));
+                    let channel = channels.get_mut(&job.channel).unwrap();
                     let mut host = Front {
                         writer: &mut writer,
                         memory: Memory {

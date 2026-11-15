@@ -48,6 +48,21 @@ impl model::Rasterizer for NativeGpuExecution {
         self.flush_ampere_constants()
             .map_err(|e| e.to_string().into())
     }
+    fn read_memory_into(
+        &mut self,
+        capture: &nixe_memory::CapturedMemory,
+        destination: &mut [u8],
+    ) -> model::Result<()> {
+        nixe_gpu::OwnerMemory::invalidate_gpu_cache(self)
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        let mut residency = self.residency.access();
+        residency
+            .invalidate_device_mappings()
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        residency
+            .read_captured_memory(capture, destination)
+            .map_err(|e| e.to_string().into_boxed_str())
+    }
     fn write_memory(
         &mut self,
         capture: &nixe_memory::CapturedMemory,

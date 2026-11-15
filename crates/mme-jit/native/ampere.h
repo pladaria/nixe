@@ -27,14 +27,21 @@ struct AmpereInvocation {
   uint32_t (*poll)(AmpereInvocation *);
   uint32_t start, error_pc, error_value;
   uint8_t end_next, stopped, cancel_end, padding;
+  const uint64_t *owned;
+  uint32_t (*resolve)(AmpereInvocation *, uint32_t);
+  uint32_t state_value;
 };
 static_assert(sizeof(AmpereAlu) == 6);
 static_assert(sizeof(AmpereInstruction) == 22);
 static_assert(offsetof(AmpereInvocation, params) == 144);
 static_assert(offsetof(AmpereInvocation, start) == 224);
-static_assert(sizeof(AmpereInvocation) == 240);
+static_assert(offsetof(AmpereInvocation, owned) == 240);
+static_assert(sizeof(AmpereInvocation) == 264);
+struct AmpereCompileStatistics {
+  uint64_t guards, removed_guards, initialization_updates, removed_updates, code_bytes;
+};
 using AmpereProgram = uint32_t (*)(AmpereInvocation *);
 extern "C" bool nixe_ampere_mme_compile(void *, const AmpereInstruction *,
-                                        const uint8_t *, size_t,
-                                        AmpereProgram *,
+                                        const uint8_t *, size_t, const uint64_t *, bool,
+                                        AmpereProgram *, AmpereCompileStatistics *,
                                         NixeMmeCompileError *) noexcept;

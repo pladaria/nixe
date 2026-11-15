@@ -5,6 +5,8 @@ use nixe_gpu::ordered::{self, ENGINE, LOCATION, MACRO_END, METHOD, ORIGIN};
 // Word tags are interpreted by the ISA-specific consumer. Tag 3 is available
 // here; Maxwell uses it for its own multi-method representation.
 const STATE: u64 = 3;
+const RECONCILE: u64 = 4;
+const MACRO: u64 = 7;
 const MAX_STATE_WRITES: usize = 128;
 // Tag: 3 bits; count: 8 bits; dirty domains: 46 bits. A single header
 // keeps even one-write blocks compact without a separate scalar path.
@@ -15,6 +17,8 @@ const _: () = {
 };
 pub enum Operation<'a> {
     Method(Source),
+    Reconcile(Source),
+    Macro(Source, u32, &'a [u8]),
     Constants(Source, &'a [ConstantWord]),
     State(Source, DirtyFlags, &'a [u64]),
     Flush,
@@ -144,6 +148,36 @@ impl<T> Writer<T> {
         }
         Ok(())
     }
+    pub fn reconcile(&mut self, source: Source) -> Result<()> {
+        self.flush_state()?;
+        self.select(source)?;
+        self.ring
+            .write(
+                &[
+                    RECONCILE
+                        | (u64::from(source.method) << 8)
+                        | (u64::from(source.argument) << 32),
+                ],
+                &[],
+            )
+            .map_err(|_| "preparation owner stopped".into())
+    }
+    pub fn run_macro(&mut self, source: Source, start: u32, parameters: &[u8]) -> Result<u64> {
+        self.flush_state()?;
+        self.select(source)?;
+        assert!(parameters.len() <= 0x4000 && parameters.len().is_multiple_of(4) && start < 0x1000);
+        // The ring owns this copy until preparation finishes or is cancelled.
+        self.ring
+            .write(
+                &[MACRO
+                    | (u64::from(start) << 8)
+                    | (u64::from(source.method) << 24)
+                    | (((parameters.len() / 4) as u64) << 40)],
+                parameters,
+            )
+            .map_err(|_| "preparation owner stopped")?;
+        Ok(self.ring.position())
+    }
     pub fn draw_boundary(&mut self) -> Result<()> {
         self.flush_state()?;
         self.ring
@@ -222,6 +256,26 @@ pub fn consume<T>(
                     writes,
                 ))?;
                 consumed = 1 + count;
+            }
+            RECONCILE => {
+                source.method = ((value >> 8) & 0xffff) as u32;
+                source.argument = (value >> 32) as u32;
+                method(Operation::Reconcile(*source))?;
+            }
+            MACRO => {
+                let count = (value >> 40) as usize;
+                let start = ((value >> 8) & 0xffff) as u32;
+                source.method = ((value >> 24) & 0xffff) as u32;
+                let storage = &batch[1..1 + count.div_ceil(2)];
+                // SAFETY: exactly count initialized little-endian words follow
+                // the header. The ring retains them until the callback returns.
+                let parameters =
+                    unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), count * 4) };
+                source.argument = parameters
+                    .get(..4)
+                    .map_or(0, |word| u32::from_le_bytes(word.try_into().unwrap()));
+                method(Operation::Macro(*source, start, parameters))?;
+                consumed = 1 + count.div_ceil(2);
             }
             METHOD => {
                 source.method = ((value >> 8) & 0xffff) as u32;

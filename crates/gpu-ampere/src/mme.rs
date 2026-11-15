@@ -4,44 +4,16 @@
 // Instruction semantics derived from Mesa (Copyright 2022 Collabora Ltd., MIT).
 // See MESA-LICENSE for the original permission notice.
 use crate::Result;
+use std::sync::Arc;
+#[cfg(feature = "performance-counters")]
+mod diagnostics;
+mod effects;
+pub(crate) use effects::Effects;
 #[cfg(target_arch = "x86_64")]
 mod jit;
 
-/// Invocation FIFO retains capacity and permits DMA to append while executing.
-#[derive(Default)]
-pub(crate) struct Parameters {
-    values: Vec<u32>,
-    consumed: usize,
-}
-impl Parameters {
-    pub fn push(&mut self, value: u32) {
-        if self.consumed == self.values.len() {
-            self.clear();
-        } else if self.values.len() == self.values.capacity()
-            && self.consumed >= self.values.len().div_ceil(2)
-        {
-            // Reclaim a large consumed prefix only when space is needed. Each
-            // moved word is amortized by at least one consumed word; retaining
-            // small prefixes avoids repeatedly moving a nearly full FIFO.
-            self.values.copy_within(self.consumed.., 0);
-            self.values.truncate(self.len());
-            self.consumed = 0;
-        }
-        self.values.push(value);
-    }
-    fn pop(&mut self) -> Option<u32> {
-        let value = *self.values.get(self.consumed)?;
-        self.consumed += 1;
-        Some(value)
-    }
-    fn len(&self) -> usize {
-        self.values.len() - self.consumed
-    }
-    fn clear(&mut self) {
-        self.values.clear();
-        self.consumed = 0;
-    }
-}
+mod parameters;
+pub(crate) use parameters::{Fifo, Parameters};
 
 const INSTRUCTIONS: usize = 0x1000;
 pub(crate) const DRAM_WORDS: usize = 0xc00;
@@ -104,42 +76,125 @@ impl Instruction {
     }
 }
 
-pub(crate) trait Host {
-    fn state(&mut self, method: u32) -> Result<u32>;
-    fn emit(
-        &mut self,
-        method: u32,
-        value: u32,
-        dram: &mut [u32],
-        fifo: &mut Parameters,
-    ) -> Result<()>;
-    fn stopped(&self) -> bool;
-    /// Canonical bank storage, refreshed after every method callback.
-    #[cfg(target_arch = "x86_64")]
-    fn bank(&mut self) -> (*mut u32, *const u32);
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Emission {
+    Complete,
+    Dma,
 }
 
-pub(crate) struct Mme {
-    code: Box<[[u32; 3]]>,
+pub(crate) trait Host {
+    const TRACK_OWNERSHIP: bool = false;
+    fn state(&mut self, method: u32) -> Result<u32>;
+    /// Only DMA may borrow/modify the parameter FIFO and data RAM. Ordinary
+    /// state and other effects retain the invocation's stable backing pointers.
+    fn emit(&mut self, method: u32, value: u32) -> Result<Emission>;
+    fn dma(&mut self, method: u32, dram: &mut [u32], fifo: &mut Fifo<'_>) -> Result<()>;
+    fn stopped(&self) -> bool;
+    /// Stable shared cell storage for the entire invocation. Methods may update
+    /// cells, but cannot replace these retained banks or ownership arrays.
+    #[cfg(target_arch = "x86_64")]
+    fn bank(&self) -> (*const u32, *const u32, *const u64);
+}
+
+#[derive(Clone)]
+pub(crate) struct Code {
+    words: Box<[[u32; 3]]>,
     uploaded: Box<[u8]>,
     decoded: Box<[Instruction]>,
-    #[cfg(target_arch = "x86_64")]
-    compiled: Option<jit::Cache>,
-    starts: [Option<u32>; 256],
+}
+/// Immutable code and its entry proof may cross the ordered boundary; executable
+/// storage and its allocator remain confined to their execution thread.
+#[derive(Clone)]
+pub struct MacroProgram {
+    pub(crate) code: Arc<Code>,
+    pub(crate) effects: Arc<Effects>,
+    pub(crate) start: u32,
+}
+struct Proof {
+    effects: Arc<Effects>,
+    installed: bool,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum Entry {
+    Unbound,
+    Unclassified(u32),
+    Front(u32),
+    Back(u32),
+}
+impl Entry {
+    fn start(self) -> Option<u32> {
+        match self {
+            Self::Unbound => None,
+            Self::Unclassified(s) | Self::Front(s) | Self::Back(s) => Some(s),
+        }
+    }
+}
+pub(crate) struct Mme {
+    context: Context,
+    proofs: Vec<Option<Proof>>,
+    entries: [Entry; 256],
     upload_word: usize,
     bind: usize,
 }
-impl Mme {
-    pub fn new(mme_jit: bool) -> Self {
+pub(crate) struct Context {
+    code: Arc<Code>,
+    #[cfg(feature = "performance-counters")]
+    statistics: diagnostics::Statistics,
+    #[cfg(target_arch = "x86_64")]
+    compiled: Option<jit::Cache>,
+}
+impl Context {
+    pub fn new(code: Arc<Code>, mme_jit: bool) -> Self {
         #[cfg(not(target_arch = "x86_64"))]
         let _ = mme_jit;
         Self {
-            code: vec![[0; 3]; INSTRUCTIONS].into_boxed_slice(),
-            uploaded: vec![0; INSTRUCTIONS].into_boxed_slice(),
-            decoded: vec![Instruction::default(); INSTRUCTIONS].into_boxed_slice(),
+            code,
+            #[cfg(feature = "performance-counters")]
+            statistics: diagnostics::Statistics {
+                owner: "frontend",
+                ..Default::default()
+            },
             #[cfg(target_arch = "x86_64")]
             compiled: mme_jit.then(jit::Cache::default),
-            starts: [None; 256],
+        }
+    }
+    pub fn set_entry(&mut self, start: u32, enabled: bool) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(cache) = &mut self.compiled {
+            cache.set_entry(start, enabled);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (start, enabled);
+    }
+    pub fn install(&mut self, code: Arc<Code>) -> bool {
+        #[cfg(feature = "performance-counters")]
+        {
+            self.statistics.owner = "preparation";
+        }
+        if Arc::ptr_eq(&self.code, &code) {
+            return false;
+        }
+        self.code = code;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(cache) = &mut self.compiled {
+            cache.clear_entries();
+        }
+        true
+    }
+}
+impl Mme {
+    pub fn new(mme_jit: bool) -> Self {
+        Self {
+            context: Context::new(
+                Arc::new(Code {
+                    words: vec![[0; 3]; INSTRUCTIONS].into_boxed_slice(),
+                    uploaded: vec![0; INSTRUCTIONS].into_boxed_slice(),
+                    decoded: vec![Instruction::default(); INSTRUCTIONS].into_boxed_slice(),
+                }),
+                mme_jit,
+            ),
+            proofs: Vec::new(),
+            entries: [Entry::Unbound; 256],
             upload_word: 0,
             bind: 0,
         }
@@ -156,19 +211,34 @@ impl Mme {
     pub fn upload(&mut self, value: u32) -> Result<()> {
         let index = self.upload_word / 3;
         let word = self.upload_word % 3;
-        let code = self
+        let old = self
+            .context
             .code
-            .get_mut(index)
+            .words
+            .get(index)
             .ok_or("MME instruction RAM overflow")?;
-        let changed = code[word] != value || self.uploaded[index] & (1 << word) == 0;
-        code[word] = value;
-        self.uploaded[index] |= 1 << word;
-        if changed {
-            if self.uploaded[index] == 7 {
-                self.decoded[index] = Instruction::decode(*code);
+        if old[word] != value || self.context.code.uploaded[index] & (1 << word) == 0 {
+            // Only a changed generation with queued readers needs a copy.
+            #[cfg(feature = "performance-counters")]
+            if Arc::strong_count(&self.context.code) > 1 {
+                self.context.statistics.code_copies += 1;
+            }
+            let code = Arc::make_mut(&mut self.context.code);
+            code.words[index][word] = value;
+            code.uploaded[index] |= 1 << word;
+            if code.uploaded[index] == 7 {
+                code.decoded[index] = Instruction::decode(code.words[index]);
+            }
+            if !self.proofs.is_empty() {
+                self.proofs.clear();
+                for entry in &mut self.entries {
+                    if let Some(start) = entry.start() {
+                        *entry = Entry::Unclassified(start);
+                    }
+                }
             }
             #[cfg(target_arch = "x86_64")]
-            if let Some(cache) = &mut self.compiled {
+            if let Some(cache) = &mut self.context.compiled {
                 cache.invalidate();
             }
         }
@@ -176,7 +246,7 @@ impl Mme {
         Ok(())
     }
     pub fn bind_address(&mut self, value: u32) -> Result<()> {
-        if value as usize >= self.starts.len() {
+        if value as usize >= self.entries.len() {
             return Err("MME start table overflow".into());
         }
         self.bind = value as usize;
@@ -186,29 +256,144 @@ impl Mme {
         if value as usize >= INSTRUCTIONS {
             return Err("MME start exceeds code RAM".into());
         }
-        *self
-            .starts
+        let entry = self
+            .entries
             .get_mut(self.bind)
-            .ok_or("MME start table overflow")? = Some(value);
+            .ok_or("MME start table overflow")?;
+        let previous = entry.start();
+        *entry = Entry::Unclassified(value);
+        if let Some(old) = previous
+            && old != value
+            && !self.entries.iter().any(|e| e.start() == Some(old))
+        {
+            self.context.set_entry(old, false);
+        }
+        self.context.set_entry(value, true);
         self.bind += 1;
         Ok(())
     }
-    pub fn execute(
+    /// Binding changes and code uploads invalidate this slot's disposition.
+    /// The common frontend call reads one slot and never touches the proof table.
+    #[inline]
+    pub fn resolve(&mut self, slot: usize, allow_back: bool) -> Result<Entry> {
+        let entry = *self.entries.get(slot).ok_or("unbound MME macro")?;
+        let start = entry.start().ok_or("unbound MME macro")?;
+        if !allow_back {
+            return Ok(Entry::Front(start));
+        }
+        if matches!(entry, Entry::Unclassified(_)) {
+            return Ok(self.classify(slot, start));
+        }
+        Ok(entry)
+    }
+    #[cold]
+    fn classify(&mut self, slot: usize, start: u32) -> Entry {
+        if start as usize >= self.proofs.len() {
+            self.proofs.resize_with(start as usize + 1, || None);
+        }
+        let proof = self.proofs[start as usize].get_or_insert_with(|| {
+            let effects = Arc::new(effects::analyze(&self.context.code, start));
+            #[cfg(feature = "performance-counters")]
+            {
+                self.context.statistics.analyses += 1;
+                self.context.statistics.eligible_entries += u64::from(effects.eligible);
+                log::debug!(
+                    "MME effect proof start={start:#x} eligible={} writes={:x?}",
+                    effects.eligible,
+                    effects.writes
+                );
+            }
+            Proof {
+                effects,
+                installed: false,
+            }
+        });
+        let entry = if proof.effects.eligible {
+            Entry::Back(start)
+        } else {
+            Entry::Front(start)
+        };
+        self.entries[slot] = entry;
+        entry
+    }
+    pub fn execute_start(
         &mut self,
-        index: usize,
-        fifo: &mut Parameters,
+        start: u32,
+        fifo: &mut Fifo<'_>,
         dram: &mut [u32],
         host: &mut impl Host,
     ) -> Result<()> {
-        let start = self
-            .starts
-            .get(index)
-            .copied()
-            .flatten()
-            .ok_or("unbound MME macro")?;
+        self.context.execute_start(start, fifo, dram, host)
+    }
+    pub(crate) fn back_program(&mut self, start: u32) -> (&Effects, Option<MacroProgram>) {
+        let proof = self.proofs[start as usize]
+            .as_mut()
+            .expect("resolved backend macro");
+        #[cfg(feature = "performance-counters")]
+        {
+            self.context.statistics.scheduled_calls += 1;
+        }
+        let install = if proof.effects.eligible && !proof.installed {
+            proof.installed = true;
+            Some(MacroProgram {
+                code: self.context.code.clone(),
+                effects: proof.effects.clone(),
+                start,
+            })
+        } else {
+            None
+        };
+        (&proof.effects, install)
+    }
+}
+impl Context {
+    pub(crate) fn execute_start(
+        &mut self,
+        start: u32,
+        fifo: &mut Fifo<'_>,
+        dram: &mut [u32],
+        host: &mut impl Host,
+    ) -> Result<()> {
+        #[cfg(feature = "performance-counters")]
+        {
+            let begin = std::time::Instant::now();
+            let mut meter = diagnostics::Meter {
+                host,
+                callbacks: Default::default(),
+                state_callbacks: 0,
+            };
+            self.statistics.parameter_bytes += std::mem::size_of_val(fifo.remaining()) as u64;
+            if fifo.borrowed() {
+                self.statistics.borrowed_parameter_bytes += fifo.remaining().len() as u64;
+            }
+            let result = self.execute_code(start, fifo, dram, &mut meter);
+            self.statistics.materialized_parameter_bytes += fifo.materialized_bytes;
+            self.statistics.calls += 1;
+            self.statistics.execution += begin.elapsed();
+            self.statistics.callbacks += meter.callbacks;
+            self.statistics.state_callbacks += meter.state_callbacks;
+            result
+        }
+        #[cfg(not(feature = "performance-counters"))]
+        self.execute_code(start, fifo, dram, host)
+    }
+    fn execute_code(
+        &mut self,
+        start: u32,
+        fifo: &mut Fifo<'_>,
+        dram: &mut [u32],
+        host: &mut impl Host,
+    ) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
         if let Some(cache) = &mut self.compiled {
-            cache.execute(&self.decoded, &self.uploaded, start, fifo, dram, host)?;
+            cache.execute(
+                &self.code.decoded,
+                &self.code.uploaded,
+                start,
+                fifo,
+                dram,
+                host,
+            )?;
             fifo.clear();
             return Ok(());
         }
@@ -222,10 +407,10 @@ impl Mme {
             }
             let pc = run.pc;
             let result: Result<bool> = (|| {
-                if self.uploaded.get(pc) != Some(&7) {
+                if self.code.uploaded.get(pc) != Some(&7) {
                     return Err("MME fetch outside uploaded instruction RAM".into());
                 }
-                let d = self.decoded[pc];
+                let d = self.code.decoded[pc];
                 let mut loads = [0; 2];
                 for (i, load) in loads.iter_mut().enumerate() {
                     if d.loads[i] {
@@ -420,7 +605,11 @@ impl Mme {
                         run.increment = ((value >> 12) & 15) * 4;
                     }
                     if output[1] != 0 {
-                        host.emit(run.method, out(output[1], d, loads, values)?, dram, fifo)?;
+                        if host.emit(run.method, out(output[1], d, loads, values)?)?
+                            == Emission::Dma
+                        {
+                            host.dma(run.method, dram, fifo)?;
+                        }
                         run.method += run.increment;
                     }
                 }

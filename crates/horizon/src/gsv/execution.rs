@@ -157,6 +157,8 @@ enum Ingress {
     Stop,
 }
 enum Control {
+    InstallChannel(u64, ampere::BackState),
+    InstallMacro(ampere::MacroProgram),
     Failure(Box<str>),
     Begin(Arc<Submission>, std::time::Instant),
     End,
@@ -467,6 +469,25 @@ impl Front<'_> {
     }
 }
 impl FrontendHost for Front<'_> {
+    fn install_macro(&mut self, _source: Source, program: ampere::MacroProgram) -> Result<()> {
+        self.finish_draws()?;
+        self.writer.send(Control::InstallMacro(program))
+    }
+    fn run_macro(&mut self, source: Source, start: u32, parameters: &[u8]) -> Result<u64> {
+        // Complete prior primitives before the macro's coherent reads. FIFO
+        // reads and executable methods can publish cache contents anywhere;
+        // subsequent frontend reads must also include this ordered position.
+        self.finish_draws()?;
+        let position = self.writer.run_macro(source, start, parameters)?;
+        self.dependencies.any(position);
+        Ok(position)
+    }
+    fn wait_until(&mut self, position: u64) -> Result<()> {
+        self.writer.wait_until(position)
+    }
+    fn reconcile(&mut self, source: Source) -> Result<()> {
+        self.writer.reconcile(source)
+    }
     fn state(&mut self, source: Source, dirty: ampere::DirtyFlags) -> Result<()> {
         self.writer.state(source, dirty)
     }
@@ -648,6 +669,15 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
             .map_err(|e| e.to_string().into_boxed_str())?;
         read_owned(self.renderer, &capture.ranges, bytes)
     }
+    fn read_into(&mut self, address: u64, destination: &mut [u8]) -> Result<()> {
+        if destination.is_empty() {
+            return Ok(());
+        }
+        let capture = GpuMemory::new(self.memory.space)
+            .capture(address, destination.len() as u64)
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        self.renderer.read_memory_into(&capture.ranges, destination)
+    }
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
@@ -787,15 +817,25 @@ fn preparation<E: ampere::Rasterizer>(
             }
             match message {
                 nixe_gpu::ordered::Read::Control(Control::Failure(error)) => return Err(error),
+                nixe_gpu::ordered::Read::Control(Control::InstallChannel(id, state)) => {
+                    renderer.create_channel(id);
+                    if channels
+                        .insert(id, ampere::Preparation::new(state))
+                        .is_some()
+                    {
+                        return Err("duplicate native channel installation".into());
+                    }
+                }
+                nixe_gpu::ordered::Read::Control(Control::InstallMacro(program)) => {
+                    let job = current.as_ref().ok_or("macro program outside submission")?;
+                    channels
+                        .get_mut(&job.channel)
+                        .unwrap()
+                        .install_macro(program);
+                }
                 nixe_gpu::ordered::Read::Control(Control::Begin(job, started)) => {
                     source.channel = job.channel;
                     source.submission = job.id;
-                    if let std::collections::btree_map::Entry::Vacant(entry) =
-                        channels.entry(job.channel)
-                    {
-                        renderer.create_channel(job.channel);
-                        entry.insert(ampere::Preparation::default());
-                    }
                     renderer.bind_channel(job.channel);
                     renderer.begin_frame_work_at(started);
                     current = Some(job);
@@ -894,7 +934,9 @@ fn preparation<E: ampere::Rasterizer>(
                 }
                 nixe_gpu::ordered::Read::Words(mut words) => {
                     let job = current.as_ref().ok_or("methods outside submission")?;
-                    let channel = channels.entry(job.channel).or_default();
+                    let channel = channels
+                        .get_mut(&job.channel)
+                        .ok_or("uninstalled native channel")?;
                     let scheduler = schedulers.entry(job.space_id).or_default();
                     let mut host = Back {
                         renderer,
@@ -911,6 +953,14 @@ fn preparation<E: ampere::Rasterizer>(
                         &mut words,
                         &mut source,
                         |operation| match operation {
+                            ampere::ordered::Operation::Reconcile(source) => {
+                                host.source = source;
+                                channel.reconcile(source, &mut host)
+                            }
+                            ampere::ordered::Operation::Macro(source, start, parameters) => {
+                                host.source = source;
+                                channel.run_macro(source, start, parameters, scheduler, &mut host)
+                            }
                             ampere::ordered::Operation::Method(source) => {
                                 host.source = source;
                                 channel.execute(source, scheduler, &mut host)

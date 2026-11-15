@@ -11,7 +11,7 @@ use std::{
 type NativeProgram = unsafe extern "C" fn(*mut Invocation) -> u32;
 #[repr(C)]
 struct Invocation {
-    // Every generated read first checks the initialized mask.
+    // Generated reads require an initialized register or a static proof.
     regs: [MaybeUninit<u32>; 24],
     initialized: u32,
     carry: u32,
@@ -41,17 +41,30 @@ struct Invocation {
     stopped: u8,
     cancel_end: u8,
     padding: u8,
+    owned: *const u64,
+    resolve: unsafe extern "C" fn(*mut Invocation, u32) -> u32,
+    state_value: u32,
 }
 const _: () = {
     assert!(size_of::<Instruction>() == 22);
     assert!(std::mem::offset_of!(Invocation, params) == 144);
     assert!(std::mem::offset_of!(Invocation, start) == 224);
-    assert!(size_of::<Invocation>() == 240);
+    assert!(std::mem::offset_of!(Invocation, owned) == 240);
+    assert!(size_of::<Invocation>() == 264);
 };
 #[repr(C)]
 struct CompileError {
     pc: u32,
     message: [c_char; 256],
+}
+#[repr(C)]
+#[derive(Default, Debug)]
+struct CompileStatistics {
+    guards: u64,
+    removed_guards: u64,
+    initialization_updates: u64,
+    removed_updates: u64,
+    code_bytes: u64,
 }
 unsafe extern "C" {
     fn nixe_ampere_mme_compile(
@@ -59,29 +72,55 @@ unsafe extern "C" {
         instructions: *const Instruction,
         uploaded: *const u8,
         count: usize,
+        entries: *const u64,
+        track_ownership: bool,
         function: *mut Option<NativeProgram>,
+        statistics: *mut CompileStatistics,
         error: *mut CompileError,
     ) -> bool;
 }
 
-#[derive(Default)]
 pub(super) struct Cache {
+    entries: [u64; INSTRUCTIONS / 64],
     runtime: Option<Rc<nixe_mme_jit::Runtime>>,
     program: Option<Program>,
 }
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            entries: [0; INSTRUCTIONS / 64],
+            runtime: None,
+            program: None,
+        }
+    }
+}
 impl Cache {
+    pub fn set_entry(&mut self, start: u32, enabled: bool) {
+        let word = &mut self.entries[start as usize / 64];
+        let mask = 1 << (start % 64);
+        let next = if enabled { *word | mask } else { *word & !mask };
+        if *word != next {
+            *word = next;
+            self.invalidate();
+        }
+    }
+    pub fn clear_entries(&mut self) {
+        self.entries.fill(0);
+        self.invalidate();
+    }
     pub fn invalidate(&mut self) {
         self.program = None;
     }
-    pub fn execute(
+    pub fn execute<H: super::Host>(
         &mut self,
         instructions: &[Instruction],
         uploaded: &[u8],
         start: u32,
-        fifo: &mut Parameters,
+        fifo: &mut Fifo<'_>,
         dram: &mut [u32],
-        host: &mut impl super::Host,
+        host: &mut H,
     ) -> Result<()> {
+        debug_assert_ne!(self.entries[start as usize / 64] & (1 << (start % 64)), 0);
         if host.stopped() {
             return Err("MME execution cancelled".into());
         }
@@ -97,6 +136,7 @@ impl Cache {
                 .rposition(|&mask| mask != 0)
                 .map_or(0, |i| i + 1);
             let mut function = None;
+            let mut statistics = CompileStatistics::default();
             let mut error = CompileError {
                 pc: 0,
                 message: [0; 256],
@@ -109,7 +149,10 @@ impl Cache {
                     instructions.as_ptr(),
                     uploaded.as_ptr(),
                     count,
+                    self.entries.as_ptr(),
+                    H::TRACK_OWNERSHIP,
                     &mut function,
+                    &mut statistics,
                     &mut error,
                 )
             };
@@ -125,7 +168,7 @@ impl Cache {
                 runtime: runtime.clone(),
             });
             log::debug!(
-                "Ampere MME JIT compiled instruction RAM: {} instructions",
+                "Ampere MME JIT compiled instruction RAM: {} instructions; {statistics:?}",
                 uploaded[..count].iter().filter(|&&mask| mask == 7).count()
             );
             nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::MmeJitCompilations, 1);
@@ -146,13 +189,13 @@ impl Drop for Program {
         unsafe { self.runtime.release(self.function as *const c_void) };
     }
 }
-struct Host<'a, H> {
+struct Host<'a, 'input, H> {
     engine: &'a mut H,
-    fifo: &'a mut Parameters,
+    fifo: &'a mut Fifo<'input>,
     error: Option<Box<str>>,
     panic: Option<Box<dyn Any + Send>>,
 }
-impl<H: super::Host> Host<'_, H> {
+impl<H: super::Host> Host<'_, '_, H> {
     fn callback(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> u32 {
         // Unwinding cannot cross generated frames, which have no unwind metadata.
         // Resume internal panics only after returning to the Rust caller.
@@ -172,30 +215,41 @@ impl<H: super::Host> Host<'_, H> {
 unsafe extern "C" fn emit<H: super::Host>(state: *mut Invocation, method: u32, value: u32) -> u32 {
     // SAFETY: installed only for this invocation and this monomorphized host.
     let state = unsafe { &mut *state };
-    let host = unsafe { &mut *state.host.cast::<Host<'_, H>>() };
-    host.fifo.consumed = state.consumed;
+    let host = unsafe { &mut *state.host.cast::<Host<'_, '_, H>>() };
     host.callback(|host| {
         if host.engine.stopped() {
             return Err("MME execution cancelled".into());
         }
-        // SAFETY: native execution is suspended; this callback holds the only
-        // active access to data RAM. Refresh raw pointers after Rust reborrows.
-        let dram = unsafe { std::slice::from_raw_parts_mut(state.dram, state.dram_size) };
-        let result = host.engine.emit(method, value, dram, host.fifo);
-        state.dram = dram.as_mut_ptr();
-        state.params = host.fifo.values.as_ptr();
-        state.params_size = host.fifo.values.len();
-        state.consumed = host.fifo.consumed;
-        let (bank, valid) = host.engine.bank();
-        state.bank = bank;
-        state.valid_bank = valid;
-        result
+        if host.engine.emit(method, value)? == Emission::Dma {
+            host.fifo.set_consumed(state.consumed);
+            // SAFETY: only DMA borrows these mutable buffers while generated
+            // code is suspended. Refresh pointers after reborrowing/reallocation.
+            let dram = unsafe { std::slice::from_raw_parts_mut(state.dram, state.dram_size) };
+            let result = host.engine.dma(method, dram, host.fifo);
+            state.dram = dram.as_mut_ptr();
+            state.params = host.fifo.data().as_ptr().cast();
+            state.params_size = host.fifo.data().len() / 4;
+            state.consumed = host.fifo.consumed();
+            result
+        } else {
+            Ok(())
+        }
+    })
+}
+
+unsafe extern "C" fn resolve<H: super::Host>(state: *mut Invocation, index: u32) -> u32 {
+    // SAFETY: native execution is suspended and this callback is paired with H.
+    let state = unsafe { &mut *state };
+    let host = unsafe { &mut *state.host.cast::<Host<'_, '_, H>>() };
+    host.callback(|host| {
+        state.state_value = host.engine.state(index * 4)?;
+        Ok(())
     })
 }
 unsafe extern "C" fn poll<H: super::Host>(state: *mut Invocation) -> u32 {
     // SAFETY: as for emit; no reference is retained across the callback.
     let state = unsafe { &mut *state };
-    let host = unsafe { &mut *state.host.cast::<Host<'_, H>>() };
+    let host = unsafe { &mut *state.host.cast::<Host<'_, '_, H>>() };
     host.callback(|host| {
         if host.engine.stopped() {
             Err("MME execution cancelled".into())
@@ -208,11 +262,11 @@ impl Program {
     fn execute<H: super::Host>(
         &self,
         start: u32,
-        fifo: &mut Parameters,
+        fifo: &mut Fifo<'_>,
         dram: &mut [u32],
         engine: &mut H,
     ) -> Result<()> {
-        let (bank, valid_bank) = engine.bank();
+        let (bank, valid_bank, owned) = engine.bank();
         let mut host = Host {
             engine,
             fifo,
@@ -232,14 +286,16 @@ impl Program {
             budget: 1024,
             scratch_x: 0,
             scratch_y: 0,
-            params: host.fifo.values.as_ptr(),
-            params_size: host.fifo.values.len(),
-            consumed: host.fifo.consumed,
+            // AMD64 loads accept unaligned little-endian command bytes. Rust
+            // never dereferences this pointer as u32 or creates a u32 slice.
+            params: host.fifo.data().as_ptr().cast(),
+            params_size: host.fifo.data().len() / 4,
+            consumed: host.fifo.consumed(),
             dram: dram.as_mut_ptr(),
             dram_size: dram.len(),
             bank,
             valid_bank,
-            host: (&mut host as *mut Host<'_, H>).cast(),
+            host: (&mut host as *mut Host<'_, '_, H>).cast(),
             emit: emit::<H>,
             poll: poll::<H>,
             start,
@@ -249,11 +305,14 @@ impl Program {
             stopped: 0,
             cancel_end: 0,
             padding: 0,
+            owned,
+            resolve: resolve::<H>,
+            state_value: 0,
         };
         // SAFETY: the generated ABI is checked above. Slices and bank remain
         // alive and exclusively owned throughout execution and callbacks.
         let error = unsafe { (self.function)(&mut state) };
-        host.fifo.consumed = state.consumed;
+        host.fifo.set_consumed(state.consumed);
         if let Some(panic) = host.panic {
             resume_unwind(panic);
         }

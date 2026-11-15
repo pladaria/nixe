@@ -48,16 +48,24 @@ struct Compiler {
   Assembler a;
   std::span<const Inst> code;
   std::span<const uint8_t> uploaded;
+  std::span<const uint64_t> entries;
+  std::vector<std::vector<u32>> successors;
+  std::vector<u32> initialized;
+  u32 guarded_registers = 0;
+  AmpereCompileStatistics &statistics;
   std::vector<Label> labels;
   std::vector<bool> after_end, loop_end;
   std::vector<Fault> faults;
   Label table, dispatch, success, leave;
   u32 pc = 0;
+  bool track_ownership;
   std::vector<std::array<bool, 2>> carry_live;
 
   Compiler(NixeMmeRuntime &runtime_, std::span<const Inst> code_,
-           std::span<const uint8_t> uploaded_)
-      : runtime(runtime_), a(nullptr), code(code_), uploaded(uploaded_) {
+           std::span<const uint8_t> uploaded_, std::span<const uint64_t> entries_,
+           bool track_ownership_, AmpereCompileStatistics &statistics_)
+      : runtime(runtime_), a(nullptr), code(code_), uploaded(uploaded_),
+        entries(entries_), statistics(statistics_), track_ownership(track_ownership_) {
     check(holder.init(runtime.jit.environment(), runtime.jit.cpu_features()));
     holder.set_error_handler(&errors);
     check(holder.attach(&a));
@@ -116,6 +124,12 @@ struct Compiler {
   void require(u32 mask) {
     if (!mask)
       return;
+    ++statistics.guards;
+    mask &= ~initialized[pc];
+    if (!mask) {
+      ++statistics.removed_guards;
+      return;
+    }
     a.mov(eax, word(offsetof(State, initialized)));
     a.not_(eax);
     a.and_(eax, mask);
@@ -164,8 +178,8 @@ struct Compiler {
   // Carry is a full word (also the high multiply result). Propagate liveness
   // through both predicate outcomes and every possible branch/loop successor.
   // Analysis is compile-time only; unrelated macros need not preserve carry.
-  void analyze_carry() {
-    std::vector<std::vector<u32>> successors(code.size());
+  void build_graph() {
+    successors.resize(code.size());
     auto edge = [&](u32 from, int64_t to) {
       if (to >= 0 && size_t(to) < code.size())
         successors[from].push_back(u32(to));
@@ -186,6 +200,71 @@ struct Compiler {
           edge(i, int64_t(i) + (int32_t(u32(v.imm) << 19) >> 19));
       }
     }
+  }
+  static u32 reads(const Inst &d, u32 mask) {
+    u32 result = 0;
+    for (u32 lane = 0; lane < 2; ++lane)
+      if (mask & (1u << lane))
+        for (u32 r : {d.alu[lane].x, d.alu[lane].y})
+          if (r < 24) result |= 1u << r;
+    return result;
+  }
+  static u32 writes(const Inst &d, u32 mask) {
+    u32 result = 0;
+    for (u32 lane = 0; lane < 2; ++lane)
+      if ((mask & (1u << lane)) && d.alu[lane].dst < 24)
+        result |= 1u << d.alu[lane].dst;
+    return result;
+  }
+  // Definite assignment intersects incoming paths, including zero-count loops,
+  // back edges and both predicate outcomes. Both ALUs read the incoming state.
+  // Keeping END fallthrough edges is conservative: termination can only remove
+  // paths, never introduce an uninitialized register on a retained path.
+  // Entry bindings are part of the compiled program's contract. A change to
+  // their set invalidates this analysis before the new entry can execute.
+  void analyze_initialized() {
+    initialized.assign(code.size(), 0x00ffffff);
+    std::vector<bool> reached(code.size(), false), queued(code.size(), false);
+    std::vector<u32> work;
+    for (u32 i = 0; i < code.size(); ++i) {
+      if (!(entries[i / 64] & (uint64_t(1) << (i % 64)))) continue;
+      initialized[i] = 0;
+      reached[i] = queued[i] = true;
+      work.push_back(i);
+    }
+    while (!work.empty()) {
+      const u32 from = work.back();
+      work.pop_back();
+      queued[from] = false;
+      if (uploaded[from] != 7) continue;
+      const auto &d = code[from];
+      const u32 definite = writes(d, predicate_mask(d, false)) &
+                           writes(d, predicate_mask(d, true));
+      const u32 output = initialized[from] | definite;
+      for (u32 to : successors[from]) {
+        const u32 merged = initialized[to] & output;
+        if (!reached[to] || initialized[to] != merged) {
+          initialized[to] = merged;
+          reached[to] = true;
+          if (!queued[to]) {
+            queued[to] = true;
+            work.push_back(to);
+          }
+        }
+      }
+    }
+    for (u32 i = 0; i < code.size(); ++i) {
+      if (!reached[i]) initialized[i] = 0;
+      if (uploaded[i] != 7) continue;
+      const auto &d = code[i];
+      u32 required = reads(d, predicate_mask(d, false)) |
+                     reads(d, predicate_mask(d, true));
+      if (d.predicate && d.predicate_reg < 24)
+        required |= 1u << d.predicate_reg;
+      guarded_registers |= required & ~initialized[i];
+    }
+  }
+  void analyze_carry() {
     std::vector<bool> input(code.size(), false);
     carry_live.resize(code.size());
     bool changed;
@@ -221,7 +300,9 @@ struct Compiler {
   }
   AmpereProgram generate() {
     analyze();
+    build_graph();
     analyze_carry();
+    analyze_initialized();
     // Six preserved registers and 40 bytes keep both ABIs aligned at call
     // sites, including the Windows shadow space. r12/r13 hold loads, r14/r15
     // results.
@@ -290,6 +371,7 @@ struct Compiler {
       check(a.embed_label(label, 8));
     AmpereProgram program = nullptr;
     check(runtime.jit.add(&program, &holder));
+    statistics.code_bytes = holder.code_size();
     return program;
   }
   void instruction(const Inst &d) {
@@ -335,6 +417,9 @@ struct Compiler {
           }
         }
       }
+    // The predicate guard has already established this bit on both paths.
+    if (d.predicate && d.predicate_reg < 24)
+      required &= ~(1u << d.predicate_reg);
     require(required);
     const bool has_flow =
         ((mask & 1) && flow(d.alu[0].op)) || ((mask & 2) && flow(d.alu[1].op));
@@ -407,8 +492,14 @@ struct Compiler {
       } else if (alu.dst != 24)
         a.jmp(fault(3));
     }
-    if (written)
-      a.or_(word(offsetof(State, initialized)), written);
+    if (written) {
+      ++statistics.initialization_updates;
+      written &= guarded_registers;
+      if (written)
+        a.or_(word(offsetof(State, initialized)), written);
+      else
+        ++statistics.removed_updates;
+    }
     for (u32 i = 0; i < 2; ++i) {
       if (!(mask & (4u << i)))
         continue;
@@ -681,7 +772,7 @@ struct Compiler {
       compare(v.op);
       a.neg(eax);
       return;
-    case 22:
+    case 22: {
       a.lea(eax, ptr(rcx, rdx));
       a.and_(eax, 0xffff);
       a.cmp(eax, 0xe00);
@@ -689,9 +780,26 @@ struct Compiler {
       a.mov(rcx, pointer(offsetof(State, valid_bank)));
       a.bt(dword_ptr(rcx), eax);
       a.jnc(fault(13));
+      auto local = a.new_label(), done = a.new_label();
+      if (track_ownership) {
+        a.mov(rcx, pointer(offsetof(State, owned)));
+        a.cmp(qword_ptr(rcx, rax, 3), 0);
+        a.je(local);
+        a.mov(arg1.r32(), eax);
+        a.mov(arg0, rbx);
+        a.mov(word(offsetof(State, error_pc)), pc);
+        a.call(pointer(offsetof(State, resolve)));
+        a.test(eax, eax);
+        a.jz(fault(10));
+        a.mov(eax, word(offsetof(State, state_value)));
+        a.jmp(done);
+      }
+      a.bind(local);
       a.mov(rcx, pointer(offsetof(State, bank)));
       a.mov(eax, dword_ptr(rcx, rax, 2));
+      a.bind(done);
       return;
+    }
     case 23: {
       if (v.imm < 2 || v.dst != 24 || v.y != 24) {
         a.jmp(fault(6));
@@ -781,14 +889,17 @@ struct Compiler {
 extern "C" bool nixe_ampere_mme_compile(void *runtime,
                                         const AmpereInstruction *instructions,
                                         const uint8_t *uploaded, size_t count,
-                                        AmpereProgram *result,
+                                        const uint64_t *entries, bool track_ownership,
+                                        AmpereProgram *result, AmpereCompileStatistics *statistics,
                                         NixeMmeCompileError *error) noexcept {
   *result = nullptr;
+  *statistics = {};
   try {
     if (count > 0x1000)
       throw std::runtime_error("MME instruction RAM exceeds 4096 instructions");
     Compiler compiler(*static_cast<NixeMmeRuntime *>(runtime),
-                      {instructions, count}, {uploaded, count});
+                      {instructions, count}, {uploaded, count},
+                      {entries, (count + 63) / 64}, track_ownership, *statistics);
     *result = compiler.generate();
     return true;
   } catch (const std::exception &e) {
