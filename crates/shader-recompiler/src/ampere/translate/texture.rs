@@ -359,12 +359,17 @@ impl Visitor<'_> {
 
     pub(super) fn texture_sample(&mut self) -> Result<()> {
         let i = self.instruction;
+        let uniform = i.opcode() == 0xf60;
+        let bindless = i.opcode() == 0x361;
         let dimension = i.bits(61, 3);
         let lod_mode = i.bits(87, 3);
         let depth = i.bits(78, 1) != 0;
         let offsets = i.bits(76, 1) != 0;
         let mask = i.bits(72, 4);
-        if i.bits(59, 1) != 0
+        if i.bits(59, 1) != u32::from(bindless)
+            || i.bits(91, 1) != u32::from(uniform)
+            || (uniform && i.bits(46, 13) != 0)
+            || (bindless && (i.bits(40, 19) != 0 || lod_mode > 3))
             || dimension == 6
             || i.bits(77, 1) != 0
             || i.bits(81, 3) != 7
@@ -386,8 +391,23 @@ impl Visitor<'_> {
         };
         let coordinates = spatial + usize::from(array);
         let has_lod = matches!(lod_mode, 2 | 3 | 6 | 7);
-        let count = coordinates + usize::from(has_lod) + usize::from(offsets) + usize::from(depth);
-        let in_a = if count <= 4 { count.div_ceil(2) } else { 4 };
+        let count = coordinates
+            + usize::from(bindless)
+            + usize::from(has_lod)
+            + usize::from(offsets)
+            + usize::from(depth);
+        // TEX.B adds its handle immediately after the coordinates. Unpacked
+        // TEX.B keeps coordinates in Ra and its handle/meta operands in Rb.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h#L2840-L2870
+        let in_a = if bindless && i.bits(60, 1) == 0 {
+            coordinates
+        } else if count <= 4 {
+            count.div_ceil(2)
+        } else if bindless {
+            coordinates
+        } else {
+            4
+        };
         let mut operands = [Value::None; 7];
         for (index, value) in operands.iter_mut().take(count).enumerate() {
             let (register, offset) = if index < in_a {
@@ -401,12 +421,18 @@ impl Visitor<'_> {
                 register.offset(offset as i32)?
             })?;
         }
-        let handle = self.emit.get_cbuf(
-            Value::U32(i.bits(54, 5)),
-            Value::U32(i.bits(40, 14) * 4),
-            32,
-            false,
-        )?;
+        let handle = if uniform {
+            self.ureg(i.bits(40, 6))?
+        } else if bindless {
+            operands[coordinates]
+        } else {
+            self.emit.get_cbuf(
+                Value::U32(i.bits(54, 5)),
+                Value::U32(i.bits(40, 14) * 4),
+                32,
+                false,
+            )?
+        };
         let mut coords = [Value::None; 4];
         for (index, value) in coords.iter_mut().take(spatial).enumerate() {
             *value = self
@@ -426,7 +452,7 @@ impl Visitor<'_> {
         } else {
             self.emit.composite_construct(&coords[..coordinates])?
         };
-        let mut next = coordinates;
+        let mut next = coordinates + usize::from(bindless);
         let lod = if has_lod {
             let value = self.emit.bit_cast(Type::F32, operands[next])?;
             next += 1;

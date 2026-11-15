@@ -30,8 +30,8 @@ pub(crate) struct SamplerDescriptors {
 }
 pub(crate) struct SamplerDescriptor {
     pub(crate) description: nixe_gpu::SamplerDescription,
-    /// Independent reduction and comparison-disable variants.
-    pub(crate) variants: [Option<vk::Sampler>; 4],
+    /// Independent reduction, comparison-disable and integer-filter variants.
+    pub(crate) variants: [Option<vk::Sampler>; 8],
     pub(crate) bytes: [u8; 32],
 }
 /// Channel selections and texture contents share the actual texture-cache

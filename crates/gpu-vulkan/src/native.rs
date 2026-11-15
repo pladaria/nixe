@@ -45,6 +45,7 @@ pub(crate) mod image_planes;
 pub(crate) mod images;
 mod state;
 mod targets;
+mod texels;
 mod vertex_format;
 use crate::residency::color_blit_pipeline;
 

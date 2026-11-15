@@ -241,6 +241,7 @@ impl NativeExecution<'_> {
                             .resolve(launch.block, Some(launch.grid)),
                     )?;
                 }
+                self.ampere_stage_texels(memory, registers, constants, resources, 5, linked)?;
                 if !self
                     .residency
                     .runtime

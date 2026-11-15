@@ -649,6 +649,18 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 return unsupported_service_command("IApplicationFunctions", request.command_id);
             };
             match command {
+                ApplicationFunctionsCommand::TryPopFromFriendInvitationStorageChannel => {
+                    if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    // No invitations enter this channel while running offline.
+                    // An empty channel returns no IStorage, rather than success.
+                    // https://switchbrew.org/wiki/AM_services#TryPopFromFriendInvitationStorageChannel
+                    applet_error(request.token, HorizonIpcResult::AM_NO_DATA_IN_CHANNEL)
+                }
                 ApplicationFunctionsCommand::GetOperationModeRefreshEvent => {
                     if !request.data.is_empty() || has_ipc_descriptors(hipc) {
                         return applet_error(
@@ -762,6 +774,39 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                             ))
                         }
                     }
+                }
+                // https://switchbrew.org/wiki/AM_services#GetSaveDataSize
+                ApplicationFunctionsCommand::GetSaveDataSize => {
+                    if !request.has_payload_size(24) || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    let system = save_data.ok_or(IpcWireError::Malformed(
+                        "application save-data storage unavailable",
+                    ))?;
+                    let user = u128::from_le_bytes(request.data[8..24].try_into().unwrap());
+                    let (normal, journal) = match system.sizes(request.data[0], user) {
+                        Ok(sizes) => sizes,
+                        Err(crate::save_data::SaveDataError::Unsupported(detail)) => {
+                            return Err(IpcWireError::UnsupportedService(
+                                UnsupportedServiceOperation::CommandVariant {
+                                    service: "IApplicationFunctions",
+                                    command_id: 26,
+                                    detail,
+                                },
+                            ));
+                        }
+                        Err(crate::save_data::SaveDataError::Io(error)) => {
+                            log::error!("save-data size query failed: {error}");
+                            return applet_error(request.token, HorizonIpcResult::FS_UNEXPECTED);
+                        }
+                    };
+                    let mut data = [0; 16];
+                    data[..8].copy_from_slice(&normal.to_le_bytes());
+                    data[8..].copy_from_slice(&journal.to_le_bytes());
+                    semantic_success(request.token, true, &data, &[], &[], None)
                 }
                 ApplicationFunctionsCommand::EnsureSaveData => {
                     if !request.has_payload_size(16) || has_ipc_descriptors(hipc) {

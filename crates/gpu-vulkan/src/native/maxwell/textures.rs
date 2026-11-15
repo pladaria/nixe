@@ -142,3 +142,47 @@ impl super::super::NativeExecution<'_> {
         self.resolve_shader_sampler(compute, index, bytes)
     }
 }
+
+impl super::super::NativeExecution<'_> {
+    pub(super) fn maxwell_stage_texels(
+        &mut self,
+        space: &MaxwellGpuMemory,
+        buffers: super::handles::HandleBuffers<'_>,
+        resources: &crate::native::pipeline_resources::StageResources,
+        stage: usize,
+        computed: &[u32],
+    ) -> Result<(), VulkanError> {
+        for slot in &resources.texels {
+            let (handle, _) = super::handles::read_handle(space, buffers, &slot.handle, computed)?;
+            let index = handle & 0xfffff;
+            let table = &self
+                .residency
+                .texture_cache
+                .bindings
+                .channel
+                .image_descriptors[usize::from(stage == 5)];
+            if index > table.maximum {
+                return Err(failed("texel descriptor exceeds TIC table"));
+            }
+            let base = table
+                .table
+                .ok_or_else(|| failed("texel buffer has no TIC table"))?;
+            let bytes = Self::read_texture_descriptor(space, base + u64::from(index) * 32)?;
+            let (address, size, format, element_bytes) =
+                super::super::texels::interpretation(slot, index, bytes)?;
+            let source = if address == 0 {
+                None
+            } else {
+                Some(nixe_gpu::native::GuestBufferRange {
+                    address: space
+                        .device_address(space.address(address).map_err(failed)?)
+                        .map_err(failed)?,
+                    size,
+                })
+            };
+            self.residency
+                .bind_texel_buffer(stage, slot.slot, source, format, element_bytes);
+        }
+        Ok(())
+    }
+}

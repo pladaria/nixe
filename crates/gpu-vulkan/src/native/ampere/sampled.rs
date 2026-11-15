@@ -194,9 +194,10 @@ impl SampledTextures {
     }
     pub fn eligible(resources: &PipelineResources) -> bool {
         resources.stages[..5].iter().all(|s| {
-            s.images
-                .iter()
-                .all(|i| i.sampler && i.storage_format.is_none())
+            s.texels.is_empty()
+                && s.images
+                    .iter()
+                    .all(|i| i.sampler && i.storage_format.is_none())
         })
     }
     #[allow(clippy::too_many_arguments)]

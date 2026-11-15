@@ -5,6 +5,33 @@
 use super::*;
 
 impl Visitor<'_> {
+    pub(super) fn redux(&mut self) -> Result<()> {
+        use crate::ir::Opcode as O;
+        let i = self.instruction;
+        let mode = i.bits(64, 32);
+        let opcode = match mode {
+            0xc000 => O::SubgroupReduceAdd,
+            0x10000 => O::SubgroupReduceUMin,
+            0x14000 => O::SubgroupReduceUMax,
+            0x10200 => O::SubgroupReduceSMin,
+            0x14200 => O::SubgroupReduceSMax,
+            0x4000 => O::SubgroupReduceOr,
+            0x8000 => O::SubgroupReduceXor,
+            _ => return Err(unsupported("Native warp reduction mode")),
+        };
+        if i.bits(12, 4) != 7 || i.bits(32, 32) != 0 || i.bits(16, 8) >= 63 {
+            return Err(unsupported(
+                "Native predicated warp reduction or destination",
+            ));
+        }
+        // REDUX reduces the active lanes and writes a uniform register. Lower
+        // directly to a subgroup reduction without synthesized shuffle loops.
+        // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-redux-sync
+        let source = self.reg(i.bits(24, 8))?;
+        let value = self.emit.emit(opcode, &[source], 0)?;
+        self.write_register(value, true)
+    }
+
     pub(super) fn uniform_wide_multiply(&mut self) -> Result<()> {
         let i = self.instruction;
         let destination = i.bits(16, 8);

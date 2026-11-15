@@ -5,6 +5,7 @@
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/audio_device.cpp
 
 use nixe_audio::{AudioBackend, AudioError};
+pub(crate) mod native;
 use nixe_runtime::{EventObject, ReadableEventObject};
 use std::sync::{
     Arc,

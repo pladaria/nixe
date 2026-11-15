@@ -105,6 +105,9 @@ impl FeatureSet {
             support_shuffle_relative: subgroup
                 .supported_operations
                 .contains(vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE),
+            support_subgroup_arithmetic: subgroup
+                .supported_operations
+                .contains(vk::SubgroupFeatureFlags::ARITHMETIC),
             supported_subgroup_stages: stages,
             support_viewport_index_layer_non_geometry: viewport_layer,
             support_typeless_image_loads: self.core.shader_storage_image_read_without_format != 0,

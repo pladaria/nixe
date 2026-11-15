@@ -18,6 +18,7 @@ pub(super) fn image_buffer(info: &mut ShaderInfo, desc: ImageBufferDescriptor) -
     let key = |d: &ImageBufferDescriptor| {
         (
             d.format,
+            d.component_type,
             d.cbuf_index,
             d.cbuf_offset,
             d.count,
@@ -33,7 +34,6 @@ pub(super) fn image_buffer(info: &mut ShaderInfo, desc: ImageBufferDescriptor) -
         let d = &mut info.image_buffer_descriptors[index];
         d.is_written |= desc.is_written;
         d.is_read |= desc.is_read;
-        d.is_integer |= desc.is_integer;
         return index as u32;
     }
     let index = info.image_buffer_descriptors.len() as u32;

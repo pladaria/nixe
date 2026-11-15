@@ -183,7 +183,7 @@ pub(crate) struct Publication {
     pub cpu: Option<(
         Arc<nixe_runtime::TransferMemoryObject>,
         nixe_runtime::WritableEventObject,
-        Arc<super::gpu::PhysicalMap>,
+        Arc<nixe_memory::DeviceHeapMapping>,
     )>,
     pub gpu: Option<nixe_memory::CapturedMemory>,
 }

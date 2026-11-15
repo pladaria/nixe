@@ -18,12 +18,42 @@ fn undefined(message: impl Into<String>) -> CompileError {
 
 /// A statically dispatched visitor translates one discovered range into its
 /// structured block. No callbacks are stored in programs or emitted artifacts.
+pub struct CodeBlock<'a> {
+    pub ir: &'a mut Ir,
+    pub current: BlockId,
+    pub syntax: &'a mut Vec<SyntaxNode>,
+}
+impl CodeBlock<'_> {
+    /// Instruction-local control flow shares the program's ordinary CFG and
+    /// syntax, so SSA and memory lowering see the actual guarded effects.
+    pub fn if_then(
+        &mut self,
+        condition: Value,
+        emit_body: impl FnOnce(&mut Ir, BlockId) -> Result<()>,
+    ) -> Result<()> {
+        let body = self.ir.new_block()?;
+        let merge = self.ir.new_block()?;
+        self.ir.add_branch(self.current, body)?;
+        self.ir.add_branch(self.current, merge)?;
+        self.ir.add_branch(body, merge)?;
+        self.syntax.push(SyntaxNode::If {
+            condition,
+            body,
+            merge,
+        });
+        self.syntax.push(SyntaxNode::Block(body));
+        emit_body(self.ir, body)?;
+        self.syntax.push(SyntaxNode::EndIf { merge });
+        self.syntax.push(SyntaxNode::Block(merge));
+        self.current = merge;
+        Ok(())
+    }
+}
 pub trait CodeTranslator<E: Environment> {
     fn translate(
         &mut self,
         environment: &mut E,
-        ir: &mut Ir,
-        block: BlockId,
+        block: &mut CodeBlock<'_>,
         begin: crate::types::ProgramOffset,
         end: crate::types::ProgramOffset,
     ) -> Result<()>;
@@ -129,13 +159,18 @@ impl<E: Environment, T: CodeTranslator<E>, L: Address, S> Builder<'_, E, T, L, S
                     if let Some(flow) = flow {
                         let flow = self.graph.block(flow)?;
                         if flow.begin != flow.end {
+                            let mut code = CodeBlock {
+                                ir: self.ir,
+                                current: block,
+                                syntax: &mut self.syntax,
+                            };
                             self.translator.translate(
                                 self.environment,
-                                self.ir,
-                                block,
+                                &mut code,
                                 flow.begin.instruction()?.address(),
                                 flow.end.instruction()?.address(),
                             )?;
+                            current = Some(code.current);
                         }
                     }
                 }
@@ -154,7 +189,12 @@ impl<E: Environment, T: CodeTranslator<E>, L: Address, S> Builder<'_, E, T, L, S
                 StatementKind::SetIndirectVariable { reg, offset } => {
                     let block = self.ensure_block(&mut current)?;
                     let mut emit = Emitter::new(self.ir, block)?;
-                    let reg = emit.get_reg(reg)?;
+                    let reg = match reg {
+                        super::flow::BranchRegister::General(reg) => emit.get_reg(reg)?,
+                        super::flow::BranchRegister::Uniform(reg) => {
+                            emit.get_uniform_reg(u32::from(reg))?
+                        }
+                    };
                     let address = emit.i_add(reg, Value::U32(offset as u32))?;
                     emit.set_indirect_branch_variable(address)?;
                 }

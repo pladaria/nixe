@@ -340,7 +340,7 @@ impl RunnableProcess {
                 }
                 _ => ThreadCreateError::Internal,
             })?;
-        object.assign_thread_id(id.get());
+        object.assign_scheduler_id(id.get());
         let result = {
             let process = self.state.lock().unwrap();
             if process.lifecycle != nixe_scheduler::ProcessLifecycle::Running {
@@ -386,12 +386,12 @@ impl RunnableProcess {
     ) -> Result<(), crate::ThreadTableError> {
         let old = self.main_thread_id;
         if old == id {
-            self.main_thread().assign_thread_id(id.get());
+            self.main_thread().assign_scheduler_id(id.get());
             return Ok(());
         }
         self.threads.rekey(old, id)?;
         self.main_thread_id = id;
-        self.main_thread().assign_thread_id(id.get());
+        self.main_thread().assign_scheduler_id(id.get());
         Ok(())
     }
 

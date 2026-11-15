@@ -104,7 +104,8 @@ pub(super) fn ioctl(
             let address = crate::gsv::gpu::VA_END - nixe_memory::PAGE_SIZE;
             if space.sync_mapping.is_none() {
                 space.sync_mapping = Some(
-                    crate::gsv::gpu::PhysicalMap::new(&space.memory, ranges)
+                    nixe_memory::DeviceHeapMemory::new(space.memory.clone())
+                        .map(ranges.into(), nixe_memory::PAGE_SIZE, None)
                         .map_err(|e| IpcWireError::SystemMemory(std::sync::Arc::new(e)))?,
                 );
             }

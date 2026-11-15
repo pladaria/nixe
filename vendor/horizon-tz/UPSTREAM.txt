@@ -1,0 +1,11 @@
+Source: https://github.com/zortos293/Lichii
+Commit: 646b5d17135a2b2701ccc7a959afd0bbbf2f6160
+Directory: externals/tz/tz
+
+Horizon-compatible time-zone parser, derived from tzcode. Original copyright
+and SPDX license notices are retained in each source file.
+
+Local changes:
+- Keep parsing scratch storage local to each call to allow concurrent requests.
+- Reject a truncated TZif header before copying it.
+- Validate serialized booleans as bytes before converting to bool.

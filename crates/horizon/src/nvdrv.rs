@@ -78,7 +78,7 @@ pub(crate) const NV_CONFIG_VAR_NOT_FOUND: u32 = 0x3_0006;
 struct NvDrvClientState {
     kernel: Arc<nixe_scheduler::SchedulerState>,
     machine: Machine,
-    device_memory: nixe_gpu_maxwell::MaxwellDeviceMemory,
+    device_memory: nixe_memory::DeviceHeapMemory,
     device_heap_initialized: bool,
     initialized: bool,
     transfer_memory_size: u32,
@@ -142,7 +142,10 @@ impl NvDrvSession {
     pub fn new(machine: Machine, kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
         let control = Arc::new(Mutex::new(NvHostControl::new(kernel)));
         Self::new_with_executor(
-            nixe_gpu_maxwell::MaxwellDeviceMemory::new(machine.clone()),
+            nixe_memory::DeviceHeapMemory::new(nixe_memory::device_memory::DeviceMemory::new(
+                machine.clone(),
+                34,
+            )),
             kernel,
             NvDrvGpuExecutor::new(machine, kernel, Arc::clone(&control)),
             control,
@@ -151,7 +154,7 @@ impl NvDrvSession {
 
     /// Startup composition; neither worker erases the selected command representation.
     pub fn with_gpu_frontend<E, L, R>(
-        device_memory: nixe_gpu_maxwell::MaxwellDeviceMemory,
+        device_memory: nixe_memory::DeviceHeapMemory,
         kernel: &Arc<nixe_scheduler::SchedulerState>,
         mme_jit: bool,
         initialize: impl FnOnce() -> Result<(E, R), nixe_gpu::BackendRuntimeError> + Send + 'static,
@@ -182,7 +185,7 @@ impl NvDrvSession {
     }
 
     fn new_with_executor(
-        device_memory: nixe_gpu_maxwell::MaxwellDeviceMemory,
+        device_memory: nixe_memory::DeviceHeapMemory,
         kernel: &Arc<nixe_scheduler::SchedulerState>,
         gpu_executor: NvDrvGpuExecutor,
         control: Arc<Mutex<NvHostControl>>,
@@ -980,7 +983,7 @@ impl NvDrvSession {
     pub(crate) fn pin_framebuffer(
         &self,
         object: &NvMapObject,
-    ) -> Result<Arc<nixe_gpu_maxwell::MaxwellDeviceMapping>, nixe_memory::MemoryError> {
+    ) -> Result<Arc<nixe_memory::DeviceHeapMapping>, nixe_memory::MemoryError> {
         let memory = self.state.lock().unwrap().device_memory.clone();
         object.pin_device(&memory)
     }

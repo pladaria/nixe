@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use nixe_runtime::TransferMemoryObject;
 
+pub(crate) mod event_fd;
+
 /// Socket-buffer configuration supplied by `bsdInitialize`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BsdClientConfig {
@@ -21,9 +23,20 @@ pub(crate) struct BsdClientConfig {
 
 #[derive(Clone, Debug)]
 struct BsdClient {
-    config: BsdClientConfig,
-    transfer_memory: Arc<TransferMemoryObject>,
+    registration: BsdRegistration,
     monitoring: bool,
+    descriptors: Arc<event_fd::Descriptors>,
+}
+
+#[derive(Clone, Debug)]
+enum BsdRegistration {
+    TransferMemory {
+        config: BsdClientConfig,
+        memory: Arc<TransferMemoryObject>,
+    },
+    Native {
+        version: u32,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -69,6 +82,28 @@ impl BsdSystem {
         config: BsdClientConfig,
         transfer_memory: Arc<TransferMemoryObject>,
     ) -> Result<(), BsdRegistrationError> {
+        self.register(
+            process_id,
+            BsdRegistration::TransferMemory {
+                config,
+                memory: transfer_memory,
+            },
+        )
+    }
+
+    pub(crate) fn register_native_client(
+        &self,
+        process_id: u64,
+        version: u32,
+    ) -> Result<(), BsdRegistrationError> {
+        self.register(process_id, BsdRegistration::Native { version })
+    }
+
+    fn register(
+        &self,
+        process_id: u64,
+        registration: BsdRegistration,
+    ) -> Result<(), BsdRegistrationError> {
         let mut state = self
             .state
             .lock()
@@ -79,9 +114,9 @@ impl BsdSystem {
         state.clients.insert(
             process_id,
             BsdClient {
-                config,
-                transfer_memory,
+                registration,
                 monitoring: false,
+                descriptors: Arc::default(),
             },
         );
         Ok(())
@@ -96,12 +131,27 @@ impl BsdSystem {
             return Err(BsdMonitoringError::UnknownClient);
         };
         client.monitoring = true;
-        log::debug!(
-            "bsd:u started monitoring process {process_id} (config version {}, transfer memory {:#x} bytes)",
-            client.config.version,
-            client.transfer_memory.size(),
-        );
+        match &client.registration {
+            BsdRegistration::TransferMemory { config, memory } => log::debug!(
+                "bsd:u started monitoring process {process_id} (config version {}, transfer memory {:#x} bytes)",
+                config.version,
+                memory.size(),
+            ),
+            BsdRegistration::Native { version } => log::debug!(
+                "bsd:u started monitoring process {process_id} (native version {version})"
+            ),
+        }
         Ok(())
+    }
+
+    pub(crate) fn descriptors(&self, process_id: u64) -> Result<Arc<event_fd::Descriptors>, u32> {
+        self.state
+            .lock()
+            .unwrap()
+            .clients
+            .get(&process_id)
+            .map(|client| client.descriptors.clone())
+            .ok_or(event_fd::BADF)
     }
 }
 

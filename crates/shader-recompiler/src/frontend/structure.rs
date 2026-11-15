@@ -1,4 +1,4 @@
-use super::flow::{Address, EndClass, FlowGraph, FunctionId};
+use super::flow::{Address, BranchRegister, EndClass, FlowGraph, FunctionId};
 use crate::{
     CompileError, Result,
     arena::{Arena, FlowBlockId, StatementId},
@@ -35,7 +35,7 @@ pub enum StatementKind {
         value: StatementId,
     },
     SetIndirectVariable {
-        reg: Reg,
+        reg: BranchRegister,
         offset: i32,
     },
     VerifyReturn {

@@ -4,8 +4,6 @@
 //! message-decoding modules do not depend on it.
 
 pub(super) use crate::ipc_wire::request::{Buffer, Request};
-pub(super) use chrono::{Datelike, Offset, Timelike};
-pub(super) use chrono_tz::OffsetComponents;
 pub(super) use nixe_memory::GuestVirtualAddress;
 pub(super) use nixe_runtime::TransferMemoryObject;
 

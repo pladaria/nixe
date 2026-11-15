@@ -1,16 +1,15 @@
-//! Maxwell NvMap pin policy: CPU-relative heap offsets and independent
-//! 64 KiB reservations share the GPU's actual device memory manager.
+//! CPU-relative GPU heap offsets and independent 64 KiB reservations share
+//! the canonical device memory manager across console frontends.
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvdrv/core/heap_mapper.cpp
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvdrv/core/nvmap.cpp
-use nixe_memory::{
+use crate::{
     AddressSpaceId, AllocationRange, GuestVirtualAddress, Machine, MemoryError, PAGE_SIZE,
 };
-use nixe_memory::{
+use crate::{
     PhysicalMapping,
     device_memory::{DeviceMapping, DeviceMemory, DeviceReservation},
 };
 use std::sync::{Arc, RwLock};
-const DEVICE_BITS: u32 = 34;
 const RESERVATION_ALIGNMENT: u64 = 64 * 1024;
 #[derive(Debug)]
 struct Heap {
@@ -25,22 +24,17 @@ struct Inner {
     heap: RwLock<Option<Heap>>,
 }
 #[derive(Clone, Debug)]
-pub struct MaxwellDeviceMemory(Arc<Inner>);
+pub struct DeviceHeapMemory(Arc<Inner>);
 #[derive(Debug)]
-pub struct MaxwellDeviceMapping {
+pub struct DeviceHeapMapping {
     // Drop pins before releasing the address reservation or session heap.
     pin: DeviceMapping,
-    memory: MaxwellDeviceMemory,
+    memory: DeviceHeapMemory,
     reservation_bytes: u64,
-    _reservation: Option<DeviceReservation>,
+    _reservation: Option<Arc<DeviceReservation>>,
 }
-impl MaxwellDeviceMemory {
-    pub fn new(machine: Machine) -> Self {
-        Self::from_device(DeviceMemory::new(machine, DEVICE_BITS))
-    }
-    /// NvCore session heap policy uses the GPU's existing SMMU, as in Eden.
-    pub fn from_device(device: DeviceMemory) -> Self {
-        assert_eq!(device.address_bits(), DEVICE_BITS);
+impl DeviceHeapMemory {
+    pub fn new(device: DeviceMemory) -> Self {
         Self(Arc::new(Inner {
             device,
             heap: RwLock::new(None),
@@ -96,7 +90,7 @@ impl MaxwellDeviceMemory {
         ranges: Arc<[AllocationRange]>,
         reservation_bytes: u64,
         cpu: Option<(AddressSpaceId, GuestVirtualAddress)>,
-    ) -> Result<Arc<MaxwellDeviceMapping>, MemoryError> {
+    ) -> Result<Arc<DeviceHeapMapping>, MemoryError> {
         let bytes = ranges.iter().map(|r| r.bytes()).sum::<u64>();
         if reservation_bytes < bytes || !reservation_bytes.is_multiple_of(PAGE_SIZE) {
             return Err(MemoryError::Invalid(
@@ -117,16 +111,16 @@ impl MaxwellDeviceMemory {
                 .map(|heap| heap.reservation.address() + address.get() - heap.cpu)
         });
         let reservation = if address.is_none() {
-            Some(self.device().reserve(
+            Some(Arc::new(self.device().reserve(
                 reservation_bytes.next_multiple_of(RESERVATION_ALIGNMENT),
                 RESERVATION_ALIGNMENT,
-            )?)
+            )?))
         } else {
             None
         };
         let address = address.unwrap_or_else(|| reservation.as_ref().unwrap().address());
         let pin = self.device().map(address, ranges, reservation.is_some())?;
-        Ok(Arc::new(MaxwellDeviceMapping {
+        Ok(Arc::new(DeviceHeapMapping {
             pin,
             memory: self.clone(),
             reservation_bytes,
@@ -134,24 +128,43 @@ impl MaxwellDeviceMemory {
         }))
     }
 }
-impl MaxwellDeviceMapping {
+impl DeviceHeapMapping {
     pub fn address(&self) -> u64 {
         self.pin.address()
     }
     pub fn reservation_bytes(&self) -> u64 {
         self.reservation_bytes
     }
-    pub(super) fn memory_machine(&self) -> nixe_memory::MachineId {
+    pub fn memory_machine(&self) -> crate::MachineId {
         self.memory.machine().identity()
     }
-    pub(super) fn read_mapping(
+    pub fn read_mapping(
         &self,
         address: u64,
         bytes: u64,
     ) -> Result<Arc<PhysicalMapping>, MemoryError> {
         self.memory.device().read_mapping(address, bytes)
     }
-    pub fn belongs_to(&self, memory: &MaxwellDeviceMemory) -> bool {
+    pub fn physical(&self) -> &Arc<PhysicalMapping> {
+        self.pin.physical()
+    }
+    /// Pin a surviving slice before retiring the old mapping. The address
+    /// reservation remains owned until every slice and GPU capture retires.
+    pub fn slice(&self, offset: u64, bytes: u64) -> Result<Arc<Self>, MemoryError> {
+        let ranges = crate::capture_subrange(self.pin.ranges(), offset, bytes)?;
+        let pin = self.memory.device().map(
+            self.address() + offset,
+            ranges.into(),
+            self._reservation.is_some(),
+        )?;
+        Ok(Arc::new(Self {
+            pin,
+            memory: self.memory.clone(),
+            reservation_bytes: bytes,
+            _reservation: self._reservation.clone(),
+        }))
+    }
+    pub fn belongs_to(&self, memory: &DeviceHeapMemory) -> bool {
         self.memory.device().same_device(memory.device())
     }
 }

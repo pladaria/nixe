@@ -83,7 +83,7 @@ impl Request {
     }
 
     pub fn thread_id(&self) -> u64 {
-        self.lifetime.client().thread().thread_id()
+        self.lifetime.client().thread().id().get()
     }
     pub fn process_id(&self) -> u64 {
         self.lifetime.client().process().process_id()

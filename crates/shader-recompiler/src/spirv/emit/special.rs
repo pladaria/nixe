@@ -194,6 +194,31 @@ impl EmitContext<'_> {
                 }
                 Id::NONE
             }
+            O::SubgroupBarrier => {
+                if !self.profile.supports_subgroup_stage(self.stage)
+                    || self.profile.max_subgroup_size != 32
+                {
+                    return Err(unsupported(
+                        "native warp barrier requires supported 32-lane host subgroups",
+                    ));
+                }
+                // WARPSYNC orders shared/global memory only among its warp,
+                // without making unrelated warps in the workgroup wait.
+                // https://docs.vulkan.org/spec/latest/chapters/shaders.html#shaders-scope-subgroup
+                self.builder
+                    .capability(spirv::Capability::GroupNonUniform)?;
+                let scope = self.const_u32(Scope::Subgroup as u32)?;
+                let semantics = self.const_u32(
+                    (M::ACQUIRE_RELEASE
+                        | M::WORKGROUP_MEMORY
+                        | M::UNIFORM_MEMORY
+                        | M::IMAGE_MEMORY)
+                        .bits(),
+                )?;
+                self.builder
+                    .instruction(Op::ControlBarrier, &[scope.0, scope.0, semantics.0])?;
+                Id::NONE
+            }
             O::Barrier | O::WorkgroupMemoryBarrier | O::DeviceMemoryBarrier => {
                 let scope = self.const_u32(if opcode == O::DeviceMemoryBarrier {
                     Scope::Device

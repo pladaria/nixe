@@ -9,6 +9,8 @@ const MAX_RETIRED: usize = 256;
 #[derive(Clone)]
 pub struct MultiRangeBinding {
     pub(crate) native: Arc<AllocatedBuffer>,
+    pub(super) offset: u64,
+    pub(super) size: u64,
     pub(super) sources: Arc<[BufferRange]>,
     pub(super) sparse: bool,
     _sources: Arc<[Arc<AllocatedBuffer>]>,
@@ -163,9 +165,7 @@ impl Residency<'_> {
                 .multi_range
                 .entries
                 .get(&key)
-                .is_some_and(|entry| {
-                    entry.geometry == geometry && entry.binding.native.size() == total
-                });
+                .is_some_and(|entry| entry.geometry == geometry && entry.binding.size == total);
             if !reusable {
                 if let Some(old) = self.runtime.multi_range.entries.remove(&key) {
                     self.retire_multi_range(old.binding)?;
@@ -173,21 +173,27 @@ impl Residency<'_> {
                 let native = self.create_sparse_multi_range(&sources, total)?;
                 let sparse = native.is_some();
                 if written && !sparse {
-                    return Err(VulkanError::InvalidResource(
-                        "writable discontinuous storage requires sparse binding and source offsets and sizes aligned to its block size",
-                    ));
+                    return Err(VulkanError::Compilation(format!(
+                        "writable discontinuous storage cannot bind sparse: key={key:#x} block={:#x} sparse_available={} total={total:#x} regions={:?}",
+                        self.runtime.multi_range.block_size, self.runtime.multi_range.use_sparse,
+                        sources.iter().map(|source| { let (memory, offset, memory_type) = source.native.memory_location();
+                            (source.range.offset, source.range.size, source.native.size(), memory.as_raw(), offset, memory_type) }).collect::<Vec<_>>()
+                    ).into()));
                 }
-                let native = match native {
+                let (native, offset) = match native {
                     Some(buffer) => buffer,
-                    None => {
-                        Arc::new(self.allocate_buffer(total, self.runtime.multi_range.usage, 0)?)
-                    }
+                    None => (
+                        Arc::new(self.allocate_buffer(total, self.runtime.multi_range.usage, 0)?),
+                        0,
+                    ),
                 };
                 self.runtime.multi_range.entries.insert(
                     key,
                     Entry {
                         binding: MultiRangeBinding {
                             native,
+                            offset,
+                            size: total,
                             sparse,
                             _sources: if sparse {
                                 sources
@@ -246,37 +252,65 @@ impl Residency<'_> {
         &self,
         sources: &[Source],
         total: u64,
-    ) -> Result<Option<Arc<AllocatedBuffer>>, VulkanError> {
+    ) -> Result<Option<(Arc<AllocatedBuffer>, u64)>, VulkanError> {
         let cache = &self.runtime.multi_range;
-        if !cache.use_sparse
-            || sources.iter().any(|source| {
-                let (_, offset, memory_type) = source.native.memory_location();
-                memory_type >= 32
-                    || cache.memory_types & (1 << memory_type) == 0
-                    || !(offset + source.range.offset).is_multiple_of(cache.block_size)
-                    || !source.range.size.is_multiple_of(cache.block_size)
-            })
-        {
+        if !cache.use_sparse {
             return Ok(None);
         }
-        let Ok(buffer) = AllocatedBuffer::sparse(&self.runtime.device.owner, total, cache.usage)
+        // Sparse binds cover complete host memory blocks. The descriptor can
+        // start inside the first block, while its range exposes only guest
+        // bytes. Padding must stay inside the retained source allocations;
+        // interior boundaries must still meet the host block alignment.
+        // https://docs.vulkan.org/spec/latest/chapters/sparsemem.html#sparsememory-resource-binding
+        let block = cache.block_size;
+        let (_, first_base, _) = sources[0].native.memory_location();
+        let padding = (first_base + sources[0].range.offset) % block;
+        let descriptor_alignment = self
+            .runtime
+            .device
+            .profile()
+            .limits
+            .min_storage_buffer_offset_alignment;
+        if !padding.is_multiple_of(descriptor_alignment) {
+            return Ok(None);
+        }
+        let mut at = 0u64;
+        let mut binds = Vec::with_capacity(sources.len());
+        for (index, source) in sources.iter().enumerate() {
+            let (memory, base, memory_type) = source.native.memory_location();
+            let prefix = if index == 0 { padding } else { 0 };
+            let Some(offset) = source.range.offset.checked_sub(prefix) else {
+                return Ok(None);
+            };
+            let bytes = source.range.size + prefix;
+            let bytes = if index + 1 == sources.len() {
+                bytes.next_multiple_of(block)
+            } else {
+                bytes
+            };
+            if memory == vk::DeviceMemory::null()
+                || memory_type >= 32
+                || cache.memory_types & (1 << memory_type) == 0
+                || !(base + offset).is_multiple_of(block)
+                || !bytes.is_multiple_of(block)
+                || offset + bytes > source.native.size()
+            {
+                return Ok(None);
+            }
+            binds.push(
+                vk::SparseMemoryBind::default()
+                    .resource_offset(at)
+                    .size(bytes)
+                    .memory(memory)
+                    .memory_offset(base + offset),
+            );
+            at += bytes;
+        }
+        debug_assert_eq!(at, (total + padding).next_multiple_of(block));
+        let Ok(buffer) = AllocatedBuffer::sparse(&self.runtime.device.owner, at, cache.usage)
         else {
             return Ok(None);
         };
-        let mut at = 0;
-        let binds: Vec<_> = sources
-            .iter()
-            .map(|source| {
-                let (memory, offset, _) = source.native.memory_location();
-                let bind = vk::SparseMemoryBind::default()
-                    .resource_offset(at)
-                    .size(source.range.size)
-                    .memory(memory)
-                    .memory_offset(offset + source.range.offset);
-                at += source.range.size;
-                bind
-            })
-            .collect();
         let buffers = [vk::SparseBufferMemoryBindInfo::default()
             .buffer(buffer.handle)
             .binds(&binds)];
@@ -298,7 +332,7 @@ impl Residency<'_> {
         };
         let result = match bound {
             Ok(()) => unsafe { owner.device.wait_for_fences(&[fence], true, u64::MAX) }
-                .map(|_| Some(Arc::new(buffer)))
+                .map(|_| Some((Arc::new(buffer), padding)))
                 .map_err(|error| VulkanError::vk("vkWaitForFences(multi-range)", error)),
             Err(vk::Result::ERROR_DEVICE_LOST) => Err(VulkanError::vk(
                 "vkQueueBindSparse",

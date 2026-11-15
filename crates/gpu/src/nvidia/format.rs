@@ -91,6 +91,15 @@ pub(super) fn decode_sampled_texture_format(
         (0x2f, [7, 7, 7, 7] | [7, 4, 4, 4] | [7, 2, 2, 2], _, false) => {
             Some(ImageFormat::Depth32Float)
         }
+        // Z32_X24S8 and R32B24G8 keep float depth in R and unsigned stencil
+        // in G. A depth-only view can route R and constants; stencil sampling
+        // needs its own aspect/type selection rather than aliasing G to depth.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/texture_cache/format_lookup_table.cpp#L165-L168
+        (0x30 | 0x05, [7, 4, 2, 2], mapping, false)
+            if mapping.iter().all(|c| matches!(c, 0 | 2 | 6 | 7)) =>
+        {
+            Some(ImageFormat::Depth32FloatStencil8Uint)
+        }
         // BC6H floating-point component types follow Maxwell's TIC table.
         // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/format_lookup_table.cpp#L190-L193
         (0x10, [7, 7, 7, 7], _, false) => Some(ImageFormat::Bc6hRgbSfloat),

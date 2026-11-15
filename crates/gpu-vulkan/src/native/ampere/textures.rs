@@ -274,3 +274,48 @@ impl NativeExecution<'_> {
         );
     }
 }
+
+impl NativeExecution<'_> {
+    pub(super) fn ampere_stage_texels(
+        &mut self,
+        memory: &mut impl RenderMemory,
+        r: &Registers,
+        constants: &[Option<(u64, u32)>],
+        resources: &crate::native::pipeline_resources::StageResources,
+        stage: usize,
+        linked: bool,
+    ) -> Result<(), VulkanError> {
+        for slot in &resources.texels {
+            let HandleSource::Direct { primary, secondary } = slot.handle else {
+                return Err(compilation(
+                    "native computed texel handles are not implemented",
+                ));
+            };
+            let mut handle = constant_word(&mut self.residency, memory, constants, primary)?;
+            if let Some(secondary) = secondary {
+                handle |= constant_word(&mut self.residency, memory, constants, secondary)?;
+            }
+            let (index, _) = indices(linked, handle);
+            let bytes = descriptor(
+                &mut self.residency,
+                memory,
+                r.address(0x1574, 0x1578),
+                r.get(0x157c),
+                index,
+            )?;
+            let (address, size, format, element_bytes) =
+                super::super::texels::interpretation(slot, index, bytes)?;
+            let source = if address == 0 {
+                None
+            } else {
+                Some(nixe_gpu::native::GuestBufferRange {
+                    address: self.ampere_address(memory, address, size)?,
+                    size,
+                })
+            };
+            self.residency
+                .bind_texel_buffer(stage, slot.slot, source, format, element_bytes);
+        }
+        self.residency.update_texel_buffers(stage, resources)
+    }
+}

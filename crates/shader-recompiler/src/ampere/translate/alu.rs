@@ -263,9 +263,10 @@ impl Visitor<'_> {
     pub(super) fn select(&mut self) -> Result<()> {
         let i = self.instruction;
         let floating = i.opcode() & 0x1ff == 8;
+        let uniform = matches!(i.opcode(), 0x287 | 0x887);
         if i.bits(64, 8) != 0
             || i.bits(74, 13) != 0
-            || i.bits(91, 1) != 0
+            || i.bits(91, 1) != u32::from(uniform)
             || (!floating && i.bits(72, 2) != 0)
         {
             return Err(unsupported("Native select modifiers"));
@@ -273,21 +274,27 @@ impl Visitor<'_> {
         let a = if floating {
             self.operand(0)?
         } else {
-            self.reg(i.bits(24, 8))?
+            self.register(i.bits(24, 8), uniform)?
         };
         let b = if floating {
             self.operand(1)?
+        } else if uniform {
+            if i.opcode() == 0x887 {
+                Value::U32(i.bits(32, 32))
+            } else {
+                self.ureg(i.bits(32, 32))?
+            }
         } else {
             self.raw_b()?
         };
         let condition = self
             .emit
-            .get_pred(Pred::new(i.bits(87, 3) as u8)?, i.bits(90, 1) != 0)?;
+            .get_pred(Self::predicate(i.bits(87, 3), uniform)?, i.bits(90, 1) != 0)?;
         let result = self.emit.select(condition, a, b)?;
         if floating {
             self.write_float(result)
         } else {
-            self.write(result)
+            self.write_register(result, uniform)
         }
     }
     pub(super) fn iadd3(&mut self) -> Result<()> {

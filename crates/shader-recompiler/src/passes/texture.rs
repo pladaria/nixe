@@ -238,22 +238,47 @@ pub fn texture_pass(
                 "Storage image has a separate sampler",
             ));
         }
-        let integer =
-            if a.handle_program.is_none() && (is_storage || flags.texture_type() != T::Buffer) {
-                if let Some((index, offset, integer)) = last_integer
-                    && index == a.index
-                    && offset == a.offset
-                {
-                    integer
-                } else {
-                    let handle = tracker.handle(&a)?;
-                    let integer = tracker.env.is_texture_pixel_format_integer(handle)?;
-                    last_integer = Some((a.index, a.offset, integer));
-                    integer
-                }
+        let integer = if a.handle_program.is_none() && flags.texture_type() != T::Buffer {
+            if let Some((index, offset, integer)) = last_integer
+                && index == a.index
+                && offset == a.offset
+            {
+                integer
             } else {
-                false
-            };
+                let handle = tracker.handle(&a)?;
+                let integer = tracker.env.is_texture_pixel_format_integer(handle)?;
+                last_integer = Some((a.index, a.offset, integer));
+                integer
+            }
+        } else {
+            false
+        };
+        let component_type = if flags.texture_type() == T::Buffer {
+            use crate::types::{ImageFormat as F, TextureComponentType as C};
+            match if is_storage {
+                flags.image_format()
+            } else {
+                F::Typeless
+            } {
+                F::Typeless if a.handle_program.is_none() => {
+                    let handle = tracker.handle(&a)?;
+                    tracker
+                        .env
+                        .read_texture_pixel_format(handle)?
+                        .component_type()
+                }
+                F::Typeless => {
+                    return Err(CompileError::new(
+                        FailureCategory::Unsupported,
+                        "Computed texel-buffer component type",
+                    ));
+                }
+                F::R8_SINT | F::R16_SINT => C::Sint,
+                _ => C::Uint,
+            }
+        } else {
+            crate::types::TextureComponentType::Float
+        };
         let index = if is_storage {
             let written = op != O::ImageRead;
             let read = op != O::ImageWrite;
@@ -264,7 +289,7 @@ pub fn texture_pass(
                         format: flags.image_format(),
                         is_written: written,
                         is_read: read,
-                        is_integer: integer,
+                        component_type,
                         cbuf_index: a.index,
                         cbuf_offset: a.offset,
                         count,
@@ -293,6 +318,7 @@ pub fn texture_pass(
             descriptors::texture_buffer(
                 &mut program.info,
                 TextureBufferDescriptor {
+                    component_type,
                     has_secondary: a.has_secondary,
                     cbuf_index: a.index,
                     cbuf_offset: a.offset,

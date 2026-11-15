@@ -520,7 +520,7 @@ pub(super) fn get_thread_id(
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 1) as u32;
     let thread_id = if handle == CURRENT_THREAD_HANDLE {
-        Some(context.thread().id().get())
+        Some(context.thread().object().thread_id())
     } else {
         context
             .process()
@@ -1015,7 +1015,7 @@ fn reacquire_condition_mutex(
             .lookup_as::<ThreadObject>(previous & !MUTEX_WAITERS)
             .filter(|thread| !thread.is_signalled())
         {
-            ConditionAcquire::Contended(GuestThreadId::new(owner.thread_id()))
+            ConditionAcquire::Contended(owner.id())
         } else {
             ConditionAcquire::InvalidOwner
         })

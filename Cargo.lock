@@ -1025,6 +1025,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "jiff-tzdb"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0980fca2cc272465bd60e82397607ba9f33add9e48defd77923301bbd03808f2"
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1467,9 +1473,9 @@ dependencies = [
  "bytemuck",
  "cc",
  "chrono",
- "chrono-tz",
  "flate2",
  "getrandom 0.4.3",
+ "jiff-tzdb",
  "log",
  "md-5",
  "nixe-applets",

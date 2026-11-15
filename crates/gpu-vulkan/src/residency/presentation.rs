@@ -12,22 +12,28 @@ impl Residency<'_> {
         format: vk::Format,
     ) -> Result<Option<ImageId>, VulkanError> {
         self.runtime.device.realize_deferred_clear()?;
-        // Select the most recently modified image at the exact framebuffer DAddr.
+        // Select the latest producer of this framebuffer's physical bytes.
+        // Display and rendering may address the same allocation through distinct
+        // SMMU aliases. Checking only the display DAddr would fall back to stale
+        // canonical RAM while the real pixels are still resident on the GPU.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L800-L861
-        let selected = self
-            .texture_cache
-            .image_pages
-            .get(&(source.address >> 20))
-            .into_iter()
-            .flatten()
-            .filter_map(|&id| {
+        let memory = &self.runtime.device_memory;
+        let mut addresses = smallvec::SmallVec::<[u64; 4]>::new();
+        addresses.push(source.address);
+        // A shared first byte locates possible bases without walking every page
+        // of the framebuffer. Verify the entire mapping before accepting an alias.
+        memory.apply_device_aliases(source.address, 1, |alias, _| addresses.push(alias));
+        let mut requested = None;
+        let mut selected = None;
+        for address in addresses {
+            let Some(images) = self.texture_cache.image_pages.get(&(address >> 20)) else {
+                continue;
+            };
+            for &id in images {
                 let entry = self.texture_cache.get(id);
                 if entry.decoded.is_some()
                     || !entry.initialized
-                    || entry
-                        .maps
-                        .first()
-                        .is_none_or(|&(base, _)| base != source.address)
+                    || entry.maps.first().is_none_or(|&(base, _)| base != address)
                     || entry.description.extent.width != source.extent[0]
                     || entry.description.extent.height < source.extent[1]
                     || entry.planes.len() != 1
@@ -36,13 +42,27 @@ impl Residency<'_> {
                     || (!source.allow_canonical_import
                         && self.require_resident_frame(id, source.extent).is_err())
                 {
-                    return None;
+                    continue;
                 }
-                Some((id, entry.modification_tick))
-            })
-            .max_by_key(|&(_, tick)| tick)
-            .map(|(id, _)| id);
-        if let Some(id) = selected {
+                if address != source.address {
+                    let requested = match &requested {
+                        Some(mapping) => mapping,
+                        None => requested.insert(memory.read_mapping(source.address, source.size)?),
+                    };
+                    if memory
+                        .read_mapping(address, source.size)?
+                        .containing_offset(requested, 0..source.size)
+                        != Some(0)
+                    {
+                        continue;
+                    }
+                }
+                if selected.is_none_or(|(_, tick)| tick < entry.modification_tick) {
+                    selected = Some((id, entry.modification_tick));
+                }
+            }
+        }
+        if let Some((id, _)) = selected {
             self.touch(Resource::Image(id));
             self.runtime.statistics.cache_hits += 1;
             return Ok(Some(id));

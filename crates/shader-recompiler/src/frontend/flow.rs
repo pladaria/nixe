@@ -64,6 +64,13 @@ pub struct IndirectBranch {
     pub address: ProgramOffset,
 }
 
+/// Keep register files distinct through structuring and SSA construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchRegister {
+    General(Reg),
+    Uniform(u8),
+}
+
 #[derive(Clone, Debug)]
 pub struct FlowBlock<L, S> {
     pub begin: FlowLocation<L>,
@@ -79,7 +86,7 @@ pub struct FlowBlock<L, S> {
     pub call_link: Option<u32>,
     /// A software return must be proven to recover the caller's link value.
     pub return_register: Option<Reg>,
-    pub branch_reg: Reg,
+    pub branch_reg: BranchRegister,
     pub branch_offset: i32,
     pub indirect_branches: Vec<IndirectBranch>,
 }
@@ -98,7 +105,7 @@ impl<L: Address, S> FlowBlock<L, S> {
             return_block: None,
             call_link: None,
             return_register: None,
-            branch_reg: Reg(0),
+            branch_reg: BranchRegister::General(Reg(0)),
             branch_offset: 0,
             indirect_branches: Vec::new(),
         }

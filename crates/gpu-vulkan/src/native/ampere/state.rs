@@ -135,7 +135,7 @@ pub(super) fn prepare(
 ) -> Result<(GraphicsParameters, GraphicsRuntimeState), VulkanError> {
     // Reject enabled effects before drawing until their complete contracts are
     // supported. Disabled state does not require interpreting dormant operands.
-    for method in [0x153c, 0x194c, 0x197c, 0x19bc, 0x19c4, 0x1148, 0x12ec] {
+    for method in [0x153c, 0x194c, 0x197c, 0x19c4, 0x1148, 0x12ec] {
         if r.get(method) != 0 {
             return Err(fail(r, method, "native raster effect is not implemented"));
         }
@@ -184,6 +184,7 @@ pub(super) fn prepare(
     )?;
     state.depth_test = boolean(r, 0x1538)? && boolean(r, 0x12cc)?;
     state.depth_write = boolean(r, 0x1538)? && boolean(r, 0x12e8)?;
+    state.depth_bounds = boolean(r, 0x19bc)?;
     if state.depth_test {
         state.depth_compare = compare(r, 0x130c)?;
     }
@@ -306,6 +307,9 @@ pub(super) fn update_dynamic(
         width: size[0],
         height: size[1],
     };
+    if params.state.depth_bounds {
+        params.depth_bounds = [r.get(0xf9c), r.get(0xfa0)].map(f32::from_bits);
+    }
     if params.state.stencil_test {
         params.stencil_reference = [r.get(0x1394); 2];
         params.stencil_compare_mask = [r.get(0x1398); 2];

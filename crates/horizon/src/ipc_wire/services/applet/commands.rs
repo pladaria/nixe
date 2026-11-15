@@ -168,6 +168,7 @@ command_enum!(AudioControllerCommand {
 
 command_enum!(ApplicationFunctionsCommand {
     20 => EnsureSaveData,
+    26 => GetSaveDataSize,
     1 => PopLaunchParameter,
     21 => GetDesiredLanguage,
     22 => SetTerminateResult,
@@ -178,6 +179,7 @@ command_enum!(ApplicationFunctionsCommand {
     110 => QueryApplicationPlayStatistics,
     111 => QueryApplicationPlayStatisticsByUid,
     130 => GetGpuErrorDetectedSystemEvent,
+    141 => TryPopFromFriendInvitationStorageChannel,
     210 => GetOperationModeRefreshEvent,
     320 => Query320,
     321 => Query321,

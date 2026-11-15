@@ -80,7 +80,7 @@ impl RunnableProcess {
             }
         }
     }
-    fn capture_exit_stack_frames(
+    pub(crate) fn capture_exit_stack_frames(
         &self,
         thread_id: nixe_scheduler::GuestThreadId,
         context: &nixe_cpu::state::RegisterContext,

@@ -3,16 +3,24 @@
 use super::instruction::{Instruction, unsupported};
 use crate::{
     Environment, Result,
+    frontend::flow::BranchRegister,
     ir::{Condition, Reg},
     types::{ByteOffset, CbufIndex, ProgramOffset},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct Table {
-    pub register: Reg,
+    pub register: BranchRegister,
     pub base: i32,
     pub targets: Vec<ProgramOffset>,
-    definitions: [ProgramOffset; 3],
+    definitions: Vec<ProgramOffset>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Register {
+    General(u32),
+    Uniform(u32),
+    UniformPredicate(u32),
 }
 
 /// Instruction-level edges deliberately exclude the synthetic IR branches used
@@ -46,7 +54,7 @@ impl<'a> Definitions<'a> {
                 }
                 fallthrough =
                     guard != Condition::always(true) || condition != Condition::always(true);
-            } else if i.opcode() == 0x949 {
+            } else if matches!(i.opcode(), 0x949 | 0x958) {
                 if let Some(table) = tables.get(&pc) {
                     for &target in &table.targets {
                         predecessors.entry(target).or_default().push(pc);
@@ -77,9 +85,12 @@ impl<'a> Definitions<'a> {
     fn definition(
         &self,
         end: ProgramOffset,
-        register: u32,
+        register: Register,
     ) -> Result<(ProgramOffset, Instruction)> {
-        if register == 255 {
+        if matches!(
+            register,
+            Register::General(255) | Register::Uniform(63) | Register::UniformPredicate(7)
+        ) {
             return Err(unsupported(
                 "Native branch-table source is the zero register",
             ));
@@ -93,7 +104,7 @@ impl<'a> Definitions<'a> {
             }
             if pc == self.entry || !self.predecessors.contains_key(&pc) {
                 return Err(unsupported(format!(
-                    "Native branch register R{register} has no definition on a path to {:#x}",
+                    "Native branch register {register:?} has no definition on a path to {:#x}",
                     pc.0
                 )));
             }
@@ -112,7 +123,7 @@ impl<'a> Definitions<'a> {
                     }
                     if found.is_some_and(|(at, _)| at != previous) {
                         return Err(unsupported(format!(
-                            "Native branch register R{register} has conflicting reaching definitions"
+                            "Native branch register {register:?} has conflicting reaching definitions"
                         )));
                     }
                     found = Some((previous, i));
@@ -123,13 +134,51 @@ impl<'a> Definitions<'a> {
         }
         found.ok_or_else(|| {
             unsupported(format!(
-                "Native branch register R{register} has no reaching definition"
+                "Native branch register {register:?} has no reaching definition"
             ))
         })
     }
 }
 
-fn writes_register(i: Instruction, pc: ProgramOffset, register: u32) -> Result<bool> {
+fn writes_register(i: Instruction, pc: ProgramOffset, register: Register) -> Result<bool> {
+    let uniform_words = match i.opcode() {
+        0xc82 | 0x882 | 0x290 | 0x890 | 0x292 | 0x892 | 0x2a4 | 0x4a4 | 0x8a4 | 0x899 | 0x299
+        | 0x499 | 0x287 | 0x887 | 0x2bd | 0x2be | 0x2bf | 0x3c2 | 0x3c4 | 0x9c3 | 0x886 => 1,
+        0x2a5 => 2,
+        0xab9 | 0xabb => {
+            if i.bits(73, 3) == 5 {
+                2
+            } else {
+                1
+            }
+        }
+        0x28c | 0x88c | 0x958 => 0,
+        _ => {
+            // Classify recognized general instructions below as well: unknown
+            // opcodes must never be silently crossed in any register namespace.
+            let words = general_words(i, pc)?;
+            return Ok(match register {
+                Register::General(register) => {
+                    (i.bits(16, 8)..i.bits(16, 8) + words).contains(&register)
+                }
+                _ => false,
+            });
+        }
+    };
+    Ok(match register {
+        Register::General(_) => false,
+        Register::Uniform(register) => {
+            (i.bits(16, 8)..i.bits(16, 8) + uniform_words).contains(&register)
+        }
+        Register::UniformPredicate(register) => match i.opcode() {
+            0x28c | 0x88c | 0x290 | 0x890 => [i.bits(81, 3), i.bits(84, 3)].contains(&register),
+            0x292 | 0x892 | 0x886 => i.bits(81, 3) == register,
+            _ => false,
+        },
+    })
+}
+
+fn general_words(i: Instruction, pc: ProgramOffset) -> Result<u32> {
     // Unknown writers cannot be crossed: an unrecognised instruction may
     // overwrite either word of the value whose definition is being tracked.
     let words = match i.opcode() {
@@ -153,45 +202,90 @@ fn writes_register(i: Instruction, pc: ProgramOffset, register: u32) -> Result<b
         0x941 | 0x942 | 0x945 => 0,
         _ => {
             return Err(unsupported(format!(
-                "Cannot prove native branch register R{register} across {:#x} at {:#x}",
+                "Cannot prove native branch register across {:#x} at {:#x}",
                 i.opcode(),
                 pc.0
             )));
         }
     };
-    Ok((i.bits(16, 8)..i.bits(16, 8) + words).contains(&register))
+    Ok(words)
 }
 
 fn definitions(
     flow: &Definitions<'_>,
     pc: ProgramOffset,
     branch: Instruction,
-) -> Result<[(ProgramOffset, Instruction); 3]> {
-    if branch.condition()? != Condition::always(true) || branch.bits(82, 14) != 0xe0 {
+) -> Result<(Vec<ProgramOffset>, Instruction, u32)> {
+    let uniform = branch.opcode() == 0x958;
+    if branch.condition()? != Condition::always(true)
+        || branch.bits(82, 14) != if uniform { 0x2e0 } else { 0xe0 }
+    {
         return Err(unsupported(
             "Native computed branch predicate/convergence mode",
         ));
     }
+    let register_file = if uniform {
+        Register::Uniform
+    } else {
+        Register::General
+    };
     let register = branch.bits(24, 8);
-    let (load_pc, load) = flow.definition(pc, register)?;
-    if load.opcode() != 0xb82 || load.bits(64, 32) != 0x800 || load.bits(16, 8) != register {
+    let (load_pc, load) = flow.definition(pc, register_file(register))?;
+    if load.opcode() != if uniform { 0xabb } else { 0xb82 }
+        || load.bits(64, 32) != if uniform { 0x08000800 } else { 0x800 }
+        || load.bits(16, 8) != register
+    {
         return Err(unsupported(
             "Native branch requires a 32-bit direct constant table",
         ));
     }
-    let (shift_pc, shift) = flow.definition(load_pc, load.bits(24, 8))?;
-    if shift.opcode() != 0x819 || shift.bits(32, 32) != 2 || shift.bits(64, 32) != 0x6ff {
+    let (shift_pc, shift) = flow.definition(load_pc, register_file(load.bits(24, 8)))?;
+    if shift.opcode() != if uniform { 0x899 } else { 0x819 }
+        || shift.bits(32, 32) != 2
+        || shift.bits(64, 32) != if uniform { 0x0800063f } else { 0x6ff }
+    {
         return Err(unsupported(
             "Native branch-table index is not a word offset",
         ));
     }
-    let (limit_pc, limit) = flow.definition(shift_pc, shift.bits(24, 8))?;
-    if limit.opcode() != 0x817 || limit.bits(64, 32) != 0x0380_0000 {
+    let (limit_pc, limit) = flow.definition(shift_pc, register_file(shift.bits(24, 8)))?;
+    let mut definitions = vec![load_pc, shift_pc, limit_pc];
+    if uniform {
+        // UISETP.LT.U32 + USEL computes min(index, bound). Prove the
+        // predicate and value through every reaching path, including writes
+        // between the comparison and select; adjacency is not assumed.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h#L1975-L2015
+        let predicate = limit.bits(87, 3);
+        if limit.opcode() != 0x887 || limit.bits(64, 32) != 0x08000000 | (predicate << 23) {
+            return Err(unsupported(
+                "Native uniform branch index lacks an unsigned select bound",
+            ));
+        }
+        let (compare_pc, compare) =
+            flow.definition(limit_pc, Register::UniformPredicate(predicate))?;
+        let source = Register::Uniform(limit.bits(24, 8));
+        if compare.opcode() != 0x88c
+            || compare.bits(24, 8) != limit.bits(24, 8)
+            || compare.bits(32, 32) != limit.bits(32, 32)
+            || compare.bits(64, 32) != 0x0bf01070 | (predicate << 17)
+        {
+            return Err(unsupported(
+                "Native uniform branch bound is not an unsigned minimum",
+            ));
+        }
+        let (source_pc, _) = flow.definition(compare_pc, source)?;
+        if flow.definition(limit_pc, source)?.0 != source_pc {
+            return Err(unsupported(
+                "Native uniform branch index changed after its comparison",
+            ));
+        }
+        definitions.extend([compare_pc, source_pc]);
+    } else if limit.opcode() != 0x817 || limit.bits(64, 32) != 0x0380_0000 {
         return Err(unsupported(
             "Native branch-table index lacks an unsigned minimum bound",
         ));
     }
-    Ok([(load_pc, load), (shift_pc, shift), (limit_pc, limit)])
+    Ok((definitions, load, limit.bits(32, 32)))
 }
 
 pub(super) fn resolve(
@@ -200,10 +294,8 @@ pub(super) fn resolve(
     pc: ProgramOffset,
     branch: Instruction,
 ) -> Result<Table> {
-    let definitions = definitions(flow, pc, branch)?;
-    let [(_, load), _, (_, limit)] = definitions;
-    let count = limit
-        .bits(32, 32)
+    let (definitions, load, bound) = definitions(flow, pc, branch)?;
+    let count = bound
         .checked_add(1)
         .filter(|&count| count <= 65536 / 4)
         .ok_or_else(|| unsupported("Native branch table exceeds constant-buffer size"))?;
@@ -226,10 +318,14 @@ pub(super) fn resolve(
     targets.sort_unstable();
     targets.dedup();
     Ok(Table {
-        register: Reg(branch.bits(24, 8) as u8),
+        register: if branch.opcode() == 0x958 {
+            BranchRegister::Uniform(branch.bits(24, 8) as u8)
+        } else {
+            BranchRegister::General(Reg(branch.bits(24, 8) as u8))
+        },
         base: base as i32,
         targets,
-        definitions: definitions.map(|(pc, _)| pc),
+        definitions,
     })
 }
 
@@ -242,7 +338,7 @@ impl Table {
     ) -> Result<()> {
         // Newly discovered indirect edges may introduce another predecessor.
         // Revalidate against the complete function before accepting its graph.
-        if definitions(flow, pc, branch)?.map(|(pc, _)| pc) != self.definitions {
+        if definitions(flow, pc, branch)?.0 != self.definitions {
             return Err(unsupported(
                 "Native branch-table definition changed during flow discovery",
             ));

@@ -107,45 +107,59 @@ impl EmitContext<'_> {
             format(pixel_format),
         )
     }
+    fn image_variable(&mut self, image: Id, count: u32) -> Result<(Id, Id)> {
+        let pointer = self.builder.type_pointer(S::UniformConstant, image)?;
+        let declaration_pointer = if count > 1 {
+            let count = self.const_u32(count)?;
+            let array = self.builder.type_array(image, count)?;
+            self.builder.type_pointer(S::UniformConstant, array)?
+        } else {
+            pointer
+        };
+        let id = self
+            .builder
+            .variable(declaration_pointer, S::UniformConstant, None)?;
+        Ok((id, pointer))
+    }
+    fn texel_scalar_type(&self, component: crate::types::TextureComponentType) -> Id {
+        use crate::types::TextureComponentType as C;
+        match component {
+            C::Float => self.types.f32[0],
+            C::Uint => self.types.u32[0],
+            C::Sint => self.types.s32[0],
+        }
+    }
     pub(super) fn define_texture_buffers(
         &mut self,
         info: &ShaderInfo,
         binding: &mut u32,
     ) -> Result<()> {
-        if info.texture_buffer_descriptors.is_empty() {
-            return Ok(());
-        }
-        let image = self.builder.type_image(
-            self.types.f32[0],
-            Dim::DimBuffer,
-            false,
-            false,
-            false,
-            1,
-            F::Unknown,
-        )?;
-        self.objects.image_buffer_type = image;
-        let pointer = self.builder.type_pointer(S::UniformConstant, image)?;
+        use crate::types::TextureComponentType as C;
         for (index, d) in info.texture_buffer_descriptors.iter().enumerate() {
-            if d.count != 1 {
-                return Err(CompileError::new(
-                    FailureCategory::Unsupported,
-                    "Array of texture buffers",
-                ));
-            }
-            let id = self.builder.variable(pointer, S::UniformConstant, None)?;
+            let image = self.builder.type_image(
+                self.texel_scalar_type(d.component_type),
+                Dim::DimBuffer,
+                false,
+                false,
+                false,
+                1,
+                F::Unknown,
+            )?;
+            let (id, pointer) = self.image_variable(image, d.count)?;
             self.bind(id, *binding)?;
             self.texture_buffers.push(ImageDefinition {
                 id,
                 image_type: image,
                 pointer_type: pointer,
                 count: d.count,
+                is_integer: d.component_type != C::Float,
+                is_signed: d.component_type == C::Sint,
                 ..Default::default()
             });
             self.resource_bindings.push(ResourceBinding {
                 set: DescriptorSet(0),
                 binding: DescriptorBinding(*binding),
-                count: 1,
+                count: d.count.max(1),
                 resource_index: ResourceIndex(index as u32),
                 source: ResourceSource::TextureBuffer(d.clone()),
                 access: ResourceAccess::Read,
@@ -159,14 +173,10 @@ impl EmitContext<'_> {
         info: &ShaderInfo,
         binding: &mut u32,
     ) -> Result<()> {
+        use crate::types::TextureComponentType as C;
         for (index, d) in info.image_buffer_descriptors.iter().enumerate() {
-            let sampled = if d.is_integer {
-                self.types.u32[0]
-            } else {
-                self.types.f32[0]
-            };
             let image = self.builder.type_image(
-                sampled,
+                self.texel_scalar_type(d.component_type),
                 Dim::DimBuffer,
                 false,
                 false,
@@ -174,21 +184,21 @@ impl EmitContext<'_> {
                 2,
                 format(d.format),
             )?;
-            let pointer = self.builder.type_pointer(S::UniformConstant, image)?;
-            let id = self.builder.variable(pointer, S::UniformConstant, None)?;
+            let (id, pointer) = self.image_variable(image, d.count)?;
             self.bind(id, *binding)?;
             self.image_buffers.push(ImageDefinition {
                 id,
                 image_type: image,
                 pointer_type: pointer,
                 count: d.count,
-                is_integer: d.is_integer,
+                is_integer: d.component_type != C::Float,
+                is_signed: d.component_type == C::Sint,
                 ..Default::default()
             });
             self.resource_bindings.push(ResourceBinding {
                 set: DescriptorSet(0),
                 binding: DescriptorBinding(*binding),
-                count: 1,
+                count: d.count.max(1),
                 resource_index: ResourceIndex(index as u32),
                 source: ResourceSource::ImageBuffer(d.clone()),
                 access: access(d.is_read, d.is_written),
@@ -231,6 +241,7 @@ impl EmitContext<'_> {
                 count: d.count,
                 is_integer: d.is_integer,
                 is_multisample: d.is_multisample,
+                is_signed: false,
             });
             self.resource_bindings.push(ResourceBinding {
                 set: DescriptorSet(0),
@@ -256,8 +267,7 @@ impl EmitContext<'_> {
     ) -> Result<()> {
         for (index, d) in info.image_descriptors.iter().enumerate() {
             let image = self.storage_image_type(d.texture_type, d.is_integer, d.format)?;
-            let pointer = self.builder.type_pointer(S::UniformConstant, image)?;
-            let id = self.builder.variable(pointer, S::UniformConstant, None)?;
+            let (id, pointer) = self.image_variable(image, d.count)?;
             self.bind(id, *binding)?;
             self.images.push(ImageDefinition {
                 id,
@@ -270,7 +280,7 @@ impl EmitContext<'_> {
             self.resource_bindings.push(ResourceBinding {
                 set: DescriptorSet(0),
                 binding: DescriptorBinding(*binding),
-                count: 1,
+                count: d.count.max(1),
                 resource_index: ResourceIndex(index as u32),
                 source: ResourceSource::Image(d.clone()),
                 access: access(d.is_read, d.is_written),

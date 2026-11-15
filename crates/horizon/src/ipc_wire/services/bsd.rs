@@ -1,15 +1,27 @@
 use super::prelude::*;
 
 use crate::bsd::{BsdClientConfig, BsdMonitoringError, BsdRegistrationError, BsdSession};
+mod local;
 
 const REGISTER_CLIENT_PAYLOAD_SIZE: usize = 0x30;
 const START_MONITORING_PAYLOAD_SIZE: usize = 0x08;
 const BSD_ERRNO_SUCCESS: u32 = 0;
+// Despite the FreeBSD stack, Horizon exposes Linux errno numbers.
+// https://switchbrew.org/wiki/Sockets_services#bsd:u,_bsd:s,_bsd:a
+const BSD_ERRNO_NETDOWN: u32 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BsdCommand {
     RegisterClient,
     StartMonitoring,
+    RegisterClientNative,
+    Socket,
+    EventFd,
+    Poll,
+    Fcntl,
+    Write,
+    Read,
+    Close,
 }
 
 impl BsdCommand {
@@ -17,12 +29,20 @@ impl BsdCommand {
         match command_id {
             0 => Some(Self::RegisterClient),
             1 => Some(Self::StartMonitoring),
+            36 => Some(Self::RegisterClientNative),
+            2 | 3 => Some(Self::Socket),
+            6 => Some(Self::Poll),
+            20 => Some(Self::Fcntl),
+            24 => Some(Self::Write),
+            25 => Some(Self::Read),
+            26 => Some(Self::Close),
+            31 => Some(Self::EventFd),
             _ => None,
         }
     }
 }
 
-pub(in crate::ipc_wire) fn dispatch_bsd(
+pub(in crate::ipc_wire) async fn dispatch_bsd(
     process: &mut Request,
     session: &BsdSession,
     request: CmifRequest<'_>,
@@ -63,6 +83,54 @@ pub(in crate::ipc_wire) fn dispatch_bsd(
     };
 
     match command {
+        BsdCommand::EventFd
+        | BsdCommand::Poll
+        | BsdCommand::Fcntl
+        | BsdCommand::Read
+        | BsdCommand::Write
+        | BsdCommand::Close => local::dispatch(process, session, request, hipc, command).await,
+        BsdCommand::Socket => {
+            // Socket / SocketExempt(domain, type, protocol) return an s32 fd
+            // and a u32 errno, independently of the successful IPC transport.
+            // https://switchbrew.org/wiki/Sockets_services#Socket
+            if !request.has_payload_size(12) || has_ipc_descriptors(hipc) {
+                return invalid_header(session, request.token);
+            }
+            // @SIMPLIFICATION: networking is deliberately offline. Reject
+            // socket creation with ENETDOWN; never allocate host sockets or
+            // fabricate a descriptor that later operations could use.
+            let mut result = [0; 8];
+            result[..4].copy_from_slice(&(-1_i32).to_le_bytes());
+            result[4..].copy_from_slice(&BSD_ERRNO_NETDOWN.to_le_bytes());
+            bsd_response(session, request.token, HorizonIpcResult::SUCCESS, &result)
+        }
+        // Switch 2 registration carries the SDK version and PID, without a
+        // guest transfer-memory work buffer. On Switch 1 this command is a no-op.
+        // https://switchbrew.org/wiki/Sockets_services#Cmd36
+        BsdCommand::RegisterClientNative => {
+            let Some(version) = request_u32(request.data, 0) else {
+                return invalid_header(session, request.token);
+            };
+            if !request.has_payload_size(16)
+                || request_u64(request.data, 8) != Some(0)
+                || hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return invalid_header(session, request.token);
+            }
+            if process.cpu().platform() == nixe_cpu::platform::TargetPlatform::Switch2 {
+                session
+                    .system()
+                    .register_native_client(process.process_id(), version)
+                    .map_err(|error| registration_error(request.command_id, error))?;
+            }
+            bsd_response(
+                session,
+                request.token,
+                HorizonIpcResult::SUCCESS,
+                &BSD_ERRNO_SUCCESS.to_le_bytes(),
+            )
+        }
         // The socket SDK opens bsd:u twice, then registers on its command-session
         // pool with the caller PID and a copied transfer-memory handle. Retaining
         // the copied object mirrors the service's ownership after the client

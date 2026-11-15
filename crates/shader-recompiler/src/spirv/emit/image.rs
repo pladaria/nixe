@@ -98,7 +98,11 @@ impl EmitContext<'_> {
         let ty = if dref {
             f
         } else if integer {
-            u4
+            if self.image_definition(info, storage)?.is_signed {
+                self.types.s32[3]
+            } else {
+                u4
+            }
         } else {
             f4
         };
@@ -217,8 +221,8 @@ impl EmitContext<'_> {
             O::ImageRead => Op::ImageRead,
             O::ImageWrite => {
                 let mut color = self.def(ir, ir.inst(id)?.arg(2)?)?;
-                if !integer {
-                    color = self.op(Op::Bitcast, f4, &[color])?;
+                if ty != u4 {
+                    color = self.op(Op::Bitcast, ty, &[color])?;
                 }
                 args.push(color.0);
                 self.builder.instruction(Op::ImageWrite, &args)?;
@@ -236,7 +240,7 @@ impl EmitContext<'_> {
             let scale = self.const_f32(0.98)?;
             result = self.op(Op::VectorTimesScalar, f4, &[result, scale])?;
         }
-        Ok(Some(if opcode == O::ImageRead && !integer {
+        Ok(Some(if opcode == O::ImageRead && ty != u4 {
             self.op(Op::Bitcast, u4, &[result])?
         } else if !storage && !dref && integer {
             self.op(Op::Bitcast, f4, &[result])?
@@ -257,18 +261,18 @@ impl EmitContext<'_> {
             O::ImageAtomicExchange32 => Op::AtomicExchange,
             _ => return Ok(None),
         };
-        if ir.resolve(ir.inst(id)?.arg(0)?)? != Value::U32(0) {
-            return Err(unsupported("Image atomic indexing requires immediate zero"));
-        }
         let info = TextureInstInfo(ir.inst(id)?.flags);
-        let def = self.image_definition(info, true)?;
+        let (_, image, marked) = self.image_pointer(ir, info, ir.inst(id)?.arg(0)?, true)?;
         let coords = self.def(ir, ir.inst(id)?.arg(1)?)?;
         let value = self.def(ir, ir.inst(id)?.arg(2)?)?;
         let pointer = self.op(
             Op::ImageTexelPointer,
             self.objects.image_u32,
-            &[def.id, coords, self.constants.u32_zero],
+            &[image, coords, self.constants.u32_zero],
         )?;
+        if marked {
+            self.nonuniform(pointer)?;
+        }
         let scope = self.const_u32(Scope::Device as u32)?;
         Ok(Some(self.op(
             atomic,

@@ -287,7 +287,7 @@ impl NativeExecution<'_> {
             }
             table.entries[index as usize] = Some(SamplerDescriptor {
                 description,
-                variants: [None; 4],
+                variants: [None; 8],
                 bytes,
             });
         }
@@ -300,10 +300,9 @@ impl NativeExecution<'_> {
         view: Option<ImageViewId>,
         depth: bool,
     ) -> Result<vk::Sampler, VulkanError> {
-        // Sampler::MakeKey / HandleFor in Eden drops min/max reduction for
-        // views whose native format cannot filter it. Keep both variants in
-        // the current TSC slot, and retain native samplers in SamplerCache.
-        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+        // Select view-dependent sampler variants in the current TSC slot;
+        // the native cache retains each sampler for its complete GPU lifetime.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L4813-L4921
         let bank = usize::from(compute);
         let entry = self
             .residency
@@ -321,7 +320,16 @@ impl NativeExecution<'_> {
                     !self.residency.texture_cache.views[view].supports_minmax_filter
                 }));
         let drop_compare = description.compare.is_some() && !depth;
-        let variant = usize::from(drop_reduction) | (usize::from(drop_compare) << 1);
+        let force_nearest = view.is_some_and(|view| {
+            super::images::color_kind(self.residency.texture_cache.views[view].description.format)
+                != 0
+        }) && (description.min_filter == nixe_gpu::FilterMode::Linear
+            || description.mag_filter == nixe_gpu::FilterMode::Linear
+            || description.mip_filter == nixe_gpu::FilterMode::Linear
+            || description.max_anisotropy > 1.);
+        let variant = usize::from(drop_reduction)
+            | (usize::from(drop_compare) << 1)
+            | (usize::from(force_nearest) << 2);
         if let Some(native) = entry.variants[variant] {
             return Ok(native);
         }
@@ -331,7 +339,9 @@ impl NativeExecution<'_> {
         if drop_compare {
             description.compare = None;
         }
-        let native = self.guest_sampler(&description)?;
+        // The original magnification mode still defines legacy Clamp's
+        // border behavior; override native filtering without changing it.
+        let native = self.guest_sampler(&description, force_nearest)?;
         self.residency
             .texture_cache
             .bindings

@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub struct PresentationImageRequest {
     pub crop: nixe_gpu::FrameCrop,
     pub transform: nixe_gpu::FrameTransform,
-    pub mapping: Arc<crate::MaxwellDeviceMapping>,
+    pub mapping: Arc<nixe_memory::DeviceHeapMapping>,
     pub offset: u64,
     pub size: u64,
     pub width: u32,

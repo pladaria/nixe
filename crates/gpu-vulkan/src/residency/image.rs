@@ -482,27 +482,13 @@ impl Residency<'_> {
         view: ImageViewId,
         format: nixe_shader_recompiler::types::ImageFormat,
     ) -> Result<ImageViewId, VulkanError> {
-        use nixe_shader_recompiler::types::ImageFormat as F;
         let parent = &self.texture_cache.views[view];
         if let Some(view) = parent.storage_views[format as usize] {
             return Ok(view);
         }
         let image = parent.image;
         let mut description = parent.description;
-        description.format = match format {
-            F::Typeless => match description.format {
-                vk::Format::R8G8B8A8_SRGB => vk::Format::R8G8B8A8_UNORM,
-                vk::Format::B8G8R8A8_SRGB => vk::Format::B8G8R8A8_UNORM,
-                value => value,
-            },
-            F::R8_UINT => vk::Format::R8_UINT,
-            F::R8_SINT => vk::Format::R8_SINT,
-            F::R16_UINT => vk::Format::R16_UINT,
-            F::R16_SINT => vk::Format::R16_SINT,
-            F::R32_UINT => vk::Format::R32_UINT,
-            F::R32G32_UINT => vk::Format::R32G32_UINT,
-            F::R32G32B32A32_UINT => vk::Format::R32G32B32A32_UINT,
-        };
+        description.format = crate::native::images::storage_format(format, description.format);
         if description.aspects != vk::ImageAspectFlags::COLOR
             || !self
                 .texture_cache

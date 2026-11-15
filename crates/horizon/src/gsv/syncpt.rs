@@ -17,7 +17,7 @@ use std::{
 #[derive(Debug)]
 pub(crate) struct SyncptMirror {
     pub counter_page: Arc<TransferMemoryObject>,
-    pub device_counter_page: Arc<super::gpu::PhysicalMap>,
+    pub device_counter_page: Arc<nixe_memory::DeviceHeapMapping>,
     pub notification: WritableEventObject,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -96,15 +96,16 @@ impl SyncptMirror {
         write(&machine, &ro, 0, initial)
             .await
             .map_err(|error| error.to_string().into_boxed_str())?;
-        let device_counter_page = Arc::new(
-            super::gpu::PhysicalMap::new(
-                device_memory,
+        let device_counter_page = nixe_memory::DeviceHeapMemory::new(device_memory.clone())
+            .map(
                 ro.ranges()
                     .capture(0, 0x2000)
-                    .map_err(|e| e.to_string().into_boxed_str())?,
+                    .map_err(|e| e.to_string().into_boxed_str())?
+                    .into(),
+                0x2000,
+                None,
             )
-            .map_err(|e| e.to_string().into_boxed_str())?,
-        );
+            .map_err(|e| e.to_string().into_boxed_str())?;
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let process = Arc::downgrade(owner);

@@ -49,6 +49,27 @@ pub(super) async fn dispatch_control(
     };
 
     match (control_command, target) {
+        (
+            CmifControlCommand::ConvertCurrentObjectToDomain,
+            HorizonIpcObject::AudioMixer(session),
+        ) => {
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
+        }
+        (
+            CmifControlCommand::ConvertCurrentObjectToDomain,
+            HorizonIpcObject::AudioCodec(session),
+        ) => {
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
+        }
+        (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Chat(session)) => {
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
+        }
+        (
+            CmifControlCommand::ConvertCurrentObjectToDomain,
+            HorizonIpcObject::NativeAudioDevice(session),
+        ) => {
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
+        }
         (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Nim(session)) => {
             write_domain_conversion(process, request.token, session.domain.convert()).await?;
         }
@@ -263,15 +284,19 @@ pub(super) async fn dispatch_control(
             | HorizonIpcObject::AudioOut(_)
             | HorizonIpcObject::AudioRendererManager(_)
             | HorizonIpcObject::AudioRenderer(_)
+            | HorizonIpcObject::AudioCodec(_)
             | HorizonIpcObject::OpusManager(_)
             | HorizonIpcObject::OpusDecoder(_)
             | HorizonIpcObject::PlayReport(_)
             | HorizonIpcObject::Friends(_)
             | HorizonIpcObject::Bcat(_)
             | HorizonIpcObject::Nim(_)
+            | HorizonIpcObject::Chat(_)
             | HorizonIpcObject::Nfp(_)
             | HorizonIpcObject::Ngc(_)
-            | HorizonIpcObject::AudioDevice(_),
+            | HorizonIpcObject::AudioDevice(_)
+            | HorizonIpcObject::NativeAudioDevice(_)
+            | HorizonIpcObject::AudioMixer(_),
         ) => {
             install_clone(process, request.token, target.clone()).await?;
         }
@@ -289,7 +314,8 @@ pub(super) async fn dispatch_control(
                 // A zero budget rejects enumeration in nn::sf before dispatch.
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L77-L81
                 HorizonIpcObject::Hid(_) | HorizonIpcObject::Account(_) => 0x100,
-                HorizonIpcObject::OpusManager(_) => 0x120,
+                HorizonIpcObject::OpusManager(_) | HorizonIpcObject::AudioCodec(_) => 0x120,
+                HorizonIpcObject::NativeAudioDevice(_) => 0x100,
                 HorizonIpcObject::PlayReport(_) | HorizonIpcObject::Csrng => 0x1000,
                 HorizonIpcObject::Friends(_) => 0x1000,
                 HorizonIpcObject::Bcat(_) => 0x1000,

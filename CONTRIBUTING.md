@@ -29,12 +29,18 @@ treat them as requirements.
 Unsupported guest-visible behavior must stop execution with a precise, actionable error. Do not ignore it,
 fabricate success, substitute defaults, or hide it as a warning.
 
-Validate state when the operation consumes it. Avoid speculative preflight checks, transactions, rollback, and
-recovery when direct execution is sufficient and guest-visible semantics do not require them.
+Avoid speculative preflight checks, transactions, rollback, and recovery when direct execution is sufficient
+and guest-visible semantics do not require them.
 
-Do not classify removal of an emulator-critical bottleneck as premature optimization.
+Exact hardware fidelity may be traded for performance when the omitted behavior does not affect games. For example,
+cryptographic or pointer-authentication semantics need not be reproduced when games work correctly without them.
+Prefer a direct, efficient implementation over preserving checks solely for hardware fidelity.
+This does not permit host undefined behavior, out-of-bounds accesses, or reading uninitialized host memory.
 
-Anotate speculative code paths with a "@SPECULATIVE" comment and description.
+Annotate speculative code paths with a `@SPECULATIVE <explanation>` comment.
+
+Document every such simplification next to its implementation with `@SIMPLIFICATION <explanation>`, describing the
+omitted behavior and why games do not require it.
 
 ## Testing
 

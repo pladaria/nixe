@@ -1,5 +1,6 @@
 //! GSV uses TIPC directly; CMIF domains never wrap its sub-sessions.
 use super::prelude::*;
+mod chat;
 mod display;
 mod gpu;
 mod image;
@@ -24,6 +25,9 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
         crate::gsv::GsvInterface::Display => {
             return display::dispatch(process, session, request, hipc).await;
         }
+        crate::gsv::GsvInterface::Chat(ref event) => {
+            return chat::dispatch(process, event, request, hipc);
+        }
         crate::gsv::GsvInterface::Gpu | crate::gsv::GsvInterface::Worker => {
             return gpu::dispatch(process, session, request, hipc).await;
         }
@@ -39,6 +43,7 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
         }
     }
     match request.command_id {
+        1201..=1203 => chat::context(process, session, request, hipc),
         901..=903 | 1001..=1003 => video::context(process, session, request, hipc),
         911 | 912 | 961 | 991 => video::images(session, request, hipc),
         111 | 112 | 114 | 314 | 315 | 423 | 429 | 430 | 434 | 435 | 1510 => {
@@ -66,14 +71,18 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
                         "GSV boot requires its client's process handle",
                     ))?;
                 let version = request_u64(request.data, 8).unwrap();
-                if !matches!(version, 0x8000_0000_0000_0001 | 0x8000_0000_0000_0005)
-                    || request.data[16..40].iter().any(|&byte| byte != 0)
-                {
+                log::debug!("GSV BootWithRemoteMemory: version={version:#x}");
+                // @SPECULATIVE: the SDK revision is opaque metadata; retain
+                // it without restricting boot to the two revisions observed
+                // in early firmware. The reference accepts later revisions
+                // through the same remote-memory lifecycle.
+                // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/nx2_gsv.h#L4087
+                if request.data[16..40].iter().any(|&byte| byte != 0) {
                     return Err(IpcWireError::UnsupportedService(
                         UnsupportedServiceOperation::CommandVariant {
                             service: "GSV UserSession",
                             command_id: request.command_id,
-                            detail: "unverified BootWithRemoteMemory version/options",
+                            detail: "unverified nonzero BootWithRemoteMemory options",
                         },
                     ));
                 }
@@ -272,9 +281,22 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
                     session.child(crate::gsv::GsvInterface::Gpu),
                 ))
                 .map_err(IpcWireError::Handle)?;
-            state.gpu = Some(crate::gsv::gpu::GpuContext::new(
-                session.graphics.memory.clone(),
-            ));
+            let heap = nixe_memory::DeviceHeapMemory::new(session.graphics.memory.clone());
+            if let Some((base, bytes)) = process
+                .memory()
+                .normal_heap_region()
+                .filter(|(_, bytes)| *bytes >= 32 * 1024 * 1024)
+            {
+                let physical = process
+                    .memory()
+                    .space()
+                    .capture(base, bytes, nixe_memory::MemoryPermissions::NONE)
+                    .and_then(|ranges| nixe_memory::PhysicalMapping::new(&ranges))
+                    .map_err(|e| IpcWireError::GraphicsService(e.to_string().into_boxed_str()))?;
+                heap.register_heap(process.memory().space().identity(), base, physical)
+                    .map_err(|e| IpcWireError::GraphicsService(e.to_string().into_boxed_str()))?;
+            }
+            state.gpu = Some(crate::gsv::gpu::GpuContext::new(heap));
             Ok(encode_tipc_response(0, &[], &[handle], &[])?)
         }
         401..=403 => {

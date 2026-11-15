@@ -36,6 +36,7 @@ pub struct ImageDefinition {
     pub count: u32,
     pub is_multisample: bool,
     pub is_integer: bool,
+    pub is_signed: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -298,7 +299,6 @@ pub struct Objects {
     pub load_const_func_f32: Id,
     pub load_const_func_u32x2: Id,
     pub load_const_func_u32x4: Id,
-    pub image_buffer_type: Id,
     pub image_u32: Id,
 }
 

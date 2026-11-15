@@ -73,6 +73,7 @@ pub const fn emission_route(opcode: O) -> EmissionRoute {
         | O::EmitVertex
         | O::EndPrimitive
         | O::Barrier
+        | O::SubgroupBarrier
         | O::WorkgroupMemoryBarrier
         | O::DeviceMemoryBarrier
         | O::WorkgroupId
@@ -553,6 +554,13 @@ pub const fn emission_route(opcode: O) -> EmissionRoute {
         | O::VoteAny
         | O::VoteEqual
         | O::SubgroupBallot
+        | O::SubgroupReduceAdd
+        | O::SubgroupReduceUMin
+        | O::SubgroupReduceUMax
+        | O::SubgroupReduceSMin
+        | O::SubgroupReduceSMax
+        | O::SubgroupReduceOr
+        | O::SubgroupReduceXor
         | O::SubgroupEqMask
         | O::SubgroupLtMask
         | O::SubgroupLeMask

@@ -345,6 +345,7 @@ impl HorizonSvcDispatcher {
                     backend: None,
                     renderers: audio_renderers,
                     opus: crate::OpusManagerSession::default(),
+                    mixer: Default::default(),
                 },
                 files: crate::ipc_wire::resources::FileServices {
                     save_data: None,

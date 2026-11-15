@@ -25,7 +25,7 @@ struct RasterizerBinding {
 pub(super) struct TranslationState {
     id: MaxwellAddressSpaceId,
     machine: Machine,
-    device: crate::MaxwellDeviceMemory,
+    device: nixe_memory::DeviceHeapMemory,
     profile: MaxwellGpuProfile,
     pub(super) table: PageTable,
     pub(super) mappings: RwLock<Mappings>,
@@ -55,7 +55,7 @@ pub struct MaxwellGpuMemory {
 
 impl MaxwellGpuMemoryHandle {
     pub(super) fn new(
-        device: crate::MaxwellDeviceMemory,
+        device: nixe_memory::DeviceHeapMemory,
         id: MaxwellAddressSpaceId,
         profile: MaxwellGpuProfile,
     ) -> Self {
@@ -90,7 +90,7 @@ impl MaxwellGpuMemoryHandle {
     pub fn machine(&self) -> &Machine {
         &self.inner.machine
     }
-    pub fn device_memory(&self) -> &crate::MaxwellDeviceMemory {
+    pub fn device_memory(&self) -> &nixe_memory::DeviceHeapMemory {
         &self.inner.device
     }
     pub fn bind_rasterizer(
@@ -162,7 +162,7 @@ impl MaxwellGpuMemory {
     pub fn machine(&self) -> &Machine {
         &self.inner.machine
     }
-    pub fn device_memory(&self) -> &crate::MaxwellDeviceMemory {
+    pub fn device_memory(&self) -> &nixe_memory::DeviceHeapMemory {
         &self.inner.device
     }
     pub fn mapping_generation(&self) -> MappingGeneration {

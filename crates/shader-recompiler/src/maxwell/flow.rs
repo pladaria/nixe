@@ -461,7 +461,7 @@ impl FlowGraph {
         block.condition = Condition::always(true);
         block.end = FlowLocation::Instruction(pc.next());
         block.end_class = EndClass::IndirectBranch;
-        block.branch_reg = table.branch_reg;
+        block.branch_reg = crate::frontend::flow::BranchRegister::General(table.branch_reg);
         block.branch_offset = table
             .branch_offset
             .wrapping_add(8)

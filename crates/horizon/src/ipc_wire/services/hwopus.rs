@@ -2,9 +2,12 @@
 //! https://switchbrew.org/wiki/Audio_services#hwopus
 //! https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/audio/hardware_opus_decoder_manager.cpp
 //! https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/audio/hardware_opus_decoder.cpp
+mod batch;
 use super::prelude::*;
+use crate::hwopus::OpusObject;
 use crate::hwopus::{BAD_ARGUMENT, BUFFER_TOO_SMALL, INPUT_TOO_SMALL, Parameters};
 use crate::{OpusDecoderSession, OpusManagerSession};
+pub(in crate::ipc_wire) use batch::dispatch_audio_codec;
 
 pub(in crate::ipc_wire) async fn dispatch_opus_manager(
     process: &mut Request,
@@ -32,7 +35,8 @@ pub(in crate::ipc_wire) async fn dispatch_opus_manager(
                 let Some(decoder) = session.domain.object(*object_id) else {
                     return opus_error(&request, HorizonIpcResult::CMIF_TARGET_NOT_FOUND);
                 };
-                return dispatch_decode(process, &decoder, request, hipc).await;
+                return batch::dispatch_object(process, &session.domain, &decoder, request, hipc)
+                    .await;
             }
         }
         None if session.domain.is_domain() => {
@@ -43,6 +47,19 @@ pub(in crate::ipc_wire) async fn dispatch_opus_manager(
         None => {}
     }
     let command = request.command_id;
+    if command == 100 {
+        if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
+            return opus_error(&request, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+        }
+        return batch::child(
+            process,
+            &session.domain,
+            &request,
+            OpusObject::Client(session.tags.clone()),
+            &[],
+            &[],
+        );
+    }
     if command > 9 {
         return unsupported_service_command("hwopus", command);
     }
@@ -117,7 +134,7 @@ pub(in crate::ipc_wire) async fn dispatch_opus_manager(
         Err(result) => return opus_error(&request, result),
     };
     if request.domain.is_some() {
-        let Some(id) = session.domain.insert_object(decoder) else {
+        let Some(id) = session.domain.insert_object(OpusObject::Decoder(decoder)) else {
             return opus_error(&request, HorizonIpcResult::CMIF_OUT_OF_DOMAIN_ENTRIES);
         };
         return semantic_success(request.token, true, &[], &[], &[id], None);

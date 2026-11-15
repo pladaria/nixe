@@ -126,17 +126,37 @@ impl SaveDataSystem {
             return Ok(volume);
         }
         let path = self.path(program_id, kind, user);
-        let metadata = fs::read(path.join("metadata"))?;
-        if metadata.len() != 24 || &metadata[..8] != METADATA_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid save-data metadata",
-            ));
-        }
-        let capacity = u64::from_le_bytes(metadata[8..16].try_into().unwrap());
+        let (capacity, _) = read_volume_sizes(&path)?;
         let volume = Arc::new(Mutex::new(TransactionalDirectory::open(path, capacity)?));
         volumes.insert(key, Arc::downgrade(&volume));
         Ok(volume)
+    }
+
+    /// Query the actual logical capacities; metadata preferences only apply
+    /// before a volume exists, as with launch-time save creation.
+    pub(crate) fn sizes(&self, kind: u8, user: u128) -> Result<(u64, u64), SaveDataError> {
+        let (kind, user, size, journal) = match kind {
+            1 => ("account", user, self.account_size, self.account_journal),
+            3 => ("device", 0, self.device_size, self.device_journal),
+            _ => {
+                return Err(SaveDataError::Unsupported(
+                    "application save-data type is not implemented",
+                ));
+            }
+        };
+        match read_volume_sizes(&self.path(self.program_id, kind, user)) {
+            Ok(sizes) => Ok(sizes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // The reference also uses application defaults before the
+                // first size record exists. Querying does not resize a save.
+                // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/filesystem/save_data_controller.cpp#L79-L89
+                if size < 0 || journal < 0 {
+                    return Err(SaveDataError::Unsupported("negative NACP save-data size"));
+                }
+                Ok((size as u64, journal as u64))
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     // EnsureSaveData creates the account save for the requested user, independently
@@ -176,18 +196,24 @@ impl SaveDataSystem {
     }
 }
 
+fn read_volume_sizes(path: &Path) -> io::Result<(u64, u64)> {
+    let bytes = fs::read(path.join("metadata"))?;
+    if bytes.len() != 24 || &bytes[..8] != METADATA_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid save-data metadata",
+        ));
+    }
+    Ok((
+        u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+    ))
+}
+
 fn ensure_volume(path: &Path, size: u64, journal: u64) -> io::Result<()> {
-    match fs::read(path.join("metadata")) {
-        Ok(bytes) => {
-            if bytes.len() != 24 || &bytes[..8] != METADATA_MAGIC {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid save-data metadata",
-                ));
-            }
-            // Ensure does not resize an existing save or overwrite its contents.
-            return Ok(());
-        }
+    match read_volume_sizes(path) {
+        // Ensure does not resize an existing save or overwrite its contents.
+        Ok(_) => return Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound && !path.exists() => {}
         Err(error) => return Err(error),
     }

@@ -92,10 +92,11 @@ pub(in crate::native) struct SampledTextures {
 impl SampledTextures {
     pub fn eligible(resources: &PipelineResources) -> bool {
         resources.stages[..5].iter().all(|stage| {
-            stage
-                .images
-                .iter()
-                .all(|image| image.sampler && image.storage_format.is_none())
+            stage.texels.is_empty()
+                && stage
+                    .images
+                    .iter()
+                    .all(|image| image.sampler && image.storage_format.is_none())
         })
     }
     fn identity(

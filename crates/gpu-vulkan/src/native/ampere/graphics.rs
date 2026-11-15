@@ -769,6 +769,14 @@ impl NativeExecution<'_> {
                             None,
                         )?;
                     }
+                    self.ampere_stage_texels(
+                        memory,
+                        r,
+                        &state.constants[group as usize],
+                        &pipeline.resources.stages[stage],
+                        stage,
+                        textures::graphics_linked(r)?,
+                    )?;
                 }
                 if !self
                     .residency

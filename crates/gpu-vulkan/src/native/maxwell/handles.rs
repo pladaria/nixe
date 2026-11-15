@@ -159,12 +159,18 @@ impl<'a, 'b> HandleReader<'a, 'b> {
         }
     }
     pub fn evaluate(&mut self, values: &mut [u32]) -> Result<(), VulkanError> {
-        for image in &self.resources.images {
+        for handle in self
+            .resources
+            .images
+            .iter()
+            .map(|image| &image.handle)
+            .chain(self.resources.texels.iter().map(|texel| &texel.handle))
+        {
             let HandleSource::Program {
                 index,
                 element,
                 slot,
-            } = image.handle
+            } = *handle
             else {
                 continue;
             };

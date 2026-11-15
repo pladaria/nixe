@@ -1,4 +1,14 @@
 fn main() {
+    cc::Build::new()
+        .cpp(true)
+        .std("c++20")
+        .warnings(false)
+        .include("../../vendor/horizon-tz")
+        .file("../../vendor/horizon-tz/tz.cpp")
+        .file("native/timezone/parser.cpp")
+        .compile("nixe_timezone");
+    println!("cargo:rerun-if-changed=../../vendor/horizon-tz");
+    println!("cargo:rerun-if-changed=native/timezone/parser.cpp");
     let codec = pkg_config::Config::new()
         .atleast_version("58")
         .probe("libavcodec")

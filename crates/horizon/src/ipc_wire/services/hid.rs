@@ -43,7 +43,10 @@ enum HidCommand {
     CreateActiveVibrationDeviceList,
     InitializeJcms,
     FinalizeJcms,
+    StartJcms,
+    StopJcms,
     SetTouchScreenOutputRanges,
+    SetMouseLibraryVersion,
 }
 
 impl HidCommand {
@@ -90,7 +93,10 @@ impl HidCommand {
             214 => Some(Self::SendVibrationValuesInMode),
             3110 => Some(Self::InitializeJcms),
             3111 => Some(Self::FinalizeJcms),
+            3112 => Some(Self::StartJcms),
+            3113 => Some(Self::StopJcms),
             1004 => Some(Self::SetTouchScreenOutputRanges),
+            3150 => Some(Self::SetMouseLibraryVersion),
             _ => None,
         }
     }
@@ -122,6 +128,19 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
     };
 
     match command {
+        HidCommand::SetMouseLibraryVersion => {
+            // https://switchbrew.org/wiki/HID_services#SetMouseLibraryVersion
+            if !request.has_payload_size(8)
+                || hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            // @SPECULATIVE: only the command name is documented. The reference
+            // accepts the applet resource user ID without changing mouse state.
+            // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/hid/hid_server.cpp#L1601-L1605
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
         HidCommand::SetTouchScreenOutputRanges => {
             // https://switchbrew.org/wiki/HID_services#SetTouchScreenOutputRanges
             if hipc.pid.is_none()
@@ -136,6 +155,29 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
                 return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
             }
             hid_system.set_touch_screen_output_ranges(width, height);
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        HidCommand::StartJcms | HidCommand::StopJcms => {
+            // https://switchbrew.org/wiki/HID_services#StartJcms
+            // The SDK sends an applet-resource ID followed by a u32 JcmsHandle.
+            if process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {
+                return unsupported_service_command("hid", request.command_id);
+            }
+            if !request.has_payload_size(12)
+                || hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let handle = request_u32(request.data, 8).unwrap();
+            if handle & 0xf8 != 0 || handle & 0xfe00 != 0 {
+                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            }
+            // @SIMPLIFICATION: no Joy-Con 2 mouse sensors are exposed. Starting
+            // or stopping a disconnected sensor leaves its initialized LIFO empty.
+            // @SPECULATIVE: this follows the reference's explicit 3112/3113
+            // success replies; no connected flags or samples are fabricated.
+            // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/hid/hid_server.cpp#L264-L265
             semantic_success(request.token, false, &[], &[], &[], None)
         }
         command @ (HidCommand::InitializeJcms | HidCommand::FinalizeJcms) => {

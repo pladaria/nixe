@@ -6,9 +6,8 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use chrono_tz::Tz;
 use nixe_loader_storage::StorageRef;
 use nixe_runtime::{
     ReadOnlyMount, ReadableEventObject, SharedMemoryObject, VirtualClock, WritableEventObject,
@@ -48,6 +47,9 @@ pub enum HorizonIpcObject {
     AudioRendererManager(crate::AudioRendererManagerSession),
     AudioRenderer(crate::AudioRendererSession),
     AudioDevice(crate::AudioDeviceSession),
+    NativeAudioDevice(crate::NativeAudioDeviceSession),
+    AudioMixer(crate::AudioMixerSession),
+    AudioCodec(crate::AudioCodecSession),
     OpusManager(crate::OpusManagerSession),
     OpusDecoder(crate::OpusDecoderSession),
     PlayReport(crate::PlayReportSession),
@@ -56,6 +58,7 @@ pub enum HorizonIpcObject {
     Bcat(crate::BcatSession),
     Nfp(crate::NfpSession),
     Nim(crate::NimSession),
+    Chat(crate::ChatSession),
     Ngc(NgcSession),
     SharedFont(crate::SharedFontSession),
     Irs(IrsSession),
@@ -1186,11 +1189,10 @@ impl TimeEnvironment {
         {
             return Err("timezone is not representable as a Horizon location name".to_owned());
         }
-        let timezone = timezone
-            .parse::<Tz>()
-            .map_err(|_| "timezone is not present in the IANA database".to_owned())?;
+        let (timezone, _) = jiff_tzdb::get(timezone)
+            .ok_or_else(|| "timezone is not present in the IANA database".to_owned())?;
         let mut location_name = [0; TIME_LOCATION_NAME_SIZE];
-        let name = timezone.name();
+        let name = timezone;
         location_name[..name.len()].copy_from_slice(name.as_bytes());
         let elapsed_seconds = i64::try_from(clock.elapsed().as_secs()).unwrap_or(i64::MAX);
         let context = SystemClockContext {
@@ -1204,6 +1206,14 @@ impl TimeEnvironment {
         initialise_time_shared_object(&mut initial, 0x00, &steady);
         initialise_time_shared_object(&mut initial, 0x38, &context.encode());
         initialise_time_shared_object(&mut initial, 0x80, &context.encode());
+        // Newer SDKs read the continuous-adjustment clock instead of the
+        // original steady-clock slot. Both must identify the same clock.
+        // With no RTC offset or correction, all adjustment coefficients are
+        // zero and the guest adds its monotonic nanoseconds directly.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/psc/time/shared_memory.h
+        let mut continuous = [0; 0x38];
+        continuous[0x28..].copy_from_slice(&TIME_SOURCE_ID);
+        initialise_time_shared_object(&mut initial, 0xd0, &continuous);
         let shared_memory = crate::system_memory::create(account, initial.len(), &initial)
             .map_err(|e| e.to_string())?;
         Ok(Self {
@@ -1211,6 +1221,7 @@ impl TimeEnvironment {
                 clock,
                 location_name,
                 timezone,
+                timezone_rule: OnceLock::new(),
                 shared_memory,
                 clock_contexts: Mutex::new([context; 3]),
                 counters: Mutex::new([0; 2]),
@@ -1233,7 +1244,8 @@ impl TimeEnvironment {
 struct TimeState {
     clock: VirtualClock,
     location_name: [u8; TIME_LOCATION_NAME_SIZE],
-    timezone: Tz,
+    timezone: &'static str,
+    timezone_rule: OnceLock<Result<crate::timezone::TimeZoneRule, crate::HorizonIpcResult>>,
     shared_memory: SharedMemoryObject,
     clock_contexts: Mutex<[SystemClockContext; 3]>,
     publications: [Arc<crate::ipc_wire::operation::Publication>; 3],
@@ -1487,8 +1499,14 @@ impl TimeZoneServiceSession {
         self.state.location_name
     }
 
-    pub(crate) fn timezone(&self) -> Tz {
-        self.state.timezone
+    pub(crate) fn timezone_rule(
+        &self,
+    ) -> Result<&crate::timezone::TimeZoneRule, crate::HorizonIpcResult> {
+        self.state
+            .timezone_rule
+            .get_or_init(|| crate::timezone::TimeZoneRule::load(self.state.timezone))
+            .as_ref()
+            .map_err(|&error| error)
     }
 }
 

@@ -373,6 +373,7 @@ pub struct SchedulerState {
     clock: crate::VirtualClock,
     timers: timer::Timers,
     core_wakers: OnceLock<Box<[std::task::Waker]>>,
+    next_thread_identity: std::sync::atomic::AtomicU64,
 }
 
 impl SchedulerState {
@@ -383,6 +384,7 @@ impl SchedulerState {
             .collect();
         Arc::new(Self {
             core_wakers: OnceLock::new(),
+            next_thread_identity: std::sync::atomic::AtomicU64::new(1),
             timers: timer::Timers::new(clock.clone(), profile.preemption_interval_ns().is_some()),
             clock: clock.clone(),
             profile,
@@ -405,6 +407,15 @@ impl SchedulerState {
                 statistics: SchedulerStatistics::default(),
             }),
         })
+    }
+
+    /// Public kernel identity, independent of recyclable scheduling slots.
+    /// The same sequence covers every process on this machine.
+    pub fn allocate_thread_identity(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.next_thread_identity
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("kernel thread identity exhausted")
     }
 
     #[must_use]

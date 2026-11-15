@@ -56,8 +56,16 @@ impl Instruction {
                     | 0x8a4
                     | 0x2a5
                     | 0x899
+                    | 0x299
+                    | 0x499
                     | 0xab9
                     | 0xabb
+                    | 0x287
+                    | 0x887
+                    | 0x2bd
+                    | 0x2be
+                    | 0x2bf
+                    | 0x958
             ) {
                 Pred::uniform(index)?
             } else {
@@ -76,7 +84,7 @@ impl Instruction {
                     0
                 }
             || (self.opcode() != 0x947 && self.bits(87, 4) != 7)
-            || self.bits(91, 1) != 0
+            || self.bits(91, 1) != u32::from(self.opcode() == 0x958)
         {
             return Err(unsupported(
                 "Native branch convergence/extra predicate mode",

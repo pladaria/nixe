@@ -87,7 +87,7 @@ pub(crate) fn requirements(preference: [u32; 16], count: u32) -> Result<(u64, u6
 #[derive(Debug)]
 pub(crate) struct Presentation {
     pub image: nixe_gpu::native::NativePresentationImage,
-    pub _mapping: Arc<super::gpu::PhysicalMap>,
+    pub _mapping: Arc<nixe_memory::DeviceHeapMapping>,
 }
 impl Pool {
     pub fn presentation(
@@ -132,7 +132,7 @@ impl Pool {
                 }
                 let extent = [(p[2] & 0xffff) + 1, (p[2] >> 16) + 1];
                 let image = nixe_gpu::native::NativePresentationImage {
-                    address: mapping.physical.pin.address() + offset - mapping.offset,
+                    address: mapping.physical.address() + offset - mapping.offset,
                     size,
                     extent,
                     row_pitch: p[5] * 64,

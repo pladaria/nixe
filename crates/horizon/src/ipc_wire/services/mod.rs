@@ -28,7 +28,9 @@ mod ngc;
 pub(super) use nfp::dispatch_nfp;
 pub(super) use ngc::dispatch_ngc;
 mod bsd;
+mod chat;
 pub(super) use bcat::dispatch_bcat;
+pub(super) use chat::dispatch_chat;
 pub(super) mod content;
 mod csrng;
 mod ectx;
@@ -59,7 +61,9 @@ pub(super) mod response;
 mod settings;
 mod sm;
 mod ssl;
+mod sysmix;
 mod time;
+pub(super) use sysmix::dispatch_audio_mixer;
 mod vi;
 
 pub(super) use account::{
@@ -67,7 +71,7 @@ pub(super) use account::{
 };
 pub(super) use apm::{dispatch_performance_manager, dispatch_performance_session};
 pub(super) use applet::{applet_object_name, applet_requests_self_exit, dispatch_applet};
-pub(super) use auddev::dispatch_audio_device;
+pub(super) use auddev::{dispatch_audio_device, dispatch_native_audio_device};
 pub(super) use audout::{dispatch_audio_out, dispatch_audio_out_manager};
 pub(super) use audren::{dispatch_audio_renderer, dispatch_audio_renderer_manager};
 pub(super) use bsd::dispatch_bsd;
@@ -75,7 +79,7 @@ pub(super) use ectx::dispatch_error_context_writer;
 pub(super) use hid::{
     dispatch_hid, dispatch_hid_active_vibration_device_list, dispatch_hid_applet_resource,
 };
-pub(super) use hwopus::{dispatch_opus_decoder, dispatch_opus_manager};
+pub(super) use hwopus::{dispatch_audio_codec, dispatch_opus_decoder, dispatch_opus_manager};
 pub(super) use irs::dispatch_irs;
 pub(super) use lm::{dispatch_log_manager, dispatch_logger};
 pub(super) use nifm::{

@@ -38,9 +38,16 @@ pub(crate) struct GsvState {
     pub inter_module_images: Option<InterModuleImages>,
     pub frame: Option<GraphicsFrame>,
     pub display: Option<display::DisplayContext>,
+    pub chat: Option<ChatContext>,
     pub video_decoder: Option<VideoContext>,
     pub video_encoder: Option<VideoContext>,
     pub video_images: std::collections::BTreeMap<u32, Arc<video_image::Image>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChatContext {
+    pub initialized: bool,
+    pub event: nixe_runtime::EventObject,
 }
 
 #[derive(Debug, Default)]
@@ -131,6 +138,7 @@ pub(crate) enum GsvInterface {
     Gpu,
     Worker,
     Display,
+    Chat(nixe_runtime::EventObject),
     VideoDecoderCreator,
     VideoEncoderCreator,
     VideoDecoder(Arc<video::Session>),

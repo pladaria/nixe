@@ -203,7 +203,7 @@ impl Display for MaxwellMappingId {
 #[derive(Clone, Debug)]
 pub struct MaxwellMapRequest {
     pub allocation: MaxwellAllocationId,
-    pub backing: Arc<crate::MaxwellDeviceMapping>,
+    pub backing: Arc<nixe_memory::DeviceHeapMapping>,
     pub backing_offset: u64,
     pub size: u64,
     pub allocation_alignment: u32,
@@ -224,7 +224,7 @@ pub struct MaxwellSparseRemapRequest {
 #[derive(Clone, Debug)]
 pub struct MaxwellSparseMapping {
     pub allocation: MaxwellAllocationId,
-    pub backing: Arc<crate::MaxwellDeviceMapping>,
+    pub backing: Arc<nixe_memory::DeviceHeapMapping>,
     pub backing_offset: u64,
     pub kind: u8,
     pub cacheable: bool,
@@ -241,7 +241,7 @@ pub struct MaxwellGpuMapping {
     size: u64,
     requested_size: u64,
     allocation: MaxwellAllocationId,
-    device: std::sync::Weak<crate::MaxwellDeviceMapping>,
+    device: std::sync::Weak<nixe_memory::DeviceHeapMapping>,
     current: Arc<AtomicBool>,
     backing_offset: u64,
     page_size: u32,
@@ -264,7 +264,7 @@ impl Eq for MaxwellGpuMapping {}
 
 struct LiveMapping {
     descriptor: MaxwellGpuMapping,
-    _device: Arc<crate::MaxwellDeviceMapping>,
+    _device: Arc<nixe_memory::DeviceHeapMapping>,
 }
 impl std::fmt::Debug for LiveMapping {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -562,7 +562,7 @@ impl Drop for MaxwellGpuAddressSpace {
 impl MaxwellGpuAddressSpace {
     #[must_use]
     pub fn new(
-        device: crate::MaxwellDeviceMemory,
+        device: nixe_memory::DeviceHeapMemory,
         id: MaxwellAddressSpaceId,
         profile: MaxwellGpuProfile,
     ) -> Self {
@@ -1715,7 +1715,7 @@ impl std::error::Error for MaxwellGpuAccessError {}
 
 fn validate_backing(
     machine: &Machine,
-    backing: &crate::MaxwellDeviceMapping,
+    backing: &nixe_memory::DeviceHeapMapping,
     offset: u64,
     size: u64,
 ) -> Result<(), MaxwellAddressSpaceError> {

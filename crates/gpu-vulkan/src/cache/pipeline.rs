@@ -467,21 +467,18 @@ impl Compiler {
                 "tessellation requires both control and evaluation stages".into(),
             ));
         }
-        if let Some(s) = state {
-            if stages.contains(vk::ShaderStageFlags::TESSELLATION_CONTROL)
+        if let Some(s) = state
+            && (stages.contains(vk::ShaderStageFlags::TESSELLATION_CONTROL)
                 != (s.topology == vk::PrimitiveTopology::PATCH_LIST)
-                || s.topology == vk::PrimitiveTopology::PATCH_LIST && s.patch_points == 0
-            {
-                return Err(CompileError::Failed(
-                    "patch topology/control stages/cardinality disagree".into(),
-                ));
-            }
-            if !s.raster_discard && !stages.contains(vk::ShaderStageFlags::FRAGMENT) {
-                return Err(CompileError::Failed(
-                    "rasterization requires a fragment shader".into(),
-                ));
-            }
+                || s.topology == vk::PrimitiveTopology::PATCH_LIST && s.patch_points == 0)
+        {
+            return Err(CompileError::Failed(
+                "patch topology/control stages/cardinality disagree".into(),
+            ));
         }
+        // The fragment stage is optional. Depth/stencil-only draws still
+        // rasterize and use interpolated depth when no fragment shader runs.
+        // https://docs.vulkan.org/spec/latest/chapters/pipelines.html#pipelines-graphics-subsets-fragment-shader
         Ok(())
     }
     fn check_graphics(&self, s: &GraphicsState) -> Result<(), CompileError> {

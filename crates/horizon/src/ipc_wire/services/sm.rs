@@ -62,6 +62,7 @@ enum ServiceKind {
     Bcat,
     Nfp,
     Nim,
+    Chat,
     Ngc,
     SharedFont,
     Irs,
@@ -71,6 +72,8 @@ enum ServiceKind {
     Ssl,
     AudioOut,
     AudioUser,
+    NativeAudioDevice,
+    AudioMixer,
     StreamPlay,
     AudioRenderer,
     Opus,
@@ -98,6 +101,7 @@ impl ServiceKind {
             b"bcat:u" => Some(Self::Bcat),
             b"nfp:user" => Some(Self::Nfp),
             b"nim:eca" => Some(Self::Nim),
+            b"chat:u" => Some(Self::Chat),
             b"ngc:u" => Some(Self::Ngc),
             b"pl:u" => Some(Self::SharedFont),
             b"irs" => Some(Self::Irs),
@@ -107,6 +111,8 @@ impl ServiceKind {
             b"ssl" => Some(Self::Ssl),
             b"audout:u" => Some(Self::AudioOut),
             b"aud:u" => Some(Self::AudioUser),
+            b"auddmg:u" => Some(Self::NativeAudioDevice),
+            b"audsmx:u" => Some(Self::AudioMixer),
             b"stpl:u" => Some(Self::StreamPlay),
             b"audren:u" => Some(Self::AudioRenderer),
             b"hwopus" => Some(Self::Opus),
@@ -262,6 +268,9 @@ fn connect_service(
         ServiceKind::Bsd => process.return_service(HorizonIpcObject::Bsd(manager.bsd_session())),
         ServiceKind::Ssl => process.return_service(HorizonIpcObject::Ssl(SslSession::new())),
         ServiceKind::Nim => process.return_service(HorizonIpcObject::Nim(crate::NimSession::new())),
+        ServiceKind::Chat => process.return_service(HorizonIpcObject::Chat(
+            crate::ChatSession::new(crate::chat::ChatObject::Service),
+        )),
         ServiceKind::Nfp => process.return_service(HorizonIpcObject::Nfp(crate::NfpSession::new())),
         ServiceKind::Ngc => {
             process.return_service(HorizonIpcObject::Ngc(crate::object::NgcSession::default()))
@@ -295,6 +304,32 @@ fn connect_service(
                 ));
             }
             process.return_service(HorizonIpcObject::AudioUser)
+        }
+        ServiceKind::NativeAudioDevice => {
+            if process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {
+                return Err(IpcWireError::UnsupportedService(
+                    UnsupportedServiceOperation::Connect {
+                        name: b"auddmg:u".as_slice().into(),
+                    },
+                ));
+            }
+            process.return_service(HorizonIpcObject::NativeAudioDevice(
+                crate::NativeAudioDeviceSession::new(
+                    crate::audio_device::native::DeviceObject::Manager,
+                ),
+            ))
+        }
+        ServiceKind::AudioMixer => {
+            if process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {
+                return Err(IpcWireError::UnsupportedService(
+                    UnsupportedServiceOperation::Connect {
+                        name: b"audsmx:u".as_slice().into(),
+                    },
+                ));
+            }
+            process.return_service(HorizonIpcObject::AudioMixer(crate::AudioMixerSession::new(
+                crate::sysmix::MixerObject::Manager,
+            )))
         }
         ServiceKind::StreamPlay => {
             if process.cpu().platform() != nixe_cpu::platform::TargetPlatform::Switch2 {

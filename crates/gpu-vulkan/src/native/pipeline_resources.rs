@@ -46,10 +46,17 @@ pub(super) struct ImageSlot {
     pub(super) depth: bool,
     pub(super) storage_format: Option<nixe_shader_recompiler::types::ImageFormat>,
 }
+pub(crate) struct TexelSlot {
+    pub(crate) slot: usize,
+    pub(crate) descriptor: usize,
+    pub(super) handle: HandleSource,
+    pub(crate) storage_format: Option<nixe_shader_recompiler::types::ImageFormat>,
+}
 #[derive(Default)]
 pub(crate) struct StageResources {
     pub(crate) uniforms: Box<[UniformSlot]>,
     pub(crate) storage: Box<[StorageSlot]>,
+    pub(crate) texels: Box<[TexelSlot]>,
     pub(in crate::native) images: Box<[ImageSlot]>,
     pub(in crate::native) handle_info: Option<std::sync::Arc<crate::cache::GuestStageMetadata>>,
 }
@@ -72,6 +79,7 @@ impl PipelineResources {
         let mut uniforms: [Vec<UniformSlot>; 6] = std::array::from_fn(|_| Vec::new());
         let mut storage: [Vec<StorageSlot>; 6] = std::array::from_fn(|_| Vec::new());
         let mut images: [Vec<ImageSlot>; 6] = std::array::from_fn(|_| Vec::new());
+        let mut texels: [Vec<TexelSlot>; 6] = std::array::from_fn(|_| Vec::new());
         let mut computed_handle_count = 0;
         let mut scale_bases = [[0usize; 2]; 6];
         let mut scale_counts = [0usize; 2];
@@ -261,6 +269,74 @@ impl PipelineResources {
                         storage_format: Some(d.format),
                     });
                 }
+                S::ImageBuffer(d) => {
+                    let offset = origin
+                        .element
+                        .checked_shl(d.size_shift)
+                        .and_then(|offset| d.cbuf_offset.0.checked_add(offset))
+                        .ok_or(fail("texel handle offset overflow"))?;
+                    let handle = if let Some(index) = d.handle_program {
+                        let slot = computed_handle_count;
+                        computed_handle_count += 1;
+                        HandleSource::Program {
+                            index: index as usize,
+                            element: origin.element,
+                            slot,
+                        }
+                    } else {
+                        HandleSource::Direct {
+                            primary: ImageHandle {
+                                cbuf: d.cbuf_index.0,
+                                offset,
+                                shift: 0,
+                            },
+                            secondary: None,
+                        }
+                    };
+                    let slot = texels[stage].len();
+                    texels[stage].push(TexelSlot {
+                        slot,
+                        descriptor,
+                        handle,
+                        storage_format: Some(d.format),
+                    });
+                }
+                S::TextureBuffer(d) => {
+                    let offset = origin
+                        .element
+                        .checked_shl(d.size_shift)
+                        .and_then(|offset| d.cbuf_offset.0.checked_add(offset))
+                        .ok_or(fail("texel handle offset overflow"))?;
+                    let handle = if let Some(index) = d.handle_program {
+                        let slot = computed_handle_count;
+                        computed_handle_count += 1;
+                        HandleSource::Program {
+                            index: index as usize,
+                            element: origin.element,
+                            slot,
+                        }
+                    } else {
+                        HandleSource::Direct {
+                            primary: ImageHandle {
+                                cbuf: d.cbuf_index.0,
+                                offset,
+                                shift: if d.has_secondary { d.shift_left } else { 0 },
+                            },
+                            secondary: d.has_secondary.then_some(ImageHandle {
+                                cbuf: d.secondary_cbuf_index.0,
+                                offset: d.secondary_cbuf_offset.0,
+                                shift: d.secondary_shift_left,
+                            }),
+                        }
+                    };
+                    let slot = texels[stage].len();
+                    texels[stage].push(TexelSlot {
+                        slot,
+                        descriptor,
+                        handle,
+                        storage_format: None,
+                    });
+                }
                 source => {
                     return Err(VulkanError::Compilation(
                         format!("unsupported guest shader resource binding: {source:?}").into(),
@@ -293,6 +369,7 @@ impl PipelineResources {
                     uniforms: std::mem::take(&mut uniforms[stage]).into_boxed_slice(),
                     storage: std::mem::take(&mut storage[stage]).into_boxed_slice(),
                     images: std::mem::take(&mut images[stage]).into_boxed_slice(),
+                    texels: std::mem::take(&mut texels[stage]).into_boxed_slice(),
                     handle_info: info.filter(|i| !i.info.handle_programs.is_empty()).cloned(),
                 }
             }),

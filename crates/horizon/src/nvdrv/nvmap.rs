@@ -177,7 +177,7 @@ struct NvMapStorage {
     allocation: NvMapAllocationMetadata,
     cpu_mapping: NvMapCpuMapping,
     ranges: Arc<[AllocationRange]>,
-    device: std::sync::Mutex<Option<Arc<nixe_gpu_maxwell::MaxwellDeviceMapping>>>,
+    device: std::sync::Mutex<Option<Arc<nixe_memory::DeviceHeapMapping>>>,
     _shared: Vec<nixe_memory::DeviceSharedMemory>,
 }
 
@@ -220,8 +220,8 @@ impl NvMapObject {
 
     pub(super) fn pin_device(
         &self,
-        memory: &nixe_gpu_maxwell::MaxwellDeviceMemory,
-    ) -> Result<Arc<nixe_gpu_maxwell::MaxwellDeviceMapping>, nixe_memory::MemoryError> {
+        memory: &nixe_memory::DeviceHeapMemory,
+    ) -> Result<Arc<nixe_memory::DeviceHeapMapping>, nixe_memory::MemoryError> {
         let storage = self
             .storage
             .as_ref()

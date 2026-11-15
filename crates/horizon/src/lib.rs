@@ -5,10 +5,15 @@
 
 mod audio;
 mod audio_device;
+mod sysmix;
+pub use sysmix::AudioMixerSession;
 mod multimedia;
 pub use audio_device::AudioDeviceSession;
+pub use audio_device::native::NativeAudioDeviceSession;
 mod audio_renderer;
 pub use audio_renderer::{AudioRendererManagerSession, AudioRendererSession};
+mod hwacod;
+pub use hwacod::AudioCodecSession;
 mod hwopus;
 pub use hwopus::{OpusDecoderSession, OpusManagerSession};
 mod play_report;
@@ -19,7 +24,9 @@ pub use nim::NimSession;
 mod nfp;
 pub use nfp::NfpSession;
 mod bsd;
+mod chat;
 pub use bcat::BcatSession;
+pub use chat::ChatSession;
 mod diagnostics;
 pub use audio::{AudioOutManagerSession, AudioOutSession};
 mod error_applet;
@@ -44,6 +51,7 @@ mod shared_font;
 mod system_memory;
 #[cfg(test)]
 mod test_memory;
+mod timezone;
 mod video_codec;
 pub use shared_font::SharedFontSession;
 mod machine_profile;

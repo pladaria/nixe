@@ -10,9 +10,8 @@ mod texture;
 mod uniform;
 use crate::{
     Environment, Result,
-    arena::BlockId,
-    frontend::asl::CodeTranslator,
-    ir::{Attribute, Emitter, FmzMode, FpControl, FpRounding, Ir, Pred, Reg, Type, Value},
+    frontend::asl::{CodeBlock, CodeTranslator},
+    ir::{Attribute, Emitter, FmzMode, FpControl, FpRounding, Pred, Reg, Type, Value},
     types::ProgramOffset,
 };
 
@@ -21,19 +20,65 @@ impl<E: Environment> CodeTranslator<E> for AmpereTranslator {
     fn translate(
         &mut self,
         env: &mut E,
-        ir: &mut Ir,
-        block: BlockId,
+        code: &mut CodeBlock<'_>,
         begin: ProgramOffset,
         end: ProgramOffset,
     ) -> Result<()> {
         for pc in (begin.0..end.0).step_by(16) {
             let instruction = Instruction::fetch(env, ProgramOffset(pc))?;
-            let mut visitor = Visitor {
-                metadata: env.metadata(),
-                emit: Emitter::new(ir, block)?,
-                instruction,
-            };
-            visitor.translate().map_err(|e| {
+            let translated = (|| {
+                if matches!(instruction.opcode(), 0x381 | 0x981) && instruction.bits(64, 4) != 0 {
+                    let mut visitor = Visitor {
+                        metadata: env.metadata(),
+                        emit: Emitter::new(code.ir, code.current)?,
+                        instruction,
+                    };
+                    // LDG's reverse-encoded load predicate is distinct from its
+                    // execution predicate (nvdisasm SM87: LDG.E ..., !P0).
+                    // https://docs.nvidia.com/cuda/cuda-binary-utilities/#instruction-set-reference
+                    // Snapshot the address before zeroing results: a destination
+                    // may alias the address pair. A false load predicate performs
+                    // no memory access, independently of the execution predicate.
+                    let address = visitor.global_load_address()?;
+                    let predicate = visitor.emit.get_pred(
+                        Pred::new((7 - instruction.bits(64, 3)) as u8)?,
+                        instruction.bits(67, 1) != 0,
+                    )?;
+                    let predicate = visitor.emit.condition_ref(predicate)?;
+                    let words = if instruction.bits(73, 3) <= 4 {
+                        1
+                    } else {
+                        1 << (instruction.bits(73, 3) - 4)
+                    };
+                    let dest = Reg(instruction.bits(16, 8) as u8);
+                    for word in 0..words {
+                        visitor.emit.set_reg(
+                            if dest == Reg::RZ {
+                                dest
+                            } else {
+                                dest.offset(word)?
+                            },
+                            Value::U32(0),
+                        )?;
+                    }
+                    code.if_then(predicate, |ir, block| {
+                        Visitor {
+                            metadata: env.metadata(),
+                            emit: Emitter::new(ir, block)?,
+                            instruction,
+                        }
+                        .global_load_value(address)
+                    })
+                } else {
+                    Visitor {
+                        metadata: env.metadata(),
+                        emit: Emitter::new(code.ir, code.current)?,
+                        instruction,
+                    }
+                    .translate()
+                }
+            })();
+            translated.map_err(|e| {
                 let detail = format!("{e}; native instruction={:032x}", instruction.0);
                 unsupported(detail).at(
                     env.metadata().stage,
@@ -143,8 +188,19 @@ impl Visitor<'_> {
         match i.opcode() {
             // Hardware reconvergence tokens have no per-invocation data effect.
             0x945 | 0x941 | 0x942 => Ok(()),
+            0x948 => {
+                // Full-mask immediate WARPSYNC, verified with nvdisasm SM87.
+                // https://docs.nvidia.com/cuda/cuda-binary-utilities/#instruction-set-reference
+                if i.bits(16, 16) != 0 || i.bits(32, 32) != u32::MAX || i.bits(64, 32) != 0x03800000
+                {
+                    return Err(unsupported("Native masked/register WARPSYNC mode"));
+                }
+                self.emit.emit(crate::ir::Opcode::SubgroupBarrier, &[], 0)?;
+                Ok(())
+            }
             0xc82 | 0x882 => self.umov(),
             0x3c2 => self.r2ur(),
+            0x3c4 => self.redux(),
             0x919 | 0x9c3 => self.special_register(),
             0x88c | 0x28c => self.uisetp(),
             0x81c => self.plop3(),
@@ -153,7 +209,9 @@ impl Visitor<'_> {
             0x381 | 0x981 => self.global_load(),
             0x386 | 0x986 => self.global_store(),
             0x388 | 0x984 | 0x988 => self.shared_memory(),
+            0x38c => self.shared_atomic(),
             0xb97 | 0xb9b | 0x998 | 0x99c => self.surface_memory(),
+            0x593 => self.surface_atomic(),
             0x83b => self.matrix_load(),
             0x240 | 0x840 => self.hmnmx(),
             0x23a => self.matrix_transpose(),
@@ -188,7 +246,7 @@ impl Visitor<'_> {
                 self.write(absolute)
             }
             0x217 | 0x817 | 0xa17 => self.imnmx(),
-            0x219 | 0x419 | 0xa19 | 0xc19 => self.shift_variable(),
+            0x219 | 0x419 | 0xa19 | 0xc19 | 0x299 | 0x499 => self.shift_variable(),
             0x819 | 0x899 => self.shf(),
             0x211 | 0x811 | 0xa11 | 0xc11 => self.lea(),
             0xb82 => self.ldc(),
@@ -213,9 +271,9 @@ impl Visitor<'_> {
             0x230 => self.hadd2_float(),
             0x23e | 0xa3e => self.pack_floats(),
             0x234 | 0x434 | 0x634 => self.hsetp(),
-            0x207 | 0x807 | 0xa07 | 0x208 | 0x808 | 0xa08 => self.select(),
+            0x207 | 0x807 | 0xa07 | 0x208 | 0x808 | 0xa08 | 0x287 | 0x887 => self.select(),
             0x210 | 0x810 | 0xa10 | 0xc10 | 0x290 | 0x890 => self.iadd3(),
-            0x300 | 0xd00 | 0x309 | 0xd09 => self.bit_scan(),
+            0x300 | 0xd00 | 0x309 | 0xd09 | 0x2bd | 0x2be | 0x2bf | 0x301 => self.bit_scan(),
             0x806 | 0x886 => self.vote(),
             0x3a1 => self.match_all(),
             0x389 | 0x589 | 0x989 | 0xf89 => self.shuffle(),
@@ -228,7 +286,7 @@ impl Visitor<'_> {
             0x306 | 0xd06 => self.i2f_narrow(),
             0x308 | 0x908 | 0xb08 | 0xd08 => self.mufu(),
             0x326 | 0x526 => self.interpolate(),
-            0xb60 => self.texture_sample(),
+            0xb60 | 0xf60 | 0x361 => self.texture_sample(),
             0xb66 | 0xf66 | 0x367 => self.texture_fetch(),
             0xb6f | 0x370 => self.texture_query(),
             0xb69 | 0xf69 | 0x36a => self.texture_lod(),

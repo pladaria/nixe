@@ -1,5 +1,6 @@
 use super::prelude::*;
 use crate::object::{MonotonicClockError, TimeObject};
+use crate::timezone::{RULE_SIZE, TimeZoneRule, location_names};
 
 enum TimeTarget {
     Root,
@@ -70,6 +71,9 @@ impl SteadyClockCommand {
 enum TimeZoneCommand {
     GetDeviceLocationName,
     GetTotalLocationNameCount,
+    LoadLocationNameList,
+    LoadTimeZoneRule,
+    ToCalendarTime,
     ToCalendarTimeWithMyRule,
 }
 
@@ -78,6 +82,9 @@ impl TimeZoneCommand {
         match command_id {
             0 => Some(Self::GetDeviceLocationName),
             2 => Some(Self::GetTotalLocationNameCount),
+            3 => Some(Self::LoadLocationNameList),
+            4 => Some(Self::LoadTimeZoneRule),
+            100 => Some(Self::ToCalendarTime),
             101 => Some(Self::ToCalendarTimeWithMyRule),
             _ => None,
         }
@@ -148,7 +155,7 @@ pub(in crate::ipc_wire) async fn dispatch_time(
             dispatch_steady_clock_target(Some(session), &clock, request)
         }
         TimeTarget::Object(TimeObject::TimeZone(timezone)) => {
-            dispatch_timezone_target(Some(session), &timezone, request)
+            dispatch_timezone_target(process, Some(session), &timezone, request, hipc).await
         }
     }
 }
@@ -426,77 +433,105 @@ fn dispatch_steady_clock_target(
     }
 }
 
-pub(in crate::ipc_wire) fn dispatch_timezone(
+pub(in crate::ipc_wire) async fn dispatch_timezone(
+    process: &mut Request,
     session: &TimeZoneServiceSession,
     request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    dispatch_timezone_target(None, session, request)
+    dispatch_timezone_target(process, None, session, request, hipc).await
 }
 
-fn dispatch_timezone_target(
+async fn dispatch_timezone_target(
+    process: &mut Request,
     parent: Option<&TimeServiceSession>,
     session: &TimeZoneServiceSession,
     request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let Some(command) = TimeZoneCommand::decode(request.command_id) else {
         return unsupported_service_command("ITimeZoneService", request.command_id);
     };
+    let response =
+        |result, data: &[u8]| time_object_response(parent, request.token, result, data, &[], &[]);
+    // Rules are fixed-size map-alias buffers (0x15/0x16), not auto-select
+    // buffers (0x21/0x22). Calendar results are inline.
+    // https://switchbrew.org/wiki/Glue_services#ITimeZoneService
     match command {
-        TimeZoneCommand::GetDeviceLocationName => time_object_response(
-            parent,
-            request.token,
+        TimeZoneCommand::GetDeviceLocationName => {
+            response(HorizonIpcResult::SUCCESS, &session.location_name())
+        }
+        TimeZoneCommand::GetTotalLocationNameCount => response(
             HorizonIpcResult::SUCCESS,
-            &session.location_name(),
-            &[],
-            &[],
+            &(location_names().count() as u32).to_le_bytes(),
         ),
-        TimeZoneCommand::GetTotalLocationNameCount => time_object_response(
-            parent,
-            request.token,
-            HorizonIpcResult::SUCCESS,
-            &1_u32.to_le_bytes(),
-            &[],
-            &[],
-        ),
-        TimeZoneCommand::ToCalendarTimeWithMyRule => {
-            let Some(timestamp) = request_u64(request.data, 0) else {
-                return time_object_response(
-                    parent,
-                    request.token,
-                    HorizonIpcResult::CMIF_INVALID_IN_HEADER,
-                    &[],
-                    &[],
-                    &[],
-                );
+        TimeZoneCommand::LoadLocationNameList => {
+            let Some(start) = request_i32(request.data, 0).filter(|&value| value >= 0) else {
+                return response(HorizonIpcResult::TIME_ZONE_OUT_OF_RANGE, &[]);
             };
-            let Ok(timestamp) = i64::try_from(timestamp) else {
-                return time_object_response(
-                    parent,
-                    request.token,
-                    HorizonIpcResult::SF_PRECONDITION_VIOLATION,
-                    &[],
-                    &[],
-                    &[],
-                );
-            };
-            let Some(data) = encode_calendar_time(session.timezone(), timestamp) else {
-                return time_object_response(
-                    parent,
-                    request.token,
-                    HorizonIpcResult::SF_PRECONDITION_VIOLATION,
-                    &[],
-                    &[],
-                    &[],
-                );
-            };
-            time_object_response(
-                parent,
-                request.token,
+            let output = one_receive_buffer(process, hipc)?;
+            let capacity = usize::try_from(output.size / 0x24).unwrap_or(usize::MAX);
+            let names: Vec<_> = location_names()
+                .skip(start as usize)
+                .take(capacity)
+                .collect();
+            process.reserve_payload(names.len() * 0x24).await?;
+            let mut data = vec![0; names.len() * 0x24];
+            for (slot, name) in data.chunks_exact_mut(0x24).zip(&names) {
+                slot[..name.len()].copy_from_slice(name.as_bytes());
+            }
+            process.write(output, 0, &mut data).await?;
+            response(
                 HorizonIpcResult::SUCCESS,
-                &data,
-                &[],
-                &[],
+                &(names.len() as u32).to_le_bytes(),
             )
+        }
+        TimeZoneCommand::LoadTimeZoneRule => {
+            let Some(name) = request.data.get(..0x24) else {
+                return response(HorizonIpcResult::CMIF_INVALID_IN_HEADER, &[]);
+            };
+            let length = name
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(name.len());
+            let Ok(name) = std::str::from_utf8(&name[..length]) else {
+                return response(HorizonIpcResult::TIME_ZONE_NOT_FOUND, &[]);
+            };
+            let output = one_receive_buffer(process, hipc)?;
+            if output.size < RULE_SIZE as u64 {
+                return response(HorizonIpcResult::TIME_ZONE_OUT_OF_RANGE, &[]);
+            }
+            process.reserve_payload(RULE_SIZE).await?;
+            let rule = match TimeZoneRule::load(name) {
+                Ok(rule) => rule,
+                Err(error) => return response(error, &[]),
+            };
+            let mut bytes = rule.into_bytes();
+            process.write(output, 0, &mut bytes).await?;
+            response(HorizonIpcResult::SUCCESS, &[])
+        }
+        TimeZoneCommand::ToCalendarTime | TimeZoneCommand::ToCalendarTimeWithMyRule => {
+            let Some(timestamp) = request_i64(request.data, 0) else {
+                return response(HorizonIpcResult::CMIF_INVALID_IN_HEADER, &[]);
+            };
+            let explicit;
+            let rule = if command == TimeZoneCommand::ToCalendarTime {
+                let input = one_send_buffer(process, hipc)?;
+                if input.size < RULE_SIZE as u64 {
+                    return response(HorizonIpcResult::TIME_ZONE_OUT_OF_RANGE, &[]);
+                }
+                process.reserve_payload(RULE_SIZE).await?;
+                let mut bytes = vec![0; RULE_SIZE];
+                process.read(input, 0, &mut bytes).await?;
+                explicit = TimeZoneRule::decode(bytes.into_boxed_slice().try_into().unwrap());
+                explicit.as_ref().map_err(|&error| error)
+            } else {
+                session.timezone_rule()
+            };
+            match rule.and_then(|rule| rule.calendar(timestamp)) {
+                Ok(data) => response(HorizonIpcResult::SUCCESS, &data),
+                Err(error) => response(error, &[]),
+            }
         }
     }
 }
@@ -533,45 +568,5 @@ fn time_response(
         semantic_success(token, false, data, copy_handles, &[], None)
     } else {
         Ok((encode_response(token, result, data, None)?, None))
-    }
-}
-
-fn encode_calendar_time(timezone: chrono_tz::Tz, timestamp: i64) -> Option<[u8; 0x20]> {
-    let utc = chrono::DateTime::from_timestamp(timestamp, 0)?;
-    let local = utc.with_timezone(&timezone);
-    let year = u16::try_from(local.year()).ok()?;
-    let mut data = [0_u8; 0x20];
-    data[..2].copy_from_slice(&year.to_le_bytes());
-    data[2] = local.month() as u8;
-    data[3] = local.day() as u8;
-    data[4] = local.hour() as u8;
-    data[5] = local.minute() as u8;
-    data[6] = local.second() as u8;
-    data[8..12].copy_from_slice(&local.weekday().num_days_from_sunday().to_le_bytes());
-    data[12..16].copy_from_slice(&local.ordinal0().to_le_bytes());
-    let abbreviation = local.format("%Z").to_string();
-    let abbreviation = abbreviation.as_bytes();
-    let abbreviation_len = abbreviation.len().min(8);
-    data[16..16 + abbreviation_len].copy_from_slice(&abbreviation[..abbreviation_len]);
-    let dst = u32::from(local.offset().dst_offset().num_seconds() != 0);
-    data[24..28].copy_from_slice(&dst.to_le_bytes());
-    let offset = local.offset().fix().local_minus_utc();
-    data[28..32].copy_from_slice(&offset.to_le_bytes());
-    Some(data)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::encode_calendar_time;
-
-    #[test]
-    fn calendar_conversion_uses_the_configured_timezone() {
-        let encoded = encode_calendar_time(chrono_tz::Europe::Madrid, 0).unwrap();
-        assert_eq!(u16::from_le_bytes(encoded[..2].try_into().unwrap()), 1970);
-        assert_eq!(&encoded[2..7], &[1, 1, 1, 0, 0]);
-        assert_eq!(
-            i32::from_le_bytes(encoded[28..32].try_into().unwrap()),
-            3600
-        );
     }
 }

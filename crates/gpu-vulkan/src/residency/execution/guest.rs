@@ -61,6 +61,14 @@ impl Residency<'_> {
                 _ => (),
             }
         }
+        for slot in &resources.texels {
+            if let Some(range) = self.runtime.buffer_bindings.channel.texel_buffers[STAGE]
+                [slot.slot]
+                .and_then(|binding| binding.native)
+            {
+                self.ensure_buffer_range(range.buffer, range.offset, range.size)?;
+            }
+        }
         Ok(())
     }
     pub(crate) fn configure_guest_buffers<const STAGE: usize, const STORAGE: bool>(
@@ -205,7 +213,8 @@ impl Residency<'_> {
                             DescriptorEntry {
                                 buffer: vk::DescriptorBufferInfo::default()
                                     .buffer(binding.native.handle)
-                                    .range(binding.native.size()),
+                                    .offset(binding.offset)
+                                    .range(binding.size),
                             },
                         );
                     }
@@ -224,6 +233,54 @@ impl Residency<'_> {
                     }
                 }
             }
+        }
+        for slot in &resources.texels {
+            let binding = self.runtime.buffer_bindings.channel.texel_buffers[STAGE][slot.slot];
+            let view = if let Some(binding) = binding {
+                let range = binding
+                    .native
+                    .ok_or(VulkanError::InvalidResource("texel buffer not prepared"))?;
+                let limits = &self.runtime.device.profile().limits;
+                let kind = pipeline.layout.key.bindings[slot.descriptor].kind;
+                let required = if kind == vk::DescriptorType::STORAGE_TEXEL_BUFFER {
+                    vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER
+                } else {
+                    vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER
+                };
+                if range.size == 0
+                    || !range.size.is_multiple_of(u64::from(binding.element_bytes))
+                    || range.size / u64::from(binding.element_bytes)
+                        > u64::from(limits.max_texel_buffer_elements)
+                    || !range
+                        .offset
+                        .is_multiple_of(limits.min_texel_buffer_offset_alignment.max(1))
+                    || !self
+                        .runtime
+                        .device
+                        .format_properties(binding.format)
+                        .buffer_features
+                        .contains(required)
+                {
+                    return Err(VulkanError::InvalidResource(
+                        "texel buffer format/size/alignment exceeds native support",
+                    ));
+                }
+                self.use_buffer(range.buffer, range.offset, range.size)?;
+                self.buffer_cache.get(range.buffer).native.texel_view(
+                    range.offset,
+                    range.size,
+                    binding.format,
+                )?
+            } else if self.runtime.device.profile().null_descriptor {
+                vk::BufferView::null()
+            } else {
+                return Err(VulkanError::InvalidResource(
+                    "null texel buffer requires nullDescriptor support",
+                ));
+            };
+            self.runtime
+                .descriptor_queue
+                .write(slot.descriptor, DescriptorEntry { texel: view });
         }
         Ok(())
     }
@@ -273,6 +330,15 @@ impl Residency<'_> {
             return Ok(());
         }
         for (stage, resources) in resources.stages.iter().enumerate() {
+            for slot in &resources.texels {
+                if pipeline.resources[slot.descriptor].writes()
+                    && let Some(range) = self.runtime.buffer_bindings.channel.texel_buffers[stage]
+                        [slot.slot]
+                        .and_then(|binding| binding.native)
+                {
+                    self.finish_buffer_write(range.buffer, range.offset, range.size)?;
+                }
+            }
             for slot in &resources.storage {
                 if !pipeline.resources[slot.descriptor].writes() {
                     continue;
@@ -325,6 +391,7 @@ impl Residency<'_> {
             for storage in &resources.storage {
                 self.update_storage_buffer(5, storage.slot, space)?;
             }
+            self.update_texel_buffers(5, resources)?;
             if !self.runtime.buffer_bindings.channel.has_deleted_buffers {
                 return Ok(());
             }

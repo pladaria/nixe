@@ -466,11 +466,16 @@ pub(crate) fn run_guest<D: ExceptionDispatcher>(
                 }
             }
             _ => {
+                let frames = report
+                    .context
+                    .as_ref()
+                    .map(|context| process.capture_exit_stack_frames(thread.id(), context));
+                let diagnostic = format!("{report} frames={frames:?}");
                 with_current(|core| {
                     core.shared.fail(RuntimeError::Execution {
                         process: core.resident.as_ref().unwrap().lease.process,
                         thread: thread.id(),
-                        diagnostic: report.to_string().into(),
+                        diagnostic: diagnostic.into(),
                     })
                 });
                 process.finish_process(nixe_scheduler::ProcessLifecycle::Faulted, None);

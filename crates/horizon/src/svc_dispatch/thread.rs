@@ -62,7 +62,7 @@ impl HorizonSvcDispatcher {
             "SetThreadCoreMask",
             move |dispatcher, context, thread, guard| {
                 let scheduler = context.process().scheduler();
-                match scheduler.migrate(GuestThreadId::new(thread.thread_id()), ideal, affinity) {
+                match scheduler.migrate(thread.id(), ideal, affinity) {
                     Ok(()) => dispatcher.finish_property_change(
                         context,
                         thread,
@@ -140,7 +140,7 @@ impl HorizonSvcDispatcher {
             move |dispatcher, context, thread, guard| match context
                 .process()
                 .scheduler()
-                .set_activity(GuestThreadId::new(thread.thread_id()), activity == 1)
+                .set_activity(thread.id(), activity == 1)
             {
                 Ok(()) if activity == 1 => dispatcher.finish_property_change(
                     context,
@@ -289,7 +289,7 @@ impl HorizonSvcDispatcher {
             result(context, HorizonKernelResult::INVALID_HANDLE);
             return resume();
         };
-        let target = GuestThreadId::new(thread.thread_id());
+        let target = thread.id();
         let caller = context.thread().id();
         let scheduler = context.process().scheduler().clone();
         if local {

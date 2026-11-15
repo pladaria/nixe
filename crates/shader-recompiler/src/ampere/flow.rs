@@ -182,7 +182,7 @@ fn analyze_function(
                     if guard == Condition::always(true) && branch == Condition::always(true) {
                         break;
                     }
-                } else if op == 0x949 {
+                } else if matches!(op, 0x949 | 0x958) {
                     boundaries.insert(next);
                     unresolved.insert(pc);
                     break;
@@ -269,7 +269,7 @@ fn analyze_function(
         while !boundaries.contains(&end)
             && !matches!(
                 last.opcode(),
-                0x944 | 0x947 | 0x949 | 0x94d | 0x950 | 0x957 | 0x95b
+                0x944 | 0x947 | 0x949 | 0x958 | 0x94d | 0x950 | 0x957 | 0x95b
             )
         {
             let Some(&following) = code.get(&end) else {
@@ -282,10 +282,13 @@ fn analyze_function(
         let mut block = FlowBlock::at(Location(pc), ());
         let is_control = matches!(
             last.opcode(),
-            0x944 | 0x947 | 0x949 | 0x94d | 0x950 | 0x957 | 0x95b
+            0x944 | 0x947 | 0x949 | 0x958 | 0x94d | 0x950 | 0x957 | 0x95b
         );
         block.end = FlowLocation::Instruction(Location(
-            if matches!(last.opcode(), 0x944 | 0x947 | 0x949 | 0x950 | 0x957 | 0x95b) {
+            if matches!(
+                last.opcode(),
+                0x944 | 0x947 | 0x949 | 0x958 | 0x950 | 0x957 | 0x95b
+            ) {
                 ProgramOffset(end.0 - 16)
             } else {
                 end
@@ -346,7 +349,7 @@ fn analyze_function(
                 block.branch_true = Some(successor(end)?);
             }
 
-            0x949 => {
+            0x949 | 0x958 => {
                 let table = &indirect[&ProgramOffset(end.0 - 16)];
                 block.end_class = EndClass::IndirectBranch;
                 block.branch_reg = table.register;

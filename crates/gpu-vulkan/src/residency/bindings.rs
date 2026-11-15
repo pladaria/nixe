@@ -24,6 +24,7 @@ pub(crate) struct BufferChannel {
     pub(crate) dirty_vertex_buffers: u32,
     pub(crate) index_buffer: Option<IndexBuffer>,
     pub(crate) storage_buffers: [Box<[Option<StorageBuffer>]>; 6],
+    pub(crate) texel_buffers: [Vec<Option<TexelBuffer>>; 6],
     pub(crate) compute_uniform_buffers: Box<[Option<UniformBuffer>]>,
     pub(crate) has_deleted_buffers: bool,
     pub(crate) streamed_uniforms: [u32; 6],
@@ -50,6 +51,7 @@ impl Default for BufferChannel {
                 vec![None; nixe_shader_recompiler::artifact::MAX_SSBOS].into_boxed_slice()
             }),
             compute_uniform_buffers: vec![None; 8].into_boxed_slice(),
+            texel_buffers: Default::default(),
             has_deleted_buffers: false,
             streamed_uniforms: [0; 6],
             address_space: None,
@@ -67,6 +69,13 @@ pub(crate) struct UniformBuffer {
     /// Shader coverage already resolved against the current guest mapping.
     /// A hardware bank may declare more bytes than its backed extent.
     pub(crate) resolved_size: u64,
+    pub(crate) native: Option<BufferRange>,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct TexelBuffer {
+    pub(crate) source: GuestBufferRange,
+    pub(crate) format: vk::Format,
+    pub(crate) element_bytes: u32,
     pub(crate) native: Option<BufferRange>,
 }
 /// Descriptor contents and virtual mappings identify a storage selection.
@@ -166,6 +175,11 @@ impl BufferBindings {
                 }
             }) {
                 storage.native = None;
+            }
+        }
+        for texel in channel.texel_buffers.iter_mut().flatten().flatten() {
+            if texel.native.is_some_and(|range| range.buffer == id) {
+                texel.native = None;
             }
         }
         for uniform in channel.compute_uniform_buffers.iter_mut().flatten() {

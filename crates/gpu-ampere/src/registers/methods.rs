@@ -387,8 +387,12 @@ pub(super) const fn scalar(class: Class, method: u32) -> Option<(&'static str, b
             0x1438 => Some(("SET_GLOBAL_BASE_INSTANCE_INDEX", true)),
             0x1450 => Some(("SET_PS_WARP_WATERMARKS", true)),
             0x1454 => Some(("SET_PS_REGISTER_WATERMARKS", true)),
-            0x1464 => Some(("STORE_ZCULL", false)),
-            0x1500 => Some(("LOAD_ZCULL", false)),
+            // @SIMPLIFICATION: store/load/invalidate maintain only the guest's
+            // hierarchical Z-cull cache. Host depth/stencil tests own visibility,
+            // so retain the register values without an effect or a cache copy.
+            // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/engines/maxwell_3d.cpp#L160-L228
+            0x1464 => Some(("STORE_ZCULL", true)),
+            0x1500 => Some(("LOAD_ZCULL", true)),
             0x1504 => Some(("SET_SURFACE_CLIP_ID_HEIGHT", true)),
             0x1508 => Some(("SET_CLIP_ID_CLEAR_RECT_HORIZONTAL", true)),
             0x150c => Some(("SET_CLIP_ID_CLEAR_RECT_VERTICAL", true)),
@@ -485,7 +489,7 @@ pub(super) const fn scalar(class: Class, method: u32) -> Option<(&'static str, b
             0x1948 => Some(("SET_PRIMITIVE_TOPOLOGY_CONTROL", true)),
             0x194c => Some(("SET_WINDOW_CLIP_ENABLE", true)),
             0x1950 => Some(("SET_WINDOW_CLIP_TYPE", true)),
-            0x1958 => Some(("INVALIDATE_ZCULL", false)),
+            0x1958 => Some(("INVALIDATE_ZCULL", true)),
             0x1968 => Some(("SET_ZCULL", true)),
             0x196c => Some(("SET_ZCULL_BOUNDS", true)),
             0x1970 => Some(("SET_PRIMITIVE_TOPOLOGY", true)),

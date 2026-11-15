@@ -122,6 +122,50 @@ impl EmitContext<'_> {
         let b = self.types.bool;
         let result = match opcode {
             O::LaneId => self.lane_id()?,
+            O::SubgroupReduceAdd
+            | O::SubgroupReduceUMin
+            | O::SubgroupReduceUMax
+            | O::SubgroupReduceSMin
+            | O::SubgroupReduceSMax
+            | O::SubgroupReduceOr
+            | O::SubgroupReduceXor => {
+                if !supported
+                    || !self.profile.support_subgroup_arithmetic
+                    || self.profile.max_subgroup_size != 32
+                {
+                    return Err(unsupported(
+                        "Warp reductions require 32-lane subgroup arithmetic",
+                    ));
+                }
+                self.builder
+                    .capability(spirv::Capability::GroupNonUniformArithmetic)?;
+                let op = match opcode {
+                    O::SubgroupReduceAdd => Op::GroupNonUniformIAdd,
+                    O::SubgroupReduceUMin => Op::GroupNonUniformUMin,
+                    O::SubgroupReduceUMax => Op::GroupNonUniformUMax,
+                    O::SubgroupReduceSMin => Op::GroupNonUniformSMin,
+                    O::SubgroupReduceSMax => Op::GroupNonUniformSMax,
+                    O::SubgroupReduceOr => Op::GroupNonUniformBitwiseOr,
+                    _ => Op::GroupNonUniformBitwiseXor,
+                };
+                let signed = matches!(opcode, O::SubgroupReduceSMin | O::SubgroupReduceSMax);
+                let ty = if signed { self.types.s32[0] } else { u };
+                let mut value = self.def(ir, ir.inst(id)?.arg(0)?)?;
+                if signed {
+                    value = self.op(Op::Bitcast, ty, &[value])?;
+                }
+                let scope = self.const_u32(Scope::Subgroup as u32)?;
+                let value = self.op(
+                    op,
+                    ty,
+                    &[scope, Id(spirv::GroupOperation::Reduce as u32), value],
+                )?;
+                if signed {
+                    self.op(Op::Bitcast, u, &[value])?
+                } else {
+                    value
+                }
+            }
             O::VoteAll | O::VoteAny | O::VoteEqual | O::SubgroupBallot => {
                 let pred = self.def(ir, ir.inst(id)?.arg(0)?)?;
                 if !supported {

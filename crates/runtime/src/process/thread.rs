@@ -58,6 +58,7 @@ pub enum ThreadStartError {
 /// Scheduling fields belong to the same generational ID in SchedulerState.
 pub struct ThreadObject {
     id: AtomicU64,
+    public_id: u64,
     registers: Mutex<Option<GuestCpuState>>,
     exit: Mutex<Option<ThreadExit>>,
     pub stack_bottom: GuestVirtualAddress,
@@ -159,6 +160,7 @@ impl ThreadObject {
     ) -> Self {
         Self {
             id: AtomicU64::new(id.get()),
+            public_id: kernel.allocate_thread_identity(),
             registers: Mutex::new(Some(state)),
             exit: Mutex::new(None),
             stack_bottom,
@@ -173,12 +175,15 @@ impl ThreadObject {
         }
     }
     pub fn id(&self) -> GuestThreadId {
-        GuestThreadId::new(self.thread_id())
+        GuestThreadId::new(self.id.load(Ordering::Acquire))
     }
+    /// Horizon thread IDs never reuse a destroyed thread's identity.
+    /// https://switchbrew.org/wiki/SVC#GetThreadId
+    /// https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/kernel/kernel.cpp#L1072
     pub fn thread_id(&self) -> u64 {
-        self.id.load(Ordering::Acquire)
+        self.public_id
     }
-    pub(crate) fn assign_thread_id(&self, id: u64) {
+    pub(crate) fn assign_scheduler_id(&self, id: u64) {
         self.id.store(id, Ordering::Release);
     }
     pub(crate) fn bind_retirement(

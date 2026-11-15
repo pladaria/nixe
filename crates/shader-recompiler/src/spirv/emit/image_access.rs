@@ -18,20 +18,19 @@ impl EmitContext<'_> {
             .copied()
             .ok_or_else(|| invariant("Image descriptor index out of range"))
     }
-    fn nonuniform(&mut self, id: Id) -> Result<()> {
+    pub(super) fn nonuniform(&mut self, id: Id) -> Result<()> {
         if self.non_uniform_ids.insert(id) {
             self.builder.decorate(id, Decoration::NonUniform, &[])?;
         }
         Ok(())
     }
-    pub(super) fn image_object(
+    pub(super) fn image_pointer(
         &mut self,
         ir: &Ir,
         info: TextureInstInfo,
         index: Value,
         storage: bool,
-        raw: bool,
-    ) -> Result<(Id, bool)> {
+    ) -> Result<(ImageDefinition, Id, bool)> {
         let def = self.image_definition(info, storage)?;
         let buffer = info.texture_type() == TextureType::Buffer;
         let kind = match (storage, buffer) {
@@ -56,16 +55,23 @@ impl EmitContext<'_> {
                 self.nonuniform(index)?;
                 self.uses_nonuniform[kind] = true;
             }
-            pointer = self.op(
-                Op::AccessChain,
-                if !storage && buffer {
-                    self.objects.image_buffer_type
-                } else {
-                    def.pointer_type
-                },
-                &[pointer, index],
-            )?;
+            pointer = self.op(Op::AccessChain, def.pointer_type, &[pointer, index])?;
         }
+        if marked {
+            self.nonuniform(pointer)?;
+        }
+        Ok((def, pointer, marked))
+    }
+    pub(super) fn image_object(
+        &mut self,
+        ir: &Ir,
+        info: TextureInstInfo,
+        index: Value,
+        storage: bool,
+        raw: bool,
+    ) -> Result<(Id, bool)> {
+        let (def, pointer, marked) = self.image_pointer(ir, info, index, storage)?;
+        let buffer = info.texture_type() == TextureType::Buffer;
         let ty = if storage || buffer {
             def.image_type
         } else {
@@ -73,7 +79,6 @@ impl EmitContext<'_> {
         };
         let object = self.op(Op::Load, ty, &[pointer])?;
         if marked {
-            self.nonuniform(pointer)?;
             self.nonuniform(object)?;
         }
         let object = if raw && !storage && !buffer {
@@ -85,15 +90,9 @@ impl EmitContext<'_> {
         } else {
             object
         };
-        Ok((
-            object,
-            if buffer && !storage {
-                false
-            } else {
-                def.is_integer
-            },
-        ))
+        Ok((object, def.is_integer))
     }
+
     pub(super) fn image_result(
         &mut self,
         ir: &mut Ir,

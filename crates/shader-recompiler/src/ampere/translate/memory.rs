@@ -1,6 +1,33 @@
 use super::*;
 
 impl Visitor<'_> {
+    pub(super) fn shared_atomic(&mut self) -> Result<()> {
+        let i = self.instruction;
+        let operation = i.bits(87, 4);
+        let offset = ((i.bits(40, 24) as i32) << 8 >> 8) as u32;
+        if i.bits(64, 32) & !0x07800200 != 0 || operation > 8 || offset & 3 != 0 {
+            return Err(unsupported("Native shared atomic mode"));
+        }
+        // ATOMS uses a signed 24-bit byte displacement, verified with nvdisasm.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h#L1475-L1486
+        let address = self.reg(i.bits(24, 8))?;
+        let address = self.emit.i_add(address, Value::U32(offset))?;
+        let value = self.reg(i.bits(32, 8))?;
+        let signed = i.bits(73, 1) != 0;
+        let result = match operation {
+            0 => self.emit.shared_atomic_i_add(address, value)?,
+            1 => self.emit.shared_atomic_i_min(address, value, signed)?,
+            2 => self.emit.shared_atomic_i_max(address, value, signed)?,
+            3 => self.emit.shared_atomic_inc(address, value)?,
+            4 => self.emit.shared_atomic_dec(address, value)?,
+            5 => self.emit.shared_atomic_and(address, value)?,
+            6 => self.emit.shared_atomic_or(address, value)?,
+            7 => self.emit.shared_atomic_xor(address, value)?,
+            _ => self.emit.shared_atomic_exchange(address, value)?,
+        };
+        self.write(result)
+    }
+
     pub(super) fn shared_memory(&mut self) -> Result<()> {
         let i = self.instruction;
         let kind = i.bits(73, 3);
@@ -244,6 +271,10 @@ impl Visitor<'_> {
         Ok(())
     }
     pub(super) fn global_load(&mut self) -> Result<()> {
+        let address = self.global_load_address()?;
+        self.global_load_value(address)
+    }
+    pub(super) fn global_load_address(&mut self) -> Result<Value> {
         let i = self.instruction;
         let size = i.bits(73, 3);
         let address_reg = Reg(i.bits(24, 8) as u8);
@@ -251,8 +282,8 @@ impl Visitor<'_> {
         let words = if size <= 4 { 1 } else { 1 << (size - 4) };
         let uniform = i.opcode() == 0x981;
         if size > 6
-            || (!uniform && (i.bits(32, 8) != 0 || i.bits(64, 32) & !0x2e00 != 0x001e8100))
-            || (uniform && (i.bits(38, 2) != 0 || i.bits(64, 32) & !0x04002e00 != 0x081e8100))
+            || (!uniform && (i.bits(32, 8) != 0 || i.bits(64, 32) & !0x2e0f != 0x001e8100))
+            || (uniform && (i.bits(38, 2) != 0 || i.bits(64, 32) & !0x04002e0f != 0x081e8100))
             || (dest != Reg::RZ
                 && (u32::from(dest.0) % words != 0 || u32::from(dest.0) + words > 255))
         {
@@ -268,7 +299,13 @@ impl Visitor<'_> {
             self.address_pair(u32::from(address_reg.0), false)?
         };
         let offset = ((i.bits(40, 24) as i32) << 8 >> 8) as u64;
-        let address = self.emit.i_add(base, Value::U64(offset))?;
+        self.emit.i_add(base, Value::U64(offset))
+    }
+    pub(super) fn global_load_value(&mut self, address: Value) -> Result<()> {
+        let i = self.instruction;
+        let size = i.bits(73, 3);
+        let words = if size <= 4 { 1 } else { 1 << (size - 4) };
+        let dest = Reg(i.bits(16, 8) as u8);
         let value = match size {
             0 => self.emit.load_global_u8(address)?,
             1 => self.emit.load_global_s8(address)?,
@@ -287,7 +324,7 @@ impl Visitor<'_> {
             let register = if dest == Reg::RZ {
                 dest
             } else {
-                dest.offset(word as i32)?
+                dest.offset(word)?
             };
             self.emit.set_reg(register, component)?;
         }

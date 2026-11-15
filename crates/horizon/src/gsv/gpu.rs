@@ -1,6 +1,7 @@
 //! Switch 2 address spaces retain canonical physical allocations independently
 //! of CPU virtual mappings. A memory handle is not itself a GPU mapping.
-use nixe_memory::device_memory::{DeviceMapping, DeviceMemory, DeviceReservation};
+use nixe_memory::device_memory::DeviceMemory;
+use nixe_memory::{AddressSpaceId, DeviceHeapMapping, DeviceHeapMemory};
 use nixe_memory::{CapturedMemory, MemoryError, PAGE_SIZE};
 use nixe_runtime::{EventObject, memory::GpuMemoryLease};
 use std::{
@@ -16,7 +17,7 @@ pub(crate) const VA_END: u64 = 0xc0_0000_0000;
 
 #[derive(Debug)]
 pub(crate) struct GpuContext {
-    pub memory: DeviceMemory,
+    pub heap: DeviceHeapMemory,
     pub created: bool,
     pub initialized: bool,
     pub worker_ready: bool,
@@ -30,9 +31,9 @@ pub(crate) struct GpuContext {
     pub next_device: u32,
 }
 impl GpuContext {
-    pub fn new(memory: DeviceMemory) -> Self {
+    pub fn new(heap: DeviceHeapMemory) -> Self {
         Self {
-            memory,
+            heap,
             created: false,
             initialized: false,
             worker_ready: false,
@@ -50,10 +51,12 @@ impl GpuContext {
 #[derive(Debug)]
 pub(crate) struct GpuAddressSpace {
     pub memory: DeviceMemory,
+    heap: DeviceHeapMemory,
+    process: AddressSpaceId,
     id: u64,
     generation: u64,
     pub mappings: BTreeMap<u64, GpuMapping>,
-    pub sync_mapping: Option<PhysicalMap>,
+    pub sync_mapping: Option<Arc<DeviceHeapMapping>>,
     regions: BTreeMap<u64, NativeRegion>,
 }
 struct NativeRegion {
@@ -102,26 +105,9 @@ pub(crate) struct GpuMapping {
     pub kind: u8,
     pub memory_handle: Option<u32>,
     pub offset: u64,
-    pub physical: Arc<PhysicalMap>,
+    pub physical: Arc<DeviceHeapMapping>,
     // Drop the SMMU lease before allowing CPU unsharing/freeing of its backing.
     pub source: Backing,
-}
-/// Drop the SMMU mapping before returning its device-address reservation.
-#[derive(Debug)]
-pub(crate) struct PhysicalMap {
-    pub pin: DeviceMapping,
-    reservation: Arc<DeviceReservation>,
-}
-impl PhysicalMap {
-    pub fn new(
-        memory: &DeviceMemory,
-        ranges: Vec<nixe_memory::AllocationRange>,
-    ) -> Result<Self, MemoryError> {
-        let bytes = ranges.iter().map(|range| range.bytes()).sum();
-        let reservation = Arc::new(memory.reserve(bytes, PAGE_SIZE)?);
-        let pin = memory.map(reservation.address(), ranges.into(), true)?;
-        Ok(Self { pin, reservation })
-    }
 }
 pub(crate) struct TileMapping {
     pub address: u64,
@@ -131,10 +117,12 @@ pub(crate) struct TileMapping {
     pub kind: u8,
 }
 impl GpuAddressSpace {
-    pub fn new(memory: DeviceMemory) -> Self {
+    pub fn new(heap: DeviceHeapMemory, process: AddressSpaceId) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
-            memory,
+            memory: heap.device().clone(),
+            heap,
+            process,
             id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             generation: 0,
             mappings: BTreeMap::new(),
@@ -199,7 +187,14 @@ impl GpuAddressSpace {
             ));
         }
         let ranges = source.capture(offset, bytes)?;
-        let physical = Arc::new(PhysicalMap::new(&self.memory, ranges)?);
+        let cpu = match &source {
+            Backing::Cpu(source) => Some((
+                self.process,
+                nixe_memory::GuestVirtualAddress::new(source.cpu_address().get() + offset),
+            )),
+            Backing::Native(_) => None,
+        };
+        let physical = self.heap.map(ranges.into(), bytes, cpu)?;
         self.generation = self.generation.wrapping_add(1);
         self.mappings.insert(
             address,
@@ -364,7 +359,7 @@ impl GpuAddressSpace {
                 let Some(map) = &self.sync_mapping else {
                     return false;
                 };
-                (VA_END - PAGE_SIZE, map, end)
+                (VA_END - PAGE_SIZE, &**map, end)
             } else {
                 let Some((&base, mapping)) = self
                     .mappings
@@ -378,7 +373,7 @@ impl GpuAddressSpace {
             };
             let low = at - base;
             let stop = high - base;
-            let spans = map.pin.physical().spans();
+            let spans = map.physical().spans();
             let first = spans.partition_point(|s| s.logical + s.bytes <= low);
             let mut covered = low;
             for span in &spans[first..] {
@@ -416,11 +411,7 @@ impl GpuAddressSpace {
             if (VA_END - PAGE_SIZE..VA_END).contains(&at)
                 && let Some(sync) = &self.sync_mapping
             {
-                ranges.extend(
-                    sync.pin
-                        .physical()
-                        .pin(at - (VA_END - PAGE_SIZE), end - at)?,
-                );
+                ranges.extend(sync.physical().pin(at - (VA_END - PAGE_SIZE), end - at)?);
                 break;
             }
             let (&start, mapping) = self
@@ -501,15 +492,7 @@ impl GpuAddressSpace {
                     continue;
                 }
                 let offset = old.offset + low - start;
-                let ranges = old.source.capture(offset, high - low)?;
-                let physical = Arc::new(PhysicalMap {
-                    pin: self.memory.map(
-                        old.physical.pin.address() + low - start,
-                        ranges.into(),
-                        true,
-                    )?,
-                    reservation: old.physical.reservation.clone(),
-                });
+                let physical = old.physical.slice(low - start, high - low)?;
                 survivors.push((
                     low,
                     GpuMapping {
@@ -566,14 +549,14 @@ impl nixe_gpu::native::ImageAddressSpace for GpuAddressSpace {
             return Ok(self
                 .sync_mapping
                 .as_ref()
-                .map(|m| m.pin.address() + address - (VA_END - PAGE_SIZE)));
+                .map(|m| m.address() + address - (VA_END - PAGE_SIZE)));
         }
         Ok(self
             .mappings
             .range(..=address)
             .next_back()
             .filter(|(_, m)| m.end > address)
-            .map(|(&start, m)| m.physical.pin.address() + address - start))
+            .map(|(&start, m)| m.physical.address() + address - start))
     }
     fn image_mapped_ranges(
         &self,
@@ -598,7 +581,7 @@ impl nixe_gpu::native::ImageAddressSpace for GpuAddressSpace {
             if low >= high {
                 continue;
             }
-            let device = mapping.physical.pin.address() + low - start;
+            let device = mapping.physical.address() + low - start;
             if let Some(last) = ranges.last_mut()
                 && last.0 + last.1 == low
                 && previous_device_end == Some(device)
@@ -671,13 +654,13 @@ impl<'a> GpuMemory<'a> {
         let device = if address >= VA_END - PAGE_SIZE {
             self.sync_mapping
                 .as_ref()
-                .map(|m| m.pin.address() + address - (VA_END - PAGE_SIZE))
+                .map(|m| m.address() + address - (VA_END - PAGE_SIZE))
         } else {
             self.mappings
                 .range(..=address)
                 .next_back()
                 .filter(|(_, m)| m.end >= end)
-                .map(|(&start, m)| m.physical.pin.address() + address - start)
+                .map(|(&start, m)| m.physical.address() + address - start)
         };
         Ok(device.and_then(|device| self.memory.span(device, bytes).map(|host| (device, host))))
     }

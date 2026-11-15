@@ -238,6 +238,7 @@ pub struct ResidencyStatistics {
 /// Concrete single-owner storage, selected once at startup. No generic backend
 /// handle registry, virtual resource dispatch or guest-ISA branch in its hot path.
 mod bindings;
+mod texels;
 pub(crate) use bindings::{StorageBuffer, StorageBufferBinding, StorageBufferKey};
 pub(crate) mod texture_bindings;
 pub struct VulkanResidency {

@@ -598,6 +598,14 @@ impl Preparation {
         }
         match m {
             0x100 | 0x1a2c => Ok(()),
+            0x2e0 if class == Class::ThreeD => {
+                // @SIMPLIFICATION: DECOMPRESS_SURFACE materializes a render
+                // target's hardware color-compression metadata. Cached images
+                // and guest publications already contain the decoded pixels;
+                // there is no compression state to resolve or extra copy to do.
+                // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/engines/maxwell_3d.h
+                Ok(())
+            }
             0x110 | 0x13c | 0x1144 | 0x11f4 | 0x56c | 0x570 | 0xdec => host.barrier(),
             0x148 | 0x14c => Ok(()), // One ordered owner; no intra-channel interleaving.
             0x21c | 0x1288 | 0x1330 | 0x1334 | 0x1338 | 0x1424 | 0x1428 | 0x244 if class.mme() => {
@@ -712,7 +720,11 @@ impl Preparation {
     }
 }
 fn copy(regs: &Registers, flags: u32, host: &mut impl PreparationHost) -> Result<()> {
-    if flags & !0x0200_039f != 0 || flags & 3 == 3 || flags & 0x18 > 0x10 {
+    // @SIMPLIFICATION: DISABLE_PLC controls the hardware compression path.
+    // Copies operate on decoded storage, so this flag does not change their
+    // bytes or ordering and requires no separate compression state.
+    // https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/common/sdk/nvidia/inc/class/clc7b5.h
+    if flags & !0x0600_039f != 0 || flags & 3 == 3 || flags & 0x18 > 0x10 {
         return Err("unsupported DMA launch flags".into());
     }
     if flags & 3 != 0 {

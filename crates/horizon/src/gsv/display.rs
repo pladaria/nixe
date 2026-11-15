@@ -14,7 +14,9 @@ pub(crate) struct DisplayContext {
     pub opened: bool,
     pub layers: std::collections::BTreeMap<u64, DisplayLayer>,
     pub active_layer: Option<u64>,
-    pub timestamp_recorders: Option<u32>,
+    // Present encodes an identity plus one in four bits. The seven recorders
+    // reported to each layer are drawn from this session-wide identity space.
+    pub timestamp_recorders: [Arc<std::sync::atomic::AtomicU64>; 15],
 }
 #[derive(Debug)]
 pub(crate) struct DisplayLayer {

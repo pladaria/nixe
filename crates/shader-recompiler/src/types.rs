@@ -438,6 +438,43 @@ pub enum TexturePixelFormat {
     D32_FLOAT_S8_UINT = 101,
 }
 
+/// Numeric component type of a native texture or texel-buffer descriptor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TextureComponentType {
+    #[default]
+    Float,
+    Uint,
+    Sint,
+}
+impl TexturePixelFormat {
+    pub const fn component_type(self) -> TextureComponentType {
+        use TextureComponentType as C;
+        match self {
+            Self::A8B8G8R8_SINT
+            | Self::R8_SINT
+            | Self::R16G16B16A16_SINT
+            | Self::R32G32B32A32_SINT
+            | Self::R32G32_SINT
+            | Self::R16_SINT
+            | Self::R16G16_SINT
+            | Self::R8G8_SINT
+            | Self::R32_SINT => C::Sint,
+            Self::A8B8G8R8_UINT
+            | Self::A2B10G10R10_UINT
+            | Self::R8_UINT
+            | Self::R16G16B16A16_UINT
+            | Self::R32G32B32A32_UINT
+            | Self::R16_UINT
+            | Self::R16G16_UINT
+            | Self::R8G8_UINT
+            | Self::R32G32_UINT
+            | Self::R32_UINT
+            | Self::S8_UINT => C::Uint,
+            _ => C::Float,
+        }
+    }
+}
+
 impl TryFrom<u32> for TexturePixelFormat {
     type Error = crate::CompileError;
     fn try_from(value: u32) -> crate::Result<Self> {

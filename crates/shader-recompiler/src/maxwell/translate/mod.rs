@@ -137,21 +137,21 @@ impl<E: crate::Environment> crate::frontend::asl::CodeTranslator<E> for MaxwellT
     fn translate(
         &mut self,
         environment: &mut E,
-        ir: &mut Ir,
-        block: BlockId,
+        block: &mut crate::frontend::asl::CodeBlock<'_>,
         begin: crate::types::ProgramOffset,
         end: crate::types::ProgramOffset,
     ) -> Result<()> {
         let mut location = super::location::Location::new(begin)?;
         while location.address() < end {
             let decoded = super::decode::fetch(environment, location)?;
-            translate_instruction(environment.metadata(), ir, block, decoded).map_err(|error| {
-                error.at(
-                    environment.metadata().stage,
-                    location.address(),
-                    Some(decoded.instruction.0),
-                )
-            })?;
+            translate_instruction(environment.metadata(), block.ir, block.current, decoded)
+                .map_err(|error| {
+                    error.at(
+                        environment.metadata().stage,
+                        location.address(),
+                        Some(decoded.instruction.0),
+                    )
+                })?;
             location = location.next();
         }
         Ok(())

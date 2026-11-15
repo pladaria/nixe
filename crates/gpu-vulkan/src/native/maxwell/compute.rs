@@ -98,6 +98,13 @@ impl crate::native::pipeline_cache::ComputePipeline {
                 );
             }
         }
+        execution.maxwell_stage_texels(
+            space,
+            super::handles::HandleBuffers::Compute(launch),
+            &self.resources.stages[5],
+            5,
+            &computed,
+        )?;
         let mut textures =
             smallvec::SmallVec::<[super::textures::ShaderTexture; 64]>::with_capacity(
                 self.resources.texture_count,

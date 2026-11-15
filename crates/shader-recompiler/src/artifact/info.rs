@@ -48,6 +48,7 @@ impl super::descriptors::DescriptorCount for StorageBufferDescriptor {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TextureBufferDescriptor {
+    pub component_type: crate::types::TextureComponentType,
     pub has_secondary: bool,
     pub cbuf_index: CbufIndex,
     pub cbuf_offset: ByteOffset,
@@ -71,7 +72,7 @@ pub struct ImageBufferDescriptor {
     pub format: ImageFormat,
     pub is_written: bool,
     pub is_read: bool,
-    pub is_integer: bool,
+    pub component_type: crate::types::TextureComponentType,
     pub cbuf_index: CbufIndex,
     pub cbuf_offset: ByteOffset,
     pub count: u32,

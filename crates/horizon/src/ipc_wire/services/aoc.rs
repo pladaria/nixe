@@ -15,6 +15,7 @@ enum AddOnContentCommand {
     PrepareLegacy,
     Prepare,
     GetListChangedEvent,
+    GetListChangedEventWithProcessId,
     NotifyMount,
     NotifyUnmount,
     CheckMountStatus,
@@ -31,6 +32,7 @@ impl AddOnContentCommand {
             6 => Some(Self::PrepareLegacy),
             7 => Some(Self::Prepare),
             8 => Some(Self::GetListChangedEvent),
+            10 => Some(Self::GetListChangedEventWithProcessId),
             11 => Some(Self::NotifyMount),
             12 => Some(Self::NotifyUnmount),
             50 => Some(Self::CheckMountStatus),
@@ -137,6 +139,18 @@ pub(in crate::ipc_wire) fn decode_root_request(
             Ok(Some(IpcRequest::PrepareAddOnContent { horizon_index }))
         }
         AddOnContentCommand::GetListChangedEvent => {
+            Ok(Some(IpcRequest::GetAddOnContentListChangedEvent))
+        }
+        AddOnContentCommand::GetListChangedEventWithProcessId => {
+            // The PID-scoped variant uses the caller's content namespace and
+            // the same change-notification semantics as command 8.
+            // https://switchbrew.org/wiki/NS_services#aoc:u
+            if hipc.pid.is_none()
+                || has_ipc_descriptors_other_than_pid(hipc)
+                || !request.has_payload_size(8)
+            {
+                return Ok(None);
+            }
             Ok(Some(IpcRequest::GetAddOnContentListChangedEvent))
         }
     }

@@ -56,15 +56,9 @@ pub(in crate::ipc_wire) fn dispatch_ssl(
             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
         );
     }
-    if !matches!(version, 1..=3) {
-        return Err(IpcWireError::UnsupportedService(
-            UnsupportedServiceOperation::CommandVariant {
-                service: "ssl",
-                command_id: request.command_id,
-                detail: "SSL interface versions outside 1..=3 are not implemented",
-            },
-        ));
-    }
+    // This setter records the client's ABI revision; it does not negotiate a
+    // TLS connection. Keep it independent of the versions supported by TLS I/O.
+    // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/ssl/ssl.cpp#L620-L627
     session.set_interface_version(version);
     log::debug!("ssl selected interface version {version}");
     ssl_response(session, request.token, HorizonIpcResult::SUCCESS)
@@ -142,36 +136,6 @@ mod tests {
             let (response, _) = dispatch_ssl(&session, request(&data), &hipc).unwrap();
             assert_eq!(request_u32(&response, 24), Some(0));
             assert_eq!(session.interface_version(), version);
-        }
-    }
-
-    #[test]
-    fn unsupported_versions_and_tls_commands_remain_fatal() {
-        let session = SslSession::new();
-        let buffer = [0_u8; 8];
-        let hipc = HipcRequest::decode(&buffer).unwrap();
-        for version in [0_u32, 4, 5, u32::MAX] {
-            assert!(matches!(
-                dispatch_ssl(&session, request(&version.to_le_bytes()), &hipc),
-                Err(IpcWireError::UnsupportedService(
-                    UnsupportedServiceOperation::CommandVariant {
-                        service: "ssl",
-                        command_id: 5,
-                        ..
-                    }
-                ))
-            ));
-            assert_eq!(session.interface_version(), 0);
-        }
-        for command_id in [0, 1, 2, 3, 4, 6, 7, 8, 9, 999] {
-            let mut request = request(&[]);
-            request.command_id = command_id;
-            assert!(matches!(
-                dispatch_ssl(&session, request, &hipc),
-                Err(IpcWireError::UnsupportedService(UnsupportedServiceOperation::Command {
-                    service: "ssl", command_id: actual
-                })) if actual == command_id
-            ));
         }
     }
 }

@@ -75,6 +75,9 @@ impl HorizonIpcResult {
     pub const TIME_NOT_COMPARABLE: Self = Self::new(MODULE_TIME, 200);
     /// A time calculation exceeded Horizon's signed 64-bit representation.
     pub const TIME_OVERFLOWED: Self = Self::new(MODULE_TIME, 201);
+    pub(crate) const TIME_ZONE_OUT_OF_RANGE: Self = Self::new(MODULE_TIME, 902);
+    pub(crate) const TIME_ZONE_PARSE_FAILED: Self = Self::new(MODULE_TIME, 903);
+    pub(crate) const TIME_ZONE_NOT_FOUND: Self = Self::new(MODULE_TIME, 989);
     /// A launch/storage channel has no data to pop. This is distinct from
     /// ReceiveMessage's empty message queue result.
     /// https://source.hodakov.me/hdkv/yuzu/commit/6cc741a886fa26a0a332d4968b86560cb73f3e2f
@@ -93,6 +96,7 @@ impl HorizonIpcResult {
     pub const AUDIO_INVALID_UPDATE_INFO: Self = Self::new(MODULE_AUDIO, 41);
     pub const AUDIO_INVALID_ADDRESS_INFO: Self = Self::new(MODULE_AUDIO, 42);
     pub const AUDIO_INVALID_HANDLE: Self = Self::new(MODULE_AUDIO, 1536);
+    pub(crate) const AUDIO_NOT_SUPPORTED: Self = Self::new(MODULE_AUDIO, 513);
     // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/service/audio/errors.h
     pub const AUDIO_INVALID_REVISION: Self = Self::new(MODULE_AUDIO, 1537);
     pub const AUDIO_INVALID_ARGUMENT: Self = Self::new(MODULE_AUDIO, 900);

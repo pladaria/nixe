@@ -304,6 +304,7 @@ impl NativeExecution<'_> {
     pub(in crate::native) fn guest_sampler(
         &mut self,
         s: &nixe_gpu::SamplerDescription,
+        force_nearest: bool,
     ) -> Result<vk::Sampler, VulkanError> {
         let address = |a| match a {
             nixe_gpu::AddressMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
@@ -319,7 +320,7 @@ impl NativeExecution<'_> {
         };
         let address_modes = s.address_modes.map(address);
         let filter = |f| {
-            if f == nixe_gpu::FilterMode::Linear {
+            if !force_nearest && f == nixe_gpu::FilterMode::Linear {
                 vk::Filter::LINEAR
             } else {
                 vk::Filter::NEAREST
@@ -328,19 +329,21 @@ impl NativeExecution<'_> {
         let info = vk::SamplerCreateInfo::default()
             .min_filter(filter(s.min_filter))
             .mag_filter(filter(s.mag_filter))
-            .mipmap_mode(if s.mip_filter == nixe_gpu::FilterMode::Linear {
-                vk::SamplerMipmapMode::LINEAR
-            } else {
-                vk::SamplerMipmapMode::NEAREST
-            })
+            .mipmap_mode(
+                if !force_nearest && s.mip_filter == nixe_gpu::FilterMode::Linear {
+                    vk::SamplerMipmapMode::LINEAR
+                } else {
+                    vk::SamplerMipmapMode::NEAREST
+                },
+            )
             .address_mode_u(address_modes[0])
             .address_mode_v(address_modes[1])
             .address_mode_w(address_modes[2])
             .mip_lod_bias(s.lod_bias)
             .min_lod(s.lod_min)
             .max_lod(s.lod_max)
-            .anisotropy_enable(s.max_anisotropy > 1.)
-            .max_anisotropy(s.max_anisotropy)
+            .anisotropy_enable(!force_nearest && s.max_anisotropy > 1.)
+            .max_anisotropy(if force_nearest { 1. } else { s.max_anisotropy })
             .compare_enable(s.compare.is_some())
             .compare_op(
                 s.compare
@@ -613,5 +616,33 @@ pub(crate) fn color_kind(format: vk::Format) -> u8 {
         | F::R32G32B32_SINT
         | F::R32G32B32A32_SINT => 2,
         _ => 0,
+    }
+}
+
+pub(crate) fn storage_format(
+    format: nixe_shader_recompiler::types::ImageFormat,
+    fallback: vk::Format,
+) -> vk::Format {
+    use nixe_shader_recompiler::types::ImageFormat as F;
+    match format {
+        F::Typeless => match fallback {
+            // Integer storage operations carry raw 32-bit register values in
+            // unsigned SPIR-V image types. Full-width signed views have the
+            // same component bits, so use their unsigned format-compatible view.
+            vk::Format::R32_SINT => vk::Format::R32_UINT,
+            vk::Format::R32G32_SINT => vk::Format::R32G32_UINT,
+            vk::Format::R32G32B32_SINT => vk::Format::R32G32B32_UINT,
+            vk::Format::R32G32B32A32_SINT => vk::Format::R32G32B32A32_UINT,
+            vk::Format::R8G8B8A8_SRGB => vk::Format::R8G8B8A8_UNORM,
+            vk::Format::B8G8R8A8_SRGB => vk::Format::B8G8R8A8_UNORM,
+            value => value,
+        },
+        F::R8_UINT => vk::Format::R8_UINT,
+        F::R8_SINT => vk::Format::R8_SINT,
+        F::R16_UINT => vk::Format::R16_UINT,
+        F::R16_SINT => vk::Format::R16_SINT,
+        F::R32_UINT => vk::Format::R32_UINT,
+        F::R32G32_UINT => vk::Format::R32G32_UINT,
+        F::R32G32B32A32_UINT => vk::Format::R32G32B32A32_UINT,
     }
 }

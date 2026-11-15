@@ -15,9 +15,16 @@ pub(super) async fn dispatch(
     request: TipcRequest<'_>,
     hipc: &HipcRequest<'_>,
 ) -> Result<Vec<u8>, IpcWireError> {
+    if request.command_id == 53 {
+        return recorded_timestamps(process, session, request, hipc).await;
+    }
     if has_ipc_descriptors(hipc) && request.command_id != 32 {
-        return Err(IpcWireError::Malformed(
-            "unexpected native display descriptors",
+        return Err(IpcWireError::GraphicsService(
+            format!(
+                "native display command {} has unexpected descriptors",
+                request.command_id
+            )
+            .into(),
         ));
     }
     if request.command_id == 229 {
@@ -41,15 +48,13 @@ pub(super) async fn dispatch(
         (1 | 3, 0) => output.extend_from_slice(&1_u32.to_le_bytes()),
         (5, 0) => output.extend_from_slice(&7_u32.to_le_bytes()),
         (51, 4) => {
-            // @SPECULATIVE: this count follows query 5 and configures the
-            // session's timestamp recorders. No presentation has occurred yet.
-            let count = request_u32(data, 0).unwrap();
-            if count > 7 || display.timestamp_recorders.is_some() {
-                return Err(IpcWireError::Malformed(
-                    "invalid timestamp recorder configuration",
-                ));
-            }
-            display.timestamp_recorders = Some(count);
+            // @SPECULATIVE: this command has no documented semantics. The
+            // reference returns a zeroed reply. Its scalar is not established
+            // as a recorder count; recorders have session-wide 4-bit identities.
+            // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/nx2_gsv.h#L1969
+            static NOTICE: std::sync::Once = std::sync::Once::new();
+            NOTICE.call_once(|| log::warn!("GSV DisplaySession command 51: speculative success with zeroed output; semantics undocumented"));
+            output.resize(32 * 4, 0);
         }
         (11, 4) if request_u32(data, 0) == Some(1) => {
             // @SPECULATIVE: the global event requested with selector 1 before
@@ -121,9 +126,12 @@ pub(super) async fn dispatch(
                     .to_le_bytes(),
             );
         }
-        (228, 12) => {
+        (228, 76) => {
             // @SPECULATIVE: cancel returns a client-owned slot without submitting
             // an image. An in-flight slot cannot be cancelled by another request.
+            // The SDK sends token/slot followed by 64 bytes of pending layer
+            // metadata. Cancellation does not consume that metadata or present
+            // it; only the token and low slot byte identify the returned buffer.
             let layer = display
                 .layers
                 .get(&request_u64(data, 0).unwrap())
@@ -263,6 +271,17 @@ pub(super) async fn dispatch(
             });
             output.resize(32 * 4, 0);
         }
+        (301, 24) if request_u64(data, 0) == Some(DEFAULT_DISPLAY) => {
+            // @SPECULATIVE: the SDK supplies a display name and two u64 words.
+            // Neither Switchbrew nor the reference describes their meaning.
+            // Match the reference's Unknown301 zeroed reply without altering
+            // layer ownership, buffer availability or completion events.
+            // https://switchbrew.org/wiki/Switch_2%3A_GSV_services#DisplaySession
+            // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/nx2_gsv.h#L1984
+            static NOTICE: std::sync::Once = std::sync::Once::new();
+            NOTICE.call_once(|| log::warn!("GSV DisplaySession command 301: speculative success with zeroed output; semantics undocumented"));
+            output.resize(32 * 4, 0);
+        }
         (351, 16) => {
             // @SPECULATIVE: Switchbrew lists this command without a signature
             // or semantics. The observed SDK request contains two u64 words.
@@ -291,6 +310,67 @@ pub(super) async fn dispatch(
     Ok(encode_tipc_response(0, &output, &handles, &[])?)
 }
 
+async fn recorded_timestamps(
+    process: &Request,
+    session: &crate::GsvSession,
+    request: TipcRequest<'_>,
+    hipc: &HipcRequest<'_>,
+) -> Result<Vec<u8>, IpcWireError> {
+    // @SPECULATIVE: the SDK's native frame-history ABI is reconstructed by
+    // the reference: recorder u32, checkpoint mask u64, capacity u64; one
+    // counter tick per selected checkpoint, followed by byte count/pending.
+    // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/nx2_gsv.h#L3015-L3038
+    if request.data.len() != 20
+        || hipc.pid.is_some()
+        || !hipc.copy_handles.is_empty()
+        || !hipc.move_handles.is_empty()
+        || !hipc.send_statics.is_empty()
+        || !hipc.send_buffers.is_empty()
+        || !hipc.exchange_buffers.is_empty()
+        || !matches!(hipc.receive_statics, ReceiveStatics::None)
+    {
+        return Err(IpcWireError::Malformed(
+            "invalid native frame-history request",
+        ));
+    }
+    let output = one_receive_buffer(process, hipc)?;
+    let tick = {
+        let state = session.state.lock().unwrap();
+        state
+            .display
+            .as_ref()
+            .filter(|display| display.initialized)
+            .and_then(|display| {
+                display
+                    .timestamp_recorders
+                    .get(request_u32(request.data, 0).unwrap() as usize)
+            })
+            .map_or(0, |recorder| {
+                recorder.load(std::sync::atomic::Ordering::Acquire)
+            })
+    };
+    let count = if tick == 0 {
+        0
+    } else {
+        u64::from((request_u64(request.data, 4).unwrap() & 0x1f).count_ones())
+            .min(request_u64(request.data, 12).unwrap())
+            .min(output.size / 8) as usize
+    };
+    let size = count * 8;
+    if size != 0 {
+        process.reserve_payload(size).await?;
+        let mut bytes = vec![0; size];
+        for entry in bytes.chunks_exact_mut(8) {
+            entry.copy_from_slice(&tick.to_le_bytes());
+        }
+        process.write(output, 0, &mut bytes).await?;
+    }
+    let mut data = [0; 12];
+    data[..8].copy_from_slice(&(size as u64).to_le_bytes());
+    data[8] = u8::from(tick == 0);
+    Ok(encode_tipc_response(0, &data, &[], &[])?)
+}
+
 async fn present(
     process: &mut Request,
     session: &crate::GsvSession,
@@ -314,14 +394,17 @@ async fn present(
     let rate = request_u32(data, 40).unwrap();
     let interval = rate >> 16;
     let refresh = rate & 0xffff;
-    if refresh != 60 {
+    // The low half is the requested presentation rate, not the fixed cadence
+    // of the display event. The reference accepts rates from 30 through 240 Hz.
+    // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/nx2_gsv.h#L2493
+    if !(30..=240).contains(&refresh) {
         return Err(IpcWireError::GraphicsService(
             format!("unsupported native presentation refresh {refresh} Hz").into(),
         ));
     }
     let counter_id = !request_u32(data, 80).unwrap();
     let threshold = request_u32(data, 88).unwrap();
-    let (frame, counter, executor, deadline) = {
+    let (frame, counter, executor, deadline, recorder) = {
         let mut state = session.state.lock().unwrap();
         let gpu = state
             .gpu
@@ -373,6 +456,22 @@ async fn present(
             .ok_or(IpcWireError::Malformed(
                 "native presentation requires an active display layer",
             ))?;
+        // The low nibble names recorder + 1; zero disables history for this
+        // frame. Retain its identity across the async present and context close.
+        let recorder_index = request_u32(data, 64).unwrap() & 15;
+        let recorder = if recorder_index == 0 {
+            None
+        } else {
+            Some(
+                display
+                    .timestamp_recorders
+                    .get(recorder_index as usize - 1)
+                    .cloned()
+                    .ok_or(IpcWireError::Malformed(
+                        "unknown presentation timestamp recorder",
+                    ))?,
+            )
+        };
         let layer = display
             .layers
             .get_mut(&token)
@@ -389,6 +488,9 @@ async fn present(
                 |free| (free & bit != 0).then_some(free & !bit),
             )
             .map_err(|_| IpcWireError::Malformed("native presentation slot is still in flight"))?;
+        if let Some(recorder) = &recorder {
+            recorder.store(0, std::sync::atomic::Ordering::Release);
+        }
         let now = process.kernel().clock().scheduler_time_ns();
         let duration = u64::from(interval) * 1_000_000_000 / u64::from(refresh);
         layer.next_present_ns = if layer.next_present_ns == 0 {
@@ -403,7 +505,7 @@ async fn present(
             slot,
             interval,
         };
-        (frame, counter, executor, layer.next_present_ns)
+        (frame, counter, executor, layer.next_present_ns, recorder)
     };
     if let Some(counter) = counter {
         let mut wait = std::pin::pin!(crate::gsv::syncpt::CounterWait::new(counter, threshold));
@@ -433,6 +535,15 @@ async fn present(
             .map(|result| result.map_err(|_| IpcWireError::Cancelled))
     })
     .await?;
+    if let Some(recorder) = recorder {
+        // @SIMPLIFICATION: all requested display checkpoints share the final
+        // presentation tick. Publish only after producer/composition and pacing
+        // complete, so history cannot report an unfinished frame as displayed.
+        let tick = (u128::from(process.kernel().clock().scheduler_time_ns())
+            * u128::from(process.cpu().platform().counter_frequency())
+            / 1_000_000_000) as u64;
+        recorder.store(tick.max(1), std::sync::atomic::Ordering::Release);
+    }
     let mut output = u64::from(available.load(std::sync::atomic::Ordering::Acquire))
         .to_le_bytes()
         .to_vec();

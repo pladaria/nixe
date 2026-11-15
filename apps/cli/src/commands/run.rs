@@ -433,7 +433,10 @@ fn run_machine(
         None
     } else {
         let device_memory =
-            nixe_gpu_maxwell::MaxwellDeviceMemory::new(process.memory().space().machine().clone());
+            nixe_memory::DeviceHeapMemory::new(nixe_memory::device_memory::DeviceMemory::new(
+                process.memory().space().machine().clone(),
+                34,
+            ));
         let cache_directory = config
             .gpu
             .cache_directory

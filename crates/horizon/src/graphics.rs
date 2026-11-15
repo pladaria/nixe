@@ -291,7 +291,7 @@ impl VideoSystem {
 
     /// Construct channel graphics state beside its renderer on the GPU owner.
     pub fn with_gpu_frontend<E, L, R>(
-        device_memory: nixe_gpu_maxwell::MaxwellDeviceMemory,
+        device_memory: nixe_memory::DeviceHeapMemory,
         kernel: &Arc<nixe_scheduler::SchedulerState>,
         presenter: Option<FrameMailbox>,
         mme_jit: bool,

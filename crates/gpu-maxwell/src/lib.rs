@@ -4,8 +4,6 @@
 //! on host-independent GPU contracts and never on Horizon or a host backend.
 
 mod address_space;
-mod device_memory;
-pub use device_memory::{MaxwellDeviceMapping, MaxwellDeviceMemory};
 mod channel;
 pub mod engines;
 mod execution;

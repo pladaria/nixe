@@ -107,7 +107,8 @@ pub(super) async fn dispatch(
                 gpu.spaces.insert(
                     id,
                     Arc::new(std::sync::RwLock::new(GpuAddressSpace::new(
-                        gpu.memory.clone(),
+                        gpu.heap.clone(),
+                        process.memory().space().identity(),
                     ))),
                 );
                 output.extend_from_slice(&id.to_le_bytes());
@@ -224,16 +225,15 @@ pub(super) async fn dispatch(
                 );
             }
             (GsvInterface::Worker, 211, 64) => {
-                // @SPECULATIVE: native SDK flags and kind bytes follow the
-                // observed job layout. Byte arguments occupy padded words;
-                // their padding is uninitialized and is not an argument.
-                if request_u32(data, 32) != Some(0)
-                    || data[36] > 1
-                    || request_u32(data, 48) != Some(0)
-                    || data[52] != 1
-                    || data[56] != 1
+                // @SPECULATIVE: option meanings follow the reference's native
+                // job layout. NormalMapGpuMemory4K writes permission,
+                // cacheability, both kinds, raw-texture mode and sync flags
+                // with byte stores into padded words. Never validate padding.
+                if data[32] != 0 || data[36] > 1 || data[48] != 0 || data[52] != 1 || data[56] != 1
                 {
-                    return Err(IpcWireError::Malformed("unsupported GPU map options"));
+                    return Err(IpcWireError::GraphicsService(
+                        format!("unsupported GPU map options: request={data:02x?}").into(),
+                    ));
                 }
                 let kind = crate::gsv::gpu::memory_kind(data[40], data[44])
                     .map_err(IpcWireError::GraphicsService)?;

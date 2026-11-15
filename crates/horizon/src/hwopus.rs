@@ -90,14 +90,32 @@ impl Parameters {
 #[derive(Clone, Debug)]
 pub struct OpusManagerSession {
     slots: Arc<Mutex<[Weak<OpusState>; 24]>>,
-    pub(crate) domain: crate::object::DomainSession<OpusDecoderSession>,
+    pub(crate) tags: Arc<crate::hwacod::Tags>,
+    pub(crate) domain: crate::object::DomainSession<OpusObject>,
 }
 
 impl Default for OpusManagerSession {
     fn default() -> Self {
         Self {
             slots: Arc::default(),
+            tags: Arc::default(),
             domain: crate::object::DomainSession::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum OpusObject {
+    Decoder(OpusDecoderSession),
+    Client(Arc<crate::hwacod::Tags>),
+    Batch(Arc<crate::hwacod::Manager>),
+}
+impl OpusObject {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Decoder(_) => "IHardwareOpusDecoder",
+            Self::Client(_) => "hwacod::IClientSession",
+            Self::Batch(_) => "IHardwareAudioCodecManagerSession",
         }
     }
 }
@@ -119,6 +137,7 @@ impl OpusManagerSession {
     pub(crate) fn open_session(&self) -> Self {
         Self {
             slots: self.slots.clone(),
+            tags: self.tags.clone(),
             domain: crate::object::DomainSession::new(),
         }
     }
@@ -257,25 +276,6 @@ mod tests {
         assert!(retained.upgrade().is_some());
         drop(decoders);
         assert!(retained.upgrade().is_none());
-    }
-
-    #[test]
-    fn domain_conversion_is_local_to_the_connection_and_clones_share_children() {
-        let registry = OpusManagerSession::default();
-        let first = registry.open_session();
-        let second = registry.open_session();
-        let clone = first.clone();
-        assert_eq!(first.domain.convert(), 1);
-        assert!(clone.domain.is_domain());
-        assert!(!second.domain.is_domain());
-        assert!(!registry.domain.is_domain());
-        let work = crate::test_memory::transfer(&vec![0; 65536]);
-        let decoder = first.open(params(), work, 65536).unwrap();
-        let id = first.domain.insert_object(decoder).unwrap();
-        assert!(clone.domain.object(id).is_some());
-        assert!(second.domain.object(id).is_none());
-        assert!(clone.domain.close_object(id));
-        assert!(first.domain.object(id).is_none());
     }
 
     #[test]

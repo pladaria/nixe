@@ -4,8 +4,10 @@
 //! https://github.com/switchbrew/libnx/blob/master/nx/source/services/auddev.c
 
 use super::prelude::*;
+mod native;
 use crate::AudioDeviceSession;
 use crate::audio_device::{ACTIVE_DEVICE, DEVICE_NAMES, OUTPUT_NAMES};
+pub(in crate::ipc_wire) use native::dispatch_native_audio_device;
 
 const NAME_SIZE: usize = 0x100;
 

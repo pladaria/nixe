@@ -420,8 +420,22 @@ pub(in crate::ipc_wire) async fn dispatch_account_manager_for_application(
     if request.command_id == 130 {
         return account_resource_cache(process, manager, request, hipc, domain).await;
     }
-    if !matches!(request.command_id, 0 | 160) {
+    if !matches!(request.command_id, 0 | 1 | 160) {
         return unsupported_service_command("IManagerForApplication", request.command_id);
+    }
+    if request.command_id == 1 && request.has_payload_size(0) && !has_ipc_descriptors(hipc) {
+        // @SPECULATIVE: expose the same local UUID-derived account identifier
+        // as the offline resource cache. This does not establish a network
+        // session or provide an authentication token.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/acc/acc.cpp#L805-L818
+        return semantic_success(
+            request.token,
+            domain,
+            &manager.provisional_account_id().to_le_bytes(),
+            &[],
+            &[],
+            None,
+        );
     }
     let result = if !request.has_payload_size(0) || has_ipc_descriptors(hipc) {
         HorizonIpcResult::CMIF_INVALID_IN_HEADER

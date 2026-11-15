@@ -30,6 +30,7 @@ pub(crate) struct AudioServices {
     pub backend: Option<Arc<dyn nixe_audio::AudioBackend>>,
     pub renderers: crate::AudioRendererManagerSession,
     pub opus: crate::OpusManagerSession,
+    pub mixer: crate::sysmix::MixerSystem,
 }
 impl AudioServices {
     pub fn output_manager(&self) -> crate::AudioOutManagerSession {

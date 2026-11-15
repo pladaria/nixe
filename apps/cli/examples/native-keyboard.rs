@@ -9,7 +9,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let monitor = device.validation_monitor();
     let memory = nixe_memory::Machine::new(4 * 1024 * 1024 * 1024)?;
-    let device_memory = nixe_gpu_maxwell::MaxwellDeviceMemory::new(memory.clone());
+    let device_memory = nixe_memory::DeviceHeapMemory::new(
+        nixe_memory::device_memory::DeviceMemory::new(memory.clone(), 34),
+    );
     let native_memory = device_memory.device().clone();
     let initialize = move || {
         let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(

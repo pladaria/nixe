@@ -97,15 +97,20 @@ impl Visitor<'_> {
     }
     pub(super) fn bit_scan(&mut self) -> Result<()> {
         let i = self.instruction;
-        let uniform_source = matches!(i.opcode(), 0xd00 | 0xd09);
-        let population = i.opcode() & 0xff == 9;
+        let uniform_destination = matches!(i.opcode(), 0x2bd..=0x2bf);
+        let uniform_source = uniform_destination || matches!(i.opcode(), 0xd00 | 0xd09);
+        let population = matches!(i.opcode(), 0x309 | 0xd09 | 0x2bf);
+        let reverse = matches!(i.opcode(), 0x2be | 0x301);
         let mode = u32::from(uniform_source) << 27;
-        if i.bits(24, 8) != 0
+        if (uniform_destination && (i.bits(12, 4) != 7 || i.bits(16, 8) >= 63))
+            || ((reverse || uniform_destination && !population) && i.bits(63, 1) != 0)
+            || i.bits(24, 8) != 0
             || i.bits(32, 31) > if uniform_source { 63 } else { 255 }
-            || if population {
+            || if population || reverse {
                 i.bits(64, 32) != mode
             } else {
-                i.bits(64, 32) & !0x600 != (mode | 0xe0000)
+                i.bits(64, 32) & !if uniform_destination { 0x400 } else { 0x600 }
+                    != (mode | 0xe0000)
             }
         {
             return Err(unsupported("Native bit-scan mode"));
@@ -114,7 +119,9 @@ impl Visitor<'_> {
         if i.bits(63, 1) != 0 {
             value = self.emit.bitwise_not(value)?;
         }
-        let result = if population {
+        let result = if reverse {
+            self.emit.bit_reverse(value)?
+        } else if population {
             self.emit.bit_count(value)?
         } else {
             let position = if i.bits(73, 1) != 0 {
@@ -130,7 +137,7 @@ impl Visitor<'_> {
                 position
             }
         };
-        self.write(result)
+        self.write_register(result, uniform_destination)
     }
     pub(super) fn imad(&mut self) -> Result<()> {
         let i = self.instruction;
@@ -316,18 +323,24 @@ impl Visitor<'_> {
     }
     pub(super) fn shift_variable(&mut self) -> Result<()> {
         let i = self.instruction;
+        let uniform = matches!(i.opcode(), 0x299 | 0x499);
+        let zero = if uniform { 63 } else { 255 };
         let low = i.bits(24, 8);
         let high = i.bits(64, 8);
         let wrap = i.bits(75, 1) != 0;
-        if i.opcode() == 0x419 {
-            if low != 255 || i.bits(64, 32) & !0x8ff != 0x10600 {
+        if matches!(i.opcode(), 0x419 | 0x499) {
+            if low != zero || i.bits(64, 32) & !0x8ff != (0x10600 | u32::from(uniform) << 27) {
                 return Err(unsupported("Native immediate-value funnel shift mode"));
             }
-            let shift = self.reg(high)?;
+            let shift = self.register(high, uniform)?;
             let value = self.scalar_shift(Value::U32(i.bits(32, 32)), shift, false, false, wrap)?;
-            return self.write(value);
+            return self.write_register(value, uniform);
         }
-        let shift = self.raw_b()?;
+        let shift = if uniform {
+            self.ureg(i.bits(32, 32))?
+        } else {
+            self.raw_b()?
+        };
         if (i.opcode() == 0x219 && i.bits(32, 32) > 255)
             || (i.opcode() == 0xa19 && i.bits(62, 2) != 0)
         {
@@ -349,24 +362,28 @@ impl Visitor<'_> {
         let right = i.bits(76, 1) != 0;
         let upper = i.bits(80, 1) != 0;
         let signed = i.bits(73, 2) == 2;
-        let expected =
-            if signed { 0x400 } else { 0x600 } | if i.opcode() == 0xc19 { 0x08000000 } else { 0 };
+        let expected = if signed { 0x400 } else { 0x600 }
+            | if uniform || i.opcode() == 0xc19 {
+                0x08000000
+            } else {
+                0
+            };
         if i.bits(64, 32) & !0x118ff != expected
             || (signed && (i.opcode() != 0x219 || !right || !upper || low != 255))
             || (!signed
                 && if right {
-                    if upper { low != 255 } else { high != 255 }
+                    if upper { low != zero } else { high != zero }
                 } else if upper {
-                    low != 255
+                    low != zero
                 } else {
-                    high != 255
+                    high != zero
                 })
         {
             return Err(unsupported("Native variable funnel shift mode"));
         }
-        let source = self.reg(if upper { high } else { low })?;
+        let source = self.register(if upper { high } else { low }, uniform)?;
         let value = self.scalar_shift(source, shift, right, signed, wrap)?;
-        self.write(value)
+        self.write_register(value, uniform)
     }
     pub(super) fn shf(&mut self) -> Result<()> {
         let i = self.instruction;

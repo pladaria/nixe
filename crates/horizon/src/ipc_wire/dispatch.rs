@@ -34,6 +34,7 @@ impl HorizonIpcObject {
             Self::Ssl(session) => session.is_domain(),
             Self::LogManager(session) => session.is_domain(),
             Self::ErrorContextWriter(session) => session.domain.is_domain(),
+            Self::AudioCodec(session) => session.domain.is_domain(),
             Self::OpusManager(session) => session.domain.is_domain(),
             Self::OpusDecoder(session) => session.domain.is_domain(),
             Self::PlayReport(session) => session.domain.is_domain(),
@@ -41,6 +42,9 @@ impl HorizonIpcObject {
             Self::Bcat(session) => session.domain.is_domain(),
             Self::Nfp(session) => session.domain.is_domain(),
             Self::Nim(session) => session.domain.is_domain(),
+            Self::Chat(session) => session.domain.is_domain(),
+            Self::NativeAudioDevice(session) => session.domain.is_domain(),
+            Self::AudioMixer(session) => session.domain.is_domain(),
             Self::Ngc(session) => session.domain.is_domain(),
             _ => false,
         }
@@ -89,22 +93,29 @@ impl HorizonIpcObject {
             Self::AudioRendererManager(_) => "audren:u",
             Self::AudioRenderer(_) => "IAudioRenderer",
             Self::AudioDevice(_) => "IAudioDevice",
-            Self::OpusManager(session) => {
-                if domain_object
-                    .and_then(|id| session.domain.object(id))
-                    .is_some()
-                {
-                    "IHardwareOpusDecoder"
-                } else {
-                    "hwopus"
-                }
-            }
+            Self::AudioMixer(session) => session
+                .target(domain_object)
+                .map_or("audsmx:u", |object| object.name()),
+            Self::NativeAudioDevice(session) => session
+                .target(domain_object)
+                .map_or("auddmg:u", |object| object.name()),
+            Self::OpusManager(session) => domain_object
+                .and_then(|id| session.domain.object(id))
+                .map_or("hwopus", |object| object.name()),
+            Self::AudioCodec(session) => domain_object
+                .and_then(|id| session.domain.object(id))
+                .as_ref()
+                .unwrap_or(&session.root)
+                .name(),
             Self::OpusDecoder(_) => "IHardwareOpusDecoder",
             Self::Hid(_) => "hid",
             Self::Ngc(_) => "ngc:u",
             Self::Nim(session) => session
                 .target(domain_object)
                 .map_or("nim:eca", |object| object.name()),
+            Self::Chat(session) => session
+                .target(domain_object)
+                .map_or("chat:u", |object| object.name()),
             Self::Nfp(session) => session
                 .target(domain_object)
                 .map_or("nfp:user", |object| object.name()),
@@ -321,6 +332,9 @@ pub(crate) async fn execute_request(
             services::dispatch_bcat(process, session, request, hipc).await?
         }
         HorizonIpcObject::Nim(session) => services::dispatch_nim(process, session, request, hipc)?,
+        HorizonIpcObject::Chat(session) => {
+            services::dispatch_chat(process, session, request, hipc)?
+        }
         HorizonIpcObject::Ngc(session) => services::dispatch_ngc(session, request, hipc)?,
         HorizonIpcObject::Nfp(session) => {
             services::dispatch_nfp(process, session, &resources.system.hid, request, hipc).await?
@@ -371,7 +385,9 @@ pub(crate) async fn execute_request(
             )
             .await?
         }
-        HorizonIpcObject::Bsd(session) => services::dispatch_bsd(process, session, request, hipc)?,
+        HorizonIpcObject::Bsd(session) => {
+            services::dispatch_bsd(process, session, request, hipc).await?
+        }
         HorizonIpcObject::Ssl(session) => services::dispatch_ssl(session, request, hipc)?,
         HorizonIpcObject::Multimedia(session) => {
             services::dispatch_multimedia(session, request, hipc)?
@@ -384,6 +400,9 @@ pub(crate) async fn execute_request(
         }
         HorizonIpcObject::StreamPlay | HorizonIpcObject::StreamPlayUser(_) => {
             services::dispatch_streamplay(process, target, request, hipc)?
+        }
+        HorizonIpcObject::AudioCodec(session) => {
+            services::dispatch_audio_codec(process, session, request, hipc).await?
         }
         HorizonIpcObject::OpusManager(session) => {
             services::dispatch_opus_manager(process, session, request, hipc).await?
@@ -420,6 +439,19 @@ pub(crate) async fn execute_request(
         HorizonIpcObject::AudioDevice(session) => {
             services::dispatch_audio_device(process, session, request, hipc).await?
         }
+        HorizonIpcObject::AudioMixer(session) => {
+            services::dispatch_audio_mixer(process, session, &resources.audio.mixer, request, hipc)?
+        }
+        HorizonIpcObject::NativeAudioDevice(session) => {
+            services::dispatch_native_audio_device(
+                process,
+                session,
+                &resources.audio,
+                request,
+                hipc,
+            )
+            .await?
+        }
         HorizonIpcObject::Hid(hid) => {
             services::dispatch_hid(process, hid, &resources.system.hid, request, hipc).await?
         }
@@ -445,7 +477,9 @@ pub(crate) async fn execute_request(
             services::dispatch_system_clock(clock, request, hipc).await?
         }
         HorizonIpcObject::SteadyClock(clock) => services::dispatch_steady_clock(clock, request)?,
-        HorizonIpcObject::TimeZone(timezone) => services::dispatch_timezone(timezone, request)?,
+        HorizonIpcObject::TimeZone(timezone) => {
+            services::dispatch_timezone(process, timezone, request, hipc).await?
+        }
         HorizonIpcObject::Vi(vi) => services::dispatch_vi(process, vi, request, hipc).await?,
         HorizonIpcObject::Csrng => services::dispatch_csrng(process, request, hipc).await?,
         HorizonIpcObject::Gsv(_) => {

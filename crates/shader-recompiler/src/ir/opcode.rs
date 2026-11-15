@@ -45,6 +45,7 @@ opcodes! {
     EndPrimitive: Void, [U32], true;
     Barrier: Void, [], true;
     WorkgroupMemoryBarrier: Void, [], true;
+    SubgroupBarrier: Void, [], true;
     DeviceMemoryBarrier: Void, [], true;
     GetRegister: U32, [Reg], false;
     SetRegister: Void, [Reg, U32], false;
@@ -560,6 +561,13 @@ opcodes! {
     VoteAny: U1, [U1], false;
     VoteEqual: U1, [U1], false;
     SubgroupBallot: U32, [U1], false;
+    SubgroupReduceAdd: U32, [U32], false;
+    SubgroupReduceUMin: U32, [U32], false;
+    SubgroupReduceUMax: U32, [U32], false;
+    SubgroupReduceSMin: U32, [U32], false;
+    SubgroupReduceSMax: U32, [U32], false;
+    SubgroupReduceOr: U32, [U32], false;
+    SubgroupReduceXor: U32, [U32], false;
     SubgroupEqMask: U32, [], false;
     SubgroupLtMask: U32, [], false;
     SubgroupLeMask: U32, [], false;

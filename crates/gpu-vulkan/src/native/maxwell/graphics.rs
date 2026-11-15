@@ -143,15 +143,16 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         shader: &crate::cache::ShaderArtifact,
         resources: &crate::native::pipeline_resources::PipelineResources,
     ) -> crate::native::pipeline_cache::ConfigureGraphics {
-        // The image/texel-buffer resource classes are rejected when building
-        // PipelineResources. The supported specs are Eden's SimpleVertex,
+        // The supported stage specializations are SimpleVertex,
         // SimpleVertexFragment, SimpleStorage and Default, in that order.
         // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp#L155-L246
         let stages = shader
             .stages
             .iter()
             .fold(0u32, |mask, s| mask | (1 << s.stage as u32));
-        let storage = resources.stages[..5].iter().any(|s| !s.storage.is_empty());
+        let storage = resources.stages[..5]
+            .iter()
+            .any(|s| !s.storage.is_empty() || !s.texels.is_empty());
         if !storage && stages & !1 == 0 {
             Self::configure_impl::<1, false>
         } else if !storage && stages & !17 == 0 {
@@ -175,7 +176,10 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
         computed: &[u32],
     ) -> Result<(), VulkanError> {
         let resources = &self.resources.stages[STAGE];
-        if resources.storage.is_empty() && resources.images.is_empty() {
+        if resources.storage.is_empty()
+            && resources.images.is_empty()
+            && resources.texels.is_empty()
+        {
             return Ok(());
         }
         let group = group.ok_or(VulkanError::InvalidResource(
@@ -200,6 +204,13 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 )?;
             }
         }
+        execution.maxwell_stage_texels(
+            space,
+            super::handles::HandleBuffers::Graphics(state, group),
+            resources,
+            STAGE,
+            computed,
+        )?;
         if !read_images {
             return Ok(());
         }
@@ -254,6 +265,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                     .update_storage_buffer(STAGE, storage.slot, space)?;
             }
         }
+        execution.residency.update_texel_buffers(STAGE, resources)?;
         Ok(())
     }
     fn configure_resources<const STAGES: u8, const STORAGE: bool>(
