@@ -216,6 +216,7 @@ pub struct ResidencyStatistics {
     pub gpu_copied_bytes: u64,
     pub dma_buffer_copies: u64,
     pub dma_image_uploads: u64,
+    pub dma_image_copies: u64,
     pub dma_image_downloads: u64,
     pub dma_cpu_fallbacks: u64,
     pub alias_copy_commands: u64,

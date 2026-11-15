@@ -14,7 +14,7 @@ struct AmpereInstruction {
 };
 struct AmpereInvocation {
   uint32_t regs[24];
-  uint32_t initialized, carry, method, increment;
+  uint32_t carry, method, increment;
   uint32_t loops, loop_start, loop_end, next_pc, budget;
   uint32_t scratch_x, scratch_y;
   const uint32_t *params;
@@ -33,15 +33,12 @@ struct AmpereInvocation {
 };
 static_assert(sizeof(AmpereAlu) == 6);
 static_assert(sizeof(AmpereInstruction) == 22);
-static_assert(offsetof(AmpereInvocation, params) == 144);
-static_assert(offsetof(AmpereInvocation, start) == 224);
-static_assert(offsetof(AmpereInvocation, owned) == 240);
-static_assert(sizeof(AmpereInvocation) == 264);
-struct AmpereCompileStatistics {
-  uint64_t guards, removed_guards, initialization_updates, removed_updates, code_bytes;
-};
+static_assert(offsetof(AmpereInvocation, params) == 136);
+static_assert(offsetof(AmpereInvocation, start) == 216);
+static_assert(offsetof(AmpereInvocation, owned) == 232);
+static_assert(sizeof(AmpereInvocation) == 256);
 using AmpereProgram = uint32_t (*)(AmpereInvocation *);
 extern "C" bool nixe_ampere_mme_compile(void *, const AmpereInstruction *,
-                                        const uint8_t *, size_t, const uint64_t *, bool,
-                                        AmpereProgram *, AmpereCompileStatistics *,
+                                        const uint8_t *, size_t, bool,
+                                        AmpereProgram *, size_t *,
                                         NixeMmeCompileError *) noexcept;

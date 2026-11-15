@@ -6,7 +6,6 @@
 // https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/nouveau/mme/mme_tu104_sim.c
 #include "ampere.h"
 #include <array>
-#include <bit>
 #include <cstdio>
 #include <optional>
 #include <span>
@@ -39,7 +38,6 @@ struct Errors : ErrorHandler {
 struct Fault {
   Label label;
   u32 pc, error;
-  std::optional<u32> value;
 };
 struct Compiler {
   NixeMmeRuntime &runtime;
@@ -48,11 +46,7 @@ struct Compiler {
   Assembler a;
   std::span<const Inst> code;
   std::span<const uint8_t> uploaded;
-  std::span<const uint64_t> entries;
   std::vector<std::vector<u32>> successors;
-  std::vector<u32> initialized;
-  u32 guarded_registers = 0;
-  AmpereCompileStatistics &statistics;
   std::vector<Label> labels;
   std::vector<bool> after_end, loop_end;
   std::vector<Fault> faults;
@@ -62,10 +56,9 @@ struct Compiler {
   std::vector<std::array<bool, 2>> carry_live;
 
   Compiler(NixeMmeRuntime &runtime_, std::span<const Inst> code_,
-           std::span<const uint8_t> uploaded_, std::span<const uint64_t> entries_,
-           bool track_ownership_, AmpereCompileStatistics &statistics_)
+           std::span<const uint8_t> uploaded_, bool track_ownership_)
       : runtime(runtime_), a(nullptr), code(code_), uploaded(uploaded_),
-        entries(entries_), statistics(statistics_), track_ownership(track_ownership_) {
+        track_ownership(track_ownership_) {
     check(holder.init(runtime.jit.environment(), runtime.jit.cpu_features()));
     holder.set_error_handler(&errors);
     check(holder.attach(&a));
@@ -82,9 +75,9 @@ struct Compiler {
   static Mem word(size_t offset) { return dword_ptr(rbx, offset); }
   static Mem byte(size_t offset) { return byte_ptr(rbx, offset); }
   static Mem pointer(size_t offset) { return qword_ptr(rbx, offset); }
-  Label fault(u32 error, std::optional<u32> value = {}) {
+  Label fault(u32 error) {
     Label label = a.new_label();
-    faults.push_back({label, pc, error, value});
+    faults.push_back({label, pc, error});
     return label;
   }
   static bool flow(u32 op) { return op >= 23 && op <= 29; }
@@ -120,21 +113,6 @@ struct Compiler {
       a.mov(dst, r13d);
     else
       a.jmp(fault(2));
-  }
-  void require(u32 mask) {
-    if (!mask)
-      return;
-    ++statistics.guards;
-    mask &= ~initialized[pc];
-    if (!mask) {
-      ++statistics.removed_guards;
-      return;
-    }
-    a.mov(eax, word(offsetof(State, initialized)));
-    a.not_(eax);
-    a.and_(eax, mask);
-    // On this fault eax carries precisely the missing register bits.
-    a.jnz(fault(12));
   }
   void analyze() {
     loop_end.assign(code.size(), false);
@@ -201,69 +179,6 @@ struct Compiler {
       }
     }
   }
-  static u32 reads(const Inst &d, u32 mask) {
-    u32 result = 0;
-    for (u32 lane = 0; lane < 2; ++lane)
-      if (mask & (1u << lane))
-        for (u32 r : {d.alu[lane].x, d.alu[lane].y})
-          if (r < 24) result |= 1u << r;
-    return result;
-  }
-  static u32 writes(const Inst &d, u32 mask) {
-    u32 result = 0;
-    for (u32 lane = 0; lane < 2; ++lane)
-      if ((mask & (1u << lane)) && d.alu[lane].dst < 24)
-        result |= 1u << d.alu[lane].dst;
-    return result;
-  }
-  // Definite assignment intersects incoming paths, including zero-count loops,
-  // back edges and both predicate outcomes. Both ALUs read the incoming state.
-  // Keeping END fallthrough edges is conservative: termination can only remove
-  // paths, never introduce an uninitialized register on a retained path.
-  // Entry bindings are part of the compiled program's contract. A change to
-  // their set invalidates this analysis before the new entry can execute.
-  void analyze_initialized() {
-    initialized.assign(code.size(), 0x00ffffff);
-    std::vector<bool> reached(code.size(), false), queued(code.size(), false);
-    std::vector<u32> work;
-    for (u32 i = 0; i < code.size(); ++i) {
-      if (!(entries[i / 64] & (uint64_t(1) << (i % 64)))) continue;
-      initialized[i] = 0;
-      reached[i] = queued[i] = true;
-      work.push_back(i);
-    }
-    while (!work.empty()) {
-      const u32 from = work.back();
-      work.pop_back();
-      queued[from] = false;
-      if (uploaded[from] != 7) continue;
-      const auto &d = code[from];
-      const u32 definite = writes(d, predicate_mask(d, false)) &
-                           writes(d, predicate_mask(d, true));
-      const u32 output = initialized[from] | definite;
-      for (u32 to : successors[from]) {
-        const u32 merged = initialized[to] & output;
-        if (!reached[to] || initialized[to] != merged) {
-          initialized[to] = merged;
-          reached[to] = true;
-          if (!queued[to]) {
-            queued[to] = true;
-            work.push_back(to);
-          }
-        }
-      }
-    }
-    for (u32 i = 0; i < code.size(); ++i) {
-      if (!reached[i]) initialized[i] = 0;
-      if (uploaded[i] != 7) continue;
-      const auto &d = code[i];
-      u32 required = reads(d, predicate_mask(d, false)) |
-                     reads(d, predicate_mask(d, true));
-      if (d.predicate && d.predicate_reg < 24)
-        required |= 1u << d.predicate_reg;
-      guarded_registers |= required & ~initialized[i];
-    }
-  }
   void analyze_carry() {
     std::vector<bool> input(code.size(), false);
     carry_live.resize(code.size());
@@ -302,7 +217,6 @@ struct Compiler {
     analyze();
     build_graph();
     analyze_carry();
-    analyze_initialized();
     // Six preserved registers and 40 bytes keep both ABIs aligned at call
     // sites, including the Windows shadow space. r12/r13 hold loads, r14/r15
     // results.
@@ -358,9 +272,7 @@ struct Compiler {
     for (const auto &f : faults) {
       a.bind(f.label);
       a.mov(word(offsetof(State, error_pc)), f.pc);
-      if (f.value)
-        a.mov(word(offsetof(State, error_value)), *f.value);
-      else if (f.error == 12 || f.error == 13)
+      if (f.error == 13)
         a.mov(word(offsetof(State, error_value)), eax);
       a.mov(eax, f.error);
       a.jmp(leave);
@@ -371,7 +283,6 @@ struct Compiler {
       check(a.embed_label(label, 8));
     AmpereProgram program = nullptr;
     check(runtime.jit.add(&program, &holder));
-    statistics.code_bytes = holder.code_size();
     return program;
   }
   void instruction(const Inst &d) {
@@ -394,8 +305,6 @@ struct Compiler {
       a.jmp(fault(16));
       return;
     }
-    if (d.predicate_reg < 24)
-      require(1u << d.predicate_reg);
     get(eax, d, d.predicate_reg, 0);
     a.test(eax, eax);
     auto when_false = a.new_label();
@@ -405,22 +314,15 @@ struct Compiler {
     body(d, predicate_mask(d, false));
   }
   void body(const Inst &d, u32 mask) {
-    u32 required = 0, written = 0;
     for (u32 i = 0; i < 2; ++i)
       if (mask & (1u << i)) {
         for (u32 r : {d.alu[i].x, d.alu[i].y}) {
-          if (r < 24)
-            required |= 1u << r;
-          else if (r > 29) {
+          if (r > 29) {
             a.jmp(fault(2));
             return;
           }
         }
       }
-    // The predicate guard has already established this bit on both paths.
-    if (d.predicate && d.predicate_reg < 24)
-      required &= ~(1u << d.predicate_reg);
-    require(required);
     const bool has_flow =
         ((mask & 1) && flow(d.alu[0].op)) || ((mask & 2) && flow(d.alu[1].op));
     if (has_flow) {
@@ -488,17 +390,8 @@ struct Compiler {
         a.mov(i == 0 ? r14d : r15d, eax);
       if (alu.dst < 24) {
         a.mov(reg(alu.dst), eax);
-        written |= 1u << alu.dst;
       } else if (alu.dst != 24)
         a.jmp(fault(3));
-    }
-    if (written) {
-      ++statistics.initialization_updates;
-      written &= guarded_registers;
-      if (written)
-        a.or_(word(offsetof(State, initialized)), written);
-      else
-        ++statistics.removed_updates;
     }
     for (u32 i = 0; i < 2; ++i) {
       if (!(mask & (4u << i)))
@@ -889,18 +782,18 @@ struct Compiler {
 extern "C" bool nixe_ampere_mme_compile(void *runtime,
                                         const AmpereInstruction *instructions,
                                         const uint8_t *uploaded, size_t count,
-                                        const uint64_t *entries, bool track_ownership,
-                                        AmpereProgram *result, AmpereCompileStatistics *statistics,
+                                        bool track_ownership,
+                                        AmpereProgram *result, size_t *code_bytes,
                                         NixeMmeCompileError *error) noexcept {
   *result = nullptr;
-  *statistics = {};
+  *code_bytes = 0;
   try {
     if (count > 0x1000)
       throw std::runtime_error("MME instruction RAM exceeds 4096 instructions");
     Compiler compiler(*static_cast<NixeMmeRuntime *>(runtime),
-                      {instructions, count}, {uploaded, count},
-                      {entries, (count + 63) / 64}, track_ownership, *statistics);
+                      {instructions, count}, {uploaded, count}, track_ownership);
     *result = compiler.generate();
+    *code_bytes = compiler.holder.code_size();
     return true;
   } catch (const std::exception &e) {
     error->pc = 0;

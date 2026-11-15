@@ -264,7 +264,6 @@ OPCODE(CRC32ISO8,                                           U32,            U32,
 OPCODE(CRC32ISO16,                                          U32,            U32,            U32                                             )
 OPCODE(CRC32ISO32,                                          U32,            U32,            U32                                             )
 OPCODE(CRC32ISO64,                                          U32,            U32,            U64                                             )
-OPCODE(ComputePAC,                                          U64,            U64,            U64,            U64,            U64             )
 
 // AES instructions
 OPCODE(AESDecryptSingleRound,                               U128,           U128                                                            )

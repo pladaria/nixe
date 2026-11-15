@@ -1,6 +1,8 @@
 //! Channel acquires retain physical backing and latch matching GPU writes.
 //! https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/nx2.h
 use super::*;
+use nixe_gpu::physical::Footprint;
+use nixe_memory::ArenaOffset;
 
 pub(super) struct Wait {
     pub acquire: ampere::SemaphoreAcquire,
@@ -106,6 +108,58 @@ impl Waiters {
                 }
             }
             at += extent.bytes as usize;
+        }
+        Ok(())
+    }
+
+    /// Native copies keep pixels on the GPU. Only an overlapping semaphore
+    /// needs a coherent read now, before a subsequent producer can overwrite it.
+    pub fn written_gpu(
+        &self,
+        destination: &Footprint,
+        mut read: impl FnMut(&GpuCapture) -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        if !self.active() {
+            return Ok(());
+        }
+        let mut affected = smallvec::SmallVec::<[_; 4]>::new();
+        {
+            let slots = self.slots.lock().unwrap();
+            for wait in slots.values() {
+                if wait.latched.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let mut intersects = false;
+                for (index, span) in destination.mapping().spans().iter().enumerate() {
+                    if span.start.get() >= wait.physical + 4
+                        || span.start.get() + span.bytes <= wait.physical
+                    {
+                        continue;
+                    }
+                    destination
+                        .visit(index, ArenaOffset::new(wait.physical), 4, |_| {
+                            intersects = true;
+                            false
+                        })
+                        .map_err(|e| e.to_string().into_boxed_str())?;
+                    if intersects {
+                        break;
+                    }
+                }
+                if intersects {
+                    affected.push(wait.clone());
+                }
+            }
+        }
+        for wait in affected {
+            let bytes = read(&wait.capture)?;
+            if wait
+                .acquire
+                .matches(u32::from_le_bytes(bytes.try_into().unwrap()))
+            {
+                wait.latched.store(true, Ordering::Release);
+                wait.thread.unpark();
+            }
         }
         Ok(())
     }

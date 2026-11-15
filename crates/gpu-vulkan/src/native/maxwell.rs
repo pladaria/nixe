@@ -7,6 +7,7 @@ use nixe_gpu_maxwell as model;
 use std::{cell::RefCell, fmt::Display, rc::Rc, sync::Arc};
 pub(in crate::native) mod blending;
 mod compute;
+mod dma;
 pub(crate) mod dynamic_state;
 pub(in crate::native) mod fixed_state;
 mod geometry;
@@ -547,7 +548,11 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             .execution()
             .record(frontend, |native| {
                 native.residency.runtime.device.realize_deferred_clear()?;
-                native.residency.accelerate_dma(operation, space)
+                let Some(copy) = dma::memory_copy(operation) else {
+                    native.residency.dma_cpu_fallback();
+                    return Ok(false);
+                };
+                native.residency.accelerate_dma(&copy, space)
             })
             .map_err(compilation)
     }

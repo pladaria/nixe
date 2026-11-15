@@ -5,7 +5,6 @@
 
 #pragma once
 
-#include "dynarmic/interface/A64/pointer_authentication.h"
 
 #include <array>
 #include <cstddef>
@@ -185,7 +184,8 @@ struct UserConfig {
     bool enable_lse = false;
     /// ARMv8.3 RCpc acquire loads.
     bool enable_rcpc = false;
-    PointerAuthentication pointer_authentication{};
+    // Translation-time selection of the simplified ARMv8.3 PAuth model.
+    bool enable_pauth = false;
 
     /// Counter-timer frequency register. The value of the register is not interpreted by
     /// dynarmic.

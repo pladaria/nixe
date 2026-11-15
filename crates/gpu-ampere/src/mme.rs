@@ -158,14 +158,6 @@ impl Context {
             compiled: mme_jit.then(jit::Cache::default),
         }
     }
-    pub fn set_entry(&mut self, start: u32, enabled: bool) {
-        #[cfg(target_arch = "x86_64")]
-        if let Some(cache) = &mut self.compiled {
-            cache.set_entry(start, enabled);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = (start, enabled);
-    }
     pub fn install(&mut self, code: Arc<Code>) -> bool {
         #[cfg(feature = "performance-counters")]
         {
@@ -177,7 +169,7 @@ impl Context {
         self.code = code;
         #[cfg(target_arch = "x86_64")]
         if let Some(cache) = &mut self.compiled {
-            cache.clear_entries();
+            cache.invalidate();
         }
         true
     }
@@ -260,15 +252,7 @@ impl Mme {
             .entries
             .get_mut(self.bind)
             .ok_or("MME start table overflow")?;
-        let previous = entry.start();
         *entry = Entry::Unclassified(value);
-        if let Some(old) = previous
-            && old != value
-            && !self.entries.iter().any(|e| e.start() == Some(old))
-        {
-            self.context.set_entry(old, false);
-        }
-        self.context.set_entry(value, true);
         self.bind += 1;
         Ok(())
     }
@@ -589,7 +573,6 @@ impl Context {
                     };
                     if a.dst < 24 {
                         run.regs[a.dst as usize] = value;
-                        run.initialized |= 1 << a.dst;
                     } else if a.dst != 24 {
                         return Err("invalid MME destination register".into());
                     }
@@ -646,8 +629,12 @@ impl Context {
 }
 #[derive(Default)]
 struct Run {
+    // @SIMPLIFICATION Treat reads before the first write as zero in both
+    // execution paths, eliminating per-read checks and initialization tracking.
+    // @SPECULATIVE Games are assumed not to rely on undefined initial register
+    // values; the hardware's initial state has not been independently verified.
+    // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/macro_turing_jit.h#L106
     regs: [u32; 24],
-    initialized: u32,
     carry: u32,
     pc: usize,
     loops: u32,
@@ -660,8 +647,7 @@ struct Run {
 impl Run {
     fn reg(&self, reg: u8, lane: usize, d: Instruction, loads: [u32; 2]) -> Result<u32> {
         match reg {
-            0..=23 if self.initialized & (1 << reg) != 0 => Ok(self.regs[reg as usize]),
-            0..=23 => Err(format!("uninitialized MME register r{reg}").into()),
+            0..=23 => Ok(self.regs[reg as usize]),
             24 => Ok(0),
             25 => Ok(d.alu[lane].imm as i16 as i32 as u32),
             26 => Ok(d.alu[1 - lane].imm as i16 as i32 as u32),

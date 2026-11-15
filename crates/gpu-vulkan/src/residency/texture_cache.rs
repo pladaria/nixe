@@ -4,8 +4,9 @@
 use super::*;
 use nixe_gpu::native::ImageAddressSpace;
 use nixe_gpu::native::ImageInfo;
+use nixe_gpu::native::MemoryCopySurface;
+use nixe_gpu::physical::{ImageFootprint, ImageStorage};
 use nixe_gpu::{ImageDimension, ImageMemoryLayout};
-use nixe_gpu_maxwell::MaxwellGpuMemory;
 const PAGE_BITS: u32 = 20;
 pub struct ImageRegistration {
     pub(super) info: ImageInfo,
@@ -32,6 +33,9 @@ fn image_type(dimension: ImageDimension) -> u8 {
     }
 }
 impl CachedImage {
+    pub(super) fn packing(&self) -> nixe_gpu::native::ImagePacking {
+        self.info.packing
+    }
     pub(super) fn can_rescale(&self, depth: bool) -> bool {
         let info = &self.info;
         matches!(info.layout, ImageMemoryLayout::BlockLinear(block) | ImageMemoryLayout::BlockLinearAmpere(block) if block.block_depth_log2 == 0)
@@ -76,12 +80,12 @@ impl CachedImage {
     fn dma_base(
         &self,
         address: u64,
-        width: u32,
-        height: u32,
+        layout: ImageFootprint,
         samples: [u32; 2],
     ) -> Option<[u32; 2]> {
         let info = &self.info;
-        if !matches!(info.layout, ImageMemoryLayout::BlockLinear(_))
+        if layout.depth_slice != 0
+            || layout.base != 0
             || info.description.dimension() == ImageDimension::Three
         {
             return None;
@@ -99,14 +103,41 @@ impl CachedImage {
             .mip_layouts
             .iter()
             .position(|(base, _)| *base == offset)?;
+        // A matching extent alone is insufficient: the GOB order and mip's
+        // block geometry must agree before interpreting its native image.
+        let block = match (info.mip_layouts[level].1, layout.storage) {
+            (
+                ImageMemoryLayout::BlockLinear(block),
+                ImageStorage::BlockLinear {
+                    block_height_log2,
+                    block_depth_log2,
+                },
+            )
+            | (
+                ImageMemoryLayout::BlockLinearAmpere(block),
+                ImageStorage::BlockLinearAmpere {
+                    block_height_log2,
+                    block_depth_log2,
+                },
+            ) if block.block_height_log2 == block_height_log2
+                && block.block_depth_log2 == block_depth_log2 =>
+            {
+                block
+            }
+            _ => return None,
+        };
+        if block.block_depth_log2 != 0 {
+            return None;
+        }
         let size = info.description.mip_extent(level as u8)?;
         let bpp = u64::from(info.description.format().plane_bytes_per_block(0)?);
+        let [block_width, block_height] = info.description.format().block_extent();
         // IsSubCopy's BPP-relaxed comparison uses GOB-aligned byte widths and
         // eight-row heights; DMA's image operand has one byte per element.
-        if (u64::from(size.width) * u64::from(samples[0]) * bpp).div_ceil(64)
-            != u64::from(width).div_ceil(64)
-            || (u64::from(size.height) * u64::from(samples[1])).div_ceil(8)
-                != u64::from(height).div_ceil(8)
+        if (u64::from(size.width.div_ceil(block_width)) * u64::from(samples[0]) * bpp).div_ceil(64)
+            != u64::from(layout.columns).div_ceil(64)
+            || (u64::from(size.height.div_ceil(block_height)) * u64::from(samples[1])).div_ceil(8)
+                != u64::from(layout.rows).div_ceil(8)
         {
             return None;
         }
@@ -390,22 +421,36 @@ impl Residency<'_> {
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L1835-L1892
     pub(super) fn dma_image_id(
         &mut self,
-        space: &MaxwellGpuMemory,
-        address: u64,
-        bytes: u64,
-        layout: nixe_gpu_maxwell::MaxwellMemoryCopyLayout,
+        space: &(impl ImageAddressSpace + ?Sized),
+        surface: &MemoryCopySurface,
         upload: bool,
     ) -> Result<Option<(ImageId, [u32; 2])>, VulkanError> {
-        let nixe_gpu_maxwell::MaxwellMemoryCopyLayout::BlockLinear {
-            surface_width,
-            surface_height,
-            ..
-        } = layout
-        else {
-            return Ok(None);
-        };
-        let gpu = space.address(address).map_err(failure)?;
-        let Ok(cpu) = space.device_address(gpu) else {
+        let found = self.find_dma_image(space, surface)?;
+        if let Some((id, _)) = found {
+            let entry = &mut self.texture_cache.images[id];
+            if !entry.gpu_modified {
+                return Ok(None);
+            }
+            if !upload && !entry.dma_downloaded {
+                entry.dma_downloaded = true;
+                return Ok(None);
+            }
+            self.touch(Resource::Image(id));
+            self.runtime.statistics.cache_hits += 1;
+        }
+        Ok(found)
+    }
+    pub(super) fn find_dma_image(
+        &mut self,
+        space: &(impl ImageAddressSpace + ?Sized),
+        surface: &MemoryCopySurface,
+    ) -> Result<Option<(ImageId, [u32; 2])>, VulkanError> {
+        let MemoryCopySurface {
+            address,
+            bytes,
+            layout,
+        } = *surface;
+        let Some(cpu) = space.image_device_address(address).map_err(failure)? else {
             return Ok(None);
         };
         let mut seen = smallvec::SmallVec::<[ImageId; 16]>::new();
@@ -421,7 +466,7 @@ impl Residency<'_> {
                     continue;
                 }
                 seen.push(id);
-                let entry = &mut cache.images[id];
+                let entry = &cache.images[id];
                 if !entry
                     .maps
                     .iter()
@@ -429,15 +474,13 @@ impl Residency<'_> {
                 {
                     continue;
                 }
-                let Some(cached) = entry.cached.as_mut() else {
+                let Some(cached) = entry.cached.as_ref() else {
                     continue;
                 };
-                if cached.address_space != space.id().get() || cached.remapped {
+                if cached.address_space != space.image_space_id() || cached.remapped {
                     continue;
                 }
-                let Some(base) =
-                    cached.dma_base(address, surface_width, surface_height, entry.sample_grid)
-                else {
+                let Some(base) = cached.dma_base(address, layout, entry.sample_grid) else {
                     continue;
                 };
                 if found.is_none() || tick <= entry.modification_tick {
@@ -445,18 +488,6 @@ impl Residency<'_> {
                     tick = entry.modification_tick;
                 }
             }
-        }
-        if let Some((id, _)) = found {
-            let entry = &mut cache.images[id];
-            if !entry.gpu_modified {
-                return Ok(None);
-            }
-            if !upload && !entry.dma_downloaded {
-                entry.dma_downloaded = true;
-                return Ok(None);
-            }
-            self.touch(Resource::Image(id));
-            self.runtime.statistics.cache_hits += 1;
         }
         Ok(found)
     }

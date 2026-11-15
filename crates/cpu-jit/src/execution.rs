@@ -26,7 +26,6 @@ pub struct Core {
 pub struct Configuration {
     pub cpu: nixe_cpu::profile::ProcessCpuContext,
     pub timer_frequency: u32,
-    pub pointer_authentication_keys: Option<[[u64; 2]; 5]>,
 }
 /// Bridge event, decoded by the CPU execution loop after Run has returned.
 pub struct Event {
@@ -82,10 +81,6 @@ impl Core {
                 register(0xd53b0020),
                 register(0xd53b00e0),
                 configuration.cpu.platform() == nixe_cpu::platform::TargetPlatform::Switch2,
-                configuration
-                    .pointer_authentication_keys
-                    .as_ref()
-                    .map_or(std::ptr::null(), |keys| keys.as_ptr().cast()),
             )
         };
         if pointer.is_null() {

@@ -1,45 +1,158 @@
 //! DMA uses registered cache entries before SafeReadCachedWrite fallback.
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L200-L275
 use super::*;
-use nixe_gpu_maxwell::{MaxwellGpuMemory, MaxwellMemoryCopyLayout, MaxwellMemoryCopyOperation};
+use nixe_gpu::native::{ImageAddressSpace, MemoryCopy, MemoryCopySurface};
+use nixe_gpu::physical::ImageStorage;
 
 fn failure(error: impl std::fmt::Display) -> VulkanError {
     VulkanError::Compilation(error.to_string().into())
 }
 impl Residency<'_> {
+    pub(crate) fn dma_cpu_fallback(&mut self) {
+        self.runtime.statistics.dma_cpu_fallbacks += 1;
+    }
     pub(crate) fn accelerate_dma(
         &mut self,
-        operation: &MaxwellMemoryCopyOperation,
-        space: &MaxwellGpuMemory,
+        copy: &MemoryCopy,
+        space: &(impl ImageAddressSpace + ?Sized),
     ) -> Result<bool, VulkanError> {
-        if operation.has_remap() {
-            self.runtime.statistics.dma_cpu_fallbacks += 1;
-            return Ok(false);
-        }
-        let accelerated = match (operation.source_layout(), operation.destination_layout()) {
-            (MaxwellMemoryCopyLayout::Pitch { .. }, MaxwellMemoryCopyLayout::Pitch { .. })
-                if operation.height() == 1 =>
-            {
-                let source = space.address(operation.source_address()).map_err(failure)?;
-                let destination = space
-                    .address(operation.destination_address())
-                    .map_err(failure)?;
-                let source = space.device_address(source).map_err(failure)?;
-                let destination = space.device_address(destination).map_err(failure)?;
-                self.dma_buffer_copy(source, destination, u64::from(operation.width()))
+        let source = copy.source.layout;
+        let destination = copy.destination.layout;
+        let accelerated = match (source.storage, destination.storage) {
+            (ImageStorage::Pitch { .. }, ImageStorage::Pitch { .. }) if source.rect.height == 1 => {
+                match (
+                    linear_range(space, &copy.source)?,
+                    linear_range(space, &copy.destination)?,
+                ) {
+                    (Some((source, _, bytes)), Some((destination, _, _))) => {
+                        self.dma_buffer_copy(source, destination, bytes)
+                    }
+                    _ => Ok(false),
+                }
             }
             (
-                MaxwellMemoryCopyLayout::Pitch { .. },
-                MaxwellMemoryCopyLayout::BlockLinear { .. },
-            ) => self.dma_buffer_image(operation, space, true),
+                ImageStorage::Pitch { .. },
+                ImageStorage::BlockLinear { .. } | ImageStorage::BlockLinearAmpere { .. },
+            ) => self.dma_buffer_image(copy, space, true),
             (
-                MaxwellMemoryCopyLayout::BlockLinear { .. },
-                MaxwellMemoryCopyLayout::Pitch { .. },
-            ) => self.dma_buffer_image(operation, space, false),
+                ImageStorage::BlockLinear { .. } | ImageStorage::BlockLinearAmpere { .. },
+                ImageStorage::Pitch { .. },
+            ) => self.dma_buffer_image(copy, space, false),
+            (
+                ImageStorage::BlockLinear { .. } | ImageStorage::BlockLinearAmpere { .. },
+                ImageStorage::BlockLinear { .. } | ImageStorage::BlockLinearAmpere { .. },
+            ) => self.dma_image_copy(copy, space),
             _ => Ok(false),
         }?;
-        self.runtime.statistics.dma_cpu_fallbacks += u64::from(!accelerated);
+        if !accelerated {
+            self.dma_cpu_fallback();
+        }
         Ok(accelerated)
+    }
+    /// Byte copies can use existing native subresources without changing their
+    /// encoded storage. Resolve both geometries before issuing any transfer;
+    /// unusual packing and conversions retain the coherent CPU path.
+    fn dma_image_copy(
+        &mut self,
+        copy: &MemoryCopy,
+        space: &(impl ImageAddressSpace + ?Sized),
+    ) -> Result<bool, VulkanError> {
+        let Some((source, source_base)) = self.find_dma_image(space, &copy.source)? else {
+            return Ok(false);
+        };
+        let Some((destination, destination_base)) =
+            self.find_dma_image(space, &copy.destination)?
+        else {
+            return Ok(false);
+        };
+        let src = self.texture_cache.get(source);
+        let dst = self.texture_cache.get(destination);
+        if !(src.gpu_modified || dst.gpu_modified)
+            || src.cached.as_ref().unwrap().packing() != dst.cached.as_ref().unwrap().packing()
+            || src.decoded.is_some()
+            || dst.decoded.is_some()
+            || src.description.samples != vk::SampleCountFlags::TYPE_1
+            || dst.description.samples != vk::SampleCountFlags::TYPE_1
+        {
+            return Ok(false);
+        }
+        let select = |entry: &ImageEntry, base: [u32; 2], surface: &MemoryCopySurface| {
+            let mut planes =
+                entry.planes.iter().enumerate().filter(|(_, plane)| {
+                    plane.mip_level == base[0] && plane.array_layer == base[1]
+                });
+            let (index, &plane) = planes.next()?;
+            let rect = surface.layout.rect;
+            let bpp = plane.bytes_per_block;
+            let block = plane.block_extent;
+            if planes.next().is_some()
+                || !rect.x.is_multiple_of(bpp)
+                || !rect.width.is_multiple_of(bpp)
+                || rect.x / bpp + rect.width / bpp > plane.extent.width.div_ceil(block.width)
+                || rect.y + rect.height > plane.extent.height.div_ceil(block.height)
+            {
+                return None;
+            }
+            let x = rect.x / bpp * block.width;
+            let y = rect.y * block.height;
+            Some((
+                index,
+                plane,
+                vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: x as i32,
+                        y: y as i32,
+                    },
+                    extent: vk::Extent2D {
+                        width: (rect.width / bpp * block.width).min(plane.extent.width - x),
+                        height: (rect.height * block.height).min(plane.extent.height - y),
+                    },
+                },
+            ))
+        };
+        let Some((src_index, src_plane, src_rect)) = select(src, source_base, &copy.source) else {
+            return Ok(false);
+        };
+        let Some((dst_index, dst_plane, dst_rect)) =
+            select(dst, destination_base, &copy.destination)
+        else {
+            return Ok(false);
+        };
+        if src_rect.extent != dst_rect.extent
+            || src_plane.block_extent != dst_plane.block_extent
+            || src_plane.aspect != dst_plane.aspect
+            || src_plane.bytes_per_block != dst_plane.bytes_per_block
+            || !format::copy_compatible(
+                src.description.format,
+                dst.description.format,
+                src_plane.aspect,
+            )
+        {
+            return Ok(false);
+        }
+        let retained = self.runtime.constructing.len();
+        self.runtime
+            .constructing
+            .extend([Resource::Image(source), Resource::Image(destination)]);
+        let result = (|| {
+            // DMA addresses guest storage, including at non-native render scales.
+            self.scale_image(source, false, false)?;
+            self.scale_image(destination, false, false)?;
+            self.copy_image_regions(
+                source,
+                destination,
+                &[(src_index, dst_index)],
+                src_rect,
+                dst_rect.offset,
+            )?;
+            self.runtime.statistics.cache_hits += 2;
+            self.runtime.statistics.dma_image_copies += 1;
+            self.runtime.statistics.gpu_copied_bytes += u64::from(copy.source.layout.rect.width)
+                * u64::from(copy.source.layout.rect.height);
+            Ok(true)
+        })();
+        self.runtime.constructing.truncate(retained);
+        result
     }
     fn dma_buffer_copy(
         &mut self,
@@ -197,30 +310,16 @@ impl Residency<'_> {
 impl Residency<'_> {
     fn dma_buffer_image(
         &mut self,
-        operation: &MaxwellMemoryCopyOperation,
-        space: &MaxwellGpuMemory,
+        copy: &MemoryCopy,
+        space: &(impl ImageAddressSpace + ?Sized),
         upload: bool,
     ) -> Result<bool, VulkanError> {
-        let (image_address, image_size, image_layout, buffer_address, buffer_layout) = if upload {
-            (
-                operation.destination_address(),
-                operation.destination_range_size(),
-                operation.destination_layout(),
-                operation.source_address(),
-                operation.source_layout(),
-            )
+        let (image_surface, buffer_surface) = if upload {
+            (&copy.destination, &copy.source)
         } else {
-            (
-                operation.source_address(),
-                operation.source_range_size(),
-                operation.source_layout(),
-                operation.destination_address(),
-                operation.destination_layout(),
-            )
+            (&copy.source, &copy.destination)
         };
-        let Some((image, [level, layer])) =
-            self.dma_image_id(space, image_address, image_size, image_layout, upload)?
-        else {
+        let Some((image, [level, layer])) = self.dma_image_id(space, image_surface, upload)? else {
             return Ok(false);
         };
         let entry = self.texture_cache.get(image);
@@ -246,15 +345,15 @@ impl Residency<'_> {
         }
         let stored = entry.storage_plane(plane);
         let multisample = entry.description.samples != vk::SampleCountFlags::TYPE_1;
-        let MaxwellMemoryCopyLayout::BlockLinear { x, y, .. } = image_layout else {
-            unreachable!()
-        };
-        let MaxwellMemoryCopyLayout::Pitch { pitch } = buffer_layout else {
-            unreachable!()
+        let layout = image_surface.layout;
+        let x = layout.rect.x;
+        let y = layout.rect.y;
+        let Some((address, pitch, buffer_size)) = linear_range(space, buffer_surface)? else {
+            return Ok(false);
         };
         let bpp = plane.bytes_per_block;
         if !x.is_multiple_of(bpp)
-            || !operation.width().is_multiple_of(bpp)
+            || !layout.rect.width.is_multiple_of(bpp)
             || !pitch.is_multiple_of(bpp)
         {
             return Ok(false);
@@ -265,8 +364,8 @@ impl Residency<'_> {
                 y: y as i32,
             },
             extent: vk::Extent2D {
-                width: operation.width() / bpp,
-                height: operation.height(),
+                width: layout.rect.width / bpp,
+                height: layout.rect.height,
             },
         };
         if x / bpp + rect.extent.width > stored.extent.width
@@ -274,22 +373,9 @@ impl Residency<'_> {
         {
             return Ok(false);
         }
-        let buffer_size = u64::from(pitch) * u64::from(operation.height());
-        let gpu = space.address(buffer_address).map_err(failure)?;
-        if space
-            .max_continuous_range(gpu, buffer_size)
-            .map_err(failure)?
-            < buffer_size
-        {
-            return Ok(false);
-        }
-        let Ok(address) = space.device_address(gpu) else {
-            return Ok(false);
-        };
         let retained = self.runtime.constructing.len();
         self.runtime.constructing.push(Resource::Image(image));
         let result = self.record_dma_buffer_image(
-            operation,
             image,
             plane,
             stored,
@@ -306,7 +392,6 @@ impl Residency<'_> {
     #[allow(clippy::too_many_arguments)]
     fn record_dma_buffer_image(
         &mut self,
-        operation: &MaxwellMemoryCopyOperation,
         image: ImageId,
         plane: ImagePlane,
         stored: ImagePlane,
@@ -344,7 +429,7 @@ impl Residency<'_> {
         self.prepare_image(image, upload, false)?;
         let mut region = vk::BufferImageCopy::default()
             .buffer_row_length(pitch / plane.bytes_per_block)
-            .buffer_image_height(operation.height())
+            .buffer_image_height(rect.extent.height)
             .image_subresource(plane.layers())
             .image_offset(vk::Offset3D {
                 x: rect.offset.x,
@@ -398,9 +483,9 @@ impl Residency<'_> {
             let mut inputs = Vec::new();
             // Only bytes actually copied from the image are published. Vulkan
             // leaves row padding undefined in the direct DMA staging copy.
-            for row in 0..u64::from(operation.height()) {
+            for row in 0..u64::from(rect.extent.height) {
                 let start = row * u64::from(pitch);
-                let bytes = u64::from(operation.width());
+                let bytes = u64::from(rect.extent.width) * u64::from(plane.bytes_per_block);
                 for span in mapping.spans() {
                     let first = start.max(span.logical);
                     let last = (start + bytes).min(span.logical + span.bytes);
@@ -460,8 +545,42 @@ impl Residency<'_> {
                 .push(super::texture_download::PendingDownload::Buffer(end));
         }
         self.runtime.statistics.dma_image_downloads += u64::from(!upload);
-        self.runtime.statistics.gpu_copied_bytes +=
-            u64::from(operation.width()) * u64::from(operation.height());
+        self.runtime.statistics.gpu_copied_bytes += u64::from(rect.extent.width)
+            * u64::from(plane.bytes_per_block)
+            * u64::from(rect.extent.height);
         Ok(true)
     }
+}
+
+/// Resolve a byte rectangle without reading its contents. Include inter-row
+/// padding but never extend the transfer past the last copied byte.
+fn linear_range(
+    space: &(impl ImageAddressSpace + ?Sized),
+    surface: &MemoryCopySurface,
+) -> Result<Option<(u64, u32, u64)>, VulkanError> {
+    let layout = surface.layout;
+    let ImageStorage::Pitch { row_pitch } = layout.storage else {
+        return Ok(None);
+    };
+    let Ok(pitch) = u32::try_from(row_pitch) else {
+        return Ok(None);
+    };
+    let offset = layout.base + u64::from(layout.rect.y) * row_pitch + u64::from(layout.rect.x);
+    let bytes = u64::from(layout.rect.height - 1) * row_pitch + u64::from(layout.rect.width);
+    if offset + bytes > surface.bytes {
+        return Ok(None);
+    }
+    let address = surface.address + offset;
+    if space
+        .image_mapped_ranges(address, bytes)
+        .map_err(failure)?
+        .next()
+        != Some((address, bytes))
+    {
+        return Ok(None);
+    }
+    Ok(space
+        .image_device_address(address)
+        .map_err(failure)?
+        .map(|device| (device, pitch, bytes)))
 }

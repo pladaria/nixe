@@ -598,7 +598,7 @@ impl<E: ampere::Rasterizer> PreparationHost for Back<'_, E> {
         self.renderer.flush_constants()
     }
 
-    fn copy(&mut self, operation: &ampere::dma::Copy) -> Result<()> {
+    fn copy(&mut self, operation: &nixe_gpu::native::MemoryCopy) -> Result<()> {
         self.copy_memory(operation)
     }
     fn reduce_report(

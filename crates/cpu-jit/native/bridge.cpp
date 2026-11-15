@@ -58,7 +58,7 @@ struct Core final : Dynarmic::A64::UserCallbacks {
 
   Core(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table, size_t address_bits,
        std::uint32_t frequency, std::uint32_t ctr, std::uint32_t dczid,
-       bool strict_architecture, const std::uint64_t* pointer_authentication_keys)
+       bool strict_architecture)
       : callbacks(cb) {
     Dynarmic::A64::UserConfig conf{};
     conf.callbacks = this;
@@ -74,16 +74,7 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.hook_unknown_hint_instructions = strict_architecture;
     conf.enable_lse = strict_architecture;
     conf.enable_rcpc = strict_architecture;
-    if (pointer_authentication_keys) {
-      // @SPECULATIVE: enable the EL0 instruction/data keys and use this process's
-      // VA width with TBI disabled. Horizon's exact key-enable and translation
-      // control configuration on Switch 2 is not documented.
-      conf.pointer_authentication.address_bits = static_cast<unsigned>(address_bits);
-      for (size_t key = 0; key < 5; ++key) {
-        conf.pointer_authentication.keys[key] = {pointer_authentication_keys[key * 2],
-                                                pointer_authentication_keys[key * 2 + 1]};
-      }
-    }
+    conf.enable_pauth = strict_architecture;
     conf.hook_data_cache_operations = false;
     // Use Eden's defined choices for constrained-unpredictable encodings,
     // including overlapping status/data zero registers in STXR/STLXR.
@@ -229,11 +220,9 @@ bool nixe_dynarmic_resolve_fault(std::uint64_t pc, std::uint64_t *call,
 const char *nixe_dynarmic_error() noexcept { return last_error.c_str(); }
 void *nixe_dynarmic_create(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table,
                            size_t bits, std::uint32_t frequency, std::uint32_t ctr,
-                           std::uint32_t dczid, bool strict_architecture,
-                           const std::uint64_t* pointer_authentication_keys) noexcept {
+                           std::uint32_t dczid, bool strict_architecture) noexcept {
   try {
-    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid, strict_architecture,
-                    pointer_authentication_keys);
+    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid, strict_architecture);
   } catch (const std::exception &e) {
     last_error = e.what();
     return nullptr;

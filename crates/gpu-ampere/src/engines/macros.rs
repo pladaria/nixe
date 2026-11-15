@@ -30,7 +30,6 @@ impl Preparation {
                 .proofs
                 .resize_with(program.start as usize + 1, || None);
         }
-        context.set_entry(program.start, true);
         execution.proofs[program.start as usize] = Some(program.effects);
     }
     pub fn run_macro(

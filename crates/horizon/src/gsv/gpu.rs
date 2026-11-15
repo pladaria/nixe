@@ -631,7 +631,7 @@ impl<'a> GpuMemory<'a> {
             guard: Some(space.read().unwrap()),
         }
     }
-    fn commit(&mut self, address: u64, bytes: u64) -> Result<(), MemoryError> {
+    pub(super) fn commit(&mut self, address: u64, bytes: u64) -> Result<(), MemoryError> {
         if self.for_each_physical(address, bytes, |_, _| {}) {
             return Ok(());
         }
@@ -646,6 +646,15 @@ impl<'a> GpuMemory<'a> {
     }
     pub fn capture(&mut self, address: u64, bytes: u64) -> Result<GpuCapture, MemoryError> {
         self.commit(address, bytes)?;
+        self.capture_mapped(address, bytes)
+    }
+    /// Retain already mapped bytes beyond this guard's lifetime. Native-only
+    /// operations keep the guard instead and need no temporary pins or leases.
+    pub(super) fn capture_mapped(
+        &self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<GpuCapture, MemoryError> {
         self.guard.as_ref().unwrap().capture(address, bytes)
     }
 }

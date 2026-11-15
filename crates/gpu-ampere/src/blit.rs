@@ -34,19 +34,22 @@ impl Blit {
             ..self.destination
         })
     }
-    pub fn byte_copy(&self) -> Result<Option<crate::dma::Copy>> {
+    pub fn byte_copy(&self) -> Result<Option<nixe_gpu::native::MemoryCopy>> {
         let Some(rect) = self.copy_source_rect() else {
             return Ok(None);
         };
         let [src, dst] = &self.images;
-        Ok(Some(crate::dma::Copy {
+        Ok(Some(nixe_gpu::native::MemoryCopy {
             source: copy_surface(src, rect)?,
             destination: copy_surface(dst, self.destination)?,
         }))
     }
 }
 
-fn copy_surface(info: &ImageInfo, rect: ScissorRect) -> Result<crate::dma::Surface> {
+fn copy_surface(
+    info: &ImageInfo,
+    rect: ScissorRect,
+) -> Result<nixe_gpu::native::MemoryCopySurface> {
     use nixe_gpu::physical::{ByteRect, ImageFootprint, ImageStorage};
     let bpp = u32::from(
         info.description
@@ -64,7 +67,7 @@ fn copy_surface(info: &ImageInfo, rect: ScissorRect) -> Result<crate::dma::Surfa
         _ => return Err("invalid native 2D copy layout".into()),
     };
     let columns = extent.width.checked_mul(bpp).ok_or("copy width overflow")?;
-    crate::dma::Surface::new(
+    crate::dma::surface(
         info.address,
         ImageFootprint {
             depth_slice: 0,

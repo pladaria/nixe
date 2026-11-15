@@ -112,7 +112,8 @@ pub(super) fn analyze(code: &Code, start: u32) -> Effects {
         start as usize,
         false,
         State {
-            regs: [None; 24],
+            // Match the deterministic initial register file of both executors.
+            regs: [Some(0); 24],
             carry: Some(0),
             method: Some(0),
             increment: Some(0),

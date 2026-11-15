@@ -32,9 +32,11 @@ enum class SystemRegisterEncoding : u32 {
 
 bool TranslatorVisitor::HINT([[maybe_unused]] Imm<4> CRm, [[maybe_unused]] Imm<3> op2) {
     const unsigned immediate = concatenate(CRm, op2).ZeroExtend<unsigned>();
-    if (HasPAuth() && (immediate == 7 || immediate == 8 || immediate == 10 ||
+    if (options.enable_pauth && (immediate == 7 || immediate == 8 || immediate == 10 ||
                       immediate == 12 || immediate == 14 || (immediate >= 24 && immediate <= 31))) {
-        return PAuthHint(immediate);
+        // @SIMPLIFICATION Unsigned pointers make PAC/AUT/XPAC hints no-ops;
+        // the speculative compatibility model is documented in pointer_authentication.cpp.
+        return true;
     }
     if (options.hook_unknown_hint_instructions) {
         return InterpretThisInstruction();

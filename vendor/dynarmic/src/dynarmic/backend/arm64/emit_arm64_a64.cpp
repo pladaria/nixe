@@ -83,10 +83,6 @@ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Po
         code.MOV(Wscratch0, A64::LocationDescriptor::fpcr_mask);
         code.LDR(W0, Xstate, offsetof(A64JitState, fpcr));
         code.LDR(X1, Xstate, offsetof(A64JitState, pc));
-        if (ctx.conf.instruction_address_bits != 0) {
-            code.LSR(Xscratch1, X1, ctx.conf.instruction_address_bits);
-            code.CBNZ(Xscratch1, fail);
-        }
         code.AND(W0, W0, Wscratch0);
         code.AND(X1, X1, A64::LocationDescriptor::pc_mask);
         code.LSL(X0, X0, A64::LocationDescriptor::fpcr_shift);

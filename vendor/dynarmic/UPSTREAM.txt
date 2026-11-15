@@ -17,17 +17,14 @@ Nixe adaptations:
 - interface/A64/config.h, frontend/A64/translate and both A64 backends:
   optionally stop at unknown extension HINTs instead of silently dropping their
   semantics on newer guest CPUs.
-- interface/A64/pointer_authentication.h, A64 decoding/translation, IR and host
-  crypto emitters: implement QARMA5-based FEAT_PAuth2 with immutable process keys,
-  PAC/AUT/XPAC, PACGA, authenticated branches/returns and authenticated loads.
-  Pointer widths match the execution address space, with TBI=0 and no FPAC.
-- A64 host entry points, indirect dispatch and return handlers: validate execution
-  addresses before the location hash drops high PC bits, including cached
-  indirect branches, returns and entry from the host.
-- common/crypto/qarma.{cpp,h}: QARMA5 helper adapted from QEMU's
-  target/arm/tcg/pauth_helper.c (Linaro copyright, LGPL-2.1-or-later).
-  Its license is retained in LICENSE.qarma.txt; the original vendored files keep
-  their existing licenses.
+- A64 PAuth decoding/translation: simplified unsigned-pointer model matching
+  Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160. PAC/AUT/XPAC emit no work;
+  PACGA uses masked XOR; authenticated branches and loads use plain addresses.
+  The translator retains the GPL-3.0-or-later notice and marks this semantic
+  approximation @SIMPLIFICATION and @SPECULATIVE. Selection happens at translation time. Removed
+  the superseded process keys, QARMA helper/license, IR opcode, host emitters and
+  PAuth-specific execution-address checks in host entry/dispatch/return paths.
+  Ordinary code-fetch and memory permission checks remain unchanged.
 - frontend/A64/translate/impl/load_store_atomic.cpp: LSE atomic operations
   adapted from Lichii revision 21d62e43caa178aeb04e74585b3aad622b278b84
   (src/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_atomic.cpp).

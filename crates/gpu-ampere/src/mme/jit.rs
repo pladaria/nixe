@@ -3,7 +3,6 @@ use super::*;
 use std::{
     any::Any,
     ffi::{CStr, c_char, c_void},
-    mem::MaybeUninit,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     rc::Rc,
 };
@@ -11,9 +10,7 @@ use std::{
 type NativeProgram = unsafe extern "C" fn(*mut Invocation) -> u32;
 #[repr(C)]
 struct Invocation {
-    // Generated reads require an initialized register or a static proof.
-    regs: [MaybeUninit<u32>; 24],
-    initialized: u32,
+    regs: [u32; 24],
     carry: u32,
     method: u32,
     increment: u32,
@@ -47,24 +44,15 @@ struct Invocation {
 }
 const _: () = {
     assert!(size_of::<Instruction>() == 22);
-    assert!(std::mem::offset_of!(Invocation, params) == 144);
-    assert!(std::mem::offset_of!(Invocation, start) == 224);
-    assert!(std::mem::offset_of!(Invocation, owned) == 240);
-    assert!(size_of::<Invocation>() == 264);
+    assert!(std::mem::offset_of!(Invocation, params) == 136);
+    assert!(std::mem::offset_of!(Invocation, start) == 216);
+    assert!(std::mem::offset_of!(Invocation, owned) == 232);
+    assert!(size_of::<Invocation>() == 256);
 };
 #[repr(C)]
 struct CompileError {
     pc: u32,
     message: [c_char; 256],
-}
-#[repr(C)]
-#[derive(Default, Debug)]
-struct CompileStatistics {
-    guards: u64,
-    removed_guards: u64,
-    initialization_updates: u64,
-    removed_updates: u64,
-    code_bytes: u64,
 }
 unsafe extern "C" {
     fn nixe_ampere_mme_compile(
@@ -72,42 +60,19 @@ unsafe extern "C" {
         instructions: *const Instruction,
         uploaded: *const u8,
         count: usize,
-        entries: *const u64,
         track_ownership: bool,
         function: *mut Option<NativeProgram>,
-        statistics: *mut CompileStatistics,
+        code_bytes: *mut usize,
         error: *mut CompileError,
     ) -> bool;
 }
 
+#[derive(Default)]
 pub(super) struct Cache {
-    entries: [u64; INSTRUCTIONS / 64],
     runtime: Option<Rc<nixe_mme_jit::Runtime>>,
     program: Option<Program>,
 }
-impl Default for Cache {
-    fn default() -> Self {
-        Self {
-            entries: [0; INSTRUCTIONS / 64],
-            runtime: None,
-            program: None,
-        }
-    }
-}
 impl Cache {
-    pub fn set_entry(&mut self, start: u32, enabled: bool) {
-        let word = &mut self.entries[start as usize / 64];
-        let mask = 1 << (start % 64);
-        let next = if enabled { *word | mask } else { *word & !mask };
-        if *word != next {
-            *word = next;
-            self.invalidate();
-        }
-    }
-    pub fn clear_entries(&mut self) {
-        self.entries.fill(0);
-        self.invalidate();
-    }
     pub fn invalidate(&mut self) {
         self.program = None;
     }
@@ -120,7 +85,6 @@ impl Cache {
         dram: &mut [u32],
         host: &mut H,
     ) -> Result<()> {
-        debug_assert_ne!(self.entries[start as usize / 64] & (1 << (start % 64)), 0);
         if host.stopped() {
             return Err("MME execution cancelled".into());
         }
@@ -136,7 +100,7 @@ impl Cache {
                 .rposition(|&mask| mask != 0)
                 .map_or(0, |i| i + 1);
             let mut function = None;
-            let mut statistics = CompileStatistics::default();
+            let mut code_bytes = 0;
             let mut error = CompileError {
                 pc: 0,
                 message: [0; 256],
@@ -149,10 +113,9 @@ impl Cache {
                     instructions.as_ptr(),
                     uploaded.as_ptr(),
                     count,
-                    self.entries.as_ptr(),
                     H::TRACK_OWNERSHIP,
                     &mut function,
-                    &mut statistics,
+                    &mut code_bytes,
                     &mut error,
                 )
             };
@@ -168,7 +131,7 @@ impl Cache {
                 runtime: runtime.clone(),
             });
             log::debug!(
-                "Ampere MME JIT compiled instruction RAM: {} instructions; {statistics:?}",
+                "Ampere MME JIT compiled instruction RAM: {} instructions; {code_bytes} native bytes",
                 uploaded[..count].iter().filter(|&&mask| mask == 7).count()
             );
             nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::MmeJitCompilations, 1);
@@ -274,8 +237,9 @@ impl Program {
             panic: None,
         };
         let mut state = Invocation {
-            regs: [MaybeUninit::uninit(); 24],
-            initialized: 0,
+            // @SIMPLIFICATION Initial reads return zero instead of faulting;
+            // the compatibility assumption is documented on the interpreter's Run.
+            regs: [0; 24],
             carry: 0,
             method: 0,
             increment: 0,
@@ -331,7 +295,6 @@ impl Program {
             9 => "invalid MME output selector".into(),
             10 => "MME host callback failed".into(),
             11 => "MME fetch outside uploaded instruction RAM".into(),
-            12 => format!("uninitialized MME registers: mask={:#x}", state.error_value).into(),
             13 => format!(
                 "MME STATE reads unknown method {:#x}",
                 state.error_value * 4

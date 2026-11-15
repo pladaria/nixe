@@ -3,7 +3,7 @@
 pub mod blit;
 mod channel;
 pub mod compute;
-pub mod dma;
+mod dma;
 mod engines;
 mod mme;
 pub mod ordered;
@@ -62,6 +62,13 @@ pub trait Rasterizer: nixe_gpu::GpuExecution {
         destination: &mut [u8],
     ) -> Result<()>;
     fn write_memory(&mut self, capture: &nixe_memory::CapturedMemory, bytes: &[u8]) -> Result<()>;
+    /// Return false when the exact layout requires coherent CPU copying.
+    fn copy_memory(
+        &mut self,
+        source: Source,
+        copy: &nixe_gpu::native::MemoryCopy,
+        memory: &mut impl RenderMemory,
+    ) -> Result<bool>;
     fn reduce_report(
         &mut self,
         source: Source,

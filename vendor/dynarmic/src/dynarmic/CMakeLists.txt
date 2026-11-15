@@ -10,8 +10,6 @@ add_library(dynarmic
     common/crypto/aes.h
     common/crypto/crc32.cpp
     common/crypto/crc32.h
-    common/crypto/qarma.cpp
-    common/crypto/qarma.h
     common/crypto/sm4.cpp
     common/crypto/sm4.h
     common/fp/fpcr.h
@@ -255,7 +253,6 @@ if ("A64" IN_LIST DYNARMIC_FRONTENDS)
         frontend/A64/translate/impl/system_flag_format.cpp
         frontend/A64/translate/impl/system_flag_manipulation.cpp
         interface/A64/a64.h
-        interface/A64/pointer_authentication.h
         interface/A64/config.h
         ir/opt/a64_callback_config_pass.cpp
         ir/opt/a64_get_set_elimination_pass.cpp
@@ -291,7 +288,6 @@ if ("x86_64" IN_LIST ARCHITECTURE)
         backend/x64/emit_x64_memory.cpp.inc
         backend/x64/emit_x64_memory.h
         backend/x64/emit_x64_packed.cpp
-        backend/x64/emit_x64_pauth.cpp
         backend/x64/emit_x64_saturation.cpp
         backend/x64/emit_x64_sha.cpp
         backend/x64/emit_x64_sm4.cpp

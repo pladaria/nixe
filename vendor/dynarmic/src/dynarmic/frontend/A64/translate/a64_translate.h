@@ -17,7 +17,6 @@ class Block;
 
 namespace A64 {
 
-struct PointerAuthentication;
 
 class LocationDescriptor;
 
@@ -43,7 +42,8 @@ struct TranslationOptions {
     bool enable_lse = false;
     /// ARMv8.3 RCpc acquire loads.
     bool enable_rcpc = false;
-    const PointerAuthentication* pointer_authentication = nullptr;
+    // Translation-time selection of the simplified ARMv8.3 PAuth model.
+    bool enable_pauth = false;
 };
 
 /**

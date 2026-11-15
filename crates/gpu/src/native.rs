@@ -7,6 +7,20 @@ use std::sync::Arc;
 mod image;
 pub use image::{ImageAddressSpace, ImageInfo, ImagePacking};
 
+/// Decoded byte-copy geometry. Engines select their own storage layout; the
+/// native resource owner decides whether existing GPU representations can copy it.
+/// Layout elements and rectangle columns are bytes (packed/aspect size one).
+pub struct MemoryCopySurface {
+    pub address: u64,
+    pub layout: crate::physical::ImageFootprint,
+    pub bytes: u64,
+}
+/// Validated byte surfaces with identical rectangle width and height.
+pub struct MemoryCopy {
+    pub source: MemoryCopySurface,
+    pub destination: MemoryCopySurface,
+}
+
 /// Framebuffer selected by its stable device address. The console request retains
 /// the original physical mapping until the graphics owner consumes the image.
 #[derive(Clone, Debug)]

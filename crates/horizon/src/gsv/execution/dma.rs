@@ -7,21 +7,46 @@ fn failure(error: impl std::fmt::Display) -> Box<str> {
     error.to_string().into_boxed_str()
 }
 impl<E: ampere::Rasterizer> Back<'_, E> {
-    pub(super) fn copy_memory(&mut self, copy: &ampere::dma::Copy) -> Result<()> {
-        let (source, destination) = {
-            let mut space = GpuMemory::new(self.memory.space);
-            (
-                space
-                    .capture(copy.source.address, copy.source.bytes)
-                    .map_err(failure)?,
-                space
-                    .capture(copy.destination.address, copy.destination.bytes)
-                    .map_err(failure)?,
-            )
-        };
+    pub(super) fn copy_memory(&mut self, copy: &nixe_gpu::native::MemoryCopy) -> Result<()> {
         let footprint = |capture: &GpuCapture, layout| {
             let ranges = capture.ranges.capture(0, capture.ranges.bytes())?;
             Footprint::new(PhysicalMapping::new(&ranges)?, WriteDomain::Image(layout))
+        };
+        let (source, destination) = {
+            let mut space = GpuMemory::new(self.memory.space);
+            space
+                .commit(copy.source.address, copy.source.bytes)
+                .map_err(failure)?;
+            space
+                .commit(copy.destination.address, copy.destination.bytes)
+                .map_err(failure)?;
+            // The translation guard retains mappings and CPU-sharing leases
+            // until native preparation has retained the resources it consumes.
+            // Only the fallback and semaphore publication need detached captures.
+            if self.renderer.copy_memory(self.source, copy, &mut space)? {
+                if self.memory.waiters.active() {
+                    let destination = space
+                        .capture_mapped(copy.destination.address, copy.destination.bytes)
+                        .map_err(failure)?;
+                    drop(space);
+                    let destination_layout =
+                        footprint(&destination, copy.destination.layout).map_err(failure)?;
+                    self.memory
+                        .waiters
+                        .written_gpu(&destination_layout, |capture| {
+                            read_owned(self.renderer, &capture.ranges, 4)
+                        })?;
+                }
+                return Ok(());
+            }
+            (
+                space
+                    .capture_mapped(copy.source.address, copy.source.bytes)
+                    .map_err(failure)?,
+                space
+                    .capture_mapped(copy.destination.address, copy.destination.bytes)
+                    .map_err(failure)?,
+            )
         };
         let source_layout = footprint(&source, copy.source.layout).map_err(failure)?;
         let destination_layout =

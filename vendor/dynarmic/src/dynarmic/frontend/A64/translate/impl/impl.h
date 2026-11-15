@@ -31,10 +31,7 @@ struct TranslatorVisitor final {
     bool UnallocatedEncoding();
     bool RaiseException(Exception exception);
 
-    bool HasPAuth() const;
-    IR::U64 StripPAC(const IR::U64& pointer);
-    IR::U64 PointerAuth(const IR::U64& pointer, const IR::U64& modifier, unsigned key, bool authenticate);
-    bool PAuthHint(unsigned immediate);
+
     bool PACAUT_reg(bool Z, Imm<3> op, Reg Rn, Reg Rd);
     bool XPAC_reg(bool D, Reg Rd);
     bool PACGA(Reg Rm, Reg Rn, Reg Rd);

@@ -56,7 +56,7 @@ pub struct Draw {
     pub instances: u32,
 }
 pub trait PreparationHost {
-    fn copy(&mut self, operation: &crate::dma::Copy) -> Result<()>;
+    fn copy(&mut self, operation: &nixe_gpu::native::MemoryCopy) -> Result<()>;
     fn read(&mut self, address: u64, bytes: usize) -> Result<Vec<u8>>;
     fn read_into(&mut self, address: u64, destination: &mut [u8]) -> Result<()>;
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()>;
@@ -719,7 +719,7 @@ fn copy(regs: &Registers, flags: u32, host: &mut impl PreparationHost) -> Result
         if host.stopped() {
             return Err("DMA copy cancelled".into());
         }
-        host.copy(&crate::dma::Copy::decode(regs, flags)?)?;
+        host.copy(&crate::dma::decode(regs, flags)?)?;
     }
     host.barrier()?;
     if flags & 0x18 != 0 {

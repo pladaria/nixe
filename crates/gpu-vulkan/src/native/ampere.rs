@@ -75,6 +75,21 @@ impl model::Rasterizer for NativeGpuExecution {
             .write_captured_memory(capture, bytes)
             .map_err(|e| e.to_string().into())
     }
+    fn copy_memory(
+        &mut self,
+        source: model::Source,
+        copy: &nixe_gpu::native::MemoryCopy,
+        memory: &mut impl RenderMemory,
+    ) -> model::Result<bool> {
+        nixe_gpu::OwnerMemory::invalidate_gpu_cache(self)
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        self.execution()
+            .record(FrontendSubmissionId::new(source.submission), |native| {
+                native.residency.runtime.device.realize_deferred_clear()?;
+                native.residency.accelerate_dma(copy, memory)
+            })
+            .map_err(|e| e.to_string().into())
+    }
     fn reduce_report(
         &mut self,
         source: model::Source,
