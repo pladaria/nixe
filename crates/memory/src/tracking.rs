@@ -223,12 +223,26 @@ impl ResourceRead<'_> {
         // SAFETY: the region is retained/admitted for this callback; the checked
         // destination is exclusive host memory. No guest RAM references escape.
         unsafe {
+            self.copy_unchecked(offset, destination);
+        }
+        Ok(())
+    }
+
+    /// Copy from an admitted region without repeating its bounds check.
+    ///
+    /// # Safety
+    /// `offset..offset + destination.len()` must be contained in this region.
+    /// The destination must not alias guest memory. The region retains and
+    /// admits its source for this callback; guest RAM never becomes a reference.
+    #[inline]
+    pub unsafe fn copy_unchecked(&self, offset: u64, destination: &mut [u8]) {
+        debug_assert!(offset <= self.bytes && destination.len() as u64 <= self.bytes - offset);
+        unsafe {
             crate::raw::capture(self.source.as_ptr().add(offset as usize), destination);
         }
         #[cfg(any(test, feature = "performance-counters"))]
         self.captured
             .set(self.captured.get() + destination.len() as u64);
-        Ok(())
     }
 }
 /// A checked copy from retained physical input into an owned native snapshot.

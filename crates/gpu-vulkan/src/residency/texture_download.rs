@@ -329,7 +329,11 @@ impl Residency<'_> {
         }
         self.download_images(ids)
     }
-    pub(super) fn preserve_texture_writes(&mut self, writes: &RangeSet) -> Result<(), VulkanError> {
+    pub(super) fn preserve_texture_writes(
+        &mut self,
+        writes: &RangeSet,
+        physical_writes: impl FnOnce() -> Result<RangeSet, VulkanError>,
+    ) -> Result<(), VulkanError> {
         let mut ids = Vec::new();
         for (address, bytes) in writes.iter() {
             for page in address >> 20..=(address + bytes - 1) >> 20 {
@@ -348,14 +352,49 @@ impl Residency<'_> {
                 }
             }
         }
-        self.download_images(ids)
+        if !ids.is_empty() {
+            let physical = physical_writes()?;
+            let mut preserved = Vec::with_capacity(ids.len());
+            for id in ids {
+                for plane in &self.texture_cache.get(id).contents.geometry {
+                    if !plane.covered_by_writes(&physical)? {
+                        preserved.push(id);
+                        break;
+                    }
+                }
+            }
+            return self.download_images(preserved);
+        }
+        Ok(())
     }
     fn download_images(&mut self, mut ids: Vec<ImageId>) -> Result<(), VulkanError> {
         ids.sort_by_key(|&id| self.texture_cache.get(id).modification_tick);
+        // Later producers publish last. An older representation fully covered
+        // by a later one would only download and copy bytes immediately replaced
+        // by that publication. Compare exact physical footprints, including all
+        // layers/aspects, before omitting it. Partial aliases retain their order.
+        let mut selected = Vec::with_capacity(ids.len());
+        for &id in ids.iter().rev() {
+            let image = self.texture_cache.get(id);
+            let covered = selected.iter().any(|&newer| {
+                let newer = self.texture_cache.get(newer);
+                image.contents.geometry.iter().all(|plane| {
+                    newer
+                        .contents
+                        .geometry
+                        .iter()
+                        .any(|other| other.covers(plane))
+                })
+            });
+            if !covered {
+                selected.push(id);
+            }
+        }
+        selected.reverse();
         for &id in &ids {
             self.texture_cache.images[id].gpu_modified = false;
         }
-        if let Some(download) = self.record_texture_downloads(&ids)? {
+        if let Some(download) = self.record_texture_downloads(&selected)? {
             self.flush()?;
             self.runtime
                 .device

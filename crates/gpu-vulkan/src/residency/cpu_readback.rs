@@ -16,7 +16,14 @@ impl Residency<'_> {
             for (a, b) in ranges.iter() {
                 self.finish_buffer_reads(a, b)?;
             }
-            self.preserve_texture_writes(&ranges)?;
+            self.preserve_texture_writes(&ranges, || {
+                Ok(memory
+                    .read_mapping(address, bytes.len() as u64)?
+                    .spans()
+                    .iter()
+                    .map(|span| (span.start.get(), span.bytes))
+                    .collect())
+            })?;
             {
                 // Fence callbacks publish query values independently of the owner.
                 // Cancel older reports before exposing the replacement RAM bytes.
@@ -88,7 +95,12 @@ impl Residency<'_> {
                 }
             }
         }
-        self.preserve_texture_writes(&ranges)?;
+        self.preserve_texture_writes(&ranges, || {
+            Ok((0..capture.len())
+                .flat_map(|i| capture[i].physical_extents())
+                .map(|extent| (extent.start.get(), extent.bytes))
+                .collect())
+        })?;
         {
             let mut queries = self.caches.query_cache.lock().unwrap();
             for (address, bytes) in ranges.iter() {
@@ -231,7 +243,13 @@ impl Residency<'_> {
             // Texture invalidation replaces a whole representation. Preserve
             // its untouched bytes before a partial canonical write. Buffer
             // invalidation already retains exact unwritten native intervals.
-            self.preserve_texture_writes(&device_ranges)?;
+            self.preserve_texture_writes(&device_ranges, || {
+                Ok(ranges
+                    .iter()
+                    .flat_map(AllocationRange::physical_extents)
+                    .map(|extent| (extent.start.get(), extent.bytes))
+                    .collect())
+            })?;
         } else {
             for (address, bytes) in device_ranges.iter() {
                 self.flush_region(address, bytes)?;
