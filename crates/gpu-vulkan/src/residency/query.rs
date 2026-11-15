@@ -185,6 +185,7 @@ impl Residency<'_> {
         });
         let report_noted = self.buffer_cache.note_report_pending(address, &query);
         let caches = Arc::clone(self.caches);
+        caches.query_pages.mark(address, query.bytes.len() as u64);
         {
             let mut cache = caches.query_cache.lock().unwrap();
             if let Some(previous) = cache.cached.insert(address, Arc::clone(&query)) {

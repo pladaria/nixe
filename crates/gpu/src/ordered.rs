@@ -18,6 +18,21 @@ const WORDS: u64 = 1;
 const CONTROL: u64 = 2;
 const PUBLISH_WORDS: u64 = 256;
 const EARLY_PUBLISH_WORDS: u64 = 8;
+/// Learn short queue gaps without reading a clock on the command path. Long
+/// dependencies reduce the active wait; successful spins estimate the next gap.
+/// The sleep handshake remains independent of this bounded performance policy.
+struct SpinLimit(u32);
+impl SpinLimit {
+    fn new() -> Self {
+        Self(256)
+    }
+    fn completed(&mut self, spins: u32) {
+        self.0 = ((self.0 * 3 + spins * 2 + 64) / 4).clamp(128, 1024);
+    }
+    fn expired(&mut self) {
+        self.0 = (self.0 / 2).max(128);
+    }
+}
 #[repr(align(128))]
 struct Cursor(AtomicU64);
 // These flags are written by opposite threads during sleep handshakes. Keep
@@ -78,6 +93,7 @@ pub struct Sender<T> {
     published: u64,
     publish_every: u64,
     batch: Option<u64>,
+    spins: SpinLimit,
     #[cfg(feature = "performance-counters")]
     pub wait: Duration,
     #[cfg(feature = "performance-counters")]
@@ -95,6 +111,7 @@ pub struct Receiver<T> {
     record_end: u64,
     published: u64,
     released: u64,
+    spins: SpinLimit,
 }
 pub enum Read<'a, T> {
     Control(T),
@@ -155,6 +172,7 @@ pub fn channel<T: Send>(capacity: usize) -> (Sender<T>, Receiver<T>) {
             published: 0,
             publish_every: PUBLISH_WORDS,
             batch: None,
+            spins: SpinLimit::new(),
             #[cfg(feature = "performance-counters")]
             wait: Duration::ZERO,
             #[cfg(feature = "performance-counters")]
@@ -172,6 +190,7 @@ pub fn channel<T: Send>(capacity: usize) -> (Sender<T>, Receiver<T>) {
             record_end: 0,
             published: 0,
             released: 0,
+            spins: SpinLimit::new(),
         },
     )
 }
@@ -263,13 +282,15 @@ impl<T> Sender<T> {
         result
     }
     fn wait_for_consumed(&mut self, position: u64) -> Result<(), Disconnected> {
-        for _ in 0..1024 {
+        for spins in 0..self.spins.0 {
             self.read = self.shared.read.0.load(Ordering::Acquire);
             if self.read >= position {
+                self.spins.completed(spins);
                 return Ok(());
             }
             std::hint::spin_loop();
         }
+        self.spins.expired();
         let s = &self.shared;
         s.producer.get_or_init(thread::current);
         s.producer_waiting.0.store(true, Ordering::SeqCst);
@@ -458,17 +479,23 @@ impl<T> Receiver<T> {
             .idle_at
             .0
             .store(self.position, Ordering::Relaxed);
-        for _ in 0..1024 {
+        let mut explicit_request = false;
+        for spins in 0..self.spins.0 {
             if self.ready() {
+                self.spins.completed(spins);
                 return Ok(true);
             }
             if stopped() {
                 return Ok(false);
             }
             if requested() {
+                explicit_request = true;
                 break;
             }
             std::hint::spin_loop();
+        }
+        if !explicit_request {
+            self.spins.expired();
         }
         loop {
             if self.ready() {

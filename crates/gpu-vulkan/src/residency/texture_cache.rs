@@ -253,6 +253,7 @@ impl TextureCache {
             .filter(|_| entry.maps.is_empty())
             .map(|cached| (cached.cpu_address, cached.info.size));
         for (address, size) in entry.maps.iter().copied().chain(unbacked) {
+            self.page_filter.mark(address, size);
             for page in address >> PAGE_BITS..=(address + size - 1) >> PAGE_BITS {
                 let entries = self.image_pages.entry(page).or_default();
                 if !entries.contains(&id) {
@@ -390,7 +391,7 @@ impl TextureCache {
     /// contents CPU-modified. Already-modified images need no second update.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L586-L597
     pub(super) fn write_memory(&mut self, address: u64, bytes: u64) {
-        if bytes == 0 {
+        if !self.page_filter.any(address, bytes) {
             return;
         }
         let end = address + bytes;
@@ -669,8 +670,8 @@ impl Residency<'_> {
             .image_modification_tick
             .checked_add(1)
             .expect("image modification tick exhausted");
-        self.texture_cache.images[id].modification_tick =
-            self.texture_cache.image_modification_tick;
+        let tick = self.texture_cache.image_modification_tick;
+        self.texture_cache.set_image_modification(id, tick);
         let entry = &mut self.texture_cache.images[id];
         for &(address, bytes) in &entry.maps {
             if !entry.gpu_modified {

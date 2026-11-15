@@ -99,6 +99,7 @@ struct BufferEntry {
 }
 pub(crate) struct ImageEntry {
     synchronized: bool,
+    aliases_current: bool,
     aliases: Vec<image::ImageAlias>,
     cpu_tracked: bool,
     maps: smallvec::SmallVec<[(u64, u64); 1]>,
@@ -390,6 +391,13 @@ impl Residency<'_> {
         &mut self,
         ranges: impl Iterator<Item = (u64, u64)> + Clone,
     ) -> Result<(), VulkanError> {
+        self.invalidate_cpu_ranges(ranges, false)
+    }
+    fn invalidate_cpu_ranges(
+        &mut self,
+        ranges: impl Iterator<Item = (u64, u64)> + Clone,
+        constants: bool,
+    ) -> Result<(), VulkanError> {
         let ranges = ranges.filter(|&(_, bytes)| bytes != 0);
         // Claim the entire batch before deciding which pages still need GPU
         // ownership. Several CPU stores can together replace all dirty bytes.
@@ -398,15 +406,29 @@ impl Residency<'_> {
             self.buffer_cache.claim_cpu_write(address, bytes);
         }
         for (address, bytes) in ranges {
-            if !self.upload_partial_write(address, bytes)? {
+            // Streamed uniforms do not clean buffer-tracker pages. Their RAM
+            // writes only need the uniform/command versions claimed above until
+            // a resident buffer has actually synchronized those pages.
+            let reaches_buffers = !constants
+                || self
+                    .buffer_cache
+                    .memory_tracker
+                    .ever_synchronized(address, bytes)
+                || self
+                    .runtime
+                    .device_memory
+                    .may_be_gpu_written(address, bytes);
+            if reaches_buffers && !self.upload_partial_write(address, bytes)? {
                 self.buffer_cache.memory_tracker.cpu_write(address, bytes);
             }
             self.texture_cache.write_memory(address, bytes);
-            self.caches
-                .query_cache
-                .lock()
-                .unwrap()
-                .invalidate_region(address, bytes);
+            if self.caches.query_pages.any(address, bytes) {
+                self.caches
+                    .query_cache
+                    .lock()
+                    .unwrap()
+                    .invalidate_region(address, bytes);
+            }
             self.shader_cache.invalidate_region(address, bytes);
         }
         Ok(())

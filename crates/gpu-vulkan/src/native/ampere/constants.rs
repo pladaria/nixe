@@ -130,9 +130,7 @@ impl NativeGpuExecution {
                 pending.push((address, size));
             }
         } else {
-            for &(address, size) in &self.state.ampere.constant_writes {
-                residency.write_constant_region(address, size)?;
-            }
+            residency.write_constant_regions(&self.state.ampere.constant_writes)?;
             self.state.ampere.constant_writes.clear();
             // Descriptor pools and fragmented destinations retain exact coherent
             // writes. They cannot inherit the selected data-buffer contract.
@@ -152,9 +150,7 @@ impl NativeGpuExecution {
             return Ok(());
         }
         let mut residency = self.residency.access();
-        for &(address, size) in &self.state.ampere.constant_writes {
-            residency.write_constant_region(address, size)?;
-        }
+        residency.write_constant_regions(&self.state.ampere.constant_writes)?;
         self.state.ampere.constant_writes.clear();
         Ok(())
     }

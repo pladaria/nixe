@@ -11,13 +11,14 @@ enum Kind {
     Cpu,
     Gpu,
     Untracked,
+    Synchronized,
 }
 struct Region {
-    words: [[u64; WORDS]; 3],
+    words: [[u64; WORDS]; 4],
 }
 impl Default for Region {
     fn default() -> Self {
-        let mut words = [[0; WORDS]; 3];
+        let mut words = [[0; WORDS]; 4];
         words[Kind::Cpu as usize].fill(u64::MAX);
         words[Kind::Untracked as usize].fill(u64::MAX);
         Self { words }
@@ -114,6 +115,10 @@ impl MemoryTracker {
     pub fn gpu_modified(&self, address: u64, size: u64) -> bool {
         self.modified(Kind::Gpu, address, size)
     }
+    /// A page never synchronized with a resident buffer remains CPU-dirty already.
+    pub fn ever_synchronized(&self, address: u64, size: u64) -> bool {
+        self.modified(Kind::Synchronized, address, size)
+    }
     // WordManager collects count edges before updating device-memory tracking.
     // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/buffer_cache/word_manager.h#L118-L144
     pub fn cpu_write(&mut self, address: u64, size: u64) {
@@ -191,6 +196,7 @@ impl MemoryTracker {
                 });
                 region.words[Kind::Cpu as usize][word] &= !mask;
                 region.words[Kind::Untracked as usize][word] &= !mask;
+                region.words[Kind::Synchronized as usize][word] |= mask;
             },
         );
         if !tracked_ranges.is_empty() {

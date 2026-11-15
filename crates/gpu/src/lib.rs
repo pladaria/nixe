@@ -7,6 +7,7 @@ mod access;
 mod address;
 mod allocation;
 pub mod memory_tracker;
+pub mod page_filter;
 pub mod physical;
 mod working_set;
 pub use working_set::{Equivalent, WorkingSet};

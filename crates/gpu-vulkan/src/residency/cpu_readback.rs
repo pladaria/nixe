@@ -41,20 +41,22 @@ impl Residency<'_> {
         memory.write_contiguous(address, nixe_memory::WriteSource::Bytes(bytes))?;
         Ok(())
     }
-    pub(crate) fn write_constant_region(
+    pub(crate) fn write_constant_regions(
         &mut self,
-        address: u64,
-        bytes: u64,
+        writes: &[(u64, u64)],
     ) -> Result<(), VulkanError> {
-        self.write_memory(address, bytes)?;
-        let memory = self.runtime.device_memory.clone();
-        let mut result = Ok(());
-        memory.apply_device_aliases(address, bytes, |a, b| {
-            if result.is_ok() {
-                result = self.write_memory(a, b);
-            }
-        });
-        result
+        let mut ranges = smallvec::SmallVec::<[(u64, u64); 16]>::new();
+        for &(address, bytes) in writes {
+            ranges.push((address, bytes));
+            self.runtime
+                .device_memory
+                .apply_device_aliases(address, bytes, |a, b| {
+                    ranges.push((a, b));
+                });
+        }
+        // Claim the complete batch, including physical aliases, before deciding
+        // whether a partially overwritten native page still needs an upload.
+        self.invalidate_cpu_ranges(ranges.iter().copied(), true)
     }
 
     pub(crate) fn flush_read_span(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {

@@ -3,6 +3,7 @@
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache_base.h
 use super::*;
 pub(crate) struct CacheOwners {
+    pub(super) query_pages: nixe_gpu::page_filter::PageFilter,
     uniform_sync: Arc<std::sync::atomic::AtomicU64>,
     pub(super) command_pages: Arc<command_pages::CommandPages>,
     pub(crate) shader_cache: nixe_gpu::shader_memory::ShaderCache,
@@ -65,6 +66,7 @@ impl CacheOwners {
         let pending_buffer_reads = Arc::clone(&buffer_cache.pending_read_count);
         let gpu_invalidations = Arc::clone(&buffer_cache.virtual_ranges.invalidations);
         Self {
+            query_pages: nixe_gpu::page_filter::PageFilter::new(device.address_bits()),
             command_pages,
             progress: Arc::clone(&progress),
             timeline,
@@ -332,6 +334,7 @@ impl Drop for BufferCache {
     }
 }
 pub(crate) struct TextureCache {
+    pub(super) page_filter: nixe_gpu::page_filter::PageFilter,
     pub(super) uniform_sync: Arc<std::sync::atomic::AtomicU64>,
     pub(super) frame_tick: u64,
     // Native samplers live with the texture cache, through queue shutdown,
@@ -382,6 +385,7 @@ impl TextureCache {
         Self {
             uniform_sync,
             samplers,
+            page_filter: nixe_gpu::page_filter::PageFilter::new(device_memory.address_bits()),
             frame_tick: 0,
             bindings: Default::default(),
             framebuffers: Default::default(),

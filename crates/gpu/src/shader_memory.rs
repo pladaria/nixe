@@ -43,6 +43,7 @@ struct Invalidations {
 }
 struct Cache {
     memory: DeviceMemory,
+    pages: crate::page_filter::PageFilter,
     counters: crate::cache_counters::CacheCounters,
     lookup: Mutex<HashMap<(u64, nixe_shader_recompiler::environment::ShaderIsa), Arc<Entry>>>,
     invalidations: Mutex<Invalidations>,
@@ -64,6 +65,7 @@ pub struct ShaderCache(Arc<Cache>);
 impl ShaderCache {
     pub fn new(memory: DeviceMemory) -> Self {
         Self(Arc::new(Cache {
+            pages: crate::page_filter::PageFilter::new(memory.address_bits()),
             memory,
             counters: crate::cache_counters::CacheCounters::new(0, 0),
             lookup: Mutex::new(HashMap::default()),
@@ -112,6 +114,9 @@ impl ShaderCache {
         if let Some(old) = lookup.get(&(address, isa)) {
             return Ok(Arc::clone(&old.info));
         }
+        // Make the filter visible before cached-page protection can send a
+        // concurrent writer through invalidation. It then joins the lock above.
+        self.0.pages.mark(address, bytes);
         self.0
             .memory
             .update_pages_cached_count(address, bytes, 1)
@@ -132,6 +137,9 @@ impl ShaderCache {
     /// and detach page entries; their lookups retire at the next normal
     /// invalidation, as ShaderCache::OnCacheInvalidation/RemovePendingShaders.
     pub fn invalidate_region(&self, address: u64, bytes: u64) {
+        if !self.0.pages.any(address, bytes) {
+            return;
+        }
         let mut invalidations = self.0.invalidations.lock().unwrap();
         self.invalidate_pages(&mut invalidations, address, bytes);
         if invalidations.pending.is_empty() {

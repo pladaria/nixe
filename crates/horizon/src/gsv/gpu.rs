@@ -657,6 +657,30 @@ impl<'a> GpuMemory<'a> {
     ) -> Result<GpuCapture, MemoryError> {
         self.guard.as_ref().unwrap().capture(address, bytes)
     }
+    /// Resolve under the existing translation guard after commitment. The caller
+    /// keeps that guard for every use of the returned host address.
+    pub(super) fn mapped_read_span(
+        &self,
+        address: u64,
+        bytes: u64,
+    ) -> nixe_gpu_ampere::Result<Option<(u64, nixe_memory::HostAddress)>> {
+        let end = address
+            .checked_add(bytes)
+            .filter(|&end| end <= VA_END)
+            .ok_or("native read overflow")?;
+        let device = if address >= VA_END - PAGE_SIZE {
+            self.sync_mapping
+                .as_ref()
+                .map(|m| m.pin.address() + address - (VA_END - PAGE_SIZE))
+        } else {
+            self.mappings
+                .range(..=address)
+                .next_back()
+                .filter(|(_, m)| m.end >= end)
+                .map(|(&start, m)| m.physical.pin.address() + address - start)
+        };
+        Ok(device.and_then(|device| self.memory.span(device, bytes).map(|host| (device, host))))
+    }
 }
 impl std::ops::Deref for GpuMemory<'_> {
     type Target = GpuAddressSpace;
@@ -690,22 +714,7 @@ impl nixe_gpu_ampere::RenderMemory for GpuMemory<'_> {
     ) -> nixe_gpu_ampere::Result<Option<(u64, nixe_memory::HostAddress)>> {
         self.commit(address, bytes)
             .map_err(|e| e.to_string().into_boxed_str())?;
-        let end = address
-            .checked_add(bytes)
-            .filter(|&end| end <= VA_END)
-            .ok_or("native read overflow")?;
-        let device = if address >= VA_END - PAGE_SIZE {
-            self.sync_mapping
-                .as_ref()
-                .map(|m| m.pin.address() + address - (VA_END - PAGE_SIZE))
-        } else {
-            self.mappings
-                .range(..=address)
-                .next_back()
-                .filter(|(_, m)| m.end >= end)
-                .map(|(&start, m)| m.physical.pin.address() + address - start)
-        };
-        Ok(device.and_then(|device| self.memory.span(device, bytes).map(|host| (device, host))))
+        self.mapped_read_span(address, bytes)
     }
     fn buffer_layout_size(&self, address: u64) -> nixe_gpu_ampere::Result<u64> {
         if let Some((_, region)) = self.regions.range(..=address).next_back()

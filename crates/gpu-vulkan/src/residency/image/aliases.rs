@@ -173,6 +173,10 @@ impl Residency<'_> {
                 }
             }
             if !forward.is_empty() {
+                let tick = self.texture_cache.images[id].modification_tick;
+                let other_tick = self.texture_cache.images[other].modification_tick;
+                self.texture_cache.images[id].aliases_current &= other_tick <= tick;
+                self.texture_cache.images[other].aliases_current &= tick <= other_tick;
                 self.texture_cache.images[id].aliases.push(ImageAlias {
                     image: other,
                     copies: forward.into(),
@@ -190,6 +194,9 @@ impl Residency<'_> {
     // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L2470-L2520
     pub(super) fn synchronize_image_aliases(&mut self, id: ImageId) -> Result<(), VulkanError> {
         let target = self.texture_cache.get(id);
+        if target.aliases_current {
+            return Ok(());
+        }
         let tick = target.modification_tick;
         let mut modified = target.gpu_modified;
         let mut any_rescaled = target.rescaled;
@@ -209,6 +216,7 @@ impl Residency<'_> {
             }
         }
         if aliases.is_empty() {
+            self.texture_cache.images[id].aliases_current = true;
             return Ok(());
         }
         let retained = self.runtime.constructing.len();
@@ -231,8 +239,8 @@ impl Residency<'_> {
         })();
         self.runtime.constructing.truncate(retained);
         result?;
+        self.texture_cache.set_image_modification(id, newest);
         let target = &mut self.texture_cache.images[id];
-        target.modification_tick = newest;
         if modified && !target.gpu_modified {
             for &(address, bytes) in &target.maps {
                 self.runtime.device_memory.mark_gpu_written(address, bytes);
@@ -355,11 +363,27 @@ impl Residency<'_> {
 }
 
 impl TextureCache {
+    /// Producers invalidate their older neighbours when their version advances.
+    /// Consumers can then reuse synchronized images without walking every alias.
+    /// Copies also propagate their inherited version to overlapping third images.
+    pub(in crate::residency) fn set_image_modification(&mut self, id: ImageId, tick: u64) {
+        self.images[id].modification_tick = tick;
+        self.images[id].aliases_current = true;
+        for index in 0..self.images[id].aliases.len() {
+            let other = self.images[id].aliases[index].image;
+            if self.images[other].modification_tick < tick {
+                self.images[other].aliases_current = false;
+            }
+        }
+    }
     pub(in crate::residency) fn unregister_image_aliases(&mut self, id: ImageId) {
         let aliases = std::mem::take(&mut self.images[id].aliases);
         for alias in aliases {
             if let Some(entry) = self.images.get_mut(alias.image) {
                 entry.aliases.retain(|alias| alias.image != id);
+                if entry.aliases.is_empty() {
+                    entry.aliases_current = true;
+                }
             }
         }
     }

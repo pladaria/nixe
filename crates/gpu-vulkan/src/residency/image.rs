@@ -204,6 +204,7 @@ impl Residency<'_> {
         let native = Arc::new(native);
         let id = self.texture_cache.images.insert(ImageEntry {
             synchronized: false,
+            aliases_current: true,
             aliases: Vec::new(),
             cpu_tracked: false,
             maps: maps.iter().collect(),
@@ -253,11 +254,7 @@ impl Residency<'_> {
             return false;
         };
         let image = cache.get(view.image);
-        image.synchronized
-            && image
-                .aliases
-                .iter()
-                .all(|alias| cache.get(alias.image).modification_tick <= image.modification_tick)
+        image.synchronized && image.aliases_current
     }
     /// Refresh CPU contents and aliases before consumption, or discard them
     /// for a full clear. Modification belongs to the image, not its rectangles.
@@ -280,7 +277,7 @@ impl Residency<'_> {
                     self.texture_cache.track_image_cpu(id)?;
                     self.refresh_image(id)?;
                 }
-                if !self.texture_cache.get(id).aliases.is_empty() {
+                if !self.texture_cache.get(id).aliases_current {
                     self.synchronize_image_aliases(id)?;
                 }
             }

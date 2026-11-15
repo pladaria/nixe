@@ -12,6 +12,9 @@ struct Work {
     fetch: commands::Fetch,
     started: Option<std::time::Instant>,
 }
+// Submissions dominate this queue. Keep their small translation arrays inline
+// rather than allocating a separate box for each submitted command list.
+#[allow(clippy::large_enum_variant)]
 enum Pending {
     Submit(Work),
     Memory(MemoryJob, Reply),
@@ -194,7 +197,9 @@ pub(super) fn run(
                         else {
                             break;
                         };
-                        let progress = channel.execute(source, &data, &mut host)?;
+                        let progress = channel.execute(source, &data, &mut host);
+                        work.fetch.recycle(data);
+                        let progress = progress?;
                         work.offset += progress.words;
                         if let Some(acquire) = progress.acquire {
                             let wait = waiters.register(acquire, &host.memory)?;
