@@ -3,7 +3,9 @@
 mod descriptors;
 mod handle;
 mod info;
+mod storage_extent;
 mod varying;
+pub use storage_extent::StorageWriteExtent;
 
 pub use descriptors::{BoundedDescriptors, DescriptorCount, num_descriptors};
 pub(crate) use handle::HandleOp;
@@ -14,7 +16,7 @@ pub use varying::VaryingState;
 use crate::types::*;
 
 /// Version of the owned artifact contract; old SSA artifacts are not compatible.
-pub const ARTIFACT_ABI_VERSION: u32 = 5;
+pub const ARTIFACT_ABI_VERSION: u32 = 6;
 
 /// Pipeline-wide allocation state, shared by stage emitters.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

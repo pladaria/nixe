@@ -274,27 +274,35 @@ impl Residency<'_> {
         }
         for (stage, resources) in resources.stages.iter().enumerate() {
             for slot in &resources.storage {
-                let scope = pipeline.resources[slot.descriptor];
-                match self.guest_storage(stage, slot) {
+                if !pipeline.resources[slot.descriptor].writes() {
+                    continue;
+                }
+                let Some(selected) =
+                    &self.runtime.buffer_bindings.channel.storage_buffers[stage][slot.slot]
+                else {
+                    continue;
+                };
+                let mut remaining = selected.write_bytes;
+                match selected.native.clone() {
                     Some(StorageBufferBinding::Buffer(range)) => {
-                        if scope.writes() {
-                            self.finish_buffer_write(range.buffer, range.offset, range.size)?;
+                        let size = remaining.min(range.size);
+                        if size != 0 {
+                            self.finish_buffer_write(range.buffer, range.offset, size)?;
                         }
                     }
-                    Some(StorageBufferBinding::PointerTable(binding)) if scope.writes() => {
+                    Some(StorageBufferBinding::PointerTable(binding)) => {
                         for range in &binding.targets {
                             self.finish_buffer_write(range.buffer, range.offset, range.size)?;
                         }
                     }
                     Some(StorageBufferBinding::MultiRange(binding)) if binding.sparse => {
                         for source in binding.sources.iter() {
-                            if scope.writes() {
-                                self.finish_buffer_write(
-                                    source.buffer,
-                                    source.offset,
-                                    source.size,
-                                )?;
+                            let size = remaining.min(source.size);
+                            if size == 0 {
+                                break;
                             }
+                            self.finish_buffer_write(source.buffer, source.offset, size)?;
+                            remaining -= size;
                         }
                     }
                     _ => {}

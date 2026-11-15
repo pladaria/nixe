@@ -227,9 +227,7 @@ impl Residency<'_> {
         for &(address, size) in &modified {
             self.buffer_cache.outdate_downloads(address, size);
             self.buffer_cache.gpu_modified_ranges.insert(address, size);
-            self.buffer_cache
-                .pending_download_ranges
-                .insert(address, size);
+            self.buffer_cache.queue_fence_download(address, size)?;
         }
         let source_handle = self.use_buffer(source.buffer, source.offset, bytes)?;
         let overlap = source.buffer == destination.buffer
@@ -296,6 +294,8 @@ impl Residency<'_> {
             });
         self.buffer_cache.dma_buffer = copy;
         result?;
+        self.buffer_cache
+            .release_clean_read_traps(destination_address, bytes);
         if !modified.is_empty() {
             self.buffer_cache.collect_command_copies = true;
             self.buffer_cache

@@ -161,6 +161,9 @@ impl Residency<'_> {
             } else {
                 // Keep the physical producer and its pending publications alive.
                 // Only the current guest binding is retired by a device remap.
+                // Publish the still-mapped bytes before losing their indexed
+                // producer; changed ranges were already disowned above.
+                self.download_buffer_memory(base, size)?;
                 self.buffer_cache.memory_tracker.cpu_write(base, size);
                 self.buffer_cache.clear_download(base, size);
                 self.buffer_cache.buffer_index.remove(slot, base, size);

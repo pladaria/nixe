@@ -39,6 +39,7 @@ fn main() {
         nixe_memory::device_memory::DeviceMemory::new(machine, 34),
         device,
         16 * 1024 * 1024,
+        nixe_gpu_vulkan::BufferDownloadPolicy::AtFence,
     )
     .unwrap();
     let mut cache = cache_owner.access();

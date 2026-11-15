@@ -31,7 +31,7 @@ pub(super) fn low_address(ir: &Ir, id: InstId) -> Result<Option<(Value, Value, u
     Ok(Some((arg(ir, vector, 0)?, arg(ir, vector, 1)?, offset)))
 }
 
-fn cbuf_word(ir: &Ir, mut id: InstId) -> Result<Option<(u32, u32)>> {
+pub(super) fn cbuf_word(ir: &Ir, mut id: InstId) -> Result<Option<(u32, u32)>> {
     let mut component = 0;
     if ir.inst(id)?.opcode() == O::CompositeExtractU32x2 {
         let Some(vector) = node(ir, arg(ir, id, 0)?, O::GetCbufU32x2)? else {
@@ -119,6 +119,7 @@ pub fn global_memory_to_storage(
     let isa = env.metadata().isa;
     let mut descriptors = BTreeMap::new();
     let mut replacements = Vec::new();
+    let mut global_stores = 0;
     // Atomics use their address as a pointer even while the binding is null.
     // Preserve that identity for loads/stores sharing the same append buffer;
     // binding reads its current address on every draw or dispatch.
@@ -146,6 +147,7 @@ pub fn global_memory_to_storage(
             let Some(op) = storage_opcode(inst.opcode()) else {
                 continue;
             };
+            global_stores += usize::from(inst.may_have_side_effects());
             let Some((low, high, _)) = low_address(ir, id)? else {
                 continue;
             };
@@ -176,6 +178,33 @@ pub fn global_memory_to_storage(
             replacements.push((block, id, address, op));
         }
     }
+    let bounded_stores = replacements
+        .iter()
+        .filter(|(_, id, _, _)| ir.inst(*id).is_ok_and(|inst| inst.may_have_side_effects()))
+        .count();
+    // A remaining global write may choose any descriptor through the runtime
+    // bounds search; no per-pointer extent can then narrow ownership safely.
+    let mut extents = BTreeMap::new();
+    if global_stores == bounded_stores {
+        let mut analyses = BTreeMap::new();
+        for &(_, id, pointer, _) in &replacements {
+            if !ir.inst(id)?.may_have_side_effects() {
+                continue;
+            }
+            let analysis = analyses.entry(pointer).or_insert_with(|| {
+                super::storage_extent::StoreExtentAnalysis::new(
+                    ir,
+                    pointer,
+                    program.execution.workgroup_size,
+                )
+            });
+            let extent = analysis.store(id).unwrap_or_default();
+            extents
+                .entry(pointer)
+                .and_modify(|old: &mut crate::artifact::StorageWriteExtent| old.merge(extent))
+                .or_insert(extent);
+        }
+    }
     for (&(bank, offset), &is_written) in &descriptors {
         program
             .info
@@ -186,6 +215,7 @@ pub fn global_memory_to_storage(
                 count: 1,
                 is_written,
                 pointer_table: None,
+                write_extent: extents.get(&(bank, offset)).copied().unwrap_or_default(),
             })?;
     }
     // The indices are local to this pass's sorted descriptor set.
@@ -238,7 +268,15 @@ pub(super) fn join_storage_info(base: &mut ShaderInfo, source: &ShaderInfo) -> R
                 && d.pointer_table == descriptor.pointer_table
         });
         indices.push(if let Some(index) = index {
-            base.storage_buffers_descriptors[index].is_written |= descriptor.is_written;
+            let existing = &mut base.storage_buffers_descriptors[index];
+            if descriptor.is_written {
+                if existing.is_written {
+                    existing.write_extent.merge(descriptor.write_extent);
+                } else {
+                    existing.write_extent = descriptor.write_extent;
+                }
+                existing.is_written = true;
+            }
             index as u32
         } else {
             let index = base.storage_buffers_descriptors.len();
@@ -274,7 +312,10 @@ pub fn add_nvn_storage_buffers(program: &mut Program) -> Result<()> {
                 d.pointer_table.is_none() && d.cbuf_index == CbufIndex(0) && d.cbuf_offset == offset
             })
         {
-            existing.is_written |= program.info.stores_global_memory;
+            if program.info.stores_global_memory {
+                existing.is_written = true;
+                existing.write_extent = Default::default();
+            }
         } else {
             program
                 .info
@@ -285,6 +326,7 @@ pub fn add_nvn_storage_buffers(program: &mut Program) -> Result<()> {
                     count: 1,
                     is_written: program.info.stores_global_memory,
                     pointer_table: None,
+                    write_extent: Default::default(),
                 })?;
         }
     }

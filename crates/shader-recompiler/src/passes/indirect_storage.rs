@@ -157,6 +157,7 @@ pub fn lower_pointer_tables(
             ));
         }
         descriptor.is_written = written;
+        descriptor.write_extent = Default::default();
         descriptor.pointer_table = Some(span);
         indices.insert(index, program.info.storage_buffers_descriptors.len() as u32);
         program.info.storage_buffers_descriptors.push(descriptor)?;

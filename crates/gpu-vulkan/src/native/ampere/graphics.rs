@@ -766,6 +766,7 @@ impl NativeExecution<'_> {
                             &state.constants[group as usize],
                             stage,
                             storage,
+                            None,
                         )?;
                     }
                 }

@@ -244,6 +244,12 @@ pub struct VulkanResidency {
     pub(crate) caches: Arc<CacheOwners>,
     pub(crate) runtime: ResidencyRuntime,
 }
+/// Selected once by the engine's CPU visibility contract.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BufferDownloadPolicy {
+    AtFence,
+    OnRead,
+}
 
 /// Resource access scoped to one graphics-owner operation. Both actual caches
 /// stay locked while preparation selects resources and records their native use.
@@ -298,6 +304,7 @@ impl VulkanResidency {
         device_memory: nixe_memory::device_memory::DeviceMemory,
         device: VulkanDevice,
         bytes: u64,
+        downloads: BufferDownloadPolicy,
     ) -> Result<Self, VulkanError> {
         let memory = device_memory.machine().clone();
         if bytes == 0 {
@@ -311,6 +318,7 @@ impl VulkanResidency {
                 Arc::clone(&device.submission.progress),
                 Arc::clone(&device.submission.timeline),
                 crate::cache::SamplerCache::new(&device),
+                downloads,
             )),
             runtime: ResidencyRuntime {
                 quad_indices: Default::default(),
@@ -540,8 +548,8 @@ impl Residency<'_> {
                     && self.buffer_cache.buffer_index.at(address) == Some(id)
                 {
                     let bytes = self.buffer_cache.get(id).native.size();
-                    self.buffer_cache.memory_tracker.cpu_write(address, bytes);
-                    self.buffer_cache.clear_download(address, bytes);
+                    self.buffer_cache.write_memory(address, bytes);
+                    self.buffer_cache.cpu_read_ranges.subtract(address, bytes);
                 }
                 let entry = self.buffer_cache.buffers.erase(id);
                 if let Some(address) = entry.device_address {

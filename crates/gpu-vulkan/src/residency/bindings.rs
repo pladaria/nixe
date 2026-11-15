@@ -83,6 +83,9 @@ pub(crate) struct StorageBuffer {
     pub(crate) key: StorageBufferKey,
     pub(crate) source: GuestBufferRange,
     pub(crate) gpu_address: u64,
+    /// Proven writable prefix for this dispatch, including pointer alignment.
+    /// The full source remains bound and synchronized for shader reads.
+    pub(crate) write_bytes: u64,
     pub(crate) native: Option<StorageBufferBinding>,
 }
 #[derive(Clone)]

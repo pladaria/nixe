@@ -214,7 +214,13 @@ impl Residency<'_> {
                 if let Some((address, bytes)) = query.pending_overwrite()
                     && buffers.gpu_modified_ranges.intersects(address, bytes)
                 {
-                    buffers.pending_download_ranges.insert(address, bytes);
+                    buffers
+                        .queue_fence_download(address, bytes)
+                        .map_err(|error| {
+                            Arc::new(nixe_memory::MemoryError::Execution(
+                                error.to_string().into(),
+                            ))
+                        })?;
                 }
                 buffers
                     .pending_reports

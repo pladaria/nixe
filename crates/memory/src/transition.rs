@@ -41,6 +41,7 @@ pub struct CoreContext {
     // not to each scalar result or the physical allocation tracking system.
     gpu_device: OnceCell<crate::device_memory::DeviceMemory>,
     read_area: Cell<crate::NativeReadArea>,
+    read_generation: Cell<[u64; 2]>,
     device_address_scratch: RefCell<Vec<u32>>,
     space: Arc<AddressSpace>,
     slot: Arc<CoreSlot>,
@@ -106,6 +107,7 @@ impl Quiescence {
             writes: owner.machine().cpu_writes().register(),
             gpu_device: OnceCell::new(),
             read_area: Cell::new(crate::NativeReadArea::default()),
+            read_generation: Cell::new([0; 2]),
             device_address_scratch: RefCell::new(Vec::new()),
             space: owner,
             slot,
@@ -324,6 +326,7 @@ impl NativeAdmission<'_> {
         let Some(device) = self.gpu_device() else {
             return false;
         };
+        self.refresh_read_area(device);
         let mut ready = true;
         device.apply_on_physical(
             extent,
@@ -344,6 +347,15 @@ impl NativeAdmission<'_> {
             },
         );
         ready
+    }
+    fn refresh_read_area(&self, device: &crate::device_memory::DeviceMemory) {
+        let generation = device.read_generation();
+        if self.context.read_generation.get() != generation {
+            self.context.read_area.set(crate::NativeReadArea::default());
+            self.context.read_generation.set(generation);
+        }
+        // Keep this pre-read generation, including across a suspended flush.
+        // A producer that races the read must invalidate the next cached use.
     }
     pub(crate) fn collect_write(
         &self,
@@ -382,6 +394,7 @@ impl NativeAdmission<'_> {
         if let Some(device) = self.gpu_device()
             && let Some(rasterizer) = device.interface()
         {
+            self.refresh_read_area(device);
             for extent in ranges
                 .iter()
                 .flat_map(crate::AllocationRange::physical_extents)

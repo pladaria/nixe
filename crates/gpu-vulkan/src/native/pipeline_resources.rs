@@ -17,6 +17,7 @@ pub(crate) struct StorageSlot {
     pub(crate) written: bool,
     pub(crate) pointer_table: Option<nixe_shader_recompiler::artifact::PointerTableSpan>,
     pub(crate) has_declared_size: bool,
+    pub(crate) write_extent: nixe_shader_recompiler::artifact::StorageWriteExtent,
     pub(crate) descriptor: usize,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +134,7 @@ impl PipelineResources {
                         cbuf: d.cbuf_index.0,
                         offset: d.cbuf_offset.0,
                         written: d.is_written,
+                        write_extent: d.write_extent,
                         pointer_table: d.pointer_table.clone(),
                         has_declared_size: metadata.info.uses_nvn_descriptor(d),
                         descriptor,

@@ -37,6 +37,7 @@ pub struct StorageBufferDescriptor {
     pub count: u32,
     pub is_written: bool,
     pub pointer_table: Option<PointerTableSpan>,
+    pub write_extent: super::StorageWriteExtent,
 }
 
 impl super::descriptors::DescriptorCount for StorageBufferDescriptor {

@@ -231,7 +231,15 @@ impl NativeExecution<'_> {
                     self.residency.compute_uniform(uniform.slot)?;
                 }
                 for storage in &resources.storage {
-                    self.ampere_storage(memory, constants, 5, storage)?;
+                    self.ampere_storage(
+                        memory,
+                        constants,
+                        5,
+                        storage,
+                        storage
+                            .write_extent
+                            .resolve(launch.block, Some(launch.grid)),
+                    )?;
                 }
                 if !self
                     .residency

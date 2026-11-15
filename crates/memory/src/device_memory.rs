@@ -157,6 +157,7 @@ pub(crate) struct Inner {
     command_versions: Box<[OnceLock<Box<CommandVersions>>]>,
     command_blocks: Box<[AtomicU64]>,
     has_command_pages: AtomicBool,
+    read_generation: AtomicU64,
     // Pin coverage is serialized independently of table readers. Cache
     // invalidation may inspect the original backing before taking its writer.
     pin_guard: Mutex<()>,
@@ -308,6 +309,7 @@ impl DeviceMemory {
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             has_command_pages: AtomicBool::new(false),
+            read_generation: AtomicU64::new(1),
             generation: AtomicU64::new(1),
             counts: (0..1usize << (address_bits - LEAF_SHIFT))
                 .map(|_| OnceLock::new())
@@ -319,6 +321,16 @@ impl DeviceMemory {
     }
     pub fn reader(&self) -> DeviceMemoryReader {
         DeviceMemoryReader::new(self.clone())
+    }
+    /// End per-core cached read areas before exposing a new GPU-owned version.
+    pub fn invalidate_read_areas(&self) {
+        self.0.read_generation.fetch_add(1, Ordering::Release);
+    }
+    pub(crate) fn read_generation(&self) -> [u64; 2] {
+        [
+            self.0.read_generation.load(Ordering::Acquire),
+            self.generation(),
+        ]
     }
     /// Record producers by physical page so aliases and address reuse cannot
     /// turn a written page into a false clean result. History is never cleared.

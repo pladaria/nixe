@@ -10,6 +10,7 @@ mod lowering;
 mod lowering_tables;
 mod ssa;
 mod storage;
+mod storage_extent;
 mod storage_table;
 pub use indirect_storage::{compact_storage, lower_pointer_tables};
 

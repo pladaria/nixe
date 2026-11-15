@@ -132,6 +132,7 @@ impl crate::native::NativeExecution<'_> {
                 size: binding_size,
             },
             gpu_address: aligned_gpu.get(),
+            write_bytes: binding_size,
             native: None,
         }))
     }

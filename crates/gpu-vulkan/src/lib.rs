@@ -17,8 +17,9 @@ pub mod smooth_motion;
 mod transfer;
 pub use memory::NativeImageDescription;
 pub use residency::{
-    AccessScope, AttachmentId, AttachmentLoad, AttachmentStore, BufferId, BufferRange, ImageId,
-    ImagePlane, ImageViewDescription, ImageViewId, Residency, ResidencyStatistics, VulkanResidency,
+    AccessScope, AttachmentId, AttachmentLoad, AttachmentStore, BufferDownloadPolicy, BufferId,
+    BufferRange, ImageId, ImagePlane, ImageViewDescription, ImageViewId, Residency,
+    ResidencyStatistics, VulkanResidency,
 };
 mod validation;
 pub use gpu_allocator::MemoryLocation;
@@ -55,9 +56,6 @@ pub use native::{
     MaxwellVulkanRasterizer, NativeExecutionStatistics, NativeFrontendStatistics,
     NativeGpuExecution,
 };
-
-#[cfg(test)]
-mod test_shaders;
 
 #[cfg(test)]
 mod test_device {

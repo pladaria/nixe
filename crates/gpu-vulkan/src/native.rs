@@ -116,6 +116,7 @@ impl NativeGpuExecution {
         device: VulkanDevice,
         configuration: CacheConfiguration,
         resident_bytes: u64,
+        downloads: crate::BufferDownloadPolicy,
     ) -> Result<Self, VulkanError> {
         let driver_pool = Arc::new(
             CompilePool::with_name(configuration.workers, "gpu-pipeline")
@@ -134,7 +135,7 @@ impl NativeGpuExecution {
                 .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
                 .unnormalized_coordinates(true)
         };
-        let mut residency = VulkanResidency::new(memory, device, resident_bytes)?;
+        let mut residency = VulkanResidency::new(memory, device, resident_bytes, downloads)?;
         let blit_samplers = {
             let mut cache = residency.access();
             let samplers = &mut cache.texture_cache.samplers;

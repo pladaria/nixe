@@ -110,6 +110,83 @@ pub(super) struct ReadBackPage {
     written: bool,
 }
 impl BufferCache {
+    fn read_ranges(&mut self, address: u64, bytes: u64) -> RangeSet {
+        let mut ranges = RangeSet::from_range(address, bytes);
+        // Only a newly observed CPU read asks to batch the learned ranges.
+        // Owner/MME reads without that demand keep their original scope.
+        if std::mem::take(&mut self.download_cpu_read_ranges) {
+            for (at, size) in self.cpu_read_ranges.iter() {
+                ranges.extend(self.gpu_modified_ranges.intersections(at, size));
+            }
+        }
+        ranges
+    }
+    pub(super) fn read_needs_download(&self, address: u64, bytes: u64) -> bool {
+        (self.download_policy == BufferDownloadPolicy::OnRead
+            && self.gpu_modified_ranges.intersects(address, bytes))
+            || self.pending_read(address, bytes).is_some()
+    }
+    /// GPU ownership does not imply CPU consumption. Cached pages already trap
+    /// native reads; a separate reference also protects partially CPU-dirty pages.
+    /// https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/buffer_cache/buffer_cache_base.h
+    pub(super) fn queue_fence_download(
+        &mut self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<(), VulkanError> {
+        if self.download_policy == BufferDownloadPolicy::AtFence {
+            self.pending_download_ranges.insert(address, bytes);
+            return Ok(());
+        }
+        let page = nixe_memory::PAGE_SIZE;
+        let begin = address / page * page;
+        let end = (address + bytes).div_ceil(page) * page;
+        if !self.read_trap_pages.contains(begin, end - begin) {
+            let mut next = begin;
+            let mut added = smallvec::SmallVec::<[(u64, u64); 4]>::new();
+            for (at, size) in self.read_trap_pages.intersections(begin, end - begin) {
+                if next < at {
+                    added.push((next, at - next));
+                }
+                next = at + size;
+            }
+            if next < end {
+                added.push((next, end - next));
+            }
+            for (at, size) in added {
+                self.device_memory.update_pages_cached_count(at, size, 1)?;
+                self.read_trap_pages.insert(at, size);
+            }
+        }
+        // Notify only for newly armed pages. The read callbacks consume these
+        // marks independently of the references keeping mixed CPU/GPU pages cached.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/buffer_cache/read_trap_tracker.h
+        if !self.read_armed_ranges.contains(begin, end - begin) {
+            self.read_armed_ranges.insert(begin, end - begin);
+            self.device_memory.invalidate_read_areas();
+        }
+        Ok(())
+    }
+    pub(super) fn release_clean_read_traps(&mut self, address: u64, bytes: u64) {
+        let page = nixe_memory::PAGE_SIZE;
+        let begin = address / page * page;
+        let end = (address + bytes).div_ceil(page) * page;
+        let mut clean = RangeSet::from_range(begin, end - begin);
+        for (at, size) in self.gpu_modified_ranges.intersections(begin, end - begin) {
+            let start = at / page * page;
+            clean.subtract(start, (at + size).div_ceil(page) * page - start);
+        }
+        for (at, size) in clean.iter() {
+            for (start, length) in self.read_trap_pages.intersections(at, size) {
+                self.device_memory
+                    .update_pages_cached_count(start, length, -1)
+                    .expect("release GPU read protection");
+            }
+            self.read_trap_pages.subtract(at, size);
+            self.read_armed_ranges.subtract(at, size);
+            self.memory_tracker.clear_gpu(at, size);
+        }
+    }
     pub(super) fn note_read_back(&mut self, address: u64, bytes: u64) {
         const MAX_PAGES: usize = 64;
         let page_size = nixe_memory::PAGE_SIZE;
@@ -188,7 +265,7 @@ impl BufferCache {
         self.note_command_write(id, address, bytes);
         self.outdate_downloads(address, bytes);
         self.gpu_modified_ranges.insert(address, bytes);
-        self.pending_download_ranges.insert(address, bytes);
+        self.queue_fence_download(address, bytes)?;
         Ok(())
     }
     pub(super) fn outdate_downloads(&mut self, address: u64, bytes: u64) {
@@ -389,6 +466,7 @@ impl BufferCache {
         }
         for (address, bytes) in self.write_download(download)?.iter() {
             self.gpu_modified_ranges.subtract(address, bytes);
+            self.release_clean_read_traps(address, bytes);
         }
         Ok(())
     }
@@ -412,14 +490,7 @@ impl BufferCache {
         for (address, bytes) in read.clean_ranges.iter() {
             self.gpu_modified_ranges.subtract(address, bytes);
             self.read_download_ranges.subtract(address, bytes);
-        }
-        for (address, bytes) in read.clean_ranges.iter() {
-            let page = nixe_memory::PAGE_SIZE;
-            for at in (address / page..(address + bytes).div_ceil(page)).map(|p| p * page) {
-                if !self.gpu_modified_ranges.intersects(at, page) {
-                    self.memory_tracker.clear_gpu(at, page);
-                }
-            }
+            self.release_clean_read_traps(address, bytes);
         }
         Ok(())
     }
@@ -461,7 +532,10 @@ impl Residency<'_> {
                 let entry = &self.buffer_cache.buffers[id];
                 let base = entry.device_address.expect("DAddr buffer index entry");
                 let stop = (base + entry.native.size()).min(end);
-                for (start, size) in self.buffer_cache.memory_tracker.downloads(at, stop - at) {
+                // GPU ownership is exact. CPU-dirty neighbours on this page do
+                // not make the remaining GPU bytes safe to read from RAM.
+                {
+                    let (start, size) = (at, stop - at);
                     match kind {
                         DownloadKind::Fence => {}
                         DownloadKind::Read => {
@@ -475,7 +549,6 @@ impl Residency<'_> {
                         }
                         DownloadKind::Synchronous => {
                             self.buffer_cache.clear_download(start, size);
-                            self.buffer_cache.memory_tracker.clear_gpu(start, size);
                         }
                     }
                     let mut add_copy = |start: u64, size: u64| -> Result<(), VulkanError> {
@@ -582,9 +655,8 @@ impl Residency<'_> {
         bytes: u64,
     ) -> Result<Option<DownloadEnd>, VulkanError> {
         self.buffer_cache.publish_completed_reads()?;
-        if let Some(download) =
-            self.record_buffer_downloads([(address, bytes)], DownloadKind::Read)?
-        {
+        let ranges = self.buffer_cache.read_ranges(address, bytes);
+        if let Some(download) = self.record_buffer_downloads(ranges.iter(), DownloadKind::Read)? {
             self.buffer_cache.enqueue_read_download(download);
             // Submit before handing the wait to the CPU; an idle owner must not
             // strand a reader whose producer needs no further guest commands.
@@ -599,8 +671,9 @@ impl Residency<'_> {
         address: u64,
         bytes: u64,
     ) -> Result<(), VulkanError> {
+        let ranges = self.buffer_cache.read_ranges(address, bytes);
         if let Some(download) =
-            self.record_buffer_downloads([(address, bytes)], DownloadKind::Synchronous)?
+            self.record_buffer_downloads(ranges.iter(), DownloadKind::Synchronous)?
         {
             let work = download.ticket.work();
             self.flush()?;

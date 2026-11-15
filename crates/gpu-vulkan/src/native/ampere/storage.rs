@@ -12,6 +12,7 @@ impl NativeExecution<'_> {
         constants: &[Option<(u64, u32)>],
         stage: usize,
         slot: &StorageSlot,
+        write_extent: Option<u64>,
     ) -> Result<(), VulkanError> {
         if slot.pointer_table.is_some() {
             return self.ampere_pointer_table(memory, constants, stage, slot);
@@ -120,9 +121,25 @@ impl NativeExecution<'_> {
                     size: bytes,
                 },
                 gpu_address: aligned,
+                write_bytes: bytes,
                 native: None,
             });
         }
+        // Dispatch dimensions can change while the descriptor and its native
+        // selection remain identical. Only narrow dirty ownership, never access.
+        let binding = self
+            .residency
+            .runtime
+            .buffer_bindings
+            .channel
+            .storage_buffers[stage][slot.slot]
+            .as_mut()
+            .unwrap();
+        binding.write_bytes = write_extent.map_or(binding.source.size, |extent| {
+            (target - binding.gpu_address)
+                .saturating_add(extent)
+                .min(binding.source.size)
+        });
         self.residency
             .update_storage_buffer(stage, slot.slot, memory)
     }
@@ -240,6 +257,7 @@ impl NativeExecution<'_> {
             },
             source,
             gpu_address: target,
+            write_bytes: source.size,
             native: Some(crate::residency::StorageBufferBinding::PointerTable(
                 Arc::new(binding),
             )),

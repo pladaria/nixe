@@ -1,5 +1,6 @@
-//! Two-level device-memory tracker. CPU-dirty pages mask GPU download demand;
-//! upload tracking owns one cached-page reference per device page.
+//! Two-level device-memory tracker. CPU and GPU ownership may share a page;
+//! exact modified ranges resolve downloads. Upload tracking owns one cached-page
+//! reference per synchronized device page.
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/memory_tracker_base.h
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/word_manager.h
 const PAGE_BITS: u32 = 12;
@@ -97,11 +98,8 @@ impl MemoryTracker {
     }
     fn modified(&self, kind: Kind, address: u64, size: u64) -> bool {
         let mut result = false;
-        word_masks(address, size, |word, mut mask| {
+        word_masks(address, size, |word, mask| {
             if let Some(region) = &self.regions[word / WORDS] {
-                if kind == Kind::Gpu {
-                    mask &= !region.words[Kind::Untracked as usize][word % WORDS];
-                }
                 result |= region.words[kind as usize][word % WORDS] & mask != 0;
             } else {
                 result |= kind == Kind::Cpu;
@@ -204,27 +202,6 @@ impl MemoryTracker {
                 .update_pages_cached_batch(&tracked_ranges, 1)
                 .expect("buffer upload protection update");
         }
-        ranges
-    }
-    pub fn downloads(&mut self, address: u64, size: u64) -> Vec<(u64, u64)> {
-        let mut ranges = Vec::new();
-        Self::visit(
-            &mut self.regions,
-            address,
-            size,
-            false,
-            |base, region, word, mut mask| {
-                mask &= !region.words[Kind::Untracked as usize][word];
-                let dirty = region.words[Kind::Gpu as usize][word] & mask;
-                visit_bits(dirty, |page, count| {
-                    push_range(
-                        &mut ranges,
-                        base + (u64::from(page) << PAGE_BITS),
-                        u64::from(count) << PAGE_BITS,
-                    )
-                });
-            },
-        );
         ranges
     }
 }

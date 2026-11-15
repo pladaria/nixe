@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             device,
             nixe_gpu_vulkan::cache::CacheConfiguration::default(),
             128 * 1024 * 1024,
+            nixe_gpu_vulkan::BufferDownloadPolicy::AtFence,
         )
         .map_err(|error| nixe_gpu::BackendRuntimeError::Backend(error.to_string().into()))?;
         renderer
