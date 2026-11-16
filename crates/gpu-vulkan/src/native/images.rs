@@ -232,13 +232,18 @@ impl NativeExecution<'_> {
                 "multisample sampling requires a multisample shader image binding",
             ));
         }
-        // Depth/stencil aspects expose their channel as R in Vulkan. Preserve
-        // the TIC's selectors and constants, converting G as Eden ImageView does.
+        // A depth/stencil view exposes one selected aspect as R. Preserve
+        // constants while remapping that aspect's logical channel.
         // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L2563-L2571
-        let depth_stencil = description.format().is_depth_stencil();
+        let aspect = nixe_gpu::nvidia::sampled_aspect(description.format(), components)
+            .map_err(VulkanError::InvalidResource)?;
+        let combined = matches!(
+            description.format(),
+            F::Depth24UnormStencil8Uint | F::Depth32FloatStencil8Uint
+        );
         let swizzle = components.0.map(|c| match c {
             ComponentSwizzle::Red => vk::ComponentSwizzle::R,
-            ComponentSwizzle::Green if depth_stencil => vk::ComponentSwizzle::R,
+            ComponentSwizzle::Green if combined => vk::ComponentSwizzle::R,
             ComponentSwizzle::Green => vk::ComponentSwizzle::G,
             ComponentSwizzle::Blue => vk::ComponentSwizzle::B,
             ComponentSwizzle::Alpha => vk::ComponentSwizzle::A,
@@ -285,7 +290,11 @@ impl NativeExecution<'_> {
                 } else {
                     vk::ImageViewType::TYPE_2D
                 },
-                aspects: self.residency.texture_cache.get(native).planes[0].aspect,
+                aspects: match aspect {
+                    nixe_gpu::native::GuestImageAspect::Color => vk::ImageAspectFlags::COLOR,
+                    nixe_gpu::native::GuestImageAspect::Depth => vk::ImageAspectFlags::DEPTH,
+                    nixe_gpu::native::GuestImageAspect::Stencil => vk::ImageAspectFlags::STENCIL,
+                },
                 base_mip,
                 mip_count: u32::from(description.mip_levels()),
                 base_layer,

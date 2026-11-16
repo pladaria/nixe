@@ -168,6 +168,17 @@ impl CachedImage {
         }
         let (level, layer) = if a.dimension() == ImageDimension::Three {
             let &(_, [level, layer]) = self.slices.iter().find(|(offset, _)| *offset == diff)?;
+            // Volume slices retain the parent GOB geometry. Array strides do
+            // not participate in their addressing; the slice offset above does.
+            match (existing.mip_layouts[level as usize].1, other.layout) {
+                (ImageMemoryLayout::BlockLinear(x), ImageMemoryLayout::BlockLinear(y))
+                | (
+                    ImageMemoryLayout::BlockLinearAmpere(x),
+                    ImageMemoryLayout::BlockLinearAmpere(y),
+                ) if x.block_height_log2 == y.block_height_log2
+                    && x.block_depth_log2 == y.block_depth_log2 => {}
+                _ => return None,
+            }
             (level, u64::from(layer))
         } else {
             let layer = diff.checked_div(existing.layer_stride).unwrap_or(0);
@@ -194,7 +205,8 @@ impl CachedImage {
         {
             return None;
         }
-        if existing.layer_stride != 0
+        if a.dimension() != ImageDimension::Three
+            && existing.layer_stride != 0
             && other.layer_stride != 0
             && existing.layer_stride != other.layer_stride
             && existing.maybe_unaligned_layer_stride != other.maybe_unaligned_layer_stride

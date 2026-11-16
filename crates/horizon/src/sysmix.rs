@@ -1,33 +1,17 @@
 //! Native audio mixer sessions retain process memory independently of handles.
 //! https://switchbrew.org/wiki/Audio_services#(S2)_audsmx:u
 use crate::object::DomainSession;
-use std::sync::{Arc, Mutex, Weak};
-
-#[derive(Debug, Default)]
-pub(crate) struct MixerSystem {
-    users: Mutex<std::collections::BTreeMap<u64, Weak<User>>>,
-}
+use std::sync::Arc;
+mod stream;
+mod system;
+pub(crate) use stream::{StreamSession, supported_format};
+pub(crate) use system::MixerSystem;
 pub(crate) struct User {
     pub(crate) memory: Arc<nixe_runtime::memory::ProcessMemory>,
 }
 impl std::fmt::Debug for User {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MixerUser").finish_non_exhaustive()
-    }
-}
-impl MixerSystem {
-    pub(crate) fn open(&self, process: &nixe_runtime::RunnableProcess) -> Option<Arc<User>> {
-        let mut users = self.users.lock().unwrap();
-        let key = process.process_id();
-        if users.get(&key).and_then(Weak::upgrade).is_some() {
-            return None;
-        }
-        users.retain(|_, user| user.strong_count() != 0);
-        let user = Arc::new(User {
-            memory: process.memory().clone(),
-        });
-        users.insert(key, Arc::downgrade(&user));
-        Some(user)
     }
 }
 
@@ -40,12 +24,14 @@ pub struct AudioMixerSession {
 pub(crate) enum MixerObject {
     Manager,
     User(Arc<User>),
+    Stream(Arc<StreamSession>),
 }
 impl MixerObject {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Manager => "audsmx:u",
             Self::User(_) => "nn::audio::sysmix::IUserSession",
+            Self::Stream(_) => "nn::audio::sysmix::IExternalStreamSession",
         }
     }
 }

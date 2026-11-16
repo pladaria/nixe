@@ -278,8 +278,12 @@ impl Visitor<'_> {
     }
     pub(super) fn imnmx(&mut self) -> Result<()> {
         let i = self.instruction;
-        if i.bits(64, 32) & !0x04000200 != 0x03800000
-            || (i.opcode() == 0x217 && i.bits(32, 32) > 255)
+        // The uniform form selects the same arithmetic and predicate, with
+        // operand B read from the uniform bank rather than a lane register.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h#L3506-L3527
+        let variable = 0x04000200 | if i.opcode() == 0xc17 { 0x08000000 } else { 0 };
+        if i.bits(64, 32) & !variable != 0x03800000
+            || (matches!(i.opcode(), 0x217 | 0xc17) && i.bits(32, 32) > 255)
             || (i.opcode() == 0xa17 && i.bits(62, 2) != 0)
         {
             return Err(unsupported("Native integer min/max mode"));

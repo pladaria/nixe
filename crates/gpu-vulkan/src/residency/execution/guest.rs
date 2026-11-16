@@ -242,6 +242,15 @@ impl Residency<'_> {
                     .ok_or(VulkanError::InvalidResource("texel buffer not prepared"))?;
                 let limits = &self.runtime.device.profile().limits;
                 let kind = pipeline.layout.key.bindings[slot.descriptor].kind;
+                let alignment = self
+                    .runtime
+                    .device
+                    .profile()
+                    .texel_buffer_alignment
+                    .required(
+                        binding.element_bytes,
+                        self.buffer_cache.get(range.buffer).native.usage,
+                    );
                 let required = if kind == vk::DescriptorType::STORAGE_TEXEL_BUFFER {
                     vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER
                 } else {
@@ -251,9 +260,7 @@ impl Residency<'_> {
                     || !range.size.is_multiple_of(u64::from(binding.element_bytes))
                     || range.size / u64::from(binding.element_bytes)
                         > u64::from(limits.max_texel_buffer_elements)
-                    || !range
-                        .offset
-                        .is_multiple_of(limits.min_texel_buffer_offset_alignment.max(1))
+                    || !range.offset.is_multiple_of(alignment)
                     || !self
                         .runtime
                         .device
@@ -261,9 +268,12 @@ impl Residency<'_> {
                         .buffer_features
                         .contains(required)
                 {
-                    return Err(VulkanError::InvalidResource(
-                        "texel buffer format/size/alignment exceeds native support",
-                    ));
+                    return Err(VulkanError::Compilation(format!(
+                        "texel buffer exceeds native support: stage={STAGE} slot={} kind={kind:?} format={:?} source={:#x} offset={:#x} size={:#x} element_bytes={} max_elements={} alignment={} features={:?} required={required:?}",
+                        slot.slot, binding.format, binding.source.address, range.offset, range.size,
+                        binding.element_bytes, limits.max_texel_buffer_elements, alignment,
+                        self.runtime.device.format_properties(binding.format).buffer_features,
+                    ).into()));
                 }
                 self.use_buffer(range.buffer, range.offset, range.size)?;
                 self.buffer_cache.get(range.buffer).native.texel_view(

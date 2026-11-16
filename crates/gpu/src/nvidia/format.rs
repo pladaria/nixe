@@ -1,4 +1,4 @@
-use crate::ImageFormat;
+use crate::{ComponentSwizzle, ImageFormat, Swizzle, native::GuestImageAspect};
 /// Decodes verified Maxwell TIC format/component/swizzle tuples into their
 /// neutral storage and sampling semantics. Numeric component and swizzle values are
 /// defined by deko3d's pinned public Maxwell tables:
@@ -83,7 +83,9 @@ pub(super) fn decode_sampled_texture_format(
         (0x15, [2, 2, 2, 2], _, false) => Some(ImageFormat::Rgb565Unorm),
         // Z24S8 uses unsigned stencil R and normalized depth G. Selecting G
         // for RGB samples the depth aspect, with alpha forced to one.
-        (0x29, [4, 2, 2, 2], [3, 3, 3, 7], false) => Some(ImageFormat::Depth24UnormStencil8Uint),
+        (0x29, [4, 2, 2, 2] | [4, 2, 4, 4], _, false) => {
+            Some(ImageFormat::Depth24UnormStencil8Uint)
+        }
         // https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/format_lookup_table.cpp
         (0x3a, [2, 2, 2, 2] | [2, 4, 4, 4], _, false) => Some(ImageFormat::Depth16Unorm),
         // ZF32 uses a float depth channel, replicated to RGB by its TIC mapping.
@@ -92,14 +94,9 @@ pub(super) fn decode_sampled_texture_format(
             Some(ImageFormat::Depth32Float)
         }
         // Z32_X24S8 and R32B24G8 keep float depth in R and unsigned stencil
-        // in G. A depth-only view can route R and constants; stencil sampling
-        // needs its own aspect/type selection rather than aliasing G to depth.
+        // in G. Storage layout is independent of which aspect the view selects.
         // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/texture_cache/format_lookup_table.cpp#L165-L168
-        (0x30 | 0x05, [7, 4, 2, 2], mapping, false)
-            if mapping.iter().all(|c| matches!(c, 0 | 2 | 6 | 7)) =>
-        {
-            Some(ImageFormat::Depth32FloatStencil8Uint)
-        }
+        (0x30 | 0x05, [7, 4, 2, 2], _, false) => Some(ImageFormat::Depth32FloatStencil8Uint),
         // BC6H floating-point component types follow Maxwell's TIC table.
         // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/format_lookup_table.cpp#L190-L193
         (0x10, [7, 7, 7, 7], _, false) => Some(ImageFormat::Bc6hRgbSfloat),
@@ -149,5 +146,62 @@ pub(super) fn decode_sampled_texture_format(
         (0x04, [7, 7, 7, 7], _, false) => Some(ImageFormat::Rg32Float),
         (0x01, [7, 7, 7, 7], _, false) => Some(ImageFormat::Rgba32Float),
         _ => None,
+    }
+}
+
+/// Select the shader-visible aspect without changing the physical storage.
+/// Combined depth/stencil channels must not alias each other through a view.
+/// https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L641-L660
+pub fn sampled_aspect(
+    format: ImageFormat,
+    swizzle: Swizzle,
+) -> Result<GuestImageAspect, &'static str> {
+    use ComponentSwizzle as C;
+    match format {
+        ImageFormat::Depth24UnormStencil8Uint | ImageFormat::Depth32FloatStencil8Uint => {
+            let red = swizzle.0.contains(&C::Red);
+            let green = swizzle.0.contains(&C::Green);
+            if (red && green) || swizzle.0.iter().any(|c| matches!(c, C::Blue | C::Alpha)) {
+                return Err("mixed or padding depth/stencil channels require separate image views");
+            }
+            let depth = if format == ImageFormat::Depth24UnormStencil8Uint {
+                !red
+            } else {
+                red
+            };
+            Ok(if depth {
+                GuestImageAspect::Depth
+            } else {
+                GuestImageAspect::Stencil
+            })
+        }
+        ImageFormat::Depth16Unorm | ImageFormat::Depth32Float => Ok(GuestImageAspect::Depth),
+        _ => Ok(GuestImageAspect::Color),
+    }
+}
+
+pub(super) fn decode_swizzle(format: ImageFormat, swizzle: [u8; 4]) -> Option<Swizzle> {
+    if !swizzle.iter().all(|c| matches!(c, 0 | 2..=7)) {
+        return None;
+    }
+    if !matches!(format, ImageFormat::Bgra8Unorm | ImageFormat::Bgra8Srgb) {
+        Some(Swizzle(swizzle.map(|component| match component {
+            0 => ComponentSwizzle::Zero,
+            // TIC B5G6R5 stores red in the low bits; the R5G6B5 storage
+            // format puts it in the high bits. Compose that channel swap
+            // with every selector, including repeated channels and constants.
+            // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/format_traits.inc
+            2 if format == ImageFormat::Rgb565Unorm => ComponentSwizzle::Blue,
+            4 if format == ImageFormat::Rgb565Unorm => ComponentSwizzle::Red,
+            2 => ComponentSwizzle::Red,
+            3 => ComponentSwizzle::Green,
+            4 => ComponentSwizzle::Blue,
+            5 => ComponentSwizzle::Alpha,
+            6 | 7 => ComponentSwizzle::One,
+            _ => unreachable!("validated TIC component mapping"),
+        })))
+    } else {
+        // These packed color formats already include their native mapping.
+        Some(Swizzle::IDENTITY)
     }
 }

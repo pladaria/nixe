@@ -142,7 +142,7 @@ impl AddressSpace {
         let mut removed = Vec::new();
         let result = (|| {
             unsafe {
-                self.arena.unmap(destination, bytes)?;
+                self.fastmem.unmap(&self.arena, destination, bytes)?;
             }
             for address in (destination.get()..destination_end).step_by(PAGE_SIZE as usize) {
                 unsafe {

@@ -10,19 +10,19 @@ use std::{cmp::Ordering, collections::BTreeMap};
 pub trait Address: Copy + Eq + Ord + std::fmt::Debug {
     fn address(self) -> ProgramOffset;
 }
-/// Synthetic predicate tests sort immediately before their real instruction but
-/// cannot be passed as an instruction-fetch address.
+/// Indexed synthetic predicate tests sort before their real instruction, in
+/// execution order, and cannot be passed as an instruction-fetch address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FlowLocation<L> {
     Instruction(L),
-    PredicateBefore(L),
+    PredicateBefore(L, u8),
 }
 
 impl<L: Address> FlowLocation<L> {
     pub fn instruction(self) -> Result<L> {
         match self {
             Self::Instruction(pc) => Ok(pc),
-            Self::PredicateBefore(_) => Err(CompileError::new(
+            Self::PredicateBefore(..) => Err(CompileError::new(
                 FailureCategory::Internal,
                 "Cannot fetch a synthetic predicate block",
             )),
@@ -33,8 +33,8 @@ impl<L: Address> FlowLocation<L> {
 impl<L: Address> Ord for FlowLocation<L> {
     fn cmp(&self, other: &Self) -> Ordering {
         let key = |location: &Self| match location {
-            Self::PredicateBefore(pc) => (pc.address().0, false),
-            Self::Instruction(pc) => (pc.address().0, true),
+            Self::PredicateBefore(pc, index) => (pc.address().0, u16::from(*index)),
+            Self::Instruction(pc) => (pc.address().0, 256),
         };
         key(self).cmp(&key(other))
     }

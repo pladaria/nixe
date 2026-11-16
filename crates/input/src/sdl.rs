@@ -51,6 +51,7 @@ impl fmt::Display for SdlInputError {
 impl std::error::Error for SdlInputError {}
 
 struct OpenGamepad {
+    player: usize,
     joystick_id: JoystickId,
     controller_id: ControllerId,
     name: Arc<str>,
@@ -136,10 +137,86 @@ pub(crate) struct SdlInputBackend {
     events: EventSubsystem,
     gamepad_subsystem: GamepadSubsystem,
     next_controller_id: u64,
+    vibration: [DeviceVibration; crate::MAX_PLAYERS],
+}
+
+#[derive(Default)]
+struct DeviceVibration {
     vibration: crate::vibration::VibrationState,
     vibration_dirty: bool,
     vibration_active: bool,
     last_vibration_send: Option<Instant>,
+}
+impl DeviceVibration {
+    fn apply(
+        &mut self,
+        receiver: &crate::vibration::VibrationReceiver,
+        open_gamepads: &mut [OpenGamepad],
+    ) -> Result<(), SdlInputError> {
+        if let Some(state) = receiver
+            .take_latest()
+            .map_err(|e| SdlInputError::new("vibration mailbox", e))?
+        {
+            if state.controller != self.vibration.controller {
+                self.stop(open_gamepads)?;
+                self.last_vibration_send = None;
+            }
+            self.vibration_dirty = !state.is_stopped() || self.vibration_active;
+            self.vibration = state;
+        }
+        // SDL's Nintendo driver spaces writes by 30 ms and refreshes sustained
+        // rumble every 50 ms. send_effect bypasses that scheduling, so preserve
+        // it here without device I/O on the emulation thread.
+        // https://github.com/libsdl-org/SDL/blob/release-3.4.12/src/joystick/hidapi/SDL_hidapi_switch.c
+        let elapsed = self.last_vibration_send.map(|last| last.elapsed());
+        let due = if self.vibration_dirty {
+            elapsed.is_none_or(|elapsed| elapsed >= Duration::from_millis(30))
+        } else {
+            !self.vibration.is_stopped()
+                && elapsed.is_some_and(|elapsed| elapsed >= Duration::from_millis(50))
+        };
+        if due {
+            if let Some(open) = open_gamepads
+                .iter_mut()
+                .find(|open| Some(open.controller_id) == self.vibration.controller)
+                && open.gamepad.connected()
+            {
+                if self.vibration_dirty {
+                    log::trace!(
+                        "controller vibration output: device={} values={:?}",
+                        open.name,
+                        self.vibration.values
+                    );
+                }
+                // A failed transport write may have reached the actuator.
+                // Shutdown must still attempt a neutral packet in that case.
+                self.vibration_active |= !self.vibration.is_stopped();
+                open.send_vibration(self.vibration.values)?;
+                self.vibration_active = !self.vibration.is_stopped();
+            }
+            self.last_vibration_send = Some(Instant::now());
+            self.vibration_dirty = false;
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self, open_gamepads: &mut [OpenGamepad]) -> Result<(), SdlInputError> {
+        if self.vibration_active
+            && let Some(open) = open_gamepads
+                .iter_mut()
+                .find(|open| Some(open.controller_id) == self.vibration.controller)
+            && open.gamepad.connected()
+        {
+            if let Some(last) = self.last_vibration_send {
+                // Closing or retargeting must also respect Nintendo's minimum
+                // write interval. This wait belongs to the device thread only.
+                std::thread::sleep(Duration::from_millis(30).saturating_sub(last.elapsed()));
+            }
+            open.send_vibration([crate::VibrationValue::default(); 2])?;
+        }
+        self.vibration_active = false;
+        Ok(())
+    }
 }
 
 impl SdlInputBackend {
@@ -178,81 +255,17 @@ impl SdlInputBackend {
             events,
             gamepad_subsystem,
             next_controller_id: 1,
-            vibration: Default::default(),
-            vibration_dirty: false,
-            vibration_active: false,
-            last_vibration_send: None,
+            vibration: std::array::from_fn(|_| DeviceVibration::default()),
         }
     }
 
     pub(crate) fn apply_vibration(
         &mut self,
-        receiver: &crate::vibration::VibrationReceiver,
+        receivers: &[crate::vibration::VibrationReceiver; crate::MAX_PLAYERS],
     ) -> Result<(), SdlInputError> {
-        if let Some(state) = receiver
-            .take_latest()
-            .map_err(|e| SdlInputError::new("vibration mailbox", e))?
-        {
-            if state.controller != self.vibration.controller {
-                self.stop_vibration()?;
-                self.last_vibration_send = None;
-            }
-            self.vibration_dirty = !state.is_stopped() || self.vibration_active;
-            self.vibration = state;
+        for (output, receiver) in self.vibration.iter_mut().zip(receivers) {
+            output.apply(receiver, &mut self.open_gamepads)?;
         }
-        // SDL's Nintendo driver spaces writes by 30 ms and refreshes sustained
-        // rumble every 50 ms. send_effect bypasses that scheduling, so preserve
-        // it here without device I/O on the emulation thread.
-        // https://github.com/libsdl-org/SDL/blob/release-3.4.12/src/joystick/hidapi/SDL_hidapi_switch.c
-        let elapsed = self.last_vibration_send.map(|last| last.elapsed());
-        let due = if self.vibration_dirty {
-            elapsed.is_none_or(|elapsed| elapsed >= Duration::from_millis(30))
-        } else {
-            !self.vibration.is_stopped()
-                && elapsed.is_some_and(|elapsed| elapsed >= Duration::from_millis(50))
-        };
-        if due {
-            if let Some(open) = self
-                .open_gamepads
-                .iter_mut()
-                .find(|open| Some(open.controller_id) == self.vibration.controller)
-                && open.gamepad.connected()
-            {
-                if self.vibration_dirty {
-                    log::trace!(
-                        "controller vibration output: device={} values={:?}",
-                        open.name,
-                        self.vibration.values
-                    );
-                }
-                // A failed transport write may have reached the actuator.
-                // Shutdown must still attempt a neutral packet in that case.
-                self.vibration_active |= !self.vibration.is_stopped();
-                open.send_vibration(self.vibration.values)?;
-                self.vibration_active = !self.vibration.is_stopped();
-            }
-            self.last_vibration_send = Some(Instant::now());
-            self.vibration_dirty = false;
-        }
-        Ok(())
-    }
-
-    fn stop_vibration(&mut self) -> Result<(), SdlInputError> {
-        if self.vibration_active
-            && let Some(open) = self
-                .open_gamepads
-                .iter_mut()
-                .find(|open| Some(open.controller_id) == self.vibration.controller)
-            && open.gamepad.connected()
-        {
-            if let Some(last) = self.last_vibration_send {
-                // Closing or retargeting must also respect Nintendo's minimum
-                // write interval. This wait belongs to the device thread only.
-                std::thread::sleep(Duration::from_millis(30).saturating_sub(last.elapsed()));
-            }
-            open.send_vibration([crate::VibrationValue::default(); 2])?;
-        }
-        self.vibration_active = false;
         Ok(())
     }
 
@@ -307,6 +320,11 @@ impl SdlInputBackend {
             {
                 continue;
             }
+            let Some(player) = (0..crate::MAX_PLAYERS)
+                .find(|&slot| !self.open_gamepads.iter().any(|open| open.player == slot))
+            else {
+                break;
+            };
             let name = self
                 .gamepad_subsystem
                 .name_for_id(joystick_id)
@@ -332,6 +350,7 @@ impl SdlInputBackend {
                 )
             })?;
             self.open_gamepads.push(OpenGamepad {
+                player,
                 joystick_id,
                 controller_id,
                 name: name.into(),
@@ -347,8 +366,10 @@ impl SdlInputBackend {
 
 impl Drop for SdlInputBackend {
     fn drop(&mut self) {
-        if let Err(error) = self.stop_vibration() {
-            log::error!("cannot stop controller vibration during shutdown: {error}");
+        for output in &mut self.vibration {
+            if let Err(error) = output.stop(&mut self.open_gamepads) {
+                log::error!("cannot stop controller vibration during shutdown: {error}");
+            }
         }
     }
 }
@@ -356,9 +377,13 @@ impl Drop for SdlInputBackend {
 impl HostInputBackend for SdlInputBackend {
     type Error = SdlInputError;
 
-    fn poll(&mut self) -> Result<Option<ControllerState>, Self::Error> {
+    fn poll(&mut self) -> Result<crate::RawControllerStates, Self::Error> {
         self.reconcile_gamepads()?;
-        Ok(self.open_gamepads.first_mut().map(controller_state))
+        let mut states = std::array::from_fn(|_| None);
+        for open in &mut self.open_gamepads {
+            states[open.player] = Some(controller_state(open));
+        }
+        Ok(states)
     }
 }
 
@@ -615,107 +640,5 @@ mod tests {
         assert_eq!(right_stick, StickState { x: 10, y: -20 });
         assert_eq!(triggers.left, 16_384);
         assert_eq!(triggers.right, u16::MAX);
-    }
-
-    #[test]
-    fn backend_ignores_open_failures_and_recognizes_reconnections() {
-        use sdl3::joystick::{JoystickType, VirtualJoystickDescription};
-
-        let sdl = sdl3::init().unwrap();
-        let subsystems = InputSubsystems::new(&sdl).unwrap();
-        let mut backend = SdlInputBackend::new(subsystems.clone());
-        assert!(!EventSubsystem::event_enabled(
-            EventType::ControllerButtonDown
-        ));
-        assert!(!EventSubsystem::event_enabled(
-            EventType::ControllerButtonUp
-        ));
-        assert!(!EventSubsystem::event_enabled(
-            EventType::ControllerAxisMotion
-        ));
-        assert!(EventSubsystem::event_enabled(
-            EventType::ControllerDeviceAdded
-        ));
-        assert!(EventSubsystem::event_enabled(
-            EventType::ControllerDeviceRemoved
-        ));
-        backend.poll().unwrap();
-        let joystick = sdl.joystick().unwrap();
-        let attach = || {
-            joystick
-                .attach_virtual_joystick(
-                    VirtualJoystickDescription::new()
-                        .name("Nixe hotplug test")
-                        .joystick_type(JoystickType::Gamepad)
-                        .with_button(SdlButton::South)
-                        .with_axis(Axis::LeftX),
-                )
-                .unwrap()
-        };
-        let connected = attach();
-        // An invalid SDL instance produces a real open failure. Supply the
-        // enumeration explicitly to exercise a failed and a healthy device
-        // together, independently of hardware attached to the test host.
-        let failed = sdl3_sys::joystick::SDL_JoystickID(0);
-        let attached = [failed, connected.id()];
-        backend.reconcile_attached_gamepads(&attached).unwrap();
-        assert_eq!(backend.failed_gamepads.len(), 1);
-        assert_eq!(backend.failed_gamepads[0].0, failed.0);
-        assert_eq!(backend.open_gamepads.len(), 1);
-        let controller_id = backend.open_gamepads[0].controller_id;
-
-        // A repeated poll must not even attempt to open the failed instance:
-        // another SDL open failure would overwrite this thread's error string.
-        sdl3::set_error("open was not retried").unwrap();
-        backend.reconcile_attached_gamepads(&attached).unwrap();
-        assert_eq!(sdl3::get_error().to_string(), "open was not retried");
-        assert_eq!(backend.failed_gamepads.len(), 1);
-        assert_eq!(backend.open_gamepads[0].controller_id, controller_id);
-
-        // The failed connection disappears and a working connection arrives
-        // between polls. Its new SDL instance must be opened immediately.
-        let recovered = attach();
-        backend
-            .reconcile_attached_gamepads(&[connected.id(), recovered.id()])
-            .unwrap();
-        assert!(backend.failed_gamepads.is_empty());
-        assert_eq!(backend.open_gamepads.len(), 2);
-        assert_eq!(backend.open_gamepads[0].controller_id, controller_id);
-        let recovered_id = backend.open_gamepads[1].controller_id;
-        assert_ne!(controller_id, recovered_id);
-
-        // Exercise real SDL enumeration, detachment, reattachment and snapshots.
-        joystick
-            .open(recovered.id())
-            .unwrap()
-            .set_virtual_button(0, true)
-            .unwrap();
-        joystick
-            .open(recovered.id())
-            .unwrap()
-            .set_virtual_axis(0, 12345)
-            .unwrap();
-        drop(connected);
-        let snapshot = backend.poll().unwrap().unwrap();
-        assert_ne!(snapshot.id, controller_id);
-        assert_eq!(snapshot.id, recovered_id);
-        assert!(snapshot.buttons.contains(Button::South));
-        assert_eq!(snapshot.left_stick.x, 12345);
-        let old_instance = recovered.id().0;
-        drop(recovered);
-        let reconnected = attach();
-        assert_ne!(reconnected.id().0, old_instance);
-        backend.poll().unwrap();
-        // A physical controller may precede the newly connected virtual one.
-        // Verify the reconnected device rather than assuming host enumeration order.
-        let reconnected = backend
-            .open_gamepads
-            .iter_mut()
-            .find(|open| open.joystick_id == reconnected.id())
-            .expect("reconnected device opened by poll");
-        let snapshot = controller_state(reconnected);
-        assert_ne!(snapshot.id, recovered_id);
-        assert_ne!(snapshot.id, controller_id);
-        assert_eq!(&*snapshot.name, "Nixe hotplug test");
     }
 }

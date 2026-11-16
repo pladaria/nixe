@@ -104,7 +104,12 @@ fn prove_setup_dead(env: &mut impl Environment, entry: ProgramOffset, handler: u
                 }
         };
         if op == 0x94d {
-            if guard == 7 && registers & 1 == 0 && read_predicates & predicates == 0 {
+            let (primary, secondary) = i.control_predicates()?;
+            if primary == crate::ir::Condition::always(true)
+                && secondary == crate::ir::Condition::always(true)
+                && registers & 1 == 0
+                && read_predicates & predicates == 0
+            {
                 return Ok(());
             }
             return Err(unsupported(

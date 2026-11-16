@@ -31,26 +31,11 @@ pub fn sampled_image_info(
             field: "format/component/swizzle",
             value: format_word,
         })?;
-    let sample_swizzle = if !matches!(format, ImageFormat::Bgra8Unorm | ImageFormat::Bgra8Srgb) {
-        Swizzle(swizzle.map(|component| match component {
-            0 => ComponentSwizzle::Zero,
-            // TIC B5G6R5 stores red in the low bits; the R5G6B5 storage
-            // format puts it in the high bits. Compose that channel swap
-            // with every selector, including repeated channels and constants.
-            // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/format_traits.inc
-            2 if format == ImageFormat::Rgb565Unorm => ComponentSwizzle::Blue,
-            4 if format == ImageFormat::Rgb565Unorm => ComponentSwizzle::Red,
-            2 => ComponentSwizzle::Red,
-            3 => ComponentSwizzle::Green,
-            4 => ComponentSwizzle::Blue,
-            5 => ComponentSwizzle::Alpha,
-            6 | 7 => ComponentSwizzle::One,
-            _ => unreachable!("validated TIC component mapping"),
-        }))
-    } else {
-        // These packed color formats already include their native mapping.
-        Swizzle::IDENTITY
-    };
+    let sample_swizzle = super::format::decode_swizzle(format, swizzle).ok_or(DescriptorError {
+        descriptor: descriptor_index,
+        field: "component swizzle",
+        value: format_word,
+    })?;
     let header_version = ((words[2] >> 21) & 7) as u8;
     let texture_type = ((words[4] >> 23) & 0xf) as u8;
     let width = (words[4] & 0xffff) + 1;

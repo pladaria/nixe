@@ -2,6 +2,107 @@ use super::*;
 use crate::{ir::TextureInstInfo, types::TextureType};
 
 impl Visitor<'_> {
+    pub(super) fn texture_gradient(&mut self) -> Result<()> {
+        // TXD keeps x/y[/layer] in Ra, four derivatives in Rb and its
+        // descriptor in a constant buffer or uniform register. Results use
+        // independent destination pairs; RZ in the second pair drops it.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h#L1244-L1312
+        let i = self.instruction;
+        let uniform = i.opcode() == 0xf6c;
+        let array = i.bits(61, 3) == 5;
+        let mask = i.bits(72, 4);
+        let channels = mask.count_ones();
+        let first = i.bits(16, 8);
+        let second = i.bits(64, 8);
+        let coordinates = i.bits(24, 8);
+        let derivatives = i.bits(32, 8);
+        let low_channels = channels.min(2);
+        if !matches!(i.bits(61, 3), 1 | 5)
+            || mask == 0
+            || i.bits(64, 32) & !0x04000fff != if uniform { 0x081e0000 } else { 0x001e0000 }
+            || i.bits(59, 2) != 0
+            || i.bits(96, 32) & 0xc00001ff != 0
+            || coordinates + 2 + u32::from(array) > 255
+            || derivatives + 4 > 255
+            || first + low_channels > 255
+            || (low_channels == 2 && first & 1 != 0)
+            || (channels <= 2 && second != 255)
+            || (channels > 2
+                && second != 255
+                && (second + channels - 2 > 255
+                    || (channels == 4 && second & 1 != 0)
+                    || (second < first + low_channels && first < second + channels - 2)))
+            || (uniform && (i.bits(46, 13) != 0 || i.bits(40, 6) == 63))
+            || (!uniform
+                && (i.bits(54, 5) >= crate::artifact::MAX_CBUFS as u32 || i.bits(40, 14) > 0x1fff))
+        {
+            return Err(unsupported("Native gradient texture mode"));
+        }
+        let handle = if uniform {
+            self.ureg(i.bits(40, 6))?
+        } else {
+            self.emit.get_cbuf(
+                Value::U32(i.bits(54, 5)),
+                Value::U32(i.bits(40, 14) * 4),
+                32,
+                false,
+            )?
+        };
+        let mut coords = [Value::None; 3];
+        for (index, coordinate) in coords.iter_mut().enumerate().take(2) {
+            let value = self.reg(coordinates + index as u32)?;
+            *coordinate = self.emit.bit_cast(Type::F32, value)?;
+        }
+        if array {
+            let layer = self.reg(coordinates + 2)?;
+            let layer = self
+                .emit
+                .bit_field_extract(layer, Value::U32(0), Value::U32(16), false)?;
+            coords[2] = self
+                .emit
+                .convert_i_to_f(32, 16, false, layer, FpControl::default())?;
+        }
+        let coords = self
+            .emit
+            .composite_construct(&coords[..2 + usize::from(array)])?;
+        let mut gradients = [Value::None; 4];
+        for (index, gradient) in gradients.iter_mut().enumerate() {
+            let value = self.reg(derivatives + index as u32)?;
+            *gradient = self.emit.bit_cast(Type::F32, value)?;
+        }
+        let gradients = self.emit.composite_construct(&gradients)?;
+        let mut info = TextureInstInfo::default();
+        info.set_texture_type(if array {
+            TextureType::ColorArray2D
+        } else {
+            TextureType::Color2D
+        });
+        info.set_num_derivatives(2);
+        let sample =
+            self.emit
+                .image_gradient(handle, coords, gradients, Value::None, Value::None, info)?;
+        let mut output = 0;
+        for component in 0..4 {
+            if mask & (1 << component) == 0 {
+                continue;
+            }
+            let destination = if output < 2 {
+                first + output
+            } else if second == 255 {
+                255
+            } else {
+                second + output - 2
+            };
+            if destination != 255 {
+                let value = self.emit.composite_extract(sample, component)?;
+                let value = self.emit.bit_cast(Type::U32, value)?;
+                self.emit.set_reg(Reg(destination as u8), value)?;
+            }
+            output += 1;
+        }
+        Ok(())
+    }
+
     pub(super) fn texture_fetch(&mut self) -> Result<()> {
         let i = self.instruction;
         let uniform = i.opcode() == 0xf66;

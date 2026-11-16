@@ -37,6 +37,7 @@ pub struct DeviceProfile {
     pub pipeline_creation_feedback: bool,
     pub emulate_scaled_formats: bool,
     pub limits: vk::PhysicalDeviceLimits,
+    pub texel_buffer_alignment: TexelBufferAlignment,
     pub core: vk::PhysicalDeviceFeatures,
     pub formats: [vk::FormatProperties; 185],
     pub null_descriptor: bool,
@@ -66,6 +67,39 @@ pub struct DeviceProfile {
     pub swapchain_mutable_format: bool,
     pub portability: Option<PortabilitySupport>,
     pub enabled_extensions: Vec<String>,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct TexelBufferAlignment {
+    storage_bytes: u64,
+    storage_single_texel: bool,
+    uniform_bytes: u64,
+    uniform_single_texel: bool,
+}
+impl TexelBufferAlignment {
+    /// Buffer views must satisfy every texel usage of their backing buffer.
+    /// Vulkan 1.3 and EXT_texel_buffer_alignment relax the legacy limit using
+    /// the format's texel size (component size for three-component formats).
+    /// https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceTexelBufferAlignmentProperties.html
+    pub(crate) fn required(self, element_bytes: u32, usage: vk::BufferUsageFlags) -> u64 {
+        let texel = u64::from(if element_bytes.is_multiple_of(3) {
+            element_bytes / 3
+        } else {
+            element_bytes
+        });
+        let effective =
+            |bytes: u64, single: bool| if single { bytes.min(texel) } else { bytes }.max(1);
+        let storage = if usage.contains(vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER) {
+            effective(self.storage_bytes, self.storage_single_texel)
+        } else {
+            1
+        };
+        let uniform = if usage.contains(vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER) {
+            effective(self.uniform_bytes, self.uniform_single_texel)
+        } else {
+            1
+        };
+        storage.max(uniform)
+    }
 }
 #[derive(Debug)]
 pub struct FloatControls {
@@ -265,6 +299,9 @@ macro_rules! fixed {
     };
 }
 optional_features! {
+    texel_alignment: vk::PhysicalDeviceTexelBufferAlignmentFeaturesEXT<'static> => |version, e: &ExtensionSet| {
+        if version < vk::API_VERSION_1_3 { supported(e, ash::ext::texel_buffer_alignment::NAME) } else { None }
+    },
     robustness2: vk::PhysicalDeviceRobustness2FeaturesEXT<'static> => fixed!(ash::ext::robustness2::NAME),
     demote: vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures<'static> => fixed!(ash::ext::shader_demote_to_helper_invocation::NAME),
     workgroup_layout: vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR<'static> => fixed!(ash::khr::workgroup_memory_explicit_layout::NAME),
@@ -413,11 +450,17 @@ impl FeatureSet {
         let mut descriptors = vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
         let mut push = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
         let mut vertex_divisor = vk::PhysicalDeviceVertexAttributeDivisorPropertiesEXT::default();
+        let mut texel = vk::PhysicalDeviceTexelBufferAlignmentProperties::default();
+        let relaxed_texel =
+            version >= vk::API_VERSION_1_3 || self.texel_alignment.texel_buffer_alignment != 0;
         let mut props = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut driver)
             .push_next(&mut floats)
             .push_next(&mut id)
             .push_next(&mut subgroup);
+        if relaxed_texel {
+            props = props.push_next(&mut texel);
+        }
         if self.chains.subgroup {
             props = props.push_next(&mut subgroup_control);
         }
@@ -468,6 +511,23 @@ impl FeatureSet {
                     .names
                     .contains(&ash::ext::pipeline_creation_feedback::NAME),
             limits: properties.limits,
+            texel_buffer_alignment: if relaxed_texel {
+                TexelBufferAlignment {
+                    storage_bytes: texel.storage_texel_buffer_offset_alignment_bytes,
+                    storage_single_texel: texel.storage_texel_buffer_offset_single_texel_alignment
+                        != 0,
+                    uniform_bytes: texel.uniform_texel_buffer_offset_alignment_bytes,
+                    uniform_single_texel: texel.uniform_texel_buffer_offset_single_texel_alignment
+                        != 0,
+                }
+            } else {
+                TexelBufferAlignment {
+                    storage_bytes: properties.limits.min_texel_buffer_offset_alignment,
+                    storage_single_texel: false,
+                    uniform_bytes: properties.limits.min_texel_buffer_offset_alignment,
+                    uniform_single_texel: false,
+                }
+            },
             core: self.core,
             // Eden Device owns immutable native format capabilities. Query
             // once, including static pipelines and dynamic vertex inputs.

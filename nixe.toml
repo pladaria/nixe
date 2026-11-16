@@ -106,6 +106,8 @@ mme_jit = true
 cache_directory = "./storage/cache/gpu"
 
 # Use `cargo cli input` to get your controller's SDL gamepad information
+# Controllers fill player slots in SDL enumeration order (first = Player 1).
+# Omit a button, axis or sensor mapping, or use "", to leave it unassigned.
 [input.profiles.switch-pro]
 device = "Nintendo Switch Pro Controller"
 type = "switch-pro"
@@ -134,3 +136,32 @@ rightx = "rightx"
 righty = "righty"
 gyroscope = "gyroscope"
 accelerometer = "accelerometer"
+
+[input.profiles.playstation-3]
+device = "PS3 Controller"
+type = "playstation-3"
+# button mapping for the SDL gamepad
+a = "east"
+b = "south"
+x = "north"
+y = "west"
+plus = "start"
+minus = "back"
+home = "guide"
+capture = ""
+l = "leftshoulder"
+r = "rightshoulder"
+leftstick = "leftstick"
+rightstick = "rightstick"
+dpup = "dpup"
+dpdown = "dpdown"
+dpleft = "dpleft"
+dpright = "dpright"
+zl = "lefttrigger"
+zr = "righttrigger"
+leftx = "leftx"
+lefty = "lefty"
+rightx = "rightx"
+righty = "righty"
+gyroscope = ""
+accelerometer = ""

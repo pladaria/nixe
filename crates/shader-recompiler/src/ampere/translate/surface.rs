@@ -48,6 +48,29 @@ impl Visitor<'_> {
         {
             return Err(unsupported("Native formatted surface atomic mode"));
         }
+        let result = self.surface_atomic_operation(operation)?;
+        self.write(result)
+    }
+
+    pub(super) fn surface_reduction(&mut self) -> Result<()> {
+        // SURED performs the surface atomic operation without returning its old value.
+        // https://docs.nvidia.com/cuda/parallel-thread-execution/#surface-instructions-sured
+        // Native encoding: https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h#L1607-L1626
+        let i = self.instruction;
+        if i.bits(64, 32) & !0x03800000 != 0x0010e000
+            || !matches!(i.bits(61, 3), 1 | 3 | 5)
+            || i.bits(59, 2) != 0
+            || i.bits(54, 5) >= crate::artifact::MAX_CBUFS as u32
+            || i.bits(40, 14) > 0x1fff
+        {
+            return Err(unsupported("Native surface reduction mode"));
+        }
+        self.surface_atomic_operation(i.bits(87, 3))?;
+        Ok(())
+    }
+
+    fn surface_atomic_operation(&mut self, operation: u32) -> Result<Value> {
+        let i = self.instruction;
         let (coordinates, mut info) = self.surface_coordinates()?;
         info.set_image_format(crate::types::ImageFormat::R32_UINT);
         let handle = self.emit.get_cbuf(
@@ -57,36 +80,25 @@ impl Visitor<'_> {
             false,
         )?;
         let value = self.reg(i.bits(32, 8))?;
-        let result = match operation {
+        match operation {
             0 => self
                 .emit
-                .image_atomic_i_add(handle, coordinates, value, info)?,
+                .image_atomic_i_add(handle, coordinates, value, info),
             1 => self
                 .emit
-                .image_atomic_u_min(handle, coordinates, value, info)?,
+                .image_atomic_u_min(handle, coordinates, value, info),
             2 => self
                 .emit
-                .image_atomic_u_max(handle, coordinates, value, info)?,
-            3 => self
-                .emit
-                .image_atomic_inc(handle, coordinates, value, info)?,
-            4 => self
-                .emit
-                .image_atomic_dec(handle, coordinates, value, info)?,
-            5 => self
-                .emit
-                .image_atomic_and(handle, coordinates, value, info)?,
-            6 => self
-                .emit
-                .image_atomic_or(handle, coordinates, value, info)?,
-            7 => self
-                .emit
-                .image_atomic_xor(handle, coordinates, value, info)?,
+                .image_atomic_u_max(handle, coordinates, value, info),
+            3 => self.emit.image_atomic_inc(handle, coordinates, value, info),
+            4 => self.emit.image_atomic_dec(handle, coordinates, value, info),
+            5 => self.emit.image_atomic_and(handle, coordinates, value, info),
+            6 => self.emit.image_atomic_or(handle, coordinates, value, info),
+            7 => self.emit.image_atomic_xor(handle, coordinates, value, info),
             _ => self
                 .emit
-                .image_atomic_exchange(handle, coordinates, value, info)?,
-        };
-        self.write(result)
+                .image_atomic_exchange(handle, coordinates, value, info),
+        }
     }
 
     pub(super) fn surface_memory(&mut self) -> Result<()> {

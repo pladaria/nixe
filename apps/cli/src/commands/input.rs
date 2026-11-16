@@ -19,7 +19,7 @@ pub fn run() -> Result<(), String> {
     let mut input = InputWorker::unmapped(&sdl)
         .map_err(|error| format!("cannot start input worker: {error}"))?;
     let _terminal = TerminalSession::enter()?;
-    render(&None)?;
+    render(&std::array::from_fn(|_| None))?;
     let mut previous = None;
 
     while !interrupted.load(Ordering::Acquire) {
@@ -42,8 +42,19 @@ fn install_interrupt_handler() -> Result<Arc<AtomicBool>, String> {
     Ok(interrupted)
 }
 
-fn render(state: &Option<ControllerState>) -> Result<(), String> {
-    let contents = format_state(state);
+fn render(states: &nixe_input::RawControllerStates) -> Result<(), String> {
+    let mut contents = String::new();
+    for (slot, state) in states
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| state.is_some())
+    {
+        let _ = writeln!(contents, "Player {}", slot + 1);
+        contents.push_str(&format_state(state));
+    }
+    if contents.is_empty() {
+        contents = format_state(&None);
+    }
     let mut stdout = io::stdout().lock();
     write!(stdout, "\x1b[H{contents}\x1b[J")
         .and_then(|()| stdout.flush())

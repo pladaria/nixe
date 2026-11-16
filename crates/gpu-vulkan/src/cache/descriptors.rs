@@ -260,6 +260,7 @@ pub struct DescriptorCache {
     owner: Arc<DeviceOwner>,
     null_descriptor: bool,
     limits: vk::PhysicalDeviceLimits,
+    texel_alignment: crate::profile::TexelBufferAlignment,
     last: HashMap<vk::DescriptorSetLayout, Weak<BindingRecord>>,
     formats: HashMap<vk::Format, vk::FormatFeatureFlags>,
     hits: u64,
@@ -291,6 +292,7 @@ impl DescriptorCache {
             owner: Arc::clone(&device.owner),
             null_descriptor: device.profile().null_descriptor,
             limits: device.profile().limits,
+            texel_alignment: device.profile().texel_buffer_alignment,
             last: HashMap::default(),
             formats: HashMap::default(),
             hits: 0,
@@ -388,8 +390,9 @@ impl DescriptorCache {
                         || !range.is_multiple_of(u64::from(*element_bytes))
                         || range / u64::from((*element_bytes).max(1))
                             > u64::from(self.limits.max_texel_buffer_elements)
-                        || !offset
-                            .is_multiple_of(self.limits.min_texel_buffer_offset_alignment.max(1))
+                        || !offset.is_multiple_of(
+                            self.texel_alignment.required(*element_bytes, buffer.usage),
+                        )
                         || offset
                             .checked_add(*range)
                             .is_none_or(|end| end > buffer.size())

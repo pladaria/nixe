@@ -84,6 +84,8 @@ struct Buffer {
 
 struct State {
     started: bool,
+    host_paused: bool,
+    largest_callback_frames: usize,
     queued: VecDeque<Buffer>,
     released: VecDeque<Buffer>,
     played_frames: u64,
@@ -95,6 +97,8 @@ impl Default for State {
     fn default() -> Self {
         Self {
             started: false,
+            host_paused: false,
+            largest_callback_frames: 0,
             queued: VecDeque::new(),
             released: VecDeque::new(),
             played_frames: 0,
@@ -129,12 +133,15 @@ impl AudioFeed {
     pub fn render(&self, output: &mut [i16]) {
         output.fill(0);
         let mut state = self.lock();
-        if !state.started || state.failure.is_some() {
+        let capacity = output.len() / self.format.layout.channels() * self.format.layout.channels();
+        state.largest_callback_frames = state
+            .largest_callback_frames
+            .max(capacity / self.format.layout.channels());
+        if !state.started || state.host_paused || state.failure.is_some() {
             return;
         }
         let mut written = 0;
         let mut released = false;
-        let capacity = output.len() / self.format.layout.channels() * self.format.layout.channels();
         while written < capacity {
             let Some(buffer) = state.queued.front_mut() else {
                 break;
@@ -222,6 +229,15 @@ impl AudioOutput {
 
     pub fn started(&self) -> Result<bool, AudioError> {
         Ok(self.state()?.started)
+    }
+    /// Suspend consumption without discarding queued samples or completing them.
+    pub fn set_host_paused(&self, paused: bool) -> Result<(), AudioError> {
+        self.state()?.host_paused = paused;
+        Ok(())
+    }
+    /// Enough producer blocks for the largest callback plus one block of slack.
+    pub fn streaming_queue_blocks(&self, block_frames: usize) -> Result<usize, AudioError> {
+        Ok((self.state()?.largest_callback_frames.div_ceil(block_frames) + 1).clamp(3, 64))
     }
     /// Per-stream gain is applied when the host consumes PCM, including buffers
     /// queued before a volume change.

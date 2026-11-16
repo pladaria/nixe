@@ -440,7 +440,8 @@ pub(crate) async fn execute_request(
             services::dispatch_audio_device(process, session, request, hipc).await?
         }
         HorizonIpcObject::AudioMixer(session) => {
-            services::dispatch_audio_mixer(process, session, &resources.audio.mixer, request, hipc)?
+            services::dispatch_audio_mixer(process, session, &resources.audio, request, hipc)
+                .await?
         }
         HorizonIpcObject::NativeAudioDevice(session) => {
             services::dispatch_native_audio_device(

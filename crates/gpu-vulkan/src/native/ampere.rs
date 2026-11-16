@@ -265,10 +265,26 @@ impl NativeExecution<'_> {
                 memory
                     .prepare_image(info.address, info.size)
                     .map_err(compilation)?;
-                let view = self.image_target_view(info, memory)?;
-                self.residency.runtime.constructing.push(Resource::Image(
-                    self.residency.texture_cache.views[view].image,
-                ));
+                let (image, [mip, layer]) = self.find_or_insert_image(info, memory)?;
+                let plane = self
+                    .residency
+                    .texture_cache
+                    .get(image)
+                    .planes
+                    .iter()
+                    .position(|p| {
+                        p.mip_level == mip
+                            && p.array_layer + p.depth_slice == layer
+                            && p.aspect == vk::ImageAspectFlags::COLOR
+                    })
+                    .ok_or_else(|| compilation("2D copy color slice is absent"))?;
+                // Both raster blits and raw copies select one 2D slice, even
+                // when its storage belongs to a resident 3D image.
+                let view = self.residency.attachment_view(image, plane)?;
+                self.residency
+                    .runtime
+                    .constructing
+                    .push(Resource::Image(image));
                 views[index] = view;
             }
             if let Some(rect) = copy_rect {

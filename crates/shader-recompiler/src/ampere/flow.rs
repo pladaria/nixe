@@ -153,8 +153,17 @@ fn analyze_function(
                 {
                     return Err(unsupported("Native return linkage mode"));
                 }
-                if op == 0x94d && (insn.bits(84, 2) != 0 || insn.bits(87, 4) != 7) {
-                    return Err(unsupported("Native special EXIT condition"));
+                if op == 0x94d {
+                    if insn.bits(84, 2) != 0 {
+                        return Err(unsupported(format!(
+                            "Native special EXIT condition at {:#x}: instruction={:032x}",
+                            pc.0, insn.0
+                        )));
+                    }
+                    let (primary, secondary) = insn.control_predicates()?;
+                    if primary != Condition::always(true) || secondary != Condition::always(true) {
+                        boundaries.extend([pc, next]);
+                    }
                 }
                 if op == 0x95b {
                     if env.metadata().stage != crate::types::Stage::Fragment
@@ -170,7 +179,7 @@ fn analyze_function(
                 }
                 code.insert(pc, insn);
                 if matches!(op, 0x944 | 0x947) && !calls.contains_key(&pc) {
-                    let (guard, branch) = insn.branch_predicates()?;
+                    let (guard, branch) = insn.control_predicates()?;
                     let target = insn.branch_target(pc)?;
                     if target < entry {
                         return Err(unsupported("Native branch leaves its function entry"));
@@ -188,13 +197,20 @@ fn analyze_function(
                     break;
                 } else if matches!(op, 0x94d | 0x950) {
                     boundaries.insert(next);
-                    if op == 0x94d
-                        && let Some(handler) = exit_handler.filter(|h| pc < h.handler)
-                    {
-                        boundaries.insert(handler.handler);
-                        pending.push(handler.handler);
-                    }
-                    if condition == Condition::always(true) {
+                    let unconditional = if op == 0x94d {
+                        let (primary, secondary) = insn.control_predicates()?;
+                        if primary != Condition::always(false)
+                            && secondary != Condition::always(false)
+                            && let Some(handler) = exit_handler.filter(|h| pc < h.handler)
+                        {
+                            boundaries.insert(handler.handler);
+                            pending.push(handler.handler);
+                        }
+                        primary == Condition::always(true) && secondary == Condition::always(true)
+                    } else {
+                        condition == Condition::always(true)
+                    };
+                    if unconditional {
                         break;
                     }
                 } else if (0x940..=0x95f).contains(&op)
@@ -298,38 +314,48 @@ fn analyze_function(
         graph.functions[function.0]
             .blocks
             .insert(FlowLocation::Instruction(Location(pc)), id);
-        let guard_condition = if last.opcode() == 0x947 {
-            last.branch_predicates()?.0
-        } else if !is_control || matches!(last.opcode(), 0x94d | 0x95b) {
-            condition
+        let guard_conditions = if last.opcode() == 0x94d {
+            // EXIT's execution and control predicates must both hold before
+            // exporting fragment outputs or entering a geometry finalizer.
+            // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h#L4005-L4039
+            let (primary, secondary) = last.control_predicates()?;
+            [primary, secondary]
+        } else if last.opcode() == 0x947 {
+            [last.control_predicates()?.0, Condition::always(true)]
+        } else if !is_control || last.opcode() == 0x95b {
+            [condition, Condition::always(true)]
         } else {
-            Condition::always(true)
+            [Condition::always(true); 2]
         };
-        let guard = if guard_condition != Condition::always(true) {
+        let mut guards = [None; 2];
+        let mut first = id;
+        for (index, guard_condition) in guard_conditions.into_iter().enumerate().rev() {
+            if guard_condition == Condition::always(true) {
+                continue;
+            }
             let mut guard = FlowBlock::at(Location(pc), ());
-            guard.begin = FlowLocation::PredicateBefore(Location(pc));
+            guard.begin = FlowLocation::PredicateBefore(Location(pc), index as u8);
             guard.end = guard.begin;
             guard.condition = guard_condition;
-            guard.branch_true = Some(id);
-            let guard_id = graph.blocks.allocate(guard)?;
-            graph.functions[function.0]
-                .blocks
-                .insert(FlowLocation::PredicateBefore(Location(pc)), guard_id);
-            Some(guard_id)
-        } else {
-            None
-        };
-        starts.insert(pc, guard.unwrap_or(id));
-        ranges.push((pc, end, last, id, guard));
+            guard.branch_true = Some(first);
+            first = graph.blocks.allocate(guard)?;
+            graph.functions[function.0].blocks.insert(
+                FlowLocation::PredicateBefore(Location(pc), index as u8),
+                first,
+            );
+            guards[index] = Some(first);
+        }
+        starts.insert(pc, first);
+        ranges.push((pc, end, last, id, guards));
     }
-    for (_pc, end, last, id, guard) in ranges {
+    for (_pc, end, last, id, guards) in ranges {
         let successor = |pc| {
             starts
                 .get(&pc)
                 .copied()
                 .ok_or_else(|| unsupported(format!("Missing native flow successor {:#x}", pc.0)))
         };
-        if let Some(guard) = guard {
+        for guard in guards.into_iter().flatten() {
             graph.block_mut(guard)?.branch_false = Some(successor(end)?);
         }
         let block = graph.block_mut(id)?;
@@ -370,7 +396,7 @@ fn analyze_function(
                 block.condition = Condition::always(true);
             }
             0x944 | 0x947 => {
-                block.condition = last.branch_predicates()?.1;
+                block.condition = last.control_predicates()?.1;
                 if block.condition != Condition::always(false) {
                     block.branch_true =
                         Some(successor(last.branch_target(ProgramOffset(end.0 - 16))?)?);

@@ -1,6 +1,152 @@
 use super::*;
 
 impl Visitor<'_> {
+    pub(super) fn local_memory(&mut self) -> Result<()> {
+        // LDL/STL use invocation-private byte addresses, with an optional
+        // uniform base added to the lane's address register.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h#L3065-L3112
+        let i = self.instruction;
+        let store = i.opcode() != 0x983;
+        let uniform = i.bits(91, 1) != 0;
+        let kind = i.bits(73, 3);
+        let words = if kind == 6 {
+            4
+        } else if kind == 5 {
+            2
+        } else {
+            1
+        };
+        let bytes = if kind < 2 {
+            1
+        } else if kind < 4 {
+            2
+        } else {
+            4
+        };
+        let data = i.bits(if store { 32 } else { 16 }, 8);
+        let offset = i.bits(40, 24);
+        let variable = (if store { 0xe00 } else { 0x200e00 })
+            | if uniform {
+                0x08000000 | if store { 0x3f } else { 0 }
+            } else {
+                0
+            };
+        if kind > 6
+            || i.bits(64, 32) & !variable != 0x00100000
+            || (store && i.bits(16, 8) != 0)
+            || (!store && (data == 255 || (!uniform && i.bits(32, 8) != 0)))
+            || (i.opcode() == 0x987 && !uniform)
+            || (data != 255 && (!data.is_multiple_of(words) || data + words > 255))
+            || offset & (bytes - 1) != 0
+            || offset + bytes * words > 0x800000
+            || self.metadata.local_memory_size == 0
+        {
+            return Err(unsupported(
+                "Native local memory size/addressing/register mode",
+            ));
+        }
+        let mut address = self.reg(i.bits(24, 8))?;
+        if uniform {
+            let base = self.ureg(i.bits(if store { 64 } else { 32 }, if store { 6 } else { 8 }))?;
+            address = self.emit.i_add(address, base)?;
+        }
+        let address = if let Value::U32(base) = address {
+            Value::U32(base.wrapping_add(offset))
+        } else {
+            self.emit.i_add(address, Value::U32(offset))?
+        };
+        for index in 0..words {
+            let at = if let Value::U32(base) = address {
+                Value::U32(base.wrapping_add(index * 4))
+            } else {
+                self.emit.i_add(address, Value::U32(index * 4))?
+            };
+            if store && matches!(at, Value::U32(at) if at >= self.metadata.local_memory_size) {
+                continue;
+            }
+            // @SIMPLIFICATION: dynamic local stores trust the guest compiler's
+            // declared spill/array bounds. Constant out-of-range stores are
+            // discarded, and loads preserve the reference's zero-result check.
+            let in_range = match at {
+                _ if store => Value::U1(true),
+                Value::U32(at) => Value::U1(at < self.metadata.local_memory_size),
+                _ => {
+                    self.emit
+                        .i_less_than(at, Value::U32(self.metadata.local_memory_size), false)?
+                }
+            };
+            let word = if let Value::U32(at) = at {
+                Value::U32(at / 4)
+            } else {
+                self.emit.shift_right_logical(at, Value::U32(2))?
+            };
+            let register = Reg(if data == 255 {
+                255
+            } else {
+                (data + index) as u8
+            });
+            let mut value = if store {
+                self.emit.get_reg(register)?
+            } else if in_range == Value::U1(false) {
+                Value::U32(0)
+            } else {
+                let value = self.emit.load_local(word)?;
+                self.emit.select(in_range, value, Value::U32(0))?
+            };
+            if bytes < 4 {
+                let shift = self.emit.shift_left_logical(at, Value::U32(3))?;
+                let shift = self
+                    .emit
+                    .bitwise_and(shift, Value::U32(if bytes == 1 { 24 } else { 16 }))?;
+                value = if store {
+                    let old = self.emit.load_local(word)?;
+                    self.emit
+                        .bit_field_insert(old, value, shift, Value::U32(bytes * 8))?
+                } else {
+                    self.emit.bit_field_extract(
+                        value,
+                        shift,
+                        Value::U32(bytes * 8),
+                        matches!(kind, 1 | 3),
+                    )?
+                };
+            }
+            if store {
+                self.emit.write_local(word, value)?;
+            } else {
+                self.emit.set_reg(register, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn shared_increment(&mut self) -> Result<()> {
+        // ATOMS.POPC.INC.32, with the old value discarded in RZ.
+        // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h#L1458-L1473
+        let i = self.instruction;
+        let offset = ((i.bits(40, 24) as i32) << 8 >> 8) as u32;
+        if i.bits(16, 8) != 255
+            || i.bits(32, 8) != 0
+            || offset & 3 != 0
+            || i.bits(64, 32) & !0xc000 != 0x0d00003f
+        {
+            return Err(unsupported("Native shared increment mode"));
+        }
+        let mut address = self.reg(i.bits(24, 8))?;
+        let stride = i.bits(78, 2);
+        if stride != 0 {
+            address = self
+                .emit
+                .shift_left_logical(address, Value::U32(stride + 1))?;
+        }
+        let address = self.emit.i_add(address, Value::U32(offset))?;
+        // @SIMPLIFICATION: omit warp coalescing for the no-result form. Atomic
+        // increments by participating invocations preserve the counter and its
+        // workgroup-barrier ordering without exposing per-lane return values.
+        self.emit.shared_atomic_i_add(address, Value::U32(1))?;
+        Ok(())
+    }
+
     pub(super) fn shared_atomic(&mut self) -> Result<()> {
         let i = self.instruction;
         let operation = i.bits(87, 4);

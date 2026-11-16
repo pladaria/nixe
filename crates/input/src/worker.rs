@@ -8,7 +8,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::{
-    ControllerState, GamepadProfiles, InputManager, ProfiledControllerState, sdl::SdlInputBackend,
+    GamepadProfiles, HostInputBackend, InputManager, MAX_PLAYERS, ProfiledControllerStates,
+    RawControllerStates, sdl::SdlInputBackend,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -58,11 +59,20 @@ pub struct InputWorker<T> {
     shared: Arc<Shared<T>>,
     thread: Option<JoinHandle<Result<(), String>>>,
     _subsystems: Option<crate::sdl::InputSubsystems>,
-    vibration: Option<crate::VibrationOutput>,
-    motion_settings: Option<crate::MotionSettings>,
+    vibration: Option<[crate::VibrationOutput; MAX_PLAYERS]>,
+    motion_settings: Option<[crate::MotionSettings; MAX_PLAYERS]>,
 }
 
-impl InputWorker<Option<ProfiledControllerState>> {
+fn vibration_channels() -> (
+    [crate::VibrationOutput; MAX_PLAYERS],
+    [crate::vibration::VibrationReceiver; MAX_PLAYERS],
+) {
+    let pairs = std::array::from_fn::<_, MAX_PLAYERS, _>(|_| crate::vibration::vibration_channel());
+    let outputs = pairs.each_ref().map(|(output, _)| output.clone());
+    (outputs, pairs.map(|(_, receiver)| receiver))
+}
+
+impl InputWorker<ProfiledControllerStates> {
     /// Starts profiled sampling. `notify` wakes the consumer when a previously
     /// empty mailbox receives a sample, and when the worker exits. It runs on
     /// the input thread and must return promptly without panicking.
@@ -73,17 +83,17 @@ impl InputWorker<Option<ProfiledControllerState>> {
     ) -> io::Result<Self> {
         let owner = crate::sdl::InputSubsystems::new(sdl).map_err(io::Error::other)?;
         let subsystems = WorkerSubsystems(owner.clone());
-        let (vibration, receiver) = crate::vibration::vibration_channel();
-        let motion_settings = crate::MotionSettings::default();
+        let (vibration, receivers) = vibration_channels();
+        let motion_settings = std::array::from_fn(|_| crate::MotionSettings::default());
         let worker_motion_settings = motion_settings.clone();
         let mut worker = Self::spawn(
             move || {
                 let backend = SdlInputBackend::new(subsystems.take());
-                let mut input = InputManager::with_profiles(backend, profiles);
-                input.motion_settings = worker_motion_settings;
+                let mut input =
+                    InputManager::with_profiles(backend, profiles, worker_motion_settings);
                 Ok::<_, crate::sdl::SdlInputError>(move || {
                     let state = input.read_profiled_input()?;
-                    input.backend.apply_vibration(&receiver)?;
+                    input.backend.apply_vibration(&receivers)?;
                     Ok(state)
                 })
             },
@@ -96,18 +106,17 @@ impl InputWorker<Option<ProfiledControllerState>> {
     }
 }
 
-impl InputWorker<Option<ControllerState>> {
+impl InputWorker<RawControllerStates> {
     pub fn unmapped(sdl: &sdl3::Sdl) -> io::Result<Self> {
         let owner = crate::sdl::InputSubsystems::new(sdl).map_err(io::Error::other)?;
         let subsystems = WorkerSubsystems(owner.clone());
-        let (vibration, receiver) = crate::vibration::vibration_channel();
+        let (vibration, receivers) = vibration_channels();
         let mut worker = Self::spawn(
             move || {
-                let backend = SdlInputBackend::new(subsystems.take());
-                let mut input = InputManager::new(backend);
+                let mut backend = SdlInputBackend::new(subsystems.take());
                 Ok::<_, crate::sdl::SdlInputError>(move || {
-                    let state = input.read_input()?;
-                    input.backend.apply_vibration(&receiver)?;
+                    let state = backend.poll()?;
+                    backend.apply_vibration(&receivers)?;
                     Ok(state)
                 })
             },
@@ -195,12 +204,12 @@ pub struct InputReader<T> {
 }
 
 impl<T> InputWorker<T> {
-    pub fn motion_settings(&self) -> Option<crate::MotionSettings> {
+    pub fn motion_settings(&self) -> Option<[crate::MotionSettings; MAX_PLAYERS]> {
         self.motion_settings.clone()
     }
 
     /// SDL device output belongs to the same worker as controller sampling.
-    pub fn vibration_output(&self) -> Option<crate::VibrationOutput> {
+    pub fn vibration_outputs(&self) -> Option<[crate::VibrationOutput; MAX_PLAYERS]> {
         self.vibration.clone()
     }
 

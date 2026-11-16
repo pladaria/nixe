@@ -130,11 +130,15 @@ pub(in crate::ipc_wire) async fn dispatch_native_audio_device(
         unreachable!()
     };
     let command = request.command_id;
-    if !matches!(command, 0 | 100 | 300 | 401 | 500) {
+    if !matches!(command, 0 | 100 | 300 | 401 | 500 | 700 | 800) {
         return unsupported_service_command("nn::audio::devmgr::IUserSession", command);
     }
-    let scalar = if matches!(command, 300 | 500) { 16 } else { 4 };
-    let has_input = matches!(command, 300 | 401 | 500);
+    let scalar = match command {
+        300 | 500 => 16,
+        700 => 8,
+        _ => 4,
+    };
+    let has_input = matches!(command, 300 | 401 | 500 | 700);
     let has_output = matches!(command, 0 | 100 | 401);
     if !request.has_payload_size(scalar)
         || hipc.pid.is_some()
@@ -148,10 +152,18 @@ pub(in crate::ipc_wire) async fn dispatch_native_audio_device(
     {
         return error(HorizonIpcResult::CMIF_INVALID_IN_HEADER);
     }
-    let functionality = request_u32(request.data, if command == 300 { 12 } else { 0 }).unwrap();
+    let functionality = match command {
+        300 => request_u32(request.data, 12).unwrap(),
+        700 => request_u32(request.data, 4).unwrap(),
+        800 => 1,
+        _ => request_u32(request.data, 0).unwrap(),
+    };
     // There is a real playback route, but no connected microphone. Do not
     // advertise an input device that cannot deliver samples.
-    if functionality != 1 && command != 500 {
+    // @SPECULATIVE: the SDK uses zero to enumerate available routes. Include
+    // the output device for that selection, matching the reference; no input
+    // route is advertised without a working capture backend.
+    if !matches!(functionality, 0 | 1) && command != 500 {
         if command == 0 {
             return semantic_success(request.token, domain, &0u32.to_le_bytes(), &[], &[], None);
         }
@@ -159,12 +171,12 @@ pub(in crate::ipc_wire) async fn dispatch_native_audio_device(
     }
     if has_input {
         let buffer = input(process, hipc)?;
-        if buffer.size < NAME_SIZE as u64 {
-            return error(HorizonIpcResult::AUDIO_INSUFFICIENT_BUFFER);
-        }
-        let mut name = vec![0; NAME_SIZE];
+        // Device names arrive as bounded strings, not fixed-size name records.
+        // The output listing uses padded records, while SDK input spans can
+        // contain just the name and its terminator.
+        let mut name = vec![0; buffer.size.min(NAME_SIZE as u64) as usize];
         process.read(buffer, 0, &mut name).await?;
-        let end = name.iter().position(|&b| b == 0).unwrap_or(NAME_SIZE);
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
         if &name[..end] != OUTPUT_NAME {
             return error(HorizonIpcResult::AUDIO_NOT_FOUND);
         }
@@ -175,11 +187,24 @@ pub(in crate::ipc_wire) async fn dispatch_native_audio_device(
         let rate = request_u32(request.data, 8).unwrap();
         // This manager describes playback; the stream service owns transport.
         // These are the PCM formats supported by the shared host audio path.
-        let supported = matches!(kind, 2 | 5) && matches!(channels, 2 | 6) && rate == 48000;
+        let supported = crate::sysmix::supported_format(kind, channels, rate);
         return if supported {
             semantic_success(request.token, domain, &[], &[], &[], None)
         } else {
             error(HorizonIpcResult::AUDIO_NOT_SUPPORTED)
+        };
+    }
+    if matches!(command, 700 | 800) {
+        if functionality != 1 {
+            return error(HorizonIpcResult::AUDIO_NOT_SUPPORTED);
+        }
+        return match audio.mixer.engage(
+            process.memory(),
+            request_u32(request.data, 0).unwrap(),
+            command == 700,
+        ) {
+            Ok(()) => semantic_success(request.token, domain, &[], &[], &[], None),
+            Err(result) => error(result),
         };
     }
     if command == 500 {

@@ -1,5 +1,5 @@
 //! Controller-support configuration through the virtual HID controller owner,
-//! following Eden's default frontend, independently of host-device attachment.
+//! independently of host-device attachment.
 //! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/frontend/applets/controller.cpp
 //! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/am/frontend/applet_controller.cpp
 //! Wire ABI:
@@ -23,25 +23,32 @@ pub(super) fn run(
     if launch.mode != LibraryAppletMode::AllForeground {
         return Err(unsupported("ControllerSupport requires AllForeground mode"));
     }
-    let keep_connected = decode(&launch.input_storages)?;
-    let selected =
-        hid.configure_full_key_controller(keep_connected)
-            .map_err(|error| match error {
-                crate::HidInputError::Memory(error) => IpcWireError::SystemMemory(error),
-                crate::HidInputError::Vibration(error) => {
-                    IpcWireError::InputBackend(error.to_string().into_boxed_str())
-                }
-            })?;
+    let config = decode(&launch.input_storages)?;
+    let keep_connected = config.keep_connected;
+    let (count, selected) = hid
+        .configure_full_key_controllers(config.min, config.max, keep_connected)
+        .map_err(|error| match error {
+            crate::HidInputError::Memory(error) => IpcWireError::SystemMemory(error),
+            crate::HidInputError::Vibration(error) => {
+                IpcWireError::InputBackend(error.to_string().into_boxed_str())
+            }
+        })?;
     let mut output = vec![0; 12];
-    output[0] = 1;
+    output[0] = count as u8;
     output[4..8].copy_from_slice(&selected.to_le_bytes());
     log::debug!(
-        "controller applet configured virtual FullKey player: id={selected:#x} keep-connected={keep_connected}"
+        "controller applet configured virtual FullKey players: count={count} selected-id={selected:#x} keep-connected={keep_connected}"
     );
     Ok(output)
 }
 
-fn decode(inputs: &[Vec<u8>]) -> Result<bool, IpcWireError> {
+struct Configuration {
+    min: usize,
+    max: usize,
+    keep_connected: bool,
+}
+
+fn decode(inputs: &[Vec<u8>]) -> Result<Configuration, IpcWireError> {
     let [common, private, arg] = inputs else {
         return Err(IpcWireError::Malformed(
             "ControllerSupport requires common, private and argument storages",
@@ -87,8 +94,9 @@ fn decode(inputs: &[Vec<u8>]) -> Result<bool, IpcWireError> {
             "invalid ControllerSupport player count range",
         ));
     }
-    if !single && min > 1 {
-        return Err(unsupported("additional player connections are required"));
-    }
-    Ok(arg[2] != 0)
+    Ok(Configuration {
+        min: if single { 1 } else { min.max(1) as usize },
+        max: if single { 1 } else { max as usize },
+        keep_connected: arg[2] != 0,
+    })
 }

@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sdl = sdl3::init()?;
     let mut input = InputWorker::unmapped(&sdl)?;
-    let output = input.vibration_output().expect("SDL actuator output");
+    let output = input.vibration_outputs().expect("SDL actuator outputs")[0].clone();
     let deadline = Instant::now() + Duration::from_secs(5);
     let controller = loop {
-        if let Some(sample) = input.take_latest()?
-            && let Some(controller) = sample.state
+        if let Some(mut sample) = input.take_latest()?
+            && let Some(controller) = sample.state[0].take()
         {
             break controller;
         }

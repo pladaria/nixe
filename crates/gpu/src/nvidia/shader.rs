@@ -29,8 +29,8 @@ pub fn texture_type(words: [u32; 8]) -> Result<T> {
     }
 }
 
-// Storage format classification does not depend on swizzles, image addresses,
-// dimensions or sampler state. Only the consumed format enters shader identity.
+// Shader component types follow the selected depth/stencil aspect. Addresses,
+// dimensions and sampler state do not enter this classification.
 pub fn pixel_format(words: [u32; 8]) -> Result<F> {
     let format = words[0] & 0x7f;
     let component = (words[0] >> 7) & 7;
@@ -190,6 +190,23 @@ pub fn pixel_format(words: [u32; 8]) -> Result<F> {
         _ => None,
     };
     if let Some(format) = compressed {
+        let storage = match format {
+            F::D32_FLOAT_S8_UINT => Some(crate::ImageFormat::Depth32FloatStencil8Uint),
+            F::S8_UINT_D24_UNORM => Some(crate::ImageFormat::Depth24UnormStencil8Uint),
+            _ => None,
+        };
+        if let Some(storage) = storage {
+            let swizzle = super::format::decode_swizzle(
+                storage,
+                [19, 22, 25, 28].map(|shift| ((words[0] >> shift) & 7) as u8),
+            )
+            .ok_or_else(|| invalid("invalid depth/stencil swizzle".into()))?;
+            let aspect =
+                super::sampled_aspect(storage, swizzle).map_err(|detail| invalid(detail.into()))?;
+            if aspect == crate::native::GuestImageAspect::Stencil {
+                return Ok(F::S8_UINT);
+            }
+        }
         return Ok(format);
     }
     // Eden's format lookup classifies invalid/uninitialized entries as RGBA8;
@@ -207,7 +224,8 @@ pub fn pixel_format(words: [u32; 8]) -> Result<F> {
 pub fn is_integer(format: F) -> bool {
     matches!(
         format,
-        F::A8B8G8R8_SINT
+        F::S8_UINT
+            | F::A8B8G8R8_SINT
             | F::A8B8G8R8_UINT
             | F::A2B10G10R10_UINT
             | F::R8_SINT

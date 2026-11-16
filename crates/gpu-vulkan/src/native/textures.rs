@@ -321,8 +321,9 @@ impl NativeExecution<'_> {
                 }));
         let drop_compare = description.compare.is_some() && !depth;
         let force_nearest = view.is_some_and(|view| {
-            super::images::color_kind(self.residency.texture_cache.views[view].description.format)
-                != 0
+            let view = &self.residency.texture_cache.views[view];
+            super::images::color_kind(view.description.format) != 0
+                || view.description.aspects == vk::ImageAspectFlags::STENCIL
         }) && (description.min_filter == nixe_gpu::FilterMode::Linear
             || description.mag_filter == nixe_gpu::FilterMode::Linear
             || description.mip_filter == nixe_gpu::FilterMode::Linear

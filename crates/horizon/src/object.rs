@@ -1610,15 +1610,18 @@ pub(crate) enum LibraryAppletId {
 }
 
 impl LibraryAppletId {
+    // Switch 2 assigns distinct wire IDs to the same applet roles. Match only
+    // documented identities; variant bits are not a general low-byte alias.
+    // https://switchbrew.org/wiki/AM_services#AppletId
     pub(crate) const fn from_raw(raw: u32) -> Option<Self> {
         Some(match raw {
-            0x0a => Self::Auth,
-            0x0b => Self::Cabinet,
-            0x0c => Self::Controller,
+            0x0a | 0x0100000a => Self::Auth,
+            0x0b | 0x0100000b => Self::Cabinet,
+            0x0c | 0x0100000c => Self::Controller,
             0x0d => Self::DataErase,
-            0x0e => Self::Error,
+            0x0e | 0x0100000e => Self::Error,
             0x0f => Self::NetConnect,
-            0x10 => Self::PlayerSelect,
+            0x10 | 0x01000010 => Self::PlayerSelect,
             0x11 => Self::SoftwareKeyboard,
             0x12 => Self::MiiEdit,
             0x13 => Self::Web,

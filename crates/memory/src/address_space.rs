@@ -1,5 +1,6 @@
 //! Indexed process translations; mapping records retain allocations, not pages.
 mod alias;
+mod fastmem;
 use crate::transition::{CoreContext, NativeAdmission, Quiescence};
 use crate::{
     Access, AccessOperation, AddressSpaceId, AddressWidth, Allocation, AllocationId, AllocationPin,
@@ -407,6 +408,7 @@ pub fn capture_subrange(
 pub struct AddressSpace {
     id: AddressSpaceId,
     arena: VirtualArena,
+    fastmem: fastmem::FastmemMappings,
     pub(crate) quiescence: Quiescence,
     table: PageTableStorage,
     mappings: UnsafeCell<BTreeMap<u64, Mapping>>,
@@ -433,6 +435,7 @@ impl AddressSpace {
             self_weak: weak.clone(),
             id: AddressSpaceId::new(id),
             arena,
+            fastmem: fastmem::FastmemMappings::default(),
             quiescence: Quiescence::default(),
             table,
             mappings: UnsafeCell::new(BTreeMap::new()),
@@ -491,8 +494,11 @@ impl AddressSpace {
         };
         transition.wait_quiescent();
         unsafe {
-            self.arena
-                .unmap(GuestVirtualAddress::new(0), self.width().bytes())
+            self.fastmem.unmap(
+                &self.arena,
+                GuestVirtualAddress::new(0),
+                self.width().bytes(),
+            )
         }
         .map_err(|error| transition.fail(error))?;
         let removed = std::mem::take(unsafe { &mut *self.mappings.get() });
@@ -829,7 +835,8 @@ impl AddressSpace {
                 let direct = entry.direct_permissions();
                 if let Some((base, previous)) = run.filter(|(_, previous)| *previous != direct) {
                     unsafe {
-                        self.arena.map(
+                        self.fastmem.map(
+                            &self.arena,
                             GuestVirtualAddress::new(address + base),
                             ArenaOffset::new(extent.start.get() + base),
                             at - base,
@@ -847,7 +854,8 @@ impl AddressSpace {
             }
             if let Some((base, direct)) = run {
                 unsafe {
-                    self.arena.map(
+                    self.fastmem.map(
+                        &self.arena,
                         GuestVirtualAddress::new(address + base),
                         ArenaOffset::new(extent.start.get() + base),
                         extent.bytes - base,
@@ -1449,7 +1457,8 @@ impl AddressSpace {
         }
         let transition = self.quiescence.begin_transition(writer)?;
         transition.wait_quiescent();
-        unsafe { self.arena.unmap(start, bytes) }.map_err(|error| transition.fail(error))?;
+        unsafe { self.fastmem.unmap(&self.arena, start, bytes) }
+            .map_err(|error| transition.fail(error))?;
         for address in (start.get()..end).step_by(PAGE_SIZE as usize) {
             unsafe {
                 self.set_entry(address, MappedPage::EMPTY);
@@ -1608,10 +1617,13 @@ impl AddressSpace {
         update: impl Fn(MappedPage) -> MappedPage,
     ) -> Result<(), MemoryError> {
         unsafe {
-            self.arena
-                .protect(GuestVirtualAddress::new(start), bytes, permissions)?;
+            self.fastmem.protect(
+                &self.arena,
+                GuestVirtualAddress::new(start),
+                bytes,
+                permissions,
+            )?;
         }
-        self.machine().tracking().record_protection();
         if relaxing {
             for address in (start..start + bytes).step_by(PAGE_SIZE as usize) {
                 let entry = update(unsafe { self.entry(address) });
@@ -1641,10 +1653,13 @@ impl AddressSpace {
                 run.filter(|(_, previous)| !changed || *previous != permissions)
             {
                 unsafe {
-                    self.arena
-                        .protect(GuestVirtualAddress::new(base), address - base, previous)?;
+                    self.fastmem.protect(
+                        &self.arena,
+                        GuestVirtualAddress::new(base),
+                        address - base,
+                        previous,
+                    )?;
                 }
-                self.machine().tracking().record_protection();
                 run = None;
             }
             if entry != old {
@@ -1658,13 +1673,13 @@ impl AddressSpace {
         }
         if let Some((base, permissions)) = run {
             unsafe {
-                self.arena.protect(
+                self.fastmem.protect(
+                    &self.arena,
                     GuestVirtualAddress::new(base),
                     start + bytes - base,
                     permissions,
                 )?;
             }
-            self.machine().tracking().record_protection();
         }
         Ok(())
     }

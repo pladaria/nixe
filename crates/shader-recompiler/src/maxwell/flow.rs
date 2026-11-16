@@ -151,7 +151,7 @@ impl FlowGraph {
         if let Some(&existing) = self.functions[function.0].blocks.get(&real) {
             return Ok(self.functions[function.0]
                 .blocks
-                .get(&FlowLocation::PredicateBefore(pc))
+                .get(&FlowLocation::PredicateBefore(pc, 0))
                 .copied()
                 .unwrap_or(existing));
         }
@@ -270,7 +270,7 @@ impl FlowGraph {
             return Ok(());
         }
         let mut virtual_block = FlowBlock::at(pc, stack.clone());
-        virtual_block.begin = FlowLocation::PredicateBefore(pc);
+        virtual_block.begin = FlowLocation::PredicateBefore(pc, 0);
         virtual_block.end = virtual_block.begin;
         virtual_block.condition = condition;
         let mut executing = std::mem::replace(self.block_mut(id)?, virtual_block);

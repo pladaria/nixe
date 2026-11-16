@@ -186,7 +186,8 @@ command_enum!(ApplicationFunctionsCommand {
 });
 
 command_enum!(LibraryAppletCreatorCommand {
-    0 => LibraryApplet,
+    0 => LibraryAppletOld,
+    3 => LibraryApplet,
     10 => Storage,
     11 => TransferMemoryStorage,
 });
@@ -197,6 +198,7 @@ command_enum!(LibraryAppletAccessorCommand {
     1 => CheckFinished,
     10 => Start,
     30 => GetResult,
+    90 => Unknown90,
     100 => PushInData,
     101 => PopOutData,
     103 => PushInteractiveInData,

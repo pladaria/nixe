@@ -1006,13 +1006,13 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 return unsupported_service_command("ILibraryAppletCreator", request.command_id);
             };
             match command {
-                // CreateLibraryApplet takes one AppletId/LibAppletMode pair and
-                // returns an ILibraryAppletAccessor domain object. libnx consumes
-                // that accessor immediately to obtain its state-change event:
-                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1516-L1564
-                LibraryAppletCreatorCommand::LibraryApplet => {
-                    if request.data.len() < 8
-                        || request.data[8..].iter().any(|byte| *byte != 0)
+                // Firmware 20 adds the caller's thread ID to the same applet
+                // creation contract. Both return an ILibraryAppletAccessor.
+                // https://switchbrew.org/wiki/AM_services#CreateLibraryApplet
+                LibraryAppletCreatorCommand::LibraryAppletOld
+                | LibraryAppletCreatorCommand::LibraryApplet => {
+                    let with_thread = command == LibraryAppletCreatorCommand::LibraryApplet;
+                    if !request.has_payload_size(if with_thread { 16 } else { 8 })
                         || has_ipc_descriptors(hipc)
                     {
                         return applet_error(
@@ -1036,10 +1036,14 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     };
+                    // @SIMPLIFICATION: HLE applets have no guest thread to
+                    // associate with the caller. Their completion and focus
+                    // already belong to this application's applet session.
+                    let caller_thread = with_thread.then(|| request_u64(request.data, 8).unwrap());
                     match session.create_library_applet(applet_id, mode) {
                         Ok(accessor_object_id) => {
                             log::debug!(
-                                "ILibraryAppletCreator created {applet_id:?} in {mode:?} mode as domain object {accessor_object_id:#x}"
+                                "ILibraryAppletCreator created {applet_id:?} in {mode:?} mode as domain object {accessor_object_id:#x}, caller-thread={caller_thread:?}"
                             );
                             Ok((
                                 encode_domain_response(
@@ -1056,7 +1060,7 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                             Err(IpcWireError::UnsupportedService(
                                 UnsupportedServiceOperation::CommandVariant {
                                     service: "ILibraryAppletCreator",
-                                    command_id: 0,
+                                    command_id: request.command_id,
                                     detail: "a prior library applet remains active",
                                 },
                             ))
@@ -1180,6 +1184,32 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 return unsupported_service_command("ILibraryAppletAccessor", request.command_id);
             };
             match command {
+                LibraryAppletAccessorCommand::Unknown90 => {
+                    if !request.has_payload_size(32) || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    if request.data[..32].iter().any(|&byte| byte != 0) {
+                        return Err(IpcWireError::UnsupportedService(
+                            UnsupportedServiceOperation::CommandVariant {
+                                service: "ILibraryAppletAccessor",
+                                command_id: 90,
+                                detail: "non-default command 90 arguments are undocumented",
+                            },
+                        ));
+                    }
+                    // @SPECULATIVE: SDK 20+ sends four zero u64s before Start.
+                    // The reference accepts this command without an effect;
+                    // its meaning beyond the default arguments is undocumented.
+                    // https://switchbrew.org/wiki/AM_services#ILibraryAppletAccessor
+                    // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/am/service/library_applet_accessor.cpp#L137-L141
+                    log::warn!(
+                        "ILibraryAppletAccessor command 90: speculative acceptance of default arguments; semantics undocumented"
+                    );
+                    applet_data(request.token, &[])
+                }
                 command @ (LibraryAppletAccessorCommand::GetAppletStateChangedEvent
                 | LibraryAppletAccessorCommand::GetPopInteractiveOutDataEvent
                 | LibraryAppletAccessorCommand::GetPopOutDataEvent) => {

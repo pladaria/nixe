@@ -220,33 +220,49 @@ fn surface(r: &Registers, base: u32) -> Result<ImageInfo> {
     }
     let width = r.get(base + 24);
     let height = r.get(base + 28);
-    if r.get(base + 12) != 1 || (base == 0x200 && r.get(base + 16) != 0) {
-        return Err("2D blit requires a single-layer 2D surface".into());
+    if r.get(base + 12) == 0 || (base == 0x200 && r.get(base + 16) != 0) {
+        return Err(format!(
+            "unsupported 2D surface: base={base:#x} depth={} layer={} block={:#x} layout={} extent={width}x{height}",
+            r.get(base + 12), r.get(base + 16), r.get(base + 8), r.get(base + 4),
+        ).into());
     }
     let bpp = u64::from(
         format
             .plane_bytes_per_texel(0)
             .ok_or("invalid 2D color format")?,
     );
-    let (layout, size) = match r.get(base + 4) {
+    let (layout, size, dimension) = match r.get(base + 4) {
         0 => {
             let block = r.get(base + 8);
             let height_log2 = ((block >> 4) & 15) as u8;
-            if block & !0x70 != 0 || height_log2 > 5 {
+            let depth_log2 = ((block >> 8) & 15) as u8;
+            if block & !0x770 != 0 || height_log2 > 5 || depth_log2 > 5 {
                 return Err(format!("unsupported 2D block size {block:#x}").into());
             }
+            // Each operation addresses one slice, even when the allocation
+            // has multiple slices interleaved inside a block. Keep that block
+            // depth for guest addressing and expose a one-slice native image;
+            // the cache can select the slice of an existing volume by address.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/twod/cl902d.h
+            // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/texture_cache/image_info.cpp#L240-L278
             let size = (u64::from(width) * bpp)
                 .next_multiple_of(64)
                 .checked_mul(u64::from(height).next_multiple_of(8 << height_log2))
+                .and_then(|size| size.checked_mul(1 << depth_log2))
                 .ok_or("2D surface storage overflow")?;
             (
                 ImageMemoryLayout::BlockLinearAmpere(BlockLinearLayout {
                     block_width_log2: 0,
                     block_height_log2: height_log2,
-                    block_depth_log2: 0,
+                    block_depth_log2: depth_log2,
                     layer_stride: size,
                 }),
                 size,
+                if depth_log2 == 0 {
+                    ImageDimension::Two
+                } else {
+                    ImageDimension::Three
+                },
             )
         }
         1 => {
@@ -261,12 +277,13 @@ fn surface(r: &Registers, base: u32) -> Result<ImageInfo> {
                     layer_stride: size,
                 },
                 size,
+                ImageDimension::Two,
             )
         }
         mode => return Err(format!("invalid 2D memory layout {mode:#x}").into()),
     };
     let description = ImageDescription::new(
-        ImageDimension::Two,
+        dimension,
         ImageExtent::new(width, height, 1).map_err(|e| e.to_string().into_boxed_str())?,
         format,
         ImageKind::Color,
@@ -275,7 +292,7 @@ fn surface(r: &Registers, base: u32) -> Result<ImageInfo> {
         SampleCount::One,
     )
     .map_err(|e| e.to_string().into_boxed_str())?;
-    Ok(ImageInfo {
+    let mut info = ImageInfo {
         address: r.address(base + 32, base + 36),
         description,
         swizzle: Swizzle::IDENTITY,
@@ -286,5 +303,18 @@ fn surface(r: &Registers, base: u32) -> Result<ImageInfo> {
         size,
         packing: ImagePacking::Native,
         sample_grid: [1, 1],
-    })
+    };
+    // Only capture the addressed slice's enclosing byte range, including its
+    // interleaved gaps, rather than extending beyond a last volume slice.
+    info.size = copy_surface(
+        &info,
+        ScissorRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+    )?
+    .bytes;
+    Ok(info)
 }

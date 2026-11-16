@@ -92,22 +92,24 @@ struct HidState {
     shared_memory: SharedMemoryObject,
     infrared: crate::object::IrsSession,
     style_events: [OnceLock<(WritableEventObject, ReadableEventObject)>; 10],
-    connected: AtomicBool,
+    connected: [AtomicBool; nixe_input::MAX_PLAYERS],
     nfc_connected: AtomicBool,
     nfc_readers: Mutex<Vec<Weak<crate::nfp::NfpReader>>>,
     configuration: Mutex<HidConfiguration>,
-    vibration_output: Mutex<Option<nixe_input::VibrationOutput>>,
+    vibration_output: Mutex<Option<[nixe_input::VibrationOutput; nixe_input::MAX_PLAYERS]>>,
     completion_events: Mutex<Option<nixe_runtime::ExternalEventSender>>,
-    motion_settings: OnceLock<nixe_input::MotionSettings>,
+    motion_settings: OnceLock<[nixe_input::MotionSettings; nixe_input::MAX_PLAYERS]>,
     jcms: Mutex<Option<Arc<nixe_runtime::TransferMemoryObject>>>,
 }
 
 impl Drop for HidState {
     fn drop(&mut self) {
-        if let Some(output) = self.vibration_output.get_mut().unwrap()
-            && let Err(error) = output.stop()
-        {
-            log::error!("cannot stop Horizon HID vibration: {error}");
+        if let Some(outputs) = self.vibration_output.get_mut().unwrap() {
+            for output in outputs {
+                if let Err(error) = output.stop() {
+                    log::error!("cannot stop Horizon HID vibration: {error}");
+                }
+            }
         }
     }
 }
@@ -115,7 +117,6 @@ impl Drop for HidState {
 #[derive(Debug)]
 struct HidProducer {
     sampling_number: u64,
-    six_axis_at_rest: [bool; 10],
     console_six_axis_sampling_number: u64,
     console_motion: nixe_input::MotionInput,
     seven_six_axis: SevenSixAxis,
@@ -126,26 +127,35 @@ struct HidProducer {
     mouse: Lifo,
     keyboard: Lifo,
     peripheral_sampling_number: u64,
+    home: Lifo,
+    capture: Lifo,
+    publication: Publication,
+    npads: [NpadProducer; nixe_input::MAX_PLAYERS],
+    controllers: nixe_input::EmulatedControllerStates,
+    pending_controllers: Option<Duration>,
+    latest_touch: Option<(EmulatedTouchScreenState, Duration)>,
+}
+
+/// Each virtual controller owns its wire rings and connection independently
+/// of the host device providing its samples.
+#[derive(Debug, Default)]
+struct NpadProducer {
+    sampling_number: u64,
     full_key: Lifo,
     system_ext: Lifo,
     six_axis: Lifo,
-    home: Lifo,
-    capture: Lifo,
     connected: bool,
-    // The configured virtual controller is independent of its host input source.
-    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/hid_core/frontend/emulated_controller.cpp
     full_key_connected: bool,
-    publication: Publication,
-    latest_controller: Option<(Option<EmulatedControllerState>, Duration)>,
-    latest_touch: Option<(EmulatedTouchScreenState, Duration)>,
+    host_connected: bool,
+    six_axis_at_rest: bool,
 }
 
 #[derive(Debug, Default)]
 struct Publication {
     writes: VecDeque<(usize, Box<[u8]>, bool)>,
     pending: Option<PendingAccess>,
-    connected: Option<bool>,
-    signal_style: bool,
+    connected: [Option<bool>; nixe_input::MAX_PLAYERS],
+    signal_style: u16,
 }
 impl Publication {
     fn write(&mut self, offset: usize, bytes: &[u8]) {
@@ -194,9 +204,11 @@ impl Publication {
                 }
             }
         }
-        if let Some(connected) = self.connected.take() {
-            state.connected.store(connected, Ordering::Release);
-            log::debug!("hid Npad connection changed: id=0x0 connected={connected}");
+        for (slot, connected) in self.connected.iter_mut().enumerate() {
+            if let Some(connected) = connected.take() {
+                state.connected[slot].store(connected, Ordering::Release);
+                log::debug!("hid Npad connection changed: id={slot:#x} connected={connected}");
+            }
         }
         Ok(true)
     }
@@ -308,7 +320,7 @@ impl HidSystem {
                 shared_memory,
                 infrared,
                 style_events: std::array::from_fn(|_| OnceLock::new()),
-                connected: AtomicBool::new(false),
+                connected: std::array::from_fn(|_| AtomicBool::new(false)),
                 nfc_connected: AtomicBool::new(false),
                 nfc_readers: Mutex::new(Vec::new()),
                 configuration: Mutex::new(HidConfiguration::default()),
@@ -319,7 +331,6 @@ impl HidSystem {
             }),
             producer: Arc::new(Mutex::new(HidProducer {
                 sampling_number: 0,
-                six_axis_at_rest: [true; 10],
                 console_six_axis_sampling_number: 0,
                 console_motion: nixe_input::MotionInput::default(),
                 seven_six_axis: SevenSixAxis::default(),
@@ -330,15 +341,16 @@ impl HidSystem {
                 mouse: Lifo::default(),
                 keyboard: Lifo::default(),
                 peripheral_sampling_number: 0,
-                full_key: Lifo::default(),
-                system_ext: Lifo::default(),
-                six_axis: Lifo::default(),
                 home: Lifo::default(),
                 capture: Lifo::default(),
-                connected: false,
-                full_key_connected: true,
                 publication: Publication::default(),
-                latest_controller: None,
+                npads: std::array::from_fn(|slot| NpadProducer {
+                    full_key_connected: slot == 0,
+                    six_axis_at_rest: true,
+                    ..NpadProducer::default()
+                }),
+                controllers: [None; nixe_input::MAX_PLAYERS],
+                pending_controllers: None,
                 latest_touch: None,
             })),
         })
@@ -346,11 +358,17 @@ impl HidSystem {
     pub(crate) fn set_completion_events(&self, events: nixe_runtime::ExternalEventSender) {
         *self.state.completion_events.lock().unwrap() = Some(events);
     }
-    pub(crate) fn set_vibration_output(&self, output: nixe_input::VibrationOutput) {
-        *self.state.vibration_output.lock().unwrap() = Some(output);
+    pub(crate) fn set_vibration_outputs(
+        &self,
+        outputs: [nixe_input::VibrationOutput; nixe_input::MAX_PLAYERS],
+    ) {
+        *self.state.vibration_output.lock().unwrap() = Some(outputs);
     }
 
-    pub(crate) fn set_motion_settings(&self, settings: nixe_input::MotionSettings) {
+    pub(crate) fn set_motion_settings(
+        &self,
+        settings: [nixe_input::MotionSettings; nixe_input::MAX_PLAYERS],
+    ) {
         self.state
             .motion_settings
             .set(settings)
@@ -372,8 +390,11 @@ impl HidSystem {
             .unwrap()
             .gyroscope_drift_modes
             .insert(key, mode);
-        if key.0 == 0
-            && let Some(settings) = self.state.motion_settings.get()
+        if let Some(settings) = self
+            .state
+            .motion_settings
+            .get()
+            .and_then(|settings| settings.get(usize::from(key.0)))
         {
             let (gyroscope, rest) = match mode {
                 0 => (0.01, 0.02),
@@ -402,49 +423,85 @@ impl HidSystem {
     ) -> Result<bool, crate::HorizonIpcResult> {
         let (npad, _, _) = six_axis_key(handle)?;
         let index = npad_index(u32::from(npad)).expect("validated six-axis Npad ID");
-        Ok(self.producer.lock().unwrap().six_axis_at_rest[index])
+        Ok(self
+            .producer
+            .lock()
+            .unwrap()
+            .npads
+            .get(index)
+            .is_none_or(|npad| npad.six_axis_at_rest))
     }
     pub(crate) fn send_vibration_values(
         &self,
         values: &[(u32, nixe_input::VibrationValue)],
     ) -> Option<Result<(), nixe_input::VibrationError>> {
-        let output = self.state.vibration_output.lock().unwrap().clone()?;
-        let mut actuators = [None; 2];
+        let outputs = self.state.vibration_output.lock().unwrap();
+        let outputs = outputs.as_ref()?;
+        let mut actuators = [[None; 2]; nixe_input::MAX_PLAYERS];
         for &(handle, value) in values {
             let [style, npad_id, device_index, _] = handle.to_le_bytes();
-            if self.state.connected.load(Ordering::Acquire) && style == 3 && npad_id == 0 {
-                actuators[usize::from(device_index)] = Some(value);
+            let slot = usize::from(npad_id);
+            if style == 3
+                && slot < nixe_input::MAX_PLAYERS
+                && self.state.connected[slot].load(Ordering::Acquire)
+            {
+                actuators[slot][usize::from(device_index)] = Some(value);
             }
         }
-        Some(if actuators.iter().all(Option::is_none) {
+        Some((|| {
+            for (output, values) in outputs.iter().zip(actuators) {
+                if values.iter().any(Option::is_some) {
+                    output.send_values(values)?;
+                }
+            }
             Ok(())
-        } else {
-            output.send_values(actuators)
-        })
+        })())
     }
-    /// Eden's default controller applet retains valid virtual players and fills
-    /// the requested slots independently of attached physical input devices.
-    /// Nixe currently models one FullKey player; the caller checks that range.
-    /// https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/frontend/applets/controller.cpp
-    pub(crate) fn configure_full_key_controller(
+
+    /// Keep valid virtual players, then fill only the slots needed to satisfy
+    /// the applet's minimum, independently of physical controller attachment.
+    /// https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/frontend/applets/controller.cpp
+    pub(crate) fn configure_full_key_controllers(
         &self,
+        min: usize,
+        max: usize,
         keep_connected: bool,
-    ) -> Result<u32, HidInputError> {
-        if !keep_connected {
-            self.disconnect_npad(0)?;
+    ) -> Result<(usize, u32), HidInputError> {
+        let mut selected = [false; nixe_input::MAX_PLAYERS];
+        let mut count = 0;
+        if keep_connected {
+            let producer = self.producer.lock().unwrap();
+            for (slot, npad) in producer.npads.iter().enumerate() {
+                if npad.full_key_connected && count < max {
+                    selected[slot] = true;
+                    count += 1;
+                }
+            }
+        }
+        for selected in &mut selected {
+            if !*selected && count < min {
+                *selected = true;
+                count += 1;
+            }
+        }
+        for (slot, &selected) in selected.iter().enumerate() {
+            if !keep_connected || !selected {
+                self.disconnect_npad(slot as u32)?;
+            }
         }
         {
             let mut producer = self.producer.lock().unwrap();
-            if !producer.full_key_connected {
-                producer.full_key_connected = true;
-                producer
-                    .latest_controller
-                    .get_or_insert((None, Duration::ZERO));
+            for (npad, selected) in producer.npads.iter_mut().zip(selected) {
+                npad.full_key_connected = selected;
             }
+            producer.pending_controllers.get_or_insert(Duration::ZERO);
         }
-        self.update_nfc_connection(true);
+        self.update_nfc_connection(selected[0]);
         self.poll_publication()?;
-        Ok(0)
+        Ok((
+            count,
+            selected.iter().position(|&selected| selected).unwrap() as u32,
+        ))
     }
     pub(crate) fn infrared_session(&self) -> crate::object::IrsSession {
         self.state.infrared.clone()
@@ -457,20 +514,16 @@ impl HidSystem {
     pub fn poll_publication(&self) -> Result<(), HidInputError> {
         let signal = {
             let mut producer = self.producer.lock().unwrap();
-            let mut signal = false;
+            let mut signal = 0;
             loop {
                 if !producer.publication.poll(&self.state)? || !producer.seven_six_axis.poll()? {
                     break;
                 }
                 signal |= std::mem::take(&mut producer.publication.signal_style);
-                if let Some((sample, delta)) = producer.latest_controller.take() {
+                if let Some(delta) = producer.pending_controllers.take() {
+                    let sample = producer.controllers;
                     let mut publication = Publication::default();
-                    producer.prepare_controller(
-                        &self.state,
-                        &mut publication,
-                        sample.as_ref(),
-                        delta,
-                    )?;
+                    producer.prepare_controllers(&self.state, &mut publication, &sample, delta)?;
                     if let Some((touch, delta)) = producer.latest_touch.take() {
                         producer.prepare_touch(&self.state, &mut publication, &touch, delta);
                     }
@@ -485,20 +538,23 @@ impl HidSystem {
             }
             signal
         };
-        if signal {
-            self.signal_player_one_style_change();
+        for slot in 0..nixe_input::MAX_PLAYERS {
+            if signal & (1 << slot) != 0 {
+                self.signal_style_change(slot);
+            }
         }
         Ok(())
     }
     pub fn publish(
         &self,
-        state: Option<&EmulatedControllerState>,
+        states: &nixe_input::EmulatedControllerStates,
         delta: Duration,
     ) -> Result<(), HidInputError> {
         let connected = {
             let mut producer = self.producer.lock().unwrap();
-            producer.latest_controller = Some((state.copied(), delta));
-            producer.full_key_connected
+            producer.controllers = *states;
+            producer.pending_controllers = Some(delta);
+            producer.npads[0].full_key_connected
         };
         self.update_nfc_connection(connected);
         self.poll_publication()
@@ -551,8 +607,8 @@ impl HidSystem {
         Some(readable.clone())
     }
 
-    fn signal_player_one_style_change(&self) {
-        if let Some((event, _)) = self.state.style_events[0].get() {
+    fn signal_style_change(&self, slot: usize) {
+        if let Some((event, _)) = self.state.style_events[slot].get() {
             event.signal();
         }
     }
@@ -561,22 +617,21 @@ impl HidSystem {
         let Some(index) = npad_index(id) else {
             return Ok(false);
         };
-        // Disconnect the virtual controller and publish through the existing
-        // producer, so an in-flight memory write cannot restore its old style.
-        // Other slots have no attached device; their style event still fires.
-        // https://github.com/eden-emulator/mirror/blob/master/src/hid_core/resources/npad/npad.cpp
-        if index == 0 {
+        // Use the same producer as samples so pending writes cannot restore
+        // a style after an explicit disconnect.
+        if index < nixe_input::MAX_PLAYERS {
             {
                 let mut producer = self.producer.lock().unwrap();
-                producer.full_key_connected = false;
-                producer.latest_controller = Some((None, Duration::ZERO));
+                producer.npads[index].full_key_connected = false;
+                producer.pending_controllers.get_or_insert(Duration::ZERO);
             }
-            self.update_nfc_connection(false);
+            if index == 0 {
+                self.update_nfc_connection(false);
+            }
             self.poll_publication()?;
-            if self.producer.lock().unwrap().connected
-                || self.state.connected.load(Ordering::Acquire)
+            if self.producer.lock().unwrap().npads[index].connected
+                || self.state.connected[index].load(Ordering::Acquire)
             {
-                // The producer signals after pending shared-memory writes finish.
                 return Ok(true);
             }
         }
@@ -879,44 +934,52 @@ impl HidProducer {
             .publish(writes, TOUCH_SCREEN_OFFSET, &entry)
     }
 
-    /// Publishes one player-one Pro Controller sample.
-    ///
-    /// A missing host source supplies neutral input to the configured virtual
-    /// controller. Only controller configuration or HID requests disconnect it.
-    fn prepare_controller(
+    fn prepare_controllers(
         &mut self,
         system: &HidState,
+        writes: &mut Publication,
+        states: &nixe_input::EmulatedControllerStates,
+        delta: Duration,
+    ) -> Result<(), HidInputError> {
+        let configuration = system.configuration.lock().unwrap();
+        self.prepare_peripherals(system, &configuration, writes, states[0].as_ref(), delta)?;
+        for (slot, (npad, state)) in self.npads.iter_mut().zip(states).enumerate() {
+            npad.prepare(system, &configuration, writes, slot, state.as_ref(), delta)?;
+        }
+        self.sampling_number = self.sampling_number.saturating_add(1);
+        let pressed = |home| {
+            self.npads.iter().zip(states).any(|(npad, state)| {
+                npad.connected
+                    && state.as_ref().is_some_and(|state| {
+                        if home {
+                            state.buttons.home
+                        } else {
+                            state.buttons.capture
+                        }
+                    })
+            })
+        };
+        let home = pressed(true);
+        let capture = pressed(false);
+        self.publish_system_button(writes, HOME_BUTTON_LIFO_OFFSET, home, true);
+        self.publish_system_button(writes, CAPTURE_BUTTON_LIFO_OFFSET, capture, false);
+        Ok(())
+    }
+
+    fn prepare_peripherals(
+        &mut self,
+        system: &HidState,
+        configuration: &HidConfiguration,
         writes: &mut Publication,
         state: Option<&EmulatedControllerState>,
         delta: Duration,
     ) -> Result<(), HidInputError> {
-        let (
-            publish_player_one,
-            publish_six_axis,
-            mouse_active,
-            keyboard_active,
-            console_six_axis_active,
-            debug_pad_active,
-        ) = {
-            let configuration = system
-                .configuration
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
-                configuration.npad_active
-                    && self.full_key_connected
-                    && configuration.supported_style_set & NPAD_STYLE_FULL_KEY != 0
-                    && configuration.supported_ids.contains(&0),
-                // FullKey, Player 1, device index 2. The packed handle layout
-                // is pinned in the public libnx HidSixAxisSensorHandle ABI:
-                // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h#L1412-L1421
-                configuration.active_six_axis_handles.contains(&0x0002_0003),
-                configuration.mouse_active,
-                configuration.keyboard_active,
-                configuration.console_six_axis_active,
-                configuration.debug_pad_active,
-            )
-        };
+        let (mouse_active, keyboard_active, console_six_axis_active, debug_pad_active) = (
+            configuration.mouse_active,
+            configuration.keyboard_active,
+            configuration.console_six_axis_active,
+            configuration.debug_pad_active,
+        );
         if debug_pad_active {
             // A debug pad is a separate device from the ordinary Npad. As in
             // Eden's default desktop configuration it publishes disconnected
@@ -982,23 +1045,72 @@ impl HidProducer {
                 self.keyboard.publish(writes, KEYBOARD_OFFSET, &entry);
             }
         }
-        if !publish_player_one {
+        Ok(())
+    }
+
+    fn publish_system_button(
+        &mut self,
+        writes: &mut Publication,
+        lifo_offset: usize,
+        pressed: bool,
+        home: bool,
+    ) {
+        let lifo = if home {
+            &mut self.home
+        } else {
+            &mut self.capture
+        };
+        let mut entry = [0_u8; SYSTEM_BUTTON_ENTRY_SIZE];
+        put_u64(&mut entry, 0, self.sampling_number.wrapping_shl(1));
+        put_u64(&mut entry, 8, self.sampling_number);
+        put_u64(&mut entry, 16, u64::from(pressed));
+        lifo.publish(writes, lifo_offset, &entry)
+    }
+}
+
+impl NpadProducer {
+    fn prepare(
+        &mut self,
+        system: &HidState,
+        configuration: &HidConfiguration,
+        writes: &mut Publication,
+        slot: usize,
+        state: Option<&EmulatedControllerState>,
+        delta: Duration,
+    ) -> Result<(), HidInputError> {
+        if state.is_some() && !self.host_connected {
+            self.full_key_connected = true;
+        }
+        self.host_connected = state.is_some();
+        let base = NPAD_OFFSET + slot * NPAD_ENTRY_SIZE;
+        let publish_npad = configuration.npad_active
+            && self.full_key_connected
+            && configuration.supported_style_set & NPAD_STYLE_FULL_KEY != 0
+            && configuration.supported_ids.contains(&(slot as u32));
+        let publish_six_axis = configuration
+            .active_six_axis_handles
+            .contains(&(0x0002_0003 | (slot as u32) << 8));
+        if !publish_npad {
             if self.connected {
-                if let Some(output) = system.vibration_output.lock().unwrap().clone() {
+                if let Some(output) = system
+                    .vibration_output
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|outputs| outputs[slot].clone())
+                {
                     output.stop()?;
                 }
                 self.sampling_number = self.sampling_number.saturating_add(1);
                 // Assignment mode persists across disconnection.
-                writes.write_u32(NPAD_OFFSET, 0);
-                writes.write(NPAD_OFFSET + 8, &[0; NPAD_ENTRY_SIZE - 8]);
+                writes.write_u32(base, 0);
+                writes.write(base + 8, &[0; NPAD_ENTRY_SIZE - 8]);
                 self.full_key = Lifo::default();
                 self.system_ext = Lifo::default();
                 self.six_axis = Lifo::default();
-                self.publish_system_button(writes, HOME_BUTTON_LIFO_OFFSET, false, true);
-                self.publish_system_button(writes, CAPTURE_BUTTON_LIFO_OFFSET, false, false);
                 self.connected = false;
-                writes.signal_style = true;
-                writes.connected = Some(self.connected);
+                writes.signal_style |= 1 << slot;
+                writes.connected[slot] = Some(self.connected);
             }
             return Ok(());
         }
@@ -1008,15 +1120,15 @@ impl HidProducer {
         self.sampling_number = self.sampling_number.saturating_add(1);
         let style_changed = !self.connected;
         if style_changed {
-            writes.write_u32(NPAD_OFFSET + 4, NPAD_JOY_ASSIGNMENT_DUAL);
-            writes.write_u32(NPAD_OFFSET + 8, 0);
-            writes.write_u32(NPAD_OFFSET + 0x4188, NPAD_DEVICE_TYPE_FULL_KEY);
+            writes.write_u32(base + 4, NPAD_JOY_ASSIGNMENT_DUAL);
+            writes.write_u32(base + 8, 0);
+            writes.write_u32(base + 0x4188, NPAD_DEVICE_TYPE_FULL_KEY);
             writes.write_u64(
-                NPAD_OFFSET + 0x4190,
+                base + 0x4190,
                 1 << 3 | 1 << 11 | 1 << 13 | 1 << 14 | 1 << 15,
             );
-            writes.write_u32(NPAD_OFFSET + 0x419c, 4);
-            writes.write_u8(NPAD_OFFSET + 0x41ac, APPLET_FOOTER_SWITCH_PRO_CONTROLLER);
+            writes.write_u32(base + 0x419c, 4);
+            writes.write_u8(base + 0x41ac, APPLET_FOOTER_SWITCH_PRO_CONTROLLER);
             self.connected = true;
         }
 
@@ -1034,15 +1146,15 @@ impl HidProducer {
             NPAD_ATTRIBUTE_CONNECTED | NPAD_ATTRIBUTE_WIRED,
         );
         self.full_key
-            .publish(writes, NPAD_OFFSET + FULL_KEY_LIFO_OFFSET, &common);
+            .publish(writes, base + FULL_KEY_LIFO_OFFSET, &common);
         // The common SystemExt ring mirrors the active controller's buttons,
         // sticks and connection attributes, as in Npad::OnUpdate.
         // https://switchbrew.org/wiki/HID_services#NpadInternalState
         self.system_ext
-            .publish(writes, NPAD_OFFSET + SYSTEM_EXT_LIFO_OFFSET, &common);
+            .publish(writes, base + SYSTEM_EXT_LIFO_OFFSET, &common);
 
         if publish_six_axis {
-            self.six_axis_at_rest[0] = state.motion.is_none_or(|motion| motion.is_at_rest);
+            self.six_axis_at_rest = state.motion.is_none_or(|motion| motion.is_at_rest);
             let mut sensor = [0_u8; SIX_AXIS_ENTRY_SIZE];
             put_u64(&mut sensor, 0, self.sampling_number.wrapping_shl(1));
             put_u64(
@@ -1075,46 +1187,20 @@ impl HidProducer {
                 put_u32(&mut sensor, 96, SIX_AXIS_ATTRIBUTE_CONNECTED);
             }
             self.six_axis
-                .publish(writes, NPAD_OFFSET + FULL_KEY_SIX_AXIS_LIFO_OFFSET, &sensor);
+                .publish(writes, base + FULL_KEY_SIX_AXIS_LIFO_OFFSET, &sensor);
         }
 
-        self.publish_system_button(writes, HOME_BUTTON_LIFO_OFFSET, state.buttons.home, true);
-        self.publish_system_button(
-            writes,
-            CAPTURE_BUTTON_LIFO_OFFSET,
-            state.buttons.capture,
-            false,
-        );
         if style_changed {
             // Publish the connected style only after its properties and first
             // samples. A client polling the style may immediately read a LIFO
             // without waiting for the style event.
             writes
                 .writes
-                .push_back((NPAD_OFFSET, NPAD_STYLE_FULL_KEY.to_le_bytes().into(), true));
-            writes.signal_style = true;
-            writes.connected = Some(self.connected);
+                .push_back((base, NPAD_STYLE_FULL_KEY.to_le_bytes().into(), true));
+            writes.signal_style |= 1 << slot;
+            writes.connected[slot] = Some(self.connected);
         }
         Ok(())
-    }
-
-    fn publish_system_button(
-        &mut self,
-        writes: &mut Publication,
-        lifo_offset: usize,
-        pressed: bool,
-        home: bool,
-    ) {
-        let lifo = if home {
-            &mut self.home
-        } else {
-            &mut self.capture
-        };
-        let mut entry = [0_u8; SYSTEM_BUTTON_ENTRY_SIZE];
-        put_u64(&mut entry, 0, self.sampling_number.wrapping_shl(1));
-        put_u64(&mut entry, 8, self.sampling_number);
-        put_u64(&mut entry, 16, u64::from(pressed));
-        lifo.publish(writes, lifo_offset, &entry)
     }
 }
 

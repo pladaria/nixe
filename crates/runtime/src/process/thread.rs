@@ -141,9 +141,16 @@ impl Drop for ThreadLocalRegion {
         if let Some(page) = page {
             // The page leaves the allocation index before unmapping. Its VA is
             // reusable only after the mapping has been released.
-            self.memory
-                .unmap(page, nixe_memory::PAGE_SIZE, super::thread_local::MAPPING)
-                .expect("the final TLS region retains its kernel page mapping");
+            if let Err(error) =
+                self.memory
+                    .unmap(page, nixe_memory::PAGE_SIZE, super::thread_local::MAPPING)
+            {
+                // A terminal address-space failure may already have stopped all
+                // cores. Keep its mapping pinned until process teardown rather
+                // than panicking in Drop and obscuring the original failure.
+                log::error!("cannot unmap retired thread-local page {page}: {error}");
+                return;
+            }
             self.pages.lock().unwrap().recycle_page(page);
         }
     }

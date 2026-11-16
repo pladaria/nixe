@@ -513,7 +513,7 @@ fn run_machine(
         keyboard: frontend.as_ref().map(WindowFrontend::keyboard_host),
         touch_screen,
         vibration: input_owner
-            .vibration_output()
+            .vibration_outputs()
             .expect("SDL input owns actuator output"),
         motion_settings: input_owner
             .motion_settings()
@@ -751,10 +751,10 @@ struct HorizonEnvironment {
 
 struct HostInputReaders {
     keyboard: Option<nixe_applets::keyboard::KeyboardHost>,
-    controller: InputReader<Option<ProfiledControllerState>>,
+    controller: InputReader<nixe_input::ProfiledControllerStates>,
     touch_screen: Option<TouchScreenReader>,
-    vibration: nixe_input::VibrationOutput,
-    motion_settings: nixe_input::MotionSettings,
+    vibration: [nixe_input::VibrationOutput; nixe_input::MAX_PLAYERS],
+    motion_settings: [nixe_input::MotionSettings; nixe_input::MAX_PLAYERS],
 }
 
 fn supervise_process(
@@ -790,11 +790,13 @@ fn supervise_process(
             Err(original) => format!("{original}; cannot quiesce CPU workers: {error}"),
         });
     }
-    if let Err(error) = host_input.vibration.stop() {
-        execution = Err(match execution {
-            Ok(_) => format!("cannot stop controller vibration: {error}"),
-            Err(original) => format!("{original}; cannot stop controller vibration: {error}"),
-        });
+    for output in &host_input.vibration {
+        if let Err(error) = output.stop() {
+            execution = Err(match execution {
+                Ok(_) => format!("cannot stop controller vibration: {error}"),
+                Err(original) => format!("{original}; cannot stop controller vibration: {error}"),
+            });
+        }
     }
     #[cfg(feature = "performance-counters")]
     log::info!("kernel scheduler: {:?}", runtime.scheduler().statistics());
@@ -921,7 +923,7 @@ fn execute(
     .with_system_archives(horizon_environment.system_archives)
     .with_diagnostics(horizon_environment.diagnostics)
     .with_audio_backend(audio_backend.clone())
-    .with_vibration_output(host_input.vibration.clone())
+    .with_vibration_outputs(host_input.vibration.clone())
     .with_motion_settings(host_input.motion_settings.clone());
     if let Some(graphics) = horizon_environment.ampere_graphics {
         dispatcher = dispatcher.with_ampere_graphics(graphics);
@@ -958,9 +960,10 @@ fn execute(
     let mut last_rate_completions = 0_u64;
     let mut last_rate_elapsed = Duration::ZERO;
     let mut last_input_sample: Option<Instant> = None;
-    let mut active_input = None;
+    let mut active_input: [Option<ActiveInput>; nixe_input::MAX_PLAYERS] =
+        std::array::from_fn(|_| None);
     let mut input_observed = false;
-    let mut active_buttons = EmulatedButtonState::default();
+    let mut active_buttons = [EmulatedButtonState::default(); nixe_input::MAX_PLAYERS];
     loop {
         runtime
             .drain_external_events()
@@ -1007,42 +1010,58 @@ fn execute(
         {
             // The input worker owns the only sampling timer. Publish each
             // consumed sample once, using capture time rather than host delay.
-            report_input_change(&mut active_input, &sample.state, input_observed);
-            input_observed = true;
-            let profiled = sample.state.as_ref();
-            let current_buttons = profiled
-                .map_or_else(EmulatedButtonState::default, |controller| {
-                    controller.state.buttons
-                });
-            if log::log_enabled!(log::Level::Trace) {
-                for (button, pressed) in button_transitions(active_buttons, current_buttons) {
-                    log::trace!(
-                        "emulated button {button} {}: elapsed={elapsed:?}",
-                        if pressed { "pressed" } else { "released" }
-                    );
+            for (slot, current) in sample.state.iter().enumerate() {
+                let controller_id = current.as_ref().map(|controller| controller.controller_id);
+                if active_input[slot]
+                    .as_ref()
+                    .map(|controller| controller.controller_id)
+                    != controller_id
+                {
+                    host_input.vibration[slot]
+                        .select_controller(controller_id)
+                        .map_err(|error| {
+                            format!("cannot route player {} vibration: {error}", slot + 1)
+                        })?;
                 }
+                report_input_change(&mut active_input[slot], current, input_observed, slot);
+                let current_buttons = current
+                    .as_ref()
+                    .map_or_else(EmulatedButtonState::default, |controller| {
+                        controller.state.buttons
+                    });
+                if log::log_enabled!(log::Level::Trace) {
+                    for (button, pressed) in
+                        button_transitions(active_buttons[slot], current_buttons)
+                    {
+                        log::trace!(
+                            "player {} emulated button {button} {}: elapsed={elapsed:?}",
+                            slot + 1,
+                            if pressed { "pressed" } else { "released" }
+                        );
+                    }
+                }
+                active_buttons[slot] = current_buttons;
             }
-            active_buttons = current_buttons;
+            input_observed = true;
             let delta = last_input_sample.map_or(Duration::ZERO, |previous| {
                 sample.captured_at.saturating_duration_since(previous)
             });
-            host_input
-                .vibration
-                .select_controller(profiled.map(|controller| controller.controller_id))
-                .map_err(|error| format!("cannot route controller vibration: {error}"))?;
-            let controller = profiled.map(|controller| &controller.state);
-            let captured = host_input
-                .keyboard
-                .as_ref()
-                .is_some_and(|host| host.route_controller(controller));
-            let muted = controller.map(|state| nixe_input::EmulatedControllerState {
-                buttons: Default::default(),
-                left_stick: Default::default(),
-                right_stick: Default::default(),
-                ..*state
+            let captured = host_input.keyboard.as_ref().is_some_and(|host| {
+                host.route_controller(sample.state[0].as_ref().map(|controller| &controller.state))
+            });
+            let controllers = sample.state.each_ref().map(|controller| {
+                controller.as_ref().map(|controller| {
+                    let mut state = controller.state;
+                    if captured {
+                        state.buttons = Default::default();
+                        state.left_stick = Default::default();
+                        state.right_stick = Default::default();
+                    }
+                    state
+                })
             });
             dispatcher
-                .advance_input(if captured { muted.as_ref() } else { controller }, delta)
+                .advance_input(&controllers, delta)
                 .map_err(|error| format!("cannot publish Horizon HID state: {error}"))?;
             let touch_state = host_input
                 .touch_screen
@@ -1141,26 +1160,32 @@ fn report_input_change(
     active: &mut Option<ActiveInput>,
     current: &Option<ProfiledControllerState>,
     previously_observed: bool,
+    slot: usize,
 ) {
     let next = current.as_ref().map(|controller| ActiveInput {
         controller_id: controller.controller_id,
         device: controller.device.clone(),
         profile_name: controller.profile_name.clone(),
     });
-    if *active == next && previously_observed {
+    if *active == next && (previously_observed || slot != 0) {
         return;
     }
     match &next {
         Some(controller) => log::info!(
-            "using input profile `{}` for {}",
+            "player {} using input profile `{}` for {}",
+            slot + 1,
             controller.profile_name,
             controller.device
         ),
         None if previously_observed && active.is_some() => {
-            log::info!("mapped gamepad disconnected; virtual player one receives neutral input");
+            log::info!(
+                "player {} mapped gamepad disconnected; virtual controller receives neutral input",
+                slot + 1
+            );
         }
         None => log::warn!(
-            "no matching first-gamepad input profile; virtual player one receives neutral input"
+            "no matching player {} gamepad input profile; virtual controller receives neutral input",
+            slot + 1
         ),
     }
     *active = next;

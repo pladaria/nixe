@@ -45,7 +45,7 @@ impl<'a> Definitions<'a> {
             let next = ProgramOffset(pc.0 + 16);
             let mut fallthrough = true;
             if matches!(i.opcode(), 0x944 | 0x947) && !calls.contains_key(&pc) {
-                let (guard, condition) = i.branch_predicates()?;
+                let (guard, condition) = i.control_predicates()?;
                 if guard != Condition::always(false) && condition != Condition::always(false) {
                     predecessors
                         .entry(i.branch_target(pc)?)
@@ -62,9 +62,12 @@ impl<'a> Definitions<'a> {
                 }
                 fallthrough = false;
             } else if matches!(i.opcode(), 0x94d | 0x950) {
-                fallthrough = i.condition()? != Condition::always(true);
+                let (primary, secondary) = i.control_predicates()?;
+                fallthrough =
+                    primary != Condition::always(true) || secondary != Condition::always(true);
                 if i.opcode() == 0x94d
-                    && i.condition()? != Condition::always(false)
+                    && primary != Condition::always(false)
+                    && secondary != Condition::always(false)
                     && let Some(handler) = exit_handler.filter(|&handler| pc < handler)
                 {
                     predecessors.entry(handler).or_default().push(pc);
@@ -141,6 +144,18 @@ impl<'a> Definitions<'a> {
 }
 
 fn writes_register(i: Instruction, pc: ProgramOffset, register: Register) -> Result<bool> {
+    if matches!(i.opcode(), 0xb6c | 0xf6c) {
+        let Register::General(register) = register else {
+            return Ok(false);
+        };
+        let channels = i.bits(72, 4).count_ones();
+        let first = i.bits(16, 8);
+        let second = i.bits(64, 8);
+        return Ok((first..first + channels.min(2)).contains(&register)
+            || (channels > 2
+                && second != 255
+                && (second..second + channels - 2).contains(&register)));
+    }
     let uniform_words = match i.opcode() {
         0xc82 | 0x882 | 0x290 | 0x890 | 0x292 | 0x892 | 0x2a4 | 0x4a4 | 0x8a4 | 0x899 | 0x299
         | 0x499 | 0x287 | 0x887 | 0x2bd | 0x2be | 0x2bf | 0x3c2 | 0x3c4 | 0x9c3 | 0x886 => 1,
@@ -184,8 +199,21 @@ fn general_words(i: Instruction, pc: ProgramOffset) -> Result<u32> {
     let words = match i.opcode() {
         0x202 | 0x802 | 0xa02 | 0x210 | 0x810 | 0xa10 | 0x220 | 0x820 | 0xa20 | 0x221 | 0x421
         | 0x621 | 0x821 | 0xa21 | 0x223 | 0x423 | 0x623 | 0x823 | 0xa23 | 0x217 | 0x817 | 0xa17
-        | 0x819 | 0x308 | 0x908 | 0xb08 | 0x326 | 0x526 | 0x209 | 0x809 | 0xa09 | 0xc09 | 0x212
-        | 0x812 | 0xa12 | 0xc12 | 0x224 | 0x424 | 0x624 | 0x824 | 0xa24 | 0xc24 | 0xe24 => 1,
+        | 0xc17 | 0x819 | 0x308 | 0x908 | 0xb08 | 0x326 | 0x526 | 0x209 | 0x809 | 0xa09 | 0xc09
+        | 0x212 | 0x812 | 0xa12 | 0xc12 | 0x224 | 0x424 | 0x624 | 0x824 | 0xa24 | 0xc24 | 0xe24 => {
+            1
+        }
+        // Accepted ATOMS/SUATOM forms return one 32-bit word. SURED and
+        // no-result ATOMS.POPC only change memory, not a register definition.
+        0x38c | 0x593 => 1,
+        0x59f | 0xf8c => 0,
+        0x983 => match i.bits(73, 3) {
+            0..=4 => 1,
+            5 => 2,
+            6 => 4,
+            _ => return Err(unsupported("Native local load register width")),
+        },
+        0x387 | 0x987 => 0,
         0xb82 => {
             if i.bits(73, 3) == 5 {
                 2

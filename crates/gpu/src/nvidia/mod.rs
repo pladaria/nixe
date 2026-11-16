@@ -8,6 +8,7 @@ mod texture;
 use crate::native::{ImageInfo, ImagePacking};
 use crate::*;
 use format::decode_sampled_texture_format;
+pub use format::sampled_aspect;
 pub use sampler::decode_sampler;
 pub use texture::{sampled_image_info, texture_address};
 /// Shader-visible dimensionality required from a sampled image.

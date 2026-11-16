@@ -1,4 +1,4 @@
-//! Friends service creation, completion events and empty local notifications.
+//! Offline friends service, completion events and empty local notifications.
 //! https://switchbrew.org/wiki/Friend_services
 use super::prelude::*;
 use crate::friends::{FriendObject, FriendSession};
@@ -103,6 +103,38 @@ pub(in crate::ipc_wire) fn dispatch_friends(
             }
         }
         FriendObject::Service { completion } => {
+            if request.command_id == 10101 {
+                // GetFriendList: offset, UID, SizedFriendFilter, process ID,
+                // and one output map-alias array of FriendImpl entries.
+                // https://reswitched.github.io/SwIPC/ifaces.html#nn::friends::detail::ipc::IFriendService
+                if !request.has_payload_size(0x2c)
+                    || hipc.pid.is_none()
+                    || !hipc.copy_handles.is_empty()
+                    || !hipc.move_handles.is_empty()
+                    || !hipc.send_statics.is_empty()
+                    || !hipc.send_buffers.is_empty()
+                    || hipc.receive_buffers.len() != 1
+                    || !hipc.exchange_buffers.is_empty()
+                    || !matches!(hipc.receive_statics, ReceiveStatics::None)
+                {
+                    return response(
+                        session,
+                        request.token,
+                        HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                    );
+                }
+                // The local offline account has no cached friends. Return the
+                // actual count without touching unused output-array entries.
+                // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/hle/service/friend/friend.cpp#L198-L213
+                return semantic_success(
+                    request.token,
+                    session.domain.is_domain(),
+                    &0_u32.to_le_bytes(),
+                    &[],
+                    &[],
+                    None,
+                );
+            }
             if !matches!(request.command_id, 0 | 1) {
                 return unsupported_service_command("IFriendService", request.command_id);
             }

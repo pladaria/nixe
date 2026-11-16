@@ -522,18 +522,18 @@ impl HorizonSvcDispatcher {
     }
 
     /// Supplies real controller actuator output owned by the host input worker.
-    pub fn with_vibration_output(
+    pub fn with_vibration_outputs(
         self: std::sync::Arc<Self>,
-        output: nixe_input::VibrationOutput,
+        outputs: [nixe_input::VibrationOutput; nixe_input::MAX_PLAYERS],
     ) -> std::sync::Arc<Self> {
-        self.resources.system.hid.set_vibration_output(output);
+        self.resources.system.hid.set_vibration_outputs(outputs);
         self
     }
 
     /// Configures the existing input worker's emulated controller motion filter.
     pub fn with_motion_settings(
         self: std::sync::Arc<Self>,
-        settings: nixe_input::MotionSettings,
+        settings: [nixe_input::MotionSettings; nixe_input::MAX_PLAYERS],
     ) -> std::sync::Arc<Self> {
         self.resources.system.hid.set_motion_settings(settings);
         self
@@ -565,15 +565,16 @@ impl HorizonSvcDispatcher {
     /// Parks audio command execution while preserving guest session state.
     pub fn set_host_paused(self: &std::sync::Arc<Self>, paused: bool) {
         self.resources.audio.renderers.set_host_paused(paused);
+        self.resources.audio.mixer.set_host_paused(paused);
     }
 
-    /// Publishes the latest player-one controller state to Horizon HID.
+    /// Publishes one complete set of independently routed controller samples.
     pub fn advance_input(
         self: &std::sync::Arc<Self>,
-        state: Option<&nixe_input::EmulatedControllerState>,
+        states: &nixe_input::EmulatedControllerStates,
         delta: Duration,
     ) -> Result<(), crate::HidInputError> {
-        self.resources.system.hid.publish(state, delta)
+        self.resources.system.hid.publish(states, delta)
     }
 
     /// Publishes the latest host touch-screen state to Horizon HID.

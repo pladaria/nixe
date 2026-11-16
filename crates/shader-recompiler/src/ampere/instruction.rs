@@ -98,12 +98,12 @@ impl Instruction {
         }
         Ok(ProgramOffset(target as u32))
     }
-    /// Native BRA has an instruction predicate and a separate branch predicate.
+    /// Native BRA/EXIT have an instruction predicate and a separate control predicate.
     /// Use the existing predicate-before block for their conjunction, without
     /// inventing a temporary predicate register or rewriting shader instructions.
-    pub fn branch_predicates(self) -> Result<(Condition, Condition)> {
+    pub fn control_predicates(self) -> Result<(Condition, Condition)> {
         let primary = self.condition()?;
-        let secondary = if self.opcode() == 0x947 {
+        let secondary = if matches!(self.opcode(), 0x947 | 0x94d) {
             Condition {
                 flow_test: FlowTest::T,
                 predicate: Pred::new(self.bits(87, 3) as u8)?,

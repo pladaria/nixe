@@ -7,7 +7,8 @@ use crate::{
     StickState,
 };
 
-/// Mapping from one host gamepad to player one's emulated Switch controller.
+/// Mapping from one host gamepad to its assigned emulated controller.
+/// Missing bindings and empty strings disable their button, axis or sensor.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GamepadProfile {
@@ -15,32 +16,72 @@ pub struct GamepadProfile {
     #[serde(rename = "type")]
     pub controller_type: ControllerKind,
 
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub a: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub b: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub x: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub y: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub plus: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub minus: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub home: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub capture: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub l: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub r: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub leftstick: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub rightstick: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub dpup: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub dpdown: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub dpleft: Option<Button>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub dpright: Option<Button>,
 
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub zl: Option<Axis>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub zr: Option<Axis>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub leftx: Option<Axis>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub lefty: Option<Axis>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub rightx: Option<Axis>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub righty: Option<Axis>,
 
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub gyroscope: Option<MotionSensor>,
+    #[serde(default, deserialize_with = "optional_mapping")]
     pub accelerometer: Option<MotionSensor>,
+}
+
+// Optional bindings are resolved once while loading configuration. Empty
+// strings and omitted entries both disable a control; other invalid identifiers
+// remain configuration errors rather than silently changing the mapping.
+fn optional_mapping<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: TryFrom<String>,
+    T::Error: std::fmt::Display,
+{
+    Option::<String>::deserialize(deserializer)?
+        .filter(|value| !value.is_empty())
+        .map(T::try_from)
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 /// Switch buttons exposed through the emulated NPad state.
@@ -86,7 +127,7 @@ pub struct ProfiledControllerState {
     pub state: EmulatedControllerState,
 }
 
-/// Selects and applies named gamepad profiles to the first attached controller.
+/// Named gamepad profiles shared by the independent player slots.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GamepadProfiles {
     profiles: BTreeMap<String, GamepadProfile>,

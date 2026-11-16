@@ -209,9 +209,12 @@ impl Visitor<'_> {
             0x381 | 0x981 => self.global_load(),
             0x386 | 0x986 => self.global_store(),
             0x388 | 0x984 | 0x988 => self.shared_memory(),
+            0x387 | 0x983 | 0x987 => self.local_memory(),
             0x38c => self.shared_atomic(),
+            0xf8c => self.shared_increment(),
             0xb97 | 0xb9b | 0x998 | 0x99c => self.surface_memory(),
             0x593 => self.surface_atomic(),
+            0x59f => self.surface_reduction(),
             0x83b => self.matrix_load(),
             0x240 | 0x840 => self.hmnmx(),
             0x23a => self.matrix_transpose(),
@@ -245,7 +248,7 @@ impl Visitor<'_> {
                 let absolute = self.emit.s_max(value, negative)?;
                 self.write(absolute)
             }
-            0x217 | 0x817 | 0xa17 => self.imnmx(),
+            0x217 | 0x817 | 0xa17 | 0xc17 => self.imnmx(),
             0x219 | 0x419 | 0xa19 | 0xc19 | 0x299 | 0x499 => self.shift_variable(),
             0x819 | 0x899 => self.shf(),
             0x211 | 0x811 | 0xa11 | 0xc11 => self.lea(),
@@ -288,6 +291,7 @@ impl Visitor<'_> {
             0x326 | 0x526 => self.interpolate(),
             0xb60 | 0xf60 | 0x361 => self.texture_sample(),
             0xb66 | 0xf66 | 0x367 => self.texture_fetch(),
+            0xb6c | 0xf6c => self.texture_gradient(),
             0xb6f | 0x370 => self.texture_query(),
             0xb69 | 0xf69 | 0x36a => self.texture_lod(),
             0xb63 | 0xf63 => self.texture_gather(),
