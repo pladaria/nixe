@@ -11,19 +11,6 @@ use crate::{
 use nixe_shader_recompiler::artifact::{HandleMemory, MAX_SSBOS};
 
 #[derive(Clone, Copy)]
-pub(super) struct HandleWord {
-    pub address: u64,
-    pub raw: u32,
-}
-#[derive(Clone, Copy)]
-pub(super) enum ConsumedHandle {
-    Direct {
-        primary: HandleWord,
-        secondary: Option<HandleWord>,
-    },
-    Program(u32),
-}
-#[derive(Clone, Copy)]
 pub(super) enum HandleBuffers<'a> {
     Graphics(&'a MaxwellThreeDState, u8),
     Compute(&'a model::MaxwellResolvedComputeLaunch),
@@ -83,53 +70,64 @@ fn failed(error: impl Display) -> VulkanError {
 }
 
 fn read_word(
+    execution: &mut NativeExecution<'_>,
     space: &MaxwellGpuMemory,
     buffers: HandleBuffers<'_>,
     source: &crate::native::pipeline_resources::ImageHandle,
-) -> Result<HandleWord, VulkanError> {
+) -> Result<u32, VulkanError> {
     let address = buffers
         .address(space, source.cbuf, source.offset, 4)?
         .ok_or(VulkanError::InvalidResource(
             "texture handle reads a disabled constant buffer",
         ))?;
-    Ok(HandleWord {
-        address: address.get(),
-        raw: space.read_u32(address).map_err(failed)?,
-    })
+    coherent_word(execution, space, address)
 }
-
 #[inline]
 pub(super) fn read_handle(
+    execution: &mut NativeExecution<'_>,
     space: &MaxwellGpuMemory,
     buffers: HandleBuffers<'_>,
     source: &HandleSource,
     values: &[u32],
-) -> Result<(u32, ConsumedHandle), VulkanError> {
+) -> Result<u32, VulkanError> {
     match source {
         HandleSource::Direct { primary, secondary } => {
-            let first = read_word(space, buffers, primary)?;
+            let first = read_word(execution, space, buffers, primary)? << primary.shift;
             let second = secondary
                 .as_ref()
-                .map(|s| read_word(space, buffers, s))
-                .transpose()?;
-            let value = (first.raw << primary.shift)
-                | second
-                    .zip(secondary.as_ref())
-                    .map_or(0, |(word, s)| word.raw << s.shift);
-            Ok((
-                value,
-                ConsumedHandle::Direct {
-                    primary: first,
-                    secondary: second,
-                },
-            ))
+                .map(|source| {
+                    read_word(execution, space, buffers, source).map(|word| word << source.shift)
+                })
+                .transpose()?
+                .unwrap_or(0);
+            Ok(first | second)
         }
-        HandleSource::Program { slot, .. } => {
-            Ok((values[*slot], ConsumedHandle::Program(values[*slot])))
-        }
+        HandleSource::Program { slot, .. } => Ok(values[*slot]),
     }
 }
 
+fn coherent_word(
+    execution: &mut NativeExecution<'_>,
+    space: &MaxwellGpuMemory,
+    address: GpuVirtualAddress,
+) -> Result<u32, VulkanError> {
+    if address.get() % nixe_memory::PAGE_SIZE + 4 <= nixe_memory::PAGE_SIZE {
+        let device = space.device_address(address).map_err(failed)?;
+        execution.residency.flush_read_span(device, 4)?;
+        return space.read_u32(address).map_err(failed);
+    }
+    // A word straddling GPU mappings uses their actual physical spans.
+    for (gpu, bytes) in space.get_submapped_range(address, 4).map_err(failed)? {
+        execution
+            .residency
+            .flush_read_span(space.device_address(gpu).map_err(failed)?, bytes)?;
+    }
+    let mut bytes = [0; 4];
+    space
+        .read_into_unsafe(address, &mut bytes)
+        .map_err(failed)?;
+    Ok(u32::from_le_bytes(bytes))
+}
 #[derive(Default)]
 struct ComputedReads {
     words: [Option<(u32, u32, u32)>; 16],
@@ -186,19 +184,6 @@ impl<'a, 'b> HandleReader<'a, 'b> {
         }
         Ok(())
     }
-    fn coherent_word(&mut self, address: GpuVirtualAddress) -> Result<u32, VulkanError> {
-        // Flush on this owner, never through its asynchronous memory endpoint.
-        // Submapped spans cover fragmented mappings without borrowing guest RAM.
-        for (gpu, bytes) in self.space.get_submapped_range(address, 4).map_err(failed)? {
-            let device = self.space.device_address(gpu).map_err(failed)?;
-            self.execution.residency.flush_region(device, bytes)?;
-        }
-        let mut bytes = [0; 4];
-        self.space
-            .read_into_unsafe(address, &mut bytes)
-            .map_err(failed)?;
-        Ok(u32::from_le_bytes(bytes))
-    }
 }
 impl HandleMemory for HandleReader<'_, '_> {
     type Error = VulkanError;
@@ -212,7 +197,7 @@ impl HandleMemory for HandleReader<'_, '_> {
             return Ok(*value);
         }
         let value = if let Some(address) = self.buffers.address(self.space, index, offset, 4)? {
-            self.coherent_word(address)?
+            coherent_word(self.execution, self.space, address)?
         } else {
             0
         };
@@ -269,6 +254,10 @@ impl HandleMemory for HandleReader<'_, '_> {
             .ok_or(VulkanError::InvalidResource(
                 "texture handle storage address overflow",
             ))?;
-        self.coherent_word(self.space.address(address).map_err(failed)?)
+        coherent_word(
+            self.execution,
+            self.space,
+            self.space.address(address).map_err(failed)?,
+        )
     }
 }

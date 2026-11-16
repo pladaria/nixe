@@ -129,11 +129,8 @@ pub trait RenderMemory: nixe_gpu::native::ImageAddressSpace {
     /// A numeric address, not a Rust borrow. Valid while the address-space owner
     /// retains its mappings. Retained selections must check mapping generations
     /// before reuse and resolve device coherence before dereferencing it.
-    fn read_span(
-        &mut self,
-        address: u64,
-        bytes: u64,
-    ) -> Result<Option<(u64, nixe_memory::HostAddress)>>;
+    fn read_span(&mut self, address: u64, bytes: u64)
+    -> Result<Option<nixe_gpu::native::ReadSpan>>;
     /// Same-layout virtual extent, including reserved native backing. Physical
     /// fragmentation is resolved separately when the resource is consumed.
     fn buffer_layout_size(&self, address: u64) -> Result<u64>;

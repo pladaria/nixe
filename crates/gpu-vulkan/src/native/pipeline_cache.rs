@@ -65,6 +65,7 @@ pub(super) struct ComputePipeline {
     key: ComputeKey,
     pub(super) pipeline: NativePipeline,
     pub(super) resources: PipelineResources,
+    pub(super) textures: std::cell::RefCell<maxwell::reuse::SampledTextures>,
 }
 // Disk jobs move complete metadata to its owner; boxing would add an allocation
 // to every loaded graphics pipeline just to shrink this temporary message.
@@ -418,6 +419,7 @@ impl PipelineCache {
             PipelineResources::new(&shader, &pipeline.layout.key, [18, 18, 18, 18, 18, 8])?;
         let configure = GraphicsPipeline::configure_func(&shader, &resources);
         let sampled_reuse = maxwell::reuse::SampledTextures::eligible(&resources);
+        let textures = std::cell::RefCell::new(maxwell::reuse::SampledTextures::new(&resources));
         Ok(GraphicsPipeline {
             identity: NEXT_GRAPHICS_PIPELINE_ID.fetch_add(1, Ordering::Relaxed),
             key,
@@ -427,7 +429,7 @@ impl PipelineCache {
             resources,
             vertex_attributes,
             configure,
-            textures: Default::default(),
+            textures,
             sampled_reuse,
         })
     }
@@ -533,10 +535,12 @@ impl PipelineCache {
         .map_err(compilation)?;
         let resources =
             PipelineResources::new(&shader, &pipeline.layout.key, [18, 18, 18, 18, 18, 8])?;
+        let textures = std::cell::RefCell::new(maxwell::reuse::SampledTextures::new(&resources));
         Ok(ComputePipeline {
             key,
             pipeline,
             resources,
+            textures,
         })
     }
 }

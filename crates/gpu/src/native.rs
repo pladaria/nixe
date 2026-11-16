@@ -7,6 +7,31 @@ use std::sync::Arc;
 mod image;
 pub use image::{ImageAddressSpace, ImageInfo, ImagePacking};
 
+/// Numerically described, physically contiguous RAM under the consuming GPU
+/// mapping owner. It borrows no guest bytes. Retained users check both mapping
+/// generations and resolve coherence for the exact consumed subrange.
+#[derive(Clone, Copy)]
+pub struct ReadSpan {
+    pub address: u64,
+    pub bytes: u64,
+    pub device: u64,
+    pub host: nixe_memory::HostAddress,
+}
+impl ReadSpan {
+    pub fn at(self, address: u64, bytes: u64) -> Option<(u64, nixe_memory::HostAddress)> {
+        let offset = address.checked_sub(self.address)?;
+        if bytes > self.bytes || offset > self.bytes - bytes {
+            return None;
+        }
+        Some((
+            self.device + offset,
+            nixe_memory::HostAddress::from_pointer(
+                self.host.as_ptr().wrapping_add(offset as usize),
+            ),
+        ))
+    }
+}
+
 /// Decoded byte-copy geometry. Engines select their own storage layout; the
 /// native resource owner decides whether existing GPU representations can copy it.
 /// Layout elements and rectangle columns are bytes (packed/aspect size one).

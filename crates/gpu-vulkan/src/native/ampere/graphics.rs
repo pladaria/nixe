@@ -1,5 +1,4 @@
 //! Native graphics pipelines retain stage programs and physical cache slots.
-mod delta;
 mod disk;
 mod inputs;
 use super::super::pipeline_resources::PipelineResources;
@@ -67,7 +66,6 @@ struct Pipeline {
     observations: Vec<(u8, Observations)>,
     vertex_attributes: u32,
     textures: std::cell::RefCell<super::sampled::SampledTextures>,
-    delta_images: std::cell::RefCell<delta::Images>,
 }
 impl Cache {
     pub(in crate::native) fn close(&mut self, channel: u64) {
@@ -139,6 +137,12 @@ impl NativeExecution<'_> {
         if draw.is_empty() {
             return Ok(());
         }
+        self.ampere_image_pools(
+            memory.image_space_id(),
+            r,
+            false,
+            textures::graphics_linked(r)?,
+        );
         let previous = cache.last_draw.take();
         let indexed = matches!(draw, Draw::Indexed { .. });
         self.state.statistics.reuse.eligible_draws += 1;
@@ -584,6 +588,8 @@ impl NativeExecution<'_> {
             };
             if reused_textures {
                 self.state.statistics.reuse.texture_hits += 1;
+            } else if let Some(reason) = textures.bindings.miss {
+                self.state.statistics.reuse.texture_misses[reason as usize] += 1;
             }
             if delta {
                 if !reused_textures {
@@ -599,7 +605,7 @@ impl NativeExecution<'_> {
                 }
                 delta = miss.is_none();
             }
-            let images = &textures.images;
+            let images = &textures.bindings.images;
             if self.residency.texture_cache.bindings.has_deleted_images {
                 miss.get_or_insert(DrawMiss::Content);
                 delta = false;
@@ -771,7 +777,6 @@ impl NativeExecution<'_> {
                     }
                     self.ampere_stage_texels(
                         memory,
-                        r,
                         &state.constants[group as usize],
                         &pipeline.resources.stages[stage],
                         stage,
@@ -843,10 +848,13 @@ impl NativeExecution<'_> {
                 delta = miss.is_none();
             }
             let descriptors = self.residency.guest_descriptor_update();
-            let mut push = pipeline
-                .delta_images
-                .borrow_mut()
-                .prepare(self, &pipeline, images, delta)?;
+            textures
+                .bindings
+                .write_native(&mut self.residency, &pipeline.pipeline, delta)?;
+            let mut push = textures
+                .bindings
+                .resource_constants(&pipeline.resources, &self.residency);
+            let images = &textures.bindings.images;
             push.set_instance_offset(primitive.first_instance);
             if pipeline.resources.uses_render_area {
                 return Err(compilation(
@@ -1050,14 +1058,18 @@ impl Pipeline {
                 "native shader resource class is not implemented",
             ));
         }
-        let textures = super::sampled::SampledTextures::new(&resources, &observations)?;
+        let textures = super::sampled::SampledTextures::new(
+            &resources,
+            observations
+                .iter()
+                .map(|(stage, observations)| (*stage, observations)),
+        )?;
         Ok(Self {
             pipeline,
             resources,
             observations,
             vertex_attributes,
             textures: std::cell::RefCell::new(textures),
-            delta_images: Default::default(),
         })
     }
 }

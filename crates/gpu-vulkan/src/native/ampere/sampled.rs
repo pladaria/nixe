@@ -1,10 +1,10 @@
-//! Pipeline-local sampled selections. Validate live handles and descriptor bytes
-//! before reusing physical views, including content and alias synchronization.
+//! Persistent pipeline binding slots consume channel-owned live descriptor records.
+//! Update changed selections and synchronize contents independently of bindings.
 //! https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/texture_cache/texture_cache.h
 use super::reads::ReadSlot;
 use super::*;
 use crate::native::pipeline_resources::{HandleSource, ImageHandle, PipelineResources};
-use crate::residency::execution::ShaderImage;
+use crate::native::sampled::{ImageBindings, SampledKey};
 use nixe_shader_recompiler::{
     environment::Observations,
     types::{TexturePixelFormat, TextureType},
@@ -25,8 +25,8 @@ struct Entry {
     changed: bool,
     primary: ReadSlot<4>,
     secondary: ReadSlot<4>,
-    tic: ReadSlot<32>,
-    tsc: ReadSlot<32>,
+    tic_revision: u64,
+    tsc_revision: u64,
     indices: (u32, u32),
 }
 struct Check {
@@ -39,23 +39,21 @@ struct Check {
 pub(super) struct SampledTextures {
     entries: Vec<Entry>,
     checks: Vec<Check>,
-    pub images: smallvec::SmallVec<[ShaderImage; 16]>,
-    identity: Option<[u64; 10]>,
+    pub bindings: ImageBindings,
     eligible: bool,
 }
 impl SampledTextures {
-    pub fn new(
+    pub fn new<'b>(
         resources: &PipelineResources,
-        observations: &[(u8, Observations)],
+        observations: impl IntoIterator<Item = (u8, &'b Observations)>,
     ) -> Result<Self, VulkanError> {
         let mut result = Self {
             entries: Vec::new(),
             checks: Vec::new(),
-            images: Default::default(),
-            identity: None,
+            bindings: ImageBindings::new(resources),
             eligible: Self::eligible(resources),
         };
-        for (stage, resources) in resources.stages[..5].iter().enumerate() {
+        for (stage, resources) in resources.stages.iter().enumerate() {
             for image in &resources.images {
                 let HandleSource::Direct { primary, secondary } = image.handle else {
                     return Err(compilation(
@@ -85,7 +83,7 @@ impl SampledTextures {
                         shift: key.sec_shift_left,
                     }),
                 };
-                result.add_check(*stage, handle, *old, observations);
+                result.add_check(stage, handle, *old, observations);
             }
             let immediate: std::collections::BTreeSet<_> = observations
                 .texture_types
@@ -100,7 +98,7 @@ impl SampledTextures {
                     .values()
                     .any(|value| *value == old)
                 {
-                    result.add_check(*stage, Handle::Immediate(old.0), old, observations);
+                    result.add_check(stage, Handle::Immediate(old.0), old, observations);
                 }
             }
         }
@@ -115,8 +113,8 @@ impl SampledTextures {
             changed: true,
             primary: Default::default(),
             secondary: Default::default(),
-            tic: Default::default(),
-            tsc: Default::default(),
+            tic_revision: 0,
+            tsc_revision: 0,
             indices: (0, 0),
         });
         index
@@ -147,14 +145,26 @@ impl SampledTextures {
             matches: false,
         });
     }
-    fn compatible(&mut self) -> Result<bool, VulkanError> {
+    fn compatible(
+        &mut self,
+        execution: &NativeExecution<'_>,
+        compute: bool,
+    ) -> Result<bool, VulkanError> {
         use nixe_gpu::nvidia::shader as classify;
         let mut compatible = true;
         for check in &mut self.checks {
             let entry = &self.entries[check.entry];
             if entry.changed {
+                let bytes = &execution
+                    .residency
+                    .texture_cache
+                    .bindings
+                    .channel
+                    .image_descriptors[usize::from(compute)]
+                .entries[entry.indices.0 as usize]
+                    .bytes;
                 let words = std::array::from_fn(|i| {
-                    u32::from_le_bytes(entry.tic.bytes[i * 4..i * 4 + 4].try_into().unwrap())
+                    u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
                 });
                 check.matches = true;
                 if let Some(expected) = check.texture {
@@ -177,23 +187,19 @@ impl SampledTextures {
     fn identity(
         execution: &NativeExecution<'_>,
         memory: &impl RenderMemory,
-        r: &Registers,
-    ) -> [u64; 10] {
-        [
-            execution.state.current_context.unwrap(),
-            memory.image_space_id(),
-            memory.mapping_generation(),
-            execution.residency.device_memory().generation(),
-            execution.residency.texture_cache.binding_revision,
-            r.address(0x1574, 0x1578),
-            u64::from(r.get(0x157c)),
-            r.address(0x155c, 0x1560),
-            u64::from(r.get(0x1564)),
-            u64::from(r.get(0x1234)),
-        ]
+        compute: bool,
+    ) -> [u64; 6] {
+        execution.sampled_scope(
+            [
+                memory.image_space_id(),
+                memory.mapping_generation(),
+                execution.residency.device_memory().generation(),
+            ],
+            compute,
+        )
     }
     pub fn eligible(resources: &PipelineResources) -> bool {
-        resources.stages[..5].iter().all(|s| {
+        resources.stages.iter().all(|s| {
             s.texels.is_empty()
                 && s.images
                     .iter()
@@ -210,26 +216,50 @@ impl SampledTextures {
         groups: [Option<u8>; 5],
         resources: &PipelineResources,
     ) -> Result<Option<bool>, VulkanError> {
-        let identity = Self::identity(execution, memory, r);
-        let mut same = self.identity == Some(identity) && self.eligible;
-        self.identity = None;
-        let linked = textures::graphics_linked(r)?;
-        execution.ampere_image_pools(memory.image_space_id(), r, false, linked);
-        let tic_base = r.address(0x1574, 0x1578);
-        let tsc_base = r.address(0x155c, 0x1560);
+        self.prepare_bindings(
+            execution,
+            memory,
+            |stage| &constants[groups[stage as usize].expect("active descriptor stage") as usize],
+            resources,
+            textures::graphics_linked(r)?,
+            false,
+        )
+    }
+    pub fn prepare_compute(
+        &mut self,
+        execution: &mut NativeExecution<'_>,
+        memory: &mut impl RenderMemory,
+        constants: &[Option<(u64, u32)>],
+        resources: &PipelineResources,
+        linked: bool,
+    ) -> Result<Option<bool>, VulkanError> {
+        self.prepare_bindings(execution, memory, |_| constants, resources, linked, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_bindings<'b>(
+        &mut self,
+        execution: &mut NativeExecution<'_>,
+        memory: &mut impl RenderMemory,
+        constants: impl Fn(u8) -> &'b [Option<(u64, u32)>],
+        resources: &PipelineResources,
+        linked: bool,
+        compute: bool,
+    ) -> Result<Option<bool>, VulkanError> {
+        let identity = Self::identity(execution, memory, compute);
+        let force = self.bindings.begin(identity, self.eligible);
+        let mut same = !force && self.eligible;
         for entry in &mut self.entries {
             let handle = match entry.handle {
                 Handle::Constant { primary, secondary } => {
-                    let group = groups[entry.stage as usize].expect("active descriptor stage");
-                    let constants = &constants[group as usize];
-                    same &= !entry.primary.update(
+                    let constants = constants(entry.stage);
+                    entry.primary.update(
                         &mut execution.residency,
                         memory,
                         textures::constant_address(constants, primary)?,
                     )?;
                     let mut handle = u32::from_le_bytes(entry.primary.bytes) << primary.shift;
                     if let Some(secondary) = secondary {
-                        same &= !entry.secondary.update(
+                        entry.secondary.update(
                             &mut execution.residency,
                             memory,
                             textures::constant_address(constants, secondary)?,
@@ -241,89 +271,51 @@ impl SampledTextures {
                 Handle::Immediate(handle) => handle,
             };
             let (tic, tsc) = textures::indices(linked, handle);
-            entry.indices = (tic, tsc);
-            if tic_base == 0
-                || tic > r.get(0x157c)
-                || (entry.sampler
-                    && (tsc_base == 0 || tsc > if linked { r.get(0x157c) } else { r.get(0x1564) }))
-            {
-                return Err(compilation(
-                    "native texture handle exceeds descriptor pools",
-                ));
-            }
-            entry.changed = entry.tic.update(
-                &mut execution.residency,
-                memory,
-                tic_base
-                    .checked_add(u64::from(tic) * 32)
-                    .ok_or_else(|| compilation("descriptor address overflow"))?,
-            )?;
-            same &= !entry.changed;
+            let (_, revision) =
+                textures::image_descriptor(&mut execution.residency, memory, compute, tic)?;
+            entry.changed = force || entry.indices.0 != tic || entry.tic_revision != revision;
+            entry.tic_revision = revision;
             if entry.sampler {
-                same &= !entry.tsc.update(
-                    &mut execution.residency,
-                    memory,
-                    tsc_base
-                        .checked_add(u64::from(tsc) * 32)
-                        .ok_or_else(|| compilation("descriptor address overflow"))?,
-                )?;
+                let (_, revision) =
+                    textures::sampler_descriptor(&mut execution.residency, memory, compute, tsc)?;
+                entry.tsc_revision = revision;
             }
+            entry.indices = (tic, tsc);
         }
-        if !self.compatible()? {
+        if !self.compatible(execution, compute)? {
             return Ok(None);
         }
-        same &= identity == Self::identity(execution, memory, r);
-        if same {
-            for image in &self.images {
-                let Some(view) = image.view else {
-                    same = false;
-                    break;
+        let force = force || identity != Self::identity(execution, memory, compute);
+        let mut index = 0;
+        for stage in &resources.stages {
+            for slot in &stage.images {
+                let entry = &self.entries[index];
+                let key = SampledKey {
+                    image: entry.indices.0,
+                    sampler: slot.sampler.then_some(entry.indices.1),
+                    image_revision: entry.tic_revision,
+                    sampler_revision: entry.tsc_revision,
                 };
-                if !execution.residency.sampled_image_ready(view)
-                    && execution.prepare_shader_texture_view(view)? != view
-                {
-                    same = false;
-                    break;
-                }
-                if identity != Self::identity(execution, memory, r)
-                    || execution
-                        .residency
-                        .texture_cache
-                        .bindings
-                        .has_deleted_images
-                {
-                    same = false;
-                    break;
-                }
+                let Some(unchanged) =
+                    self.bindings
+                        .update(execution, index, key, force, |execution| {
+                            execution.resolve_ampere_texture(
+                                memory,
+                                slot,
+                                compute,
+                                key.image,
+                                key.sampler.unwrap_or(0),
+                            )
+                        })?
+                else {
+                    return Ok(Some(false));
+                };
+                same &= unchanged;
+                index += 1;
             }
         }
-        if !same {
-            self.images.clear();
-            let mut index = 0;
-            for (stage, group) in groups.into_iter().enumerate() {
-                if group.is_none() {
-                    continue;
-                }
-                for slot in &resources.stages[stage].images {
-                    let entry = &self.entries[index];
-                    index += 1;
-                    let Some(image) = execution.resolve_ampere_texture(
-                        memory,
-                        slot,
-                        false,
-                        entry.indices.0,
-                        entry.indices.1,
-                        entry.tic.bytes,
-                        slot.sampler.then_some(entry.tsc.bytes),
-                    )?
-                    else {
-                        return Ok(Some(false));
-                    };
-                    self.images.push(image);
-                }
-            }
-        }
-        self.identity = Some(Self::identity(execution, memory, r));
-        Ok(Some(same))
+        debug_assert_eq!(index, self.bindings.images.len());
+        let current = Self::identity(execution, memory, compute);
+        Ok(Some(self.bindings.finish(identity, current, same)))
     }
 }

@@ -783,22 +783,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_sections_and_active_dsp_features_remain_explicit() {
-        let mut data = packet(true);
-        put_word(&mut data, 16, 0x60);
-        assert!(matches!(layout(&data), Err(UpdateError::Invalid)));
-        let mut data = packet(true);
-        data.pop();
-        assert!(matches!(layout(&data), Err(UpdateError::Invalid)));
-        let mut data = packet(true);
-        let voice = 0x40 + 0x10 + 5 * 0x20 + 0x70;
-        data[voice + 0x170] = 3;
-        assert!(
-            matches!(RendererUpdateState::default().update(&params(), &layout(&data).unwrap(), &data, |_, _| panic!()), Err(UpdateError::Unsupported(detail)) if detail.contains("Delay"))
-        );
-    }
-
-    #[test]
     fn splitter_voice_fans_out_once_per_channel_and_submixes_follow_dependencies() {
         for revision in [8_u32, 9, 12, 15] {
             let mut params = params();

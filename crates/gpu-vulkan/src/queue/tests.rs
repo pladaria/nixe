@@ -66,61 +66,6 @@ fn mapped_readback_owns_staging_through_reuse_and_shutdown() {
     validation.check().unwrap();
 }
 
-#[test]
-#[ignore = "Explicit diagnostic: delays the native submit thread to measure zero-time polling"]
-fn profile_zero_timeout_submission_acknowledgement() {
-    let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
-        return;
-    };
-    let validation = device.validation_monitor();
-    let ticket = device.enqueue_buffer_readback(&[13; 64]).unwrap();
-    let queue_mutex = Arc::clone(&device.owner.queue_mutex);
-    let (held, ready) = std::sync::mpsc::sync_channel(1);
-    std::thread::scope(|scope| {
-        scope.spawn(move || {
-            let _guard = queue_mutex.lock().unwrap();
-            held.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(150));
-        });
-        ready.recv().unwrap();
-        device.flush().unwrap();
-        let begin = std::time::Instant::now();
-        let completed = device.wait_for_work(ticket.work(), Duration::ZERO).unwrap();
-        eprintln!(
-            "zero-time-poll elapsed_ms={} completed={completed}",
-            begin.elapsed().as_secs_f64() * 1000.0,
-        );
-    });
-    assert!(device.wait_for_work(ticket.work(), Duration::MAX).unwrap());
-    device.flush().unwrap();
-    device.wait_for_work(ticket.work(), Duration::MAX).unwrap();
-    assert_eq!(ticket.completed().unwrap().as_ref(), [13; 64]);
-    drop(device);
-    validation.check().unwrap();
-}
-
-#[test]
-#[ignore = "Explicit physical-GPU throughput diagnostic, outside game measurement windows"]
-fn profile_native_transfer_roundtrip() {
-    let Some(mut device) = support::device_for_test_with_validation(
-        crate::ApiPreference::Auto,
-        crate::ValidationMode::Disabled,
-    ) else {
-        return;
-    };
-    let bytes: Vec<_> = (0..1024 * 1024).map(|i| (i * 37) as u8).collect();
-    assert_eq!(device.transfer_round_trip(&bytes).unwrap(), bytes);
-    let begin = std::time::Instant::now();
-    for _ in 0..64 {
-        assert_eq!(device.transfer_round_trip(&bytes).unwrap(), bytes);
-    }
-    eprintln!(
-        "native-roundtrip iterations=64 bytes_per_iteration={} seconds={}",
-        bytes.len(),
-        begin.elapsed().as_secs_f64(),
-    );
-}
-
 #[cfg(feature = "performance-counters")]
 #[test]
 fn recording_chunk_fullness_does_not_seal_a_native_batch() {

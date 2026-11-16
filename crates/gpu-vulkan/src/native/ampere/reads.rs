@@ -5,7 +5,7 @@ use super::*;
 pub(super) struct ReadSlot<const N: usize> {
     address: u64,
     mapping: Option<[u64; 3]>,
-    pointer: Option<(u64, nixe_memory::HostAddress)>,
+    pointer: Option<nixe_gpu::native::ReadSpan>,
     capture: Option<nixe_memory::CapturedMemory>,
     pub bytes: [u8; N],
 }
@@ -27,46 +27,80 @@ impl<const N: usize> ReadSlot<N> {
         memory: &mut impl RenderMemory,
         address: u64,
     ) -> Result<bool, VulkanError> {
-        let mapping = [
-            memory.image_space_id(),
-            memory.mapping_generation(),
-            residency.device_memory().generation(),
-        ];
-        let relocated = self.address != address || self.mapping != Some(mapping);
-        if relocated {
-            self.pointer = memory.read_span(address, N as u64).map_err(compilation)?;
-            self.capture = if self.pointer.is_none() {
-                Some(
-                    memory
-                        .capture_memory(address, N as u64)
-                        .map_err(compilation)?,
-                )
-            } else {
-                None
-            };
-            self.address = address;
-            self.mapping = Some([
+        #[cfg(feature = "performance-counters")]
+        residency.note_input_read();
+        loop {
+            let mapping = [
                 memory.image_space_id(),
                 memory.mapping_generation(),
                 residency.device_memory().generation(),
-            ]);
-        }
-        let mut bytes = [0; N];
-        if let Some((device, host)) = self.pointer {
-            residency.flush_read_span(device, N as u64)?;
-            // The consuming view retains shared mapping ownership. Both virtual
-            // and physical generations were checked before using this address.
-            unsafe {
-                host.read_into(&mut bytes);
+            ];
+            let relocated = self.address != address || self.mapping != Some(mapping);
+            let reusable = self.mapping == Some(mapping)
+                && self
+                    .pointer
+                    .is_some_and(|span| span.at(address, N as u64).is_some());
+            #[cfg(feature = "performance-counters")]
+            if relocated {
+                residency.note_input_location(reusable);
             }
-        } else {
-            residency.read_captured_memory(
-                self.capture.as_ref().expect("fragmented input"),
-                &mut bytes,
-            )?;
+            if relocated && !reusable {
+                self.pointer = memory.read_span(address, N as u64).map_err(compilation)?;
+                self.capture = if self.pointer.is_none() {
+                    Some(
+                        memory
+                            .capture_memory(address, N as u64)
+                            .map_err(compilation)?,
+                    )
+                } else {
+                    None
+                };
+                self.address = address;
+                self.mapping = Some([
+                    memory.image_space_id(),
+                    memory.mapping_generation(),
+                    residency.device_memory().generation(),
+                ]);
+            }
+            self.address = address;
+            let mut bytes = [0; N];
+            if let Some(span) = self.pointer {
+                let (device, host) = span.at(address, N as u64).expect("retained input extent");
+                residency.flush_read_span(device, N as u64)?;
+                if self.mapping
+                    != Some([
+                        memory.image_space_id(),
+                        memory.mapping_generation(),
+                        residency.device_memory().generation(),
+                    ])
+                {
+                    self.mapping = None;
+                    continue;
+                }
+                // The consuming mapping owner retains RAM. Coherence was resolved
+                // and the physical translation revalidated before this raw read.
+                unsafe {
+                    host.read_into(&mut bytes);
+                }
+            } else {
+                residency.read_captured_memory(
+                    self.capture.as_ref().expect("fragmented input"),
+                    &mut bytes,
+                )?;
+            }
+            if self.mapping
+                != Some([
+                    memory.image_space_id(),
+                    memory.mapping_generation(),
+                    residency.device_memory().generation(),
+                ])
+            {
+                self.mapping = None;
+                continue;
+            }
+            let changed = relocated || bytes != self.bytes;
+            self.bytes = bytes;
+            return Ok(changed);
         }
-        let changed = relocated || bytes != self.bytes;
-        self.bytes = bytes;
-        Ok(changed)
     }
 }

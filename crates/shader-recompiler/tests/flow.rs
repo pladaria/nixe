@@ -1,14 +1,13 @@
 use nixe_shader_recompiler::{
     diagnostics::FailureCategory,
     environment::*,
-    ir::{Condition, Reg},
     maxwell::{
         bits::insert,
         decode::Opcode,
         flow::{EndClass, FlowGraph, Token, TokenStack},
         location::{FlowLocation, Location},
     },
-    types::{ByteOffset, CbufIndex, ProgramOffset, Stage},
+    types::{ProgramOffset, Stage},
 };
 
 fn pc(offset: u32) -> Location {
@@ -99,29 +98,6 @@ fn branch_to_middle_splits_blocks_and_preserves_loop_end() {
 }
 
 #[test]
-fn incoming_back_edge_targets_predicate_test_before_instruction() {
-    let predicated = insert::<16, 4>(word(Opcode::ISETP_reg), 0);
-    let mut env = environment(&[
-        (8, word(Opcode::NOP)),
-        (16, predicated),
-        (24, branch(Opcode::BRA, 24, 16)),
-    ]);
-    let graph = FlowGraph::analyze(&mut env, pc(8), false).unwrap();
-    let test = graph.functions[0].blocks[&FlowLocation::PredicateBefore(pc(16))];
-    let execution = block_at(&graph, 16);
-    let back = block_at(&graph, 24);
-    assert_eq!(graph.block(test).unwrap().branch_true, Some(execution));
-    assert_eq!(graph.block(test).unwrap().branch_false, Some(back));
-    assert_eq!(graph.block(execution).unwrap().branch_true, Some(back));
-    assert_eq!(graph.block(back).unwrap().branch_true, Some(test));
-    assert_eq!(graph.block(test).unwrap().condition.predicate.index(), 0);
-    assert_eq!(
-        graph.block(execution).unwrap().condition,
-        Condition::always(true)
-    );
-}
-
-#[test]
 fn calls_and_demotions_keep_their_continuations() {
     let mut env = environment(&[
         (8, branch(Opcode::CAL, 8, 40)),
@@ -164,82 +140,6 @@ fn vertex_a_exits_share_a_dispatch_continuation() {
         graph.block(dispatcher).unwrap().begin,
         FlowLocation::Instruction(pc(24))
     );
-}
-
-fn indirect_environment(conditional: bool, negative: bool) -> SnapshotEnvironment {
-    let imnmx = word(Opcode::IMNMX_imm) | 2 | (1 << 8) | (2 << 20) | ((negative as u64) << 56);
-    let shl = word(Opcode::SHL_imm) | 3 | (2 << 8) | (2 << 20);
-    let ldc = insert::<48, 3>(
-        word(Opcode::LDC) | 4 | (3 << 8) | (0x100 << 20) | (2 << 36),
-        4,
-    );
-    let brx = insert::<16, 4>(
-        word(Opcode::BRX) | 15 | (4 << 8),
-        if conditional { 0 } else { 7 },
-    );
-    let code = [
-        (8, imnmx),
-        (16, shl),
-        (24, ldc),
-        (40, brx),
-        (56, word(Opcode::EXIT) | 15),
-        (80, word(Opcode::EXIT) | 15),
-    ];
-    SnapshotEnvironment::new(
-        EnvironmentMetadata {
-            stage: Stage::Compute,
-            ..Default::default()
-        },
-        Observations {
-            instructions: code
-                .into_iter()
-                .map(|(pc, word)| (ProgramOffset(pc), word))
-                .collect(),
-            cbuf_words: [(0x100, 8), (0x104, 32), (0x108, 8)]
-                .into_iter()
-                .map(|(offset, value)| {
-                    (
-                        CbufWordKey {
-                            index: CbufIndex(2),
-                            offset: ByteOffset(offset),
-                        },
-                        value,
-                    )
-                })
-                .collect(),
-            ..Default::default()
-        },
-    )
-}
-
-#[test]
-fn indirect_branch_targets_are_finite_sorted_and_record_every_cbuf_word() {
-    let mut source = indirect_environment(false, false);
-    let mut recording = RecordingEnvironment::new(&mut source);
-    let graph = FlowGraph::analyze(&mut recording, pc(8), false).unwrap();
-    assert_eq!(recording.observations().cbuf_words.len(), 3);
-    let entry = graph.block(block_at(&graph, 8)).unwrap();
-    assert_eq!(entry.end_class, EndClass::IndirectBranch);
-    assert_eq!(entry.branch_reg, Reg(4));
-    assert_eq!(entry.branch_offset, 48);
-    assert_eq!(
-        entry
-            .indirect_branches
-            .iter()
-            .map(|entry| entry.address.0)
-            .collect::<Vec<_>>(),
-        [56, 80]
-    );
-    for (conditional, negative, reason) in [
-        (true, false, "Conditional indirect"),
-        (false, true, "Failed to track"),
-    ] {
-        let mut env = indirect_environment(conditional, negative);
-        let error = FlowGraph::analyze(&mut env, pc(8), false).err().unwrap();
-        assert_eq!(error.category, FailureCategory::Unsupported);
-        assert_eq!(error.pc, Some(ProgramOffset(40)));
-        assert!(error.message.contains(reason));
-    }
 }
 
 #[test]

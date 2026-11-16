@@ -19,6 +19,7 @@ pub(crate) use conversion::stage as helper_stage;
 mod budget;
 mod cpu_readback;
 mod decoded_texture;
+mod descriptor_table;
 mod dma;
 pub(crate) mod execution;
 mod format;
@@ -234,6 +235,30 @@ pub struct ResidencyStatistics {
     pub image_view_allocations: u64,
     pub buffer_merges: u64,
     pub evictions: u64,
+    #[cfg(feature = "performance-counters")]
+    pub mutable_input_reads: u64,
+    #[cfg(feature = "performance-counters")]
+    pub mutable_input_relocations: u64,
+    #[cfg(feature = "performance-counters")]
+    pub mutable_input_span_reuses: u64,
+    #[cfg(feature = "performance-counters")]
+    pub descriptor_reads: u64,
+    #[cfg(feature = "performance-counters")]
+    pub descriptor_relocations: u64,
+    #[cfg(feature = "performance-counters")]
+    pub descriptor_changes: u64,
+    #[cfg(feature = "performance-counters")]
+    pub descriptor_contiguous_reads: u64,
+    #[cfg(feature = "performance-counters")]
+    pub descriptor_fragmented_reads: u64,
+    #[cfg(feature = "performance-counters")]
+    pub descriptor_mapping_retries: u64,
+    #[cfg(feature = "performance-counters")]
+    pub descriptor_selection_invalidations: u64,
+    #[cfg(feature = "performance-counters")]
+    pub sampled_slot_resolves: u64,
+    #[cfg(feature = "performance-counters")]
+    pub sampled_slot_keeps: u64,
 }
 /// Concrete single-owner storage, selected once at startup. No generic backend
 /// handle registry, virtual resource dispatch or guest-ISA branch in its hot path.

@@ -402,7 +402,7 @@ impl GpuAddressSpace {
     fn capture(&self, address: u64, bytes: u64) -> Result<GpuCapture, MemoryError> {
         let end = address
             .checked_add(bytes)
-            .filter(|&end| bytes != 0 && end <= VA_END)
+            .filter(|&end| end <= VA_END)
             .ok_or(MemoryError::Invalid("invalid GPU access range"))?;
         let mut at = address;
         let mut leases = Vec::new();
@@ -646,23 +646,54 @@ impl<'a> GpuMemory<'a> {
         &self,
         address: u64,
         bytes: u64,
-    ) -> nixe_gpu_ampere::Result<Option<(u64, nixe_memory::HostAddress)>> {
+    ) -> nixe_gpu_ampere::Result<Option<nixe_gpu::native::ReadSpan>> {
+        if bytes == 0 {
+            return Ok(None);
+        }
         let end = address
             .checked_add(bytes)
             .filter(|&end| end <= VA_END)
             .ok_or("native read overflow")?;
-        let device = if address >= VA_END - PAGE_SIZE {
+        let mapping = if address >= VA_END - PAGE_SIZE {
             self.sync_mapping
                 .as_ref()
-                .map(|m| m.address() + address - (VA_END - PAGE_SIZE))
+                .map(|m| (VA_END - PAGE_SIZE, VA_END, m.address()))
         } else {
             self.mappings
                 .range(..=address)
                 .next_back()
                 .filter(|(_, m)| m.end >= end)
-                .map(|(&start, m)| m.physical.address() + address - start)
+                .map(|(&start, m)| (start, m.end, m.physical.address()))
         };
-        Ok(device.and_then(|device| self.memory.span(device, bytes).map(|host| (device, host))))
+        let Some((start, limit, device)) = mapping else {
+            return Ok(None);
+        };
+        // A moving constant-buffer word can reuse the current mapped page.
+        // Validate existing RAM only: do not commit or read additional pages.
+        let page = address / PAGE_SIZE * PAGE_SIZE;
+        if end <= page + PAGE_SIZE {
+            let base = page.max(start);
+            let count = (page + PAGE_SIZE).min(limit) - base;
+            let device = device + base - start;
+            if let Some(host) = self.memory.span(device, count) {
+                return Ok(Some(nixe_gpu::native::ReadSpan {
+                    address: base,
+                    bytes: count,
+                    device,
+                    host,
+                }));
+            }
+        }
+        let device = device + address - start;
+        Ok(self
+            .memory
+            .span(device, bytes)
+            .map(|host| nixe_gpu::native::ReadSpan {
+                address,
+                bytes,
+                device,
+                host,
+            }))
     }
 }
 impl std::ops::Deref for GpuMemory<'_> {
@@ -694,7 +725,7 @@ impl nixe_gpu_ampere::RenderMemory for GpuMemory<'_> {
         &mut self,
         address: u64,
         bytes: u64,
-    ) -> nixe_gpu_ampere::Result<Option<(u64, nixe_memory::HostAddress)>> {
+    ) -> nixe_gpu_ampere::Result<Option<nixe_gpu::native::ReadSpan>> {
         self.commit(address, bytes)
             .map_err(|e| e.to_string().into_boxed_str())?;
         self.mapped_read_span(address, bytes)

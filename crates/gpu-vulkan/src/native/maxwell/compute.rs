@@ -30,7 +30,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
         launch: &model::MaxwellResolvedComputeLaunch,
         space: &MaxwellGpuMemory,
         groups: [u32; 3],
-        images: &mut smallvec::SmallVec<[crate::residency::execution::ShaderImage; 64]>,
+        memo: &mut super::reuse::SampledTextures,
     ) -> Result<(), crate::VulkanError> {
         use crate::VulkanError as V;
         let via_header = launch.texture_pool.is_some_and(|p| p.via_header_index);
@@ -46,8 +46,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
             launch.texture_pool.map(|p| (p.address, p.maximum_index)),
             sampler_pool.map(|p| (p.address, p.maximum_index)),
         );
-        let mut computed = smallvec::SmallVec::<[u32; 64]>::new();
-        computed.resize(self.resources.computed_handle_count, 0);
+        let computed = &mut memo.computed_handles;
         if !computed.is_empty() {
             super::handles::HandleReader::new(
                 execution,
@@ -55,7 +54,7 @@ impl crate::native::pipeline_cache::ComputePipeline {
                 &self.resources.stages[5],
                 super::handles::HandleBuffers::Compute(launch),
             )
-            .evaluate(&mut computed)?;
+            .evaluate(computed)?;
         }
         for slot in &self.resources.stages[5].uniforms {
             let (address, size) = launch.constant_buffer(slot.slot as u8).map_err(|reason| {
@@ -103,40 +102,9 @@ impl crate::native::pipeline_cache::ComputePipeline {
             super::handles::HandleBuffers::Compute(launch),
             &self.resources.stages[5],
             5,
-            &computed,
+            computed,
         )?;
-        let mut textures =
-            smallvec::SmallVec::<[super::textures::ShaderTexture; 64]>::with_capacity(
-                self.resources.texture_count,
-            );
-        let buffers = super::handles::HandleBuffers::Compute(launch);
-        for slot in &self.resources.stages[5].images {
-            let (handle, consumed) =
-                super::handles::read_handle(space, buffers, &slot.handle, &computed)?;
-            let sampler = if slot.sampler {
-                Some(execution.shader_sampler(
-                    true,
-                    space,
-                    if via_header {
-                        handle & 0xfffff
-                    } else {
-                        handle >> 20
-                    },
-                )?)
-            } else {
-                None
-            };
-            textures.push(super::textures::ShaderTexture {
-                handle: consumed,
-                index: handle & 0xfffff,
-                dimension: slot.dimension,
-                depth: slot.depth,
-                descriptor: slot.descriptor,
-                sampler,
-                storage_format: slot.storage_format,
-            });
-        }
-        execution.fill_shader_images(true, space, &textures, images)
+        Ok(())
     }
     pub(in crate::native) fn dispatch(
         &self,
@@ -152,24 +120,62 @@ impl crate::native::pipeline_cache::ComputePipeline {
             .runtime
             .device
             .realize_deferred_clear()?;
-        let mut images = smallvec::SmallVec::new();
-        self.configure_resources(execution, launch, space, groups, &mut images)?;
-        execution
-            .residency
-            .update_compute_buffers(&self.resources.stages[5], space)?;
-        let push = crate::native::state::ShaderConstants::resources(
-            &self.resources,
-            &images,
-            &execution.residency,
-        );
-        execution.residency.dispatch_guest(
-            pipeline,
-            &self.resources,
-            &images,
-            groups,
-            push.as_bytes(),
-        )?;
-        execution.state.statistics.dispatches += 1;
-        Ok(())
+        let mut memo = self.textures.borrow_mut();
+        loop {
+            execution
+                .residency
+                .texture_cache
+                .bindings
+                .has_deleted_images = false;
+            self.configure_resources(execution, launch, space, groups, &mut memo)?;
+            let before = super::reuse::SampledTextures::identity(execution, space, true);
+            let eligible = self.resources.stages[5].texels.is_empty()
+                && self.resources.stages[5]
+                    .images
+                    .iter()
+                    .all(|i| i.sampler && i.storage_format.is_none());
+            let force = memo.bindings.begin(before, eligible);
+            let mut index = 0;
+            let Some(reused) = memo.prepare_stage(
+                execution,
+                space,
+                &self.resources.stages[5],
+                super::handles::HandleBuffers::Compute(launch),
+                true,
+                launch.texture_pool.is_some_and(|p| p.via_header_index),
+                force,
+                &mut index,
+            )?
+            else {
+                continue;
+            };
+            let after = super::reuse::SampledTextures::identity(execution, space, true);
+            memo.bindings
+                .finish(before, after, reused && !force && eligible);
+            execution
+                .residency
+                .update_compute_buffers(&self.resources.stages[5], space)?;
+            if execution
+                .residency
+                .texture_cache
+                .bindings
+                .has_deleted_images
+            {
+                continue;
+            }
+            let push = memo
+                .bindings
+                .resource_constants(&self.resources, &execution.residency);
+            let images = &memo.bindings.images;
+            execution.residency.dispatch_guest(
+                pipeline,
+                &self.resources,
+                images,
+                groups,
+                push.as_bytes(),
+            )?;
+            execution.state.statistics.dispatches += 1;
+            return Ok(());
+        }
     }
 }

@@ -39,7 +39,10 @@ impl Fetch {
         self.spans.clear();
         view.commit(address, size as u64)
             .map_err(|e| e.to_string().into_boxed_str())?;
-        if let Some((device, host)) = view.mapped_read_span(address, size as u64)? {
+        if let Some((device, host)) = view
+            .mapped_read_span(address, size as u64)?
+            .and_then(|span| span.at(address, size as u64))
+        {
             self.spans.push(Span {
                 offset: 0,
                 bytes: size,
@@ -51,7 +54,10 @@ impl Fetch {
             while offset < size {
                 let at = address + offset as u64;
                 let bytes = (size - offset).min((4096 - (at & 4095)) as usize);
-                let Some((device, host)) = view.mapped_read_span(at, bytes as u64)? else {
+                let Some((device, host)) = view
+                    .mapped_read_span(at, bytes as u64)?
+                    .and_then(|span| span.at(at, bytes as u64))
+                else {
                     return Ok(false);
                 };
                 self.spans.push(Span {

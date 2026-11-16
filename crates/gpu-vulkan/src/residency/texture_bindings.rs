@@ -3,36 +3,132 @@
 //! the texture mutex, without sharing the GPU engine's register flags.
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
 use super::*;
-pub(crate) struct TextureEntry {
-    pub(crate) bytes: [u8; 32],
-    pub(crate) info: Option<nixe_gpu::native::ImageInfo>,
-}
 /// Current TIC entries belong to the channel, not to a shader's descriptor ABI.
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
-#[derive(Default)]
-pub(crate) struct ImageDescriptors {
+pub(crate) struct DescriptorTable<T> {
     pub(crate) table: Option<u64>,
     pub(crate) address_space: Option<u64>,
     pub(crate) maximum: u32,
-    pub(crate) entries: Vec<Option<ImageDescriptor>>,
+    pub(crate) changes: u64,
+    pub(crate) next_revision: u64,
+    pub(crate) entries: Vec<DescriptorRecord<T>>,
+}
+impl<T> Default for DescriptorTable<T> {
+    fn default() -> Self {
+        Self {
+            table: None,
+            address_space: None,
+            maximum: 0,
+            changes: 1,
+            next_revision: 0,
+            entries: Vec::new(),
+        }
+    }
+}
+impl<T> DescriptorTable<T> {
+    pub(crate) fn synchronize(&mut self, space: u64, pool: Option<(u64, u32)>) {
+        let table = pool.map(|p| p.0);
+        let maximum = pool.map_or(0, |p| p.1);
+        if self.table != table || self.address_space != Some(space) || self.maximum != maximum {
+            // A different pool no longer owns these retained fragmented inputs.
+            // Keep the allocation capacity, but release obsolete physical pins.
+            self.entries.clear();
+            self.table = table;
+            self.address_space = Some(space);
+            self.maximum = maximum;
+            self.invalidate();
+        }
+    }
+    pub(crate) fn invalidate(&mut self) {
+        self.changes = self
+            .changes
+            .checked_add(1)
+            .expect("descriptor table revision exhausted");
+    }
+    pub(crate) fn entry(&mut self, index: u32) -> &mut DescriptorRecord<T> {
+        assert!(index <= self.maximum);
+        let index = index as usize;
+        if self.entries.len() <= index {
+            self.entries
+                .resize_with(index + 1, DescriptorRecord::default);
+        }
+        &mut self.entries[index]
+    }
+}
+impl<T: BoundDescriptor> DescriptorTable<T> {
+    /// Preparing one image can invalidate other views after their descriptor
+    /// bytes were read. Validate the bound selection again at its actual use.
+    pub(crate) fn selection(&mut self, index: u32) -> Option<&mut T> {
+        let entry = &mut self.entries[index as usize];
+        if entry.changes != self.changes {
+            if let Some(value) = &mut entry.value {
+                value.invalidate_selection();
+            }
+            self.next_revision = self
+                .next_revision
+                .checked_add(1)
+                .expect("descriptor revision exhausted");
+            entry.revision = self.next_revision;
+            entry.changes = self.changes;
+        }
+        entry.value.as_mut()
+    }
+}
+/// A channel/pool index owns one live descriptor and its physical read location.
+/// Pipeline bindings keep revisions, not copies of these bytes or translations.
+pub(crate) struct DescriptorRecord<T> {
+    pub(crate) source: Option<DescriptorSource>,
+    pub(crate) address: u64,
+    pub(crate) mapping: [u64; 3],
+    pub(crate) changes: u64,
+    pub(crate) revision: u64,
+    pub(crate) bytes: [u8; 32],
+    pub(crate) value: Option<T>,
+}
+impl<T> Default for DescriptorRecord<T> {
+    fn default() -> Self {
+        Self {
+            source: None,
+            address: 0,
+            mapping: [0; 3],
+            changes: 0,
+            revision: 0,
+            bytes: [0; 32],
+            value: None,
+        }
+    }
+}
+#[derive(Clone)]
+pub(crate) enum DescriptorSource {
+    Contiguous {
+        device: u64,
+        host: nixe_memory::HostAddress,
+    },
+    Captured(Arc<nixe_memory::CapturedMemory>),
+    /// Fragmented or partly unmapped GPU memory. Its generation-specific reader
+    /// preserves the memory manager's hole semantics under the consuming owner.
+    Virtual,
+}
+pub(crate) trait BoundDescriptor {
+    fn invalidate_selection(&mut self);
 }
 pub(crate) struct ImageDescriptor {
     /// Array/non-array selections for ordinary and depth-comparison sampling.
     pub(crate) views: [Option<ImageViewId>; 4],
-    pub(crate) raw: TextureEntry,
+    pub(crate) info: Option<nixe_gpu::native::ImageInfo>,
 }
-#[derive(Default)]
-pub(crate) struct SamplerDescriptors {
-    pub(crate) table: Option<u64>,
-    pub(crate) address_space: Option<u64>,
-    pub(crate) maximum: u32,
-    pub(crate) entries: Vec<Option<SamplerDescriptor>>,
+impl BoundDescriptor for ImageDescriptor {
+    fn invalidate_selection(&mut self) {
+        self.views = [None; 4];
+    }
 }
 pub(crate) struct SamplerDescriptor {
     pub(crate) description: nixe_gpu::SamplerDescription,
     /// Independent reduction, comparison-disable and integer-filter variants.
     pub(crate) variants: [Option<vk::Sampler>; 8],
-    pub(crate) bytes: [u8; 32],
+}
+impl BoundDescriptor for SamplerDescriptor {
+    fn invalidate_selection(&mut self) {}
 }
 /// Channel selections and texture contents share the actual texture-cache
 /// mutex, including CPU coherence and native image deletion.
@@ -50,8 +146,8 @@ pub(crate) struct TextureChannel {
     // Only texture-cache operations touch this mask, under its existing mutex.
     // A cleared native selection must be resolved even without a register write.
     pub(crate) invalidated_targets: u16,
-    pub(crate) image_descriptors: [ImageDescriptors; 2],
-    pub(crate) sampler_descriptors: [SamplerDescriptors; 2],
+    pub(crate) image_descriptors: [DescriptorTable<ImageDescriptor>; 2],
+    pub(crate) sampler_descriptors: [DescriptorTable<SamplerDescriptor>; 2],
     pub(crate) render_targets: FramebufferKey,
     pub(crate) render_targets_serial: u64,
     pub(crate) last_framebuffer_serial: u64,
@@ -115,13 +211,9 @@ impl TextureBindings {
         self.has_deleted_images = true;
         let invalidate = |bank: &mut TextureChannel| {
             for table in &mut bank.image_descriptors {
-                for entry in table.entries.iter_mut().flatten() {
-                    for view in &mut entry.views {
-                        if view.is_some_and(|id| removed.contains(&id)) {
-                            *view = None;
-                        }
-                    }
-                }
+                // Deletion can invalidate many channels repeatedly in one draw.
+                // Clear bound selections lazily on their next descriptor read.
+                table.invalidate();
             }
             let mut flags = 0;
             for (slot, current) in bank.render_targets.views.iter_mut().enumerate() {

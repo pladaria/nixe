@@ -308,6 +308,15 @@ pub(crate) struct ShaderImage {
     // Configure captures native handles after those actual owners retain them.
     pub(crate) native: vk::DescriptorImageInfo,
 }
+impl ShaderImage {
+    pub(crate) fn same_selection(self, other: Self) -> bool {
+        self.view == other.view
+            && self.descriptor == other.descriptor
+            && self.native.image_view == other.native.image_view
+            && self.native.sampler == other.native.sampler
+            && self.native.image_layout == other.native.image_layout
+    }
+}
 impl Residency<'_> {
     pub(crate) fn targets_current(&self, targets: &PreparedTargets) -> bool {
         if targets.binding_revision.load(Ordering::Relaxed) == self.texture_cache.binding_revision {

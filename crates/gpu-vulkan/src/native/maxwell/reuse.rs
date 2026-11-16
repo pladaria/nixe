@@ -1,95 +1,25 @@
-//! Pipeline-local sampled selections and the last resolved draw.
-//! https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/texture_cache/texture_cache.h
-//! https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-use super::handles::{ConsumedHandle, HandleBuffers, HandleWord};
+//! Persistent sampled slots and the last resolved draw for the current pipeline.
+use super::handles::HandleBuffers;
 use super::*;
 use crate::VulkanError;
-use crate::native::pipeline_resources::HandleSource;
-use crate::native::{NativeExecution, pipeline_resources::PipelineResources};
-use crate::residency::execution::ShaderImage;
-use nixe_memory::{HostAddress, Machine};
+pub(in crate::native) use crate::native::draw_reuse::{DrawMiss, DrawScope, TextureMiss};
+use crate::native::sampled::{ImageBindings, SampledKey};
+use crate::native::{
+    NativeExecution,
+    pipeline_resources::{PipelineResources, StageResources},
+};
 
-struct RetainedWord {
-    word: HandleWord,
-    pointer: HostAddress,
-}
-impl RetainedWord {
-    fn matches(
-        &self,
-        space: &MaxwellGpuMemory,
-        buffers: HandleBuffers<'_>,
-        source: &crate::native::pipeline_resources::ImageHandle,
-    ) -> bool {
-        buffers
-            .address(space, source.cbuf, source.offset, 4)
-            .ok()
-            .flatten()
-            .is_some_and(|a| a.get() == self.word.address)
-            && unsafe { self.pointer.read_u32(0) } == self.word.raw
-    }
-}
-enum RetainedHandle {
-    Direct {
-        primary: RetainedWord,
-        secondary: Option<RetainedWord>,
-    },
-    Program(u32),
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(usize)]
-pub(in crate::native) enum TextureMiss {
-    Cold,
-    Identity,
-    Handle,
-    Descriptor,
-    Image,
-    Unsupported,
-}
-pub(in crate::native) use crate::native::draw_reuse::DrawMiss;
-use crate::native::draw_reuse::DrawScope;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ReuseStatistics {
-    pub eligible_draws: u64,
-    pub draw_hits: u64,
-    pub pipeline_hits: u64,
-    pub texture_attempts: u64,
-    pub texture_hits: u64,
-    pub memo_builds: u64,
-    pub draw_misses: [u64; 9],
-    pub texture_misses: [u64; 6],
-}
-
-struct Entry {
-    handle: RetainedHandle,
-    tic: HostAddress,
-    tsc: HostAddress,
-    tic_bytes: [u64; 4],
-    tsc_bytes: [u64; 4],
-}
-impl Entry {
-    fn matches(&self) -> bool {
-        // The memo retains the physical arena. Its GPU and device mapping
-        // generations are checked before these instruction-based RAM reads.
-        // No Rust reference to concurrently writable guest memory is formed.
-        unsafe {
-            (0..4).all(|i| self.tic.read_u64(i * 8) == self.tic_bytes[i])
-                && (0..4).all(|i| self.tsc.read_u64(i * 8) == self.tsc_bytes[i])
-        }
-    }
-}
-
-#[derive(Default)]
 pub(in crate::native) struct SampledTextures {
-    pub images: smallvec::SmallVec<[ShaderImage; 4]>,
+    pub bindings: ImageBindings,
     pub computed_handles: Vec<u32>,
-    entries: Vec<Entry>,
-    identity: Option<[u64; 10]>,
-    machine: Option<Machine>,
-    misses: u32,
 }
 impl SampledTextures {
+    pub fn new(resources: &PipelineResources) -> Self {
+        Self {
+            bindings: ImageBindings::new(resources),
+            computed_handles: vec![0; resources.computed_handle_count],
+        }
+    }
     pub fn eligible(resources: &PipelineResources) -> bool {
         resources.stages[..5].iter().all(|stage| {
             stage.texels.is_empty()
@@ -99,220 +29,119 @@ impl SampledTextures {
                     .all(|image| image.sampler && image.storage_format.is_none())
         })
     }
-    fn identity(
+    pub fn identity(
         execution: &NativeExecution<'_>,
         space: &MaxwellGpuMemory,
-        via_header: bool,
-    ) -> [u64; 10] {
-        let cache = &execution.residency.texture_cache;
-        let bank = &cache.bindings.channel;
-        let images = &bank.image_descriptors[0];
-        let samplers = &bank.sampler_descriptors[0];
-        [
-            execution.state.current_context.unwrap(),
-            space.id().get(),
-            space.mapping_generation().get(),
-            space.device_memory().device().generation(),
-            images.table.unwrap_or(0),
-            u64::from(images.maximum),
-            samplers.table.unwrap_or(0),
-            u64::from(samplers.maximum),
-            u64::from(via_header),
-            cache.binding_revision,
-        ]
+        compute: bool,
+    ) -> [u64; 6] {
+        execution.sampled_scope(
+            [
+                space.id().get(),
+                space.mapping_generation().get(),
+                space.device_memory().device().generation(),
+            ],
+            compute,
+        )
     }
-    pub fn validate(
-        &self,
-        execution: &NativeExecution<'_>,
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_stage(
+        &mut self,
+        execution: &mut NativeExecution<'_>,
+        space: &MaxwellGpuMemory,
+        resources: &StageResources,
+        buffers: HandleBuffers<'_>,
+        compute: bool,
+        via_header: bool,
+        force: bool,
+        index: &mut usize,
+    ) -> Result<Option<bool>, VulkanError> {
+        let mut reused = true;
+        for slot in &resources.images {
+            let handle = super::handles::read_handle(
+                execution,
+                space,
+                buffers,
+                &slot.handle,
+                &self.computed_handles,
+            );
+            let handle = handle?;
+            let image = handle & 0xfffff;
+            let sampler = slot
+                .sampler
+                .then_some(if via_header { image } else { handle >> 20 });
+            let limit = execution
+                .residency
+                .texture_cache
+                .bindings
+                .channel
+                .image_descriptors[usize::from(compute)]
+            .maximum;
+            let image_revision = if image <= limit {
+                execution.maxwell_image_descriptor(space, compute, image)?.1
+            } else {
+                0
+            };
+            let sampler_revision = sampler
+                .map(|index| execution.maxwell_sampler_descriptor(space, compute, index))
+                .transpose()?
+                .map_or(0, |(_, revision)| revision);
+            let key = SampledKey {
+                image,
+                sampler,
+                image_revision,
+                sampler_revision,
+            };
+            let Some(same) = self
+                .bindings
+                .update(execution, *index, key, force, |execution| {
+                    execution.resolve_maxwell_texture(space, slot, compute, image, sampler)
+                })?
+            else {
+                return Ok(None);
+            };
+            reused &= same;
+            *index += 1;
+        }
+        Ok(Some(reused))
+    }
+    pub fn prepare_graphics(
+        &mut self,
+        execution: &mut NativeExecution<'_>,
         space: &MaxwellGpuMemory,
         state: &MaxwellThreeDState,
         resources: &PipelineResources,
         groups: [Option<u8>; 5],
         via_header: bool,
-    ) -> Result<(), TextureMiss> {
-        let Some(identity) = self.identity else {
-            return Err(TextureMiss::Cold);
-        };
-        if identity != Self::identity(execution, space, via_header)
-            || self
-                .machine
-                .as_ref()
-                .is_none_or(|m| m.identity() != space.machine().identity())
-        {
-            return Err(TextureMiss::Identity);
-        }
-        let mut entries = self.entries.iter();
+    ) -> Result<bool, VulkanError> {
+        let before = Self::identity(execution, space, false);
+        let force = self.bindings.begin(before, Self::eligible(resources));
+        let mut reused = !force && Self::eligible(resources);
+        let mut index = 0;
         for (stage, group) in resources.stages[..5].iter().zip(groups) {
             if stage.images.is_empty() {
                 continue;
             }
-            let Some(group) = group else {
-                return Err(TextureMiss::Handle);
-            };
-            let buffers = HandleBuffers::Graphics(state, group);
-            for image in &stage.images {
-                let entry = entries.next().expect("memo handle count");
-                let matches = match (&entry.handle, &image.handle) {
-                    (
-                        RetainedHandle::Direct { primary, secondary },
-                        HandleSource::Direct {
-                            primary: source,
-                            secondary: second,
-                        },
-                    ) => {
-                        primary.matches(space, buffers, source)
-                            && match (secondary, second) {
-                                (Some(word), Some(source)) => word.matches(space, buffers, source),
-                                (None, None) => true,
-                                _ => false,
-                            }
-                    }
-                    (RetainedHandle::Program(value), HandleSource::Program { slot, .. }) => {
-                        self.computed_handles[*slot] == *value
-                    }
-                    _ => false,
-                };
-                if !matches {
-                    return Err(TextureMiss::Handle);
-                }
-                if !entry.matches() {
-                    return Err(TextureMiss::Descriptor);
-                }
-            }
-        }
-        Ok(())
-    }
-    pub fn ready(&self, execution: &NativeExecution<'_>) -> bool {
-        self.images.iter().all(|image| {
-            image
-                .view
-                .is_some_and(|view| execution.residency.sampled_image_ready(view))
-        })
-    }
-    pub fn prepare(&mut self, execution: &mut NativeExecution<'_>) -> Result<bool, VulkanError> {
-        let revision = execution.residency.texture_cache.binding_revision;
-        for image in &self.images {
-            let Some(view) = image.view else {
+            let group = group.ok_or(VulkanError::InvalidResource(
+                "image stage has no constant-buffer group",
+            ))?;
+            let Some(same) = self.prepare_stage(
+                execution,
+                space,
+                stage,
+                HandleBuffers::Graphics(state, group),
+                false,
+                via_header,
+                force,
+                &mut index,
+            )?
+            else {
                 return Ok(false);
             };
-            if execution.prepare_shader_texture_view(view)? != view
-                || revision != execution.residency.texture_cache.binding_revision
-                || execution
-                    .residency
-                    .texture_cache
-                    .bindings
-                    .has_deleted_images
-            {
-                self.identity = None;
-                return Ok(false);
-            }
+            reused &= same;
         }
-        Ok(true)
-    }
-    pub fn miss(&mut self) -> bool {
-        self.identity = None;
-        self.misses = self.misses.saturating_add(1);
-        self.misses <= 8 || self.misses & 15 == 0
-    }
-    pub fn hit(&mut self) {
-        self.misses = 0;
-    }
-    pub fn remember(
-        &mut self,
-        execution: &NativeExecution<'_>,
-        space: &MaxwellGpuMemory,
-        textures: &[super::textures::ShaderTexture],
-        via_header: bool,
-    ) -> bool {
-        self.identity = None;
-        self.entries.clear();
-        let identity = Self::identity(execution, space, via_header);
-        let bank = &execution.residency.texture_cache.bindings.channel;
-        let images = &bank.image_descriptors[0];
-        let samplers = &bank.sampler_descriptors[0];
-        let pointer = |address: u64, size: u64| {
-            if (address & (nixe_memory::PAGE_SIZE - 1)) + size > nixe_memory::PAGE_SIZE {
-                return None;
-            }
-            space.pointer(space.address(address).ok()?, size)
-        };
-        for (texture, image) in textures.iter().zip(&self.images) {
-            let retain = |word: HandleWord| {
-                pointer(word.address, 4).map(|pointer| RetainedWord { word, pointer })
-            };
-            let handle = match texture.handle {
-                ConsumedHandle::Direct { primary, secondary } => {
-                    let Some(primary) = retain(primary) else {
-                        return false;
-                    };
-                    let secondary = if let Some(word) = secondary {
-                        let Some(word) = retain(word) else {
-                            return false;
-                        };
-                        Some(word)
-                    } else {
-                        None
-                    };
-                    if unsafe { primary.pointer.read_u32(0) } != primary.word.raw
-                        || secondary
-                            .as_ref()
-                            .is_some_and(|w| unsafe { w.pointer.read_u32(0) } != w.word.raw)
-                    {
-                        return false;
-                    }
-                    RetainedHandle::Direct { primary, secondary }
-                }
-                ConsumedHandle::Program(value) => RetainedHandle::Program(value),
-            };
-            if image.view.is_none() {
-                return false;
-            }
-            let Some(tic) = images
-                .entries
-                .get(texture.index as usize)
-                .and_then(Option::as_ref)
-            else {
-                return false;
-            };
-            let Some(sampler) = texture.sampler else {
-                return false;
-            };
-            let Some(tsc) = samplers
-                .entries
-                .get(sampler as usize)
-                .and_then(Option::as_ref)
-            else {
-                return false;
-            };
-            let pointers = pointer(images.table.unwrap() + u64::from(texture.index) * 32, 32).zip(
-                pointer(samplers.table.unwrap() + u64::from(sampler) * 32, 32),
-            );
-            let Some((tic_host, tsc_host)) = pointers else {
-                return false;
-            };
-            let words = |bytes: &[u8; 32]| {
-                std::array::from_fn(|i| {
-                    u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
-                })
-            };
-            let entry = Entry {
-                handle,
-                tic: tic_host,
-                tsc: tsc_host,
-                tic_bytes: words(&tic.raw.bytes),
-                tsc_bytes: words(&tsc.bytes),
-            };
-            if !entry.matches() {
-                return false;
-            }
-            self.entries.push(entry);
-        }
-        if identity != Self::identity(execution, space, via_header) {
-            return false;
-        }
-        self.machine = Some(space.machine().clone());
-        self.identity = Some(identity);
-        true
+        debug_assert_eq!(index, self.bindings.images.len());
+        let after = Self::identity(execution, space, false);
+        Ok(self.bindings.finish(before, after, reused))
     }
 }
 

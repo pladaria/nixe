@@ -1,6 +1,6 @@
 //! Shared descriptor admission and physical image/sampler selections.
 use super::*;
-use crate::residency::texture_bindings::{ImageDescriptor, SamplerDescriptor, TextureEntry};
+use crate::residency::texture_bindings::{ImageDescriptor, SamplerDescriptor};
 use nixe_gpu::nvidia::TextureDimension as Dimension;
 fn failed(error: impl std::fmt::Display) -> VulkanError {
     VulkanError::Compilation(error.to_string().into())
@@ -20,32 +20,14 @@ impl NativeExecution<'_> {
             .bindings
             .channel
             .image_descriptors[bank];
-        let base = image.map(|p| p.0);
-        let maximum = image.map_or(0, |p| p.1);
-        if images.table != base || images.address_space != Some(space) || images.maximum != maximum
-        {
-            images.entries.clear();
-            images.table = base;
-            images.maximum = maximum;
-            images.address_space = Some(space);
-        }
+        images.synchronize(space, image);
         let samplers = &mut self
             .residency
             .texture_cache
             .bindings
             .channel
             .sampler_descriptors[bank];
-        let base = sampler.map(|p| p.0);
-        let maximum = sampler.map_or(0, |p| p.1);
-        if samplers.table != base
-            || samplers.address_space != Some(space)
-            || samplers.maximum != maximum
-        {
-            samplers.entries.clear();
-            samplers.table = base;
-            samplers.maximum = maximum;
-            samplers.address_space = Some(space);
-        }
+        samplers.synchronize(space, sampler);
     }
     pub(in crate::native) fn prepare_shader_texture_view(
         &mut self,
@@ -64,10 +46,23 @@ impl NativeExecution<'_> {
         compute: bool,
         required: Dimension,
         index: u32,
-        bytes: [u8; 32],
         tiling: nixe_gpu::nvidia::TextureTiling,
     ) -> Result<Option<usize>, VulkanError> {
         let bank = usize::from(compute);
+        self.residency
+            .texture_cache
+            .bindings
+            .channel
+            .image_descriptors[bank]
+            .selection(index);
+        let bytes = self
+            .residency
+            .texture_cache
+            .bindings
+            .channel
+            .image_descriptors[bank]
+            .entries[index as usize]
+            .bytes;
         let words = std::array::from_fn(|i| {
             u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
         });
@@ -82,16 +77,10 @@ impl NativeExecution<'_> {
                 .bindings
                 .channel
                 .image_descriptors[bank];
-            if table.entries.len() <= index as usize {
-                table.entries.resize_with(index as usize + 1, || None);
-            }
-            if table.entries[index as usize]
-                .as_ref()
-                .is_none_or(|entry| entry.raw.bytes != bytes)
-            {
-                table.entries[index as usize] = Some(ImageDescriptor {
+            if table.entries[index as usize].value.is_none() {
+                table.entries[index as usize].value = Some(ImageDescriptor {
                     views: [None; 4],
-                    raw: TextureEntry { bytes, info: None },
+                    info: None,
                 });
             }
             return Ok(None);
@@ -145,9 +134,7 @@ impl NativeExecution<'_> {
             .image_descriptors[bank]
             .entries
             .get(index as usize)
-            .and_then(Option::as_ref)
-            .map(|entry| &entry.raw)
-            .is_some_and(|raw| raw.bytes == bytes);
+            .is_some_and(|entry| entry.value.is_some());
         if !current {
             let info = nixe_gpu::nvidia::sampled_image_info(dimension, index, bytes, tiling)
                 .map_err(|error| failed(format_args!("{error}; TIC={words:08x?}")))?;
@@ -157,15 +144,9 @@ impl NativeExecution<'_> {
                 .bindings
                 .channel
                 .image_descriptors[bank];
-            if table.entries.len() <= index as usize {
-                table.entries.resize_with(index as usize + 1, || None);
-            }
-            table.entries[index as usize] = Some(ImageDescriptor {
+            table.entries[index as usize].value = Some(ImageDescriptor {
                 views: [None; 4],
-                raw: TextureEntry {
-                    bytes,
-                    info: Some(info),
-                },
+                info: Some(info),
             });
         }
         Ok(Some(view_kind))
@@ -179,6 +160,12 @@ impl NativeExecution<'_> {
         depth: bool,
     ) -> Result<ImageViewId, VulkanError> {
         let bank = usize::from(compute);
+        self.residency
+            .texture_cache
+            .bindings
+            .channel
+            .image_descriptors[bank]
+            .selection(index);
         let view_kind = view_kind | (usize::from(depth) << 1);
         if let Some(view) = self
             .residency
@@ -187,6 +174,7 @@ impl NativeExecution<'_> {
             .channel
             .image_descriptors[bank]
             .entries[index as usize]
+            .value
             .as_ref()
             .unwrap()
             .views[view_kind]
@@ -200,9 +188,9 @@ impl NativeExecution<'_> {
             .channel
             .image_descriptors[bank]
             .entries[index as usize]
+            .value
             .as_ref()
             .unwrap()
-            .raw
             .info
             .as_ref()
             .unwrap()
@@ -252,6 +240,7 @@ impl NativeExecution<'_> {
             .channel
             .image_descriptors[bank]
             .entries[index as usize]
+            .value
             .as_mut()
             .unwrap()
             .views[view_kind] = Some(view);
@@ -261,34 +250,20 @@ impl NativeExecution<'_> {
         &mut self,
         compute: bool,
         index: u32,
-        bytes: [u8; 32],
     ) -> Result<u32, VulkanError> {
-        let bank = usize::from(compute);
-        let current = self
+        let table = &mut self
             .residency
             .texture_cache
             .bindings
             .channel
-            .sampler_descriptors[bank]
-            .entries
-            .get(index as usize)
-            .and_then(Option::as_ref)
-            .is_some_and(|entry| entry.bytes == bytes);
-        if !current {
-            let description = nixe_gpu::nvidia::decode_sampler(index, bytes).map_err(failed)?;
-            let table = &mut self
-                .residency
-                .texture_cache
-                .bindings
-                .channel
-                .sampler_descriptors[bank];
-            if table.entries.len() <= index as usize {
-                table.entries.resize_with(index as usize + 1, || None);
-            }
-            table.entries[index as usize] = Some(SamplerDescriptor {
+            .sampler_descriptors[usize::from(compute)];
+        let entry = &mut table.entries[index as usize];
+        if entry.value.is_none() {
+            let description =
+                nixe_gpu::nvidia::decode_sampler(index, entry.bytes).map_err(failed)?;
+            entry.value = Some(SamplerDescriptor {
                 description,
                 variants: [None; 8],
-                bytes,
             });
         }
         Ok(index)
@@ -311,6 +286,7 @@ impl NativeExecution<'_> {
             .channel
             .sampler_descriptors[bank]
             .entries[index as usize]
+            .value
             .as_ref()
             .unwrap();
         let mut description = entry.description;
@@ -349,6 +325,7 @@ impl NativeExecution<'_> {
             .channel
             .sampler_descriptors[bank]
             .entries[index as usize]
+            .value
             .as_mut()
             .unwrap()
             .variants[variant] = Some(native);

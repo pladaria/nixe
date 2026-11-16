@@ -15,6 +15,27 @@ pub(in crate::native) enum DrawMiss {
     Content,
 }
 
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub(in crate::native) enum TextureMiss {
+    Cold,
+    Identity,
+    Handle,
+    Descriptor,
+    Image,
+    Unsupported,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReuseStatistics {
+    pub eligible_draws: u64,
+    pub draw_hits: u64,
+    pub pipeline_hits: u64,
+    pub texture_attempts: u64,
+    pub texture_hits: u64,
+    pub draw_misses: [u64; 9],
+    pub texture_misses: [u64; 6],
+}
+
 #[derive(Clone, Copy)]
 pub(in crate::native) struct DrawScope {
     channel: Option<u64>,

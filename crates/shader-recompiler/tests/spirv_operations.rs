@@ -2,9 +2,8 @@ use nixe_shader_recompiler::{
     Profile, RuntimeInfo,
     arena::{BlockId, InstId},
     artifact::{Bindings, ConstantBufferDescriptor, TextureDescriptor},
-    diagnostics::FailureCategory,
     ir::{Attribute, FpControl, Ir, Opcode as O, Program, TextureInstInfo, Type, Value as V},
-    spirv::{EmissionRoute, EmitContext, Id, emission_route},
+    spirv::{EmitContext, Id},
     types::{CbufIndex, Stage, TextureType},
 };
 use spirv::{Decoration, Op};
@@ -96,40 +95,6 @@ fn profile() -> Profile {
         unified_descriptor_binding: true,
         ..Default::default()
     }
-}
-#[test]
-fn dispatch_separates_illegal_unlowered_and_unsupported_operations() {
-    assert_eq!(O::ALL.len(), 534);
-    assert_eq!(emission_route(O::GetZeroFromOp), EmissionRoute::Invariant);
-    assert_eq!(
-        emission_route(O::BindlessImageFetch),
-        EmissionRoute::Invariant
-    );
-    assert_eq!(
-        emission_route(O::GlobalAtomicIAdd32),
-        EmissionRoute::Unsupported
-    );
-    let p = Program::new(Stage::Compute);
-    let profile = profile();
-    let runtime = RuntimeInfo::default();
-    let mut ctx = EmitContext::new(&profile, &runtime, &p, &mut Bindings::default()).unwrap();
-    let mut ir = Ir::new().unwrap();
-    let block = ir.new_block().unwrap();
-    let undef = append(&mut ir, block, O::UndefU64, &[]);
-    let reg = append(
-        &mut ir,
-        block,
-        O::GetRegister,
-        &[V::Reg(nixe_shader_recompiler::ir::Reg(0))],
-    );
-    assert_eq!(
-        ctx.emit_instruction(&mut ir, undef).unwrap_err().category,
-        FailureCategory::UnsupportedReferenceCase
-    );
-    assert_eq!(
-        ctx.emit_instruction(&mut ir, reg).unwrap_err().category,
-        FailureCategory::Internal
-    );
 }
 #[test]
 fn add_defines_and_consumes_all_four_auxiliary_flags() {

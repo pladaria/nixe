@@ -113,32 +113,58 @@ pub(super) fn read_into(
     bytes: &mut [u8],
 ) -> Result<(), VulkanError> {
     let count = bytes.len();
-    if let Some((device, host)) = memory
-        .read_span(address, count as u64)
-        .map_err(compilation)?
-    {
-        residency.flush_read_span(device, count as u64)?;
-        // The caller owns the GPU address space throughout consumption. Its
-        // mappings retain both physical RAM and CPU sharing, including aliases.
-        unsafe {
-            host.read_into(bytes);
-        }
+    if count == 0 {
         return Ok(());
     }
-    let capture = memory
-        .capture_memory(address, count as u64)
-        .map_err(|error| {
-            compilation(format!(
-                "native memory read at {address:#x}, {count} bytes: {error}"
-            ))
-        })?;
-    residency
-        .read_captured_memory(&capture, bytes)
-        .map_err(|error| {
-            compilation(format!(
-                "coherent native read at {address:#x}, {count} bytes: {error}"
-            ))
-        })
+    loop {
+        let source = memory
+            .read_span(address, count as u64)
+            .map_err(compilation)?;
+        let identity = [
+            memory.image_space_id(),
+            memory.mapping_generation(),
+            residency.device_memory().generation(),
+        ];
+        if let Some((device, host)) = source.and_then(|span| span.at(address, count as u64)) {
+            residency.flush_read_span(device, count as u64)?;
+            if identity
+                != [
+                    memory.image_space_id(),
+                    memory.mapping_generation(),
+                    residency.device_memory().generation(),
+                ]
+            {
+                continue;
+            }
+            // The consuming mapping owner retains the physical RAM. Coherence
+            // cannot authorize dereferencing a translation it just invalidated.
+            unsafe { host.read_into(bytes) };
+        } else {
+            let capture = memory
+                .capture_memory(address, count as u64)
+                .map_err(|error| {
+                    compilation(format!(
+                        "native memory read at {address:#x}, {count} bytes: {error}"
+                    ))
+                })?;
+            residency
+                .read_captured_memory(&capture, bytes)
+                .map_err(|error| {
+                    compilation(format!(
+                        "coherent native read at {address:#x}, {count} bytes: {error}"
+                    ))
+                })?;
+        }
+        if identity
+            == [
+                memory.image_space_id(),
+                memory.mapping_generation(),
+                residency.device_memory().generation(),
+            ]
+        {
+            return Ok(());
+        }
+    }
 }
 
 pub(super) struct EnvironmentReader<'a, 'b, M> {
@@ -219,7 +245,7 @@ impl<M: RenderMemory> Environment for EnvironmentReader<'_, '_, M> {
             textures::texture_words(
                 self.residency,
                 self.memory,
-                self.registers,
+                self.metadata.stage == Stage::Compute,
                 handle.0,
                 self.linked,
             )
@@ -234,7 +260,7 @@ impl<M: RenderMemory> Environment for EnvironmentReader<'_, '_, M> {
             textures::texture_words(
                 self.residency,
                 self.memory,
-                self.registers,
+                self.metadata.stage == Stage::Compute,
                 handle.0,
                 self.linked,
             )

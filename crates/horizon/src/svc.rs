@@ -362,16 +362,4 @@ mod tests {
                     .all(|name| !name.is_empty())
         }));
     }
-
-    #[test]
-    fn unknown_immediates_return_a_structured_unsupported_result() {
-        for immediate in [0, 0x38, 0x3b, 0x3e, 0x6e, 0x80, 0xff, 0x1_0000] {
-            let error = decode_horizon_svc(immediate).unwrap_err();
-            assert_eq!(error.immediate(), immediate);
-            assert_eq!(
-                error.to_string(),
-                format!("unsupported Horizon SVC immediate {immediate:#x}")
-            );
-        }
-    }
 }

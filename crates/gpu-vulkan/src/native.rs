@@ -35,6 +35,7 @@ mod completion;
 mod draw_reuse;
 mod pipeline_cache;
 pub(crate) mod pipeline_resources;
+mod sampled;
 
 pub(crate) mod maxwell;
 pub(crate) use maxwell::blending::Blending;
@@ -56,7 +57,7 @@ pub struct NativeExecutionStatistics {
     pub submits: u64,
     pub dispatches: u64,
     pub dynamic_state_refreshes: u64,
-    pub reuse: maxwell::reuse::ReuseStatistics,
+    pub reuse: draw_reuse::ReuseStatistics,
 }
 pub struct NativeGpuExecution {
     // The fencing thread joins before the native timeline is destroyed.
@@ -571,6 +572,31 @@ impl NativeExecution<'_> {
                 queue.recording_wait_ns,
                 0,
             );
+            let stats = self.residency.statistics();
+            nixe_gpu::trace::event(
+                "frame_input_locations",
+                stats.mutable_input_reads,
+                stats.mutable_input_relocations,
+                stats.mutable_input_span_reuses,
+            );
+            nixe_gpu::trace::event(
+                "frame_descriptor_reads",
+                stats.descriptor_reads,
+                stats.descriptor_relocations,
+                stats.descriptor_changes,
+            );
+            nixe_gpu::trace::event(
+                "frame_descriptor_sources",
+                stats.descriptor_contiguous_reads,
+                stats.descriptor_fragmented_reads,
+                stats.descriptor_mapping_retries,
+            );
+            nixe_gpu::trace::event(
+                "frame_sampled_slots",
+                stats.sampled_slot_resolves,
+                stats.sampled_slot_keeps,
+                stats.descriptor_selection_invalidations,
+            );
         }
         let reuse = self.state.statistics.reuse;
         nixe_gpu::trace::event(
@@ -583,7 +609,7 @@ impl NativeExecution<'_> {
             "frame_texture_reuse",
             reuse.texture_attempts,
             reuse.texture_hits,
-            reuse.memo_builds,
+            reuse.texture_attempts - reuse.texture_hits,
         );
         for (index, reasons) in reuse.draw_misses.chunks_exact(3).enumerate() {
             nixe_gpu::trace::event(

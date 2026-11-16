@@ -294,24 +294,32 @@ impl Residency<'_> {
         }
         Ok(())
     }
+    pub(crate) fn prepare_guest_image(
+        &mut self,
+        pipeline: &NativePipeline,
+        image: &ShaderImage,
+    ) -> Result<(), VulkanError> {
+        if let Some(view) = image.view {
+            let id = self.texture_cache.views[view].image;
+            let scope = pipeline.resources[image.descriptor];
+            if scope.writes() {
+                self.mark_image_modified(id)?;
+            }
+            self.shader_image(id)?;
+        } else if !self.runtime.device.profile().null_descriptor {
+            return Err(VulkanError::InvalidResource(
+                "null guest image requires nullDescriptor support",
+            ));
+        };
+        Ok(())
+    }
     pub(crate) fn configure_guest_images(
         &mut self,
         pipeline: &NativePipeline,
         images: &[ShaderImage],
     ) -> Result<(), VulkanError> {
         for image in images {
-            if let Some(view) = image.view {
-                let id = self.texture_cache.views[view].image;
-                let scope = pipeline.resources[image.descriptor];
-                if scope.writes() {
-                    self.mark_image_modified(id)?;
-                }
-                self.shader_image(id)?;
-            } else if !self.runtime.device.profile().null_descriptor {
-                return Err(VulkanError::InvalidResource(
-                    "null guest image requires nullDescriptor support",
-                ));
-            };
+            self.prepare_guest_image(pipeline, image)?;
             self.runtime.descriptor_queue.write(
                 image.descriptor,
                 DescriptorEntry {

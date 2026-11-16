@@ -103,7 +103,7 @@ impl DiskKey {
 }
 enum Loaded {
     Graphics(Box<Key>, Box<Pipeline>),
-    Compute(u64, Arc<super::super::compute::Pipeline>),
+    Compute(u64, Box<super::super::compute::Pipeline>),
 }
 impl Cache {
     pub(in crate::native) fn load(
@@ -199,7 +199,7 @@ impl Cache {
                                 observations.remove(0).1,
                                 Some(worker),
                             )?;
-                            Ok(Loaded::Compute(hash, Arc::new(pipeline)))
+                            Ok(Loaded::Compute(hash, Box::new(pipeline)))
                         }
                         DiskKey::Compute(_) => {
                             Err(compilation("invalid native compute environment"))
@@ -234,7 +234,7 @@ impl Cache {
                         .pipelines
                         .entry((hash, scale[0], scale[1]))
                         .or_default()
-                        .push(pipeline);
+                        .push(Rc::from(pipeline));
                     loaded += 1;
                 }
                 Err(error) => log::warn!("cached native pipeline construction: {error}"),

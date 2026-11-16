@@ -79,7 +79,10 @@ impl Binding {
                             base == 0 || end <= base || address >= base.saturating_add(bytes)
                         })
                 })
-                && let Some((device, _)) = memory.read_span(address, size).map_err(compilation)?
+                && let Some((device, _)) = memory
+                    .read_span(address, size)
+                    .map_err(compilation)?
+                    .and_then(|span| span.at(address, size))
                 && let Some(physical) = residency.device_memory().physical_address(device)
                 && !self.pool_spans.intersects(physical.get(), size)
             {

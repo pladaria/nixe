@@ -248,13 +248,11 @@ impl Residency<'_> {
     /// A resolved sampled view can bypass preparation only while both its RAM
     /// contents and every physical alias are current. The texture lock covers
     /// this decision and the draw that consumes it.
-    pub(crate) fn sampled_image_ready(&self, view: ImageViewId) -> bool {
+    pub(crate) fn sampled_image_ready(&self, view: ImageViewId) -> Option<bool> {
         let cache = &self.texture_cache;
-        let Some(view) = cache.views.get(view) else {
-            return false;
-        };
+        let view = cache.views.get(view)?;
         let image = cache.get(view.image);
-        image.synchronized && image.aliases_current
+        Some(image.synchronized && image.aliases_current)
     }
     /// Refresh CPU contents and aliases before consumption, or discard them
     /// for a full clear. Modification belongs to the image, not its rectangles.

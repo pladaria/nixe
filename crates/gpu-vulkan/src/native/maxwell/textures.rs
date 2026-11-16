@@ -2,87 +2,120 @@
 //! bytes; unchanged native selections survive shader and pipeline changes.
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
 use super::*;
+use crate::residency::texture_bindings::{
+    BoundDescriptor, DescriptorSource, DescriptorTable, TextureChannel,
+};
 use crate::{VulkanError, residency::ImageViewId};
 use ash::vk;
 use nixe_gpu::nvidia::TextureDimension as Dimension;
-
-/// A consumed handle is retained while FillImageViews resolves the cache.
-/// Eviction retries do not re-read constant buffers or sampler descriptors.
-pub(in crate::native) struct ShaderTexture {
-    pub(super) handle: super::handles::ConsumedHandle,
-    pub(in crate::native) index: u32,
-    pub(in crate::native) dimension: Dimension,
-    pub(in crate::native) descriptor: usize,
-    pub(in crate::native) sampler: Option<u32>,
-    pub(in crate::native) depth: bool,
-    pub(in crate::native) storage_format: Option<nixe_shader_recompiler::types::ImageFormat>,
-}
 
 fn failed(error: impl Display) -> VulkanError {
     VulkanError::Compilation(error.to_string().into())
 }
 impl super::super::NativeExecution<'_> {
-    fn read_texture_descriptor(
-        space: &MaxwellGpuMemory,
-        address: u64,
-    ) -> Result<[u8; 32], VulkanError> {
-        let address = space.address(address).map_err(failed)?;
-        let mut bytes = [0; 32];
-        space
-            .read_into_unsafe(address, &mut bytes)
-            .map_err(failed)?;
-        Ok(bytes)
-    }
-    // Eden ConfigureImpl gathers handles/samplers first; FillImageViews repeats
-    // only view resolution and PrepareImageView when an image was deleted.
-    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L219-L240
-    pub(in crate::native) fn fill_shader_images<
-        A: smallvec::Array<Item = crate::residency::execution::ShaderImage>,
-    >(
+    fn read_maxwell_descriptor<T: BoundDescriptor>(
         &mut self,
-        compute: bool,
+        mut space: &MaxwellGpuMemory,
+        index: u32,
+        table: impl for<'a> Fn(&'a mut TextureChannel) -> &'a mut DescriptorTable<T>,
+    ) -> Result<([u8; 32], u64), VulkanError> {
+        self.residency.read_descriptor(
+            &mut space,
+            index,
+            table,
+            |space, device| {
+                [
+                    space.id().get(),
+                    space.mapping_generation().get(),
+                    device.generation(),
+                ]
+            },
+            |space, device, address| {
+                let guest = space.address(address).map_err(failed)?;
+                space.checked_add(guest, 31).map_err(failed)?;
+                if address % nixe_memory::PAGE_SIZE + 32 <= nixe_memory::PAGE_SIZE
+                    && let Some(device_address) = space.image_device_address(address)?
+                    && let Some(host) = device.span(device_address, 32)
+                {
+                    return Ok(DescriptorSource::Contiguous {
+                        device: device_address,
+                        host,
+                    });
+                }
+                Ok(DescriptorSource::Virtual)
+            },
+            |residency, space, address, bytes| {
+                for (guest, count) in space.image_mapped_ranges(address, 32)? {
+                    if let Some(device) = space.image_device_address(guest)? {
+                        residency.flush_read_span(device, count)?;
+                    }
+                }
+                space
+                    .read_into_unsafe(space.address(address).map_err(failed)?, bytes)
+                    .map_err(failed)
+            },
+        )
+    }
+    pub(in crate::native) fn maxwell_image_descriptor(
+        &mut self,
         space: &MaxwellGpuMemory,
-        textures: &[ShaderTexture],
-        images: &mut smallvec::SmallVec<A>,
-    ) -> Result<(), VulkanError> {
-        images.clear();
-        images.reserve(textures.len());
-        loop {
-            self.residency.texture_cache.bindings.has_deleted_images = false;
-            images.clear();
-            for texture in textures {
-                let view = self.shader_texture_view(
-                    compute,
-                    space,
-                    texture.dimension,
-                    texture.index,
-                    texture.depth,
-                )?;
-                let view = if let Some(format) = texture.storage_format {
-                    view.map(|view| self.residency.storage_image_view(view, format))
-                        .transpose()?
-                } else {
-                    view
-                };
-                let sampler = texture
-                    .sampler
-                    .map(|index| self.sampler_for_view(compute, index, view, texture.depth))
-                    .transpose()?;
-                images.push(crate::residency::execution::ShaderImage {
-                    view,
-                    descriptor: texture.descriptor,
-                    native: vk::DescriptorImageInfo::default()
-                        .image_view(view.map_or(vk::ImageView::null(), |id| {
-                            self.residency.texture_cache.views[id].native.handle
-                        }))
-                        .image_layout(vk::ImageLayout::GENERAL)
-                        .sampler(sampler.unwrap_or(vk::Sampler::null())),
-                });
-            }
-            if !self.residency.texture_cache.bindings.has_deleted_images {
-                return Ok(());
-            }
+        compute: bool,
+        index: u32,
+    ) -> Result<([u8; 32], u64), VulkanError> {
+        self.read_maxwell_descriptor(space, index, |channel| {
+            &mut channel.image_descriptors[usize::from(compute)]
+        })
+    }
+    pub(in crate::native) fn maxwell_sampler_descriptor(
+        &mut self,
+        space: &MaxwellGpuMemory,
+        compute: bool,
+        index: u32,
+    ) -> Result<([u8; 32], u64), VulkanError> {
+        self.read_maxwell_descriptor(space, index, |channel| {
+            &mut channel.sampler_descriptors[usize::from(compute)]
+        })
+    }
+    pub(in crate::native) fn resolve_maxwell_texture(
+        &mut self,
+        space: &MaxwellGpuMemory,
+        slot: &crate::native::pipeline_resources::ImageSlot,
+        compute: bool,
+        index: u32,
+        sampler: Option<u32>,
+    ) -> Result<Option<crate::residency::execution::ShaderImage>, VulkanError> {
+        #[cfg(feature = "performance-counters")]
+        self.residency.note_sampled_slot(false);
+        let view = self.shader_texture_view(compute, space, slot.dimension, index, slot.depth)?;
+        if self.residency.texture_cache.bindings.has_deleted_images {
+            return Ok(None);
         }
+        let view = if let Some(format) = slot.storage_format {
+            view.map(|view| self.residency.storage_image_view(view, format))
+                .transpose()?
+        } else {
+            view
+        };
+        if self.residency.texture_cache.bindings.has_deleted_images {
+            return Ok(None);
+        }
+        let sampler = sampler
+            .map(|index| {
+                self.resolve_shader_sampler(compute, index)?;
+                self.sampler_for_view(compute, index, view, slot.depth)
+            })
+            .transpose()?
+            .unwrap_or(vk::Sampler::null());
+        Ok(Some(crate::residency::execution::ShaderImage {
+            view,
+            descriptor: slot.descriptor,
+            native: vk::DescriptorImageInfo::default()
+                .image_view(view.map_or(vk::ImageView::null(), |id| {
+                    self.residency.texture_cache.views[id].native.handle
+                }))
+                .image_layout(vk::ImageLayout::GENERAL)
+                .sampler(sampler),
+        }))
     }
     pub(in crate::native) fn shader_texture_view(
         &mut self,
@@ -99,47 +132,17 @@ impl super::super::NativeExecution<'_> {
             .bindings
             .channel
             .image_descriptors[bank];
-        let base = table.table.ok_or(VulkanError::InvalidResource(
-            "shader consumes an unprogrammed TIC table",
-        ))?;
         if index > table.maximum {
             return Ok(None);
         }
-        let bytes = Self::read_texture_descriptor(space, base + u64::from(index) * 32)?;
         let kind = self.admit_shader_texture(
             compute,
             required,
             index,
-            bytes,
             nixe_gpu::nvidia::TextureTiling::Maxwell,
         )?;
         kind.map(|kind| self.resolve_shader_texture(compute, space, index, kind, depth))
             .transpose()
-    }
-    pub(in crate::native) fn shader_sampler(
-        &mut self,
-        compute: bool,
-        space: &MaxwellGpuMemory,
-        index: u32,
-    ) -> Result<u32, VulkanError> {
-        let bank = usize::from(compute);
-        let table = &self
-            .residency
-            .texture_cache
-            .bindings
-            .channel
-            .sampler_descriptors[bank];
-        let base = table.table.ok_or(VulkanError::InvalidResource(
-            "shader consumes an unprogrammed TSC table",
-        ))?;
-        if index > table.maximum {
-            return Err(failed(format_args!(
-                "TSC index {index} exceeds programmed maximum {}",
-                table.maximum
-            )));
-        }
-        let bytes = Self::read_texture_descriptor(space, base + u64::from(index) * 32)?;
-        self.resolve_shader_sampler(compute, index, bytes)
     }
 }
 
@@ -153,7 +156,7 @@ impl super::super::NativeExecution<'_> {
         computed: &[u32],
     ) -> Result<(), VulkanError> {
         for slot in &resources.texels {
-            let (handle, _) = super::handles::read_handle(space, buffers, &slot.handle, computed)?;
+            let handle = super::handles::read_handle(self, space, buffers, &slot.handle, computed)?;
             let index = handle & 0xfffff;
             let table = &self
                 .residency
@@ -164,10 +167,7 @@ impl super::super::NativeExecution<'_> {
             if index > table.maximum {
                 return Err(failed("texel descriptor exceeds TIC table"));
             }
-            let base = table
-                .table
-                .ok_or_else(|| failed("texel buffer has no TIC table"))?;
-            let bytes = Self::read_texture_descriptor(space, base + u64::from(index) * 32)?;
+            let (bytes, _) = self.maxwell_image_descriptor(space, stage == 5, index)?;
             let (address, size, format, element_bytes) =
                 super::super::texels::interpretation(slot, index, bytes)?;
             let source = if address == 0 {

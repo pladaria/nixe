@@ -61,10 +61,8 @@ impl ShaderConstants {
     pub(super) fn graphics(
         resources: &super::pipeline_resources::PipelineResources,
         state: &nixe_gpu_maxwell::engines::threed::MaxwellThreeDState,
-        images: &[crate::residency::execution::ShaderImage],
-        residency: &crate::Residency<'_>,
+        mut constants: Self,
     ) -> Result<Self, VulkanError> {
-        let mut constants = Self::resources(resources, images, residency);
         if resources.uses_render_area {
             let extent = maxwell::registers::surface_extent(state.register_words());
             constants.0[..4]

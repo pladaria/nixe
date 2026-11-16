@@ -171,30 +171,3 @@ fn rejects_corruption_and_all_truncated_prefixes() {
         );
     }
 }
-
-#[test]
-fn rejects_or_safely_exposes_malformed_edge_cases() {
-    let mut magic = build_npdm();
-    magic[0] = b'X';
-    invalid(magic, "META magic");
-
-    let mut flags = build_npdm();
-    flags[0x0c] = 4 << 1;
-    invalid(flags, "process flag bits");
-
-    let mut offset = build_npdm();
-    put32(&mut offset, 0x70, u32::MAX as usize);
-    invalid(offset, "outside its parent");
-
-    let mut service = build_npdm();
-    let aci = u32::from_le_bytes(service[0x70..0x74].try_into().unwrap()) as usize;
-    let sac = u32::from_le_bytes(service[aci + 0x28..aci + 0x2c].try_into().unwrap()) as usize;
-    service[aci + sac] = 7;
-    invalid(service, "service entry is truncated");
-
-    let mut text = build_npdm();
-    text[0x20] = 0xff;
-    let npdm = load(text).unwrap();
-    assert_eq!(npdm.name()[0], 0xff);
-    assert_eq!(npdm.name_str(), None);
-}

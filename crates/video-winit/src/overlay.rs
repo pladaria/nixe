@@ -10,9 +10,21 @@ use winit::{event::WindowEvent, window::Window};
 
 const VOLUME_DURATION: Duration = Duration::from_secs(2);
 
-egui_phosphor::subset! {
-    mod icons {
-        use fill::{SPEAKER_HIGH, SPEAKER_X};
+mod icons {
+    pub(super) use egui_phosphor::variants::fill::{SPEAKER_HIGH, SPEAKER_X};
+
+    const GLYPHS: &[&str] = &[SPEAKER_HIGH, SPEAKER_X];
+    const SOURCE: &[u8] = egui_phosphor::variants::bytes::fill::FONT;
+    const FONT_LEN: usize = egui_phosphor::subset::subset_len(SOURCE, GLYPHS);
+    static FONT: [u8; FONT_LEN] = egui_phosphor::subset::subset_into::<FONT_LEN>(SOURCE, GLYPHS);
+    const FONT_NAME: &str = module_path!();
+
+    pub(super) fn family() -> egui::FontFamily {
+        egui::FontFamily::Name(FONT_NAME.into())
+    }
+
+    pub(super) fn add_as_family(fonts: &mut egui::FontDefinitions) {
+        egui_phosphor::add_font_bytes_as_family(fonts, FONT_NAME, &FONT);
     }
 }
 
@@ -40,7 +52,7 @@ impl Overlay {
         fonts
             .families
             .insert(FontFamily::Monospace, vec!["DejaVu".into()]);
-        icons::fill::add_as_family(&mut fonts);
+        icons::add_as_family(&mut fonts);
         ctx.set_fonts(fonts);
         ctx.set_visuals(egui::Visuals::light());
         let input = egui_winit::State::new(
@@ -163,15 +175,15 @@ impl VolumeNotice {
             Color32::from_rgba_unmultiplied(0x20, 0x20, 0x20, 153),
         );
         let icon = if self.value == 0 {
-            icons::fill::SPEAKER_X
+            icons::SPEAKER_X
         } else {
-            icons::fill::SPEAKER_HIGH
+            icons::SPEAKER_HIGH
         };
         painter.text(
             origin + vec2(40., 28.) * pixel,
             egui::Align2::CENTER_CENTER,
             icon,
-            FontId::new(32. * pixel, icons::fill::family()),
+            FontId::new(32. * pixel, icons::family()),
             Color32::WHITE,
         );
         let bar = Rect::from_min_size(origin + vec2(68., 25.) * pixel, vec2(164., 6.) * pixel);

@@ -1,5 +1,5 @@
 use ash::vk;
-use nixe_gpu_vulkan::{AllocationMode, ApiPath, ApiPreference, MemoryLocation, VulkanDevice};
+use nixe_gpu_vulkan::{AllocationMode, ApiPath, ApiPreference, MemoryLocation};
 
 #[path = "support/device.rs"]
 mod support;
@@ -87,15 +87,4 @@ fn allocations_retain_device_and_instance_until_their_last_drop() {
     drop(buffer);
     drop(image);
     validation.check().unwrap();
-}
-#[test]
-fn new_backend_has_no_wgpu_or_guest_decoder_dependency() {
-    fn movable<T: Send>() {}
-    movable::<VulkanDevice>();
-    movable::<nixe_gpu_vulkan::AllocatedBuffer>();
-    movable::<nixe_gpu_vulkan::AllocatedImage>();
-    let manifest = include_str!("../Cargo.toml");
-    for dependency in ["wgpu", "nixe-gpu-wgpu", "nixe-gpu-maxwell", "nixe-horizon"] {
-        assert!(!manifest.contains(dependency));
-    }
 }

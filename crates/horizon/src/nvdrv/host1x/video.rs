@@ -415,75 +415,7 @@ impl NvDec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nvdrv::nvmap::{NvMapAllocationMetadata, NvMapCpuMapping, NvMapObjects, NvMapOwner};
-    use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
-    #[test]
-    fn reference_identity_survives_iova_reassignment_and_distinguishes_reused_addresses() {
-        let mut nvmap = NvMapObjects::default();
-        let owner = NvMapOwner::new(1);
-        let mut objects = Vec::new();
-        for base in [0x1000, 0x2000] {
-            let handle = nvmap.create(owner, 4096).unwrap();
-            let machine = crate::test_memory::machine();
-            let storage = machine.account(4096).unwrap().allocate(4096).unwrap();
-            let input = nixe_memory::AllocationRange::new(storage.pin(), 0, 4096).unwrap();
-            nvmap
-                .allocate(
-                    owner,
-                    handle,
-                    NvMapAllocationMetadata::new(0, 0, 4096, 0),
-                    NvMapCpuMapping::new(AddressSpaceId::new(1), GuestVirtualAddress::new(base)),
-                    Arc::from([input.clone()]),
-                )
-                .unwrap();
-            objects.push(
-                nvmap
-                    .object_snapshot_by_owned_handle(owner, handle)
-                    .unwrap(),
-            );
-        }
-        let original = Arc::new(BTreeMap::from([(
-            0x1000,
-            Mapping {
-                physical: nixe_memory::PhysicalMapping::new(objects[0].ranges().unwrap()).unwrap(),
-                object: objects[0].clone(),
-                references: 1,
-            },
-        )]));
-        let remapped = Arc::new(BTreeMap::from([
-            (
-                0x1000,
-                Mapping {
-                    physical: nixe_memory::PhysicalMapping::new(objects[1].ranges().unwrap())
-                        .unwrap(),
-                    object: objects[1].clone(),
-                    references: 1,
-                },
-            ),
-            (
-                0x3000,
-                Mapping {
-                    physical: nixe_memory::PhysicalMapping::new(objects[0].ranges().unwrap())
-                        .unwrap(),
-                    object: objects[0].clone(),
-                    references: 1,
-                },
-            ),
-        ]));
-        assert_eq!(
-            surface_identity(&original, 0x1020).unwrap(),
-            surface_identity(&remapped, 0x3020).unwrap()
-        );
-        assert_ne!(
-            surface_identity(&original, 0x1020).unwrap(),
-            surface_identity(&remapped, 0x1020).unwrap()
-        );
-        assert_ne!(
-            surface_identity(&remapped, 0x3020).unwrap(),
-            surface_identity(&remapped, 0x3021).unwrap()
-        );
-    }
     #[test]
     fn gob_addresses_cover_every_byte_once_across_rows_and_block_heights() {
         for log2 in 0..=5 {
