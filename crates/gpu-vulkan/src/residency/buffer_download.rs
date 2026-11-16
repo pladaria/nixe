@@ -260,6 +260,13 @@ impl BufferCache {
                 "GPU buffer writes require a mapped device-address range",
             ))?
             + offset;
+        #[cfg(feature = "performance-counters")]
+        nixe_gpu::trace::detail_event(
+            "readback_producer",
+            address,
+            bytes,
+            self.buffers[id].write_tick,
+        );
         self.note_uniform_gpu_write(address, bytes);
         self.memory_tracker.gpu_write(address, bytes);
         self.note_command_write(id, address, bytes);
@@ -329,6 +336,8 @@ impl BufferCache {
         let end = self.next_download_end(download.ticket.work());
         self.read_download_ranges
             .extend(download.write_ranges.iter());
+        #[cfg(feature = "performance-counters")]
+        nixe_gpu::trace::detail_event("readback_prefix", end.serial, end.work.tick(), 1);
         self.read_downloads
             .push_back((end, ReadDownload::new(download)));
         self.pending_read_count
@@ -399,7 +408,11 @@ impl BufferCache {
             .front()
             .is_some_and(|(next, _)| next.serial <= end.serial)
         {
-            let (_, download) = self.read_downloads.pop_front().unwrap();
+            let (end, download) = self.read_downloads.pop_front().unwrap();
+            #[cfg(feature = "performance-counters")]
+            nixe_gpu::trace::detail_event("readback_finish_prefix", end.serial, end.work.tick(), 1);
+            #[cfg(not(feature = "performance-counters"))]
+            let _ = end;
             // Retire the reader even if publication fails during cancellation.
             let result = self.publish_read_download(download);
             self.pending_read_count
@@ -430,6 +443,9 @@ impl BufferCache {
         for (address, bytes) in download.write_ranges.iter() {
             self.note_uniform_gpu_write(address, bytes);
         }
+        #[cfg(feature = "performance-counters")]
+        let _trace =
+            nixe_gpu::trace::span("readback_publication", download.ticket.work().tick(), 0, 0);
         let staging = download.ticket.completed()?;
         let memory = self.device_memory.machine();
         for publication in download.publications {
@@ -448,6 +464,8 @@ impl BufferCache {
                         .write_ranges
                         .intersections(address, length as u64)
                         .map(|(start, size)| {
+                            #[cfg(feature = "performance-counters")]
+                            nixe_gpu::trace::detail_event("readback_published", start, size, 0);
                             self.canonical_readback_bytes += size;
                             (start - address) as usize..(start - address + size) as usize
                         })
@@ -500,7 +518,6 @@ impl BufferCache {
 enum DownloadKind {
     Fence,
     Read,
-    Synchronous,
 }
 
 impl Residency<'_> {
@@ -517,6 +534,8 @@ impl Residency<'_> {
         let page = nixe_memory::PAGE_SIZE;
         let mut previous_end = 0;
         for (address, bytes) in ranges {
+            #[cfg(feature = "performance-counters")]
+            nixe_gpu::trace::detail_event("readback_requested", address, bytes, kind as u64);
             if bytes == 0 {
                 continue;
             }
@@ -532,10 +551,23 @@ impl Residency<'_> {
                 let entry = &self.buffer_cache.buffers[id];
                 let base = entry.device_address.expect("DAddr buffer index entry");
                 let stop = (base + entry.native.size()).min(end);
+                #[cfg(feature = "performance-counters")]
+                let provenance = {
+                    use ash::vk::Handle;
+                    (entry.native.handle.as_raw(), entry.write_tick)
+                };
                 // GPU ownership is exact. CPU-dirty neighbours on this page do
                 // not make the remaining GPU bytes safe to read from RAM.
                 {
                     let (start, size) = (at, stop - at);
+                    #[cfg(feature = "performance-counters")]
+                    for (at, count) in self
+                        .buffer_cache
+                        .read_download_ranges
+                        .intersections(start, size)
+                    {
+                        nixe_gpu::trace::detail_event("readback_covered", at, count, kind as u64);
+                    }
                     match kind {
                         DownloadKind::Fence => {}
                         DownloadKind::Read => {
@@ -547,11 +579,17 @@ impl Residency<'_> {
                                 download.clean_ranges.subtract(start, size);
                             }
                         }
-                        DownloadKind::Synchronous => {
-                            self.buffer_cache.clear_download(start, size);
-                        }
                     }
                     let mut add_copy = |start: u64, size: u64| -> Result<(), VulkanError> {
+                        #[cfg(feature = "performance-counters")]
+                        {
+                            nixe_gpu::trace::detail_event(
+                                "readback_source",
+                                start,
+                                provenance.0,
+                                provenance.1,
+                            );
+                        }
                         let footprint = self.runtime.device_memory.read_mapping(start, size)?;
                         let inputs = download_inputs(&footprint)?;
                         let target = total;
@@ -619,6 +657,29 @@ impl Residency<'_> {
             .device
             .submission
             .reserve_readback_aligned(total, 64)?;
+        #[cfg(feature = "performance-counters")]
+        for part in &publications {
+            nixe_gpu::trace::detail_event(
+                "readback_copy",
+                part.address,
+                part.bytes,
+                ticket.work().tick(),
+            );
+            if nixe_gpu::trace::detailed_active() {
+                for (offset, input) in &part.inputs {
+                    let mut logical = part.address + offset;
+                    for extent in input.physical_extents() {
+                        nixe_gpu::trace::detail_event(
+                            "readback_physical",
+                            logical,
+                            extent.start.get(),
+                            extent.bytes,
+                        );
+                        logical += extent.bytes;
+                    }
+                }
+            }
+        }
         let target = self.runtime.device.submission.staging_buffer(&slice).handle;
         let mut sources = Vec::with_capacity(groups.len());
         for (id, copies) in &mut groups {
@@ -654,7 +715,26 @@ impl Residency<'_> {
         address: u64,
         bytes: u64,
     ) -> Result<Option<DownloadEnd>, VulkanError> {
+        #[cfg(feature = "performance-counters")]
+        let _trace = nixe_gpu::trace::span("read_buffer_prepare", address, bytes, 0);
+        if bytes == 0 {
+            return Ok(None);
+        }
         self.buffer_cache.publish_completed_reads()?;
+        let page = nixe_memory::PAGE_SIZE;
+        let begin = address / page * page;
+        let end = (address + bytes).div_ceil(page) * page;
+        if !self.buffer_cache.download_cpu_read_ranges
+            && !self
+                .buffer_cache
+                .gpu_modified_ranges
+                .intersects(begin, end - begin)
+        {
+            // Physical-page read marks are conservative and survive publication.
+            // Clean pages need no temporary interval set, buffer lookup or staging scan.
+            // An older reader can still own an ordered snapshot of these bytes.
+            return Ok(self.buffer_cache.pending_read(address, bytes));
+        }
         let ranges = self.buffer_cache.read_ranges(address, bytes);
         if let Some(download) = self.record_buffer_downloads(ranges.iter(), DownloadKind::Read)? {
             self.buffer_cache.enqueue_read_download(download);
@@ -664,25 +744,28 @@ impl Residency<'_> {
         }
         Ok(self.buffer_cache.pending_read(address, bytes))
     }
-    /// Owner-dependent reads synchronize all modified bytes of the affected
-    /// tracker pages and replace older publications before preparation resumes.
-    pub(crate) fn download_buffer_memory(
+    /// A dependent owner read consumes the same ordered snapshots as CPU reads.
+    /// Copies already pending for the current version cover the read; only gaps
+    /// need another reservation/submission. A later producer removes its bytes
+    /// from that coverage and therefore still requires a new, ordered copy.
+    #[cfg_attr(feature = "performance-counters", track_caller)]
+    pub(crate) fn read_buffer_memory(
         &mut self,
         address: u64,
         bytes: u64,
     ) -> Result<(), VulkanError> {
-        let ranges = self.buffer_cache.read_ranges(address, bytes);
-        if let Some(download) =
-            self.record_buffer_downloads(ranges.iter(), DownloadKind::Synchronous)?
-        {
-            let work = download.ticket.work();
-            self.flush()?;
-            self.runtime
-                .device
-                .wait_for_work(work, std::time::Duration::MAX)?;
-            self.buffer_cache.publish_fence_download(download)?;
+        #[cfg(feature = "performance-counters")]
+        let _trace = nixe_gpu::trace::span("read_buffer_sync", address, bytes, 0);
+        if let Some(end) = self.prepare_buffer_read(address, bytes)? {
+            self.complete_buffer_read(end)?;
         }
         Ok(())
+    }
+    fn complete_buffer_read(&mut self, end: DownloadEnd) -> Result<(), VulkanError> {
+        self.runtime
+            .device
+            .wait_for_work(end.work(), std::time::Duration::MAX)?;
+        self.buffer_cache.publish_reads_through(end)
     }
     pub(super) fn finish_buffer_reads(
         &mut self,
@@ -690,10 +773,7 @@ impl Residency<'_> {
         bytes: u64,
     ) -> Result<(), VulkanError> {
         if let Some(end) = self.buffer_cache.pending_read(address, bytes) {
-            self.runtime
-                .device
-                .wait_for_work(end.work(), std::time::Duration::MAX)?;
-            self.buffer_cache.publish_reads_through(end)?;
+            self.complete_buffer_read(end)?;
         }
         Ok(())
     }

@@ -327,6 +327,9 @@ impl Residency<'_> {
                 }
             }
         }
+        #[cfg(feature = "performance-counters")]
+        let _trace = (!ids.is_empty())
+            .then(|| nixe_gpu::trace::span("read_texture", address, bytes, ids.len() as u64));
         self.download_images(ids)
     }
     pub(super) fn preserve_texture_writes(

@@ -754,6 +754,8 @@ impl QueueState {
         ticket: WorkTicket,
         timeout: Duration,
     ) -> Result<bool, VulkanError> {
+        #[cfg(feature = "performance-counters")]
+        let _cost = progress::WaitTrace::new(ticket.tick);
         let deadline = Instant::now().checked_add(timeout);
         let _trace = nixe_gpu::trace::span(
             "timeline_wait",

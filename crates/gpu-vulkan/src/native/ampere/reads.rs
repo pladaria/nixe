@@ -21,6 +21,7 @@ impl<const N: usize> Default for ReadSlot<N> {
     }
 }
 impl<const N: usize> ReadSlot<N> {
+    #[cfg_attr(feature = "performance-counters", track_caller)]
     pub fn update(
         &mut self,
         residency: &mut Residency<'_>,

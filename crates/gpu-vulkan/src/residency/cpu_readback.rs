@@ -59,6 +59,7 @@ impl Residency<'_> {
         self.invalidate_cpu_ranges(ranges.iter().copied(), true)
     }
 
+    #[cfg_attr(feature = "performance-counters", track_caller)]
     pub(crate) fn flush_read_span(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
         if !self
             .runtime
@@ -67,6 +68,8 @@ impl Residency<'_> {
         {
             return Ok(());
         }
+        #[cfg(feature = "performance-counters")]
+        let _trace = nixe_gpu::trace::span("read_coherent", address, bytes, 0);
         self.flush_region(address, bytes)?;
         let memory = self.runtime.device_memory.clone();
         let mut result = Ok(());
@@ -121,11 +124,15 @@ impl Residency<'_> {
     }
     /// Read directly into owner-provided storage after resolving GPU authority.
     /// The capture retains every physical span for the complete access.
+    #[cfg_attr(feature = "performance-counters", track_caller)]
     pub(crate) fn read_captured_memory(
         &mut self,
         capture: &nixe_memory::CapturedMemory,
         destination: &mut [u8],
     ) -> Result<(), VulkanError> {
+        #[cfg(feature = "performance-counters")]
+        let _trace =
+            nixe_gpu::trace::span("read_captured", capture.bytes(), capture.len() as u64, 0);
         if capture.bytes() != destination.len() as u64 {
             return Err(VulkanError::InvalidResource(
                 "owner read size differs from its capture",
@@ -153,7 +160,7 @@ impl Residency<'_> {
     pub(crate) fn flush_region(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
         self.runtime.device.realize_deferred_clear()?;
         self.download_texture_memory(address, bytes)?;
-        self.download_buffer_memory(address, bytes)?;
+        self.read_buffer_memory(address, bytes)?;
         self.caches
             .query_cache
             .lock()
@@ -209,6 +216,9 @@ impl Residency<'_> {
                     "invalid rasterizer flush area",
                 ));
             }
+            #[cfg(feature = "performance-counters")]
+            let _trace =
+                nixe_gpu::trace::span("read_cpu_prepare", area.start, area.end - area.start, 0);
             // Buffer-only reads return after submission. A query store has a
             // real dependency on overlapping read copies and resolves them
             // before publishing its value on this ordered owner boundary.
@@ -291,6 +301,8 @@ impl nixe_memory::PreparedRead for ReadCompletion {
         // https://github.com/zortos293/Lichii/blob/b4b830c8faf1fb5d7b2ad1b892117f4cfd708546/src/video_core/buffer_cache/buffer_cache.h#L789-L819
         let finish = || {
             if let Some(end) = self.end {
+                #[cfg(feature = "performance-counters")]
+                let _trace = nixe_gpu::trace::span("read_cpu_wait", end.work().tick(), 0, 0);
                 self.caches
                     .timeline
                     .wait(&self.caches.progress, end.work().tick())?;

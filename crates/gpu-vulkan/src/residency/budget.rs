@@ -140,7 +140,7 @@ impl Residency<'_> {
             Resource::Buffer(id) => {
                 let entry = self.buffer_cache.get(id);
                 if let Some(address) = entry.device_address {
-                    self.download_buffer_memory(address, entry.native.size())
+                    self.read_buffer_memory(address, entry.native.size())
                 } else {
                     Ok(())
                 }

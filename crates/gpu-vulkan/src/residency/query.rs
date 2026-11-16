@@ -129,6 +129,8 @@ impl QueryCache {
             })
     }
     pub(super) fn flush_region(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
+        #[cfg(feature = "performance-counters")]
+        let _trace = nixe_gpu::trace::span("read_query", address, bytes, 0);
         let end = address.saturating_add(bytes);
         for (&at, query) in self.cached.range(address.saturating_sub(15)..end) {
             if at + query.bytes.len() as u64 > address && !query.invalidated.load(Ordering::Relaxed)

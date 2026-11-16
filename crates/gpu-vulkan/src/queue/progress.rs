@@ -53,6 +53,8 @@ impl Timeline {
     /// Wait without borrowing the scheduler or holding a resource-cache lock.
     /// A finite native wait permits cancellation; a timeout is never completion.
     pub fn wait(&self, progress: &SubmissionProgress, tick: u64) -> Result<(), VulkanError> {
+        #[cfg(feature = "performance-counters")]
+        let _trace = WaitTrace::new(tick);
         while !self.is_done(progress, tick)? {
             if progress.cancelled() {
                 return Err(VulkanError::QueueStopped);
@@ -258,6 +260,51 @@ impl SubmissionProgress {
                     .wait_while(state, |s| s.sequence == sequence)
                     .unwrap();
             }
+        }
+    }
+}
+
+/// Detailed captures distinguish CPU spent polling/recording from descheduled
+/// native waits. Neither clock is read in ordinary or frame-only builds.
+#[cfg(feature = "performance-counters")]
+pub(super) struct WaitTrace {
+    tick: u64,
+    clocks: Option<(Instant, Option<u64>)>,
+}
+#[cfg(feature = "performance-counters")]
+impl WaitTrace {
+    pub(super) fn new(tick: u64) -> Self {
+        Self {
+            tick,
+            clocks: nixe_gpu::trace::detailed_active().then(|| (Instant::now(), Self::cpu_time())),
+        }
+    }
+    fn cpu_time() -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: time is writable and the clock describes this thread.
+            if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) } == 0 {
+                return Some(time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64);
+            }
+        }
+        None
+    }
+}
+#[cfg(feature = "performance-counters")]
+impl Drop for WaitTrace {
+    fn drop(&mut self) {
+        if let Some((wall, cpu)) = self.clocks {
+            let cpu = cpu.zip(Self::cpu_time()).map(|(a, b)| b - a);
+            nixe_gpu::trace::detail_event(
+                "readback_wait_cost",
+                self.tick,
+                wall.elapsed().as_nanos() as u64,
+                cpu.unwrap_or(u64::MAX),
+            );
         }
     }
 }
