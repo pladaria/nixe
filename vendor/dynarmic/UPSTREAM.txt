@@ -5,6 +5,14 @@ License: 0BSD (LICENSE.txt); bundled dependencies retain their own licenses.
 Vendored source including bundled dependencies. Built for A64 by nixe-cpu-jit.
 
 Nixe adaptations:
+- Diagnostic builds only (DYNARMIC_JIT_DIAGNOSTICS, selected by the Rust
+  performance-counters feature): owner-written per-JIT lookup/compile counters,
+  instruction-input fingerprints, phase timings, native mainline/deferred byte
+  counts, and distinct capacity/requested/targeted/fastmem invalidation events.
+  Follows Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160's per-JIT counter
+  ownership; buffered event/epoch analysis is implemented by the native bridge
+  and offline tools. Production builds contain no diagnostic fields, counters,
+  clocks or callbacks. Instruction fingerprints are not used for cache validity.
 - backend/exception_handler{.h,_posix.cpp}: expose cold fault resolution and
   allow nixe to own POSIX signal capture (DYNARMIC_EXTERNAL_FAULT_HANDLER).
 - backend/x64/a64_emit_x64.cpp: check halt/budget at linked and indirect/return
@@ -35,6 +43,11 @@ Nixe adaptations:
   gated by the RCpc CPU feature. A64CheckMemoryAlignment in both host backends
   faults before a misaligned atomic operation; precise memory exits preserve
   earlier setters.
+
+The native bridge selects Lichii's per-JIT code-cache policy: 512 MiB on x64
+except Solaris/NetBSD/DragonFly/OpenBSD; the 128 MiB vendor default remains on
+other hosts. Allocation, demand residency, full/targeted invalidation and
+per-JIT executable ownership use the existing backend, without code sharing.
 
 The Rust/C ABI integration is in crates/cpu-jit. The generic native fault
 capture implementation is shared with the interpreter in cpu-direct-memory.

@@ -20,5 +20,6 @@ if(TARGET Zycore)
 endif()
 
 if(NIXE_PERFORMANCE_COUNTERS)
+  target_compile_definitions(dynarmic PUBLIC DYNARMIC_JIT_DIAGNOSTICS)
   target_compile_definitions(nixe_dynarmic PRIVATE NIXE_PERFORMANCE_COUNTERS)
 endif()

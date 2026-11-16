@@ -23,6 +23,9 @@ struct StateMeasurement {
 #include <memory>
 #include <string>
 #include "state.h"
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+#include "diagnostics.h"
+#endif
 
 using Dynarmic::HaltReason;
 using Dynarmic::A64::Vector;
@@ -54,6 +57,9 @@ struct Core final : Dynarmic::A64::UserCallbacks {
   std::uint64_t tpidr = 0, tpidrro = 0;
   NixeExit exit{};
   Dynarmic::ExclusiveMonitor monitor{1};
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+  std::unique_ptr<JitDiagnostics> diagnostics = JitDiagnostics::open();
+#endif
   std::unique_ptr<Dynarmic::A64::Jit> jit;
 
   Core(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table, size_t address_bits,
@@ -62,6 +68,17 @@ struct Core final : Dynarmic::A64::UserCallbacks {
       : callbacks(cb) {
     Dynarmic::A64::UserConfig conf{};
     conf.callbacks = this;
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__sun__) && \
+    !defined(__NetBSD__) && !defined(__DragonFly__) && !defined(__OpenBSD__)
+    // Reserve enough per-core code space to retain the translated working set.
+    // Backing pages become resident as code is emitted. Invalidation and
+    // ownership stay local, including callbacks and patched branch targets.
+    // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/arm/dynarmic/arm_dynarmic_64.cpp#L374-L379
+    conf.code_cache_size = 512U * 1024 * 1024;
+#endif
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+    conf.diagnostics = diagnostics ? &diagnostics->counters : nullptr;
+#endif
     conf.tpidr_el0 = &tpidr;
     conf.tpidrro_el0 = &tpidrro;
     conf.cntfrq_el0 = frequency;
@@ -366,7 +383,13 @@ bool nixe_dynarmic_run(Core *core, void *context, NixeExit *result) noexcept {
   try {
     core->context = context;
     core->exit = {};
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+    if (core->diagnostics) core->diagnostics->enter();
+#endif
     const auto halt = core->jit->Run();
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+    if (core->diagnostics) core->diagnostics->snapshot();
+#endif
     if (Dynarmic::Has(halt, HaltReason::MemoryAbort) && core->exit.kind == 0) {
       core->exit = {4, 0, core->jit->GetPC()};
     }

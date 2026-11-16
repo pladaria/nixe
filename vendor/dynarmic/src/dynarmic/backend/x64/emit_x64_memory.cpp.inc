@@ -45,6 +45,11 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
     if (iter->second.recompile) {
         const auto marker = iter->second.marker;
         do_not_fastmem.insert(marker);
+#ifdef DYNARMIC_A64_FAULT_DIAGNOSTICS
+        if (conf.diagnostics && GetBasicBlock(std::get<0>(marker))) {
+            conf.diagnostics->invalidate(conf.diagnostics->context, std::get<0>(marker).Value(), true);
+        }
+#endif
         InvalidateBasicBlocks({std::get<0>(marker)});
     }
 

@@ -178,6 +178,9 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     }
     EmitX64::EmitTerminal(block.GetTerminal(), ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
     code.int3();
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+    const auto mainline_end = code.getCurr();
+#endif
 
     for (auto& deferred_emit : ctx.deferred_emits) {
         deferred_emit();
@@ -186,6 +189,12 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     code.int3();
 
     const size_t size = static_cast<size_t>(code.getCurr() - entrypoint);
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+    if (conf.diagnostics) {
+        conf.diagnostics->mainline_bytes += mainline_end - entrypoint;
+        conf.diagnostics->deferred_bytes += code.getCurr() - mainline_end;
+    }
+#endif
 
     const A64::LocationDescriptor descriptor{block.Location()};
     const A64::LocationDescriptor end_location{block.EndLocation()};
@@ -204,7 +213,17 @@ void A64EmitX64::ClearCache() {
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    const auto locations = block_ranges.InvalidateRanges(ranges);
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+    if (conf.diagnostics) {
+        for (const auto descriptor : locations) {
+            if (GetBasicBlock(descriptor)) {
+                conf.diagnostics->invalidate(conf.diagnostics->context, descriptor.Value(), false);
+            }
+        }
+    }
+#endif
+    InvalidateBasicBlocks(locations);
 }
 
 void A64EmitX64::ClearFastDispatchTable() {

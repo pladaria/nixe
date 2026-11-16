@@ -6,6 +6,9 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+#include <chrono>
+#endif
 
 #include <boost/icl/interval_set.hpp>
 #include <mcl/assert.hpp>
@@ -257,23 +260,54 @@ private:
     }
 
     CodePtr GetBlock(IR::LocationDescriptor current_location) {
-        if (auto block = emitter.GetBasicBlock(current_location))
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+        if (conf.diagnostics) ++conf.diagnostics->lookups;
+#endif
+        if (auto block = emitter.GetBasicBlock(current_location)) {
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+            if (conf.diagnostics) ++conf.diagnostics->hits;
+#endif
             return block->entrypoint;
+        }
 
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
             // Immediately evacuate cache
             invalidate_entire_cache = true;
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+            capacity_clear = true;
+#endif
             PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
         // JIT Compile
-        const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+        using Clock = std::chrono::steady_clock;
+        Compilation compilation{.descriptor = current_location.Value(),
+                                .fingerprint = 14695981039346656037ULL};
+        const auto started = Clock::now();
+#endif
+        const auto get_code = [&](u64 vaddr) {
+            const auto value = conf.callbacks->MemoryReadCode(vaddr);
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+            // A diagnostic input fingerprint, never a code-cache validity key.
+            for (const u64 word : {vaddr, value ? u64{*value} : u64{0x100000000ULL}}) {
+                compilation.fingerprint ^= word;
+                compilation.fingerprint *= 1099511628211ULL;
+            }
+#endif
+            return value;
+        };
         A64::Translate(ir_block, A64::LocationDescriptor{current_location}, get_code,
                        {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct,
                         conf.hook_hint_instructions, conf.hook_unknown_hint_instructions, conf.enable_lse, conf.enable_rcpc,
                         conf.enable_pauth});
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+        const auto translated = Clock::now();
+        compilation.guest_bytes = A64::LocationDescriptor{ir_block.EndLocation()}.PC() -
+                                  A64::LocationDescriptor{current_location}.PC();
+#endif
         Optimization::PolyfillPass(ir_block, polyfill_options);
         Optimization::A64CallbackConfigPass(ir_block, conf);
         Optimization::NamingPass(ir_block);
@@ -291,7 +325,25 @@ private:
 #ifdef DYNARMIC_VERIFY_IR
         Optimization::VerificationPass(ir_block);
 #endif
-        return emitter.Emit(ir_block).entrypoint;
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+        const auto optimized = Clock::now();
+        compilation.ir_instructions = ir_block.size();
+#endif
+        const auto emitted = emitter.Emit(ir_block);
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+        if (conf.diagnostics) {
+            const auto duration = [](auto begin, auto end) {
+                return std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
+            };
+            compilation.host_address = reinterpret_cast<std::uintptr_t>(emitted.entrypoint);
+            compilation.native_bytes = emitted.size;
+            compilation.translation_ns = duration(started, translated);
+            compilation.optimization_ns = duration(translated, optimized);
+            compilation.emission_ns = duration(optimized, Clock::now());
+            conf.diagnostics->compile(conf.diagnostics->context, compilation);
+        }
+#endif
+        return emitted.entrypoint;
     }
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
@@ -306,6 +358,10 @@ private:
 
             jit_state.ResetRSB();
             if (invalidate_entire_cache) {
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+                if (conf.diagnostics) conf.diagnostics->clear(conf.diagnostics->context, capacity_clear);
+                capacity_clear = false;
+#endif
                 block_of_code.ClearCache();
                 emitter.ClearCache();
             } else {
@@ -317,6 +373,9 @@ private:
     }
 
     bool is_executing = false;
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+    bool capacity_clear = false;
+#endif
 
     const UserConfig conf;
     A64JitState jit_state;
