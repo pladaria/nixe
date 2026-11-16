@@ -53,6 +53,53 @@ pub struct AtomicAccess {
     pub operation: AtomicOperation,
 }
 impl AtomicAccess {
+    /// Execute a naturally aligned operation on canonical, coherent RAM.
+    ///
+    /// # Safety
+    /// The caller validates a width of 1, 2, 4, 8 or 16, retains that many
+    /// initialized bytes and resolves device ownership before entering. Guest
+    /// RAM must not be borrowed as a Rust reference while these instructions run.
+    pub(crate) unsafe fn apply_at(self, address: *mut u8) -> AccessResult {
+        self.before();
+        let (previous, written) = match self.operation {
+            AtomicOperation::CompareExchange {
+                expected,
+                replacement,
+            } => {
+                let mask = u128::MAX >> (128 - u32::from(self.bytes) * 8);
+                let expected = expected & mask;
+                let previous = unsafe {
+                    crate::raw::compare_exchange(
+                        address,
+                        self.bytes as usize,
+                        expected,
+                        replacement & mask,
+                    )
+                };
+                (previous, previous == expected)
+            }
+            AtomicOperation::ReadModifyWrite { .. } => {
+                let mut previous = unsafe { crate::raw::read_value(address, self.bytes as usize) };
+                loop {
+                    let (replacement, _) = self.update(previous);
+                    let observed = unsafe {
+                        crate::raw::compare_exchange(
+                            address,
+                            self.bytes as usize,
+                            previous,
+                            replacement,
+                        )
+                    };
+                    if observed == previous {
+                        break (previous, true);
+                    }
+                    previous = observed;
+                }
+            }
+        };
+        self.after();
+        AccessResult::Atomic { previous, written }
+    }
     pub(crate) fn update(self, current: u128) -> (u128, bool) {
         let mask = u128::MAX >> (128 - u32::from(self.bytes) * 8);
         match self.operation {

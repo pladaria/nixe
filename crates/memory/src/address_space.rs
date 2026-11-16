@@ -1103,21 +1103,37 @@ impl AddressSpace {
         unsafe { self.write_admitted(start.get(), end, source) };
         Ok(Access::Ready(()))
     }
-    pub fn has_cached_pages(
+    /// Ordinary RAM atomics use the canonical page-table pointer under native
+    /// admission. Only cached pages need retained ranges and owner resolution.
+    /// Successful generated fastmem atomics do not enter this callback path.
+    pub fn atomic_native(
         &self,
         native: &NativeAdmission<'_>,
         start: GuestVirtualAddress,
-        bytes: u64,
-    ) -> Result<bool, MemoryError> {
+        operation: crate::AtomicAccess,
+    ) -> Result<Option<crate::AccessResult>, MemoryError> {
         if !std::ptr::eq(self, native.address_space()) || !native.is_active() {
             return Err(MemoryError::Invalid(
-                "CPU cache query requires native admission",
+                "native atomic requires active admission for this address space",
             ));
         }
-        let end = self.range(start, bytes)?;
-        Ok((start.get() & !(PAGE_SIZE - 1)..end)
-            .step_by(PAGE_SIZE as usize)
-            .any(|at| entry_cached(unsafe { self.raw_entry(at) })))
+        let bytes = u64::from(operation.bytes);
+        if !matches!(bytes, 1 | 2 | 4 | 8 | 16) || !start.get().is_multiple_of(bytes) {
+            return Err(MemoryError::Invalid(
+                "native atomic has invalid width or alignment",
+            ));
+        }
+        self.range(start, bytes)?;
+        let raw = unsafe { self.raw_entry(start.get()) };
+        // An exclusive store requires write permission, including on a checked
+        // write-only page. Natural alignment keeps every supported width in one page.
+        require_entry(raw, start, MemoryPermissions::WRITE)?;
+        if entry_cached(raw) {
+            return Ok(None);
+        }
+        Ok(Some(unsafe {
+            operation.apply_at(entry_pointer(raw, start.get()))
+        }))
     }
     /// Complete ordinary stores or collect cache-dependent overwrites without
     /// leaving native execution. Immutable observation invalidation and collection
@@ -1160,10 +1176,15 @@ impl AddressSpace {
             )?;
             let pointer = entry_pointer(raw, page);
             let physical = (pointer as usize - base) as u64;
-            if entry_cached(raw)
-                && native.cpu_writes().last_gpu_page.load(Ordering::Acquire) != physical / PAGE_SIZE
-            {
-                return Ok(false);
+            if entry_cached(raw) {
+                // Selecting a different owner clears the last-page shortcut
+                // before it can authorize collection for the new rasterizer.
+                if native.gpu_binding().is_none()
+                    || native.cpu_writes().last_gpu_page.load(Ordering::Acquire)
+                        != physical / PAGE_SIZE
+                {
+                    return Ok(false);
+                }
             }
             cached_collection |= entry_cached(raw);
             physical_pages[index] = ArenaOffset::new(physical);
@@ -1291,7 +1312,7 @@ impl AddressSpace {
         }
         self.range(start, bytes as u64)?;
         if start.get() % PAGE_SIZE + bytes as u64 > PAGE_SIZE {
-            return Ok(None);
+            return self.read_native_split(native, start, bytes);
         }
         let raw = unsafe { self.raw_entry(start.get()) };
         let source = entry_pointer(raw, start.get());
@@ -1315,6 +1336,62 @@ impl AddressSpace {
         // The unmarked pointer already carries direct native eligibility. A
         // cached pointer reaches this load only after its DAddr area is ready.
         Ok(Some(unsafe { crate::raw::read_value(source, bytes) }))
+    }
+
+    #[cold]
+    fn read_native_split(
+        &self,
+        native: &NativeAdmission<'_>,
+        start: GuestVirtualAddress,
+        bytes: usize,
+    ) -> Result<Option<u128>, MemoryError> {
+        let first_bytes = (PAGE_SIZE - start.get() % PAGE_SIZE) as usize;
+        let second = start.get() + first_bytes as u64;
+        let entries = [
+            (start.get(), first_bytes, unsafe {
+                self.raw_entry(start.get())
+            }),
+            (second, bytes - first_bytes, unsafe {
+                self.raw_entry(second)
+            }),
+        ];
+        for &(address, _, raw) in &entries {
+            require_entry(
+                raw,
+                GuestVirtualAddress::new(address),
+                MemoryPermissions::READ,
+            )?;
+        }
+        let base = self
+            .machine()
+            .arena()
+            .host_address(ArenaOffset::new(0), 0)
+            .unwrap()
+            .as_ptr() as usize;
+        for &(address, count, raw) in &entries {
+            if entry_cached(raw)
+                && !native.prepare_read(Extent {
+                    start: ArenaOffset::new((entry_pointer(raw, address) as usize - base) as u64),
+                    bytes: count as u64,
+                })
+            {
+                return Ok(None);
+            }
+        }
+        let mut result = [0; 16];
+        let mut offset = 0;
+        for (address, count, raw) in entries {
+            // Each checked page remains retained by native admission, including
+            // fragmented physical mappings. Guest RAM never becomes a slice.
+            unsafe {
+                crate::raw::capture(
+                    entry_pointer(raw, address),
+                    &mut result[offset..offset + count],
+                );
+            }
+            offset += count;
+        }
+        Ok(Some(u128::from_le_bytes(result)))
     }
 
     pub fn write_value(
@@ -1361,8 +1438,8 @@ impl AddressSpace {
         }
         Ok(Access::Ready(()))
     }
-    /// A host/kernel atomic captures its physical operation before leaving
-    /// translation admission. Native callbacks use capture_native instead.
+    /// Host/kernel atomics retain only operations that must leave translation
+    /// admission for cache resolution. Ordinary RAM executes in place.
     pub fn atomic(
         &self,
         start: GuestVirtualAddress,
@@ -1374,7 +1451,18 @@ impl AddressSpace {
                 "atomic access has invalid width or alignment",
             ));
         }
-        let ranges = self.capture(start, bytes, MemoryPermissions::READ_WRITE)?;
+        let end = self.range(start, bytes)?;
+        let access = self.quiescence.enter_host()?;
+        let raw = unsafe { self.raw_entry(start.get()) };
+        require_entry(raw, start, MemoryPermissions::READ_WRITE)?;
+        if !entry_cached(raw) {
+            return Ok(Access::Ready(unsafe {
+                operation.apply_at(entry_pointer(raw, start.get()))
+            }));
+        }
+        let ranges =
+            unsafe { self.capture_admitted(start.get(), end, MemoryPermissions::READ_WRITE) }?;
+        drop(access);
         self.machine()
             .access_captured(&ranges, AccessOperation::Atomic(operation))
     }

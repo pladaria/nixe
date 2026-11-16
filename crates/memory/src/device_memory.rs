@@ -74,6 +74,83 @@ pub trait DeviceMemoryInterface: Send + Sync + std::fmt::Debug {
     fn unmap_memory(&self, address: u64, bytes: u64);
     fn on_cpu_write(&self, address: u64, bytes: u64) -> bool;
 }
+/// Retained only during an admitted CPU invocation or a physical operation.
+/// Binding rejects replacement while either owner is live, so an upgraded
+/// selection remains authoritative without locking the registries again.
+pub(crate) struct CpuBinding {
+    pub device: DeviceMemory,
+    pub interface: Arc<dyn DeviceMemoryInterface>,
+}
+pub(crate) struct WeakCpuBinding {
+    device: Weak<Inner>,
+    interface: Weak<dyn DeviceMemoryInterface>,
+}
+impl CpuBinding {
+    pub fn resolve(machine: &Machine) -> Option<Self> {
+        let device = machine.gpu_device_memory()?;
+        let interface = device.interface()?;
+        Some(Self { device, interface })
+    }
+    pub fn downgrade(&self) -> WeakCpuBinding {
+        WeakCpuBinding {
+            device: Arc::downgrade(&self.device.0),
+            interface: Arc::downgrade(&self.interface),
+        }
+    }
+    pub fn must_flush(&self, extent: crate::Extent, scratch: &RefCell<Vec<u32>>) -> bool {
+        let mut flush = false;
+        self.device
+            .apply_on_physical(extent, scratch, |address, bytes| {
+                flush |= self.interface.must_flush_region(address, bytes);
+            });
+        flush
+    }
+    pub fn notify_write(
+        &self,
+        extents: impl Iterator<Item = crate::Extent>,
+        scratch: &RefCell<Vec<u32>>,
+    ) -> bool {
+        let mut collect = false;
+        for extent in extents {
+            self.device
+                .apply_on_physical(extent, scratch, |address, bytes| {
+                    collect |= self.interface.on_cpu_write(address, bytes);
+                });
+        }
+        collect
+    }
+    /// Captures survive native suspension and remapping. Check current physical
+    /// aliases rather than the cached flag from the old virtual translation.
+    pub fn notify_cached_write(
+        &self,
+        extents: impl Iterator<Item = crate::Extent>,
+        scratch: &RefCell<Vec<u32>>,
+    ) -> bool {
+        let mut collect = false;
+        for extent in extents {
+            self.device
+                .apply_on_physical(extent, scratch, |mut address, mut bytes| {
+                    while bytes != 0 {
+                        let count = bytes.min(PAGE_SIZE - address % PAGE_SIZE);
+                        if self.device.cached_count(address) != 0 {
+                            collect |= self.interface.on_cpu_write(address, count);
+                        }
+                        address += count;
+                        bytes -= count;
+                    }
+                });
+        }
+        collect
+    }
+}
+impl WeakCpuBinding {
+    pub fn upgrade(&self) -> Option<CpuBinding> {
+        Some(CpuBinding {
+            device: DeviceMemory(self.device.upgrade()?),
+            interface: self.interface.upgrade()?,
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, Default)]
 struct Page {
     allocation: AllocationId,

@@ -37,9 +37,8 @@ pub(crate) struct Quiescence {
 }
 pub struct CoreContext {
     writes: Arc<crate::cpu_writes::CpuWriteCollector>,
-    // Memory::gpu_device_memory and rasterizer_read_areas belong to the core,
-    // not to each scalar result or the physical allocation tracking system.
-    gpu_device: OnceCell<crate::device_memory::DeviceMemory>,
+    // Idle cores must not retain an old rasterizer or prevent device rebinding.
+    gpu_binding: RefCell<Option<crate::device_memory::WeakCpuBinding>>,
     read_area: Cell<crate::NativeReadArea>,
     read_generation: Cell<[u64; 2]>,
     device_address_scratch: RefCell<Vec<u32>>,
@@ -51,6 +50,7 @@ pub struct CoreContext {
 pub struct NativeAdmission<'a> {
     context: &'a CoreContext,
     active: Cell<bool>,
+    gpu_binding: OnceCell<crate::device_memory::CpuBinding>,
     _not_send: PhantomData<Rc<()>>,
 }
 pub(crate) struct HostAdmission<'a>(&'a Quiescence);
@@ -105,7 +105,7 @@ impl Quiescence {
         self.cores.lock().unwrap().push(Arc::downgrade(&slot));
         CoreContext {
             writes: owner.machine().cpu_writes().register(),
-            gpu_device: OnceCell::new(),
+            gpu_binding: RefCell::new(None),
             read_area: Cell::new(crate::NativeReadArea::default()),
             read_generation: Cell::new([0; 2]),
             device_address_scratch: RefCell::new(Vec::new()),
@@ -302,6 +302,7 @@ impl CoreContext {
         Ok(NativeAdmission {
             context: self,
             active: Cell::new(true),
+            gpu_binding: OnceCell::new(),
             _not_send: PhantomData,
         })
     }
@@ -315,17 +316,35 @@ impl NativeAdmission<'_> {
     pub(crate) fn cpu_writes(&self) -> &crate::cpu_writes::CpuWriteCollector {
         &self.context.writes
     }
-    fn gpu_device(&self) -> Option<&crate::device_memory::DeviceMemory> {
-        if self.context.gpu_device.get().is_none() {
-            let device = self.context.space.machine().gpu_device_memory()?;
-            let _ = self.context.gpu_device.set(device);
+    pub(crate) fn gpu_binding(&self) -> Option<&crate::device_memory::CpuBinding> {
+        if self.gpu_binding.get().is_none() {
+            let mut selected = self.context.gpu_binding.borrow_mut();
+            if let Some(binding) = selected.as_ref().and_then(|binding| binding.upgrade()) {
+                let _ = self.gpu_binding.set(binding);
+            } else {
+                self.context.read_area.set(crate::NativeReadArea::default());
+                self.context.read_generation.set([0; 2]);
+                self.cpu_writes()
+                    .last_gpu_page
+                    .store(u64::MAX, Ordering::Release);
+                let binding =
+                    crate::device_memory::CpuBinding::resolve(self.address_space().machine());
+                *selected = binding.as_ref().map(|binding| binding.downgrade());
+                if let Some(binding) = binding {
+                    let _ = self.gpu_binding.set(binding);
+                }
+            }
         }
-        self.context.gpu_device.get()
+        self.gpu_binding.get()
+    }
+    pub(crate) fn device_address_scratch(&self) -> &RefCell<Vec<u32>> {
+        &self.context.device_address_scratch
     }
     pub(crate) fn prepare_read(&self, extent: crate::Extent) -> bool {
-        let Some(device) = self.gpu_device() else {
+        let Some(binding) = self.gpu_binding() else {
             return false;
         };
+        let device = &binding.device;
         self.refresh_read_area(device);
         let mut ready = true;
         device.apply_on_physical(
@@ -335,10 +354,7 @@ impl NativeAdmission<'_> {
                 if !ready || self.context.read_area.get().contains(address, bytes) {
                     return;
                 }
-                let Some(area) = device
-                    .interface()
-                    .and_then(|rasterizer| rasterizer.try_on_cpu_read(address, bytes))
-                else {
+                let Some(area) = binding.interface.try_on_cpu_read(address, bytes) else {
                     ready = false;
                     return;
                 };
@@ -362,12 +378,12 @@ impl NativeAdmission<'_> {
         extents: &[crate::Extent],
         write: impl FnOnce(),
     ) -> Result<bool, MemoryError> {
-        let Some(device) = self.gpu_device() else {
+        let Some(binding) = self.gpu_binding() else {
             return Ok(false);
         };
         self.cpu_writes().write(
             self.address_space().machine(),
-            device,
+            &binding.device,
             extents,
             &self.context.device_address_scratch,
             write,
@@ -391,9 +407,9 @@ impl NativeAdmission<'_> {
         if !matches!(size, 1 | 2 | 4 | 8 | 16) {
             return Err(MemoryError::Invalid("unsupported native read width").into());
         }
-        if let Some(device) = self.gpu_device()
-            && let Some(rasterizer) = device.interface()
-        {
+        if let Some(binding) = self.gpu_binding() {
+            let device = &binding.device;
+            let rasterizer = &binding.interface;
             self.refresh_read_area(device);
             for extent in ranges
                 .iter()

@@ -18,10 +18,13 @@ pub enum Counter {
     ContextSaves,
     InternalHaltResumes,
     AdmissionNanoseconds,
+    DirectAtomicCallbacks,
+    CapturedMemoryCallbacks,
+    MemoryAdmissionSuspensions,
 }
 #[cfg(feature = "performance-counters")]
-static COUNTERS: [std::sync::atomic::AtomicU64; 16] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+static COUNTERS: [std::sync::atomic::AtomicU64; 19] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 19];
 #[inline]
 pub fn record(counter: Counter, amount: u64) {
     #[cfg(feature = "performance-counters")]
@@ -48,8 +51,11 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         "JitContextSaves",
         "JitInternalHaltResumes",
         "JitAdmissionNanoseconds",
+        "JitDirectAtomicCallbacks",
+        "JitCapturedMemoryCallbacks",
+        "JitMemoryAdmissionSuspensions",
     ];
-    let values: [u64; 16] =
+    let values: [u64; 19] =
         std::array::from_fn(|index| COUNTERS[index].load(std::sync::atomic::Ordering::Relaxed));
     let total = values[Counter::ReadCallbacks as usize]
         + values[Counter::WriteCallbacks as usize]

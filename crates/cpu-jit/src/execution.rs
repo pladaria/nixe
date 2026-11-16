@@ -428,18 +428,47 @@ unsafe extern "C" fn memory(
         {
             return Ok(true);
         }
+        let atomic = (operation == 2).then(|| {
+            let expected = unsafe { u128::from(*expected) | (u128::from(*expected.add(1)) << 64) };
+            AtomicAccess {
+                bytes: bytes as u8,
+                ordering: AccessOrdering::SequentiallyConsistent,
+                operation: AtomicOperation::CompareExchange {
+                    expected,
+                    replacement: input,
+                },
+            }
+        });
+        if let Some(atomic) = atomic
+            && let Some(AccessResult::Atomic { written, .. }) =
+                context
+                    .space
+                    .atomic_native(context.admission, address, atomic)?
+        {
+            record(Counter::DirectAtomicCallbacks, 1);
+            unsafe {
+                *value = u64::from(written);
+            }
+            return Ok(true);
+        }
+        record(Counter::CapturedMemoryCallbacks, 1);
         let ranges =
             context
                 .space
                 .capture_native(context.admission, address, u64::from(bytes), required)?;
         if operation == 0 {
             let admission = context.admission;
+            record(Counter::MemoryAdmissionSuspensions, 1);
             admission.suspend();
             let completed = admission.read_captured::<MemoryAccessFailure>(&ranges, |area| {
                 let operation = AccessOperation::PrepareRead(area);
-                let result = context
-                    .process
-                    .resolve_access(context.space.machine().access_captured(&ranges, operation))?;
+                let result = context.process.resolve_access(
+                    context
+                        .space
+                        .machine()
+                        .request_device_access(ranges.clone(), operation)
+                        .map(nixe_memory::Access::Pending),
+                )?;
                 match result {
                     AccessResult::ReadPrepared(read) => read.finish().map_err(Into::into),
                     _ => Err(MemoryError::Invalid(
@@ -458,28 +487,14 @@ unsafe extern "C" fn memory(
         }
         let access = match operation {
             1 => AccessOperation::Write(input.to_le_bytes()[..bytes as usize].into()),
-            2 => {
-                let expected =
-                    unsafe { u128::from(*expected) | (u128::from(*expected.add(1)) << 64) };
-                AccessOperation::Atomic(AtomicAccess {
-                    bytes: bytes as u8,
-                    ordering: AccessOrdering::SequentiallyConsistent,
-                    operation: AtomicOperation::CompareExchange {
-                        expected,
-                        replacement: input,
-                    },
-                })
-            }
+            2 => AccessOperation::Atomic(atomic.unwrap()),
             _ => unreachable!(),
         };
-        let cached = operation == 1
-            && context
-                .space
-                .has_cached_pages(context.admission, address, u64::from(bytes))?;
+        record(Counter::MemoryAdmissionSuspensions, 1);
         context.admission.suspend();
         let completed = context
             .process
-            .resolve_access(context.admission.access_captured(&ranges, cached, access));
+            .resolve_access(context.admission.access_captured(&ranges, access));
         resume_memory(context)?;
         match completed? {
             AccessResult::Written(_) => Ok(true),

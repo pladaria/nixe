@@ -1,4 +1,5 @@
 //! Physical device coverage and ordered CPU/device RAM access.
+use crate::device_memory::CpuBinding;
 use crate::{AddressSpace, AllocationRange, ArenaOffset, Extent, Machine, MemoryError, PAGE_SIZE};
 use std::sync::{
     Arc, RwLock, Weak,
@@ -290,7 +291,6 @@ impl crate::NativeAdmission<'_> {
     pub fn access_captured(
         &self,
         ranges: &[AllocationRange],
-        cached: bool,
         mut operation: crate::AccessOperation,
     ) -> Result<crate::Access<crate::AccessResult>, MemoryError> {
         assert!(
@@ -298,10 +298,18 @@ impl crate::NativeAdmission<'_> {
             "CPU cache notification requires suspended admission"
         );
         let machine = self.address_space().machine();
-        let notify = matches!(operation, crate::AccessOperation::Atomic(_))
-            || (matches!(operation, crate::AccessOperation::Write(_)) && cached);
+        let binding = self.gpu_binding();
+        let notify = matches!(
+            operation,
+            crate::AccessOperation::Atomic(_) | crate::AccessOperation::Write(_)
+        );
         let collect = notify
-            && machine.notify_cpu_write(ranges.iter().flat_map(AllocationRange::physical_extents));
+            && binding.is_some_and(|binding| {
+                binding.notify_cached_write(
+                    ranges.iter().flat_map(AllocationRange::physical_extents),
+                    self.device_address_scratch(),
+                )
+            });
         if collect
             && let crate::AccessOperation::Write(bytes) = &mut operation
             && self.collect_cached_write(ranges, bytes)?
@@ -310,7 +318,7 @@ impl crate::NativeAdmission<'_> {
                 std::mem::take(bytes),
             )));
         }
-        machine.finish_captured_access(ranges, operation)
+        machine.finish_captured_access(ranges, operation, binding)
     }
     fn collect_cached_write(
         &self,
@@ -414,36 +422,6 @@ impl Machine {
         drop(spaces);
         Ok(())
     }
-    pub(crate) fn must_flush_physical(&self, extent: Extent) -> bool {
-        let Some(device) = self.gpu_device_memory() else {
-            return false;
-        };
-        let Some(interface) = device.interface() else {
-            return false;
-        };
-        let mut flush = false;
-        let scratch = std::cell::RefCell::new(Vec::new());
-        device.apply_on_physical(extent, &scratch, |address, bytes| {
-            flush |= interface.must_flush_region(address, bytes)
-        });
-        flush
-    }
-    pub(crate) fn notify_cpu_write(&self, extents: impl Iterator<Item = Extent>) -> bool {
-        let Some(device) = self.gpu_device_memory() else {
-            return false;
-        };
-        let Some(rasterizer) = device.interface() else {
-            return false;
-        };
-        let mut collect = false;
-        let scratch = std::cell::RefCell::new(Vec::new());
-        for extent in extents {
-            device.apply_on_physical(extent, &scratch, |address, bytes| {
-                collect |= rasterizer.on_cpu_write(address, bytes);
-            });
-        }
-        collect
-    }
 }
 
 impl Machine {
@@ -497,14 +475,14 @@ impl Machine {
         operation: crate::AtomicAccess,
     ) -> Result<crate::AccessResult, MemoryError> {
         Ok(self
-            .atomic_impl(range, operation, false)?
+            .atomic_impl(range, operation, None)?
             .expect("owner-resolved atomic cannot defer to itself"))
     }
     fn atomic_impl(
         &self,
         range: &AllocationRange,
         operation: crate::AtomicAccess,
-        route_device: bool,
+        binding: Option<&CpuBinding>,
     ) -> Result<Option<crate::AccessResult>, MemoryError> {
         if u64::from(operation.bytes) != range.bytes() {
             return Err(MemoryError::Invalid(
@@ -512,46 +490,15 @@ impl Machine {
             ));
         }
         let extent = self.atomic_extent(range)?;
-        if route_device && self.must_flush_physical(extent) {
+        let scratch = std::cell::RefCell::new(Vec::new());
+        if binding.is_some_and(|binding| binding.must_flush(extent, &scratch)) {
             return Ok(None);
         }
-        operation.before();
-        let apply = || {
-            let address = self
-                .arena()
-                .host_address(extent.start, extent.bytes)
-                .unwrap();
-            let mut previous =
-                unsafe { crate::raw::read_value(address.as_ptr(), extent.bytes as usize) };
-            loop {
-                let (replacement, written) = operation.update(previous);
-                if !written {
-                    return crate::AccessResult::Atomic {
-                        previous,
-                        written: false,
-                    };
-                }
-
-                let observed = unsafe {
-                    crate::raw::compare_exchange(
-                        address.as_ptr(),
-                        extent.bytes as usize,
-                        previous,
-                        replacement,
-                    )
-                };
-                if observed == previous {
-                    return crate::AccessResult::Atomic {
-                        previous,
-                        written: true,
-                    };
-                }
-                previous = observed;
-            }
-        };
-        let result = Some(apply());
-        operation.after();
-        Ok(result)
+        let address = self
+            .arena()
+            .host_address(extent.start, extent.bytes)
+            .unwrap();
+        Ok(Some(unsafe { operation.apply_at(address.as_ptr()) }))
     }
 
     // Callers borrow a live allocation or validated pins through the transition.
@@ -599,32 +546,38 @@ impl Machine {
         ranges: &[AllocationRange],
         operation: crate::AccessOperation,
     ) -> Result<crate::Access<crate::AccessResult>, MemoryError> {
+        let binding = CpuBinding::resolve(self);
         if matches!(
             operation,
             crate::AccessOperation::Write(_) | crate::AccessOperation::Atomic(_)
-        ) {
-            self.notify_cpu_write(ranges.iter().flat_map(AllocationRange::physical_extents));
+        ) && let Some(binding) = &binding
+        {
+            binding.notify_write(
+                ranges.iter().flat_map(AllocationRange::physical_extents),
+                &std::cell::RefCell::new(Vec::new()),
+            );
         }
-        self.finish_captured_access(ranges, operation)
+        self.finish_captured_access(ranges, operation, binding.as_ref())
     }
     fn finish_captured_access(
         &self,
         ranges: &[AllocationRange],
         mut operation: crate::AccessOperation,
+        binding: Option<&CpuBinding>,
     ) -> Result<crate::Access<crate::AccessResult>, MemoryError> {
-        if let Some(result) = self.try_access_captured(ranges, &mut operation)? {
+        if let Some(result) = self.try_access_captured(ranges, &mut operation, binding)? {
             return Ok(crate::Access::Ready(result));
         }
         self.request_device_access(ranges.to_vec(), operation)
             .map(crate::Access::Pending)
     }
-    /// Execute admitted RAM operations directly, without submitting to a device
-    /// endpoint. The graphics owner uses None to enter its exact authority in
-    /// place; external callers submit that same still-unexecuted operation.
-    pub fn try_access_captured(
+    /// Execute RAM-current operations through the already selected owners.
+    /// An unresolved dependency leaves the operation intact for submission.
+    fn try_access_captured(
         &self,
         ranges: &[AllocationRange],
         operation: &mut crate::AccessOperation,
+        binding: Option<&CpuBinding>,
     ) -> Result<Option<crate::AccessResult>, MemoryError> {
         let size = self.validate_ranges(ranges)?;
         if ranges.is_empty() {
@@ -636,7 +589,7 @@ impl Machine {
             crate::AccessOperation::PrepareRead(_) => return Ok(None),
 
             crate::AccessOperation::Write(bytes) => {
-                if self.write_physical_impl(ranges, bytes, true)? {
+                if self.write_physical_impl(ranges, bytes, binding)? {
                     return Ok(Some(crate::AccessResult::Written(std::mem::take(bytes))));
                 }
             }
@@ -646,7 +599,7 @@ impl Machine {
                         "atomic access must name one physical span",
                     ));
                 };
-                if let Some(result) = self.atomic_impl(range, *atomic, true)? {
+                if let Some(result) = self.atomic_impl(range, *atomic, binding)? {
                     return Ok(Some(result));
                 }
             }
@@ -654,7 +607,7 @@ impl Machine {
                 if destination.len() != size {
                     destination.resize(size, 0);
                 }
-                if self.read_physical_into(ranges, destination)? {
+                if self.read_physical_into(ranges, destination, binding)? {
                     return Ok(Some(crate::AccessResult::Read(std::mem::take(destination))));
                 }
             }
@@ -683,7 +636,8 @@ impl Machine {
         self.validate_capture(ranges)?;
         let bytes = destination.len() as u64;
         let extents = ranges.physical_extents(offset, bytes)?;
-        if !self.read_ram_extents(extents, destination)? {
+        let binding = CpuBinding::resolve(self);
+        if !self.read_ram_extents(extents, destination, binding.as_ref())? {
             return self
                 .request_device_access(
                     ranges.capture(offset, bytes)?,
@@ -703,7 +657,12 @@ impl Machine {
     ) -> Result<crate::Access<Vec<u8>>, MemoryError> {
         self.validate_capture(ranges)?;
         let bytes = destination.len() as u64;
-        if self.read_ram_extents(ranges.physical_extents(offset, bytes)?, &mut destination)? {
+        let binding = CpuBinding::resolve(self);
+        if self.read_ram_extents(
+            ranges.physical_extents(offset, bytes)?,
+            &mut destination,
+            binding.as_ref(),
+        )? {
             return Ok(crate::Access::Ready(destination));
         }
         self.request_device_access(
@@ -724,6 +683,7 @@ impl Machine {
         &self,
         ranges: &[AllocationRange],
         destination: &mut [u8],
+        binding: Option<&CpuBinding>,
     ) -> Result<bool, MemoryError> {
         if self.validate_ranges(ranges)? != destination.len() {
             return Err(MemoryError::Invalid(
@@ -733,6 +693,7 @@ impl Machine {
         self.read_ram_extents(
             ranges.iter().flat_map(AllocationRange::physical_extents),
             destination,
+            binding,
         )
     }
     // Every caller retains the validated physical spans through an allocation,
@@ -741,50 +702,25 @@ impl Machine {
         &self,
         extents: impl Iterator<Item = Extent>,
         destination: &mut [u8],
+        binding: Option<&CpuBinding>,
     ) -> Result<bool, MemoryError> {
         let mut offset = 0;
+        let scratch = std::cell::RefCell::new(Vec::new());
         for extent in extents {
             let bytes = extent.bytes as usize;
-            // SAFETY: the caller retains each selected physical span.
-            if !unsafe {
-                self.try_read_mapped_ram(extent.start, &mut destination[offset..offset + bytes])?
-            } {
+            let source = self
+                .arena()
+                .host_address(extent.start, extent.bytes)
+                .ok_or(MemoryError::Invalid("mapped read exceeds physical RAM"))?;
+            if binding.is_some_and(|binding| binding.must_flush(extent, &scratch)) {
                 return Ok(false);
             }
+            // The caller retains every span; coherence is resolved through the
+            // same owners for the entire operation, without registry re-entry.
+            unsafe {
+                self.copy_ram_to_host(source, &mut destination[offset..offset + bytes]);
+            }
             offset += bytes;
-        }
-        Ok(true)
-    }
-    /// Copy mapped, RAM-current bytes directly to their consumer. Device-owned
-    /// pages return false without reading or changing the destination. This
-    /// never enqueues a request to the graphics owner's own endpoint.
-    ///
-    /// # Safety
-    /// The caller must retain all physical bytes for the duration of the call,
-    /// using a borrowed Allocation, accepted AllocationRange values or a mapping lock whose
-    /// mapping owner retains those ranges. Destination must be exclusively
-    /// owned host memory, disjoint from guest RAM. GPU mapping metadata alone
-    /// is weak and is not sufficient lifetime protection.
-    pub unsafe fn try_read_mapped_ram(
-        &self,
-        start: ArenaOffset,
-        destination: &mut [u8],
-    ) -> Result<bool, MemoryError> {
-        let extent = Extent {
-            start,
-            bytes: destination.len() as u64,
-        };
-        let source = self
-            .arena()
-            .host_address(start, extent.bytes)
-            .ok_or(MemoryError::Invalid("mapped read exceeds physical RAM"))?;
-        if self.must_flush_physical(extent) {
-            return Ok(false);
-        }
-        // Coherence belongs to the real cache owners; retained inputs and the
-        // fixed RAM arena provide lifetime, without a generic observation lease.
-        unsafe {
-            self.copy_ram_to_host(source, destination);
         }
         Ok(true)
     }
@@ -979,7 +915,7 @@ impl Machine {
         ranges: &[AllocationRange],
         source: &[u8],
     ) -> Result<(), MemoryError> {
-        let written = self.write_physical_impl(ranges, source, false)?;
+        let written = self.write_physical_impl(ranges, source, None)?;
         debug_assert!(written);
         Ok(())
     }
@@ -1028,17 +964,23 @@ impl Machine {
         let extents: smallvec::SmallVec<[_; 4]> = ranges
             .physical_extents(offset, source.len() as u64)?
             .collect();
-        self.notify_cpu_write(extents.iter().copied());
+        let binding = CpuBinding::resolve(self);
+        if let Some(binding) = &binding {
+            binding.notify_write(
+                extents.iter().copied(),
+                &std::cell::RefCell::new(Vec::new()),
+            );
+        }
         if source.is_empty() {
             return Ok(true);
         }
-        Ok(self.try_write_extents(&extents, source, true))
+        Ok(self.try_write_extents(&extents, source, binding.as_ref()))
     }
     fn write_physical_impl(
         &self,
         ranges: &[AllocationRange],
         source: &[u8],
-        route_device: bool,
+        binding: Option<&CpuBinding>,
     ) -> Result<bool, MemoryError> {
         if self.validate_ranges(ranges)? != source.len() {
             return Err(MemoryError::Invalid("physical write payload size mismatch"));
@@ -1047,17 +989,22 @@ impl Machine {
             .iter()
             .flat_map(AllocationRange::physical_extents)
             .collect();
-        Ok(self.try_write_extents(&extents, source, route_device))
+        Ok(self.try_write_extents(&extents, source, binding))
     }
 
-    /// Inputs and payload have already been validated and retained. None needs
-    /// an observation transition; Some(false) needs device-owner resolution.
-    fn try_write_extents(&self, extents: &[Extent], source: &[u8], route_device: bool) -> bool {
-        if route_device
-            && extents
+    /// Validate all dependencies before writing any part of the payload.
+    fn try_write_extents(
+        &self,
+        extents: &[Extent],
+        source: &[u8],
+        binding: Option<&CpuBinding>,
+    ) -> bool {
+        let scratch = std::cell::RefCell::new(Vec::new());
+        if binding.is_some_and(|binding| {
+            extents
                 .iter()
-                .any(|&extent| self.must_flush_physical(extent))
-        {
+                .any(|&extent| binding.must_flush(extent, &scratch))
+        }) {
             return false;
         }
 
@@ -1084,7 +1031,11 @@ impl crate::Allocation {
         }
         let extents = self.physical_extents(offset, bytes as u64)?;
         let mut output = vec![0; bytes];
-        if !self.machine().read_ram_extents(extents, &mut output)? {
+        let binding = CpuBinding::resolve(self.machine());
+        if !self
+            .machine()
+            .read_ram_extents(extents, &mut output, binding.as_ref())?
+        {
             let range =
                 AllocationRange::new(self.pin_range(offset, bytes as u64)?, offset, bytes as u64)?;
             return self
@@ -1104,8 +1055,14 @@ impl crate::Allocation {
             .physical_extents(offset, source.len() as u64)?
             .collect();
         let machine = self.machine();
-        machine.notify_cpu_write(extents.iter().copied());
-        let written = machine.try_write_extents(&extents, source, true);
+        let binding = CpuBinding::resolve(machine);
+        if let Some(binding) = &binding {
+            binding.notify_write(
+                extents.iter().copied(),
+                &std::cell::RefCell::new(Vec::new()),
+            );
+        }
+        let written = machine.try_write_extents(&extents, source, binding.as_ref());
         if written {
             return Ok(crate::Access::Ready(()));
         }
