@@ -740,9 +740,9 @@ impl NativeExecution<'_> {
                                     // The declared native bank size is an upper limit;
                                     // code-adjacent tables can end at the mapping boundary.
                                     // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/buffer_cache/buffer_cache.h#L2605-L2620
-                                    let size = required.min(
-                                        memory.buffer_layout_size(address).map_err(compilation)?,
-                                    );
+                                    let size = memory
+                                        .buffer_layout_size(address, required)
+                                        .map_err(compilation)?;
                                     self.ampere_address(memory, address, size).map(|address| {
                                         nixe_gpu::native::GuestBufferRange { address, size }
                                     })
@@ -941,16 +941,13 @@ impl NativeExecution<'_> {
         address: u64,
         size: u64,
     ) -> Result<u64, VulkanError> {
-        memory.prepare_image(address, size).map_err(compilation)?;
-        let mut ranges = memory.image_mapped_ranges(address, size)?;
-        if ranges.next() != Some((address, size)) || ranges.next().is_some() {
+        let range = memory.buffer_range(address, size).map_err(compilation)?;
+        if range.size != size {
             return Err(compilation(
                 "fragmented native buffer mapping is not implemented",
             ));
         }
-        memory
-            .image_device_address(address)?
-            .ok_or_else(|| compilation("unmapped native buffer"))
+        Ok(range.device)
     }
     fn ampere_buffer(
         &mut self,

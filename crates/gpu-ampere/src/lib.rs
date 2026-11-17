@@ -133,10 +133,14 @@ pub trait RenderMemory: nixe_gpu::native::ImageAddressSpace {
     -> Result<Option<nixe_gpu::native::ReadSpan>>;
     /// Same-layout virtual extent, including reserved native backing. Physical
     /// fragmentation is resolved separately when the resource is consumed.
-    fn buffer_layout_size(&self, address: u64) -> Result<u64>;
-    /// Mapped prefix whose GPU addresses advance through consecutive device
-    /// addresses. This stops at either a hole or a device-range discontinuity.
-    fn max_contiguous_range(&self, address: u64, bytes: u64) -> Result<u64>;
+    fn buffer_layout_size(&self, address: u64, limit: u64) -> Result<u64>;
+    /// Prepare any lazy backing in the requested extent and return its first
+    /// device-contiguous span. Explicit fragmented bindings consume later spans separately.
+    fn buffer_range(
+        &mut self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<nixe_gpu::native::MappedGpuRange>;
     fn capture_memory(&mut self, address: u64, bytes: u64) -> Result<nixe_memory::CapturedMemory>;
     fn mapping_generation(&self) -> u64;
     fn prepare_image(&mut self, address: u64, bytes: u64) -> Result<()>;

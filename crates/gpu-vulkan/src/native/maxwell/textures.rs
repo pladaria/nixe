@@ -45,10 +45,8 @@ impl super::super::NativeExecution<'_> {
                 Ok(DescriptorSource::Virtual)
             },
             |residency, space, address, bytes| {
-                for (guest, count) in space.image_mapped_ranges(address, 32)? {
-                    if let Some(device) = space.image_device_address(guest)? {
-                        residency.flush_read_span(device, count)?;
-                    }
+                for range in space.image_mapped_ranges(address, 32)? {
+                    residency.flush_read_span(range.device, range.size)?;
                 }
                 space
                     .read_into_unsafe(space.address(address).map_err(failed)?, bytes)

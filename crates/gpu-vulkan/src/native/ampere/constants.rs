@@ -49,10 +49,9 @@ impl Binding {
                     self.pools = None;
                     return Ok(None);
                 };
-                for (at, count) in ranges {
-                    let Some(device) = memory.image_device_address(at)? else {
-                        continue;
-                    };
+                for range in ranges {
+                    let device = range.device;
+                    let count = range.size;
                     let mut offset = 0;
                     while offset < count {
                         let at = device + offset;

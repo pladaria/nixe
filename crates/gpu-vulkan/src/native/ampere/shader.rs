@@ -349,19 +349,13 @@ pub(super) fn capture_program(
         .0
         .0 as usize
         + 8;
-    let ranges = env
-        .memory
-        .image_mapped_ranges(address, size as u64)?
-        .collect::<Vec<_>>();
-    if ranges.len() != 1 || ranges[0] != (address, size as u64) {
-        return Err(compilation(
-            "fragmented native shader code mapping is not implemented",
-        ));
-    }
     let physical = env
         .memory
-        .image_device_address(address)?
-        .ok_or_else(|| compilation("unmapped native shader"))?;
+        .image_mapped_ranges(address, size as u64)?
+        .next()
+        .filter(|r| r.gpu == address && r.size == size as u64)
+        .ok_or_else(|| compilation("fragmented native shader code mapping is not implemented"))?
+        .device;
     let mut hash = rustc_hash::FxHasher::default();
     ShaderIsa::Ampere.hash(&mut hash);
     env.metadata.hash(&mut hash);

@@ -77,12 +77,11 @@ impl NativeExecution<'_> {
             let size = match declared_size {
                 Some(size) => size,
                 None => memory
-                    .buffer_layout_size(target)
+                    .buffer_layout_size(target, 8 * 1024 * 1024)
                     .map_err(|e| compilation(format!(
                         "native storage stage={stage} slot={} cbuf={} offset={:#x} descriptor={descriptor:#x} target={target:#x}: {e}",
                         slot.slot, slot.cbuf, slot.offset
-                    )))?
-                    .min(8 * 1024 * 1024),
+                    )))?,
             };
             let alignment = self
                 .residency
@@ -100,7 +99,7 @@ impl NativeExecution<'_> {
                 end.next_multiple_of(nixe_memory::PAGE_SIZE)
             };
             let mut bytes = end - aligned;
-            memory.prepare_image(aligned, bytes).map_err(|e| {
+            let first = memory.buffer_range(aligned, bytes).map_err(|e| {
                 compilation(format!(
                     "native storage stage={stage} slot={}: {e}",
                     slot.slot
@@ -112,12 +111,19 @@ impl NativeExecution<'_> {
                 // A same-kind virtual region can span discontinuous storage.
                 // Explicit NVN address/size descriptors keep their full range.
                 // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/buffer_cache/buffer_cache.h#L4388-L4393
-                let contiguous = memory
-                    .max_contiguous_range(target, size)
-                    .map_err(compilation)?;
-                if contiguous == 0 {
-                    return Err(compilation("unmapped native global pointer"));
-                }
+                let prefix = target - aligned;
+                let contiguous = if prefix < first.size {
+                    size.min(first.size - prefix)
+                } else {
+                    // An unusually large host alignment can span a device discontinuity
+                    // before the guest pointer. The prefix is measured at the pointer.
+                    memory
+                        .image_mapped_ranges(target, size)?
+                        .next()
+                        .filter(|r| r.gpu == target)
+                        .ok_or_else(|| compilation("unmapped native global pointer"))?
+                        .size
+                };
                 let end = target + contiguous;
                 let end = if slot.written {
                     end
@@ -140,9 +146,7 @@ impl NativeExecution<'_> {
                 }
                 bytes = bounded;
             }
-            let device = memory
-                .image_device_address(aligned)?
-                .ok_or_else(|| compilation("unmapped native global pointer"))?;
+            let device = first.device;
             key.mapping_generation = memory.mapping_generation();
             self.residency
                 .runtime
@@ -235,13 +239,10 @@ impl NativeExecution<'_> {
         let mut bytes = vec![0u8; size as usize];
         shader::read_into(&mut self.residency, memory, target, &mut bytes)?;
         let mut source_ranges = Vec::new();
-        for (gpu, bytes) in memory.image_mapped_ranges(target, size)? {
-            let address = memory
-                .image_device_address(gpu)?
-                .ok_or_else(|| compilation("unmapped indirect pointer table"))?;
+        for range in memory.image_mapped_ranges(target, size)? {
             source_ranges.push(nixe_gpu::native::GuestBufferRange {
-                address,
-                size: bytes,
+                address: range.device,
+                size: range.size,
             });
         }
         let source = source_ranges

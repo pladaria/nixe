@@ -5,7 +5,7 @@ use crate::*;
 use nixe_memory::AllocationRange;
 use std::sync::Arc;
 mod image;
-pub use image::{ImageAddressSpace, ImageInfo, ImagePacking};
+pub use image::{ImageAddressSpace, ImageInfo, ImagePacking, MappedGpuRange};
 
 /// Numerically described, physically contiguous RAM under the consuming GPU
 /// mapping owner. It borrows no guest bytes. Retained users check both mapping

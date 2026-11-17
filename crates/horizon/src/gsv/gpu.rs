@@ -1,5 +1,7 @@
 //! Switch 2 address spaces retain canonical physical allocations independently
 //! of CPU virtual mappings. A memory handle is not itself a GPU mapping.
+mod runs;
+use nixe_gpu::native::MappedGpuRange;
 use nixe_memory::device_memory::DeviceMemory;
 use nixe_memory::{AddressSpaceId, DeviceHeapMapping, DeviceHeapMemory};
 use nixe_memory::{CapturedMemory, MemoryError, PAGE_SIZE};
@@ -56,7 +58,8 @@ pub(crate) struct GpuAddressSpace {
     id: u64,
     generation: u64,
     pub mappings: BTreeMap<u64, GpuMapping>,
-    pub sync_mapping: Option<Arc<DeviceHeapMapping>>,
+    runs: runs::MappingRuns,
+    sync_mapping: Option<Arc<DeviceHeapMapping>>,
     regions: BTreeMap<u64, NativeRegion>,
 }
 struct NativeRegion {
@@ -126,10 +129,28 @@ impl GpuAddressSpace {
             id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             generation: 0,
             mappings: BTreeMap::new(),
+            runs: Default::default(),
             sync_mapping: None,
             regions: BTreeMap::new(),
         }
     }
+    pub fn map_sync_page(&mut self, values: &nixe_memory::Allocation) -> Result<u64, MemoryError> {
+        let address = VA_END - PAGE_SIZE;
+        if self.sync_mapping.is_none() {
+            let range =
+                nixe_memory::AllocationRange::new(values.pin_range(0, PAGE_SIZE)?, 0, PAGE_SIZE)?;
+            let mapping = DeviceHeapMemory::new(self.memory.clone()).map(
+                vec![range].into(),
+                PAGE_SIZE,
+                None,
+            )?;
+            self.runs.insert(address, VA_END, mapping.address());
+            self.sync_mapping = Some(mapping);
+            self.generation = self.generation.wrapping_add(1);
+        }
+        Ok(address)
+    }
+
     pub fn map(
         &mut self,
         address: u64,
@@ -195,6 +216,7 @@ impl GpuAddressSpace {
             Backing::Native(_) => None,
         };
         let physical = self.heap.map(ranges.into(), bytes, cpu)?;
+        self.runs.insert(address, end, physical.address());
         self.generation = self.generation.wrapping_add(1);
         self.mappings.insert(
             address,
@@ -450,9 +472,14 @@ impl GpuAddressSpace {
                     && (address | bytes).is_multiple_of(PAGE_SIZE)
             })
             .ok_or(MemoryError::Invalid("invalid GPU mapping edit range"))?;
+        let first = self
+            .mappings
+            .range(..=address)
+            .next_back()
+            .map_or(address, |(&start, _)| start);
         let keys: Vec<_> = self
             .mappings
-            .range(..end)
+            .range(first..end)
             .filter(|(_, mapping)| mapping.end > address)
             .map(|(&start, _)| start)
             .collect();
@@ -506,6 +533,10 @@ impl GpuAddressSpace {
                 ));
             }
             self.generation = self.generation.wrapping_add(1);
+            if kind.is_none() {
+                self.runs
+                    .remove_mapped(start.max(address), end.min(old.end));
+            }
             self.mappings.remove(&start);
             self.mappings.extend(survivors);
         }
@@ -545,58 +576,18 @@ impl nixe_gpu::native::ImageAddressSpace for GpuAddressSpace {
         self.id
     }
     fn image_device_address(&self, address: u64) -> Result<Option<u64>, MemoryError> {
-        if (VA_END - PAGE_SIZE..VA_END).contains(&address) {
-            return Ok(self
-                .sync_mapping
-                .as_ref()
-                .map(|m| m.address() + address - (VA_END - PAGE_SIZE)));
-        }
-        Ok(self
-            .mappings
-            .range(..=address)
-            .next_back()
-            .filter(|(_, m)| m.end > address)
-            .map(|(&start, m)| m.physical.address() + address - start))
+        Ok(self.runs.prefix(address, VA_END).map(|r| r.device))
     }
     fn image_mapped_ranges(
         &self,
         address: u64,
         bytes: u64,
-    ) -> Result<impl Iterator<Item = (u64, u64)>, MemoryError> {
+    ) -> Result<impl Iterator<Item = MappedGpuRange>, MemoryError> {
         let end = address
             .checked_add(bytes)
             .filter(|&end| end <= VA_END)
             .ok_or(MemoryError::Invalid("invalid image mapping range"))?;
-        let mut ranges = smallvec::SmallVec::<[(u64, u64); 8]>::new();
-        let mut previous_device_end = None;
-        // Include an overlapping predecessor without scanning unrelated maps.
-        let first = self
-            .mappings
-            .range(..=address)
-            .next_back()
-            .map_or(address, |(&a, _)| a);
-        for (&start, mapping) in self.mappings.range(first..end) {
-            let low = address.max(start);
-            let high = end.min(mapping.end);
-            if low >= high {
-                continue;
-            }
-            let device = mapping.physical.address() + low - start;
-            if let Some(last) = ranges.last_mut()
-                && last.0 + last.1 == low
-                && previous_device_end == Some(device)
-            {
-                last.1 += high - low;
-            } else {
-                ranges.push((low, high - low));
-            }
-            previous_device_end = Some(device + high - low);
-        }
-        if end > VA_END - PAGE_SIZE && self.sync_mapping.is_some() {
-            let low = address.max(VA_END - PAGE_SIZE);
-            ranges.push((low, end - low));
-        }
-        Ok(ranges.into_iter())
+        Ok(self.runs.segments(address, end))
     }
 }
 
@@ -615,7 +606,18 @@ impl<'a> GpuMemory<'a> {
         }
     }
     pub(super) fn commit(&mut self, address: u64, bytes: u64) -> Result<(), MemoryError> {
-        if self.for_each_physical(address, bytes, |_, _| {}) {
+        let end = address
+            .checked_add(bytes)
+            .filter(|&end| end <= VA_END)
+            .ok_or(MemoryError::Invalid("invalid GPU memory access"))?;
+        let mut covered = address;
+        for range in self.runs.segments(address, end) {
+            if range.gpu != covered {
+                break;
+            }
+            covered += range.size;
+        }
+        if covered == end {
             return Ok(());
         }
         drop(self.guard.take());
@@ -654,37 +656,24 @@ impl<'a> GpuMemory<'a> {
             .checked_add(bytes)
             .filter(|&end| end <= VA_END)
             .ok_or("native read overflow")?;
-        let mapping = if address >= VA_END - PAGE_SIZE {
-            self.sync_mapping
-                .as_ref()
-                .map(|m| (VA_END - PAGE_SIZE, VA_END, m.address()))
-        } else {
-            self.mappings
-                .range(..=address)
-                .next_back()
-                .filter(|(_, m)| m.end >= end)
-                .map(|(&start, m)| (start, m.end, m.physical.address()))
-        };
-        let Some((start, limit, device)) = mapping else {
+        let Some(range) = self.runs.prefix(address, end).filter(|r| r.size == bytes) else {
             return Ok(None);
         };
-        // A moving constant-buffer word can reuse the current mapped page.
-        // Validate existing RAM only: do not commit or read additional pages.
-        let page = address / PAGE_SIZE * PAGE_SIZE;
+        // Every mapping boundary is page aligned. Retain the whole host page
+        // when a small read moves within it; span verifies the physical backing.
+        let page = address & !(PAGE_SIZE - 1);
         if end <= page + PAGE_SIZE {
-            let base = page.max(start);
-            let count = (page + PAGE_SIZE).min(limit) - base;
-            let device = device + base - start;
-            if let Some(host) = self.memory.span(device, count) {
+            let device = range.device - (address - page);
+            if let Some(host) = self.memory.span(device, PAGE_SIZE) {
                 return Ok(Some(nixe_gpu::native::ReadSpan {
-                    address: base,
-                    bytes: count,
+                    address: page,
+                    bytes: PAGE_SIZE,
                     device,
                     host,
                 }));
             }
         }
-        let device = device + address - start;
+        let device = range.device;
         Ok(self
             .memory
             .span(device, bytes)
@@ -713,7 +702,7 @@ impl nixe_gpu::native::ImageAddressSpace for GpuMemory<'_> {
         &self,
         address: u64,
         bytes: u64,
-    ) -> Result<impl Iterator<Item = (u64, u64)>, MemoryError> {
+    ) -> Result<impl Iterator<Item = MappedGpuRange>, MemoryError> {
         self.guard
             .as_ref()
             .unwrap()
@@ -726,21 +715,26 @@ impl nixe_gpu_ampere::RenderMemory for GpuMemory<'_> {
         address: u64,
         bytes: u64,
     ) -> nixe_gpu_ampere::Result<Option<nixe_gpu::native::ReadSpan>> {
+        if let Some(span) = self.mapped_read_span(address, bytes)? {
+            return Ok(Some(span));
+        }
         self.commit(address, bytes)
             .map_err(|e| e.to_string().into_boxed_str())?;
         self.mapped_read_span(address, bytes)
     }
-    fn buffer_layout_size(&self, address: u64) -> nixe_gpu_ampere::Result<u64> {
+    fn buffer_layout_size(&self, address: u64, limit: u64) -> nixe_gpu_ampere::Result<u64> {
+        let limit = address.saturating_add(limit);
         if let Some((_, region)) = self.regions.range(..=address).next_back()
             && address < region.end
         {
+            let limit = region.end.min(limit);
             let preceding = self.mappings.range(..=address).next_back();
             let kind = preceding
                 .filter(|(_, mapping)| address < mapping.end)
                 .map_or(0, |(_, mapping)| mapping.kind);
             let begin = preceding.map_or(address, |(&start, _)| start);
             let mut end = address;
-            for (&start, mapping) in self.mappings.range(begin..region.end) {
+            for (&start, mapping) in self.mappings.range(begin..limit) {
                 if mapping.end <= end {
                     continue;
                 }
@@ -753,9 +747,9 @@ impl nixe_gpu_ampere::RenderMemory for GpuMemory<'_> {
                 if mapping.kind != kind {
                     return Ok(end - address);
                 }
-                end = mapping.end.min(region.end);
+                end = mapping.end.min(limit);
             }
-            return Ok(if kind == 0 { region.end } else { end } - address);
+            return Ok(if kind == 0 { limit } else { end } - address);
         }
         let Some((&start, first)) = self
             .mappings
@@ -765,6 +759,9 @@ impl nixe_gpu_ampere::RenderMemory for GpuMemory<'_> {
         else {
             return Err("unmapped native buffer pointer".into());
         };
+        if first.end >= limit {
+            return Ok(limit - address);
+        }
         let mut end = first.end;
         for (&next, mapping) in self
             .mappings
@@ -773,56 +770,33 @@ impl nixe_gpu_ampere::RenderMemory for GpuMemory<'_> {
             if next != end || mapping.kind != first.kind {
                 break;
             }
+            if mapping.end >= limit {
+                return Ok(limit - address);
+            }
             end = mapping.end;
         }
         Ok(end - address)
     }
-    fn max_contiguous_range(&self, address: u64, bytes: u64) -> nixe_gpu_ampere::Result<u64> {
+    fn buffer_range(
+        &mut self,
+        address: u64,
+        bytes: u64,
+    ) -> nixe_gpu_ampere::Result<MappedGpuRange> {
         let end = address
             .checked_add(bytes)
-            .filter(|&end| address >= VA_START && end <= VA_END)
+            .filter(|&end| bytes != 0 && address >= VA_START && end <= VA_END)
             .ok_or("invalid native buffer range")?;
-        if address >= VA_END - PAGE_SIZE {
-            return Ok(if self.sync_mapping.is_some() {
-                bytes
-            } else {
-                0
-            });
-        }
-        let first = self
-            .mappings
-            .range(..=address)
-            .next_back()
-            .map_or(address, |(&start, _)| start);
-        let mut at = address;
-        let mut device_end = None;
-        for (&start, mapping) in self.mappings.range(first..end) {
-            if mapping.end <= at {
-                continue;
-            }
-            if start > at {
-                break;
-            }
-            let device = mapping.physical.address() + at - start;
-            if device_end.is_some_and(|expected| expected != device) {
-                break;
-            }
-            let count = end.min(mapping.end) - at;
-            at += count;
-            device_end = Some(device + count);
-            if at == end {
-                break;
-            }
-        }
-        // The reserved sync page is a separate mapping but may follow the
-        // previous device span without introducing a discontinuity.
-        if at == VA_END - PAGE_SIZE
-            && let Some(sync) = &self.sync_mapping
-            && device_end == Some(sync.address())
+        if let Some(range) = self.runs.prefix(address, end)
+            && range.size == bytes
         {
-            at = end;
+            return Ok(range);
         }
-        Ok(at - address)
+        // Preparing a native reservation can fill a hole or join existing runs.
+        // Keep explicit fragmented bindings mapped across their whole extent.
+        self.prepare_image(address, bytes)?;
+        self.runs
+            .prefix(address, end)
+            .ok_or_else(|| "unmapped native buffer".into())
     }
     fn capture_memory(
         &mut self,
@@ -867,5 +841,65 @@ impl nixe_gpu_ampere::RenderMemory for GpuMemory<'_> {
             at = high;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixe_gpu::native::ImageAddressSpace;
+    use nixe_gpu_ampere::RenderMemory;
+
+    #[test]
+    fn buffer_ranges_follow_lazy_backing_edits_and_the_reserved_sync_page() {
+        let machine = nixe_memory::Machine::new(4 * 1024 * 1024).unwrap();
+        let account = machine.account(1024 * 1024).unwrap();
+        let device = DeviceMemory::new(machine, 32);
+        let mut space = GpuAddressSpace::new(DeviceHeapMemory::new(device), AddressSpaceId::new(1));
+        let start = VA_START;
+        let bytes = 3 * PAGE_SIZE;
+        space.create_region(start, bytes, account.clone()).unwrap();
+        assert_eq!(space.image_device_address(start).unwrap(), None);
+        let space = RwLock::new(space);
+        let first = GpuMemory::new(&space).buffer_range(start, bytes).unwrap();
+        assert_eq!(first.size, bytes);
+        {
+            let mut map = space.write().unwrap();
+            map.modify_kind(start + PAGE_SIZE, PAGE_SIZE, 2).unwrap();
+            assert_eq!(
+                map.image_mapped_ranges(start, bytes)
+                    .unwrap()
+                    .collect::<Vec<_>>(),
+                [first]
+            );
+            map.unmap(start + PAGE_SIZE, PAGE_SIZE).unwrap();
+            assert!(
+                map.image_device_address(start + PAGE_SIZE)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                map.image_device_address(start + 2 * PAGE_SIZE).unwrap(),
+                Some(first.device + 2 * PAGE_SIZE)
+            );
+        }
+        let mut view = GpuMemory::new(&space);
+        assert_eq!(view.buffer_layout_size(start + 7, 64).unwrap(), 64);
+        assert_eq!(view.buffer_range(start, bytes).unwrap().size, PAGE_SIZE);
+        let filled = view.buffer_range(start + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert_ne!(filled.device, first.device + PAGE_SIZE);
+        drop(view);
+        let mut map = space.write().unwrap();
+        let sync = account.allocate(PAGE_SIZE).unwrap();
+        let address = map.map_sync_page(&sync).unwrap();
+        let original = map.image_device_address(address).unwrap().unwrap();
+        let generation = map.generation;
+        assert_eq!(map.map_sync_page(&sync).unwrap(), address);
+        assert_eq!(map.generation, generation);
+        map.unmap(address, PAGE_SIZE).unwrap();
+        assert_eq!(
+            map.image_device_address(VA_END - 1).unwrap(),
+            Some(original + PAGE_SIZE - 1)
+        );
     }
 }

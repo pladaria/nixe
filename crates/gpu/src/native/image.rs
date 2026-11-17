@@ -23,15 +23,22 @@ pub struct ImageInfo {
     pub sample_grid: [u32; 2],
 }
 
+/// A mapped GPU interval with consecutive device addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MappedGpuRange {
+    pub gpu: u64,
+    pub device: u64,
+    pub size: u64,
+}
+
 /// GPU translation only. Device memory owns physical pins and cache coherence.
-/// Implementations group contiguous device addresses without capturing pixels.
 pub trait ImageAddressSpace {
     fn image_space_id(&self) -> u64;
     fn image_device_address(&self, address: u64) -> Result<Option<u64>, nixe_memory::MemoryError>;
-    /// (GPU start, byte length) of each device-contiguous mapped span.
+    /// Each mapped span with its translation from the same traversal.
     fn image_mapped_ranges(
         &self,
         address: u64,
         bytes: u64,
-    ) -> Result<impl Iterator<Item = (u64, u64)>, nixe_memory::MemoryError>;
+    ) -> Result<impl Iterator<Item = MappedGpuRange>, nixe_memory::MemoryError>;
 }

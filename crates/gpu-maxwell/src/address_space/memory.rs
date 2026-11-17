@@ -1,5 +1,6 @@
 //! The shared GPU page table used directly by the command processor.
 use super::*;
+use nixe_gpu::native::MappedGpuRange;
 use std::sync::{
     OnceLock, RwLock, Weak,
     atomic::{AtomicU64, AtomicUsize},
@@ -398,31 +399,32 @@ impl MaxwellGpuMemory {
         &self,
         offset: GpuVirtualAddress,
         size: u64,
-    ) -> Result<smallvec::SmallVec<[(GpuVirtualAddress, u64); 8]>, MaxwellGpuAccessError> {
+    ) -> Result<smallvec::SmallVec<[MappedGpuRange; 8]>, MaxwellGpuAccessError> {
         self.validate_resolution_request(offset)?;
         if size == 0 {
             return Err(MaxwellGpuAccessError::EmptyRange);
         }
         self.checked_add(offset, size - 1)
             .map_err(MaxwellGpuAccessError::Address)?;
-        let mut ranges = smallvec::SmallVec::<[(GpuVirtualAddress, u64); 8]>::new();
+        let mut ranges = smallvec::SmallVec::<[MappedGpuRange; 8]>::new();
         let mut cursor = offset.get();
         let end = cursor + size;
-        let mut expected_device = None;
         while cursor < end {
             let span = self.inner.table.span(cursor);
             let bytes = span.bytes.min(end - cursor);
             if let Some(device) = span.address {
-                if let Some((_, size)) = ranges.last_mut().filter(|(base, size)| {
-                    base.get() + *size == cursor && expected_device == Some(device)
-                }) {
-                    *size += bytes;
+                if let Some(last) = ranges.last_mut()
+                    && last.gpu + last.size == cursor
+                    && last.device + last.size == device
+                {
+                    last.size += bytes;
                 } else {
-                    ranges.push((self.address(cursor).expect("validated GPU range"), bytes));
+                    ranges.push(MappedGpuRange {
+                        gpu: cursor,
+                        device,
+                        size: bytes,
+                    });
                 }
-                expected_device = Some(device + bytes);
-            } else {
-                expected_device = None;
             }
             cursor += bytes;
         }
@@ -1002,14 +1004,13 @@ impl nixe_gpu::native::ImageAddressSpace for MaxwellGpuMemory {
         &self,
         address: u64,
         bytes: u64,
-    ) -> Result<impl Iterator<Item = (u64, u64)>, nixe_memory::MemoryError> {
+    ) -> Result<impl Iterator<Item = MappedGpuRange>, nixe_memory::MemoryError> {
         let address = self
             .address(address)
             .map_err(|e| nixe_memory::MemoryError::Execution(e.to_string().into()))?;
         Ok(self
             .get_submapped_range(address, bytes)
             .map_err(|e| nixe_memory::MemoryError::Execution(e.to_string().into()))?
-            .into_iter()
-            .map(|(a, b)| (a.get(), b)))
+            .into_iter())
     }
 }

@@ -117,10 +117,10 @@ fn coherent_word(
         return space.read_u32(address).map_err(failed);
     }
     // A word straddling GPU mappings uses their actual physical spans.
-    for (gpu, bytes) in space.get_submapped_range(address, 4).map_err(failed)? {
+    for range in space.get_submapped_range(address, 4).map_err(failed)? {
         execution
             .residency
-            .flush_read_span(space.device_address(gpu).map_err(failed)?, bytes)?;
+            .flush_read_span(range.device, range.size)?;
     }
     let mut bytes = [0; 4];
     space

@@ -84,31 +84,16 @@ pub(super) fn ioctl(
                         .map_err(|e| IpcWireError::SystemMemory(std::sync::Arc::new(e)))?,
                 );
             }
-            let values = syncpt.gpu_values.as_ref().unwrap();
-            let ranges = vec![
-                nixe_memory::AllocationRange::new(
-                    values
-                        .pin_range(0, nixe_memory::PAGE_SIZE)
-                        .map_err(|e| IpcWireError::SystemMemory(std::sync::Arc::new(e)))?,
-                    0,
-                    nixe_memory::PAGE_SIZE,
-                )
-                .map_err(|e| IpcWireError::SystemMemory(std::sync::Arc::new(e)))?,
-            ];
+            let values = syncpt.gpu_values.as_ref().unwrap().clone();
             let space = owner
                 .gpu
                 .as_mut()
                 .and_then(|g| g.spaces.get_mut(&id))
                 .ok_or(IpcWireError::Malformed("GPU address space missing"))?;
             let mut space = space.write().unwrap();
-            let address = crate::gsv::gpu::VA_END - nixe_memory::PAGE_SIZE;
-            if space.sync_mapping.is_none() {
-                space.sync_mapping = Some(
-                    nixe_memory::DeviceHeapMemory::new(space.memory.clone())
-                        .map(ranges.into(), nixe_memory::PAGE_SIZE, None)
-                        .map_err(|e| IpcWireError::SystemMemory(std::sync::Arc::new(e)))?,
-                );
-            }
+            let address = space
+                .map_sync_page(&values)
+                .map_err(|e| IpcWireError::SystemMemory(Arc::new(e)))?;
             output[..8].copy_from_slice(&address.to_le_bytes());
             output[8..12].copy_from_slice(&4_u32.to_le_bytes());
             output[12..16].copy_from_slice(&crate::gsv::SYNCPOINT_COUNT.to_le_bytes());

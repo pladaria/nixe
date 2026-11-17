@@ -571,16 +571,10 @@ fn linear_range(
         return Ok(None);
     }
     let address = surface.address + offset;
-    if space
+    Ok(space
         .image_mapped_ranges(address, bytes)
         .map_err(failure)?
         .next()
-        != Some((address, bytes))
-    {
-        return Ok(None);
-    }
-    Ok(space
-        .image_device_address(address)
-        .map_err(failure)?
-        .map(|device| (device, pitch, bytes)))
+        .filter(|r| r.gpu == address && r.size == bytes)
+        .map(|r| (r.device, pitch, bytes)))
 }

@@ -136,18 +136,14 @@ impl VirtualRangeCache {
             segments: smallvec::SmallVec::new(),
         };
         let mut expected = address;
-        for (gpu, size) in memory.image_mapped_ranges(address, bytes)? {
-            if gpu != expected || size == 0 || size > u64::from(u32::MAX) {
+        for range in memory.image_mapped_ranges(address, bytes)? {
+            let size = range.size;
+            if range.gpu != expected || size == 0 || size > u64::from(u32::MAX) || range.device == 0
+            {
                 break;
             }
-            let Some(device) = memory
-                .image_device_address(gpu)?
-                .filter(|&device| device != 0)
-            else {
-                break;
-            };
             entry.segments.push(GuestBufferRange {
-                address: device,
+                address: range.device,
                 size,
             });
             expected += size;

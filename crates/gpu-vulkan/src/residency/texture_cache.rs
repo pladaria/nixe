@@ -514,7 +514,7 @@ impl Residency<'_> {
         let mut parts = Vec::new();
         let mut maps = RangeSet::default();
         let mut first_cpu = None;
-        for (gpu, bytes) in space
+        for range in space
             .image_mapped_ranges(info.address, info.size)
             .map_err(failure)?
         {
@@ -522,11 +522,7 @@ impl Residency<'_> {
             // image format and tiling, which come from ImageInfo's registers/TIC.
             // Compression PTE kinds do not select a different image layout here.
             // https://github.com/eden-emulator/mirror/blob/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/image_info.cpp
-            let cpu = space
-                .image_device_address(gpu)?
-                .ok_or(VulkanError::InvalidResource(
-                    "mapped image span disappeared",
-                ))?;
+            let (gpu, cpu, bytes) = (range.gpu, range.device, range.size);
             first_cpu.get_or_insert(cpu);
             let physical = self.runtime.device_memory.read_mapping(cpu, bytes)?;
             parts.push((gpu - info.address, physical));
@@ -586,14 +582,10 @@ impl Residency<'_> {
             Some(cpu) => cpu,
             None => {
                 let mut ranges = space.image_mapped_ranges(info.address, info.size)?;
-                let Some((first, _)) = ranges.next() else {
+                let Some(first) = ranges.next() else {
                     return Ok(None);
                 };
-                space
-                    .image_device_address(first)?
-                    .ok_or(VulkanError::InvalidResource(
-                        "mapped image span disappeared",
-                    ))?
+                first.device
             }
         };
         let end = cpu

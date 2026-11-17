@@ -210,8 +210,9 @@ impl NativeExecution<'_> {
                     for uniform in &resources.uniforms {
                         let source = constants[uniform.slot]
                             .map(|(address, size)| {
-                                let size = u64::from(size.min(uniform.size))
-                                    .min(memory.buffer_layout_size(address).map_err(compilation)?);
+                                let size = memory
+                                    .buffer_layout_size(address, u64::from(size.min(uniform.size)))
+                                    .map_err(compilation)?;
                                 self.ampere_address(memory, address, size).map(|address| {
                                     nixe_gpu::native::GuestBufferRange { address, size }
                                 })
