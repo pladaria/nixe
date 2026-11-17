@@ -338,7 +338,9 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
 }
 
 EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& descriptor, CodePtr entrypoint, size_t size) {
-    PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
+    if (PerfMapEnabled()) {
+        PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
+    }
     Patch(descriptor, entrypoint);
 
     BlockDescriptor block_desc{entrypoint, size};
@@ -404,7 +406,7 @@ void EmitX64::ClearCache() {
     block_descriptors.clear();
     patch_information.clear();
 
-    PerfMapClear();
+    PerfMapClear(code.GetCodeBegin(), code.getCode() + code.GetTotalCodeSize());
 }
 
 void EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& locations) {

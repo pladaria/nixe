@@ -215,7 +215,9 @@ void A64EmitX64::GenFastmemFallbacks() {
                     ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLocRegIdx(value_idx));
                     code.ZeroExtendFrom(bitsize, Xbyak::Reg64{value_idx});
                     code.ret();
-                    PerfMapRegister(read_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a64_read_fallback_{}", bitsize));
+                    if (PerfMapEnabled()) {
+                        PerfMapRegister(read_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a64_read_fallback_{}", bitsize));
+                    }
                 }
 
                 for (const auto& [bitsize, callback] : write_callbacks) {
@@ -244,7 +246,9 @@ void A64EmitX64::GenFastmemFallbacks() {
                     }
                     ABI_PopCallerSaveRegistersAndAdjustStack(code);
                     code.ret();
-                    PerfMapRegister(write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a64_write_fallback_{}", bitsize));
+                    if (PerfMapEnabled()) {
+                        PerfMapRegister(write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a64_write_fallback_{}", bitsize));
+                    }
                 }
 
                 for (const auto& [bitsize, callback] : exclusive_write_callbacks) {
@@ -272,7 +276,9 @@ void A64EmitX64::GenFastmemFallbacks() {
                     callback.EmitCall(code);
                     ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLoc::RAX);
                     code.ret();
-                    PerfMapRegister(exclusive_write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a64_exclusive_write_fallback_{}", bitsize));
+                    if (PerfMapEnabled()) {
+                        PerfMapRegister(exclusive_write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr_idx][value_idx], code.getCurr(), fmt::format("a64_exclusive_write_fallback_{}", bitsize));
+                    }
                 }
             }
         }

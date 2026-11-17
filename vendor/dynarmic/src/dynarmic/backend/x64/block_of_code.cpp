@@ -225,6 +225,9 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
         , jsi(jsi)
         , constant_pool(*this, CONSTANT_POOL_SIZE)
         , host_features(GetHostFeatures()) {
+    // Retire earlier names before reusing host addresses. Teardown leaves the
+    // last map available for postmortem sampling instead of emptying it.
+    PerfMapClear(getCode(), getCode() + GetTotalCodeSize());
     EnableWriting();
     EnsureMemoryCommitted(PRELUDE_COMMIT_SIZE);
     GenRunCode(rcp);

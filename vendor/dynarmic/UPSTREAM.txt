@@ -5,6 +5,16 @@ License: 0BSD (LICENSE.txt); bundled dependencies retain their own licenses.
 Vendored source including bundled dependencies. Built for A64 by nixe-cpu-jit.
 
 Nixe adaptations:
+- backend/x64/{perf_map,emit_x64,a32_emit_x64_memory,a64_emit_x64_memory,
+  block_of_code}: cache PERF_BUILDID_DIR enablement once, and skip friendly-name
+  formatting and the process-wide map mutex when disabled. Follows Lichii
+  646b5d17135a2b2701ccc7a959afd0bbbf2f6160's PerfMapEnabled decision.
+  Retain range-scoped symbol ownership as in its JitSymbols interface: Linux
+  keeps live entries and rebuilds the perf map only when a cache range retires,
+  preserving other JITs and the owner's prelude. New code allocations retire
+  prior names in reused host addresses; teardown retains the last map for
+  postmortem sampling. Non-Linux symbol operations remain inline
+  no-ops; generated guest code and cache invalidation semantics are unchanged.
 - Diagnostic builds only (DYNARMIC_JIT_DIAGNOSTICS, selected by the Rust
   performance-counters feature): owner-written per-JIT lookup/compile counters,
   instruction-input fingerprints, phase timings, native mainline/deferred byte
