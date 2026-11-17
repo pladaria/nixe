@@ -7,7 +7,7 @@
 #include <memory>
 #include <mutex>
 #ifdef DYNARMIC_JIT_DIAGNOSTICS
-#include <chrono>
+#    include <chrono>
 #endif
 
 #include <boost/icl/interval_set.hpp>
@@ -85,6 +85,10 @@ public:
             // RSB optimization
             const u32 new_rsb_ptr = (jit_state.rsb_ptr - 1) & A64JitState::RSBPtrMask;
             if (jit_state.GetUniqueHash() == jit_state.rsb_location_descriptors[new_rsb_ptr]) {
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+                if (conf.diagnostics)
+                    ++conf.diagnostics->rsb_hits;
+#endif
                 jit_state.rsb_ptr = new_rsb_ptr;
                 return reinterpret_cast<CodePtr>(jit_state.rsb_codeptrs[new_rsb_ptr]);
             }
@@ -234,11 +238,20 @@ public:
     void DumpDisassembly() const {
         const size_t size = reinterpret_cast<const char*>(block_of_code.getCurr()) - reinterpret_cast<const char*>(block_of_code.GetCodeBegin());
         Common::DumpDisassembledX64(block_of_code.GetCodeBegin(), size);
+        const auto [far_begin, far_size] = block_of_code.GetFarCode();
+        if (far_size)
+            Common::DumpDisassembledX64(far_begin, far_size);
     }
 
     std::vector<std::string> Disassemble() const {
         const size_t size = reinterpret_cast<const char*>(block_of_code.getCurr()) - reinterpret_cast<const char*>(block_of_code.GetCodeBegin());
-        return Common::DisassembleX64(block_of_code.GetCodeBegin(), size);
+        auto lines = Common::DisassembleX64(block_of_code.GetCodeBegin(), size);
+        const auto [far_begin, far_size] = block_of_code.GetFarCode();
+        if (far_size) {
+            auto cold = Common::DisassembleX64(far_begin, far_size);
+            lines.insert(lines.end(), std::make_move_iterator(cold.begin()), std::make_move_iterator(cold.end()));
+        }
+        return lines;
     }
 
 private:
@@ -261,11 +274,13 @@ private:
 
     CodePtr GetBlock(IR::LocationDescriptor current_location) {
 #ifdef DYNARMIC_JIT_DIAGNOSTICS
-        if (conf.diagnostics) ++conf.diagnostics->lookups;
+        if (conf.diagnostics)
+            ++conf.diagnostics->lookups;
 #endif
         if (auto block = emitter.GetBasicBlock(current_location)) {
 #ifdef DYNARMIC_JIT_DIAGNOSTICS
-            if (conf.diagnostics) ++conf.diagnostics->hits;
+            if (conf.diagnostics)
+                ++conf.diagnostics->hits;
 #endif
             return block->entrypoint;
         }
@@ -305,8 +320,7 @@ private:
                         conf.enable_pauth});
 #ifdef DYNARMIC_JIT_DIAGNOSTICS
         const auto translated = Clock::now();
-        compilation.guest_bytes = A64::LocationDescriptor{ir_block.EndLocation()}.PC() -
-                                  A64::LocationDescriptor{current_location}.PC();
+        compilation.guest_bytes = A64::LocationDescriptor{ir_block.EndLocation()}.PC() - A64::LocationDescriptor{current_location}.PC();
 #endif
         Optimization::PolyfillPass(ir_block, polyfill_options);
         Optimization::A64CallbackConfigPass(ir_block, conf);
@@ -328,6 +342,7 @@ private:
 #ifdef DYNARMIC_JIT_DIAGNOSTICS
         const auto optimized = Clock::now();
         compilation.ir_instructions = ir_block.size();
+        const auto cold_before = block_of_code.GetFarCode().second;
 #endif
         const auto emitted = emitter.Emit(ir_block);
 #ifdef DYNARMIC_JIT_DIAGNOSTICS
@@ -337,6 +352,8 @@ private:
             };
             compilation.host_address = reinterpret_cast<std::uintptr_t>(emitted.entrypoint);
             compilation.native_bytes = emitted.size;
+            compilation.cold_bytes = block_of_code.GetFarCode().second - cold_before;
+            compilation.near_bytes = emitted.size - compilation.cold_bytes;
             compilation.translation_ns = duration(started, translated);
             compilation.optimization_ns = duration(translated, optimized);
             compilation.emission_ns = duration(optimized, Clock::now());
@@ -359,7 +376,8 @@ private:
             jit_state.ResetRSB();
             if (invalidate_entire_cache) {
 #ifdef DYNARMIC_JIT_DIAGNOSTICS
-                if (conf.diagnostics) conf.diagnostics->clear(conf.diagnostics->context, capacity_clear);
+                if (conf.diagnostics)
+                    conf.diagnostics->clear(conf.diagnostics->context, capacity_clear);
                 capacity_clear = false;
 #endif
                 block_of_code.ClearCache();

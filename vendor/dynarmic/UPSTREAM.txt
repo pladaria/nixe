@@ -6,6 +6,35 @@ headers; bundled dependencies retain their own licenses.
 Vendored source including bundled dependencies. Built for A64 by nixe-cpu-jit.
 
 Nixe adaptations:
+- backend/{code_cache_hash,block_range_information}, backend/x64/{emit_x64,
+  a64_emit_x64}, and ARM64-host descriptor owners: mix the full PC/context key
+  for robin maps/sets, including incoming references, invalidation and fastmem
+  markers. Follows the postmix decision of Lichii's boost flat containers at
+  646b5d17135a2b2701ccc7a959afd0bbbf2f6160, using the existing mcl XMRX mixer.
+  Standard hashes are unchanged for clients whose containers already mix.
+- backend/x64/a64_emit_x64: use a cache-line-aligned 2^16-entry, four-way fast
+  dispatch table with full tags and FIFO insertion, following Lichii
+  646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Publish after C++ lookup so capacity
+  clears cannot discard a just-inserted tag. Retire only exact tags in all ways.
+  A64's software return stack has 32 entries; entry lookup, push/pop masks,
+  state offsets and invalidation resets derive from the same owning state.
+- backend/x64/{a64_emit_x64,emit_x64_data_processing,emit_x64_memory}: fold
+  single-use scalar base+displacement additions into unchecked fastmem operands,
+  following Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160. The emission marker
+  is stored directly on IR instructions instead of a hash index. Preserve full
+  callback addresses, inverse/base restoration, store aliases, precise memory
+  aborts and deoptimization. Recovery and fault trampolines use the cold region.
+- Diagnostic builds only: count generated dispatch hits/misses and RSB hits;
+  record disjoint near/cold emitted bytes alongside the existing compilation
+  phases. No generated diagnostic instruction or field is present in normal builds.
+- backend/x64/{block_of_code,a64_emit_x64,emit_x64_memory}: shared compact
+  A64 exit stubs and a separate cold region following Lichii
+  646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Reserve its final-quarter share
+  normally, or seven-sixteenths when precise memory-abort recovery enlarges
+  every access stub. The total allocation stays unchanged. Preserve reusable inline deferred
+  captures, per-transition halt checks, precise fault metadata and epoch ownership.
+  Bound both write fronts independently, commit/protect both on Windows and
+  describe actual disjoint regions in symbols and disassembly.
 - The native bridge assumes valid commercial-software guest addresses and
   omits fastmem-width checks, following Lichii's Auto policy at
   646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Real arena/page-table sizes,

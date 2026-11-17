@@ -20,6 +20,7 @@
 #include <tsl/robin_map.h>
 #include <tsl/robin_set.h>
 
+#include "dynarmic/backend/code_cache_hash.h"
 #include "dynarmic/backend/exception_handler.h"
 #include "dynarmic/backend/x64/deferred_emit.h"
 #include "dynarmic/backend/x64/reg_alloc.h"
@@ -43,6 +44,13 @@ class BlockOfCode;
 
 bool IsZeroExtendedU32Producer(const IR::Inst* inst);
 
+inline std::optional<s32> FoldedAddressDisplacement(IR::Value address) {
+    if (address.IsImmediate() || !address.GetInst()->IsAddressFolded()) {
+        return std::nullopt;
+    }
+    return static_cast<s32>(address.GetInst()->GetArg(1).GetImmediateAsU64());
+}
+
 using A64FullVectorWidth = std::integral_constant<size_t, 128>;
 
 // Generated memory wrappers form a fixed domain: ordering, width and two host
@@ -65,7 +73,7 @@ template<typename T>
 using HalfVectorArray = std::array<T, A64FullVectorWidth::value / mcl::bitsizeof<T> / 2>;
 
 struct EmitContext {
-    EmitContext(RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits);
+    EmitContext(RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits, boost::container::stable_vector<DeferredEmit>& cold_emits);
     virtual ~EmitContext();
 
     void EraseInstruction(IR::Inst* inst);
@@ -82,6 +90,7 @@ struct EmitContext {
     IR::Block& block;
 
     boost::container::stable_vector<DeferredEmit>& deferred_emits;
+    boost::container::stable_vector<DeferredEmit>& cold_emits;
     boost::container::stable_vector<Xbyak::Label>& labels;
 };
 
@@ -89,7 +98,7 @@ class EmitX64 {
 public:
     struct BlockDescriptor {
         CodePtr entrypoint;  // Entrypoint of emitted code
-        size_t size;         // Length in bytes of emitted code
+        size_t size;         // Total emitted bytes, including separately owned cold code
     };
 
     explicit EmitX64(BlockOfCode& code, HostLocSet gpr_candidates, bool spill_to_free_gpr = false, bool scratch_copy_to_free_reg = false);
@@ -102,13 +111,13 @@ public:
     virtual void ClearCache();
 
     /// Invalidates a selection of basic blocks.
-    void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& locations);
+    void InvalidateBasicBlocks(const LocationDescriptorSet& locations);
 
 protected:
     using DoNotFastmemMarker = std::tuple<IR::LocationDescriptor, unsigned>;
     struct FastmemMarkerHash {
         size_t operator()(const DoNotFastmemMarker& marker) const noexcept {
-            size_t seed = std::hash<IR::LocationDescriptor>{}(std::get<0>(marker));
+            size_t seed = CodeCacheHash{}(std::get<0>(marker));
             boost::hash_combine(seed, std::get<1>(marker));
             return seed;
         }
@@ -127,7 +136,7 @@ protected:
     virtual std::string LocationDescriptorToFriendlyName(const IR::LocationDescriptor&) const = 0;
     void EmitAddCycles(size_t cycles);
     Xbyak::Label EmitCond(IR::Cond cond);
-    BlockDescriptor RegisterBlock(const IR::LocationDescriptor& location_descriptor, CodePtr entrypoint, size_t size);
+    BlockDescriptor RegisterBlock(const IR::LocationDescriptor& location_descriptor, CodePtr entrypoint, size_t size, CodePtr cold_begin = nullptr, size_t cold_size = 0);
     void PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target);
 
     void EmitVerboseDebuggingOutput(RegAlloc& reg_alloc);
@@ -173,9 +182,12 @@ protected:
     // its labels rather than allocating std::function captures per access.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
     boost::container::stable_vector<DeferredEmit> deferred_emits;
+    boost::container::stable_vector<DeferredEmit> cold_emits;
     ExceptionHandler exception_handler;
-    tsl::robin_map<IR::LocationDescriptor, BlockDescriptor> block_descriptors;
-    tsl::robin_map<IR::LocationDescriptor, PatchInformation> patch_information;
+    // Power-of-two buckets need mixed upper address/FPCR bits. Identity hashes
+    // can otherwise grow without resolving long chains of equal low PC bits.
+    tsl::robin_map<IR::LocationDescriptor, BlockDescriptor, CodeCacheHash> block_descriptors;
+    tsl::robin_map<IR::LocationDescriptor, PatchInformation, CodeCacheHash> patch_information;
 };
 
 }  // namespace Dynarmic::Backend::X64

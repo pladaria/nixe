@@ -14,6 +14,7 @@
 #include <tsl/robin_map.h>
 
 #include "dynarmic/backend/arm64/fastmem.h"
+#include "dynarmic/backend/code_cache_hash.h"
 #include "dynarmic/interface/A32/coprocessor.h"
 #include "dynarmic/interface/optimization_flags.h"
 #include "dynarmic/ir/location_descriptor.h"
@@ -102,7 +103,7 @@ struct EmittedBlockInfo {
     CodePtr entry_point;
     size_t size;
     std::vector<Relocation> relocations;
-    tsl::robin_map<IR::LocationDescriptor, std::vector<BlockRelocation>> block_relocations;
+    tsl::robin_map<IR::LocationDescriptor, std::vector<BlockRelocation>, CodeCacheHash> block_relocations;
     tsl::robin_map<std::ptrdiff_t, FastmemPatchInfo> fastmem_patch_info;
 };
 

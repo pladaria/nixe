@@ -171,11 +171,21 @@ public:
         return allocation_location;
     }
 
+    // Transient lowering decision, valid for this block's current emission.
+    // Kept beside allocation metadata instead of a separate per-block index.
+    void SetAddressFolded(bool value) {
+        address_folded = value;
+    }
+    bool IsAddressFolded() const {
+        return address_folded;
+    }
+
 private:
     void Use(const Value& value);
     void UndoUse(const Value& value);
 
     u8 allocation_location = InvalidAllocationLocation;
+    bool address_folded = false;
     Opcode op;
     unsigned use_count = 0;
     unsigned name = 0;

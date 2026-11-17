@@ -58,8 +58,8 @@ static Xbyak::Address MJitStateExtReg(A32::ExtReg reg) {
     ASSERT_FALSE("Should never happen.");
 }
 
-A32EmitContext::A32EmitContext(const A32::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits)
-        : EmitContext(reg_alloc, block, labels, deferred_emits), conf(conf) {}
+A32EmitContext::A32EmitContext(const A32::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits, boost::container::stable_vector<DeferredEmit>& cold_emits)
+        : EmitContext(reg_alloc, block, labels, deferred_emits, cold_emits), conf(conf) {}
 
 A32::LocationDescriptor A32EmitContext::Location() const {
     return A32::LocationDescriptor{block.Location()};
@@ -114,7 +114,7 @@ A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
         code.DisableWriting();
     };
 
-    A32EmitContext ctx{conf, reg_alloc, block, labels, deferred_emits};
+    A32EmitContext ctx{conf, reg_alloc, block, labels, deferred_emits, cold_emits};
 
     // Start emitting.
     code.align();

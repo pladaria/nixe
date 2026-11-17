@@ -2,6 +2,8 @@
  * Copyright (c) 2022 MerryMage
  * SPDX-License-Identifier: 0BSD
  */
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <utility>
 
@@ -20,6 +22,12 @@ namespace Dynarmic::Backend::X64 {
 namespace {
 
 using namespace Xbyak::util;
+
+// Preserve ordering between boundary detection and its fallthrough fallback.
+template<typename Context>
+auto& ColdEmits(BlockOfCode& code, Context& ctx) {
+    return code.HasFarCode() ? ctx.cold_emits : ctx.deferred_emits;
+}
 
 constexpr size_t page_bits = 12;
 constexpr size_t page_size = 1 << page_bits;
@@ -60,7 +68,7 @@ void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsi
     code.jnz(*detect_boundary, code.T_NEAR);
     code.L(*resume);
 
-    ctx.deferred_emits.emplace_back([=, &code] {
+    ColdEmits(code, ctx).emplace_back([=, &code] {
         code.L(*detect_boundary);
         code.mov(tmp, vaddr);
         code.and_(tmp, page_align_mask);
@@ -397,6 +405,10 @@ void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak:
         code.mov(qword[pointer], tmp);
         code.L(ok);
     }
+}
+
+inline size_t FoldedDisp(s32 displacement) {
+    return static_cast<size_t>(static_cast<s64>(displacement));
 }
 
 inline bool IsOrdered(IR::AccType acctype) {

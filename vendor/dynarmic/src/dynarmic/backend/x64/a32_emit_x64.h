@@ -23,7 +23,7 @@ namespace Dynarmic::Backend::X64 {
 class RegAlloc;
 
 struct A32EmitContext final : public EmitContext {
-    A32EmitContext(const A32::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits);
+    A32EmitContext(const A32::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits, boost::container::stable_vector<DeferredEmit>& cold_emits);
 
     A32::LocationDescriptor Location() const;
     A32::LocationDescriptor EndLocation() const;

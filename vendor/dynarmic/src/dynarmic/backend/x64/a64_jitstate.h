@@ -50,7 +50,7 @@ struct A64JitState {
     static constexpr u64 RESERVATION_GRANULE_MASK = 0xFFFF'FFFF'FFFF'FFF0ull;
     u8 exclusive_state = 0;
 
-    static constexpr size_t RSBSize = 8;  // MUST be a power of 2.
+    static constexpr size_t RSBSize = 32;  // MUST be a power of 2.
     static constexpr size_t RSBPtrMask = RSBSize - 1;
     u32 rsb_ptr = 0;
     std::array<u64, RSBSize> rsb_location_descriptors;

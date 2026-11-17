@@ -10,6 +10,7 @@
 #include <boost/icl/interval_set.hpp>
 #include <tsl/robin_set.h>
 
+#include "dynarmic/backend/code_cache_hash.h"
 #include "dynarmic/ir/location_descriptor.h"
 
 namespace Dynarmic::Backend {
@@ -19,7 +20,7 @@ class BlockRangeInformation {
 public:
     void AddRange(boost::icl::discrete_interval<ProgramCounterType> range, IR::LocationDescriptor location);
     void ClearCache();
-    tsl::robin_set<IR::LocationDescriptor> InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges);
+    LocationDescriptorSet InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges);
 
 private:
     // Compilation appends an extent; the less frequent invalidation scans it.

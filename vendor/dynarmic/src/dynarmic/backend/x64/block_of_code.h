@@ -2,6 +2,8 @@
  * Copyright (c) 2016 MerryMage
  * SPDX-License-Identifier: 0BSD
  */
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
 
@@ -9,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <type_traits>
+#include <utility>
 
 #include <mcl/bit/bit_field.hpp>
 #include <mcl/stdint.hpp>
@@ -38,6 +41,7 @@ class BlockOfCode final : public Xbyak::CodeGenerator {
 public:
     BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp);
     BlockOfCode(const BlockOfCode&) = delete;
+    ~BlockOfCode() { maxSize_ = total_code_size; }
 
     /// Call when external emitters have finished emitting their preludes.
     void PreludeComplete();
@@ -51,6 +55,13 @@ public:
 
     /// Clears this block of code and resets code pointer to beginning.
     void ClearCache();
+    /// Reserve a disjoint cold region before completing the prelude.
+    void EnableFarCode(size_t size);
+    bool HasFarCode() const { return far_code_begin != nullptr; }
+    void SwitchToFarCode();
+    void SwitchToNearCode();
+    std::pair<const u8*, size_t> GetFarCode() const;
+
     /// Calculates how much space is remaining to use.
     size_t SpaceRemaining() const;
     /// Ensure at least codesize bytes of code cache memory are committed at the current code_ptr.
@@ -189,11 +200,18 @@ private:
     RunCodeCallbacks cb;
     JitStateInfo jsi;
 
+    const size_t total_code_size;
+    const u8* far_code_begin = nullptr;
+    const u8* far_code_ptr = nullptr;
+    const u8* near_code_ptr = nullptr;
+    bool in_far_code = false;
+
     bool prelude_complete = false;
     CodePtr code_begin = nullptr;
 
 #ifdef _WIN32
     size_t committed_size = 0;
+    size_t far_committed_size = 0;
 #endif
 
     ConstantPool constant_pool;

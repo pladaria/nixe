@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /* This file is part of the dynarmic project.
  * Copyright (c) 2022 MerryMage
  * SPDX-License-Identifier: 0BSD
@@ -60,6 +63,13 @@ template<std::size_t bitsize, auto callback>
 void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst, const std::optional<DoNotFastmemMarker>& fastmem_marker) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const bool ordered = IsOrdered(args[2].GetImmediateAccType());
+    auto displacement = [&] {
+        if constexpr (std::is_same_v<AxxEmitContext, A64EmitContext>) {
+            return FoldedAddressDisplacement(inst->GetArg(1));
+        } else {
+            return std::optional<s32>{};
+        }
+    }();
 
     if (!conf.page_table && !fastmem_marker) {
         // Neither fastmem nor page table: Use callbacks
@@ -72,6 +82,9 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst, const std::
             ctx.reg_alloc.DefineValue(inst, xmm1);
         } else {
             ctx.reg_alloc.HostCall(inst, {}, args[1]);
+            if (displacement) {
+                code.lea(code.ABI_PARAM2, code.ptr[code.ABI_PARAM2 + FoldedDisp(*displacement)]);
+            }
             if (ordered) {
                 code.mfence();
             }
@@ -90,8 +103,14 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst, const std::
         ctx.reg_alloc.ScratchGpr(HostLoc::RDX);
     }
 
-    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[1]);
+    Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[1]);
     const int value_idx = bitsize == 128 ? ctx.reg_alloc.ScratchXmm().getIdx() : ctx.reg_alloc.ScratchGpr().getIdx();
+    if (displacement && !fastmem_marker) {
+        const auto full_address = ctx.reg_alloc.ScratchGpr();
+        code.lea(full_address, code.ptr[vaddr + FoldedDisp(*displacement)]);
+        vaddr = full_address;
+        displacement.reset();
+    }
 
     const auto wrapped_fn = read_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr.getIdx()][value_idx];
 
@@ -100,11 +119,33 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst, const std::
     if (fastmem_marker) {
         // Use fastmem
         bool require_abort_handling;
-        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, inst->GetArg(1));
+        auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, inst->GetArg(1));
+        if (displacement) {
+            src_ptr = src_ptr + FoldedDisp(*displacement);
+        }
 
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
-        ctx.deferred_emits.emplace_back([=, this, &ctx] {
+        ColdEmits(code, ctx).emplace_back([=, this, &ctx] {
+            if (displacement) {
+                // Callbacks consume the full guest address. Restore the base on
+                // return because other live SSA values may still reference it.
+                code.L(*abort);
+                code.lea(vaddr, code.ptr[vaddr + FoldedDisp(*displacement)]);
+                code.call(wrapped_fn);
+                const auto resume = code.getCurr();
+                code.lea(vaddr, code.ptr[vaddr + FoldedDisp(-*displacement)]);
+                EmitCheckMemoryAbort(ctx, inst, end);
+                code.jmp(*end, code.T_NEAR);
+                const auto stub = code.getCurr<void (*)()>();
+                code.lea(vaddr, code.ptr[vaddr + FoldedDisp(*displacement)]);
+                code.jmp(reinterpret_cast<const void*>(wrapped_fn), code.T_NEAR);
+                fastmem_patch_info.emplace(
+                    mcl::bit_cast<u64>(location),
+                    FastmemPatchInfo{mcl::bit_cast<u64>(resume), mcl::bit_cast<u64>(stub),
+                                     *fastmem_marker, conf.recompile_on_fastmem_failure});
+                return;
+            }
             code.L(*abort);
             code.call(wrapped_fn);
 
@@ -126,7 +167,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst, const std::
         const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr);
         EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
-        ctx.deferred_emits.emplace_back([=, this, &ctx] {
+        ColdEmits(code, ctx).emplace_back([=, this, &ctx] {
             code.L(*abort);
             code.call(wrapped_fn);
             EmitCheckMemoryAbort(ctx, inst, end);
@@ -146,6 +187,13 @@ template<std::size_t bitsize, auto callback>
 void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst, const std::optional<DoNotFastmemMarker>& fastmem_marker) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const bool ordered = IsOrdered(args[3].GetImmediateAccType());
+    auto displacement = [&] {
+        if constexpr (std::is_same_v<AxxEmitContext, A64EmitContext>) {
+            return FoldedAddressDisplacement(inst->GetArg(1));
+        } else {
+            return std::optional<s32>{};
+        }
+    }();
 
     if (!conf.page_table && !fastmem_marker) {
         // Neither fastmem nor page table: Use callbacks
@@ -157,6 +205,9 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst, const std:
             code.CallFunction(memory_write_128);
         } else {
             ctx.reg_alloc.HostCall(nullptr, {}, args[1], args[2]);
+            if (displacement) {
+                code.lea(code.ABI_PARAM2, code.ptr[code.ABI_PARAM2 + FoldedDisp(*displacement)]);
+            }
             Devirtualize<callback>(conf.callbacks).EmitCall(code);
         }
         if (ordered) {
@@ -174,10 +225,18 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst, const std:
         ctx.reg_alloc.ScratchGpr(HostLoc::RDX);
     }
 
-    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[1]);
+    Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[1]);
     const int value_idx = bitsize == 128
                             ? ctx.reg_alloc.UseXmm(args[2]).getIdx()
                             : (ordered ? ctx.reg_alloc.UseScratchGpr(args[2]).getIdx() : ctx.reg_alloc.UseGpr(args[2]).getIdx());
+
+    // A fallback adjusts the address in place; it must not change the data too.
+    if (displacement && (!fastmem_marker || (bitsize != 128 && value_idx == vaddr.getIdx()))) {
+        const auto full_address = ctx.reg_alloc.ScratchGpr();
+        code.lea(full_address, code.ptr[vaddr + FoldedDisp(*displacement)]);
+        vaddr = full_address;
+        displacement.reset();
+    }
 
     const auto wrapped_fn = write_fallbacks[ordered][MemoryFallbackSizeIndex(bitsize)][vaddr.getIdx()][value_idx];
 
@@ -186,11 +245,31 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst, const std:
     if (fastmem_marker) {
         // Use fastmem
         bool require_abort_handling;
-        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, inst->GetArg(1));
+        auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, inst->GetArg(1));
+        if (displacement) {
+            dest_ptr = dest_ptr + FoldedDisp(*displacement);
+        }
 
         const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
 
-        ctx.deferred_emits.emplace_back([=, this, &ctx] {
+        ColdEmits(code, ctx).emplace_back([=, this, &ctx] {
+            if (displacement) {
+                code.L(*abort);
+                code.lea(vaddr, code.ptr[vaddr + FoldedDisp(*displacement)]);
+                code.call(wrapped_fn);
+                const auto resume = code.getCurr();
+                code.lea(vaddr, code.ptr[vaddr + FoldedDisp(-*displacement)]);
+                EmitCheckMemoryAbort(ctx, inst, end);
+                code.jmp(*end, code.T_NEAR);
+                const auto stub = code.getCurr<void (*)()>();
+                code.lea(vaddr, code.ptr[vaddr + FoldedDisp(*displacement)]);
+                code.jmp(reinterpret_cast<const void*>(wrapped_fn), code.T_NEAR);
+                fastmem_patch_info.emplace(
+                    mcl::bit_cast<u64>(location),
+                    FastmemPatchInfo{mcl::bit_cast<u64>(resume), mcl::bit_cast<u64>(stub),
+                                     *fastmem_marker, conf.recompile_on_fastmem_failure});
+                return;
+            }
             code.L(*abort);
             code.call(wrapped_fn);
 
@@ -212,7 +291,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst, const std:
         const auto dest_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr);
         EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
 
-        ctx.deferred_emits.emplace_back([=, this, &ctx] {
+        ColdEmits(code, ctx).emplace_back([=, this, &ctx] {
             code.L(*abort);
             code.call(wrapped_fn);
             EmitCheckMemoryAbort(ctx, inst, end);
@@ -386,7 +465,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
         code.L(*end);
 
         if (require_abort_handling) {
-            ctx.deferred_emits.emplace_back([=, this] {
+            ColdEmits(code, ctx).emplace_back([=, this] {
                 code.L(*abort);
                 code.call(wrapped_fn);
                 code.jmp(*end, code.T_NEAR);
@@ -508,7 +587,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
 
         code.setnz(status.cvt8());
 
-        ctx.deferred_emits.emplace_back([=, this] {
+        ColdEmits(code, ctx).emplace_back([=, this] {
             code.L(*abort);
             code.call(wrapped_fn);
 

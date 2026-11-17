@@ -286,6 +286,11 @@ struct UserConfig {
     bool scratch_copy_to_free_reg = false;
     /// x64: omit zero-extension when a 32-bit producer already cleared the high bits.
     bool elide_redundant_zext = false;
+    /// Share rel32 exit stubs and keep memory recovery paths outside the mainline region.
+    bool compact_block_exits = false;
+    bool far_code = false;
+    /// Fold single-use scalar address additions into unchecked fastmem operands.
+    bool fold_address_offsets = false;
 
     /// This option relates to translation. Generally when we run into an unpredictable
     /// instruction the ExceptionRaised callback is called. If this is true, we define

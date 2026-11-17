@@ -2,6 +2,8 @@
  * Copyright (c) 2016 MerryMage
  * SPDX-License-Identifier: 0BSD
  */
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "dynarmic/backend/x64/block_of_code.h"
 
@@ -72,7 +74,9 @@ public:
         VirtualFree(static_cast<void*>(p), 0, MEM_RELEASE);
     }
 
-    bool useProtect() const override { return false; }
+    bool useProtect() const override {
+        return false;
+    }
 #else
     static constexpr size_t DYNARMIC_PAGE_SIZE = 4096;
 
@@ -108,7 +112,9 @@ public:
     }
 
 #    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
-    bool useProtect() const override { return false; }
+    bool useProtect() const override {
+        return false;
+    }
 #    endif
 #endif
 };
@@ -223,6 +229,7 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
         : Xbyak::CodeGenerator(total_code_size, nullptr, &s_allocator)
         , cb(std::move(cb))
         , jsi(jsi)
+        , total_code_size(total_code_size)
         , constant_pool(*this, CONSTANT_POOL_SIZE)
         , host_features(GetHostFeatures()) {
     // Retire earlier names before reusing host addresses. Teardown leaves the
@@ -244,8 +251,10 @@ void BlockOfCode::EnableWriting() {
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
 #    ifdef _WIN32
     ProtectMemory(getCode(), committed_size, false);
+    if (far_committed_size)
+        ProtectMemory(far_code_begin, far_committed_size, false);
 #    else
-    ProtectMemory(getCode(), maxSize_, false);
+    ProtectMemory(getCode(), total_code_size, false);
 #    endif
 #endif
 }
@@ -254,35 +263,78 @@ void BlockOfCode::DisableWriting() {
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
 #    ifdef _WIN32
     ProtectMemory(getCode(), committed_size, true);
+    if (far_committed_size)
+        ProtectMemory(far_code_begin, far_committed_size, true);
 #    else
-    ProtectMemory(getCode(), maxSize_, true);
+    ProtectMemory(getCode(), total_code_size, true);
 #    endif
 #endif
 }
 
 void BlockOfCode::ClearCache() {
-    ASSERT(prelude_complete);
+    ASSERT(prelude_complete && !in_far_code);
     SetCodePtr(code_begin);
+    far_code_ptr = far_code_begin;
+}
+
+void BlockOfCode::EnableFarCode(size_t size) {
+    ASSERT(!prelude_complete && !HasFarCode());
+    ASSERT(size && size < total_code_size / 2);
+    far_code_begin = getCode() + ((total_code_size - size) & ~size_t(4095));
+    far_code_ptr = far_code_begin;
+    // Xbyak bounds each write against the active region, including oversized blocks.
+    maxSize_ = far_code_begin - getCode();
+    ASSERT(getCurr<const u8*>() < far_code_begin);
+}
+
+void BlockOfCode::SwitchToFarCode() {
+    ASSERT(HasFarCode() && !in_far_code);
+    near_code_ptr = getCurr<const u8*>();
+    in_far_code = true;
+    maxSize_ = total_code_size;
+    SetCodePtr(far_code_ptr);
+}
+
+void BlockOfCode::SwitchToNearCode() {
+    ASSERT(in_far_code);
+    far_code_ptr = getCurr<const u8*>();
+    in_far_code = false;
+    SetCodePtr(near_code_ptr);
+    maxSize_ = far_code_begin - getCode();
+}
+
+std::pair<const u8*, size_t> BlockOfCode::GetFarCode() const {
+    ASSERT(!in_far_code);
+    return {far_code_begin, HasFarCode() ? size_t(far_code_ptr - far_code_begin) : 0};
 }
 
 size_t BlockOfCode::SpaceRemaining() const {
-    ASSERT(prelude_complete);
-    const u8* current_ptr = getCurr<const u8*>();
-    if (current_ptr >= &top_[maxSize_])
-        return 0;
-    return &top_[maxSize_] - current_ptr;
+    ASSERT(prelude_complete && !in_far_code);
+    const size_t near_remaining = maxSize_ - size_;
+    return HasFarCode() ? std::min(near_remaining, size_t(getCode() + total_code_size - far_code_ptr)) : near_remaining;
 }
 
 void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
 #ifdef _WIN32
-    if (committed_size < size_ + codesize) {
-        committed_size = std::min<size_t>(maxSize_, committed_size + codesize);
 #    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
-        VirtualAlloc(top_, committed_size, MEM_COMMIT, PAGE_READWRITE);
+    constexpr DWORD protection = PAGE_READWRITE;
 #    else
-        VirtualAlloc(top_, committed_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    constexpr DWORD protection = PAGE_EXECUTE_READWRITE;
 #    endif
+    const auto commit = [&](const u8* begin, size_t& committed, size_t required, size_t capacity) {
+        if (required <= committed)
+            return;
+        const size_t end = std::min(capacity, required);
+        ASSERT_MSG(VirtualAlloc(const_cast<u8*>(begin), end, MEM_COMMIT, protection),
+                   "Cannot commit native code pages (error {})", GetLastError());
+        committed = end;
+    };
+    if (HasFarCode()) {
+        const size_t far_used = (in_far_code ? getCurr<const u8*>() : far_code_ptr) - far_code_begin;
+        commit(far_code_begin, far_committed_size, far_used + codesize, total_code_size - size_t(far_code_begin - getCode()));
     }
+    if (!in_far_code)
+        commit(getCode(), committed_size, size_ + codesize, maxSize_);
 #endif
 }
 
@@ -516,7 +568,7 @@ CodePtr BlockOfCode::GetCodeBegin() const {
 }
 
 size_t BlockOfCode::GetTotalCodeSize() const {
-    return maxSize_;
+    return total_code_size;
 }
 
 void* BlockOfCode::AllocateFromCodeSpace(size_t alloc_size) {

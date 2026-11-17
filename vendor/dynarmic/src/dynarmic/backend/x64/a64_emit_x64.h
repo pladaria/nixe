@@ -2,6 +2,8 @@
  * Copyright (c) 2016 MerryMage
  * SPDX-License-Identifier: 0BSD
  */
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
 
@@ -21,7 +23,7 @@ namespace Dynarmic::Backend::X64 {
 class RegAlloc;
 
 struct A64EmitContext final : public EmitContext {
-    A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits);
+    A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits, boost::container::stable_vector<DeferredEmit>& cold_emits);
 
     A64::LocationDescriptor Location() const;
     bool IsSingleStep() const;
@@ -60,13 +62,11 @@ protected:
         const void* code_ptr = nullptr;
     };
     static_assert(sizeof(FastDispatchEntry) == 0x10);
-    // Keep Eden's full-tag direct cache while bounding the sparse lookup's
-    // page working set independently of the generated-code cache capacity.
-    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
-    static constexpr size_t fast_dispatch_table_size = 0x40000;
-    static constexpr u64 fast_dispatch_table_mask =
-        (fast_dispatch_table_size - 1) * sizeof(FastDispatchEntry);
-    std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
+    // Four entries share a cache line; full compilation-context tags guard every hit.
+    static constexpr size_t fast_dispatch_table_size = 1 << 16;
+    static constexpr size_t fast_dispatch_set_size = 4;
+    static constexpr u64 fast_dispatch_table_mask = (fast_dispatch_table_size - fast_dispatch_set_size) * sizeof(FastDispatchEntry);
+    alignas(64) std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
     void ClearFastDispatchTable();
 
     void (*memory_read_128)();
@@ -136,6 +136,14 @@ protected:
     void EmitTerminalImpl(IR::Term::If terminal, IR::LocationDescriptor initial_location, bool is_single_step) override;
     void EmitTerminalImpl(IR::Term::CheckBit terminal, IR::LocationDescriptor initial_location, bool is_single_step) override;
     void EmitTerminalImpl(IR::Term::CheckHalt terminal, IR::LocationDescriptor initial_location, bool is_single_step) override;
+
+    tsl::robin_map<u64, CodePtr, CodeCacheHash> exit_stubs;
+    std::vector<std::pair<u64, Xbyak::Label*>> pending_exit_stubs;
+    bool emitting_block = false;
+    Xbyak::Label* PendingExitStub(const IR::LocationDescriptor& target);
+    void FlushPendingExitStubs();
+    void EmitUnlinkedExit(const IR::LocationDescriptor& target);
+    void EmitCompactPatch(const IR::LocationDescriptor& target, CodePtr target_code_ptr, int condition);
 
     // Patching
     void Unpatch(const IR::LocationDescriptor& target_desc) override;

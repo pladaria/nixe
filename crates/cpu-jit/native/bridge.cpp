@@ -129,6 +129,9 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.spill_to_free_gpr = true;
     conf.scratch_copy_to_free_reg = true;
     conf.elide_redundant_zext = true;
+    conf.compact_block_exits = true;
+    conf.far_code = true;
+    conf.fold_address_offsets = true;
     jit = std::make_unique<Dynarmic::A64::Jit>(conf);
   }
   void stop(std::uint32_t kind, std::uint32_t detail, std::uint64_t pc) {

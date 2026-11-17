@@ -16,6 +16,7 @@
 
 #include "dynarmic/backend/arm64/emit_arm64.h"
 #include "dynarmic/backend/arm64/fastmem.h"
+#include "dynarmic/backend/code_cache_hash.h"
 #include "dynarmic/interface/halt_reason.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/location_descriptor.h"
@@ -39,7 +40,7 @@ public:
 
     CodePtr GetOrEmit(IR::LocationDescriptor descriptor);
 
-    void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors);
+    void InvalidateBasicBlocks(const LocationDescriptorSet& descriptors);
 
     virtual void ClearCache();
 
@@ -75,10 +76,10 @@ protected:
 
     // A IR::LocationDescriptor will have one current CodePtr.
     // However, there can be multiple other CodePtrs which are older, previously invalidated blocks.
-    tsl::robin_map<IR::LocationDescriptor, CodePtr> block_entries;
+    tsl::robin_map<IR::LocationDescriptor, CodePtr, CodeCacheHash> block_entries;
     std::map<CodePtr, IR::LocationDescriptor> reverse_block_entries;
     tsl::robin_map<CodePtr, EmittedBlockInfo> block_infos;
-    tsl::robin_map<IR::LocationDescriptor, tsl::robin_set<CodePtr>> block_references;
+    tsl::robin_map<IR::LocationDescriptor, tsl::robin_set<CodePtr>, CodeCacheHash> block_references;
 
     ExceptionHandler exception_handler;
     FastmemManager fastmem_manager;

@@ -32,13 +32,14 @@ namespace Dynarmic::Backend::X64 {
 
 using namespace Xbyak::util;
 
-EmitContext::EmitContext(RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits)
-        : reg_alloc(reg_alloc), block(block), deferred_emits(deferred_emits), labels(labels) {
-    DEBUG_ASSERT(deferred_emits.empty());
+EmitContext::EmitContext(RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits, boost::container::stable_vector<DeferredEmit>& cold_emits)
+        : reg_alloc(reg_alloc), block(block), deferred_emits(deferred_emits), cold_emits(cold_emits), labels(labels) {
+    DEBUG_ASSERT(deferred_emits.empty() && cold_emits.empty());
 }
 
 EmitContext::~EmitContext() {
     deferred_emits.clear();
+    cold_emits.clear();
 }
 
 void EmitContext::EraseInstruction(IR::Inst* inst) {
@@ -355,13 +356,16 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
     return pass;
 }
 
-EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& descriptor, CodePtr entrypoint, size_t size) {
+EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& descriptor, CodePtr entrypoint, size_t size, CodePtr cold_begin, size_t cold_size) {
     if (PerfMapEnabled()) {
-        PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
+        const auto name = LocationDescriptorToFriendlyName(descriptor);
+        PerfMapRegister(entrypoint, static_cast<const u8*>(entrypoint) + size, name);
+        if (cold_size)
+            PerfMapRegister(cold_begin, static_cast<const u8*>(cold_begin) + cold_size, name + "_cold");
     }
     Patch(descriptor, entrypoint);
 
-    BlockDescriptor block_desc{entrypoint, size};
+    BlockDescriptor block_desc{entrypoint, size + cold_size};
     block_descriptors.insert({IR::LocationDescriptor{descriptor.Value()}, block_desc});
     return block_desc;
 }
@@ -427,7 +431,7 @@ void EmitX64::ClearCache() {
     PerfMapClear(code.GetCodeBegin(), code.getCode() + code.GetTotalCodeSize());
 }
 
-void EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& locations) {
+void EmitX64::InvalidateBasicBlocks(const LocationDescriptorSet& locations) {
     code.EnableWriting();
     SCOPE_EXIT {
         code.DisableWriting();

@@ -70,7 +70,7 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
     return block_info.entry_point;
 }
 
-void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors) {
+void AddressSpace::InvalidateBasicBlocks(const LocationDescriptorSet& descriptors) {
     UnprotectCodeMemory();
 
     for (const auto& descriptor : descriptors) {

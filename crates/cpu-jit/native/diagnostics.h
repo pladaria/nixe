@@ -52,10 +52,10 @@ class JitDiagnostics {
       return;
     }
     ++event_count_;
-    if (std::fprintf(events_.get(), "%llu,%s,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+    if (std::fprintf(events_.get(), "%llu,%s,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
         u(now()), kind, u(owner_), u(epoch_), u(c.descriptor), u(c.fingerprint),
         u(c.host_address), u(c.native_bytes), u(c.guest_bytes), u(c.ir_instructions),
-        u(c.translation_ns), u(c.optimization_ns), u(c.emission_ns)) < 0) {
+        u(c.translation_ns), u(c.optimization_ns), u(c.emission_ns), u(c.near_bytes), u(c.cold_bytes)) < 0) {
       io_error();
     }
   }
@@ -65,6 +65,8 @@ class JitDiagnostics {
     ++s.compiled;
     s.guest_bytes += c.guest_bytes;
     s.native_bytes += c.native_bytes;
+    s.near_bytes += c.near_bytes;
+    s.cold_bytes += c.cold_bytes;
     s.translation_ns += c.translation_ns;
     s.optimization_ns += c.optimization_ns;
     s.emission_ns += c.emission_ns;
@@ -99,8 +101,8 @@ class JitDiagnostics {
     if (!events_ || !snapshots_) throw std::runtime_error("Cannot open JIT diagnostic files");
     std::setvbuf(events_.get(), event_buffer_.data(), _IOFBF, event_buffer_.size());
     std::setvbuf(snapshots_.get(), snapshot_buffer_.data(), _IOFBF, snapshot_buffer_.size());
-    std::fputs("time_ns,event,owner_tid,epoch,descriptor,fingerprint,host_address,native_bytes,guest_bytes,ir_instructions,translation_ns,optimization_ns,emission_ns\n", events_.get());
-    std::fputs("time_ns,owner_tid,lookups,hits,compiled,guest_bytes,native_bytes,mainline_bytes,deferred_bytes,capacity_clears,requested_clears,targeted_blocks,fastmem_blocks,translation_ns,optimization_ns,emission_ns,dropped_events,io_failed,event_limit\n", snapshots_.get());
+    std::fputs("time_ns,event,owner_tid,epoch,descriptor,fingerprint,host_address,native_bytes,guest_bytes,ir_instructions,translation_ns,optimization_ns,emission_ns,near_bytes,cold_bytes\n", events_.get());
+    std::fputs("time_ns,owner_tid,lookups,hits,compiled,guest_bytes,native_bytes,mainline_bytes,deferred_bytes,capacity_clears,requested_clears,targeted_blocks,fastmem_blocks,translation_ns,optimization_ns,emission_ns,dropped_events,io_failed,event_limit,dispatch_hits,dispatch_misses,rsb_hits,near_bytes,cold_bytes\n", snapshots_.get());
     counters.context = this;
     counters.compile = compiled;
     counters.invalidate = invalidated;
@@ -125,11 +127,11 @@ public:
     if (!force && time < next_snapshot_) return;
     next_snapshot_ = time + std::chrono::seconds(1);
     const auto& s = counters;
-    if (std::fprintf(snapshots_.get(), "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu\n",
+    if (std::fprintf(snapshots_.get(), "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu\n",
         u(now()), u(owner_), u(s.lookups), u(s.hits), u(s.compiled), u(s.guest_bytes),
         u(s.native_bytes), u(s.mainline_bytes), u(s.deferred_bytes), u(s.capacity_clears),
         u(s.requested_clears), u(s.targeted_blocks), u(s.fastmem_blocks), u(s.translation_ns),
-        u(s.optimization_ns), u(s.emission_ns), u(dropped_), unsigned(io_failed_), u(event_limit_)) < 0 ||
+        u(s.optimization_ns), u(s.emission_ns), u(dropped_), unsigned(io_failed_), u(event_limit_), u(s.dispatch_hits), u(s.dispatch_misses), u(s.rsb_hits), u(s.near_bytes), u(s.cold_bytes)) < 0 ||
         std::fflush(events_.get()) != 0 || std::fflush(snapshots_.get()) != 0) {
       io_error();
     }
