@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -14,7 +13,7 @@
 
 #include "dynarmic/interface/optimization_flags.h"
 #ifdef DYNARMIC_JIT_DIAGNOSTICS
-#include "dynarmic/interface/A64/diagnostics.h"
+#    include "dynarmic/interface/A64/diagnostics.h"
 #endif
 
 namespace Dynarmic {
@@ -280,6 +279,13 @@ struct UserConfig {
     /// recompilation of that block with fastmem disabled. Recompiled code will use memory
     /// callbacks.
     bool recompile_on_exclusive_fastmem_failure = true;
+
+    /// x64: preserve evicted GPR values in an available callee-saved register.
+    bool spill_to_free_gpr = false;
+    /// x64: copy a live writable operand into a free register before evicting it.
+    bool scratch_copy_to_free_reg = false;
+    /// x64: omit zero-extension when a 32-bit producer already cleared the high bits.
+    bool elide_redundant_zext = false;
 
     /// This option relates to translation. Generally when we run into an unpredictable
     /// instruction the ExceptionRaised callback is called. If this is true, we define

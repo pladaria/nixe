@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /* This file is part of the dynarmic project.
  * Copyright (c) 2016 MerryMage
  * SPDX-License-Identifier: 0BSD
@@ -43,12 +46,27 @@ void EmitContext::EraseInstruction(IR::Inst* inst) {
     inst->ClearArgs();
 }
 
-EmitX64::EmitX64(BlockOfCode& code, HostLocSet gpr_candidates)
-        : code(code), reg_alloc(code, gpr_candidates, any_xmm) {
+EmitX64::EmitX64(BlockOfCode& code, HostLocSet gpr_candidates, bool spill_to_free_gpr, bool scratch_copy_to_free_reg)
+        : code(code), reg_alloc(code, gpr_candidates, any_xmm, spill_to_free_gpr, scratch_copy_to_free_reg) {
     exception_handler.Register(code);
 }
 
 EmitX64::~EmitX64() = default;
+
+bool IsZeroExtendedU32Producer(const IR::Inst* inst) {
+    // These emitters always write a 32-bit destination, clearing its upper half.
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::A64GetW:
+    case IR::Opcode::A64ReadMemory32:
+    case IR::Opcode::LeastSignificantWord:
+    case IR::Opcode::Add32:
+    case IR::Opcode::Sub32:
+    case IR::Opcode::ConditionalSelect32:
+        return true;
+    default:
+        return false;
+    }
+}
 
 std::optional<EmitX64::BlockDescriptor> EmitX64::GetBasicBlock(IR::LocationDescriptor descriptor) const {
     const auto iter = block_descriptors.find(descriptor);

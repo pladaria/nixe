@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /* This file is part of the dynarmic project.
  * Copyright (c) 2016 MerryMage
  * SPDX-License-Identifier: 0BSD
@@ -265,10 +268,19 @@ bool Argument::IsInMemory() const {
     return HostLocIsSpill(*reg_alloc.ValueLocation(value.GetInst()));
 }
 
-RegAlloc::RegAlloc(BlockOfCode& code, HostLocSet gpr_candidates, HostLocSet xmm_candidates)
+RegAlloc::RegAlloc(BlockOfCode& code, HostLocSet gpr_candidates, HostLocSet xmm_candidates, bool spill_to_free_gpr, bool scratch_copy_to_free_reg)
         : gpr_candidates(gpr_candidates)
         , xmm_candidates(xmm_candidates)
-        , code(code) {}
+        , scratch_copy_to_free_reg(scratch_copy_to_free_reg)
+        , code(code) {
+    if (spill_to_free_gpr) {
+        for (const auto loc : ABI_ALL_CALLEE_SAVE) {
+            if (HostLocIsGPR(loc) && loc != HostLoc::RBP && loc < HostLoc::R13 && gpr_candidates.test(static_cast<size_t>(loc))) {
+                spill_gpr_candidates.set(static_cast<size_t>(loc));
+            }
+        }
+    }
+}
 
 RegAlloc::ArgumentInfo RegAlloc::GetArgumentInfo(IR::Inst* inst) {
     ArgumentInfo ret = {Argument{*this}, Argument{*this}, Argument{*this}, Argument{*this}};
@@ -419,6 +431,15 @@ HostLoc RegAlloc::UseScratchImpl(IR::Value use_value, HostLocSet desired_locatio
     const bool can_use_current_location = HostLocIsRegister(current_location) && desired_locations.test(static_cast<size_t>(current_location));
     if (can_use_current_location && !LocInfo(current_location).IsLocked()) {
         if (!LocInfo(current_location).IsLastUse()) {
+            if (scratch_copy_to_free_reg) {
+                const auto copy_location = SelectARegister(desired_locations);
+                if (LocInfo(copy_location).IsEmpty()) {
+                    // Keep the live operand in place; only the copy is writable.
+                    CopyToScratch(bit_width, copy_location, current_location);
+                    LocInfo(copy_location).WriteLock();
+                    return copy_location;
+                }
+            }
             MoveOutOfTheWay(current_location);
         } else {
             LocInfo(current_location).SetLastUse();
@@ -667,6 +688,18 @@ void RegAlloc::SpillRegister(HostLoc loc) {
     ASSERT_MSG(!LocInfo(loc).IsEmpty(), "There is no need to spill unoccupied registers");
     ASSERT_MSG(!LocInfo(loc).IsLocked(), "Registers that have been allocated must not be spilt");
 
+    if (HostLocIsGPR(loc)) {
+        auto remaining = spill_gpr_candidates.to_ullong();
+        while (remaining != 0) {
+            const auto candidate = static_cast<HostLoc>(std::countr_zero(remaining));
+            remaining &= remaining - 1;
+            if (std::as_const(*this).LocInfo(candidate).IsEmpty()) {
+                // Callee-saved destinations remain valid across host callbacks.
+                Move(candidate, loc);
+                return;
+            }
+        }
+    }
     const HostLoc new_loc = FindFreeSpill();
     Move(new_loc, loc);
 }

@@ -42,6 +42,8 @@ public:
     /// Call when external emitters have finished emitting their preludes.
     void PreludeComplete();
 
+    bool elide_redundant_zext = false;
+
     /// Change permissions to RW. This is required to support systems with W^X enforced.
     void EnableWriting();
     /// Change permissions to RX. This is required to support systems with W^X enforced.
@@ -175,7 +177,9 @@ public:
     static const std::array<Xbyak::Reg64, ABI_PARAM_COUNT> ABI_PARAMS;
 #endif
 
-    JitStateInfo GetJitStateInfo() const { return jsi; }
+    JitStateInfo GetJitStateInfo() const {
+        return jsi;
+    }
 
     bool HasHostFeature(HostFeature feature) const {
         return (host_features & feature) == feature;

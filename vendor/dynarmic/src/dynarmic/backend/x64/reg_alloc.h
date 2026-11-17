@@ -119,6 +119,11 @@ public:
     /// Is this value currently in memory?
     bool IsInMemory() const;
 
+    IR::Inst* GetInst() const {
+        ASSERT(!IsImmediate());
+        return value.GetInst();
+    }
+
 private:
     friend class RegAlloc;
     explicit Argument(RegAlloc& reg_alloc)
@@ -133,7 +138,7 @@ class RegAlloc final {
 public:
     using ArgumentInfo = std::array<Argument, IR::max_arg_count>;
 
-    explicit RegAlloc(BlockOfCode& code, HostLocSet gpr_candidates, HostLocSet xmm_candidates);
+    explicit RegAlloc(BlockOfCode& code, HostLocSet gpr_candidates, HostLocSet xmm_candidates, bool spill_to_free_gpr = false, bool scratch_copy_to_free_reg = false);
 
     ArgumentInfo GetArgumentInfo(IR::Inst* inst);
     void RegisterPseudoOperation(IR::Inst* inst);
@@ -186,6 +191,8 @@ private:
 
     HostLocSet gpr_candidates;
     HostLocSet xmm_candidates;
+    HostLocSet spill_gpr_candidates;
+    bool scratch_copy_to_free_reg;
 
     HostLoc SelectARegister(HostLocSet desired_locations) const;
     std::optional<HostLoc> ValueLocation(const IR::Inst* value) const {

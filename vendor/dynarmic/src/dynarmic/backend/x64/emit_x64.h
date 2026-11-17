@@ -41,6 +41,8 @@ namespace Dynarmic::Backend::X64 {
 
 class BlockOfCode;
 
+bool IsZeroExtendedU32Producer(const IR::Inst* inst);
+
 using A64FullVectorWidth = std::integral_constant<size_t, 128>;
 
 // Generated memory wrappers form a fixed domain: ordering, width and two host
@@ -90,7 +92,7 @@ public:
         size_t size;         // Length in bytes of emitted code
     };
 
-    explicit EmitX64(BlockOfCode& code, HostLocSet gpr_candidates);
+    explicit EmitX64(BlockOfCode& code, HostLocSet gpr_candidates, bool spill_to_free_gpr = false, bool scratch_copy_to_free_reg = false);
     virtual ~EmitX64();
 
     /// Looks up an emitted host block in the cache.

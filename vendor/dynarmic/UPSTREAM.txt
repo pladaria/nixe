@@ -1,10 +1,29 @@
 Source: https://github.com/lioncash/dynarmic
 Revision: a41c380246d3d9f9874f0f792d234dc0cc17c180
-License: 0BSD (LICENSE.txt); bundled dependencies retain their own licenses.
+License: 0BSD (LICENSE.txt), with GPL-3.0-or-later additions identified in source
+headers; bundled dependencies retain their own licenses.
 
 Vendored source including bundled dependencies. Built for A64 by nixe-cpu-jit.
 
 Nixe adaptations:
+- The native bridge assumes valid commercial-software guest addresses and
+  omits fastmem-width checks, following Lichii's Auto policy at
+  646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Real arena/page-table sizes,
+  page permissions and coherent fault handling are unchanged. Document the
+  simplification at the configuration boundary; other native configurations
+  retain their bounded fastmem policy.
+- backend/x64/{emit_x64,emit_x64_data_processing,a64_emit_x64}: omit redundant
+  U32-to-U64 normalization for the verified producer set used by Lichii
+  646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Widening aliases require a GPR;
+  partial-width spill slots are normalized before any 64-bit use. A64 enables
+  the policy through its owning code buffer; A32 retains normal emission.
+- backend/x64/reg_alloc: preserve evicted values in eligible free callee-saved
+  GPRs and copy writable live operands into free registers before spilling,
+  following Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Precompute the
+  ABI/admission spill-candidate mask once; retain direct IR allocation locations
+  and scope-local release tracking. A64 options are enabled in the native bridge;
+  other frontends retain their policy. Imported algorithm additions retain the
+  reference's GPL-3.0-or-later notices.
 - backend/block_range_information: append compiled guest extents to a contiguous
   vector and retire intersecting entries on invalidation, following Lichii
   646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Keep separate compilation contexts

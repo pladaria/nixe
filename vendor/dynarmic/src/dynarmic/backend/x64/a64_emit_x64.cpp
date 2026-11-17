@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /* This file is part of the dynarmic project.
  * Copyright (c) 2016 MerryMage
  * SPDX-License-Identifier: 0BSD
@@ -98,18 +101,22 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
 }
 
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
-        : EmitX64(code, [&conf] {
-            HostLocSet gprs{any_gpr};
-            if (conf.page_table) {
-                gprs.reset(static_cast<size_t>(HostLoc::R14));
-            }
-            if (conf.fastmem_pointer) {
-                gprs.reset(static_cast<size_t>(HostLoc::R13));
-            }
-            return gprs;
-        }())
+        : EmitX64(
+            code, [&conf] {
+                HostLocSet gprs{any_gpr};
+                if (conf.page_table) {
+                    gprs.reset(static_cast<size_t>(HostLoc::R14));
+                }
+                if (conf.fastmem_pointer) {
+                    gprs.reset(static_cast<size_t>(HostLoc::R13));
+                }
+                return gprs;
+            }(),
+            conf.spill_to_free_gpr,
+            conf.scratch_copy_to_free_reg)
         , conf(conf)
         , jit_interface{jit_interface} {
+    code.elide_redundant_zext = conf.elide_redundant_zext;
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();
@@ -445,6 +452,10 @@ void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
     const auto addr = qword[r15 + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
     if (args[1].FitsInImmediateS32()) {
         code.mov(addr, args[1].GetImmediateS32());
+    } else if (conf.elide_redundant_zext && !args[1].IsImmediate() && IsZeroExtendedU32Producer(args[1].GetInst())) {
+        // Reloading a spilled U32 into a GPR also clears its high bits.
+        const auto to_store = ctx.reg_alloc.UseGpr(args[1]);
+        code.mov(addr, to_store);
     } else {
         // TODO: zext tracking, xmm variant
         const Xbyak::Reg64 to_store = ctx.reg_alloc.UseScratchGpr(args[1]);

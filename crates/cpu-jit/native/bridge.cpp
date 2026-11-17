@@ -116,12 +116,19 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.absolute_offset_page_table = true;
     conf.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;
     conf.only_detect_misalignment_via_page_table_on_page_boundary = true;
-    conf.fastmem_address_space_bits = address_bits;
+    // @SIMPLIFICATION Assume commercial software uses valid guest addresses and
+    // omit runtime fastmem-width checks. The actual arena, page-table width,
+    // page permissions and fault/coherency handling retain their real bounds.
+    // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/arm/dynarmic/arm_dynarmic_64.cpp#L454-L462
+    conf.fastmem_address_space_bits = 64;
     conf.silently_mirror_fastmem = false;
     // A fault recompiles this site through the shared page-table pointer.
     // Untouched sites keep fastmem; unmarked pages use direct RAM pointers.
     conf.recompile_on_fastmem_failure = true;
     conf.recompile_on_exclusive_fastmem_failure = true;
+    conf.spill_to_free_gpr = true;
+    conf.scratch_copy_to_free_reg = true;
+    conf.elide_redundant_zext = true;
     jit = std::make_unique<Dynarmic::A64::Jit>(conf);
   }
   void stop(std::uint32_t kind, std::uint32_t detail, std::uint64_t pc) {
