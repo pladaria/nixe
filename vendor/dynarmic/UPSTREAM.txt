@@ -5,6 +5,16 @@ License: 0BSD (LICENSE.txt); bundled dependencies retain their own licenses.
 Vendored source including bundled dependencies. Built for A64 by nixe-cpu-jit.
 
 Nixe adaptations:
+- backend/block_range_information: append compiled guest extents to a contiguous
+  vector and retire intersecting entries on invalidation, following Lichii
+  646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Keep separate compilation contexts
+  and inclusive u32/u64 endpoints, and reuse capacity across cache clears. Use
+  the existing invalidation interval set's logarithmic overlap lookup rather
+  than scanning every invalidated interval for every recorded block.
+  ARM64-host address spaces also clear their A32/A64 extent records through
+  the virtual cache-clear boundary, including capacity-triggered resets in
+  the base emitter. This closes a lifecycle omission present in the reference;
+  x64 already clears its extent owner at both reset boundaries.
 - backend/x64/{perf_map,emit_x64,a32_emit_x64_memory,a64_emit_x64_memory,
   block_of_code}: cache PERF_BUILDID_DIR enablement once, and skip friendly-name
   formatting and the process-wide map mutex when disabled. Follows Lichii

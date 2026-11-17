@@ -181,6 +181,11 @@ IR::Block A32AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
     return ir_block;
 }
 
+void A32AddressSpace::ClearCache() {
+    AddressSpace::ClearCache();
+    block_ranges.ClearCache();
+}
+
 void A32AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u32>& ranges) {
     InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
 }

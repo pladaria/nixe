@@ -5,7 +5,8 @@
 
 #include "dynarmic/backend/block_range_information.h"
 
-#include <boost/icl/interval_map.hpp>
+#include <algorithm>
+
 #include <boost/icl/interval_set.hpp>
 #include <mcl/stdint.hpp>
 #include <tsl/robin_set.h>
@@ -14,7 +15,9 @@ namespace Dynarmic::Backend {
 
 template<typename ProgramCounterType>
 void BlockRangeInformation<ProgramCounterType>::AddRange(boost::icl::discrete_interval<ProgramCounterType> range, IR::LocationDescriptor location) {
-    block_ranges.add(std::make_pair(range, Locations{location}));
+    if (!boost::icl::is_empty(range)) {
+        block_ranges.push_back({boost::icl::first(range), boost::icl::last(range), location});
+    }
 }
 
 template<typename ProgramCounterType>
@@ -25,15 +28,19 @@ void BlockRangeInformation<ProgramCounterType>::ClearCache() {
 template<typename ProgramCounterType>
 tsl::robin_set<IR::LocationDescriptor> BlockRangeInformation<ProgramCounterType>::InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges) {
     tsl::robin_set<IR::LocationDescriptor> erase_locations;
-    for (auto invalidate_interval : ranges) {
-        auto pair = block_ranges.equal_range(invalidate_interval);
-        for (auto it = pair.first; it != pair.second; ++it) {
-            for (const auto& descriptor : it->second) {
-                erase_locations.insert(descriptor);
-            }
-        }
+    if (ranges.empty()) {
+        return erase_locations;
     }
-    // TODO: EFFICIENCY: Remove ranges that are to be erased.
+    std::erase_if(block_ranges, [&](const Range& range) {
+        // Interval-set lookup finds any overlap in O(log M), including batches
+        // with many disjoint invalidations, without a temporary range index.
+        const auto extent = boost::icl::discrete_interval<ProgramCounterType>::closed(range.first, range.last);
+        if (ranges.find(extent) == ranges.end()) {
+            return false;
+        }
+        erase_locations.insert(range.location);
+        return true;
+    });
     return erase_locations;
 }
 

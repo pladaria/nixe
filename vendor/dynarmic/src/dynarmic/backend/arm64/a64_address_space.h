@@ -19,6 +19,7 @@ public:
 
     IR::Block GenerateIR(IR::LocationDescriptor) const override;
 
+    void ClearCache() override;
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 
 protected:

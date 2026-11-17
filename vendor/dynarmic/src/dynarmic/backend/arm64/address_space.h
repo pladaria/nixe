@@ -41,7 +41,7 @@ public:
 
     void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors);
 
-    void ClearCache();
+    virtual void ClearCache();
 
     void DumpDisassembly() const;
 
