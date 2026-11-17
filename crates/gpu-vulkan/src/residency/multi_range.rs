@@ -13,13 +13,11 @@ pub struct MultiRangeBinding {
     pub(super) size: u64,
     pub(super) sources: Arc<[BufferRange]>,
     pub(super) sparse: bool,
-    _sources: Arc<[Arc<AllocatedBuffer>]>,
+    owners: Arc<[Arc<AllocatedBuffer>]>,
 }
 struct Entry {
     binding: MultiRangeBinding,
     geometry: u64,
-    content: u64,
-    dirty: bool,
 }
 struct Retired {
     _binding: MultiRangeBinding,
@@ -87,7 +85,6 @@ impl MultiRangeCache {
 struct Source {
     range: BufferRange,
     native: Arc<AllocatedBuffer>,
-    write_tick: u64,
 }
 fn hash(values: impl IntoIterator<Item = u64>) -> u64 {
     values.into_iter().fold(0xcbf29ce484222325, |hash, value| {
@@ -111,7 +108,9 @@ impl Residency<'_> {
             let prefer_sparse = self.runtime.multi_range.use_sparse;
             let mut sources = smallvec::SmallVec::<[Source; 8]>::new();
             let mut total = 0u64;
-            let mut invalidate = false;
+            // Resolve every allocation before retaining selections: a later
+            // overlapping range can merge away an earlier buffer slot.
+            // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/buffer_cache/multi_range_refresh.h
             for guest in ranges {
                 let range = self.device_buffer(
                     guest.address,
@@ -123,22 +122,32 @@ impl Residency<'_> {
                 self.runtime
                     .constructing
                     .push(Resource::Buffer(range.buffer));
-                let uploaded = self.runtime.statistics.cpu_uploaded_bytes;
-                self.ensure_buffer_range(range.buffer, range.offset, range.size)?;
-                // BindMultiRangeStorage invalidates when SynchronizeBuffer
-                // returns true (no upload), matching the pinned reference.
-                invalidate |= self.runtime.statistics.cpu_uploaded_bytes == uploaded;
+            }
+            for guest in ranges {
+                let range = self.device_buffer(
+                    guest.address,
+                    guest.size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER,
+                    false,
+                    prefer_sparse,
+                )?;
+                self.runtime
+                    .constructing
+                    .push(Resource::Buffer(range.buffer));
                 let entry = self.buffer_cache.get(range.buffer);
                 sources.push(Source {
                     range,
                     native: Arc::clone(&entry.native),
-                    write_tick: entry.write_tick,
                 });
                 total = total
                     .checked_add(range.size)
                     .ok_or(VulkanError::InvalidResource(
                         "multi-range storage size overflow",
                     ))?;
+            }
+            for source in &sources {
+                let range = source.range;
+                self.ensure_buffer_range(range.buffer, range.offset, range.size)?;
             }
             if total
                 > u64::from(
@@ -159,13 +168,25 @@ impl Residency<'_> {
                     .iter()
                     .flat_map(|s| [s.native.handle.as_raw(), s.range.offset, s.range.size]),
             );
-            let content = hash(sources.iter().map(|s| s.write_tick));
             let reusable = self
                 .runtime
                 .multi_range
                 .entries
                 .get(&key)
-                .is_some_and(|entry| entry.geometry == geometry && entry.binding.size == total);
+                .is_some_and(|entry| {
+                    entry.geometry == geometry
+                        && entry.binding.size == total
+                        && entry.binding.sources.len() == sources.len()
+                        && entry
+                            .binding
+                            .sources
+                            .iter()
+                            .zip(entry.binding.owners.iter())
+                            .zip(&sources)
+                            .all(|((&range, native), source)| {
+                                range == source.range && Arc::ptr_eq(native, &source.native)
+                            })
+                });
             if !reusable {
                 if let Some(old) = self.runtime.multi_range.entries.remove(&key) {
                     self.retire_multi_range(old.binding)?;
@@ -195,53 +216,36 @@ impl Residency<'_> {
                             offset,
                             size: total,
                             sparse,
-                            _sources: if sparse {
-                                sources
-                                    .iter()
-                                    .map(|source| Arc::clone(&source.native))
-                                    .collect()
-                            } else {
-                                Arc::from([])
-                            },
-                            // Gathered storage owns its independent copy. Only
-                            // sparse aliases keep source owners for DropOwner
-                            // and shader access/modified-range tracking.
-                            sources: if sparse {
-                                sources
-                                    .iter()
-                                    .map(|source| source.range)
-                                    .collect::<Vec<_>>()
-                                    .into()
-                            } else {
-                                Arc::from([])
-                            },
+                            // Both representations depend on source geometry.
+                            // Keep owners alive and invalidate their selections
+                            // when a physical buffer slot is retired or merged.
+                            owners: sources
+                                .iter()
+                                .map(|source| Arc::clone(&source.native))
+                                .collect(),
+                            sources: sources
+                                .iter()
+                                .map(|source| source.range)
+                                .collect::<Vec<_>>()
+                                .into(),
                         },
                         geometry,
-                        content,
-                        dirty: true,
                     },
                 );
             }
-            let entry = self.runtime.multi_range.entries.get_mut(&key).unwrap();
-            if entry.content != content || invalidate {
-                entry.content = content;
-                entry.dirty = true;
-            }
-            let gather = !entry.binding.sparse && entry.dirty;
+            let entry = &self.runtime.multi_range.entries[&key];
             let binding = entry.binding.clone();
             if written && !binding.sparse {
                 return Err(VulkanError::InvalidResource(
                     "writable discontinuous storage cannot use a readonly gathered buffer",
                 ));
             }
-            if gather {
+            if !binding.sparse {
+                // Submission ticks do not identify content: CPU uploads and
+                // multiple GPU writes can share one tick. Refresh gathered
+                // reads at consumption; sparse bindings alias current storage.
+                // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/buffer_cache/multi_range_refresh.h
                 self.gather_multi_range(&sources, &binding.native)?;
-                self.runtime
-                    .multi_range
-                    .entries
-                    .get_mut(&key)
-                    .unwrap()
-                    .dirty = false;
             }
             Ok(binding)
         })();

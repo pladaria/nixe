@@ -777,6 +777,53 @@ impl nixe_gpu_ampere::RenderMemory for GpuMemory<'_> {
         }
         Ok(end - address)
     }
+    fn max_contiguous_range(&self, address: u64, bytes: u64) -> nixe_gpu_ampere::Result<u64> {
+        let end = address
+            .checked_add(bytes)
+            .filter(|&end| address >= VA_START && end <= VA_END)
+            .ok_or("invalid native buffer range")?;
+        if address >= VA_END - PAGE_SIZE {
+            return Ok(if self.sync_mapping.is_some() {
+                bytes
+            } else {
+                0
+            });
+        }
+        let first = self
+            .mappings
+            .range(..=address)
+            .next_back()
+            .map_or(address, |(&start, _)| start);
+        let mut at = address;
+        let mut device_end = None;
+        for (&start, mapping) in self.mappings.range(first..end) {
+            if mapping.end <= at {
+                continue;
+            }
+            if start > at {
+                break;
+            }
+            let device = mapping.physical.address() + at - start;
+            if device_end.is_some_and(|expected| expected != device) {
+                break;
+            }
+            let count = end.min(mapping.end) - at;
+            at += count;
+            device_end = Some(device + count);
+            if at == end {
+                break;
+            }
+        }
+        // The reserved sync page is a separate mapping but may follow the
+        // previous device span without introducing a discontinuity.
+        if at == VA_END - PAGE_SIZE
+            && let Some(sync) = &self.sync_mapping
+            && device_end == Some(sync.address())
+        {
+            at = end;
+        }
+        Ok(at - address)
+    }
     fn capture_memory(
         &mut self,
         address: u64,

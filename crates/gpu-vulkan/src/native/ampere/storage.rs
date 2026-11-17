@@ -99,13 +99,47 @@ impl NativeExecution<'_> {
             } else {
                 end.next_multiple_of(nixe_memory::PAGE_SIZE)
             };
-            let bytes = end - aligned;
+            let mut bytes = end - aligned;
             memory.prepare_image(aligned, bytes).map_err(|e| {
                 compilation(format!(
                     "native storage stage={stage} slot={}: {e}",
                     slot.slot
                 ))
             })?;
+            if declared_size.is_none() {
+                // @SIMPLIFICATION Unbounded native pointers use one contiguous
+                // device range, matching the normal binding policy below.
+                // A same-kind virtual region can span discontinuous storage.
+                // Explicit NVN address/size descriptors keep their full range.
+                // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/video_core/buffer_cache/buffer_cache.h#L4388-L4393
+                let contiguous = memory
+                    .max_contiguous_range(target, size)
+                    .map_err(compilation)?;
+                if contiguous == 0 {
+                    return Err(compilation("unmapped native global pointer"));
+                }
+                let end = target + contiguous;
+                let end = if slot.written {
+                    end
+                } else {
+                    end.next_multiple_of(nixe_memory::PAGE_SIZE)
+                };
+                let bounded = end - aligned;
+                #[cfg(feature = "performance-counters")]
+                if bounded != bytes {
+                    nixe_gpu::trace::detail_event(
+                        "native_storage_contiguous",
+                        target,
+                        bytes,
+                        bounded,
+                    );
+                    log::debug!(
+                        "native storage contiguous bound: stage={stage} slot={} pointer={target:#x} inferred_bytes={bytes:#x} bound_bytes={bounded:#x}",
+                        slot.slot
+                    );
+                }
+                bytes = bounded;
+            }
             let device = memory
                 .image_device_address(aligned)?
                 .ok_or_else(|| compilation("unmapped native global pointer"))?;
@@ -138,6 +172,12 @@ impl NativeExecution<'_> {
         binding.set_write_extent(write_extent);
         self.residency
             .update_storage_buffer(stage, slot.slot, memory)
+            .map_err(|error| {
+                compilation(format!(
+                    "native storage stage={stage} slot={} pointer={target:#x} declared_size={declared_size:?}: {error}",
+                    slot.slot
+                ))
+            })
     }
 }
 
