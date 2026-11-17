@@ -21,7 +21,6 @@ pub struct Core {
     context: CoreContext,
     code: CodeCache,
     control: CpuControl,
-    precise_memory_faults: bool,
 }
 pub struct Configuration {
     pub cpu: nixe_cpu::profile::ProcessCpuContext,
@@ -49,7 +48,6 @@ struct Callbacks<'a> {
     core: *mut c_void,
     code: Vec<CodeCapture>,
     error: Option<MemoryAccessFailure>,
-    precise_memory_faults: bool,
 }
 struct Invocation {
     core: *mut c_void,
@@ -105,8 +103,6 @@ impl Core {
             context,
             code: CodeCache::default(),
             control,
-            precise_memory_faults: configuration.cpu.platform()
-                == nixe_cpu::platform::TargetPlatform::Switch2,
         })
     }
     pub fn space(&self) -> &Arc<AddressSpace> {
@@ -199,7 +195,6 @@ impl Core {
             core: handle.pointer,
             code: Vec::new(),
             error: None,
-            precise_memory_faults: self.precise_memory_faults,
         };
         let mut call = Invocation {
             core: handle.pointer,
@@ -510,13 +505,12 @@ unsafe extern "C" fn memory(
     match capture {
         Ok(done) => done,
         Err(MemoryAccessFailure::Memory(error)) if error.is_access_fault() => {
-            if context.precise_memory_faults {
-                // Preserve the faulting PC and register state. In particular,
-                // failed pointer authentication must not turn into a zero load.
-                return false;
-            }
-            // The normal callback policy does not abort or reconstruct an
-            // invalid guest instruction. Match the reference default values.
+            // @SIMPLIFICATION Commercial games use valid data addresses. As in
+            // the normal reference policy, unmapped reads return zero, unmapped
+            // writes have no destination and exclusive writes complete. This is
+            // independent of guest ISA features; host errors/cancellation below
+            // return false and must leave native execution immediately.
+            // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/core/arm/dynarmic/arm_dynarmic_64.cpp
             unsafe {
                 *value = u64::from(operation == 2);
                 *value.add(1) = 0;

@@ -158,6 +158,12 @@ public:
         return return_from_run_code[FORCE_RETURN];
     }
 
+    // Emission positions prove no intervening flag-changing code was generated.
+    bool reuse_host_flags = false;
+    const void* nzcv_live_pos = nullptr;
+    const void* nzcv_flags_pos = nullptr;
+    const void* nzcv_flags_inst = nullptr;
+
     void int3() { db(0xCC); }
 
     /// Allocate memory of `size` bytes from the same block of memory the code is in.

@@ -53,6 +53,7 @@ public:
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 
 protected:
+    bool check_bit_in_zf = false;
     const A64::UserConfig conf;
     A64::Jit* jit_interface;
     BlockRangeInformation<u64> block_ranges;

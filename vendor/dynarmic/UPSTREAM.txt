@@ -6,6 +6,22 @@ headers; bundled dependencies retain their own licenses.
 Vendored source including bundled dependencies. Built for A64 by nixe-cpu-jit.
 
 Nixe adaptations:
+- A64 x64 memory callbacks can abort terminal host failures without retaining
+  precise recoverable guest state across every ordinary access. The bridge
+  uses Lichii's normal memory policy independently of extended ARM ISA selection;
+  callback guards preserve immediate cancellation/failure exit. Recoverable
+  precise-memory-abort configurations remain supported by the vendor interface.
+- backend/x64/a64_emit_x64: omit halt checks on forward links in no-cycle mode,
+  following Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160, with an additional
+  compile-time code-page boundary check to bound unchecked forward chains.
+  Backward/indirect exits and page crossings retain checks; no runtime budget
+  counter is added. Cycle-counted and single-step paths keep their contracts.
+- backend/x64/{a64_emit_x64,emit_x64,emit_x64_data_processing,block_of_code}:
+  reuse adjacent arithmetic NZCV and final check-bit host flags in no-cycle
+  mode, following Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Keep committed
+  guest flags, carry polarity and conservative immediate/callback boundaries.
+  Emission-position proofs never cross blocks; verbose instrumentation and
+  cycle-counted terminals retain explicit check-bit storage.
 - backend/{code_cache_hash,block_range_information}, backend/x64/{emit_x64,
   a64_emit_x64}, and ARM64-host descriptor owners: mix the full PC/context key
   for robin maps/sets, including incoming references, invalidation and fastmem

@@ -139,13 +139,20 @@ void EmitX64::EmitTestBit(EmitContext& ctx, IR::Inst* inst) {
 
 static void EmitConditionalSelect(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bitsize) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    // Loading an immediate may emit XOR; register moves preserve the flags.
+    const bool flags_live = code.nzcv_live_pos != nullptr && code.nzcv_live_pos == code.getCurr() && !args[1].IsImmediate() && !args[2].IsImmediate();
+    const auto cond = args[0].GetImmediateCond();
     const Xbyak::Reg32 nzcv = ctx.reg_alloc.ScratchGpr(HostLoc::RAX).cvt32();
     const Xbyak::Reg then_ = ctx.reg_alloc.UseGpr(args[1]).changeBit(bitsize);
     const Xbyak::Reg else_ = ctx.reg_alloc.UseScratchGpr(args[2]).changeBit(bitsize);
 
-    code.mov(nzcv, dword[r15 + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
-
-    code.LoadRequiredFlagsForCondFromRax(args[0].GetImmediateCond());
+    if (flags_live) {
+        if (cond == IR::Cond::HI || cond == IR::Cond::LS)
+            code.cmc();
+    } else {
+        code.mov(nzcv, dword[r15 + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
+        code.LoadRequiredFlagsForCondFromRax(cond);
+    }
 
     switch (args[0].GetImmediateCond()) {
     case IR::Cond::EQ:
@@ -199,6 +206,8 @@ static void EmitConditionalSelect(BlockOfCode& code, EmitContext& ctx, IR::Inst*
     }
 
     ctx.reg_alloc.DefineValue(inst, else_);
+    if (flags_live && cond != IR::Cond::HI && cond != IR::Cond::LS)
+        code.nzcv_live_pos = code.getCurr();
 }
 
 void EmitX64::EmitConditionalSelect32(EmitContext& ctx, IR::Inst* inst) {
@@ -1002,6 +1011,10 @@ static void EmitAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bit
     }
 
     ctx.reg_alloc.DefineValue(inst, result);
+    if (nzcv_inst && code.reuse_host_flags) {
+        code.nzcv_flags_pos = code.getCurr();
+        code.nzcv_flags_inst = nzcv_inst;
+    }
 }
 
 void EmitX64::EmitAdd32(EmitContext& ctx, IR::Inst* inst) {
@@ -1103,6 +1116,10 @@ static void EmitSub(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bit
     }
     if (!is_cmp) {
         ctx.reg_alloc.DefineValue(inst, result);
+    }
+    if (nzcv_inst && code.reuse_host_flags) {
+        code.nzcv_flags_pos = code.getCurr();
+        code.nzcv_flags_inst = nzcv_inst;
     }
 }
 

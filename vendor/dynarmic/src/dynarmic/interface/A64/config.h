@@ -291,6 +291,11 @@ struct UserConfig {
     bool far_code = false;
     /// Fold single-use scalar address additions into unchecked fastmem operands.
     bool fold_address_offsets = false;
+    /// x64: consume adjacent guest NZCV/check-bit producers without reloading flags.
+    /// Disabled when cycle counting can clobber flags before the terminal.
+    bool reuse_host_flags = false;
+    /// x64 no-cycle mode: check backward, indirect and code-page-crossing links.
+    bool halt_check_on_back_edges = false;
 
     /// This option relates to translation. Generally when we run into an unpredictable
     /// instruction the ExceptionRaised callback is called. If this is true, we define
@@ -305,6 +310,10 @@ struct UserConfig {
     /// This allows accurately emulating protection fault handlers. If true, we check
     /// for exit after every data memory access by the emulated program.
     bool check_halt_on_memory_access = false;
+    /// x64: stop on a failed memory callback without preserving recoverable
+    /// guest exception state across every valid access. Callback failures are
+    /// terminal to the host; use check_halt_on_memory_access for precise recovery.
+    bool check_memory_callback_abort = false;
 
     /// This option allows you to disable cycle counting. If this is set to false,
     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.

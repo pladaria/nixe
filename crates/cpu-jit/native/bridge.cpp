@@ -64,7 +64,7 @@ struct Core final : Dynarmic::A64::UserCallbacks {
 
   Core(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table, size_t address_bits,
        std::uint32_t frequency, std::uint32_t ctr, std::uint32_t dczid,
-       bool strict_architecture)
+       bool extended_isa)
       : callbacks(cb) {
     Dynarmic::A64::UserConfig conf{};
     conf.callbacks = this;
@@ -86,12 +86,19 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.dczid_el0 = dczid;
     conf.wall_clock_cntpct = true;
     conf.enable_cycle_counting = false;
-    conf.check_halt_on_memory_access = strict_architecture;
+    // Normal execution uses the reference's non-recoverable memory policy.
+    // Fatal/stopped callbacks still leave native code before any guest consumer.
+    // Precise guest exception state is independent of the selected ARM ISA.
+#if defined(__x86_64__) || defined(_M_X64)
+    conf.check_memory_callback_abort = true;
+#else
+    conf.check_halt_on_memory_access = true;
+#endif
     conf.hook_hint_instructions = false;
-    conf.hook_unknown_hint_instructions = strict_architecture;
-    conf.enable_lse = strict_architecture;
-    conf.enable_rcpc = strict_architecture;
-    conf.enable_pauth = strict_architecture;
+    conf.hook_unknown_hint_instructions = extended_isa;
+    conf.enable_lse = extended_isa;
+    conf.enable_rcpc = extended_isa;
+    conf.enable_pauth = extended_isa;
     conf.hook_data_cache_operations = false;
     // Use Eden's defined choices for constrained-unpredictable encodings,
     // including overlapping status/data zero registers in STXR/STLXR.
@@ -132,6 +139,8 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.compact_block_exits = true;
     conf.far_code = true;
     conf.fold_address_offsets = true;
+    conf.reuse_host_flags = true;
+    conf.halt_check_on_back_edges = true;
     jit = std::make_unique<Dynarmic::A64::Jit>(conf);
   }
   void stop(std::uint32_t kind, std::uint32_t detail, std::uint64_t pc) {
@@ -247,9 +256,9 @@ bool nixe_dynarmic_resolve_fault(std::uint64_t pc, std::uint64_t *call,
 const char *nixe_dynarmic_error() noexcept { return last_error.c_str(); }
 void *nixe_dynarmic_create(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table,
                            size_t bits, std::uint32_t frequency, std::uint32_t ctr,
-                           std::uint32_t dczid, bool strict_architecture) noexcept {
+                           std::uint32_t dczid, bool extended_isa) noexcept {
   try {
-    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid, strict_architecture);
+    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid, extended_isa);
   } catch (const std::exception &e) {
     last_error = e.what();
     return nullptr;

@@ -119,10 +119,11 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         , conf(conf)
         , jit_interface{jit_interface} {
     code.elide_redundant_zext = conf.elide_redundant_zext;
+    code.reuse_host_flags = conf.reuse_host_flags && !conf.enable_cycle_counting;
     if (conf.far_code) {
-        // Precise memory-abort exits enlarge every recovery stub. Reserve their
-        // share up front so the cold front does not clear a half-empty cache.
-        const size_t cold_size = conf.check_halt_on_memory_access
+        // Memory-abort exits enlarge recovery stubs. Reserve their share up
+        // front so the cold region does not clear a half-empty cache.
+        const size_t cold_size = (conf.check_halt_on_memory_access || conf.check_memory_callback_abort)
                                    ? conf.code_cache_size / 16 * 7
                                    : conf.code_cache_size / 4;
         code.EnableFarCode(cold_size);
@@ -191,6 +192,9 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     // Start emitting.
     code.align();
     const u8* const entrypoint = code.getCurr();
+    code.nzcv_flags_pos = nullptr;
+    code.nzcv_live_pos = nullptr;
+    check_bit_in_zf = false;
 
     ASSERT(block.GetCondition() == IR::Cond::AL);
 
@@ -227,8 +231,12 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
 
     if (conf.enable_cycle_counting) {
         EmitAddCycles(block.CycleCount());
+        code.nzcv_live_pos = nullptr;
     }
     EmitX64::EmitTerminal(block.GetTerminal(), ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+    code.nzcv_flags_pos = nullptr;
+    code.nzcv_live_pos = nullptr;
+    check_bit_in_zf = false;
     code.int3();
     [[maybe_unused]] const auto mainline_end = code.getCurr<const u8*>();
     if (code.HasFarCode())
@@ -413,6 +421,12 @@ void A64EmitX64::EmitPushRSB(EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64SetCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const Xbyak::Reg8 to_store = ctx.reg_alloc.UseGpr(args[0]).cvt8();
+    // No code after this final instruction changes ZF before the CheckBit terminal.
+    if (code.reuse_host_flags && !conf.very_verbose_debugging_output && &ctx.block.back() == inst && std::holds_alternative<IR::Term::CheckBit>(ctx.block.GetTerminal())) {
+        code.test(to_store, to_store);
+        check_bit_in_zf = true;
+        return;
+    }
     code.mov(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], to_store);
 }
 
@@ -460,9 +474,11 @@ void A64EmitX64::EmitA64SetNZCVRaw(A64EmitContext& ctx, IR::Inst* inst) {
 }
 
 void A64EmitX64::EmitA64SetNZCV(A64EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = code.reuse_host_flags && code.nzcv_flags_pos != nullptr && code.nzcv_flags_pos == code.getCurr() && !inst->GetArg(0).IsImmediate() && code.nzcv_flags_inst == inst->GetArg(0).GetInst();
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const Xbyak::Reg32 to_store = ctx.reg_alloc.UseScratchGpr(args[0]).cvt32();
     code.mov(dword[r15 + offsetof(A64JitState, cpsr_nzcv)], to_store);
+    code.nzcv_live_pos = flags_live ? code.getCurr() : nullptr;
 }
 
 void A64EmitX64::EmitA64GetW(A64EmitContext& ctx, IR::Inst* inst) {
@@ -532,6 +548,8 @@ void A64EmitX64::EmitA64GetFPSR(A64EmitContext& ctx, IR::Inst* inst) {
 }
 
 void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
+    // Register materialization and stores below preserve host flags.
+    const bool flags_live = code.nzcv_live_pos != nullptr && code.nzcv_live_pos == code.getCurr();
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
     const auto addr = qword[r15 + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
@@ -547,9 +565,13 @@ void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
         code.mov(to_store.cvt32(), to_store.cvt32());
         code.mov(addr, to_store);
     }
+    if (flags_live)
+        code.nzcv_live_pos = code.getCurr();
 }
 
 void A64EmitX64::EmitA64SetX(A64EmitContext& ctx, IR::Inst* inst) {
+    // Register materialization and stores below preserve host flags.
+    const bool flags_live = code.nzcv_live_pos != nullptr && code.nzcv_live_pos == code.getCurr();
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
     const auto addr = qword[r15 + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
@@ -562,6 +584,8 @@ void A64EmitX64::EmitA64SetX(A64EmitContext& ctx, IR::Inst* inst) {
         const Xbyak::Reg64 to_store = ctx.reg_alloc.UseGpr(args[1]);
         code.mov(addr, to_store);
     }
+    if (flags_live)
+        code.nzcv_live_pos = code.getCurr();
 }
 
 void A64EmitX64::EmitA64SetS(A64EmitContext& ctx, IR::Inst* inst) {
@@ -795,11 +819,28 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::ReturnToDispatch, IR::LocationDescri
     code.ReturnFromRunCode();
 }
 
-void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDescriptor, bool is_single_step) {
+namespace {
+bool UncheckedForwardLink(const A64::UserConfig& conf, IR::LocationDescriptor next, IR::LocationDescriptor initial) {
+    const auto from = A64::LocationDescriptor{initial}.PC();
+    const auto to = A64::LocationDescriptor{next}.PC();
+    // Every cycle contains a backward or indirect edge. Checking page crossings
+    // also bounds an acyclic chain to at most 1024 distinct forward block starts,
+    // without adding a counter to generated code. Blocking callbacks and cold
+    // compilation retain their existing interruption boundaries.
+    return conf.halt_check_on_back_edges && !conf.enable_cycle_counting && to > from && (to ^ from) < 4096;
+}
+}  // namespace
+
+void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
     if (!conf.HasOptimization(OptimizationFlag::BlockLinking) || is_single_step) {
         code.mov(rax, A64::LocationDescriptor{terminal.next}.PC());
         code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
         code.ReturnFromRunCode();
+        return;
+    }
+
+    if (UncheckedForwardLink(conf, terminal.next, initial_location)) {
+        EmitTerminalImpl(IR::Term::LinkBlockFast{terminal.next}, initial_location, is_single_step);
         return;
     }
 
@@ -830,7 +871,11 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
     EmitUnlinkedExit(terminal.next);
 }
 
-void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::LocationDescriptor, bool is_single_step) {
+void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    if (conf.halt_check_on_back_edges && !conf.enable_cycle_counting && !UncheckedForwardLink(conf, terminal.next, initial_location)) {
+        EmitTerminalImpl(IR::Term::LinkBlock{terminal.next}, initial_location, is_single_step);
+        return;
+    }
     if (!conf.HasOptimization(OptimizationFlag::BlockLinking) || is_single_step) {
         code.mov(rax, A64::LocationDescriptor{terminal.next}.PC());
         code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
@@ -881,7 +926,11 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::If terminal, IR::LocationDescriptor 
 
 void A64EmitX64::EmitTerminalImpl(IR::Term::CheckBit terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
     Xbyak::Label fail;
-    code.cmp(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
+    if (check_bit_in_zf) {
+        check_bit_in_zf = false;
+    } else {
+        code.cmp(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
+    }
     code.jz(fail);
     EmitTerminal(terminal.then_, initial_location, is_single_step);
     code.L(fail);

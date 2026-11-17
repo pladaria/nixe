@@ -287,7 +287,7 @@ void A64EmitX64::GenFastmemFallbacks() {
 
 #define Axx A64
 #ifdef DYNARMIC_JIT_DIAGNOSTICS
-#define DYNARMIC_A64_FAULT_DIAGNOSTICS
+#    define DYNARMIC_A64_FAULT_DIAGNOSTICS
 #endif
 #include "dynarmic/backend/x64/emit_x64_memory.cpp.inc"
 #undef DYNARMIC_A64_FAULT_DIAGNOSTICS
@@ -428,7 +428,7 @@ void A64EmitX64::EmitA64ExclusiveWriteMemory128(A64EmitContext& ctx, IR::Inst* i
 }
 
 void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext&, IR::Inst* inst, Xbyak::Label* end) {
-    if (!conf.check_halt_on_memory_access) {
+    if (!conf.check_halt_on_memory_access && !conf.check_memory_callback_abort) {
         return;
     }
 
