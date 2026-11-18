@@ -90,7 +90,30 @@ pub fn set_device(c: &Call) -> Result<u64> {
     Ok(0)
 }
 pub fn defaults(c: &Call) -> Result<u64> {
-    c.write(c.args[0] + 8, &0u32)?;
+    c.write(c.args[0] + 8, &[65536u64, 262144, 0, 0, 0])?;
+    Ok(0)
+}
+fn set_size(c: &Call, offset: u64) -> Result<u64> {
+    c.write(c.args[0] + offset, &c.args[1])?;
+    Ok(0)
+}
+pub fn command_bytes(c: &Call) -> Result<u64> {
+    set_size(c, 8)
+}
+pub fn compute_bytes(c: &Call) -> Result<u64> {
+    set_size(c, 16)
+}
+pub fn threshold(c: &Call) -> Result<u64> {
+    set_size(c, 24)
+}
+pub fn queue_bytes(c: &Call) -> Result<u64> {
+    let [cmd, compute]: [u64; 2] = c.read(c.args[0] + 8)?;
+    // @SIMPLIFICATION The native queue owns its host submission storage. Reserve the advertised
+    // control memory plus the command and compute budgets in the guest.
+    Ok((cmd + compute + 16384).next_multiple_of(4096))
+}
+pub fn queue_memory(c: &Call) -> Result<u64> {
+    c.write(c.args[0] + 32, &[c.args[1], c.args[2]])?;
     Ok(0)
 }
 pub fn initialize(c: &Call) -> Result<u64> {
@@ -185,9 +208,25 @@ pub fn flush(c: &Call) -> Result<u64> {
     Ok(0)
 }
 pub fn acquire(c: &Call) -> Result<u64> {
+    acquire_slot(c, c.args[1])
+}
+pub fn window_acquire(c: &Call) -> Result<u64> {
+    if c.args[1] != 0 {
+        let ready = Arc::new(Fence::default());
+        c.session.graphics()?.backend.acquire_fence(ready.clone())?;
+        c.session
+            .queues
+            .lock()
+            .unwrap()
+            .syncs
+            .insert(c.args[1], ready);
+    }
+    acquire_slot(c, c.args[0])
+}
+fn acquire_slot(c: &Call, window: u64) -> Result<u64> {
     let (index, deadline) = {
         let mut q = c.session.queues.lock().unwrap();
-        let w = q.windows.get_mut(&c.args[1]).ok_or("unknown window")?;
+        let w = q.windows.get_mut(&window).ok_or("unknown window")?;
         // Present submits the copy to an independently leased image on the same
         // graphics queue. Later writes to this slot already follow that copy.
         let index = w.next;

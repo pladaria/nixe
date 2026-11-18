@@ -4,6 +4,7 @@ pub(super) enum Work {
     Submit(Vec<Operation>),
     Flush,
     Fence(Arc<Fence>),
+    AcquireFence(Arc<Fence>),
     Present(Texture, u32, Option<nixe_video::FrameMailbox>, u64),
 }
 pub(super) struct Request {
@@ -15,15 +16,8 @@ impl Request {
         let result = match self.work {
             Work::Submit(commands) => backend.nvn_submit(commands),
             Work::Flush => backend.flush(),
-            Work::Fence(fence) => backend.submit(Some(Box::new(move |result| {
-                fence.signal(
-                    result
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(|e| e.to_string().into()),
-                );
-                result
-            }))),
+            Work::Fence(fence) => backend.submit(Some(signal(fence))),
+            Work::AcquireFence(fence) => backend.nvn_acquire_fence(signal(fence)),
             Work::Present(t, interval, mailbox, sequence) => {
                 backend.nvn_present(t, interval).map(|image| {
                     if let Some(mailbox) = mailbox {
@@ -36,6 +30,17 @@ impl Request {
         };
         let _ = self.reply.send(result.map_err(|e| e.to_string().into()));
     }
+}
+fn signal(fence: Arc<Fence>) -> nixe_gpu::FenceAction {
+    Box::new(move |result| {
+        fence.signal(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|e| e.to_string().into()),
+        );
+        result
+    })
 }
 struct Client {
     backend: std::sync::Weak<NvDrvGpuExecutor>,
@@ -72,6 +77,9 @@ impl Client {
 impl nixe_nvn::Backend for Client {
     fn submit(&self, ops: Vec<Operation>) -> nixe_nvn::Result<()> {
         self.execute(Work::Submit(ops))
+    }
+    fn acquire_fence(&self, f: Arc<Fence>) -> nixe_nvn::Result<()> {
+        self.execute(Work::AcquireFence(f))
     }
     fn fence(&self, f: Arc<Fence>) -> nixe_nvn::Result<()> {
         self.execute(Work::Fence(f))

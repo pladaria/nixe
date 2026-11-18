@@ -13,16 +13,19 @@ pub struct Shader {
 #[repr(C)]
 pub(crate) struct Program {
     pub count: u64,
-    pub stages: [Shader; 6],
+    // The graphics path accepts a vertex/fragment pair. Earlier NVN SDKs
+    // allocate only 128 bytes for a program, including in arrays of objects.
+    pub stages: [Shader; 2],
 }
+const _: () = assert!(size_of::<Program>() <= 128);
 pub fn initialize(c: &Call) -> Result<u64> {
     c.write(c.args[0], &0u64)?;
     Ok(1)
 }
 pub fn shaders(c: &Call) -> Result<u64> {
     let n = c.args[1] as u32 as usize;
-    if n > 6 {
-        return Err(format!("invalid stage count {n}").into());
+    if n > 2 {
+        return Err(format!("unsupported NVN program with {n} shader stages").into());
     }
     let mut p = Program {
         count: n as u64,

@@ -256,6 +256,13 @@ impl Residency<'_> {
         &mut self,
         view: ImageViewId,
     ) -> Result<Arc<execution::PreparedTargets>, VulkanError> {
+        self.framebuffer_for_views(view, None)
+    }
+    pub(crate) fn framebuffer_for_views(
+        &mut self,
+        view: ImageViewId,
+        depth: Option<ImageViewId>,
+    ) -> Result<Arc<execution::PreparedTargets>, VulkanError> {
         let description = &self.texture_cache.views[view].description;
         let mut key = FramebufferKey {
             size: [description.size.width, description.size.height],
@@ -267,6 +274,14 @@ impl Residency<'_> {
             8
         };
         key.views[slot] = Some(view);
+        if let Some(depth) = depth {
+            let d = &self.texture_cache.views[depth].description;
+            key.size = [
+                key.size[0].min(d.size.width),
+                key.size[1].min(d.size.height),
+            ];
+            key.views[8] = Some(depth);
+        }
         let id = self.framebuffer_id(key)?;
         Ok(Arc::clone(&self.texture_cache.slot_framebuffers[id]))
     }

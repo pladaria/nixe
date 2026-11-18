@@ -25,6 +25,12 @@ pub struct Sampled {
 #[derive(Debug)]
 pub struct Draw {
     pub target: Texture,
+    pub depth_target: Option<Texture>,
+    pub raster: RasterState,
+    pub flip_y: bool,
+    pub depth_range: [f32; 2],
+    pub blend_color: [f32; 4],
+    pub indices: Option<(u32, u64, i32)>,
     pub viewport: [i32; 4],
     pub scissor: [i32; 4],
     pub shaders: SmallVec<[Shader; 2]>,
@@ -45,6 +51,13 @@ pub enum Operation {
         scissor: [i32; 4],
         color: [f32; 4],
         mask: u32,
+    },
+    ClearDepth {
+        target: Texture,
+        scissor: [i32; 4],
+        depth: Option<f32>,
+        stencil: u8,
+        mask: u8,
     },
     Draw(Box<Draw>),
 }
@@ -131,6 +144,16 @@ mod op {
     pub const UNIFORM: u32 = 11;
     pub const TEXTURE: u32 = 12;
     pub const DRAW: u32 = 13;
+    pub const INDEXED: u32 = 14;
+    pub const DEPTH_RANGE: u32 = 15;
+    pub const SWIZZLES: u32 = 16;
+    pub const CLEAR_DEPTH: u32 = 17;
+    pub const BLEND_COLOR: u32 = 18;
+    pub const BLEND: u32 = 19;
+    pub const COLOR: u32 = 20;
+    pub const MASK: u32 = 21;
+    pub const DEPTH: u32 = 22;
+    pub const POLY: u32 = 23;
 }
 fn record(c: &Call, op: u32, words: &[u64]) -> Result<u64> {
     let r: Recorder = c.read(c.args[0])?;
@@ -179,6 +202,53 @@ simple!(barrier, BARRIER, 1);
 simple!(vertex, VERTEX, 3);
 simple!(uniform, UNIFORM, 4);
 simple!(draw, DRAW, 3);
+simple!(indexed, INDEXED, 5);
+macro_rules! bind_state {
+    ($fn:ident,$tag:ident,$ty:ty) => {
+        pub fn $fn(c: &Call) -> Result<u64> {
+            record(c, op::$tag, &[c.read::<$ty>(c.args[1])? as u64])
+        }
+    };
+}
+bind_state!(blend, BLEND, u64);
+bind_state!(color, COLOR, u32);
+bind_state!(mask, MASK, u32);
+bind_state!(depth, DEPTH, u32);
+bind_state!(poly, POLY, u32);
+pub fn blend_color(c: &Call) -> Result<u64> {
+    record(c, op::BLEND_COLOR, &c.read::<[u64; 2]>(c.args[1])?)
+}
+pub fn depth_range(c: &Call) -> Result<u64> {
+    record(
+        c,
+        op::DEPTH_RANGE,
+        &[bytemuck::cast([(c.float)(0), (c.float)(1)])],
+    )
+}
+pub fn clear_depth(c: &Call) -> Result<u64> {
+    record(
+        c,
+        op::CLEAR_DEPTH,
+        &[
+            (c.float)(0).to_bits() as u64,
+            c.args[1],
+            c.args[2],
+            c.args[3],
+        ],
+    )
+}
+pub fn swizzles(c: &Call) -> Result<u64> {
+    if c.args[1] != 0 || c.args[2] != 1 {
+        return Err("multiple viewport swizzles are unsupported".into());
+    }
+    let sw: [u32; 4] = c.read(c.args[3])?;
+    let flip = match sw {
+        [0, 2, 4, 6] => false,
+        [0, 3, 4, 6] => true,
+        _ => return Err(format!("unsupported viewport swizzle {sw:?}").into()),
+    };
+    record(c, op::SWIZZLES, &[flip.into()])
+}
 pub fn texture(c: &Call) -> Result<u64> {
     record(
         c,
@@ -187,19 +257,21 @@ pub fn texture(c: &Call) -> Result<u64> {
     )
 }
 pub fn targets(c: &Call) -> Result<u64> {
-    if c.args[1] != 1
-        || c.args[4] != 0
-        || c.args[5] != 0
-        || c.args[3] != 0 && c.read::<u64>(c.args[3])? != 0
-    {
-        return Err("unsupported attachment count, depth target or texture view".into());
+    if c.args[1] != 1 {
+        return Err("only one color attachment is supported".into());
     }
-    let target: Texture = c.read(c.read::<u64>(c.args[2])?)?;
-    record(
-        c,
-        op::TARGETS,
-        bytemuck::cast_slice(std::slice::from_ref(&target)),
-    )
+    let view = if c.args[3] == 0 {
+        0
+    } else {
+        c.read(c.args[3])?
+    };
+    let color = texels::view(c, c.read(c.args[2])?, view)?;
+    let depth = if c.args[4] != 0 {
+        texels::view(c, c.args[4], c.args[5])?
+    } else {
+        Texture::default()
+    };
+    record(c, op::TARGETS, bytemuck::cast_slice(&[color, depth]))
 }
 pub fn clear(c: &Call) -> Result<u64> {
     let rgba: [u64; 2] = c.read(c.args[2])?;
@@ -227,6 +299,11 @@ pub fn streams(c: &Call) -> Result<u64> {
 #[derive(Default)]
 pub(crate) struct State {
     target: Option<Texture>,
+    depth_target: Option<Texture>,
+    raster: RasterState,
+    flip_y: bool,
+    depth_range: Option<[f32; 2]>,
+    blend_color: [f32; 4],
     viewport: [i32; 4],
     scissor: [i32; 4],
     shaders: SmallVec<[Shader; 2]>,
@@ -262,8 +339,35 @@ impl State {
                 op::TEXTURE_POOL if n == 2 => {
                     self.texture_pool = pool::DescriptorPool::new(w[0], w[1] as u32)
                 }
-                op::TARGETS if n == 4 => {
-                    self.target = Some(bytemuck::pod_read_unaligned(bytemuck::cast_slice(w)))
+                op::TARGETS if n == 8 => {
+                    let [color, depth]: [Texture; 2] =
+                        bytemuck::pod_read_unaligned(bytemuck::cast_slice(w));
+                    self.target = Some(color);
+                    self.depth_target = (depth.address != 0).then_some(depth);
+                }
+                op::BLEND if n == 1 => {
+                    let blend = w[0].to_le_bytes();
+                    if blend[0] == 0 {
+                        self.raster.blend = blend;
+                    }
+                }
+                op::COLOR if n == 1 => self.raster.blend_enable = w[0] as u32,
+                op::MASK if n == 1 => self.raster.channel_mask = w[0] as u32,
+                op::POLY if n == 1 => self.raster.polygon = (w[0] as u32).to_le_bytes(),
+                op::DEPTH if n == 1 => self.raster.depth = (w[0] as u32).to_le_bytes(),
+                op::DEPTH_RANGE if n == 1 => self.depth_range = Some(bytemuck::cast(w[0])),
+                op::SWIZZLES if n == 1 => self.flip_y = w[0] != 0,
+                op::BLEND_COLOR if n == 2 => self.blend_color = bytemuck::cast([w[0], w[1]]),
+                op::CLEAR_DEPTH if n == 4 => {
+                    if let Some(target) = self.depth_target {
+                        ops.push(Operation::ClearDepth {
+                            target,
+                            scissor: self.scissor,
+                            depth: (w[1] != 0).then(|| f32::from_bits(w[0] as u32)),
+                            stencil: w[2] as u8,
+                            mask: w[3] as u8,
+                        });
+                    }
                 }
                 op::VIEWPORT if n == 4 => self.viewport = std::array::from_fn(|i| w[i] as i32),
                 op::SCISSOR if n == 4 => self.scissor = std::array::from_fn(|i| w[i] as i32),
@@ -312,7 +416,9 @@ impl State {
                     let item = (w[0] as u32, (w[0] >> 32) as u32, w[1]);
                     put(&mut self.textures, item, |v| v.0 == item.0 && v.1 == item.1);
                 }
-                op::DRAW if n == 3 => {
+                op::DRAW | op::INDEXED
+                    if (op == op::DRAW && n == 3) || (op == op::INDEXED && n == 5) =>
+                {
                     let shaders = self.shaders.clone();
                     let textures = self
                         .textures
@@ -328,6 +434,12 @@ impl State {
                         .collect::<Result<_>>()?;
                     ops.push(Operation::Draw(Box::new(Draw {
                         target: self.target.ok_or("no color attachment bound")?,
+                        depth_target: self.depth_target,
+                        raster: self.raster,
+                        flip_y: self.flip_y,
+                        depth_range: self.depth_range.unwrap_or([0., 1.]),
+                        blend_color: self.blend_color,
+                        indices: (op == op::INDEXED).then(|| (w[1] as u32, w[3], w[4] as i32)),
                         viewport: self.viewport,
                         scissor: self.scissor,
                         shaders,

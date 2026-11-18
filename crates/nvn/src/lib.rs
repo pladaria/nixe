@@ -1,11 +1,14 @@
 //! Guest NVN objects and command recording. The renderer receives queue operations,
 //! while object storage and procedure resolution stay in the guest ABI.
+mod buffer;
 mod command;
 mod device;
 mod memory;
 mod pool;
 mod program;
 mod queue;
+mod state;
+mod texels;
 mod texture;
 mod vertex;
 
@@ -14,12 +17,14 @@ use nixe_cpu::platform::TargetPlatform;
 use nixe_memory::{AddressSpace, DeviceHeapMemory};
 pub use program::Shader;
 pub use queue::{Fence, PendingWait};
+pub use state::RasterState;
 use std::sync::{Arc, Mutex, OnceLock};
 pub use texture::{Layout, Sampler, Texture};
 
 pub type Result<T> = std::result::Result<T, Box<str>>;
 pub trait Backend: Send + Sync {
     fn submit(&self, commands: Vec<Operation>) -> Result<()>;
+    fn acquire_fence(&self, fence: Arc<Fence>) -> Result<()>;
     fn fence(&self, fence: Arc<Fence>) -> Result<()>;
     fn flush(&self) -> Result<()>;
     fn present(&self, texture: Texture, interval: u32) -> Result<()>;
@@ -62,6 +67,7 @@ pub struct Call<'a> {
     pub session: &'a Session,
     pub memory: &'a AddressSpace,
     pub args: [u64; 6],
+    pub float: &'a dyn Fn(u8) -> f32,
     pub pending: std::cell::Cell<Option<PendingWait>>,
 }
 pub type Handler = fn(&Call<'_>) -> Result<u64>;
@@ -79,13 +85,51 @@ macro_rules! procedures {
     };
 }
 procedures! {
+    texels {
+        TextureViewSetDefaults => defaults,
+        TextureViewSetFormat => format,
+        TextureViewSetLevels => levels,
+        TextureViewSetTarget => target,
+        TextureReadTexels => read,
+        TextureWriteTexels => write,
+        TextureFlushTexels => cache,
+        TextureInvalidateTexels => cache,
+    },
+    state {
+        PolygonStateSetDefaults => poly,
+        PolygonStateSetFrontFace => front,
+        PolygonStateSetCullFace => cull,
+        BlendStateSetDefaults => blend,
+        BlendStateSetBlendFunc => factors,
+        BlendStateSetBlendEquation => equations,
+        BlendStateSetBlendTarget => target,
+        ColorStateSetDefaults => color,
+        ColorStateSetBlendEnable => enable,
+        DepthStencilStateSetDefaults => depth,
+        DepthStencilStateSetDepthTestEnable => test,
+        DepthStencilStateSetDepthWriteEnable => write,
+        DepthStencilStateSetDepthFunc => compare,
+        ChannelMaskStateSetDefaults => mask,
+        ChannelMaskStateSetChannelMask => channels,
+    },
+    buffer {
+        BufferBuilderSetDevice => set_device,
+        BufferBuilderSetStorage => storage,
+        BufferBuilderSetDefaults => defaults,
+        BufferInitialize => initialize,
+        BufferFinalize => finalize,
+        BufferMap => map,
+        BufferGetAddress => address,
+    },
     device {
+        DeviceBuilderSetFlags => flags,
         DeviceBuilderSetDefaults => defaults,
         DeviceInitialize => initialize,
         DeviceGetInteger => integer,
         DeviceGetTextureHandle => texture_handle,
     },
     pool {
+        MemoryPoolFinalize => finalize,
         MemoryPoolBuilderSetDefaults => defaults,
         MemoryPoolBuilderSetDevice => set_device,
         MemoryPoolBuilderSetStorage => storage,
@@ -98,6 +142,12 @@ procedures! {
         SamplerPoolInitialize => descriptor_pool,
     },
     texture {
+        TextureGetWidth => width,
+        TextureGetHeight => height,
+        TextureGetFormat => get_format,
+        TextureGetTarget => get_target,
+        TextureBuilderSetDepth => depth,
+        TextureFinalize => finalize,
         TextureBuilderSetDevice => set_device,
         TextureBuilderSetDefaults => defaults,
         TextureBuilderSetFlags => flags,
@@ -132,6 +182,16 @@ procedures! {
         VertexStreamStateSetDivisor => divisor,
     },
     command {
+        CommandBufferDrawElementsBaseVertex => indexed,
+        CommandBufferSetDepthRange => depth_range,
+        CommandBufferSetViewportSwizzles => swizzles,
+        CommandBufferClearDepthStencil => clear_depth,
+        CommandBufferSetBlendColor => blend_color,
+        CommandBufferBindPolygonState => poly,
+        CommandBufferBindBlendState => blend,
+        CommandBufferBindColorState => color,
+        CommandBufferBindChannelMaskState => mask,
+        CommandBufferBindDepthStencilState => depth,
         CommandBufferInitialize => initialize,
         CommandBufferAddCommandMemory => add_commands,
         CommandBufferAddControlMemory => add_control,
@@ -153,6 +213,12 @@ procedures! {
         CommandBufferDrawArrays => draw,
     },
     queue {
+        WindowAcquireTexture => window_acquire,
+        QueueBuilderSetCommandMemorySize => command_bytes,
+        QueueBuilderSetComputeMemorySize => compute_bytes,
+        QueueBuilderGetQueueMemorySize => queue_bytes,
+        QueueBuilderSetQueueMemory => queue_memory,
+        QueueBuilderSetCommandFlushThreshold => threshold,
         WindowBuilderSetDefaults => window_defaults,
         WindowBuilderSetDevice => set_device,
         WindowBuilderSetNativeWindow => native_window,

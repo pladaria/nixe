@@ -20,7 +20,7 @@ pub(crate) struct Pool {
     pub cpu: u64,
     pub gpu: u64,
     pub bytes: u64,
-    flags: u32,
+    pub flags: u32,
     padding: u32,
 }
 pub fn defaults(c: &Call) -> Result<u64> {
@@ -126,4 +126,8 @@ impl DescriptorPool {
 pub(crate) fn slot(c: &Call, pointer: u64, index: u32) -> Result<u64> {
     let pool: DescriptorPool = c.read(pointer)?;
     pool.slot(index)
+}
+pub fn finalize(c: &Call) -> Result<u64> {
+    c.session.pools.lock().unwrap().remove(&c.args[0]);
+    Ok(0)
 }

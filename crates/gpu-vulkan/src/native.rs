@@ -934,6 +934,19 @@ impl nixe_gpu::GpuPresentation for NativeGpuExecution {
     ) -> Result<(), BackendRuntimeError> {
         self.submit_nvn(commands)
     }
+    fn nvn_acquire_fence(
+        &mut self,
+        action: nixe_gpu::FenceAction,
+    ) -> Result<(), BackendRuntimeError> {
+        // Presentation already submitted its independent image copy. The acquire
+        // sync observes that timeline without sealing another command buffer.
+        let queue = &self.residency.runtime.device.submission;
+        let work = queue.ticket(queue.scheduled);
+        self.state
+            .fences
+            .queue(Some(work), false, Some(action))
+            .map_err(runtime)
+    }
     fn nvn_present(
         &mut self,
         t: nixe_nvn::Texture,

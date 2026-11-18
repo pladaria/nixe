@@ -42,13 +42,17 @@ pub(super) fn layout(
     };
     Ok((l, layout))
 }
-pub(super) fn info(t: nixe_nvn::Texture) -> Result<ImageInfo, VulkanError> {
-    let (l, layout) = layout(t)?;
-    let format = match t.format {
+pub(super) fn format(format: u16) -> Result<ImageFormat, VulkanError> {
+    Ok(match format {
         0x25 => ImageFormat::Rgba8Unorm,
+        0x35 => ImageFormat::Depth24UnormStencil8Uint,
         0x95 => ImageFormat::Rgb565Unorm,
         f => return Err(error(format!("unsupported NVN texture format {f:#x}"))),
-    };
+    })
+}
+pub(super) fn info(t: nixe_nvn::Texture) -> Result<ImageInfo, VulkanError> {
+    let (l, layout) = layout(t)?;
+    let format = format(t.format)?;
     let description = ImageDescription::new(
         ImageDimension::Two,
         ImageExtent {
@@ -57,7 +61,11 @@ pub(super) fn info(t: nixe_nvn::Texture) -> Result<ImageInfo, VulkanError> {
             depth: 1,
         },
         format,
-        ImageKind::Color,
+        if format.is_depth_stencil() {
+            ImageKind::DepthStencil
+        } else {
+            ImageKind::Color
+        },
         t.levels,
         1,
         SampleCount::One,

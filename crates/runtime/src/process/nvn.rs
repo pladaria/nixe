@@ -389,6 +389,7 @@ impl NvnHooks {
                     session: &hle.session,
                     memory: memory.space(),
                     args: std::array::from_fn(|i| state.read_x(x(i as u8))),
+                    float: &|i| f32::from_bits(state.vector(i).unwrap() as u32),
                     pending: Default::default(),
                 };
                 let value = handler(&call)?;

@@ -21,6 +21,13 @@ pub struct Layout {
     pub pitch: u32,
 }
 impl Texture {
+    pub(crate) fn texel_bytes(&self) -> Result<u32> {
+        match self.format {
+            0x25 | 0x35 => Ok(4),
+            0x95 => Ok(2),
+            f => Err(format!("unsupported texture format {f:#x}").into()),
+        }
+    }
     pub fn layout(&self) -> Result<Layout> {
         if self.target != 1
             || self.samples > 1
@@ -31,11 +38,7 @@ impl Texture {
         {
             return Err(format!("unsupported texture layout {self:?}").into());
         }
-        let bpp = match self.format {
-            0x25 => 4, // RGBA8
-            0x95 => 2, // BGR565
-            f => return Err(format!("unsupported texture format {f:#x}").into()),
-        };
+        let bpp = self.texel_bytes()?;
         let row = self.width.checked_mul(bpp).ok_or("texture row overflows")?;
         if self.flags & 0x50 != 0 {
             let alignment = if self.flags & 0x40 != 0 { 128 } else { 32 };
@@ -115,6 +118,7 @@ pub fn size(c: &Call) -> Result<u64> {
 }
 pub fn storage(c: &Call) -> Result<u64> {
     let p: pool::Pool = c.read(c.args[1])?;
+    c.write(c.args[0] + 40, &(p.cpu + c.args[2]))?;
     c.write(
         c.args[0] + 8,
         &p.gpu
@@ -135,13 +139,11 @@ pub fn initialize(c: &Call) -> Result<u64> {
     let t: Texture = c.read(c.args[1] + 8)?;
     t.layout()?;
     c.write(c.args[0], &t)?;
+    c.write(c.args[0] + 32, &c.read::<u64>(c.args[1] + 40)?)?;
     Ok(1)
 }
 pub fn register_texture(c: &Call) -> Result<u64> {
-    if c.args[3] != 0 {
-        return Err("explicit NVN texture views are unsupported".into());
-    }
-    let t: Texture = c.read(c.args[2])?;
+    let t = texels::view(c, c.args[2], c.args[3])?;
     c.write(pool::slot(c, c.args[0], c.args[1] as u32)?, &t)?;
     Ok(0)
 }
@@ -185,6 +187,28 @@ pub fn register_sampler(c: &Call) -> Result<u64> {
     Ok(0)
 }
 
+pub fn depth(c: &Call) -> Result<u64> {
+    if c.args[1] as u32 != 1 {
+        return Err("3D texture storage is unsupported".into());
+    }
+    Ok(0)
+}
+pub fn width(c: &Call) -> Result<u64> {
+    Ok(c.read::<Texture>(c.args[0])?.width.into())
+}
+pub fn height(c: &Call) -> Result<u64> {
+    Ok(c.read::<Texture>(c.args[0])?.height.into())
+}
+pub fn get_format(c: &Call) -> Result<u64> {
+    Ok(c.read::<Texture>(c.args[0])?.format.into())
+}
+pub fn get_target(c: &Call) -> Result<u64> {
+    Ok(c.read::<Texture>(c.args[0])?.target.into())
+}
+pub fn finalize(c: &Call) -> Result<u64> {
+    c.write(c.args[0], &Texture::default())?;
+    Ok(0)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

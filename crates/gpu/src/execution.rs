@@ -149,6 +149,11 @@ pub trait GpuPresentation: GpuExecution {
             "NVN command execution unavailable".into(),
         ))
     }
+    fn nvn_acquire_fence(&mut self, _action: FenceAction) -> Result<(), BackendRuntimeError> {
+        Err(BackendRuntimeError::Backend(
+            "NVN presentation unavailable".into(),
+        ))
+    }
     fn nvn_present(
         &mut self,
         _texture: nixe_nvn::Texture,
