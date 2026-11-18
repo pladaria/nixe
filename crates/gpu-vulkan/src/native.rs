@@ -574,6 +574,18 @@ impl NativeExecution<'_> {
             );
             let stats = self.residency.statistics();
             nixe_gpu::trace::event(
+                "frame_owner_reads",
+                stats.owner_historical_reads,
+                stats.owner_clean_reads,
+                stats.owner_clean_pages,
+            );
+            nixe_gpu::trace::event(
+                "frame_owner_reuse",
+                stats.owner_read_hits,
+                stats.owner_read_fills,
+                self.residency.device_memory().owner_read_invalidations(),
+            );
+            nixe_gpu::trace::event(
                 "frame_input_locations",
                 stats.mutable_input_reads,
                 stats.mutable_input_relocations,

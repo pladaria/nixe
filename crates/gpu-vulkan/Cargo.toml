@@ -26,7 +26,7 @@ tempfile.workspace = true
 cc = "1"
 
 [features]
-performance-counters = ["nixe-gpu/performance-counters"]
+performance-counters = ["nixe-gpu/performance-counters", "nixe-memory/performance-counters"]
 
 [dev-dependencies]
 nixe-gpu-maxwell = { workspace = true, features = ["test-support"] }

@@ -244,6 +244,17 @@ pub struct ResidencyStatistics {
     #[cfg(feature = "performance-counters")]
     pub descriptor_reads: u64,
     #[cfg(feature = "performance-counters")]
+    pub owner_historical_reads: u64,
+    #[cfg(feature = "performance-counters")]
+    pub owner_clean_reads: u64,
+    #[cfg(feature = "performance-counters")]
+    pub owner_clean_pages: u64,
+    #[cfg(feature = "performance-counters")]
+    pub owner_read_hits: u64,
+    #[cfg(feature = "performance-counters")]
+    pub owner_read_fills: u64,
+
+    #[cfg(feature = "performance-counters")]
     pub descriptor_relocations: u64,
     #[cfg(feature = "performance-counters")]
     pub descriptor_changes: u64,
@@ -302,6 +313,7 @@ pub(crate) struct ResidencyRuntime {
     statistics: ResidencyStatistics,
     barriers: sync::Barriers,
     multi_range: multi_range::MultiRangeCache,
+    clean_reads: Box<[cpu_readback::CleanRead]>,
     /// Entries needed by a cold reconstruction cannot be evicted by its allocations.
     pub(crate) constructing: Vec<Resource>,
     descriptors: crate::cache::DescriptorCache,
@@ -362,6 +374,11 @@ impl VulkanResidency {
                 statistics: ResidencyStatistics::default(),
                 barriers: sync::Barriers::default(),
                 multi_range,
+                clean_reads: vec![
+                    cpu_readback::CleanRead::default();
+                    cpu_readback::CLEAN_READ_SLOTS
+                ]
+                .into_boxed_slice(),
                 constructing: Vec::new(),
                 descriptor_resources: Vec::new(),
                 descriptor_queue: crate::cache::UpdateDescriptorQueue::new(

@@ -228,9 +228,11 @@ pub(crate) struct Inner {
     // ApplyOpOnPAddr must not retain the mapping guard during rasterizer callbacks.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/device_memory_manager.h#L75-L89
     reverse: Box<[AtomicU32]>,
-    // Monotonic physical producer history. False proves no native cache/query
-    // has ever owned these bytes; true still requires consulting actual caches.
+    // Two bits per physical page. The low bit is lifetime GPU-write history.
+    // A producer also sets the high bit to invalidate owner read evidence.
     gpu_written: Box<[AtomicU64]>,
+    #[cfg(feature = "performance-counters")]
+    owner_read_invalidations: AtomicU64,
     command_versions: Box<[OnceLock<Box<CommandVersions>>]>,
     command_blocks: Box<[AtomicU64]>,
     has_command_pages: AtomicBool,
@@ -250,6 +252,11 @@ struct CommandVersions {
     // content generation. Host stores preserve synchronization; GPU producers
     // and mapping retirement invalidate it atomically with the generation.
     versions: [AtomicU64; 64],
+}
+pub enum OwnerReadSpan {
+    Unwritten,
+    CheckRange,
+    Page { physical: u64, reusable: bool },
 }
 #[derive(Clone, Debug)]
 pub struct DeviceMemory(pub(crate) Arc<Inner>);
@@ -376,7 +383,9 @@ impl DeviceMemory {
                 processes: vec![Weak::new()],
             }),
             reverse: (0..physical_pages).map(|_| AtomicU32::new(0)).collect(),
-            gpu_written: (0..physical_pages.div_ceil(64))
+            #[cfg(feature = "performance-counters")]
+            owner_read_invalidations: AtomicU64::new(0),
+            gpu_written: (0..physical_pages.div_ceil(32))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             command_versions: (0..physical_pages.div_ceil(64))
@@ -414,9 +423,17 @@ impl DeviceMemory {
     #[inline]
     pub fn mark_gpu_written(&self, address: u64, bytes: u64) {
         self.visit_physical_pages(address, bytes, |page| {
-            let word = &self.0.gpu_written[page / 64];
-            let mask = 1 << (page % 64);
-            if word.load(Ordering::Relaxed) & mask == 0 {
+            let word = &self.0.gpu_written[page / 32];
+            let shift = (page % 32) * 2;
+            let mask = 3 << shift;
+            let state = word.load(Ordering::Relaxed) & mask;
+            if state != mask {
+                #[cfg(feature = "performance-counters")]
+                if state != 0 {
+                    self.0
+                        .owner_read_invalidations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 word.fetch_or(mask, Ordering::Release);
             }
             if let Some(versions) = self.0.command_versions[page / 64].get() {
@@ -435,7 +452,7 @@ impl DeviceMemory {
     pub fn register_command_pages(&self, address: u64, bytes: u64) -> bool {
         let mut written = false;
         self.visit_physical_pages(address, bytes, |page| {
-            if self.0.gpu_written[page / 64].load(Ordering::Acquire) & (1 << (page % 64)) == 0 {
+            if self.gpu_page_state(page) & 1 == 0 {
                 return false;
             }
             written = true;
@@ -550,10 +567,48 @@ impl DeviceMemory {
                 .fetch_or(1, Ordering::Release);
         });
     }
+    #[inline]
+    fn gpu_page_state(&self, page: usize) -> u64 {
+        (self.0.gpu_written[page / 32].load(Ordering::Acquire) >> ((page % 32) * 2)) & 3
+    }
+    /// Classify a synchronous rasterizer read in physical coordinates. Reads
+    /// spanning pages keep the ordinary per-range publication order.
+    #[inline]
+    pub fn owner_read_span(&self, address: u64, bytes: u64) -> OwnerReadSpan {
+        if bytes == 0 {
+            return OwnerReadSpan::Unwritten;
+        }
+        if address >= 1 << self.0.address_bits || bytes > PAGE_SIZE - address % PAGE_SIZE {
+            return if self.may_be_gpu_written(address, bytes) {
+                OwnerReadSpan::CheckRange
+            } else {
+                OwnerReadSpan::Unwritten
+            };
+        }
+        let Some(physical) = self.physical_address(address) else {
+            return OwnerReadSpan::Unwritten;
+        };
+        let page = (physical.get() / PAGE_SIZE) as usize;
+        match self.gpu_page_state(page) {
+            0 => OwnerReadSpan::Unwritten,
+            state => OwnerReadSpan::Page {
+                physical: physical.get(),
+                reusable: state == 1,
+            },
+        }
+    }
+    /// Only the single bound rasterizer arms a page, while holding the producer
+    /// caches. Its local entry identifies the interval and the mapping generation.
+    pub fn remember_owner_read(&self, physical: u64) {
+        let page = (physical / PAGE_SIZE) as usize;
+        self.0.gpu_written[page / 32].fetch_and(!(2 << ((page % 32) * 2)), Ordering::Release);
+    }
+    #[cfg(feature = "performance-counters")]
+    pub fn owner_read_invalidations(&self) -> u64 {
+        self.0.owner_read_invalidations.load(Ordering::Relaxed)
+    }
     pub fn may_be_gpu_written(&self, address: u64, bytes: u64) -> bool {
-        self.visit_physical_pages(address, bytes, |page| {
-            self.0.gpu_written[page / 64].load(Ordering::Acquire) & (1 << (page % 64)) != 0
-        })
+        self.visit_physical_pages(address, bytes, |page| self.gpu_page_state(page) & 1 != 0)
     }
     fn visit_physical_pages(
         &self,

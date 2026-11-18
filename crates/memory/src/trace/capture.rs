@@ -242,6 +242,8 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
                 | "split_requests"
                 | "frame_reuse"
                 | "frame_texture_reuse"
+                | "frame_owner_reads"
+                | "frame_owner_reuse"
                 | "frame_input_locations"
                 | "frame_descriptor_reads"
                 | "frame_descriptor_sources"

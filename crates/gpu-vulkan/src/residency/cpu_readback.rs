@@ -3,6 +3,18 @@
 use super::*;
 use nixe_memory::{AccessOperation, AccessResult, AllocationRange, DeviceAccessRequest};
 
+#[cfg(test)]
+mod tests;
+
+// Direct mapping bounds owner storage; collisions only replace evidence.
+pub(super) const CLEAN_READ_SLOTS: usize = 1024;
+#[derive(Clone, Copy, Default)]
+pub(super) struct CleanRead {
+    start: u64,
+    end: u64,
+    generation: u64,
+}
+
 impl Residency<'_> {
     pub(crate) fn write_constant_span(
         &mut self,
@@ -59,14 +71,126 @@ impl Residency<'_> {
         self.invalidate_cpu_ranges(ranges.iter().copied(), true)
     }
 
+    fn has_read_producer(&self, address: u64, bytes: u64) -> bool {
+        // Reactive buffer downloads collect every dirty interval on the input
+        // pages. A clean word beside a dirty buffer must still trigger that batch.
+        let page = nixe_memory::PAGE_SIZE;
+        let start = address & !(page - 1);
+        let end = (address + bytes).div_ceil(page) * page;
+        self.buffer_cache
+            .gpu_modified_ranges
+            .intersects(start, end - start)
+            || self.buffer_cache.pending_read(address, bytes).is_some()
+            || self.texture_cache.region_gpu_modified(address, bytes)
+            || (self.caches.query_pages.any(address, bytes)
+                && self
+                    .caches
+                    .query_cache
+                    .lock()
+                    .unwrap()
+                    .must_flush_region(address, bytes))
+    }
+
+    fn physical_read_is_clean(&self, address: u64, bytes: u64) -> bool {
+        if self.has_read_producer(address, bytes) {
+            return false;
+        }
+        let mut clean = true;
+        self.runtime
+            .device_memory
+            .apply_device_aliases(address, bytes, |at, size| {
+                clean = clean && !self.has_read_producer(at, size);
+            });
+        clean
+    }
+
     #[cfg_attr(feature = "performance-counters", track_caller)]
     pub(crate) fn flush_read_span(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
-        if !self
-            .runtime
-            .device_memory
-            .may_be_gpu_written(address, bytes)
-        {
+        use nixe_memory::device_memory::OwnerReadSpan;
+        let span = self.runtime.device_memory.owner_read_span(address, bytes);
+        if matches!(span, OwnerReadSpan::Unwritten) {
             return Ok(());
+        }
+        #[cfg(feature = "performance-counters")]
+        let clean = {
+            self.runtime.statistics.owner_historical_reads += 1;
+            let clean = self.physical_read_is_clean(address, bytes);
+            if clean {
+                self.runtime.statistics.owner_clean_reads += 1;
+                let page = nixe_memory::PAGE_SIZE;
+                if bytes <= page - (address % page)
+                    && self.physical_read_is_clean(address & !(page - 1), page)
+                {
+                    self.runtime.statistics.owner_clean_pages += 1;
+                }
+            }
+            clean
+        };
+        if let OwnerReadSpan::Page { physical, reusable } = span
+            && !self.buffer_cache.download_cpu_read_ranges
+            && self
+                .buffer_cache
+                .pending_read_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            && self.runtime.device.submission.deferred_clear.is_none()
+        {
+            let page = nixe_memory::PAGE_SIZE;
+            let index = (physical / page) as usize % CLEAN_READ_SLOTS;
+            let entry = self.runtime.clean_reads[index];
+            let generation = self.runtime.device_memory.generation();
+            if reusable
+                && entry.generation == generation
+                && entry.start <= physical
+                && physical + bytes <= entry.end
+            {
+                #[cfg(feature = "performance-counters")]
+                {
+                    assert!(
+                        clean,
+                        "owner read hit overlaps a GPU producer at {address:#x} ({bytes} bytes)"
+                    );
+                    self.runtime.statistics.owner_read_hits += 1;
+                }
+                return Ok(());
+            }
+            // Prove wider coverage without downloading any adjacent bytes. If
+            // a neighbour is dirty, only the requested interval can be reused.
+            let base = address & !(page - 1);
+            let range = if self.physical_read_is_clean(base, page) {
+                Some((physical & !(page - 1), page))
+            } else if (address != base || bytes != page)
+                && self.physical_read_is_clean(address, bytes)
+            {
+                Some((physical, bytes))
+            } else {
+                None
+            };
+            if let Some((start, size)) = range {
+                // Mapping changes can introduce another device alias. Discard
+                // evidence from a walk across two generations.
+                if self.runtime.device_memory.generation() == generation
+                    && self
+                        .runtime
+                        .device_memory
+                        .physical_address(address)
+                        .is_some_and(|p| p.get() == physical)
+                {
+                    self.runtime.clean_reads[index] = CleanRead {
+                        start,
+                        end: start + size,
+                        generation,
+                    };
+                    if !reusable {
+                        self.runtime.device_memory.remember_owner_read(physical);
+                    }
+                    #[cfg(feature = "performance-counters")]
+                    {
+                        self.runtime.statistics.owner_read_fills += 1;
+                    }
+                    return Ok(());
+                }
+            }
         }
         #[cfg(feature = "performance-counters")]
         let _trace = nixe_gpu::trace::span("read_coherent", address, bytes, 0);
