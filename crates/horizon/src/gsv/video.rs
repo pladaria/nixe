@@ -423,39 +423,66 @@ impl Inner {
         }
         Ok(())
     }
-    fn publish(&self, target: &Target, frame: &Frame) -> Result<()> {
-        let l = target.image.pool.layout;
-        if frame.width != l.width as usize || frame.height != l.height as usize {
+    fn publish(&self, target: &Target, frame: Frame) -> Result<()> {
+        let layout = target.image.pool.layout;
+        let width = frame.width;
+        let height = frame.height;
+        if width != layout.width as usize || height != layout.height as usize {
             return Err("decoded frame dimensions disagree with output image".into());
         }
-        let uv = frame.chroma();
-        for (src, stride, width, rows, offset) in [
-            (
-                frame.luma(),
-                frame.luma_pitch(),
-                frame.width,
-                frame.height,
-                0,
-            ),
-            (
-                uv.as_ref(),
-                frame.chroma_pitch(),
-                frame.width.div_ceil(2) * 2,
-                frame.height.div_ceil(2),
-                l.chroma,
-            ),
-        ] {
-            let mut bytes = vec![0; l.pitch * rows];
-            for y in 0..rows {
-                bytes[y * l.pitch..y * l.pitch + width]
-                    .copy_from_slice(&src[y * stride..y * stride + width]);
-            }
-            self.write(
+        let base = target.image.offset();
+        let luma = layout.pitch * height;
+        let chroma = layout.pitch * height.div_ceil(2);
+        let portions = [(base, luma), (base + layout.chroma as u64, chroma)];
+        // The closure owns the FFmpeg reference even if the graphics owner must
+        // finish a pending write first. The space between the planes is skipped.
+        let access = self
+            .machine
+            .publish_captured(
                 &target.image.pool.backing.ranges,
-                target.image.offset() + offset as u64,
-                bytes,
-            )?;
+                &portions,
+                move |at, destination| {
+                    use crate::video_codec::Plane;
+                    let (plane, width, offset) = if at < luma {
+                        (
+                            Plane::Packed {
+                                data: frame.luma(),
+                                stride: frame.luma_pitch(),
+                            },
+                            width,
+                            at,
+                        )
+                    } else {
+                        (frame.chroma_plane(), width.div_ceil(2) * 2, at - luma)
+                    };
+                    super::video_image::write_plane(
+                        plane,
+                        width,
+                        layout.pitch,
+                        offset,
+                        destination,
+                    );
+                },
+            )
+            .map_err(|e| e.to_string().into_boxed_str())?;
+        #[cfg(feature = "performance-counters")]
+        let deferred = matches!(access, Access::Pending(_));
+        if let Access::Pending(pending) = access {
+            match self
+                .wait(pending)?
+                .map_err(|e| e.to_string().into_boxed_str())?
+            {
+                AccessResult::Published(_) => (),
+                _ => return Err("invalid video publication completion".into()),
+            }
         }
+        #[cfg(feature = "performance-counters")]
+        nixe_memory::trace::event(
+            "video_publication",
+            (width * height + width.div_ceil(2) * 2 * height.div_ceil(2)) as u64,
+            (luma + chroma) as u64,
+            u64::from(deferred),
+        );
         Ok(())
     }
     fn run(&self) -> Result<()> {
@@ -527,7 +554,7 @@ impl Inner {
                         continue;
                     }
                 }
-                if let Some(pixels) = &frame.frame {
+                if let Some(pixels) = frame.frame {
                     self.publish(&target, pixels)?;
                 }
                 let l = target.image.pool.layout;

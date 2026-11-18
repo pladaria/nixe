@@ -73,3 +73,60 @@ impl Image {
         Ok(out)
     }
 }
+
+/// Copy one physical piece of a pitch-linear output plane. The source ends
+/// at the last visible pixel; decoder row padding is never guest pixel data.
+pub(super) fn write_plane(
+    plane: crate::video_codec::Plane<'_>,
+    width: usize,
+    pitch: usize,
+    start: usize,
+    destination: nixe_memory::ResourceWrite<'_>,
+) {
+    use crate::video_codec::Plane;
+    let size = destination.bytes();
+    if let Plane::Packed { data, stride } = plane
+        && stride == width
+        && width == pitch
+    {
+        destination.write_at(0, &data[start..start + size]);
+        return;
+    }
+    let mut row = start / pitch;
+    let mut column = start % pitch;
+    let mut written = 0;
+    while written < size {
+        let count = (pitch - column).min(size - written);
+        let pixels = width.saturating_sub(column).min(count);
+        if pixels != 0 {
+            match plane {
+                Plane::Packed { data, stride } => {
+                    let source = row * stride + column;
+                    destination.write_at(written, &data[source..source + pixels]);
+                }
+                Plane::Chroma(uv) => {
+                    // Planar software output must be interleaved. Limit scratch
+                    // to a few cache lines even for a fragmented output row.
+                    let mut interleaved = [0; 256];
+                    let mut x = 0;
+                    while x < pixels {
+                        let n = (pixels - x).min(interleaved.len());
+                        uv.interleave(row, column + x, &mut interleaved[..n]);
+                        destination.write_at(written + x, &interleaved[..n]);
+                        x += n;
+                    }
+                }
+            }
+        }
+        if pixels < count {
+            // Layout rounds row pitch to 64 bytes.
+            destination.write_at(written + pixels, &[0; 64][..count - pixels]);
+        }
+        written += count;
+        column = 0;
+        row += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests;

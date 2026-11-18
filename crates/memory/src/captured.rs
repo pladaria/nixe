@@ -83,9 +83,20 @@ impl CapturedMemory {
     }
     /// Independent exact leases for an operation that escapes the input owner.
     pub fn capture(&self, offset: u64, bytes: u64) -> Result<Vec<AllocationRange>, MemoryError> {
-        self.selected(offset, bytes)?
-            .map(|(range, offset, bytes)| range.slice(offset, bytes))
-            .collect()
+        let mut ranges = Vec::new();
+        self.capture_into(offset, bytes, &mut ranges)?;
+        Ok(ranges)
+    }
+    pub(crate) fn capture_into(
+        &self,
+        offset: u64,
+        bytes: u64,
+        ranges: &mut Vec<AllocationRange>,
+    ) -> Result<(), MemoryError> {
+        for (range, offset, bytes) in self.selected(offset, bytes)? {
+            ranges.push(range.slice(offset, bytes)?);
+        }
+        Ok(())
     }
 }
 impl std::ops::Index<usize> for CapturedMemory {

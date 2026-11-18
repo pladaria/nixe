@@ -69,6 +69,16 @@ pub struct ResourceWrite<'a> {
     _publication: std::marker::PhantomData<&'a ()>,
 }
 impl ResourceWrite<'_> {
+    pub fn bytes(&self) -> usize {
+        self.bytes as usize
+    }
+    /// Store disjoint host bytes without borrowing the guest RAM as a slice.
+    pub fn write_at(&self, offset: usize, source: &[u8]) {
+        assert!(offset <= self.bytes() && source.len() <= self.bytes() - offset);
+        // SAFETY: the checked interval belongs to this admitted destination.
+        unsafe { self.write_unchecked(offset as u64, source) };
+    }
+
     /// Copy disjoint host bytes into a previously validated destination.
     ///
     /// # Safety
@@ -301,7 +311,9 @@ impl crate::NativeAdmission<'_> {
         let binding = self.gpu_binding();
         let notify = matches!(
             operation,
-            crate::AccessOperation::Atomic(_) | crate::AccessOperation::Write(_)
+            crate::AccessOperation::Atomic(_)
+                | crate::AccessOperation::Write(_)
+                | crate::AccessOperation::Publish { .. }
         );
         let collect = notify
             && binding.is_some_and(|binding| {
@@ -528,6 +540,10 @@ impl Machine {
                 self.write_resolved(ranges, bytes)?;
                 Ok(crate::AccessResult::Written(std::mem::take(bytes)))
             }
+            crate::AccessOperation::Publish { bytes, copy } => {
+                self.publish_ranges(ranges, *bytes, copy, None)?;
+                Ok(crate::AccessResult::Published(*bytes))
+            }
             crate::AccessOperation::Atomic(operation) => {
                 let [range] = ranges else {
                     return Err(MemoryError::Invalid(
@@ -549,7 +565,9 @@ impl Machine {
         let binding = CpuBinding::resolve(self);
         if matches!(
             operation,
-            crate::AccessOperation::Write(_) | crate::AccessOperation::Atomic(_)
+            crate::AccessOperation::Write(_)
+                | crate::AccessOperation::Publish { .. }
+                | crate::AccessOperation::Atomic(_)
         ) && let Some(binding) = &binding
         {
             binding.notify_write(
@@ -591,6 +609,11 @@ impl Machine {
             crate::AccessOperation::Write(bytes) => {
                 if self.write_physical_impl(ranges, bytes, binding)? {
                     return Ok(Some(crate::AccessResult::Written(std::mem::take(bytes))));
+                }
+            }
+            crate::AccessOperation::Publish { bytes, copy } => {
+                if self.publish_ranges(ranges, *bytes, copy, binding)? {
+                    return Ok(Some(crate::AccessResult::Published(*bytes)));
                 }
             }
             crate::AccessOperation::Atomic(atomic) => {
@@ -954,6 +977,64 @@ impl Machine {
         )
         .map(crate::Access::Pending)
     }
+    /// Publish selected portions of a capture as a single ordered write. Source
+    /// offsets count only the selected bytes. Each destination is confined to one
+    /// portion and physical extent. Gaps are neither written nor invalidated.
+    pub fn publish_captured(
+        &self,
+        capture: &crate::CapturedMemory,
+        portions: &[(u64, usize)],
+        copy: impl Fn(usize, ResourceWrite<'_>) + Send + 'static,
+    ) -> Result<crate::Access<()>, MemoryError> {
+        self.validate_capture(capture)?;
+        let mut extents = smallvec::SmallVec::<[Extent; 4]>::new();
+        let mut bytes = 0usize;
+        for &(offset, size) in portions {
+            extents.extend(capture.physical_extents(offset, size as u64)?);
+            bytes = bytes
+                .checked_add(size)
+                .ok_or(MemoryError::Invalid("publication size overflows"))?;
+        }
+        let binding = CpuBinding::resolve(self);
+        if let Some(binding) = &binding {
+            binding.notify_write(
+                extents.iter().copied(),
+                &std::cell::RefCell::new(Vec::new()),
+            );
+        }
+        if self.try_write_extents_with(&extents, binding.as_ref(), &copy) {
+            return Ok(crate::Access::Ready(()));
+        }
+        let mut ranges = Vec::new();
+        for &(offset, size) in portions {
+            capture.capture_into(offset, size as u64, &mut ranges)?;
+        }
+        self.request_device_access(
+            ranges,
+            crate::AccessOperation::Publish {
+                bytes,
+                copy: Box::new(copy),
+            },
+        )
+        .map(crate::Access::Pending)
+    }
+
+    fn publish_ranges(
+        &self,
+        ranges: &[AllocationRange],
+        bytes: usize,
+        copy: &dyn Fn(usize, ResourceWrite<'_>),
+        binding: Option<&CpuBinding>,
+    ) -> Result<bool, MemoryError> {
+        if self.validate_ranges(ranges)? != bytes {
+            return Err(MemoryError::Invalid("physical publication size mismatch"));
+        }
+        let extents: smallvec::SmallVec<[_; 4]> = ranges
+            .iter()
+            .flat_map(AllocationRange::physical_extents)
+            .collect();
+        Ok(self.try_write_extents_with(&extents, binding, copy))
+    }
     fn write_captured_ram(
         &self,
         ranges: &crate::CapturedMemory,
@@ -999,6 +1080,18 @@ impl Machine {
         source: &[u8],
         binding: Option<&CpuBinding>,
     ) -> bool {
+        self.try_write_extents_with(extents, binding, |offset, region| {
+            // SAFETY: these extents cover exactly the validated source.
+            unsafe { region.write_unchecked(0, &source[offset..offset + region.bytes()]) };
+        })
+    }
+
+    fn try_write_extents_with(
+        &self,
+        extents: &[Extent],
+        binding: Option<&CpuBinding>,
+        copy: impl Fn(usize, ResourceWrite<'_>),
+    ) -> bool {
         let scratch = std::cell::RefCell::new(Vec::new());
         if binding.is_some_and(|binding| {
             extents
@@ -1010,12 +1103,18 @@ impl Machine {
 
         let mut offset = 0;
         for &extent in extents {
-            let end = offset + extent.bytes as usize;
-            // SAFETY: the caller retains every destination through the stores.
-            unsafe {
-                self.write_admitted(extent, &source[offset..end]);
-            }
-            offset = end;
+            copy(
+                offset,
+                ResourceWrite {
+                    destination: self
+                        .arena()
+                        .host_address(extent.start, extent.bytes)
+                        .expect("retained physical store"),
+                    bytes: extent.bytes,
+                    _publication: std::marker::PhantomData,
+                },
+            );
+            offset += extent.bytes as usize;
         }
         true
     }

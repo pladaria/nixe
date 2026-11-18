@@ -33,6 +33,42 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Plane<'a> {
+    Packed { data: &'a [u8], stride: usize },
+    Chroma(PlanarChroma<'a>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PlanarChroma<'a> {
+    pub u: &'a [u8],
+    pub v: &'a [u8],
+    pub u_stride: usize,
+    pub v_stride: usize,
+}
+
+impl PlanarChroma<'_> {
+    pub fn interleave(self, row: usize, column: usize, output: &mut [u8]) {
+        let u = &self.u[row * self.u_stride + column / 2..];
+        let v = &self.v[row * self.v_stride + column / 2..];
+        let (u, output) = if !column.is_multiple_of(2) && !output.is_empty() {
+            output[0] = v[0];
+            (&u[1..], &mut output[1..])
+        } else {
+            (u, output)
+        };
+        let v = &v[column % 2..];
+        let count = output.len() / 2;
+        let mut pairs = output.chunks_exact_mut(2);
+        for ((pair, a), b) in pairs.by_ref().zip(&u[..count]).zip(&v[..count]) {
+            pair.copy_from_slice(&[*a, *b]);
+        }
+        if let [last] = pairs.into_remainder() {
+            *last = u[count];
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Frame {
     raw: *mut c_void,
@@ -41,8 +77,8 @@ pub(crate) struct Frame {
     planes: [*const u8; 3],
     strides: [usize; 3],
 }
-// Each consumer owns an immutable AVFrame reference. Borrowed
-// plane slices cannot outlive that reference; only owned uploads cross threads.
+// A pending publication moves its owned AVFrame reference to the writer.
+// Each plane slice is borrowed only while that writer is copying pixels.
 // SAFETY: this value owns an immutable AVFrame reference. FFmpeg buffer
 // references are thread-safe; no mutable plane access crosses the handoff.
 // https://ffmpeg.org/doxygen/trunk/group__lavu__buffer.html
@@ -109,26 +145,42 @@ impl Frame {
     pub(crate) fn luma_pitch(&self) -> usize {
         self.strides[0]
     }
-    pub(crate) fn chroma(&self) -> Cow<'_, [u8]> {
-        let width = self.width.div_ceil(2) * 2;
+    pub(crate) fn chroma_plane(&self) -> Plane<'_> {
+        let samples = self.width.div_ceil(2);
         let rows = self.height.div_ceil(2);
-        if self.planes[2].is_null() {
-            // SAFETY: receive validated the NV12 plane and its complete extent.
-            Cow::Borrowed(unsafe {
-                std::slice::from_raw_parts(self.planes[1], (rows - 1) * self.strides[1] + width)
-            })
-        } else {
-            // The CPU compositor consumes semiplanar UV. Convert only software
-            // planar output; CUDA already supplies an interleaved host plane.
-            let mut uv = vec![0; width * rows];
-            for (y, row) in uv.chunks_exact_mut(width).enumerate() {
-                for (x, value) in row.iter_mut().enumerate() {
-                    unsafe {
-                        *value = *self.planes[1 + x % 2].add(y * self.strides[1 + x % 2] + x / 2);
-                    }
-                }
+        let plane = |i: usize, width| {
+            // SAFETY: receive validated the positive stride and FFmpeg retains
+            // these rows, including the final visible bytes (without padding).
+            unsafe {
+                std::slice::from_raw_parts(self.planes[i], (rows - 1) * self.strides[i] + width)
             }
-            Cow::Owned(uv)
+        };
+        if self.planes[2].is_null() {
+            Plane::Packed {
+                data: plane(1, samples * 2),
+                stride: self.strides[1],
+            }
+        } else {
+            Plane::Chroma(PlanarChroma {
+                u: plane(1, samples),
+                v: plane(2, samples),
+                u_stride: self.strides[1],
+                v_stride: self.strides[2],
+            })
+        }
+    }
+
+    pub(crate) fn chroma(&self) -> Cow<'_, [u8]> {
+        match self.chroma_plane() {
+            Plane::Packed { data, .. } => Cow::Borrowed(data),
+            Plane::Chroma(uv) => {
+                let width = self.width.div_ceil(2) * 2;
+                let mut bytes = vec![0; width * self.height.div_ceil(2)];
+                for (y, row) in bytes.chunks_exact_mut(width).enumerate() {
+                    uv.interleave(y, 0, row);
+                }
+                Cow::Owned(bytes)
+            }
         }
     }
     /// Own only the visible pixels needed by the asynchronous graphics owner.

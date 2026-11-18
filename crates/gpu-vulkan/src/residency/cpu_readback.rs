@@ -375,7 +375,10 @@ impl Residency<'_> {
                 device_ranges.insert(address, bytes);
             }
         }
-        if matches!(operation, AccessOperation::Write(_)) {
+        if matches!(
+            operation,
+            AccessOperation::Write(_) | AccessOperation::Publish { .. }
+        ) {
             // Texture invalidation replaces a whole representation. Preserve
             // its untouched bytes before a partial canonical write. Buffer
             // invalidation already retains exact unwritten native intervals.
@@ -397,7 +400,9 @@ impl Residency<'_> {
             .apply_resolved_access(ranges, operation)?;
         if matches!(
             result,
-            AccessResult::Written(_) | AccessResult::Atomic { written: true, .. }
+            AccessResult::Written(_)
+                | AccessResult::Published(_)
+                | AccessResult::Atomic { written: true, .. }
         ) {
             self.write_cpu_ranges(device_ranges.iter())?;
         }

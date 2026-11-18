@@ -161,6 +161,11 @@ pub enum AccessOperation {
     /// Record and submit a native CPU read. The reader finishes the returned completion outside native admission.
     PrepareRead(NativeReadArea),
     Write(Vec<u8>),
+    /// An owned source writes into admitted RAM, including fragmented backing.
+    Publish {
+        bytes: usize,
+        copy: Box<dyn Fn(usize, crate::ResourceWrite<'_>) + Send>,
+    },
     Atomic(AtomicAccess),
 }
 /// A submitted native read, finished on its consumer after owner preparation.
@@ -173,6 +178,7 @@ pub enum AccessResult {
     Read(Vec<u8>),
     ReadPrepared(Box<dyn PreparedRead>),
     Written(Vec<u8>),
+    Published(usize),
     Atomic { previous: u128, written: bool },
 }
 /// The native memory owner's per-core RasterizerDownloadArea, in DAddr space.
@@ -299,6 +305,9 @@ impl DeviceAccessRequest {
                 (AccessOperation::PrepareRead(_), AccessResult::ReadPrepared(_)) => true,
                 (AccessOperation::Write(_), AccessResult::Written(bytes)) => {
                     bytes.len() == self.bytes
+                }
+                (AccessOperation::Publish { .. }, AccessResult::Published(count)) => {
+                    *count == self.bytes
                 }
                 (AccessOperation::Atomic(access), AccessResult::Atomic { previous, written })
                     if matches!(
@@ -471,6 +480,9 @@ impl Machine {
         match &operation {
             AccessOperation::Write(data) if data.len() != bytes => {
                 return Err(MemoryError::Invalid("device write payload size mismatch"));
+            }
+            AccessOperation::Publish { bytes: size, .. } if *size != bytes => {
+                return Err(MemoryError::Invalid("device publication size mismatch"));
             }
             AccessOperation::Atomic(access) => {
                 let physical = ranges[0].physical_extents().next().unwrap();

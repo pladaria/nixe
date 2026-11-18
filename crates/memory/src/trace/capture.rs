@@ -228,6 +228,7 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
                 | "mme_upload"
                 | "mme_start"
                 | "mme_program"
+                | "video_publication"
                 | "frame_work"
                 | "frame_queue"
                 | "frame_memory"

@@ -162,3 +162,85 @@ fn single_texel(r: &mut Residency<'_>, address: u64) -> Result<ImageId, VulkanEr
         None,
     )
 }
+
+#[test]
+fn disjoint_publication_waits_for_the_owner_before_writing_any_plane() -> Result<(), VulkanError> {
+    use nixe_memory::{
+        Access, AccessRequestId, AllocationId, CapturedMemory, DeviceAccessEndpoint, MachineId,
+        PAGE_SIZE,
+    };
+    use std::sync::mpsc;
+    struct Endpoint(mpsc::Sender<DeviceAccessRequest>);
+    impl DeviceAccessEndpoint for Endpoint {
+        fn submit(&self, request: DeviceAccessRequest) {
+            self.0.send(request).unwrap();
+        }
+        fn cancel(&self, _: AccessRequestId) {}
+        fn allocation_pressure(&self, _: MachineId, _: u64) {}
+        fn allocation_released(&self, _: MachineId, _: AllocationId) {}
+        fn physical_retired(&self, _: MachineId, _: AllocationId, _: Box<[nixe_memory::Extent]>) {}
+    }
+    let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let monitor = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4 << 20)?.allocate(2 * PAGE_SIZE)?;
+    let memory = DeviceMemory::new(machine.clone(), 32);
+    let range = AllocationRange::new(allocation.pin(), 0, 2 * PAGE_SIZE)?;
+    let base = 0x10000;
+    let _mapping = memory.map(base, Arc::from([range.clone()]), true)?;
+    let capture = CapturedMemory::from(range);
+    let mut cache = VulkanResidency::new(
+        memory.clone(),
+        device,
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let mut r = cache.access();
+    let buf = r.device_buffer(
+        base + PAGE_SIZE,
+        8,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        false,
+        false,
+    )?;
+    r.fill_buffer(buf.buffer, buf.offset, 8, 0x12121212)?;
+    drop(r);
+    let (tx, rx) = mpsc::channel();
+    let endpoint: Arc<dyn DeviceAccessEndpoint> = Arc::new(Endpoint(tx));
+    machine.set_device_endpoint(&endpoint);
+    let src = Arc::new(*b"12345678");
+    let owned = Arc::downgrade(&src);
+    let access =
+        machine.publish_captured(&capture, &[(4, 4), (PAGE_SIZE, 4)], move |at, dst| {
+            dst.write_at(0, &src[at..at + dst.bytes()]);
+        })?;
+    let Access::Pending(mut pending) = access else {
+        panic!("GPU-written second plane must defer")
+    };
+    drop(capture);
+    assert!(owned.upgrade().is_some());
+    assert!(pending.poll().is_none());
+    let mut first = [0xff; 8];
+    memory.reader().read_block_unsafe(base, &mut first)?;
+    assert_eq!(first, [0; 8]);
+    let mut r = cache.access();
+    r.queue_device_access(rx.try_recv().unwrap())?;
+    assert!(matches!(
+        pending.wait().unwrap(),
+        AccessResult::Published(8)
+    ));
+    assert!(owned.upgrade().is_none());
+    memory.reader().read_block_unsafe(base, &mut first)?;
+    assert_eq!(first, *b"\0\0\0\x001234");
+    r.flush_read_span(base + PAGE_SIZE, 8)?;
+    let mut last = [0; 8];
+    memory
+        .reader()
+        .read_block_unsafe(base + PAGE_SIZE, &mut last)?;
+    assert_eq!(last, *b"5678\x12\x12\x12\x12");
+    drop(r);
+    drop(cache);
+    monitor.check()
+}
