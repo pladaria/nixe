@@ -1,6 +1,8 @@
 //! Channel-owned descriptor bytes and translations shared across pipeline users.
 use super::*;
-use texture_bindings::{BoundDescriptor, DescriptorSource, DescriptorTable, TextureChannel};
+use texture_bindings::{
+    BoundDescriptor, DescriptorMapping, DescriptorSource, DescriptorTable, TextureChannel,
+};
 
 impl Residency<'_> {
     #[cfg(feature = "performance-counters")]
@@ -26,112 +28,107 @@ impl Residency<'_> {
     /// Read live bytes every time. Only the translation and interpretation are
     /// retained: stable registers never make descriptor memory immutable.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn read_descriptor<M, T: BoundDescriptor>(
-        &mut self,
+    pub(crate) fn read_descriptor<'r, M, T: BoundDescriptor + 'r>(
+        &'r mut self,
         memory: &mut M,
         index: u32,
         table: impl for<'b> Fn(&'b mut TextureChannel) -> &'b mut DescriptorTable<T>,
-        identity: impl Fn(&M, &nixe_memory::device_memory::DeviceMemory) -> [u64; 3],
+        identity: impl Fn(&M, &nixe_memory::device_memory::DeviceMemory) -> DescriptorMapping,
         mut locate: impl FnMut(
             &mut M,
             &nixe_memory::device_memory::DeviceMemory,
             u64,
         ) -> Result<DescriptorSource, VulkanError>,
         mut read_virtual: impl FnMut(&mut Self, &mut M, u64, &mut [u8; 32]) -> Result<(), VulkanError>,
-    ) -> Result<([u8; 32], u64), VulkanError> {
+    ) -> Result<(&'r [u8; 32], u64), VulkanError> {
         #[cfg(feature = "performance-counters")]
         {
             self.runtime.statistics.descriptor_reads += 1;
         }
         loop {
-            let mapping = identity(memory, &self.runtime.device_memory);
-            let (address, source, relocated) = {
-                let table = table(&mut self.texture_cache.bindings.channel);
-                let base = table.table.ok_or(VulkanError::InvalidResource(
-                    "unprogrammed descriptor table",
-                ))?;
-                if index > table.maximum {
-                    return Err(VulkanError::InvalidResource(
-                        "descriptor index exceeds pool limit",
-                    ));
-                }
-                let address = base
-                    .checked_add(u64::from(index) * 32)
-                    .ok_or(VulkanError::InvalidResource("descriptor address overflow"))?;
-                let entry = table.entry(index);
-                let relocated =
-                    entry.address != address || entry.mapping != mapping || entry.source.is_none();
-                (
-                    address,
-                    (!relocated).then(|| entry.source.as_ref().unwrap().clone()),
-                    relocated,
-                )
-            };
-            let (source, mapping) = match source {
-                Some(source) => (source, mapping),
+            let mut mapping = identity(memory, &self.runtime.device_memory);
+            let table_ref = table(&mut self.texture_cache.bindings.channel);
+            // Pool/base/limit changes clear the records. Every populated slot
+            // has already passed admission at this index.
+            let cached = table_ref
+                .entries
+                .get(index as usize)
+                .filter(|entry| entry.mapping == mapping)
+                .and_then(|entry| entry.source.clone());
+            let relocated = cached.is_none();
+            let source = match cached {
+                Some(source) => source,
                 None => {
+                    let base = table_ref.table.ok_or(VulkanError::InvalidResource(
+                        "unprogrammed descriptor table",
+                    ))?;
+                    if index > table_ref.maximum {
+                        return Err(VulkanError::InvalidResource(
+                            "descriptor index exceeds pool limit",
+                        ));
+                    }
+                    let address = base
+                        .checked_add(u64::from(index) * 32)
+                        .ok_or(VulkanError::InvalidResource("descriptor address overflow"))?;
                     #[cfg(feature = "performance-counters")]
                     {
                         self.runtime.statistics.descriptor_relocations += 1;
                     }
                     let source = locate(memory, &self.runtime.device_memory, address)?;
-                    let mapping = identity(memory, &self.runtime.device_memory);
-                    let entry = table(&mut self.texture_cache.bindings.channel).entry(index);
-                    entry.address = address;
+                    if matches!(mapping, DescriptorMapping::Guarded(_)) {
+                        // Locating lazy native backing can replace the address-space guard.
+                        mapping = identity(memory, &self.runtime.device_memory);
+                    }
+                    if table_ref.entries.len() <= index as usize {
+                        table_ref
+                            .entries
+                            .resize_with(index as usize + 1, Default::default);
+                    }
+                    let entry = &mut table_ref.entries[index as usize];
                     entry.mapping = mapping;
                     entry.source = Some(source.clone());
-                    (source, mapping)
+                    source
                 }
             };
-            let mut bytes = [0; 32];
-            match &source {
+            let bytes = match source {
                 DescriptorSource::Contiguous { device, host } => {
                     #[cfg(feature = "performance-counters")]
                     {
                         self.runtime.statistics.descriptor_contiguous_reads += 1;
                     }
-                    self.flush_read_span(*device, 32)?;
-                    // Coherence can replace physical resources. Never dereference
-                    // a saved pointer after its mapping identity has changed.
-                    if identity(memory, &self.runtime.device_memory) != mapping {
-                        #[cfg(feature = "performance-counters")]
-                        {
-                            self.runtime.statistics.descriptor_mapping_retries += 1;
-                        }
-                        table(&mut self.texture_cache.bindings.channel)
-                            .entry(index)
-                            .source = None;
-                        continue;
-                    }
-                    // The consuming memory owner retains the checked mapping.
-                    // Raw instructions form no Rust reference to guest memory.
-                    unsafe {
-                        host.read_into(&mut bytes);
-                    }
+                    self.flush_read_span(device, 32)?;
+                    // GSV's guard pins its device mappings. On Maxwell the texture
+                    // cache lock holds off physical retirement until this read ends.
+                    unsafe { host.read_array() }
                 }
                 DescriptorSource::Captured(capture) => {
                     #[cfg(feature = "performance-counters")]
                     {
                         self.runtime.statistics.descriptor_fragmented_reads += 1;
                     }
-                    self.read_captured_memory(capture, &mut bytes)?
+                    let mut bytes = [0; 32];
+                    self.read_captured_memory(&capture, &mut bytes)?;
+                    bytes
                 }
-                DescriptorSource::Virtual => {
+                DescriptorSource::Virtual(address) => {
                     #[cfg(feature = "performance-counters")]
                     {
                         self.runtime.statistics.descriptor_fragmented_reads += 1;
                     }
-                    read_virtual(self, memory, address, &mut bytes)?
+                    let mut bytes = [0; 32];
+                    read_virtual(self, memory, address, &mut bytes)?;
+                    bytes
                 }
-            }
-            if identity(memory, &self.runtime.device_memory) != mapping {
+            };
+            // A concurrent remap during location, coherence or copying makes
+            // these bytes obsolete. The old generation also forces relocation.
+            if matches!(mapping, DescriptorMapping::Concurrent { .. })
+                && identity(memory, &self.runtime.device_memory) != mapping
+            {
                 #[cfg(feature = "performance-counters")]
                 {
                     self.runtime.statistics.descriptor_mapping_retries += 1;
                 }
-                table(&mut self.texture_cache.bindings.channel)
-                    .entry(index)
-                    .source = None;
                 continue;
             }
             let table = table(&mut self.texture_cache.bindings.channel);
@@ -162,7 +159,10 @@ impl Residency<'_> {
                 entry.revision = table.next_revision;
             }
             entry.changes = changes;
-            return Ok((entry.bytes, entry.revision));
+            return Ok((&entry.bytes, entry.revision));
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

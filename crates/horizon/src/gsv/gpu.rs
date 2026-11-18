@@ -709,7 +709,9 @@ impl nixe_gpu::native::ImageAddressSpace for GpuMemory<'_> {
             .image_mapped_ranges(address, bytes)
     }
 }
-impl nixe_gpu_ampere::RenderMemory for GpuMemory<'_> {
+// SAFETY: the read guard owns the GSV mappings and their SMMU pins. Only a
+// mutable call can release it to commit backing, which advances the generation.
+unsafe impl nixe_gpu_ampere::RenderMemory for GpuMemory<'_> {
     fn read_span(
         &mut self,
         address: u64,
@@ -849,6 +851,55 @@ mod tests {
     use super::*;
     use nixe_gpu::native::ImageAddressSpace;
     use nixe_gpu_ampere::RenderMemory;
+
+    #[test]
+    fn constant_word_crossing_a_remapped_page_reads_both_live_halves() {
+        let machine = nixe_memory::Machine::new(4 << 20).unwrap();
+        let account = machine.account(1 << 20).unwrap();
+        let device = DeviceMemory::new(machine, 32);
+        let mut map = GpuAddressSpace::new(
+            DeviceHeapMemory::new(device.clone()),
+            AddressSpaceId::new(1),
+        );
+        map.create_region(VA_START, 2 * PAGE_SIZE, account).unwrap();
+        let map = RwLock::new(map);
+        let boundary = VA_START + PAGE_SIZE;
+        let mut memory = GpuMemory::new(&map);
+        let (at, host) = memory
+            .read_span(boundary - 2, 4)
+            .unwrap()
+            .unwrap()
+            .at(boundary - 2, 4)
+            .unwrap();
+        device
+            .write_contiguous(at, nixe_memory::WriteSource::Bytes(&[1, 2, 3, 4]))
+            .unwrap();
+        // The active read guard retains both pages.
+        assert_eq!(unsafe { host.read_array::<4>() }, [1, 2, 3, 4]);
+        let generation = memory.mapping_generation();
+        drop(memory);
+
+        map.write().unwrap().unmap(boundary, PAGE_SIZE).unwrap();
+        let mut memory = GpuMemory::new(&map);
+        assert_ne!(memory.mapping_generation(), generation);
+        assert!(memory.read_span(boundary - 2, 4).unwrap().is_none());
+        let second = memory.image_device_address(boundary).unwrap().unwrap();
+        device
+            .write_contiguous(second, nixe_memory::WriteSource::Bytes(&[5, 6]))
+            .unwrap();
+        let capture = memory.capture_memory(boundary - 2, 4).unwrap();
+        assert_eq!(capture.len(), 2);
+        let mut bytes = [0; 4];
+        device
+            .machine()
+            .capture_stream(std::slice::from_ref(&capture[0]), &mut bytes[..2])
+            .unwrap();
+        device
+            .machine()
+            .capture_stream(std::slice::from_ref(&capture[1]), &mut bytes[2..])
+            .unwrap();
+        assert_eq!(bytes, [1, 2, 5, 6]);
+    }
 
     #[test]
     fn buffer_ranges_follow_lazy_backing_edits_and_the_reserved_sync_page() {

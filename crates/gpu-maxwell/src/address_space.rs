@@ -549,6 +549,8 @@ impl Drop for MaxwellGpuAddressSpace {
                 .unmap(mapping.offset.get(), mapping.size);
         }
         let retired = std::mem::take(&mut tables.live);
+        // Readers may outlive the address-space handle during teardown.
+        self.memory.inner.generation.fetch_add(1, Ordering::Release);
         drop(tables);
         for live in retired.values() {
             self.memory.unmap_memory(live, 0, u64::MAX);
@@ -815,10 +817,11 @@ impl MaxwellGpuAddressSpace {
             })
             .collect::<Vec<_>>();
         if !mappings.is_empty() {
-            self.advance_mapping_generation()?;
+            let generation = self.next_mapping_generation()?;
             for mapping_offset in mappings {
                 retired.extend(self.remove_mapping(&mut tables, mapping_offset));
             }
+            self.publish_mapping_generation(generation);
         }
         self.reservations.remove(&offset);
         tables.kinds.map(
@@ -971,11 +974,7 @@ impl MaxwellGpuAddressSpace {
         };
         let mapping = self.install_mapping(&mut tables, mapping);
         self.next_mapping_id = next_mapping_id;
-        self.mapping_generation = generation;
-        self.memory
-            .inner
-            .generation
-            .store(generation.get(), Ordering::Release);
+        self.publish_mapping_generation(generation);
         drop(tables);
         self.memory
             .modify_gpu_memory(mapping.offset.get(), mapping.size);
@@ -1013,12 +1012,13 @@ impl MaxwellGpuAddressSpace {
             .map(|(key, live)| (key, &live.descriptor))
             .filter_map(|(mapping_offset, mapping)| (mapping.id == id).then_some(*mapping_offset))
             .collect::<Vec<_>>();
-        self.advance_mapping_generation()?;
+        let generation = self.next_mapping_generation()?;
         retired.extend(
             removed
                 .into_iter()
                 .filter_map(|mapping_offset| self.remove_mapping(&mut tables, mapping_offset)),
         );
+        self.publish_mapping_generation(generation);
         drop(tables);
         for live in &retired {
             self.memory.unmap_memory(live, 0, u64::MAX);
@@ -1110,11 +1110,7 @@ impl MaxwellGpuAddressSpace {
             }
         }
         self.next_mapping_id = next_mapping_id;
-        self.mapping_generation = generation;
-        self.memory
-            .inner
-            .generation
-            .store(generation.get(), Ordering::Release);
+        self.publish_mapping_generation(generation);
         drop(tables);
         for (start, end) in spans {
             for live in &retired {
@@ -1281,11 +1277,7 @@ impl MaxwellGpuAddressSpace {
             }
         }
         tables.kinds.map(start, size, kind);
-        self.mapping_generation = generation;
-        self.memory
-            .inner
-            .generation
-            .store(generation.get(), Ordering::Release);
+        self.publish_mapping_generation(generation);
         Ok(())
     }
 
@@ -1576,13 +1568,12 @@ impl MaxwellGpuAddressSpace {
             .map_err(MaxwellAddressSpaceError::GenerationExhausted)
     }
 
-    fn advance_mapping_generation(&mut self) -> Result<(), MaxwellAddressSpaceError> {
-        self.mapping_generation = self.next_mapping_generation()?;
+    fn publish_mapping_generation(&mut self, generation: MappingGeneration) {
+        self.mapping_generation = generation;
         self.memory
             .inner
             .generation
-            .store(self.mapping_generation.get(), Ordering::Release);
-        Ok(())
+            .store(generation.get(), Ordering::Release);
     }
 
     fn next_mapping_identity(&self) -> Result<(MaxwellMappingId, u64), MaxwellAddressSpaceError> {

@@ -38,6 +38,28 @@ impl HostAddress {
         unsafe { crate::raw::read_value(self.as_ptr().add(offset), 8) as u64 }
     }
 
+    /// Read a fixed-width value into owned storage without borrowing guest RAM.
+    ///
+    /// # Safety
+    /// The caller retains all N readable bytes and resolves device coherence.
+    #[inline]
+    pub unsafe fn read_array<const N: usize>(self) -> [u8; N] {
+        let mut bytes = [0; N];
+        unsafe {
+            match N {
+                4 => bytes.copy_from_slice(&self.read_u32(0).to_le_bytes()),
+                8 => bytes.copy_from_slice(&self.read_u64(0).to_le_bytes()),
+                32 => {
+                    let (low, high) = bytes.split_at_mut(16);
+                    crate::raw::capture(self.as_ptr(), low);
+                    crate::raw::capture(self.as_ptr().add(16), high);
+                }
+                _ => self.read_into(&mut bytes),
+            }
+        }
+        bytes
+    }
+
     /// Copy live guest bytes without forming references to concurrently written RAM.
     ///
     /// # Safety

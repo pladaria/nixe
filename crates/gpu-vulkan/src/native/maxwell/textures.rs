@@ -3,7 +3,7 @@
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
 use super::*;
 use crate::residency::texture_bindings::{
-    BoundDescriptor, DescriptorSource, DescriptorTable, TextureChannel,
+    BoundDescriptor, DescriptorMapping, DescriptorSource, DescriptorTable, TextureChannel,
 };
 use crate::{VulkanError, residency::ImageViewId};
 use ash::vk;
@@ -13,22 +13,19 @@ fn failed(error: impl Display) -> VulkanError {
     VulkanError::Compilation(error.to_string().into())
 }
 impl super::super::NativeExecution<'_> {
-    fn read_maxwell_descriptor<T: BoundDescriptor>(
-        &mut self,
+    fn read_maxwell_descriptor<'r, T: BoundDescriptor + 'r>(
+        &'r mut self,
         mut space: &MaxwellGpuMemory,
         index: u32,
         table: impl for<'a> Fn(&'a mut TextureChannel) -> &'a mut DescriptorTable<T>,
-    ) -> Result<([u8; 32], u64), VulkanError> {
+    ) -> Result<(&'r [u8; 32], u64), VulkanError> {
         self.residency.read_descriptor(
             &mut space,
             index,
             table,
-            |space, device| {
-                [
-                    space.id().get(),
-                    space.mapping_generation().get(),
-                    device.generation(),
-                ]
+            |space, device| DescriptorMapping::Concurrent {
+                gpu: space.mapping_generation().get(),
+                device: device.generation(),
             },
             |space, device, address| {
                 let guest = space.address(address).map_err(failed)?;
@@ -42,7 +39,7 @@ impl super::super::NativeExecution<'_> {
                         host,
                     });
                 }
-                Ok(DescriptorSource::Virtual)
+                Ok(DescriptorSource::Virtual(address))
             },
             |residency, space, address, bytes| {
                 for range in space.image_mapped_ranges(address, 32)? {
@@ -59,7 +56,7 @@ impl super::super::NativeExecution<'_> {
         space: &MaxwellGpuMemory,
         compute: bool,
         index: u32,
-    ) -> Result<([u8; 32], u64), VulkanError> {
+    ) -> Result<(&[u8; 32], u64), VulkanError> {
         self.read_maxwell_descriptor(space, index, |channel| {
             &mut channel.image_descriptors[usize::from(compute)]
         })
@@ -69,7 +66,7 @@ impl super::super::NativeExecution<'_> {
         space: &MaxwellGpuMemory,
         compute: bool,
         index: u32,
-    ) -> Result<([u8; 32], u64), VulkanError> {
+    ) -> Result<(&[u8; 32], u64), VulkanError> {
         self.read_maxwell_descriptor(space, index, |channel| {
             &mut channel.sampler_descriptors[usize::from(compute)]
         })
@@ -156,18 +153,9 @@ impl super::super::NativeExecution<'_> {
         for slot in &resources.texels {
             let handle = super::handles::read_handle(self, space, buffers, &slot.handle, computed)?;
             let index = handle & 0xfffff;
-            let table = &self
-                .residency
-                .texture_cache
-                .bindings
-                .channel
-                .image_descriptors[usize::from(stage == 5)];
-            if index > table.maximum {
-                return Err(failed("texel descriptor exceeds TIC table"));
-            }
             let (bytes, _) = self.maxwell_image_descriptor(space, stage == 5, index)?;
             let (address, size, format, element_bytes) =
-                super::super::texels::interpretation(slot, index, bytes)?;
+                super::super::texels::interpretation(slot, index, *bytes)?;
             let source = if address == 0 {
                 None
             } else {

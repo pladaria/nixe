@@ -8,8 +8,8 @@ mod image;
 pub use image::{ImageAddressSpace, ImageInfo, ImagePacking, MappedGpuRange};
 
 /// Numerically described, physically contiguous RAM under the consuming GPU
-/// mapping owner. It borrows no guest bytes. Retained users check both mapping
-/// generations and resolve coherence for the exact consumed subrange.
+/// mapping owner. Retained users validate the identity of the owner that pins
+/// the translation and resolve coherence for the exact consumed subrange.
 #[derive(Clone, Copy)]
 pub struct ReadSpan {
     pub address: u64,

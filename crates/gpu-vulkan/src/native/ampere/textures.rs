@@ -5,7 +5,7 @@ use crate::{
     native::pipeline_resources::{HandleSource, ImageHandle},
     residency::execution::ShaderImage,
     residency::texture_bindings::{
-        BoundDescriptor, DescriptorSource, DescriptorTable, TextureChannel,
+        BoundDescriptor, DescriptorMapping, DescriptorSource, DescriptorTable, TextureChannel,
     },
 };
 use nixe_gpu::nvidia::TextureTiling;
@@ -24,23 +24,17 @@ pub(super) fn indices(linked: bool, handle: u32) -> (u32, u32) {
         (handle & 0xfffff, handle >> 20)
     }
 }
-fn descriptor<T: BoundDescriptor>(
-    residency: &mut Residency<'_>,
+fn descriptor<'r, T: BoundDescriptor + 'r>(
+    residency: &'r mut Residency<'_>,
     memory: &mut impl RenderMemory,
     index: u32,
     table: impl for<'a> Fn(&'a mut TextureChannel) -> &'a mut DescriptorTable<T>,
-) -> Result<([u8; 32], u64), VulkanError> {
+) -> Result<(&'r [u8; 32], u64), VulkanError> {
     residency.read_descriptor(
         memory,
         index,
         table,
-        |memory, device| {
-            [
-                memory.image_space_id(),
-                memory.mapping_generation(),
-                device.generation(),
-            ]
-        },
+        |memory, _| DescriptorMapping::Guarded(memory.mapping_generation()),
         |memory, _, address| {
             Ok(
                 if let Some((device, host)) = memory
@@ -59,22 +53,22 @@ fn descriptor<T: BoundDescriptor>(
         |_, _, _, _| Err(compilation("native descriptor has no retained input")),
     )
 }
-pub(super) fn image_descriptor(
-    residency: &mut Residency<'_>,
+pub(super) fn image_descriptor<'r>(
+    residency: &'r mut Residency<'_>,
     memory: &mut impl RenderMemory,
     compute: bool,
     index: u32,
-) -> Result<([u8; 32], u64), VulkanError> {
+) -> Result<(&'r [u8; 32], u64), VulkanError> {
     descriptor(residency, memory, index, |channel| {
         &mut channel.image_descriptors[usize::from(compute)]
     })
 }
-pub(super) fn sampler_descriptor(
-    residency: &mut Residency<'_>,
+pub(super) fn sampler_descriptor<'r>(
+    residency: &'r mut Residency<'_>,
     memory: &mut impl RenderMemory,
     compute: bool,
     index: u32,
-) -> Result<([u8; 32], u64), VulkanError> {
+) -> Result<(&'r [u8; 32], u64), VulkanError> {
     descriptor(residency, memory, index, |channel| {
         &mut channel.sampler_descriptors[usize::from(compute)]
     })
@@ -246,7 +240,7 @@ impl NativeExecution<'_> {
             let (index, _) = indices(linked, handle);
             let (bytes, _) = image_descriptor(&mut self.residency, memory, stage == 5, index)?;
             let (address, size, format, element_bytes) =
-                super::super::texels::interpretation(slot, index, bytes)?;
+                super::super::texels::interpretation(slot, index, *bytes)?;
             let source = if address == 0 {
                 None
             } else {

@@ -124,8 +124,15 @@ pub trait Rasterizer: nixe_gpu::GpuExecution {
         memory: &mut impl RenderMemory,
     ) -> Result<()>;
 }
-/// Commit lazy native GPU backing only when a resource is consumed.
-pub trait RenderMemory: nixe_gpu::native::ImageAddressSpace {
+/// Graphics memory for one consuming owner.
+///
+/// # Safety
+/// A read span must cover its stated extent in live RAM. Its VA translation
+/// and device pins must stay valid until the next mutable memory operation or
+/// the owner's release, including during rasterizer coherence callbacks.
+/// A retained span may be reused only under the same space ID and generation.
+/// Implementors must advance the generation when such a translation changes.
+pub unsafe trait RenderMemory: nixe_gpu::native::ImageAddressSpace {
     /// A numeric address, not a Rust borrow. Valid while the address-space owner
     /// retains its mappings. Retained selections must check mapping generations
     /// before reuse and resolve device coherence before dereferencing it.

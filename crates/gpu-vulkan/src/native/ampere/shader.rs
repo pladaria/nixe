@@ -116,54 +116,29 @@ pub(super) fn read_into(
     if count == 0 {
         return Ok(());
     }
-    loop {
-        let source = memory
-            .read_span(address, count as u64)
-            .map_err(compilation)?;
-        let identity = [
-            memory.image_space_id(),
-            memory.mapping_generation(),
-            residency.device_memory().generation(),
-        ];
-        if let Some((device, host)) = source.and_then(|span| span.at(address, count as u64)) {
-            residency.flush_read_span(device, count as u64)?;
-            if identity
-                != [
-                    memory.image_space_id(),
-                    memory.mapping_generation(),
-                    residency.device_memory().generation(),
-                ]
-            {
-                continue;
-            }
-            // The consuming mapping owner retains the physical RAM. Coherence
-            // cannot authorize dereferencing a translation it just invalidated.
-            unsafe { host.read_into(bytes) };
-        } else {
-            let capture = memory
-                .capture_memory(address, count as u64)
-                .map_err(|error| {
-                    compilation(format!(
-                        "native memory read at {address:#x}, {count} bytes: {error}"
-                    ))
-                })?;
-            residency
-                .read_captured_memory(&capture, bytes)
-                .map_err(|error| {
-                    compilation(format!(
-                        "coherent native read at {address:#x}, {count} bytes: {error}"
-                    ))
-                })?;
-        }
-        if identity
-            == [
-                memory.image_space_id(),
-                memory.mapping_generation(),
-                residency.device_memory().generation(),
-            ]
-        {
-            return Ok(());
-        }
+    let source = memory
+        .read_span(address, count as u64)
+        .map_err(compilation)?;
+    if let Some((device, host)) = source.and_then(|span| span.at(address, count as u64)) {
+        residency.flush_read_span(device, count as u64)?;
+        // The active RenderMemory guard owns the translation and its physical backing.
+        unsafe { host.read_into(bytes) };
+        Ok(())
+    } else {
+        let capture = memory
+            .capture_memory(address, count as u64)
+            .map_err(|error| {
+                compilation(format!(
+                    "native memory read at {address:#x}, {count} bytes: {error}"
+                ))
+            })?;
+        residency
+            .read_captured_memory(&capture, bytes)
+            .map_err(|error| {
+                compilation(format!(
+                    "coherent native read at {address:#x}, {count} bytes: {error}"
+                ))
+            })
     }
 }
 

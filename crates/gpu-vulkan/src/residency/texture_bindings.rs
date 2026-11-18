@@ -45,15 +45,6 @@ impl<T> DescriptorTable<T> {
             .checked_add(1)
             .expect("descriptor table revision exhausted");
     }
-    pub(crate) fn entry(&mut self, index: u32) -> &mut DescriptorRecord<T> {
-        assert!(index <= self.maximum);
-        let index = index as usize;
-        if self.entries.len() <= index {
-            self.entries
-                .resize_with(index + 1, DescriptorRecord::default);
-        }
-        &mut self.entries[index]
-    }
 }
 impl<T: BoundDescriptor> DescriptorTable<T> {
     /// Preparing one image can invalidate other views after their descriptor
@@ -78,8 +69,7 @@ impl<T: BoundDescriptor> DescriptorTable<T> {
 /// Pipeline bindings keep revisions, not copies of these bytes or translations.
 pub(crate) struct DescriptorRecord<T> {
     pub(crate) source: Option<DescriptorSource>,
-    pub(crate) address: u64,
-    pub(crate) mapping: [u64; 3],
+    pub(crate) mapping: DescriptorMapping,
     pub(crate) changes: u64,
     pub(crate) revision: u64,
     pub(crate) bytes: [u8; 32],
@@ -89,14 +79,20 @@ impl<T> Default for DescriptorRecord<T> {
     fn default() -> Self {
         Self {
             source: None,
-            address: 0,
-            mapping: [0; 3],
+            mapping: DescriptorMapping::Guarded(0),
             changes: 0,
             revision: 0,
             bytes: [0; 32],
             value: None,
         }
     }
+}
+/// The pool's synchronized address space owns its records. A guarded mapping
+/// pins VA and device backing together. Shared page tables can change during a read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DescriptorMapping {
+    Guarded(u64),
+    Concurrent { gpu: u64, device: u64 },
 }
 #[derive(Clone)]
 pub(crate) enum DescriptorSource {
@@ -107,7 +103,7 @@ pub(crate) enum DescriptorSource {
     Captured(Arc<nixe_memory::CapturedMemory>),
     /// Fragmented or partly unmapped GPU memory. Its generation-specific reader
     /// preserves the memory manager's hole semantics under the consuming owner.
-    Virtual,
+    Virtual(u64),
 }
 pub(crate) trait BoundDescriptor {
     fn invalidate_selection(&mut self);
