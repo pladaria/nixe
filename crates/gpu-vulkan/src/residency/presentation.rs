@@ -86,7 +86,7 @@ impl Residency<'_> {
                 "opaque framebuffer has no current resident producer; canonical import is forbidden",
             ));
         }
-        if !entry.current() {
+        if !entry.synchronized {
             return Err(VulkanError::InvalidResource(
                 "framebuffer image is CPU-modified; canonical import is forbidden",
             ));
@@ -162,6 +162,7 @@ impl Residency<'_> {
         image: ImageId,
         extent: [u32; 2],
     ) -> Result<Arc<AllocatedImage>, VulkanError> {
+        self.apply_dma_patches(image, dma_upload::DmaUse::Graphics)?;
         if self.require_resident_frame(image, extent).is_err() {
             self.prepare_image(image, false, false)?;
         }

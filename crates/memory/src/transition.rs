@@ -381,6 +381,12 @@ impl NativeAdmission<'_> {
         let Some(binding) = self.gpu_binding() else {
             return Ok(false);
         };
+        if extents
+            .iter()
+            .any(|&extent| !binding.interface.can_collect_cpu_write(extent))
+        {
+            return Ok(false);
+        }
         self.cpu_writes().write(
             self.address_space().machine(),
             &binding.device,

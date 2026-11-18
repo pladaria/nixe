@@ -21,6 +21,9 @@ mod cpu_readback;
 mod decoded_texture;
 mod descriptor_table;
 mod dma;
+mod dma_upload;
+#[cfg(test)]
+mod dma_upload_tests;
 pub(crate) mod execution;
 mod format;
 mod image;
@@ -109,6 +112,7 @@ pub(crate) struct ImageEntry {
     gpu_modified: bool,
     forced_flushed: bool,
     dma_downloaded: bool,
+    dma: dma_upload::DmaImage,
     contents: Contents,
     native: Arc<AllocatedImage>,
     original: Arc<AllocatedImage>,
@@ -144,7 +148,7 @@ impl ImageEntry {
         self.cpu_tracked = false;
     }
     fn current(&self) -> bool {
-        self.synchronized
+        self.synchronized && !self.dma.pending()
     }
     pub(crate) fn view_format(&self, requested: vk::Format) -> vk::Format {
         if self.decoded.is_some() {
@@ -320,6 +324,7 @@ pub(crate) struct ResidencyRuntime {
     descriptor_resources: Vec<crate::cache::DescriptorResource>,
     descriptor_queue: crate::cache::UpdateDescriptorQueue,
     compute_pass_descriptor_queue: crate::cache::UpdateDescriptorQueue,
+    dma_copy_regions: Vec<vk::BufferImageCopy>,
     descriptor_offsets: Vec<u32>,
     uniform_updates: Vec<Option<crate::queue::Slice>>,
     streamed_uses: Vec<usize>,
@@ -387,6 +392,7 @@ impl VulkanResidency {
                 compute_pass_descriptor_queue: crate::cache::UpdateDescriptorQueue::new(
                     crate::cache::UpdateDescriptorQueue::COMPUTE_FRAME_PAYLOAD_SIZE,
                 ),
+                dma_copy_regions: Vec::new(),
                 descriptor_offsets: Vec::new(),
                 uniform_updates: Vec::new(),
                 streamed_uses: Vec::new(),
@@ -431,6 +437,13 @@ impl VulkanResidency {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RamWrite {
+    Cpu,
+    Constant,
+    MirroredImage,
+}
+
 impl Residency<'_> {
     /// Apply a completed RAM store without discarding GPU-owned bytes elsewhere
     /// on its pages. Partial uploads keep those pages resident on the GPU.
@@ -442,12 +455,12 @@ impl Residency<'_> {
         &mut self,
         ranges: impl Iterator<Item = (u64, u64)> + Clone,
     ) -> Result<(), VulkanError> {
-        self.invalidate_cpu_ranges(ranges, false)
+        self.invalidate_cpu_ranges(ranges, RamWrite::Cpu)
     }
     fn invalidate_cpu_ranges(
         &mut self,
         ranges: impl Iterator<Item = (u64, u64)> + Clone,
-        constants: bool,
+        kind: RamWrite,
     ) -> Result<(), VulkanError> {
         let ranges = ranges.filter(|&(_, bytes)| bytes != 0);
         // Claim the entire batch before deciding which pages still need GPU
@@ -460,7 +473,7 @@ impl Residency<'_> {
             // Streamed uniforms do not clean buffer-tracker pages. Their RAM
             // writes only need the uniform/command versions claimed above until
             // a resident buffer has actually synchronized those pages.
-            let reaches_buffers = !constants
+            let reaches_buffers = kind != RamWrite::Constant
                 || self
                     .buffer_cache
                     .memory_tracker
@@ -472,7 +485,9 @@ impl Residency<'_> {
             if reaches_buffers && !self.upload_partial_write(address, bytes)? {
                 self.buffer_cache.memory_tracker.cpu_write(address, bytes);
             }
-            self.texture_cache.write_memory(address, bytes);
+            if kind != RamWrite::MirroredImage {
+                self.texture_cache.write_memory(address, bytes);
+            }
             if self.caches.query_pages.any(address, bytes) {
                 self.caches
                     .query_cache

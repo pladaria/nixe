@@ -233,6 +233,7 @@ impl Residency<'_> {
                 if self.resolution().active && any_rescaled {
                     self.scale_image(source, can_rescale, false)?;
                 }
+                self.apply_dma_patches(source, dma_upload::DmaUse::Alias)?;
                 self.copy_alias_regions(source, id, &copies)?;
             }
             Ok(())

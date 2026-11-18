@@ -373,6 +373,20 @@ impl Residency<'_> {
         {
             return Ok(false);
         }
+        if upload && !entry.gpu_modified {
+            if rect.offset.x != 0
+                || rect.offset.y != 0
+                || rect.extent.width != stored.extent.width
+                || rect.extent.height != stored.extent.height
+                || pitch != layout.rect.width
+            {
+                return Ok(false);
+            }
+            self.runtime.constructing.push(Resource::Image(image));
+            let result = self.upload_clean_dma(image, stored, address, buffer_size);
+            self.unpin(Resource::Image(image));
+            return result;
+        }
         let retained = self.runtime.constructing.len();
         self.runtime.constructing.push(Resource::Image(image));
         let result = self.record_dma_buffer_image(

@@ -72,6 +72,8 @@ pub trait DeviceMemoryInterface: Send + Sync + std::fmt::Debug {
     fn on_cpu_read(&self, address: u64, bytes: u64) -> crate::NativeReadArea;
     fn invalidate_region(&self, address: u64, bytes: u64);
     fn unmap_memory(&self, address: u64, bytes: u64);
+    /// A rounded write journal cannot represent partial stores to mixed-authority image pages.
+    fn can_collect_cpu_write(&self, extent: crate::Extent) -> bool;
     fn on_cpu_write(&self, address: u64, bytes: u64) -> bool;
 }
 /// Retained only during an admitted CPU invocation or a physical operation.

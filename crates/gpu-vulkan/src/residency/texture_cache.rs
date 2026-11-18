@@ -389,6 +389,7 @@ impl TextureCache {
                         views.extend_from_slice(&entry.views);
                     }
                     cached.remapped = true;
+                    entry.dma.discard(dma_upload::DmaUse::Invalidate);
                     entry.synchronized = false;
                     entry.untrack_cpu(&self.device_memory);
                 }
@@ -399,21 +400,40 @@ impl TextureCache {
         self.bindings.invalidate_image_views(&views);
         self.remove_framebuffers(&views);
     }
+    pub(super) fn advance_image_modification(&mut self, id: ImageId) {
+        self.image_modification_tick = self
+            .image_modification_tick
+            .checked_add(1)
+            .expect("image modification tick exhausted");
+        self.set_image_modification(id, self.image_modification_tick);
+    }
     /// WriteMemory keeps native images/views and marks intersecting DAddr
     /// contents CPU-modified. Already-modified images need no second update.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L586-L597
     pub(super) fn write_memory(&mut self, address: u64, bytes: u64) {
+        self.invalidate_cpu_images::<false>(address, bytes);
+    }
+    pub(super) fn invalidate_cpu_images<const BEFORE_STORE: bool>(
+        &mut self,
+        address: u64,
+        bytes: u64,
+    ) {
         if !self.page_filter.any(address, bytes) {
             return;
         }
         let end = address + bytes;
+        self.supersede_mixed_cpu_store(address, end);
         for page in address >> PAGE_BITS..=(end - 1) >> PAGE_BITS {
             let Some(ids) = self.image_pages.get(&page) else {
                 continue;
             };
             for &id in ids {
                 let entry = &mut self.images[id];
-                if !entry.synchronized {
+                if !entry.synchronized
+                    || (BEFORE_STORE && entry.gpu_modified && entry.dma.mixed_authority)
+                {
+                    // Keep the native version visible to MustFlushRegion until
+                    // the ordered owner has preserved the bytes outside the store.
                     continue;
                 }
                 if entry
@@ -421,6 +441,7 @@ impl TextureCache {
                     .iter()
                     .any(|&(base, size)| base < end && address < base + size)
                 {
+                    entry.dma.discard(dma_upload::DmaUse::Invalidate);
                     entry.synchronized = false;
                     entry.untrack_cpu(&self.device_memory);
                 }
@@ -441,7 +462,7 @@ impl Residency<'_> {
         let found = self.find_dma_image(space, surface)?;
         if let Some((id, _)) = found {
             let entry = &mut self.texture_cache.images[id];
-            if !entry.gpu_modified {
+            if !upload && !entry.gpu_modified {
                 return Ok(None);
             }
             if !upload && !entry.dma_downloaded {
@@ -669,14 +690,11 @@ impl Residency<'_> {
                 "decoded compressed textures are read-only; writes require the encoded canonical representation",
             ));
         }
-        self.texture_cache.image_modification_tick = self
-            .texture_cache
-            .image_modification_tick
-            .checked_add(1)
-            .expect("image modification tick exhausted");
-        let tick = self.texture_cache.image_modification_tick;
-        self.texture_cache.set_image_modification(id, tick);
+        self.texture_cache.advance_image_modification(id);
         let entry = &mut self.texture_cache.images[id];
+        if entry.dma.mixed_authority {
+            self.runtime.device_memory.invalidate_read_areas();
+        }
         for &(address, bytes) in &entry.maps {
             if !entry.gpu_modified {
                 self.runtime.device_memory.mark_gpu_written(address, bytes);

@@ -810,6 +810,57 @@ impl Footprint {
         }
         Ok(())
     }
+    /// A later write can supersede bytes while a fence owns an older staging
+    /// snapshot. Publish only the remaining spans with their original layout.
+    pub fn publish_resource_except(
+        &self,
+        writer: &nixe_memory::ResourceWriter<'_>,
+        native_start: u64,
+        source: &[u8],
+        excluded: &nixe_memory::RangeSet,
+    ) -> Result<(), MemoryError> {
+        if excluded.is_empty() {
+            return self.publish_resource(writer, native_start, source);
+        }
+        if writer.machine() != self.mapping.machine() {
+            return Err(MemoryError::Invalid(
+                "resource publication names another machine",
+            ));
+        }
+        self.validate_native_interval(native_start, source.len())?;
+        for (index, span) in self.mapping.spans().iter().enumerate() {
+            let lo = span.logical.max(self.start);
+            let hi = (span.logical + span.bytes).min(self.end);
+            if lo >= hi {
+                continue;
+            }
+            let start = span.start.get() + lo - span.logical;
+            let end = start + hi - lo;
+            let mut cursor = start;
+            for (skip, bytes) in excluded
+                .intersections(start, end - start)
+                .chain(std::iter::once((end, 0)))
+            {
+                if cursor < skip {
+                    let extent = nixe_memory::Extent {
+                        start: ArenaOffset::new(cursor),
+                        bytes: skip - cursor,
+                    };
+                    let destination = writer.region(extent)?;
+                    self.visit(index, extent.start, extent.bytes, |run| {
+                        let at = (run.native - native_start) as usize;
+                        destination.write_at(
+                            (run.start.get() - cursor) as usize,
+                            &source[at..at + run.bytes as usize],
+                        );
+                        true
+                    })?;
+                }
+                cursor = skip + bytes;
+            }
+        }
+        Ok(())
+    }
     fn validate_native_interval(
         &self,
         native_start: u64,

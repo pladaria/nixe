@@ -229,6 +229,7 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
                 | "mme_start"
                 | "mme_program"
                 | "video_publication"
+                | "dma_alias_use"
                 | "frame_work"
                 | "frame_queue"
                 | "frame_memory"

@@ -213,6 +213,7 @@ impl Residency<'_> {
             gpu_modified: false,
             forced_flushed: false,
             dma_downloaded: false,
+            dma: Default::default(),
             contents: Contents {
                 lru: None,
                 geometry: geometry.clone(),
@@ -252,7 +253,7 @@ impl Residency<'_> {
         let cache = &self.texture_cache;
         let view = cache.views.get(view)?;
         let image = cache.get(view.image);
-        Some(image.synchronized && image.aliases_current)
+        Some(image.current() && image.aliases_current)
     }
     /// Refresh CPU contents and aliases before consumption, or discard them
     /// for a full clear. Modification belongs to the image, not its rectangles.
@@ -267,6 +268,7 @@ impl Residency<'_> {
         let result = (|| {
             if invalidate {
                 let entry = &mut self.texture_cache.images[id];
+                entry.dma.discard(dma_upload::DmaUse::Clear);
                 entry.synchronized = true;
                 entry.gpu_modified = false;
                 self.texture_cache.track_image_cpu(id)?;
@@ -275,6 +277,7 @@ impl Residency<'_> {
                     self.texture_cache.track_image_cpu(id)?;
                     self.refresh_image(id)?;
                 }
+                self.apply_dma_patches(id, dma_upload::DmaUse::Graphics)?;
                 if !self.texture_cache.get(id).aliases_current {
                     self.synchronize_image_aliases(id)?;
                 }
@@ -427,7 +430,7 @@ impl Residency<'_> {
         }
         Ok(())
     }
-    fn record_cpu_image_plane(
+    pub(super) fn record_cpu_image_plane(
         &mut self,
         id: ImageId,
         plane: ImagePlane,

@@ -46,6 +46,7 @@ struct PlaneDownload {
     source: u64,
     size: u64,
     native_start: u64,
+    superseded: RangeSet,
     geometry: Arc<Footprint>,
     inputs: Vec<nixe_memory::AllocationRange>,
 }
@@ -80,6 +81,7 @@ impl TextureCache {
             preemptive: true,
         };
         let mut found = false;
+        let mut exact_read = false;
         for page in address >> 20..=(end - 1) >> 20 {
             let Some(ids) = self.image_pages.get(&page) else {
                 continue;
@@ -92,6 +94,10 @@ impl TextureCache {
                         .iter()
                         .any(|&(base, size)| base < end && address < base + size)
                 {
+                    continue;
+                }
+                if entry.dma.covers_read(&self.device_memory, address, bytes) {
+                    exact_read = true;
                     continue;
                 }
                 // Native reads cannot wait for publication while admitted.
@@ -112,7 +118,7 @@ impl TextureCache {
                 entry.forced_flushed = true;
             }
         }
-        if !found {
+        if !found && !exact_read {
             area.start = address / 4096 * 4096;
             area.end = end.div_ceil(4096) * 4096;
         }
@@ -123,13 +129,17 @@ impl Residency<'_> {
     fn record_texture_downloads(
         &mut self,
         ids: &[ImageId],
+        reason: dma_upload::DmaUse,
     ) -> Result<Option<ImageDownload>, VulkanError> {
         if ids.is_empty() {
             return Ok(None);
         }
         self.runtime.device.realize_deferred_clear()?;
         for &id in ids {
+            // Readbacks consume original guest texels. Apply partial DMA writes
+            // there directly, avoiding a round trip through scaled storage.
             self.scale_image(id, false, false)?;
+            self.apply_dma_patches(id, reason)?;
         }
         let sources = ids
             .iter()
@@ -235,6 +245,7 @@ impl Residency<'_> {
                 source: offset,
                 size,
                 native_start: plane.offset,
+                superseded: RangeSet::default(),
                 geometry,
                 inputs,
             });
@@ -252,7 +263,7 @@ impl Residency<'_> {
         if !entry.gpu_modified || !entry.synchronized {
             return Ok(());
         }
-        if let Some(download) = self.record_texture_downloads(&[id])? {
+        if let Some(download) = self.record_texture_downloads(&[id], dma_upload::DmaUse::Evict)? {
             self.flush()?;
             self.runtime
                 .device
@@ -272,7 +283,7 @@ impl Residency<'_> {
             })
             .collect();
         // All non-DMA image planes share one 64-byte-aligned reservation.
-        let images = self.record_texture_downloads(&ids)?;
+        let images = self.record_texture_downloads(&ids, dma_upload::DmaUse::Fence)?;
         let mut publications = Vec::with_capacity(pending.len());
         let mut first_plane = 0;
         for download in pending.drain(..) {
@@ -316,6 +327,9 @@ impl Residency<'_> {
                     let entry = self.texture_cache.get(id);
                     if entry.gpu_modified
                         && entry.synchronized
+                        && !entry
+                            .dma
+                            .covers_read(&self.runtime.device_memory, address, bytes)
                         && !ids.contains(&id)
                         && entry
                             .maps
@@ -397,7 +411,9 @@ impl Residency<'_> {
         for &id in &ids {
             self.texture_cache.images[id].gpu_modified = false;
         }
-        if let Some(download) = self.record_texture_downloads(&selected)? {
+        if let Some(download) =
+            self.record_texture_downloads(&selected, dma_upload::DmaUse::Readback)?
+        {
             self.flush()?;
             self.runtime
                 .device
@@ -409,6 +425,48 @@ impl Residency<'_> {
 }
 
 impl TextureCache {
+    // A fence captured before a write-through DMA can still own other bytes
+    // of that same image. A subsequent CPU store supersedes those bytes too.
+    pub(super) fn supersede_mixed_cpu_store(&mut self, address: u64, end: u64) {
+        if self.mixed_download_planes == 0 {
+            return;
+        }
+        let mut writes = RangeSet::default();
+        let mut at = address;
+        while at < end {
+            let bytes = (end - at).min(nixe_memory::PAGE_SIZE - at % nixe_memory::PAGE_SIZE);
+            if let Some(start) = self.device_memory.physical_address(at) {
+                writes.insert(start.get(), bytes);
+            }
+            at += bytes;
+        }
+        self.mask_image_downloads(&writes, true);
+    }
+    pub(super) fn supersede_image_downloads(&mut self, writes: &RangeSet) {
+        self.mask_image_downloads(writes, false);
+    }
+    fn mask_image_downloads(&mut self, writes: &RangeSet, mixed_only: bool) {
+        for snapshot in self.downloads.iter_mut().filter_map(|f| f.images.as_mut()) {
+            for plane in &mut snapshot.planes {
+                let untouched = plane.superseded.is_empty();
+                if mixed_only && untouched {
+                    continue;
+                }
+                for extent in plane
+                    .inputs
+                    .iter()
+                    .flat_map(nixe_memory::AllocationRange::physical_extents)
+                {
+                    for (at, bytes) in writes.intersections(extent.start.get(), extent.bytes) {
+                        plane.superseded.insert(at, bytes);
+                    }
+                }
+                if untouched && !plane.superseded.is_empty() {
+                    self.mixed_download_planes += 1;
+                }
+            }
+        }
+    }
     fn publish_image_download(&mut self, download: ImageDownload) -> Result<(), VulkanError> {
         let data = download.ticket.completed()?;
         // DownloadMemory orders images by modification tick, then consumes
@@ -427,9 +485,12 @@ impl TextureCache {
         self.device_memory
             .machine()
             .write_resources(&plane.inputs, |writer| {
-                plane
-                    .geometry
-                    .publish_resource(writer, plane.native_start, source)
+                plane.geometry.publish_resource_except(
+                    writer,
+                    plane.native_start,
+                    source,
+                    &plane.superseded,
+                )
             })?;
         self.native_readback_bytes += plane.size;
         self.canonical_readback_bytes += plane.size;
@@ -441,6 +502,13 @@ impl TextureCache {
             // Completed staging is borrowed once and retained through the whole
             // prefix. Publication neither flushes nor waits for another fence.
             let (data, planes, _sources) = if let Some(images) = download.images {
+                if self.mixed_download_planes != 0 {
+                    self.mixed_download_planes -= images
+                        .planes
+                        .iter()
+                        .filter(|p| !p.superseded.is_empty())
+                        .count();
+                }
                 (
                     Some(images.ticket.completed()?),
                     images.planes,

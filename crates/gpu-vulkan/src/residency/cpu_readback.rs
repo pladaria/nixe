@@ -68,7 +68,7 @@ impl Residency<'_> {
         }
         // Claim the complete batch, including physical aliases, before deciding
         // whether a partially overwritten native page still needs an upload.
-        self.invalidate_cpu_ranges(ranges.iter().copied(), true)
+        self.invalidate_cpu_ranges(ranges.iter().copied(), RamWrite::Constant)
     }
 
     fn has_read_producer(&self, address: u64, bytes: u64) -> bool {
@@ -91,7 +91,7 @@ impl Residency<'_> {
                     .must_flush_region(address, bytes))
     }
 
-    fn physical_read_is_clean(&self, address: u64, bytes: u64) -> bool {
+    pub(super) fn physical_read_is_clean(&self, address: u64, bytes: u64) -> bool {
         if self.has_read_producer(address, bytes) {
             return false;
         }
@@ -375,9 +375,18 @@ impl Residency<'_> {
                 device_ranges.insert(address, bytes);
             }
         }
+        if let AccessOperation::Atomic(_) = operation {
+            // A successful atomic replaces RAM and invalidates the image even
+            // when just its addressed word was already mirrored by DMA.
+            for (address, bytes) in device_ranges.iter() {
+                self.flush_region(address, bytes)?;
+            }
+        }
         if matches!(
             operation,
-            AccessOperation::Write(_) | AccessOperation::Publish { .. }
+            AccessOperation::Write(_)
+                | AccessOperation::Publish { .. }
+                | AccessOperation::Atomic(_)
         ) {
             // Texture invalidation replaces a whole representation. Preserve
             // its untouched bytes before a partial canonical write. Buffer

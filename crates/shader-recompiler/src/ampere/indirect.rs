@@ -214,6 +214,8 @@ fn general_words(i: Instruction, pc: ProgramOffset) -> Result<u32> {
             _ => return Err(unsupported("Native local load register width")),
         },
         0x387 | 0x987 => 0,
+        // DEPBAR waits on the scoreboard and has no register destination.
+        0x91a => 0,
         0xb82 => {
             if i.bits(73, 3) == 5 {
                 2
@@ -372,5 +374,34 @@ impl Table {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependency_barrier_preserves_the_branch_table_register() {
+        // Bound R1, scale it into R2, then load the branch displacement into R0.
+        let bound = 0x7817 | (1 << 16) | (3u128 << 32) | (0x0380_0000u128 << 64);
+        let shift = 0x7819 | (2 << 16) | (1 << 24) | (2u128 << 32) | (0x6ffu128 << 64);
+        let load = 0x7b82 | (2 << 24) | (0x800u128 << 64);
+        let depbar = 0x791a | (0x8000u128 << 32);
+        let branch = Instruction(0x7949 | (0xe0u128 << 82));
+        let code = [bound, shift, load, depbar, branch.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, word)| (ProgramOffset(index as u32 * 16), Instruction(word)))
+            .collect();
+        let calls = BTreeMap::new();
+        let flow =
+            Definitions::new(&code, &calls, &BTreeMap::new(), ProgramOffset(0), None).unwrap();
+        let (sources, _, max_index) = definitions(&flow, ProgramOffset(64), branch).unwrap();
+        assert_eq!(
+            sources,
+            [ProgramOffset(32), ProgramOffset(16), ProgramOffset(0)]
+        );
+        assert_eq!(max_index, 3);
     }
 }

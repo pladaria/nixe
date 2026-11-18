@@ -3,6 +3,7 @@
 //! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache_base.h
 use super::*;
 pub(crate) struct CacheOwners {
+    pub(super) ordered_store_pages: nixe_gpu::page_filter::PageFilter,
     pub(super) query_pages: nixe_gpu::page_filter::PageFilter,
     uniform_sync: Arc<std::sync::atomic::AtomicU64>,
     pub(super) command_pages: Arc<command_pages::CommandPages>,
@@ -68,6 +69,14 @@ impl CacheOwners {
         let pending_buffer_reads = Arc::clone(&buffer_cache.pending_read_count);
         let gpu_invalidations = Arc::clone(&buffer_cache.virtual_ranges.invalidations);
         Self {
+            ordered_store_pages: nixe_gpu::page_filter::PageFilter::new(
+                device
+                    .machine()
+                    .arena()
+                    .capacity()
+                    .next_power_of_two()
+                    .ilog2(),
+            ),
             query_pages: nixe_gpu::page_filter::PageFilter::new(device.address_bits()),
             command_pages,
             progress: Arc::clone(&progress),
@@ -199,6 +208,11 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
         area
     }
 
+    fn can_collect_cpu_write(&self, extent: nixe_memory::Extent) -> bool {
+        !self
+            .ordered_store_pages
+            .any(extent.start.get(), extent.bytes)
+    }
     fn on_cpu_write(&self, address: u64, bytes: u64) -> bool {
         {
             let mut cache = self.buffer_cache.lock().unwrap();
@@ -220,7 +234,7 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
         self.texture_cache
             .lock()
             .unwrap()
-            .write_memory(address, bytes);
+            .invalidate_cpu_images::<true>(address, bytes);
         self.query_cache
             .lock()
             .unwrap()
@@ -386,6 +400,7 @@ pub(crate) struct TextureCache {
     pub(super) virtual_invalid_space: u64,
     pub(super) pending_downloads: Vec<texture_download::PendingDownload>,
     pub(super) downloads: std::collections::VecDeque<texture_download::Download>,
+    pub(super) mixed_download_planes: usize,
     pub(super) decoder: nixe_gpu::texture_decode::BlockDecoder,
     pub(super) sample_conversion: Option<sample_readback::SampleConversion>,
     pub(super) scaling: Option<scaling::Helpers>,
@@ -432,6 +447,7 @@ impl TextureCache {
             virtual_invalid_space: 0,
             pending_downloads: Default::default(),
             downloads: Default::default(),
+            mixed_download_planes: 0,
             decoder: Default::default(),
             sample_conversion: Default::default(),
             scaling: None,
