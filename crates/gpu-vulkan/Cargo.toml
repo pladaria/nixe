@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nixe-nvn.workspace = true
 nixe-memory.workspace = true
 smallvec = "1"
 rustc-hash.workspace = true

@@ -797,11 +797,21 @@ impl Residency<'_> {
         draw: Draw,
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
+        self.draw_bound(&graphics.program, &graphics.parameters, targets, draw, push)
+    }
+
+    pub(crate) fn draw_bound(
+        &mut self,
+        program: &HostProgram,
+        parameters: &GraphicsParameters,
+        targets: &Arc<PreparedTargets>,
+        draw: Draw,
+        push: &[u8],
+    ) -> Result<WorkTicket, VulkanError> {
         // Host utilities accept independently constructed pipeline/framebuffer
         // captures. Guest draws derive both from their owning caches directly.
         self.validate_framebuffer(
-            graphics
-                .program
+            program
                 .pipeline
                 .graphics
                 .as_ref()
@@ -809,9 +819,9 @@ impl Residency<'_> {
             targets,
         )?;
         let retained = self.runtime.constructing.len();
-        self.retain_host_program(&graphics.program);
+        self.retain_host_program(program);
         self.retain_target_resources(targets);
-        for binding in graphics.parameters.state.vertex_bindings.iter() {
+        for binding in parameters.state.vertex_bindings.iter() {
             let vertex = self.vertex_binding(binding.binding)?;
             self.runtime
                 .constructing
@@ -834,15 +844,13 @@ impl Residency<'_> {
             }));
         let result = (|| {
             if !draw.is_empty() {
-                let enabled = graphics
-                    .parameters
+                let enabled = parameters
                     .state
                     .vertex_bindings
                     .iter()
                     .fold(0u32, |mask, binding| mask | (1 << binding.binding));
                 self.bind_host_geometry_buffers(None, enabled, draw, None, |binding| {
-                    graphics
-                        .parameters
+                    parameters
                         .state
                         .vertex_bindings
                         .iter()
@@ -858,19 +866,19 @@ impl Residency<'_> {
                     update: None,
                 }
             } else {
-                let descriptors = self.stream_graphics(&graphics.program)?;
-                self.host_program_access(&graphics.program)?;
+                let descriptors = self.stream_graphics(program)?;
+                self.host_program_access(program)?;
                 descriptors
             };
             if !draw.is_empty() && descriptors.record.is_none() && descriptors.update.is_none() {
-                descriptors.record = self.host_descriptor_record(&graphics.program)?;
+                descriptors.record = self.host_descriptor_record(program)?;
             }
             if descriptors.dynamic_offsets.is_none() {
-                descriptors.dynamic_offsets = Some(graphics.program.dynamic_offsets.clone());
+                descriptors.dynamic_offsets = Some(program.dynamic_offsets.clone());
             }
             let mut images = smallvec::SmallVec::<[ShaderImage; 16]>::new();
-            for &descriptor in &graphics.program.pipeline.image_bindings {
-                if let Some(binding) = graphics.program.bindings.get(descriptor) {
+            for &descriptor in &program.pipeline.image_bindings {
+                if let Some(binding) = program.bindings.get(descriptor) {
                     match binding {
                         HostBinding::Image(view) => images.push(ShaderImage {
                             view: Some(view.id),
@@ -926,20 +934,18 @@ impl Residency<'_> {
                 }
             }
             let result = self.record_draw_inner(
-                &graphics.program.pipeline,
+                &program.pipeline,
                 targets,
                 &images,
                 descriptors,
                 draw,
                 push,
                 false,
-                |aspect| Ok(attachment_read_only(aspect, &graphics.parameters.state)),
-                |residency| {
-                    residency.graphics_state(&graphics.program.pipeline, &graphics.parameters)
-                },
+                |aspect| Ok(attachment_read_only(aspect, &parameters.state)),
+                |residency| residency.graphics_state(&program.pipeline, parameters),
             )?;
             if !draw.is_empty() {
-                self.host_program_written(&graphics.program)?;
+                self.host_program_written(program)?;
             }
             Ok(result)
         })();

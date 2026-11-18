@@ -303,6 +303,11 @@ pub struct GraphicsTeardownReport {
 }
 
 impl VideoSystem {
+    pub fn attach_nvn(&self, session: &nixe_nvn::Session) -> nixe_nvn::Result<()> {
+        let state = self.state.lock().unwrap();
+        session.attach(state.nvdrv.nvn_graphics(state.presenter.clone())?)
+    }
+
     #[must_use]
     pub fn new(
         machine: nixe_memory::Machine,

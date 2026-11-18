@@ -1411,6 +1411,7 @@ dependencies = [
  "half",
  "hashbrown",
  "nixe-memory",
+ "nixe-nvn",
  "nixe-shader-recompiler",
  "rustc-hash",
  "smallvec",
@@ -1456,6 +1457,7 @@ dependencies = [
  "nixe-gpu-ampere",
  "nixe-gpu-maxwell",
  "nixe-memory",
+ "nixe-nvn",
  "nixe-shader-recompiler",
  "nixe-video",
  "raw-window-handle",
@@ -1493,6 +1495,7 @@ dependencies = [
  "nixe-loader-storage",
  "nixe-loader-title",
  "nixe-memory",
+ "nixe-nvn",
  "nixe-runtime",
  "nixe-scheduler",
  "nixe-video",
@@ -1574,6 +1577,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nixe-nvn"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "nixe-cpu",
+ "nixe-memory",
+ "nixe-scheduler",
+ "smallvec",
+]
+
+[[package]]
 name = "nixe-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1588,6 +1602,7 @@ dependencies = [
  "nixe-loader-storage",
  "nixe-loader-title",
  "nixe-memory",
+ "nixe-nvn",
  "nixe-scheduler",
  "tempfile",
 ]

@@ -6,6 +6,7 @@ pub struct ProcessBuilder {
     kernel: Arc<nixe_scheduler::SchedulerState>,
     sd_card_root: Option<PathBuf>,
     count_nvn_calls: bool,
+    nvn_hle: bool,
     machine: nixe_memory::Machine,
     system: nixe_memory::MemoryAccount,
 }
@@ -36,6 +37,7 @@ impl ProcessBuilder {
             kernel,
             sd_card_root: None,
             count_nvn_calls: false,
+            nvn_hle: false,
             machine,
             system,
         }
@@ -50,6 +52,12 @@ impl ProcessBuilder {
     #[must_use]
     pub const fn with_nvn_call_counting(mut self, enabled: bool) -> Self {
         self.count_nvn_calls = enabled;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_nvn_hle(mut self, enabled: bool) -> Self {
+        self.nvn_hle = enabled;
         self
     }
 
@@ -128,10 +136,16 @@ impl ProcessBuilder {
             .map(|module| module.image_base().saturating_add(module.image_extent()))
             .max()
             .ok_or_else(|| error(ProcessBuildStage::Placement, "launch plan has no modules"))?;
-        let nvn = self
-            .count_nvn_calls
-            .then(|| nvn::CallTrace::prepare(plan, &mut modules, process_code_end));
-        let process_code_end = nvn.as_ref().map_or(process_code_end, nvn::CallTrace::end);
+        let nvn = (self.count_nvn_calls || self.nvn_hle).then(|| {
+            nvn::NvnHooks::prepare(
+                plan,
+                &mut modules,
+                process_code_end,
+                self.count_nvn_calls,
+                self.nvn_hle,
+            )
+        });
+        let process_code_end = nvn.as_ref().map_or(process_code_end, nvn::NvnHooks::end);
         let memory_layout = ProcessMemoryLayout::for_address_space(
             self.config.memory_layout_profile,
             address_space,

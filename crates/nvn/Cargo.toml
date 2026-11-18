@@ -1,0 +1,12 @@
+[package]
+name = "nixe-nvn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nixe-scheduler.workspace = true
+nixe-memory.workspace = true
+nixe-cpu.workspace = true
+bytemuck = { workspace = true, features = ["derive"] }
+smallvec = "1"

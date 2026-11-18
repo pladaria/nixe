@@ -56,7 +56,7 @@ timezone = "Europe/Madrid"
 
 [diagnostics]
 # Count guest NVN API calls and write dump/nvn/<title>/<timestamp>-calls.csv on exit.
-# Disabled by default. Enable for diagnostics on either console generation.
+# Sorted by invocation count (highest first), then by function name. Disabled by default.
 count_nvn_calls = true
 # Minimum severity emitted by the CLI logger.
 log_level = "debug"
@@ -105,6 +105,9 @@ resolution_scale = 1.0
 # Compile Maxwell/Ampere MME macros to native AMD64 code. Defaults to true.
 # Selected once per channel; false or a non-AMD64 host uses the interpreter.
 mme_jit = true
+# Execute intercepted NVN calls in Rust. An unsupported invocation stops the game.
+# Defaults to false and works independently of diagnostics.count_nvn_calls.
+nvn_hle = false
 # Per-title shader environments and Vulkan driver caches, relative to this file.
 cache_directory = "./storage/cache/gpu"
 

@@ -51,7 +51,19 @@ impl Residency<'_> {
         program: HostProgram,
         parameters: GraphicsParameters,
     ) -> Result<HostGraphics, VulkanError> {
-        let pipeline = &program.pipeline;
+        self.validate_static_parameters(&program.pipeline, &parameters)?;
+        self.validate_dynamic_parameters(&parameters)?;
+        Ok(HostGraphics {
+            program,
+            parameters,
+        })
+    }
+
+    pub(crate) fn validate_static_parameters(
+        &self,
+        pipeline: &NativePipeline,
+        parameters: &GraphicsParameters,
+    ) -> Result<(), VulkanError> {
         if pipeline.bind_point != vk::PipelineBindPoint::GRAPHICS
             || pipeline.graphics.as_ref()
                 != Some(
@@ -70,12 +82,7 @@ impl Residency<'_> {
             .validate(self.runtime.device.profile())?;
         parameters
             .blending
-            .validate(self.runtime.device.profile(), &parameters.state)?;
-        self.validate_dynamic_parameters(&parameters)?;
-        Ok(HostGraphics {
-            program,
-            parameters,
-        })
+            .validate(self.runtime.device.profile(), &parameters.state)
     }
     pub(crate) fn validate_dynamic_parameters(
         &self,

@@ -379,15 +379,52 @@ pub(crate) fn run_guest<D: ExceptionDispatcher>(
         match report.stop {
             ExecutionStop::Safepoint => continue,
             ExecutionStop::SupervisorCall { source, immediate } => {
-                if immediate == crate::process::nvn::RESOLVE_SVC
-                    && let Some(trace) = &process.nvn
-                    && trace.resolve(
-                        source.pc.get(),
-                        &mut guest.execution.thread,
-                        process.memory(),
-                    )
+                if immediate == crate::process::nvn::NVN_SVC
+                    && let Some(hooks) = &process.nvn
                 {
-                    continue;
+                    use crate::process::nvn::{Svc, wait_on_guest};
+                    let handled = hooks
+                        .handle_svc(
+                            source.pc.get(),
+                            &mut guest.execution.thread,
+                            process.memory(),
+                        )
+                        .and_then(|svc| match svc {
+                            Svc::Unknown => Ok(false),
+                            Svc::Returned => Ok(true),
+                            Svc::Wait(wait) => {
+                                let thread_context = ExceptionThreadContext::new(
+                                    thread.id(),
+                                    current_lease().vcpu,
+                                    &thread,
+                                    &mut guest.execution.thread,
+                                    thread.tls_base,
+                                );
+                                let mut context = ExceptionDispatchContext::new(
+                                    source,
+                                    &process,
+                                    thread_context,
+                                    generation,
+                                );
+                                wait_on_guest(&mut context, wait)?;
+                                Ok(true)
+                            }
+                        });
+                    match handled {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(diagnostic) => {
+                            with_current(|core| {
+                                core.shared.fail(RuntimeError::Execution {
+                                    process: core.resident.as_ref().unwrap().lease.process,
+                                    thread: thread.id(),
+                                    diagnostic,
+                                })
+                            });
+                            process.finish_process(nixe_scheduler::ProcessLifecycle::Faulted, None);
+                            return Completion::Faulted;
+                        }
+                    }
                 }
                 if immediate == 7 && thread.loader_return == Some(source.pc) {
                     let exit_code =

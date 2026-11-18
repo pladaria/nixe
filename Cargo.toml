@@ -8,6 +8,7 @@ members = [
     "crates/cpu-jit",
     "crates/cpu-direct-memory",
     "crates/gpu",
+    "crates/nvn",
     "crates/shader-recompiler",
     "crates/gpu-maxwell",
     "crates/mme-jit",
@@ -34,6 +35,7 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
+nixe-nvn = { path = "crates/nvn" }
 ash = "=0.38.0"
 ash-window = "=0.13.0"
 gpu-allocator = { version = "=0.28.0", default-features = false, features = ["std", "vulkan"] }

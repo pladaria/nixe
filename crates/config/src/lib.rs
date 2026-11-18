@@ -62,6 +62,8 @@ pub struct GpuConfig {
     pub cache_directory: PathBuf,
     /// Compile uploaded MME macros on supported host architectures.
     pub mme_jit: bool,
+    /// Implement resolved NVN calls in the host. Unsupported invocations stop execution.
+    pub nvn_hle: bool,
     pub resolution_scale: ResolutionScale,
 }
 impl Default for GpuConfig {
@@ -69,6 +71,7 @@ impl Default for GpuConfig {
         Self {
             cache_directory: PathBuf::from("./storage/cache/gpu"),
             mme_jit: true,
+            nvn_hle: false,
             resolution_scale: ResolutionScale::default(),
         }
     }
@@ -128,6 +131,7 @@ impl NixeConfig {
         let mut gpu = GpuConfig {
             cache_directory: raw.gpu.cache_directory,
             mme_jit: raw.gpu.mme_jit,
+            nvn_hle: raw.gpu.nvn_hle,
             resolution_scale: raw.gpu.resolution_scale,
         };
         gpu.cache_directory = resolve_path(base_directory, gpu.cache_directory);
@@ -321,7 +325,7 @@ pub struct DiagnosticsConfig {
     pub log_level: DiagnosticLogLevel,
     /// Host severity policy applied to logs emitted by Horizon guests.
     pub guest_logs_level: GuestLogsLevel,
-    /// Collect guest NVN calls in first-invocation order.
+    /// Report guest NVN functions in descending invocation count.
     pub count_nvn_calls: bool,
     /// Requests filesystem access logs from the guest SDK.
     pub file_system_access_log: bool,
@@ -487,6 +491,8 @@ struct RawGpuConfig {
     #[serde(default = "default_true")]
     mme_jit: bool,
     #[serde(default)]
+    nvn_hle: bool,
+    #[serde(default)]
     resolution_scale: ResolutionScale,
 }
 
@@ -495,6 +501,7 @@ impl Default for RawGpuConfig {
         Self {
             cache_directory: default_gpu_cache_directory(),
             mme_jit: true,
+            nvn_hle: false,
             resolution_scale: ResolutionScale::default(),
         }
     }

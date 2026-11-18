@@ -33,6 +33,7 @@ macro_rules! graphics_stages {
 }
 mod completion;
 mod draw_reuse;
+mod nvn;
 mod pipeline_cache;
 pub(crate) mod pipeline_resources;
 mod sampled;
@@ -81,6 +82,7 @@ struct NativeState {
     host: Option<crate::presentation::Host>,
     descriptors: DescriptorCache,
     ampere: ampere::graphics::Cache,
+    nvn: nvn::Cache,
     dynamic: maxwell::dynamic_state::DynamicState,
     current_context: Option<u64>,
     blit_pipelines: HashMap<vk::Format, NativePipeline>,
@@ -168,6 +170,7 @@ impl NativeGpuExecution {
                 host: None,
                 descriptors,
                 ampere: Default::default(),
+                nvn: Default::default(),
                 dynamic: Default::default(),
                 current_context: None,
                 blit_pipelines: HashMap::default(),
@@ -925,6 +928,19 @@ fn owner_memory_error(error: BackendRuntimeError) -> Arc<nixe_memory::MemoryErro
 }
 
 impl nixe_gpu::GpuPresentation for NativeGpuExecution {
+    fn nvn_submit(
+        &mut self,
+        commands: Vec<nixe_nvn::Operation>,
+    ) -> Result<(), BackendRuntimeError> {
+        self.submit_nvn(commands)
+    }
+    fn nvn_present(
+        &mut self,
+        t: nixe_nvn::Texture,
+        interval: u32,
+    ) -> Result<ResidentImage, BackendRuntimeError> {
+        self.composite_image(nvn::presentation(t).map_err(runtime)?, interval, None)
+    }
     type Conversion = NativeNv12Conversion;
     type ImageRequest = nixe_gpu_maxwell::PresentationImageRequest;
     fn convert_nv12(&mut self, conversion: &Self::Conversion) -> Result<(), BackendRuntimeError> {

@@ -174,6 +174,12 @@ where
     }
     fn service_control(&mut self, message: GpuMessage) -> Result<(), GpuExecutorFailure> {
         let result = match message {
+            GpuMessage::Nvn(request) => {
+                if let Some(backend) = self.backend.borrow_mut().as_mut() {
+                    request.run(backend)
+                }
+                Ok(())
+            }
             GpuMessage::RequestComposite {
                 composite,
                 fences,
@@ -317,7 +323,8 @@ where
             // New command lists and external requests can expose CPU stores
             // into unprotected RAM. Invalidate in order before consuming them.
             // https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/video_core/gpu_thread.cpp#L191-L224
-            GpuMessage::Submission(_)
+            GpuMessage::Nvn(_)
+            | GpuMessage::Submission(_)
             | GpuMessage::CreateAddressSpace(_)
             | GpuMessage::AddressSpaceIoctl { .. }
             | GpuMessage::CreateChannel(_)

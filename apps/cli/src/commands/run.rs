@@ -242,6 +242,7 @@ fn run_machine(
         .map_err(|error| error.to_string())?;
     let process_builder = ProcessBuilder::new(memory, system_memory, kernel.clone())
         .with_nvn_call_counting(config.diagnostics.count_nvn_calls)
+        .with_nvn_hle(config.gpu.nvn_hle)
         .with_sd_card_root(sd_card_root)
         .with_config(machine_profile.process_build_config());
     let process = process_builder
@@ -483,6 +484,9 @@ fn run_machine(
             maxwell,
         )
         .map_err(|error| error.to_string())?;
+        if let Some(session) = process.nvn_session() {
+            video.attach_nvn(session).map_err(String::from)?;
+        }
         Some(video)
     };
     log::info!(

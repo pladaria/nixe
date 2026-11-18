@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nixe-nvn.workspace = true
 half = "2.7"
 spirv = "0.4"
 bcdec_rs = "0.2.0"

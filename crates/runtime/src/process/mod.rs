@@ -64,7 +64,7 @@ const HORIZON_REGION_ALIGNMENT: u64 = 0x20_0000;
 
 /// A process whose executable bytes are visible only through process memory.
 pub struct RunnableProcess {
-    pub(crate) nvn: Option<nvn::CallTrace>,
+    pub(crate) nvn: Option<nvn::NvnHooks>,
     process_id: u64,
     state: Mutex<ProcessState>,
     generation: std::sync::atomic::AtomicU64,

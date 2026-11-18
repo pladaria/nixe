@@ -220,6 +220,18 @@ impl NvDrvSession {
         }
     }
 
+    pub(crate) fn nvn_graphics(
+        &self,
+        mailbox: Option<nixe_video::FrameMailbox>,
+    ) -> nixe_nvn::Result<nixe_nvn::Graphics> {
+        let state = self.state.lock().unwrap();
+        let backend = state.gpu_backend.as_ref().ok_or("no GPU backend for NVN")?;
+        Ok(nixe_nvn::Graphics {
+            heap: state.device_memory.clone(),
+            backend: gpu_executor::nvn::client(backend, mailbox),
+        })
+    }
+
     pub(crate) fn request_composite(
         &self,
         composite: Composite,

@@ -141,6 +141,23 @@ pub trait GpuExecution: OwnerMemory + 'static {
 /// Presentation and media requests have their own guest-facing ownership ABI.
 /// Resource synchronization and queue execution remain shared across engines.
 pub trait GpuPresentation: GpuExecution {
+    fn nvn_submit(
+        &mut self,
+        _commands: Vec<nixe_nvn::Operation>,
+    ) -> Result<(), BackendRuntimeError> {
+        Err(BackendRuntimeError::Backend(
+            "NVN command execution unavailable".into(),
+        ))
+    }
+    fn nvn_present(
+        &mut self,
+        _texture: nixe_nvn::Texture,
+        _interval: u32,
+    ) -> Result<ResidentImage, BackendRuntimeError> {
+        Err(BackendRuntimeError::Backend(
+            "NVN presentation unavailable".into(),
+        ))
+    }
     type Conversion: Send + 'static;
     type ImageRequest: Send + 'static;
     /// Host conversion records directly; executable waits belong to native recording.

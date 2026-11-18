@@ -8,6 +8,7 @@ license.workspace = true
 performance-counters = ["nixe-gpu-maxwell/performance-counters", "nixe-gpu-ampere/performance-counters"]
 
 [dependencies]
+nixe-nvn.workspace = true
 smallvec = "1"
 getrandom.workspace = true
 nixe-memory.workspace = true

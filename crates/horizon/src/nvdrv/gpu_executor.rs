@@ -17,6 +17,7 @@ use std::thread::{self, JoinHandle};
 
 use nixe_gpu_maxwell::PresentationImageRequest;
 mod commands;
+pub(super) mod nvn;
 mod owner;
 
 // Bound owned ingress independently of native completion.
@@ -159,6 +160,7 @@ type CommandReplySender = mpsc::Sender<(FrontendSubmissionId, CommandReadReply)>
     reason = "retained deliveries are bounded by shared permits"
 )]
 enum GpuMessage {
+    Nvn(nvn::Request),
     CreateAddressSpace(nixe_gpu_maxwell::MaxwellGpuAddressSpace),
     AddressSpaceIoctl {
         space: nixe_gpu_maxwell::MaxwellAddressSpaceId,
