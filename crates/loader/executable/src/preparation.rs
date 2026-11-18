@@ -79,6 +79,50 @@ pub struct PreparedModule {
 }
 
 impl PreparedModule {
+    /// Redirect a defined AArch64 function before the guest runtime linker resolves imports.
+    /// The callback receives the original guest VA. The file and executable instructions stay intact.
+    pub fn redirect_nso_export(
+        &mut self,
+        metadata: &crate::NsoMetadata,
+        name: &[u8],
+        mut replacement: impl FnMut(u64) -> Option<u64>,
+    ) {
+        let Some(ro) = self.mappings.iter_mut().find(|m| {
+            m.permissions.is_readable()
+                && !m.permissions.is_writable()
+                && !m.permissions.is_executable()
+        }) else {
+            return;
+        };
+        let strings = metadata.dynamic_string_table();
+        let symbols = metadata.dynamic_symbol_table();
+        let mut at = symbols.offset() as usize;
+        for _ in 0..symbols.size() / 24 {
+            let Some(sym) = ro.bytes.get(at..at + 24) else {
+                break;
+            };
+            let name_at = u32::from_le_bytes(sym[..4].try_into().unwrap()) as usize;
+            let value = u64::from_le_bytes(sym[8..16].try_into().unwrap());
+            if sym[4] & 15 == 2
+                && sym[6..8] != [0, 0]
+                && name_at + name.len() < strings.size() as usize
+                && ro
+                    .bytes
+                    .get(strings.offset() as usize + name_at..)
+                    .is_some_and(|s| {
+                        s.strip_prefix(name)
+                            .is_some_and(|end| end.first() == Some(&0))
+                    })
+                && value < self.image_extent
+                && let Some(new) = replacement(self.image_base + value)
+            {
+                ro.bytes[at + 8..at + 16]
+                    .copy_from_slice(&new.wrapping_sub(self.image_base).to_le_bytes());
+            }
+            at += 24;
+        }
+    }
+
     /// Returns the source executable format.
     pub const fn format(&self) -> ExecutableFormat {
         self.format

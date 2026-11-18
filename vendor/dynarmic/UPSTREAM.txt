@@ -1,137 +1,116 @@
-Source: https://github.com/lioncash/dynarmic
-Revision: a41c380246d3d9f9874f0f792d234dc0cc17c180
-License: 0BSD (LICENSE.txt), with GPL-3.0-or-later additions identified in source
-headers; bundled dependencies retain their own licenses.
+Dynarmic is vendored with its bundled dependencies. nixe-cpu-jit builds it
+for A64 guests. The license is 0BSD (LICENSE.txt), with GPL-3.0-or-later
+additions identified in source headers, including the register allocator
+additions and the A64 PAuth and LSE translators. Bundled dependencies retain
+their own licenses.
 
-Vendored source including bundled dependencies. Built for A64 by nixe-cpu-jit.
+Nixe adaptations
 
-Nixe adaptations:
-- A64 x64 memory callbacks can abort terminal host failures without retaining
-  precise recoverable guest state across every ordinary access. The bridge
-  uses Lichii's normal memory policy independently of extended ARM ISA selection;
-  callback guards preserve immediate cancellation/failure exit. Recoverable
-  precise-memory-abort configurations remain supported by the vendor interface.
-- backend/x64/a64_emit_x64: omit halt checks on forward links in no-cycle mode,
-  following Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160, with an additional
-  compile-time code-page boundary check to bound unchecked forward chains.
-  Backward/indirect exits and page crossings retain checks; no runtime budget
-  counter is added. Cycle-counted and single-step paths keep their contracts.
-- backend/x64/{a64_emit_x64,emit_x64,emit_x64_data_processing,block_of_code}:
-  reuse adjacent arithmetic NZCV and final check-bit host flags in no-cycle
-  mode, following Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Keep committed
-  guest flags, carry polarity and conservative immediate/callback boundaries.
-  Emission-position proofs never cross blocks; verbose instrumentation and
-  cycle-counted terminals retain explicit check-bit storage.
+- On x64, A64 memory callbacks can terminate execution on a host failure
+  without retaining precise recoverable guest state at every ordinary access.
+  The native bridge selects the memory policy independently of ARM ISA
+  extensions. Callback guards exit immediately on cancellation or failure.
+  The configuration interface also supports precise recoverable memory aborts.
+- backend/x64/a64_emit_x64 omits halt checks on forward links within a code
+  page when cycle counting is disabled. The emitter checks the page boundary
+  at compile time. Backward links, indirect exits and page crossings keep
+  their halt checks. Cycle-counted and single-step execution retain theirs.
+- backend/x64/{a64_emit_x64,emit_x64,emit_x64_data_processing,block_of_code}
+  reuses host flags from adjacent arithmetic operations for NZCV and from
+  the final check-bit operation in no-cycle mode. The emitter preserves
+  committed guest flags and carry polarity. It checks emission positions
+  within a single block and treats immediates and callbacks conservatively.
+  Verbose instrumentation and cycle-counted terminals store check bits explicitly.
 - backend/{code_cache_hash,block_range_information}, backend/x64/{emit_x64,
-  a64_emit_x64}, and ARM64-host descriptor owners: mix the full PC/context key
-  for robin maps/sets, including incoming references, invalidation and fastmem
-  markers. Follows the postmix decision of Lichii's boost flat containers at
-  646b5d17135a2b2701ccc7a959afd0bbbf2f6160, using the existing mcl XMRX mixer.
-  Standard hashes are unchanged for clients whose containers already mix.
-- backend/x64/a64_emit_x64: use a cache-line-aligned 2^16-entry, four-way fast
-  dispatch table with full tags and FIFO insertion, following Lichii
-  646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Publish after C++ lookup so capacity
-  clears cannot discard a just-inserted tag. Retire only exact tags in all ways.
-  A64's software return stack has 32 entries; entry lookup, push/pop masks,
-  state offsets and invalidation resets derive from the same owning state.
-- backend/x64/{a64_emit_x64,emit_x64_data_processing,emit_x64_memory}: fold
-  single-use scalar base+displacement additions into unchecked fastmem operands,
-  following Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160. The emission marker
-  is stored directly on IR instructions instead of a hash index. Preserve full
-  callback addresses, inverse/base restoration, store aliases, precise memory
-  aborts and deoptimization. Recovery and fault trampolines use the cold region.
-- Diagnostic builds only: count generated dispatch hits/misses and RSB hits;
-  record disjoint near/cold emitted bytes alongside the existing compilation
-  phases. No generated diagnostic instruction or field is present in normal builds.
-- backend/x64/{block_of_code,a64_emit_x64,emit_x64_memory}: shared compact
-  A64 exit stubs and a separate cold region following Lichii
-  646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Reserve its final-quarter share
-  normally, or seven-sixteenths when precise memory-abort recovery enlarges
-  every access stub. The total allocation stays unchanged. Preserve reusable inline deferred
-  captures, per-transition halt checks, precise fault metadata and epoch ownership.
-  Bound both write fronts independently, commit/protect both on Windows and
-  describe actual disjoint regions in symbols and disassembly.
-- The native bridge assumes valid commercial-software guest addresses and
-  omits fastmem-width checks, following Lichii's Auto policy at
-  646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Real arena/page-table sizes,
-  page permissions and coherent fault handling are unchanged. Document the
-  simplification at the configuration boundary; other native configurations
-  retain their bounded fastmem policy.
-- backend/x64/{emit_x64,emit_x64_data_processing,a64_emit_x64}: omit redundant
-  U32-to-U64 normalization for the verified producer set used by Lichii
-  646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Widening aliases require a GPR;
-  partial-width spill slots are normalized before any 64-bit use. A64 enables
-  the policy through its owning code buffer; A32 retains normal emission.
-- backend/x64/reg_alloc: preserve evicted values in eligible free callee-saved
-  GPRs and copy writable live operands into free registers before spilling,
-  following Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Precompute the
-  ABI/admission spill-candidate mask once; retain direct IR allocation locations
-  and scope-local release tracking. A64 options are enabled in the native bridge;
-  other frontends retain their policy. Imported algorithm additions retain the
-  reference's GPL-3.0-or-later notices.
-- backend/block_range_information: append compiled guest extents to a contiguous
-  vector and retire intersecting entries on invalidation, following Lichii
-  646b5d17135a2b2701ccc7a959afd0bbbf2f6160. Keep separate compilation contexts
-  and inclusive u32/u64 endpoints, and reuse capacity across cache clears. Use
-  the existing invalidation interval set's logarithmic overlap lookup rather
-  than scanning every invalidated interval for every recorded block.
-  ARM64-host address spaces also clear their A32/A64 extent records through
-  the virtual cache-clear boundary, including capacity-triggered resets in
-  the base emitter. This closes a lifecycle omission present in the reference;
-  x64 already clears its extent owner at both reset boundaries.
+  a64_emit_x64} and the ARM64-host descriptor owners use the mcl XMRX mixer
+  on the full PC/context key for robin maps and sets. This covers incoming
+  block references, invalidation and fastmem markers. Containers that already
+  mix their hashes use the standard hashes.
+- backend/x64/a64_emit_x64 uses a cache-line-aligned, four-way fast dispatch
+  table with 2^16 entries, full tags and FIFO insertion. It publishes the tag
+  after the C++ lookup, which can clear the cache on capacity exhaustion.
+  Invalidation retires exact tag matches across all four ways. A64's 32-entry
+  software return stack supplies the bounds for entry lookup, push/pop masks,
+  state offsets and invalidation resets.
+- backend/x64/{a64_emit_x64,emit_x64_data_processing,emit_x64_memory} folds
+  single-use scalar base-plus-displacement additions into unchecked fastmem
+  operands. IR instructions carry their own emission markers. The emitter
+  preserves full callback addresses, inverse/base restoration, store aliases,
+  precise memory aborts and deoptimization. Recovery and fault trampolines use
+  the cold code region.
+- Diagnostic builds count generated dispatch hits and misses, return-stack
+  hits, and the bytes emitted in the near and cold regions separately.
+- backend/x64/{block_of_code,a64_emit_x64,emit_x64_memory} shares compact
+  A64 exit stubs. The cold region uses the final quarter of the existing
+  allocation, or seven-sixteenths when precise memory-abort recovery needs
+  larger stubs. Each region has its own write bound, Windows memory
+  commitment and protection, and symbol and disassembly coverage. Deferred
+  captures remain reusable inline. Stubs preserve per-transition halt checks,
+  precise fault metadata and epoch ownership.
+- The native bridge assumes valid guest addresses in commercial games and
+  omits fastmem-width checks. Arena and page-table bounds, page permissions
+  and coherent fault handling still apply. The configuration boundary documents
+  the simplification. Other native configurations can use bounded fastmem.
+- backend/x64/{emit_x64,emit_x64_data_processing,a64_emit_x64} omits redundant
+  U32-to-U64 normalization for producers known to clear the upper bits.
+  Widening aliases require a general-purpose register. Partial-width spill
+  slots are normalized before 64-bit use. A64 selects the policy through its
+  code buffer. A32 uses its normal emission path.
+- backend/x64/reg_alloc preserves evicted values in free callee-saved registers
+  where the ABI allows it. It copies writable live operands into free registers
+  before spilling. The allocator computes the ABI and admission spill-candidate
+  mask once, records allocation locations on the IR and tracks releases per
+  scope. The native bridge enables these options for A64.
+- backend/block_range_information stores compiled guest extents in a contiguous
+  vector. Invalidation uses the interval set's logarithmic overlap lookup to
+  retire intersecting entries. Extents retain their compilation context and
+  inclusive u32/u64 endpoints. Cache clears reuse the vector's capacity. Both
+  x64 and ARM64 hosts clear extent records on explicit and capacity-triggered
+  resets. On ARM64 the virtual cache-clear boundary covers both A32 and A64.
 - backend/x64/{perf_map,emit_x64,a32_emit_x64_memory,a64_emit_x64_memory,
-  block_of_code}: cache PERF_BUILDID_DIR enablement once, and skip friendly-name
-  formatting and the process-wide map mutex when disabled. Follows Lichii
-  646b5d17135a2b2701ccc7a959afd0bbbf2f6160's PerfMapEnabled decision.
-  Retain range-scoped symbol ownership as in its JitSymbols interface: Linux
-  keeps live entries and rebuilds the perf map only when a cache range retires,
-  preserving other JITs and the owner's prelude. New code allocations retire
-  prior names in reused host addresses; teardown retains the last map for
-  postmortem sampling. Non-Linux symbol operations remain inline
-  no-ops; generated guest code and cache invalidation semantics are unchanged.
-- Diagnostic builds only (DYNARMIC_JIT_DIAGNOSTICS, selected by the Rust
-  performance-counters feature): owner-written per-JIT lookup/compile counters,
-  instruction-input fingerprints, phase timings, native mainline/deferred byte
-  counts, and distinct capacity/requested/targeted/fastmem invalidation events.
-  Follows Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160's per-JIT counter
-  ownership; buffered event/epoch analysis is implemented by the native bridge
-  and offline tools. Production builds contain no diagnostic fields, counters,
-  clocks or callbacks. Instruction fingerprints are not used for cache validity.
-- backend/exception_handler{.h,_posix.cpp}: expose cold fault resolution and
-  allow nixe to own POSIX signal capture (DYNARMIC_EXTERNAL_FAULT_HANDLER).
-- backend/x64/a64_emit_x64.cpp: check halt/budget at linked and indirect/return
-  transitions so scheduler preemption and memory transitions remain bounded.
-- frontend/A64/translate/impl/sys_dc.cpp: end blocks after cache operations;
-  nixe applies ownership transitions after dropping its execution lease.
-- ir/opt/a64_get_set_elimination_pass.cpp, ir/opt/passes.h and
-  both A64 backends: retain setters visible at memory-abort exits
-  while still forwarding register values and eliminating redundant accesses.
-- interface/A64/config.h, frontend/A64/translate and both A64 backends:
-  optionally stop at unknown extension HINTs instead of silently dropping their
-  semantics on newer guest CPUs.
-- A64 PAuth decoding/translation: simplified unsigned-pointer model matching
-  Lichii 646b5d17135a2b2701ccc7a959afd0bbbf2f6160. PAC/AUT/XPAC emit no work;
-  PACGA uses masked XOR; authenticated branches and loads use plain addresses.
-  The translator retains the GPL-3.0-or-later notice and marks this semantic
-  approximation @SIMPLIFICATION and @SPECULATIVE. Selection happens at translation time. Removed
-  the superseded process keys, QARMA helper/license, IR opcode, host emitters and
-  PAuth-specific execution-address checks in host entry/dispatch/return paths.
-  Ordinary code-fetch and memory permission checks remain unchanged.
-- frontend/A64/translate/impl/load_store_atomic.cpp: LSE atomic operations
-  adapted from Lichii revision 21d62e43caa178aeb04e74585b3aad622b278b84
-  (src/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_atomic.cpp).
-  The file retains its GPL-3.0-or-later notice. CPU feature selection enables
-  LSE at translation time; exclusive IR implements CAS/CASP, SWP and atomic ALU
-  operations, including acquire/release and retries without partial register
-  updates. LDAPR uses the existing limited-order acquire memory operations,
-  gated by the RCpc CPU feature. A64CheckMemoryAlignment in both host backends
-  faults before a misaligned atomic operation; precise memory exits preserve
-  earlier setters.
+  block_of_code} checks PERF_BUILDID_DIR once. When disabled, it skips symbol
+  name formatting and the process-wide map mutex. Linux tracks live symbols
+  by code range and rebuilds the perf map when a range retires, preserving
+  other JITs and the owner's prelude. New allocations retire old names at
+  reused addresses. Teardown retains the last map for postmortem sampling.
+  Non-Linux symbol operations compile to inline no-ops.
+- DYNARMIC_JIT_DIAGNOSTICS, enabled by the Rust performance-counters feature,
+  records per-JIT lookup and compilation counters, instruction fingerprints,
+  phase timings, and mainline and deferred code sizes. It distinguishes
+  capacity resets, requested clears, targeted invalidations and fastmem
+  invalidations. The native bridge buffers events for offline epoch analysis.
+  Production builds omit the diagnostic fields, counters, clocks and callbacks.
+  Fingerprints are diagnostic only.
+- backend/exception_handler{.h,_posix.cpp} exposes cold fault resolution.
+  DYNARMIC_EXTERNAL_FAULT_HANDLER lets Nixe own POSIX signal capture.
+- backend/x64/a64_emit_x64.cpp checks halt and budget conditions at linked,
+  indirect and return transitions to bound scheduler preemption and memory
+  transitions.
+- frontend/A64/translate/impl/sys_dc.cpp ends blocks after cache operations.
+  Nixe applies ownership transitions after releasing its execution lease.
+- ir/opt/a64_get_set_elimination_pass.cpp, ir/opt/passes.h and both A64
+  backends retain register setters visible at memory-abort exits while
+  forwarding register values and eliminating redundant accesses.
+- interface/A64/config.h, frontend/A64/translate and both A64 backends can
+  stop at unknown extension HINTs on newer guest CPUs.
+- A64 pointer authentication uses an unsigned-pointer model selected at
+  translation time. PAC, AUT and XPAC emit no host instructions. PACGA uses
+  masked XOR. Authenticated branches and loads use plain addresses. This
+  removes per-process keys, the QARMA helper, the PAuth IR opcode, its host
+  emitters and PAuth-specific address checks at entry, dispatch and return.
+  Code fetches and memory accesses retain their ordinary permission checks.
+  The translator marks the approximation @SIMPLIFICATION and @SPECULATIVE.
+- frontend/A64/translate/impl/load_store_atomic.cpp selects LSE operations at
+  translation time. Exclusive IR implements CAS/CASP, SWP and atomic ALU
+  operations with acquire/release ordering and retries without partial register
+  updates. With RCpc enabled, LDAPR uses limited-order acquire operations.
+  A64CheckMemoryAlignment in both host backends faults before a misaligned
+  atomic operation. Precise memory exits preserve earlier register setters.
 
-The native bridge selects Lichii's per-JIT code-cache policy: 512 MiB on x64
-except Solaris/NetBSD/DragonFly/OpenBSD; the 128 MiB vendor default remains on
-other hosts. Allocation, demand residency, full/targeted invalidation and
-per-JIT executable ownership use the existing backend, without code sharing.
+The native bridge allocates a 512 MiB code cache per JIT on x64 except on
+Solaris, NetBSD, DragonFly and OpenBSD. Those systems and other hosts use
+128 MiB. Each JIT owns its executable allocation. The backend manages demand
+residency and both full and targeted invalidation.
 
-The Rust/C ABI integration is in crates/cpu-jit. The generic native fault
-capture implementation is shared with the interpreter in cpu-direct-memory.
+The Rust/C ABI integration lives in crates/cpu-jit. The interpreter and the JIT
+share native fault capture through cpu-direct-memory.

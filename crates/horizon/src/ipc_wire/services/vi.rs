@@ -1,4 +1,5 @@
 use super::prelude::*;
+use crate::graphics::LayerKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApplicationDisplayCommand {
@@ -238,7 +239,7 @@ pub(in crate::ipc_wire) async fn dispatch_vi(
                     let Some(display_id) = request_u64(request.data, 8) else {
                         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                     };
-                    let Some(layer) = video.create_layer(display_id) else {
+                    let Some(layer) = video.create_layer(display_id, LayerKind::Stray) else {
                         return cmif_error(
                             request.token,
                             HorizonIpcResult::SF_PRECONDITION_VIOLATION,
@@ -437,7 +438,12 @@ pub(in crate::ipc_wire) async fn dispatch_vi(
                     let Some(display_id) = request_u64(request.data, 8) else {
                         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                     };
-                    let Some(layer) = video.create_layer(display_id) else {
+                    let kind = if command == ManagerDisplayCommand::CreateStray {
+                        LayerKind::Stray
+                    } else {
+                        LayerKind::Managed
+                    };
+                    let Some(layer) = video.create_layer(display_id, kind) else {
                         return cmif_error(
                             request.token,
                             HorizonIpcResult::SF_PRECONDITION_VIOLATION,

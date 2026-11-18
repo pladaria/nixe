@@ -29,9 +29,11 @@ pub trait OwnerMemory {
         &mut self,
         regions: &[crate::native::GuestBufferRange],
     ) -> Result<(), Arc<nixe_memory::MemoryError>>;
-    fn inline_memory(
+    /// Preserve GPU-owned texels outside a partial inline RAM write before it lands.
+    fn prepare_inline_write(
         &mut self,
-        regions: &[crate::native::GuestBufferRange],
+        address: u64,
+        bytes: u64,
     ) -> Result<(), Arc<nixe_memory::MemoryError>>;
     fn access_memory(
         &mut self,

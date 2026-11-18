@@ -894,13 +894,14 @@ impl nixe_gpu::OwnerMemory for NativeGpuExecution {
             .write_regions(regions)
             .map_err(|error| owner_memory_error(runtime(error)))
     }
-    fn inline_memory(
+    fn prepare_inline_write(
         &mut self,
-        regions: &[GuestBufferRange],
+        address: u64,
+        bytes: u64,
     ) -> Result<(), Arc<nixe_memory::MemoryError>> {
         self.residency
             .access()
-            .write_regions(regions)
+            .prepare_inline_write(address, bytes)
             .map_err(|error| owner_memory_error(runtime(error)))
     }
     fn access_memory(

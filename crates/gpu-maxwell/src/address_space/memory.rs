@@ -470,7 +470,7 @@ impl MaxwellGpuMemory {
         source: nixe_memory::WriteSource<'_>,
     ) -> Result<(), MaxwellGpuAccessError> {
         let bytes = source.len() as u64;
-        self.write_upload(address, source)?;
+        self.write_upload(address, source, |_, _| Ok(()))?;
         if bytes != 0 {
             self.invalidations.add(address.get(), bytes);
         }
@@ -500,17 +500,29 @@ impl MaxwellGpuMemory {
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<(), MaxwellGpuAccessError> {
         let bytes = source.len() as u64;
-        self.write_upload(address, source)?;
+        self.write_upload(address, source, |device, count| {
+            if self
+                .device_memory()
+                .device()
+                .may_be_gpu_written(device, count)
+            {
+                access
+                    .prepare_inline_write(device, count)
+                    .map_err(MaxwellGpuAccessError::Backing)?;
+            }
+            Ok(())
+        })?;
         let mut regions = Vec::new();
         Self::submapped_ranges(&self.inner.table, address.get(), bytes, &mut regions);
         access
-            .inline_memory(&regions)
+            .invalidate_regions(&regions)
             .map_err(MaxwellGpuAccessError::Backing)
     }
     fn write_upload(
         &self,
         address: GpuVirtualAddress,
         source: nixe_memory::WriteSource<'_>,
+        mut before_store: impl FnMut(u64, u64) -> Result<(), MaxwellGpuAccessError>,
     ) -> Result<(), MaxwellGpuAccessError> {
         self.validate_resolution_request(address)?;
         if source.is_empty() {
@@ -538,6 +550,7 @@ impl MaxwellGpuMemory {
                         .finish_read(device, count)
                         .map_err(MaxwellGpuAccessError::Backing)?;
                 }
+                before_store(device, count)?;
                 let begin = (at - address.get()) as usize;
                 let source = source.slice(begin..begin + count as usize);
                 let device_memory = self.device_memory().device();

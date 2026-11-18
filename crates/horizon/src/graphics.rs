@@ -154,18 +154,36 @@ pub struct ViSession {
     client: Arc<Mutex<ViClient>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ViClient {
+    video: Weak<Mutex<VideoState>>,
     opened_layers: BTreeSet<u64>,
     vsync_event: Option<Arc<ViVsyncEvent>>,
+}
+
+impl Drop for ViClient {
+    fn drop(&mut self) {
+        if !self.opened_layers.is_empty()
+            && let Some(video) = self.video.upgrade()
+        {
+            let mut state = video.lock().unwrap();
+            for &id in &self.opened_layers {
+                state.detach_layer(id);
+            }
+        }
+    }
 }
 
 impl ViSession {
     pub(crate) fn new(kind: ViObjectKind, video: VideoSystem) -> Self {
         Self {
             kind,
+            client: Arc::new(Mutex::new(ViClient {
+                video: Arc::downgrade(&video.state),
+                opened_layers: BTreeSet::new(),
+                vsync_event: None,
+            })),
             video,
-            client: Arc::default(),
         }
     }
 
@@ -197,42 +215,24 @@ impl ViSession {
     }
 
     pub(crate) fn open_layer(&self, layer_id: u64) -> Option<LayerState> {
-        let layer = self.video.layer(layer_id)?;
-        self.client
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .opened_layers
-            .insert(layer_id)
-            .then_some(layer)
+        let mut client = self.client.lock().unwrap();
+        let mut state = self.video.state.lock().unwrap();
+        let layer = state.layers.get(&layer_id)?.clone();
+        let queue = state.queues[&layer.binder_id].clone();
+        let std::collections::btree_map::Entry::Vacant(entry) =
+            state.display_stack.entry(layer.binder_id)
+        else {
+            return None;
+        };
+        entry.insert(queue);
+        client.opened_layers.insert(layer_id);
+        Some(layer)
     }
 
-    // Close the application connection, not the AM/manager-owned layer.
-    // The Binder producer retains its identity across a resolution change.
-    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/vi/application_display_service.cpp
-    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/vi/container.cpp
     pub(crate) fn close_layer(&self, layer_id: u64) -> bool {
-        if !self
-            .client
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .opened_layers
-            .remove(&layer_id)
-        {
-            return false;
-        }
-        let mut state = self
-            .video
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(layer) = state.layers.get(&layer_id) else {
-            return false;
-        };
-        let binder_id = layer.binder_id;
-        if let Some(queue) = state.queues.get_mut(&binder_id) {
-            queue.lock().unwrap().abandon();
-        }
-        true
+        let mut client = self.client.lock().unwrap();
+        client.opened_layers.remove(&layer_id)
+            && self.video.state.lock().unwrap().detach_layer(layer_id)
     }
 }
 
@@ -242,7 +242,6 @@ pub(crate) struct LayerState {
     pub(crate) binder_id: i32,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) visible: bool,
     pub(crate) scaling_mode: u32,
     pub(crate) x: f32,
     pub(crate) y: f32,
@@ -254,12 +253,35 @@ struct VideoState {
     next_layer_id: u64,
     layers: BTreeMap<u64, LayerState>,
     queues: BTreeMap<i32, Arc<Mutex<BufferQueue>>>,
+    display_stack: BTreeMap<i32, Arc<Mutex<BufferQueue>>>,
     vsync_events: BTreeMap<usize, WritableEventObject>,
     presenter: Option<FrameMailbox>,
     nvdrv: NvDrvSession,
     next_frame_sequence: u64,
     composition_frame: u64,
     pending_composites: Vec<std::sync::mpsc::Receiver<Result<(), Box<str>>>>,
+}
+
+impl VideoState {
+    // Closing a VI layer detaches its consumer and releases the latched buffer.
+    // The producer and its queued buffers belong to the lifetime of the layer.
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/vi/container.cpp
+    fn detach_layer(&mut self, id: u64) -> bool {
+        let Some(layer) = self.layers.get(&id) else {
+            return false;
+        };
+        let Some(queue) = self.display_stack.remove(&layer.binder_id) else {
+            return false;
+        };
+        queue.lock().unwrap().release_acquired();
+        true
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayerKind {
+    Managed,
+    Stray,
 }
 
 /// Cloneable process display state shared across independently opened services.
@@ -322,6 +344,7 @@ impl VideoSystem {
                 next_layer_id: 1,
                 layers: BTreeMap::new(),
                 queues: BTreeMap::new(),
+                display_stack: BTreeMap::new(),
                 vsync_events: BTreeMap::new(),
                 presenter,
                 nvdrv,
@@ -395,6 +418,7 @@ impl VideoSystem {
             device_fds_released: nvdrv.device_fds_released,
             allocations_released: nvdrv.allocations_released,
         };
+        state.display_stack.clear();
         state.layers.clear();
         for queue in state.queues.values() {
             queue.lock().unwrap().abandon();
@@ -431,7 +455,7 @@ impl VideoSystem {
         }
     }
 
-    pub(crate) fn create_layer(&self, display_id: u64) -> Option<LayerState> {
+    pub(crate) fn create_layer(&self, display_id: u64, kind: LayerKind) -> Option<LayerState> {
         Self::display_resolution(display_id)?;
         let mut state = self
             .state
@@ -445,27 +469,18 @@ impl VideoSystem {
             binder_id,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
-            visible: true,
             scaling_mode: 0,
             x: 0.0,
             y: 0.0,
             z: 0,
         };
         state.layers.insert(id, layer.clone());
-        state.queues.insert(
-            binder_id,
-            Arc::new(Mutex::new(BufferQueue::new(&self.kernel, binder_id))),
-        );
+        let queue = Arc::new(Mutex::new(BufferQueue::new(&self.kernel, binder_id)));
+        if kind == LayerKind::Stray {
+            state.display_stack.insert(binder_id, queue.clone());
+        }
+        state.queues.insert(binder_id, queue);
         Some(layer)
-    }
-
-    pub(crate) fn layer(&self, layer_id: u64) -> Option<LayerState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .layers
-            .get(&layer_id)
-            .cloned()
     }
 
     pub(crate) fn remove_layer(&self, layer_id: u64) -> bool {
@@ -476,6 +491,7 @@ impl VideoSystem {
         let Some(layer) = state.layers.remove(&layer_id) else {
             return false;
         };
+        state.display_stack.remove(&layer.binder_id);
         if let Some(queue) = state.queues.remove(&layer.binder_id) {
             queue.lock().unwrap().abandon();
         }
@@ -697,7 +713,7 @@ impl VideoSystem {
     }
 
     fn poll_composite_registration(state: &mut VideoState) -> Result<bool, FramebufferError> {
-        if !state.layers.values().any(|layer| layer.visible) {
+        if state.display_stack.is_empty() {
             return Ok(true);
         }
         // Bound in-flight compositions by the previous sync registration;
@@ -722,7 +738,7 @@ impl VideoSystem {
         registration: &Waker,
         vsync: std::time::Instant,
     ) -> Result<(), FramebufferError> {
-        if !state.layers.values().any(|layer| layer.visible) {
+        if state.display_stack.is_empty() {
             for event in state.vsync_events.values() {
                 event.signal();
             }
@@ -730,7 +746,7 @@ impl VideoSystem {
         }
         let display_sequence = state.composition_frame.saturating_add(1);
         let VideoState {
-            queues,
+            display_stack,
             nvdrv,
             presenter,
             next_frame_sequence,
@@ -738,7 +754,7 @@ impl VideoSystem {
             pending_composites,
             ..
         } = state;
-        for (&binder_id, queue) in &*queues {
+        for (&binder_id, queue) in &*display_stack {
             let mut queue = queue.lock().unwrap();
             if queue.acquired.is_some() {
                 continue;
@@ -807,8 +823,12 @@ impl VideoSystem {
         // Release against the advanced counter in this composition, as Eden
         // does, so interval1 does not occupy a producer slot for another tick.
         // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/service/nvnflinger/hardware_composer.cpp#L165-L175
-        for (&binder_id, queue) in queues {
-            if let Some(slot) = queue.lock().unwrap().release_acquired(*composition_frame) {
+        for (&binder_id, queue) in display_stack {
+            if let Some(slot) = queue
+                .lock()
+                .unwrap()
+                .release_acquired_if_due(*composition_frame)
+            {
                 nixe_memory::trace::event(
                     "buffer_release",
                     ((binder_id as u32 as u64) << 32) | slot as u32 as u64,
@@ -1488,12 +1508,16 @@ impl BufferQueue {
         self.signal_dequeue_condition();
         Ok(())
     }
-    fn release_acquired(&mut self, frame: u64) -> Option<i32> {
+    fn release_acquired_if_due(&mut self, frame: u64) -> Option<i32> {
         let acquired = self.acquired.as_ref()?;
         if acquired.release_frame > frame {
             return None;
         }
-        let slot_index = self.acquired.take().unwrap().slot;
+        self.release_acquired()
+    }
+
+    fn release_acquired(&mut self) -> Option<i32> {
+        let slot_index = self.acquired.take()?.slot;
         let slot = self
             .slots
             .get_mut(&slot_index)
@@ -1924,4 +1948,39 @@ pub(crate) fn encode_native_window(binder_id: i32) -> Vec<u8> {
     // The sole object table entry at 0x38 is zero: the payload-relative offset
     // of the flattened Binder handle. All reserved fields remain zero.
     parcel
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_layer_reopens_with_the_same_live_buffer_queue() {
+        let video = VideoSystem::new(crate::test_memory::machine(), &crate::test_memory::kernel());
+        let layer = video
+            .create_layer(DEFAULT_DISPLAY_ID, LayerKind::Managed)
+            .unwrap();
+        let first = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
+        let second = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
+
+        first.open_layer(layer.id).unwrap();
+        let queue = video.state.lock().unwrap().display_stack[&layer.binder_id].clone();
+        assert!(second.open_layer(layer.id).is_none());
+        assert!(!second.close_layer(layer.id));
+        assert!(first.close_layer(layer.id));
+        assert!(video.state.lock().unwrap().display_stack.is_empty());
+
+        let reopened = second.open_layer(layer.id).unwrap();
+        assert_eq!(reopened.binder_id, layer.binder_id);
+        assert!(Arc::ptr_eq(
+            &queue,
+            &video.state.lock().unwrap().display_stack[&reopened.binder_id],
+        ));
+        assert!(!queue.lock().unwrap().abandoned);
+        drop(second);
+        first.open_layer(layer.id).unwrap();
+        assert!(video.remove_layer(layer.id));
+        assert!(queue.lock().unwrap().abandoned);
+        assert!(video.state.lock().unwrap().display_stack.is_empty());
+    }
 }

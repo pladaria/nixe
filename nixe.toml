@@ -55,6 +55,9 @@ timezone = "Europe/Madrid"
 # fixed_unix_timestamp = 0
 
 [diagnostics]
+# Count guest NVN API calls and write dump/nvn/<title>/<timestamp>-calls.csv on exit.
+# Disabled by default. Enable for diagnostics on either console generation.
+count_nvn_calls = true
 # Minimum severity emitted by the CLI logger.
 log_level = "debug"
 # Preserve each Horizon guest log packet's severity. A concrete level forces

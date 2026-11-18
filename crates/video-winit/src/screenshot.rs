@@ -145,7 +145,7 @@ fn save_png(path: &Path, dimensions: (u32, u32), bytes: &[u8]) -> io::Result<()>
     result
 }
 
-fn filename_title(title: &str) -> String {
+pub fn filename_title(title: &str) -> String {
     let mut name = String::new();
     for c in title.chars().flat_map(char::to_lowercase) {
         let c = if c.is_alphanumeric() || c == '_' {

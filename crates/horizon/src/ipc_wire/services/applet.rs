@@ -1,4 +1,5 @@
 use super::prelude::*;
+use crate::graphics::LayerKind;
 
 mod audio;
 mod commands;
@@ -465,7 +466,7 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                     }
                     let video_system =
                         graphics.require_video("ISelfController", request.command_id)?;
-                    let Some(layer) = video_system.create_layer(1) else {
+                    let Some(layer) = video_system.create_layer(1, LayerKind::Managed) else {
                         return applet_error(
                             request.token,
                             HorizonIpcResult::SF_PRECONDITION_VIOLATION,
@@ -477,7 +478,7 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                     // https://switchbrew.org/wiki/AM_services#CreateManagedDisplaySeparableLayer
                     let mut data = layer.id.to_le_bytes().to_vec();
                     if command == SelfControllerCommand::CreateManagedDisplaySeparableLayer {
-                        let recording = video_system.create_layer(1).ok_or(
+                        let recording = video_system.create_layer(1, LayerKind::Managed).ok_or(
                             IpcWireError::HostResourceExhausted(
                                 "creating the recording display layer",
                             ),

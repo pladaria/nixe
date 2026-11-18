@@ -35,9 +35,10 @@ impl nixe_gpu::OwnerMemory for RamAccess {
     ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
         Ok(())
     }
-    fn inline_memory(
+    fn prepare_inline_write(
         &mut self,
-        _: &[nixe_gpu::native::GuestBufferRange],
+        _: u64,
+        _: u64,
     ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
         Ok(())
     }
@@ -83,9 +84,10 @@ where
     ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
         Ok(())
     }
-    fn inline_memory(
+    fn prepare_inline_write(
         &mut self,
-        _: &[nixe_gpu::native::GuestBufferRange],
+        _: u64,
+        _: u64,
     ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
         Ok(())
     }
@@ -116,9 +118,10 @@ impl nixe_gpu::OwnerMemory for PhysicalAccess {
     ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
         Ok(())
     }
-    fn inline_memory(
+    fn prepare_inline_write(
         &mut self,
-        _: &[nixe_gpu::native::GuestBufferRange],
+        _: u64,
+        _: u64,
     ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
         Ok(())
     }
@@ -167,9 +170,10 @@ impl<G: FnMut(u64, u64) -> Result<(), std::sync::Arc<MemoryError>>> nixe_gpu::Ow
     ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
         Ok(())
     }
-    fn inline_memory(
+    fn prepare_inline_write(
         &mut self,
-        _: &[nixe_gpu::native::GuestBufferRange],
+        _: u64,
+        _: u64,
     ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
         Ok(())
     }

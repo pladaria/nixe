@@ -172,6 +172,7 @@ impl NixeConfig {
             diagnostics: DiagnosticsConfig {
                 log_level: raw.diagnostics.log_level,
                 guest_logs_level: raw.diagnostics.guest_logs_level,
+                count_nvn_calls: raw.diagnostics.count_nvn_calls,
                 file_system_access_log: raw.diagnostics.file_system_access_log,
             },
             gpu,
@@ -320,6 +321,8 @@ pub struct DiagnosticsConfig {
     pub log_level: DiagnosticLogLevel,
     /// Host severity policy applied to logs emitted by Horizon guests.
     pub guest_logs_level: GuestLogsLevel,
+    /// Collect guest NVN calls in first-invocation order.
+    pub count_nvn_calls: bool,
     /// Requests filesystem access logs from the guest SDK.
     pub file_system_access_log: bool,
 }
@@ -602,6 +605,8 @@ struct RawDiagnosticsConfig {
     guest_logs_level: GuestLogsLevel,
     #[serde(default)]
     file_system_access_log: bool,
+    #[serde(default)]
+    count_nvn_calls: bool,
 }
 
 const fn default_follow_symlinks() -> bool {
@@ -880,6 +885,7 @@ mod tests {
         assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Info);
         assert_eq!(config.diagnostics.guest_logs_level, GuestLogsLevel::Inherit);
         assert!(!config.diagnostics.file_system_access_log);
+        assert!(!config.diagnostics.count_nvn_calls);
         assert_eq!(
             config.gpu,
             GpuConfig {
@@ -942,11 +948,13 @@ mod tests {
                 [diagnostics]
                 guest_logs_level = "warn"
                 file_system_access_log = true
+                count_nvn_calls = true
             "#,
         );
         let config = NixeConfig::load(&explicit.path).unwrap();
         assert_eq!(config.diagnostics.guest_logs_level, GuestLogsLevel::Warn);
         assert!(config.diagnostics.file_system_access_log);
+        assert!(config.diagnostics.count_nvn_calls);
 
         for level in ["inherit", "trace", "debug", "info", "warn", "error", "off"] {
             let file = TemporaryConfig::new(&format!(

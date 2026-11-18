@@ -46,6 +46,7 @@ pub use machine::{Runtime, RuntimeError};
 pub use module_memory::{InstallStage, ModuleInstallError, install_prepared_module};
 pub use nixe_scheduler::{ProcessLifecycle, ThreadLifecycle};
 pub use nixe_scheduler::{VirtualClock, VirtualClockMode};
+pub use process::nvn::NvnCallReport;
 pub use process::{
     ExecutionReport, ExecutionStop, GuestStackFrame, ProcessAddressSpace, ProcessBuildConfig,
     ProcessBuildError, ProcessBuildStage, ProcessBuilder, ProcessExit, ProcessExitCause,

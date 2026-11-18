@@ -5,6 +5,7 @@ pub struct ProcessBuilder {
     config: ProcessBuildConfig,
     kernel: Arc<nixe_scheduler::SchedulerState>,
     sd_card_root: Option<PathBuf>,
+    count_nvn_calls: bool,
     machine: nixe_memory::Machine,
     system: nixe_memory::MemoryAccount,
 }
@@ -34,6 +35,7 @@ impl ProcessBuilder {
             config: ProcessBuildConfig::default(),
             kernel,
             sd_card_root: None,
+            count_nvn_calls: false,
             machine,
             system,
         }
@@ -42,6 +44,12 @@ impl ProcessBuilder {
     #[must_use]
     pub const fn with_config(mut self, config: ProcessBuildConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_nvn_call_counting(mut self, enabled: bool) -> Self {
+        self.count_nvn_calls = enabled;
         self
     }
 
@@ -109,7 +117,7 @@ impl ProcessBuilder {
         let abi = metadata.abi;
         let random_entropy = generate_process_entropy()?;
         let placements = module_placements(plan, self.config.image_base, address_space)?;
-        let modules = prepare_modules(plan, &placements, address_space)?;
+        let mut modules = prepare_modules(plan, &placements, address_space)?;
         let process_code_start = modules
             .iter()
             .map(PreparedModule::image_base)
@@ -120,6 +128,10 @@ impl ProcessBuilder {
             .map(|module| module.image_base().saturating_add(module.image_extent()))
             .max()
             .ok_or_else(|| error(ProcessBuildStage::Placement, "launch plan has no modules"))?;
+        let nvn = self
+            .count_nvn_calls
+            .then(|| nvn::CallTrace::prepare(plan, &mut modules, process_code_end));
+        let process_code_end = nvn.as_ref().map_or(process_code_end, nvn::CallTrace::end);
         let memory_layout = ProcessMemoryLayout::for_address_space(
             self.config.memory_layout_profile,
             address_space,
@@ -194,6 +206,12 @@ impl ProcessBuilder {
                 matches!(abi, InitialProcessAbi::Homebrew),
             )
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
+        }
+
+        if let Some(trace) = &nvn {
+            trace
+                .install(&memory)
+                .map_err(|e| ProcessBuildError::new(ProcessBuildStage::Mapping, e))?;
         }
 
         let stack_size = align_up(stack_size.max(PAGE_SIZE), PAGE_SIZE)?;
@@ -333,6 +351,7 @@ impl ProcessBuilder {
         )
         .map_err(|error| ProcessBuildError::new(ProcessBuildStage::CpuInitialization, error))?;
         let process = RunnableProcess {
+            nvn,
             scheduler: self.kernel.clone(),
             generation: std::sync::atomic::AtomicU64::new(1),
             active_requests: std::sync::atomic::AtomicUsize::new(0),
@@ -547,7 +566,7 @@ fn prepare_modules(
         .collect()
 }
 
-fn kernel_mapping(
+pub(super) fn kernel_mapping(
     kind: crate::memory::MemoryKind,
     permissions: MemoryPermissions,
 ) -> crate::memory::Mapping {

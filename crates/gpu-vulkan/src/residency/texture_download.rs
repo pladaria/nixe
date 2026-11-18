@@ -346,6 +346,38 @@ impl Residency<'_> {
             .then(|| nixe_gpu::trace::span("read_texture", address, bytes, ids.len() as u64));
         self.download_images(ids)
     }
+    /// An inline upload updates RAM, whereas a dirty image may hold the only
+    /// copy of its other texels. Preserve those texels before the RAM store
+    /// and exclude the store itself from older fence snapshots.
+    pub(crate) fn prepare_inline_write(
+        &mut self,
+        address: u64,
+        bytes: u64,
+    ) -> Result<(), VulkanError> {
+        let memory = self.runtime.device_memory.clone();
+        let mut ranges = RangeSet::from_range(address, bytes);
+        memory.apply_device_aliases(address, bytes, |a, b| ranges.insert(a, b));
+        let physical = || -> Result<RangeSet, VulkanError> {
+            Ok(memory
+                .read_mapping(address, bytes)?
+                .spans()
+                .iter()
+                .map(|span| (span.start.get(), span.bytes))
+                .collect())
+        };
+        if self
+            .texture_cache
+            .downloads
+            .iter()
+            .any(|download| download.images.is_some())
+        {
+            let writes = physical()?;
+            self.texture_cache.supersede_image_downloads(&writes);
+            self.preserve_texture_writes(&ranges, || Ok(writes))
+        } else {
+            self.preserve_texture_writes(&ranges, physical)
+        }
+    }
     pub(super) fn preserve_texture_writes(
         &mut self,
         writes: &RangeSet,

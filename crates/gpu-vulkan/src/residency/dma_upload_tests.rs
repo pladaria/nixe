@@ -312,3 +312,77 @@ fn check_alias(format: ImageFormat) -> Result<(), VulkanError> {
     validation.check()?;
     Ok(())
 }
+
+#[test]
+fn inline_upload_preserves_gpu_texels_and_supersedes_an_earlier_fence() -> Result<(), VulkanError> {
+    let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4096)?.allocate(4096)?;
+    let pixels = AllocationRange::new(allocation.pin(), 0, 4096)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let (image_address, alias) = (0x10000, 0x20000);
+    let _image_map = memory.map(image_address, Arc::from([pixels.clone()]), true)?;
+    let _alias_map = memory.map(alias, Arc::from([pixels]), true)?;
+    let mut cache = VulkanResidency::new(
+        memory.clone(),
+        device,
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let mut r = cache.access();
+    let layout = ImageMemoryLayout::PitchLinear {
+        row_pitch: 256,
+        layer_stride: 4096,
+    };
+    let image = r.insert_guest_image(
+        &info(image_address, ImageFormat::R32Uint, 64, 16, layout),
+        &Space,
+    )?;
+    r.clear_color_image(
+        image,
+        0,
+        vk::ClearColorValue {
+            uint32: [0x41414141, 0, 0, 0],
+        },
+    )?;
+    r.texture_cache
+        .pending_downloads
+        .push(texture_download::PendingDownload::Image(image));
+    r.commit_texture_downloads()?;
+    let fence = r.texture_visibility_work().unwrap();
+
+    let tail = alias + 4092;
+    r.prepare_inline_write(tail, 4)?;
+    memory.write_block_unsafe(tail, WriteSource::Bytes(&[1, 2, 3, 4]))?;
+    r.write_regions(&[nixe_gpu::native::GuestBufferRange {
+        address: tail,
+        size: 4,
+    }])?;
+    let mut prefix = [0u8; 4];
+    memory
+        .reader()
+        .read_block_unsafe(image_address, &mut prefix)?;
+    assert_eq!(
+        prefix, [0x41; 4],
+        "untouched GPU texels must be in RAM before the older fence publishes"
+    );
+    r.flush()?;
+    r.runtime
+        .device
+        .wait_for_work(fence, std::time::Duration::MAX)?;
+    r.texture_cache.pop_async_flush(&mut r.buffer_cache)?;
+
+    let mut result = [0u8; 4096];
+    memory
+        .reader()
+        .read_block_unsafe(image_address, &mut result)?;
+    assert_eq!(result[..4092], [0x41; 4092]);
+    assert_eq!(result[4092..], [1, 2, 3, 4]);
+    drop(r);
+    drop(cache);
+    validation.check()?;
+    Ok(())
+}

@@ -7,6 +7,7 @@ mod keyboard;
 mod native;
 mod overlay;
 mod screenshot;
+pub use screenshot::filename_title;
 mod vulkan;
 use native::Presenter;
 pub use vulkan::with_vulkan_device;

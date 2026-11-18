@@ -129,9 +129,10 @@ impl nixe_gpu::OwnerMemory for MissingGpuExecution {
     ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
         match *self {}
     }
-    fn inline_memory(
+    fn prepare_inline_write(
         &mut self,
-        _: &[nixe_gpu::native::GuestBufferRange],
+        _: u64,
+        _: u64,
     ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
         match *self {}
     }

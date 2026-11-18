@@ -241,6 +241,7 @@ fn run_machine(
         .account(machine_profile.system_memory_capacity())
         .map_err(|error| error.to_string())?;
     let process_builder = ProcessBuilder::new(memory, system_memory, kernel.clone())
+        .with_nvn_call_counting(config.diagnostics.count_nvn_calls)
         .with_sd_card_root(sd_card_root)
         .with_config(machine_profile.process_build_config());
     let process = process_builder
@@ -522,21 +523,25 @@ fn run_machine(
     let audio_backend = audio.backend();
 
     let Some(frontend) = frontend else {
-        return finish_execution(supervise_process(
-            runtime,
-            process,
-            horizon_environment,
-            video_system,
-            host_input,
-            audio_backend,
-            gpu_diagnostics,
-        ));
+        return finish_execution(
+            supervise_process(
+                runtime,
+                process,
+                horizon_environment,
+                video_system,
+                host_input,
+                audio_backend,
+                gpu_diagnostics,
+            ),
+            &title_name,
+            &title_identifier,
+        );
     };
     let volume_backend = Arc::clone(&audio_backend);
     let mut volume = config.audio.volume;
     let frontend = frontend
         .with_game_title(title_name.clone())
-        .with_screenshots(title_name, config.filesystem.screenshots.clone())
+        .with_screenshots(title_name.clone(), config.filesystem.screenshots.clone())
         .with_volume_handler(move |delta| {
             volume = volume.saturating_add_signed(delta).min(100);
             volume_backend
@@ -582,7 +587,7 @@ fn run_machine(
     let worker_result = worker
         .join()
         .map_err(|_| "guest execution worker panicked".to_owned())?;
-    let execution_result = finish_execution(worker_result);
+    let execution_result = finish_execution(worker_result, &title_name, &title_identifier);
     frontend_result.map(|_| ()).and(execution_result)
 }
 
@@ -652,6 +657,7 @@ const fn effective_diagnostics_configuration(
     file_system_access_log_override: Option<bool>,
 ) -> DiagnosticsConfig {
     DiagnosticsConfig {
+        count_nvn_calls: configuration.count_nvn_calls,
         log_level: configuration.log_level,
         guest_logs_level: match guest_logs_level_override {
             Some(level) => level,
@@ -684,6 +690,7 @@ mod diagnostics_tests {
     #[test]
     fn cli_guest_diagnostics_override_only_the_selected_policy() {
         let configured = DiagnosticsConfig {
+            count_nvn_calls: false,
             log_level: nixe_config::DiagnosticLogLevel::Info,
             guest_logs_level: GuestLogsLevel::Warn,
             file_system_access_log: true,
@@ -728,6 +735,7 @@ impl Drop for WorkerCompletion {
 }
 
 struct RunOutcome {
+    nvn_report: Option<(nixe_runtime::NvnCallReport, Duration)>,
     execution: Result<ExecutionSummary, String>,
     teardown: Result<ProcessTeardownReport, String>,
     graphics_teardown: nixe_horizon::GraphicsTeardownReport,
@@ -812,6 +820,16 @@ fn supervise_process(
         .as_ref()
         .map(VideoSystem::teardown)
         .unwrap_or_default();
+    let nvn_report = runtime
+        .process(process_id)
+        .and_then(|process| process.nvn_call_report())
+        .and_then(|result| match result {
+            Ok(report) => Some((report, execution_started.elapsed())),
+            Err(error) => {
+                log::error!("cannot collect NVN call counters: {error}");
+                None
+            }
+        });
     let teardown = match runtime.remove_process(process_id) {
         Ok(report) => report,
         Err(nixe_runtime::RuntimeError::ProcessTeardown { failure, .. }) => {
@@ -824,6 +842,7 @@ fn supervise_process(
         }
         Err(error) => {
             return RunOutcome {
+                nvn_report,
                 execution,
                 teardown: Err(format!("cannot remove process during teardown: {error}")),
                 graphics_teardown,
@@ -837,13 +856,47 @@ fn supervise_process(
         });
     }
     RunOutcome {
+        nvn_report,
         execution,
         teardown: Ok(teardown),
         graphics_teardown,
     }
 }
 
-fn finish_execution(result: RunOutcome) -> Result<(), String> {
+fn write_nvn_report(
+    title: &str,
+    title_id: &str,
+    duration: Duration,
+    report: nixe_runtime::NvnCallReport,
+) -> std::io::Result<()> {
+    use std::io::{BufWriter, Write};
+    let directory = std::path::Path::new("dump/nvn").join(nixe_video_winit::filename_title(title));
+    std::fs::create_dir_all(&directory)?;
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
+    let path = directory.join(format!("{timestamp}-calls.csv"));
+    let mut file = BufWriter::new(std::fs::File::create_new(&path)?);
+    writeln!(file, "function,invocations")?;
+    for (name, count) in &report.calls {
+        writeln!(file, "\"{}\",{count}", name.replace('"', "\"\""))?;
+    }
+    file.flush()?;
+    log::info!(
+        "NVN call report {}: title={title_id} elapsed={duration:.2?} bootstrap_found={} partial={} registered={} invoked={}",
+        path.display(),
+        report.bootstrap_found,
+        !report.complete,
+        report.resolved_entries,
+        report.calls.len()
+    );
+    Ok(())
+}
+
+fn finish_execution(result: RunOutcome, title: &str, title_id: &str) -> Result<(), String> {
+    if let Some((report, duration)) = result.nvn_report
+        && let Err(error) = write_nvn_report(title, title_id, duration, report)
+    {
+        log::error!("cannot write NVN call report: {error}");
+    }
     let teardown = result
         .teardown
         .map_err(|diagnostic| match &result.execution {
@@ -1369,11 +1422,16 @@ mod tests {
             Err("Dynarmic: invalid native state".to_owned()),
         ] {
             let failed = execution.is_err();
-            let error = finish_execution(RunOutcome {
-                execution,
-                teardown: Err("cannot remove process during teardown: backend failure".into()),
-                graphics_teardown: Default::default(),
-            })
+            let error = finish_execution(
+                RunOutcome {
+                    nvn_report: None,
+                    execution,
+                    teardown: Err("cannot remove process during teardown: backend failure".into()),
+                    graphics_teardown: Default::default(),
+                },
+                "test",
+                "test",
+            )
             .unwrap_err();
             assert!(error.contains("cannot remove process during teardown: backend failure"));
             assert_eq!(error.contains("Dynarmic: invalid native state"), failed);

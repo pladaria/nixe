@@ -379,6 +379,16 @@ pub(crate) fn run_guest<D: ExceptionDispatcher>(
         match report.stop {
             ExecutionStop::Safepoint => continue,
             ExecutionStop::SupervisorCall { source, immediate } => {
+                if immediate == crate::process::nvn::RESOLVE_SVC
+                    && let Some(trace) = &process.nvn
+                    && trace.resolve(
+                        source.pc.get(),
+                        &mut guest.execution.thread,
+                        process.memory(),
+                    )
+                {
+                    continue;
+                }
                 if immediate == 7 && thread.loader_return == Some(source.pc) {
                     let exit_code =
                         guest

@@ -5,6 +5,7 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 nixe-memory.workspace = true
 sdl3.workspace = true
 nixe-audio.workspace = true

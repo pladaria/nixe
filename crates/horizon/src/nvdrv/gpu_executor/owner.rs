@@ -980,16 +980,13 @@ impl<
             .unwrap()
             .invalidate_regions(regions)
     }
-    fn inline_memory(
-        &mut self,
-        regions: &[nixe_gpu::native::GuestBufferRange],
-    ) -> Result<(), Arc<MemoryError>> {
+    fn prepare_inline_write(&mut self, address: u64, bytes: u64) -> Result<(), Arc<MemoryError>> {
         self.owner
             .backend
             .borrow_mut()
             .as_mut()
             .unwrap()
-            .inline_memory(regions)
+            .prepare_inline_write(address, bytes)
     }
     fn access_memory(
         &mut self,
