@@ -77,6 +77,23 @@ impl Default for GpuConfig {
     }
 }
 
+/// Host-side modifications selected by the base application ID.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModsConfig {
+    pub enabled: bool,
+    pub directory: PathBuf,
+}
+
+impl Default for ModsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: PathBuf::from("./mods"),
+        }
+    }
+}
+
 /// Configuration shared by the CLI and desktop applications.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NixeConfig {
@@ -84,6 +101,7 @@ pub struct NixeConfig {
     pub version: u32,
     /// Title-library locations and discovery behavior.
     pub library: LibraryConfig,
+    pub mods: ModsConfig,
     /// Host filesystem locations for guest storage and screenshots.
     pub filesystem: FileSystemConfig,
     /// System-wide preferences and caller-owned key location.
@@ -149,6 +167,10 @@ impl NixeConfig {
                 follow_symlinks: raw.library.follow_symlinks,
                 convert_solid_to_blocks: raw.library.convert_solid_to_blocks,
                 keep_solid_backup: raw.library.keep_solid_backup,
+            },
+            mods: ModsConfig {
+                enabled: raw.mods.enabled,
+                directory: resolve_path(base_directory, raw.mods.directory),
             },
             filesystem: FileSystemConfig {
                 sd_card: resolve_path(base_directory, raw.filesystem.sd_card),
@@ -468,6 +490,8 @@ impl Default for VideoConfig {
 struct RawConfig {
     version: u32,
     library: RawLibraryConfig,
+    #[serde(default)]
+    mods: ModsConfig,
     #[serde(default)]
     filesystem: RawFileSystemConfig,
     system: RawSystemConfig,
@@ -844,6 +868,9 @@ mod tests {
                 follow_symlinks = false
                 convert_solid_to_blocks = false
                 keep_solid_backup = "remove"
+                [mods]
+                enabled = true
+                directory = "game-mods"
                 [filesystem]
                 sd_card = "./custom-sd"
                 save_data = "./custom-save"
@@ -866,6 +893,8 @@ mod tests {
         assert!(!config.library.scan_options().recursive);
         assert!(!config.library.scan_options().follow_symlinks);
         assert!(!config.library.convert_solid_to_blocks);
+        assert!(config.mods.enabled);
+        assert_eq!(config.mods.directory, base.join("game-mods"));
         assert_eq!(config.filesystem.sd_card, base.join("./custom-sd"));
         assert_eq!(config.filesystem.save_data, base.join("./custom-save"));
         assert_eq!(
@@ -1028,6 +1057,8 @@ mod tests {
         assert!(config.library.follow_symlinks);
         assert!(config.library.scan_options().follow_symlinks);
         assert!(config.library.convert_solid_to_blocks);
+        assert!(!config.mods.enabled);
+        assert_eq!(config.mods.directory, file.directory.join("./mods"));
         assert_eq!(
             config.filesystem.screenshots,
             file.path.parent().unwrap().join("./storage/screenshots")

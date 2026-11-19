@@ -541,11 +541,8 @@ fn module_placements(
 }
 
 fn image_extent(image: &LaunchModuleImage) -> Result<u64, ProcessBuildError> {
-    let executable = match image {
-        LaunchModuleImage::Nso(image) => image.executable(),
-        LaunchModuleImage::Nro(image) => image.executable(),
-    };
-    executable
+    image
+        .executable()
         .segments()
         .iter()
         .map(|segment| segment.memory_offset().checked_add(segment.mapping_size()))
@@ -565,11 +562,16 @@ fn prepare_modules(
         .iter()
         .zip(placements)
         .map(|(module, config)| {
-            let prepared = match module.image() {
+            let mut prepared = match module.image() {
                 LaunchModuleImage::Nso(image) => image.prepare(*config),
                 LaunchModuleImage::Nro(image) => image.prepare(*config),
             }
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Preparation, error))?;
+            for patch in &module.patches {
+                patch
+                    .apply(&mut prepared, module.name())
+                    .map_err(|e| ProcessBuildError::new(ProcessBuildStage::Preparation, e))?;
+            }
             validate_range(
                 address_space,
                 prepared.image_base(),

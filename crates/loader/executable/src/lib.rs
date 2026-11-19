@@ -4,7 +4,9 @@ mod binary;
 mod npdm;
 mod nro;
 mod nso;
+mod patch;
 mod preparation;
+pub use patch::NsoPatch;
 
 use std::fmt::{Debug, Formatter};
 

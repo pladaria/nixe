@@ -61,6 +61,10 @@ impl ExeFsArchive {
         Ok(Self { files })
     }
 
+    pub fn replace_file(&mut self, name: &str, source: StorageRef) {
+        self.files.insert(name.to_owned(), source);
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.files.keys().map(String::as_str)
     }

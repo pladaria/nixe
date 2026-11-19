@@ -119,7 +119,14 @@ fn resolve_launch(
             log::info!(
                 "source is an installed title; building from the resolved base, update and DLC set"
             );
-            Launcher::build_resolved_title((**title).clone(), Some(&library.keys))
+            Launcher::build_resolved_title_with_mods(
+                (**title).clone(),
+                Some(&library.keys),
+                config
+                    .mods
+                    .enabled
+                    .then_some(config.mods.directory.as_path()),
+            )
         }
         LibraryTitleSource::Homebrew(path) => {
             log::info!("source is a homebrew NRO: {}", path.display());

@@ -8,7 +8,7 @@ use crate::{
     ExecutableFormat, ExecutableImage, ExecutableSegment, ExecutableSegmentKind, MemoryPermissions,
 };
 
-const HEADER_SIZE: u64 = 0x100;
+pub(crate) const HEADER_SIZE: u64 = 0x100;
 const PAGE_SIZE: u64 = 0x1000;
 const MOD0_SIZE: u64 = 0x1c;
 const KNOWN_FLAGS: u32 = 0xff;

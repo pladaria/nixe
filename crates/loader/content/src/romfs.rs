@@ -41,6 +41,20 @@ impl RomFsArchive {
         build::build(tree)
     }
 
+    /// Export the namespace for a layered mount. File data stays in its original storage.
+    pub fn to_tree(&self) -> Result<crate::ReadOnlyTree, LoadError> {
+        let mut tree = crate::ReadOnlyTree::default();
+        for dir in &self.directories {
+            if dir != "/" {
+                tree.insert_directory(dir)?;
+            }
+        }
+        for file in &self.files {
+            tree.insert_file(file.path(), self.open_file(file)?)?;
+        }
+        Ok(tree)
+    }
+
     pub fn directories(&self) -> &[String] {
         &self.directories
     }

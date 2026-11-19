@@ -79,6 +79,19 @@ pub struct PreparedModule {
 }
 
 impl PreparedModule {
+    pub(crate) fn patch_region(&mut self, offset: u64) -> Option<&mut [u8]> {
+        let i = self
+            .mappings
+            .partition_point(|m| m.image_offset <= offset)
+            .checked_sub(1)?;
+        let mapping = &mut self.mappings[i];
+        let start = usize::try_from(offset - mapping.image_offset).ok()?;
+        mapping
+            .bytes
+            .get_mut(start..)
+            .filter(|tail| !tail.is_empty())
+    }
+
     /// Redirect a defined AArch64 function before the guest runtime linker resolves imports.
     /// The callback receives the original guest VA. The file and executable instructions stay intact.
     pub fn redirect_nso_export(

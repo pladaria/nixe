@@ -163,6 +163,15 @@ pub enum LaunchModuleImage {
     Nro(NroImage),
 }
 
+impl LaunchModuleImage {
+    pub fn executable(&self) -> &nixe_loader_executable::ExecutableImage {
+        match self {
+            Self::Nso(image) => image.executable(),
+            Self::Nro(image) => image.executable(),
+        }
+    }
+}
+
 impl Debug for LaunchModuleImage {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -178,11 +187,17 @@ pub struct LaunchModule {
     name: Box<str>,
     role: ModuleRole,
     image: LaunchModuleImage,
+    pub(crate) patches: Vec<Arc<nixe_loader_executable::NsoPatch>>,
 }
 
 impl LaunchModule {
     pub(crate) fn new(name: Box<str>, role: ModuleRole, image: LaunchModuleImage) -> Self {
-        Self { name, role, image }
+        Self {
+            name,
+            role,
+            image,
+            patches: Vec::new(),
+        }
     }
     pub fn name(&self) -> &str {
         &self.name

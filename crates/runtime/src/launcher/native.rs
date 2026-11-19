@@ -5,6 +5,7 @@ pub(super) fn build_native(
     path: &Path,
     resolved: ResolvedTitle,
     keys: Option<&dyn NcaKeyProvider>,
+    mods: TitleMods,
 ) -> Result<LaunchPlan, LaunchError> {
     let effective = resolved
         .patch
@@ -36,13 +37,15 @@ pub(super) fn build_native(
             .map_err(|error| LaunchError::load(LaunchStage::ProgramContent, path, error))?,
     )
     .map_err(|error| LaunchError::load(LaunchStage::ProgramContent, path, error))?;
+    let exefs = mods.exefs(exefs)?;
     let npdm = load_npdm(
         path,
         &exefs,
         resolved.application_id,
         package.metadata.npdm.as_ref(),
     )?;
-    let (modules, entry) = load_modules(path, &exefs)?;
+    let (mut modules, entry) = load_modules(path, &exefs)?;
+    mods.attach_patches(&mut modules)?;
     let mut tree: Option<ReadOnlyTree> = None;
     let mut contributors = Vec::new();
     for (package, role) in resolved
@@ -86,7 +89,7 @@ pub(super) fn build_native(
                 [hash] => ContentIdentity::NupTree(*hash),
                 _ => unreachable!("RomFS has one or two contributors"),
             };
-            RomFsArchive::from_tree(tree)
+            RomFsArchive::from_tree(mods.overlay_romfs(tree)?)
                 .map(|romfs| ReadOnlyMount::new(provenance, Some(content), romfs))
                 .map_err(|error| LaunchError::load(LaunchStage::PrimaryFileSystem, path, error))
         })

@@ -1,4 +1,6 @@
+mod mods;
 mod native;
+use mods::TitleMods;
 use native::build_native;
 
 use std::collections::BTreeSet;
@@ -31,6 +33,7 @@ pub struct LauncherInput {
     keys: Option<NcaKeySet>,
     directory_options: DirectoryScanOptions,
     application_id: Option<ApplicationId>,
+    mods_directory: Option<PathBuf>,
 }
 
 impl LauncherInput {
@@ -40,7 +43,12 @@ impl LauncherInput {
             keys: None,
             directory_options: DirectoryScanOptions::default(),
             application_id: None,
+            mods_directory: None,
         }
+    }
+    pub fn with_mods_directory(mut self, directory: PathBuf) -> Self {
+        self.mods_directory = Some(directory);
+        self
     }
     pub fn with_keys(mut self, keys: NcaKeySet) -> Self {
         self.keys = Some(keys);
@@ -79,6 +87,7 @@ pub enum LaunchStage {
     ExecutableModules,
     PrimaryFileSystem,
     AddOnContent,
+    Modifications,
 }
 
 /// Structured, context-preserving launch-plan construction failure.
@@ -239,6 +248,7 @@ impl Launcher {
                 catalog,
                 input.application_id,
                 input.keys.as_ref(),
+                input.mods_directory.as_deref(),
             )
         } else {
             Err(LaunchError::invalid(
@@ -257,11 +267,20 @@ impl Launcher {
         resolved: ResolvedTitle,
         keys: Option<&NcaKeySet>,
     ) -> Result<LaunchPlan, LaunchError> {
+        Self::build_resolved_title_with_mods(resolved, keys, None)
+    }
+
+    pub fn build_resolved_title_with_mods(
+        resolved: ResolvedTitle,
+        keys: Option<&NcaKeySet>,
+        mods_directory: Option<&Path>,
+    ) -> Result<LaunchPlan, LaunchError> {
         let context = PathBuf::from(format!("resolved-title-{}", resolved.application_id));
         build_packaged(
             &context,
             resolved,
             keys.map(|keys| keys as &dyn NcaKeyProvider),
+            mods_directory,
         )
     }
 
@@ -275,7 +294,13 @@ impl Launcher {
             None => TitleCatalog::scan_directory_with_options(path, input.directory_options),
         }
         .map_err(|error| LaunchError::title(LaunchStage::TitleDiscovery, path, error))?;
-        Self::build_from_catalog(path, catalog, input.application_id, input.keys.as_ref())
+        Self::build_from_catalog(
+            path,
+            catalog,
+            input.application_id,
+            input.keys.as_ref(),
+            input.mods_directory.as_deref(),
+        )
     }
 
     fn build_from_catalog(
@@ -283,6 +308,7 @@ impl Launcher {
         catalog: TitleCatalog,
         selection: Option<ApplicationId>,
         keys: Option<&NcaKeySet>,
+        mods_directory: Option<&Path>,
     ) -> Result<LaunchPlan, LaunchError> {
         let application_id = match selection {
             Some(id) => id,
@@ -315,6 +341,7 @@ impl Launcher {
             path,
             resolved,
             keys.map(|value| value as &dyn NcaKeyProvider),
+            mods_directory,
         )
     }
 
@@ -357,7 +384,9 @@ fn build_packaged(
     path: &Path,
     resolved: ResolvedTitle,
     keys: Option<&dyn NcaKeyProvider>,
+    mods_directory: Option<&Path>,
 ) -> Result<LaunchPlan, LaunchError> {
+    let mods = TitleMods::discover(mods_directory, resolved.application_id)?;
     let native = resolved
         .base
         .as_ref()
@@ -383,7 +412,7 @@ fn build_packaged(
         ));
     }
     if native {
-        return build_native(path, resolved, keys);
+        return build_native(path, resolved, keys, mods);
     }
     let base = resolved.base.as_ref().ok_or_else(|| {
         LaunchError::invalid(
@@ -444,9 +473,11 @@ fn build_packaged(
         }
     };
     log::debug!("ExeFS located and parsed in {:?}", exefs_started.elapsed());
+    let exefs = mods.exefs(exefs)?;
     let npdm = load_npdm(path, &exefs, resolved.application_id, None)?;
     let modules_started = Instant::now();
-    let (modules, entry_module) = load_modules(path, &exefs)?;
+    let (mut modules, entry_module) = load_modules(path, &exefs)?;
+    mods.attach_patches(&mut modules)?;
     log::debug!(
         "{} executable module(s) loaded in {:?}",
         modules.len(),
@@ -454,6 +485,22 @@ fn build_packaged(
     );
     let primary_started = Instant::now();
     let primary = load_primary_mount(path, &resolved, effective, &program, keys)?;
+    let primary = match primary {
+        Some(mount) if mods.has_romfs() => {
+            let tree = mount
+                .romfs()
+                .to_tree()
+                .map_err(|error| LaunchError::load(LaunchStage::Modifications, path, error))?;
+            let romfs = nixe_loader_content::RomFsArchive::from_tree(mods.overlay_romfs(tree)?)
+                .map_err(|error| LaunchError::load(LaunchStage::Modifications, path, error))?;
+            Some(ReadOnlyMount::new(
+                mount.provenance(),
+                mount.content_identity().copied(),
+                romfs,
+            ))
+        }
+        mount => mount,
+    };
     log::debug!(
         "primary filesystem resolved in {:?}",
         primary_started.elapsed()
@@ -1053,6 +1100,129 @@ mod tests {
         assert_eq!(module_role("subsdk"), None);
         assert_eq!(module_role("subsdk-1"), None);
         assert_eq!(module_role("other"), None);
+    }
+
+    #[test]
+    fn title_mods_patch_only_matching_prepared_modules_in_order() {
+        use nixe_loader_executable::PreparationConfig;
+        use nixe_loader_storage::BytesStorage;
+
+        let root = tempfile::tempdir().unwrap();
+        let title = ApplicationId::new(0xabc);
+        let dir = root.path().join("0000000000000abc");
+        let first = dir.join("A/ExeFS");
+        let second = dir.join("B/exefs");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let mut main = minimal_nso(0);
+        main[0x40] = 0xab;
+        let sdk = minimal_nso(2);
+        let archive = || {
+            ExeFsLoader::load(Arc::new(BytesStorage(
+                minimal_exefs(&[("main", &main), ("sdk", &sdk)]).into(),
+            )))
+            .unwrap()
+        };
+        fs::write(first.join("1.0.pchtxt"), "@nsobid-AB\n@flag offset_shift 0x100\n@enabled\n00000000 01020304\n@disabled\n00000000 EE\n@enabled\n00000004 \"/#\" // text\n@credits\n").unwrap();
+        fs::write(
+            first.join("2.0.pchtxt"),
+            "@nsobid-AB01\n@enabled\nFFFFFFFF 00\n",
+        )
+        .unwrap();
+        fs::write(
+            second.join("ab.ips"),
+            b"PATCH\x00\x01\x01\x00\x00\x00\x02\xaaEOF",
+        )
+        .unwrap();
+        fs::write(
+            second.join("ab.more.ips"),
+            b"IPS32\x00\x00\x01\x03\x00\x01\xfeEEOF",
+        )
+        .unwrap();
+        for (root, candidate, expected) in [
+            (Some(root.path()), title, 3),
+            (Some(root.path()), ApplicationId::new(0xdef), 0),
+            (None, title, 0),
+        ] {
+            let mods = TitleMods::discover(root, candidate).unwrap();
+            let (mut modules, _) = load_modules(&dir, &mods.exefs(archive()).unwrap()).unwrap();
+            mods.attach_patches(&mut modules).unwrap();
+            assert!(modules[1].patches.is_empty());
+            let m = &modules[0];
+            assert_eq!(m.patches.len(), expected);
+            let LaunchModuleImage::Nso(nso) = m.image() else {
+                unreachable!()
+            };
+            let location = PreparationConfig {
+                image_base: 0x10000,
+                address_limit: 0x100000,
+            };
+            let mut image = nso.prepare(location).unwrap();
+            for patch in &m.patches {
+                patch.apply(&mut image, m.name()).unwrap();
+            }
+            let bytes = &image.mappings()[0].bytes()[..6];
+            if expected > 0 {
+                assert_eq!(bytes, &[1, 0xaa, 0xaa, 0xfe, b'/', b'#']);
+                assert_eq!(
+                    &nso.prepare(location).unwrap().mappings()[0].bytes()[..6],
+                    &[0; 6]
+                );
+            } else {
+                assert_eq!(bytes, &[0; 6]);
+            }
+        }
+    }
+
+    #[test]
+    fn title_mods_layer_files_with_stable_priority_in_the_guest_romfs_image() {
+        use nixe_loader_content::{ReadOnlyTree, RomFsArchive};
+        use nixe_loader_storage::BytesStorage;
+
+        let root = tempfile::tempdir().unwrap();
+        let title = ApplicationId::new(0xabc);
+        let dir = root.path().join(title.to_string());
+        for (package, value) in [("A", b'A'), ("B", b'B')] {
+            let folder = dir.join(package);
+            fs::create_dir_all(folder.join("romfs/sub")).unwrap();
+            fs::create_dir_all(folder.join("exefs")).unwrap();
+            fs::write(folder.join("romfs/sub/shared"), [value]).unwrap();
+            fs::write(folder.join("romfs/sub").join(package), [value]).unwrap();
+            fs::write(folder.join("exefs/main"), minimal_nso(value)).unwrap();
+        }
+        let mods = TitleMods::discover(Some(root.path()), title).unwrap();
+        let archive = ExeFsLoader::load(Arc::new(BytesStorage(
+            minimal_exefs(&[("main", &minimal_nso(0))]).into(),
+        )))
+        .unwrap();
+        let (modules, _) = load_modules(&dir, &mods.exefs(archive).unwrap()).unwrap();
+        assert_eq!(modules[0].image().executable().module_id(), &[b'A'; 32]);
+
+        let mut base = ReadOnlyTree::default();
+        base.insert_directory("/sub").unwrap();
+        for path in ["/original", "/sub/shared"] {
+            base.insert_file(path, Arc::new(BytesStorage(vec![0].into())))
+                .unwrap();
+        }
+        let base = RomFsArchive::from_tree(base).unwrap();
+        let layered =
+            RomFsArchive::from_tree(mods.overlay_romfs(base.to_tree().unwrap()).unwrap()).unwrap();
+        let guest_view = RomFsLoader::load(layered.storage()).unwrap();
+        for (path, byte) in [
+            ("/original", 0),
+            ("/sub/shared", b'A'),
+            ("/sub/A", b'A'),
+            ("/sub/B", b'B'),
+        ] {
+            let mut actual = [0];
+            guest_view
+                .open(path)
+                .unwrap()
+                .unwrap()
+                .read_at(0, &mut actual)
+                .unwrap();
+            assert_eq!(actual, [byte]);
+        }
     }
 
     #[test]

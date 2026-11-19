@@ -18,6 +18,14 @@ convert_solid_to_blocks = true
 # the .solid backup and log a warning.
 keep_solid_backup = "trash"
 
+[mods]
+# Apply installed game mods at launch. Defaults to false when omitted.
+enabled = true
+# Relative to this file. Layout: <directory>/<base title ID>/<mod name>/exefs/ or romfs/.
+# ExeFS supports replacement modules, IPS/IPS32 (.ips) and IPSwitch (.pchtxt).
+# Executable patches must match the NSO build ID of the installed game version.
+directory = "./mods"
+
 [filesystem]
 # Host directory exposed to the guest as the removable sdmc: filesystem.
 # Relative paths are resolved from the directory containing this file.
@@ -70,7 +78,7 @@ file_system_access_log = true
 [audio]
 output = "stereo"
 # Host volume: 0 mutes output, 100 is full volume. Defaults to 100.
-volume = 10
+volume = 0
 
 [video]
 # Filter for fitting the game image to the window; does not change render resolution.
@@ -107,7 +115,7 @@ resolution_scale = 1.0
 mme_jit = true
 # Execute intercepted NVN calls in Rust. An unsupported invocation stops the game.
 # Defaults to false and works independently of diagnostics.count_nvn_calls.
-nvn_hle = false
+nvn_hle = true
 # Per-title shader environments and Vulkan driver caches, relative to this file.
 cache_directory = "./storage/cache/gpu"
 
