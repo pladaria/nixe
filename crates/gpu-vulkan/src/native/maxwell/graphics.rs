@@ -423,7 +423,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
                 .channel
                 .enabled_vertex_buffers;
             execution.residency.bind_host_geometry_buffers(
-                Some(channel),
+                Some(crate::queue::GeometryOwner::Channel(channel)),
                 enabled,
                 arguments,
                 native_index.as_ref(),
@@ -608,6 +608,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
             descriptors,
             draw,
             push.as_bytes(),
+            None,
             registers.register_words()[0x1514 / 4] != 0,
             |aspect| {
                 let r = registers.register_words();

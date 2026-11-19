@@ -228,6 +228,7 @@ impl NvDrvSession {
         let backend = state.gpu_backend.as_ref().ok_or("no GPU backend for NVN")?;
         Ok(nixe_nvn::Graphics {
             heap: state.device_memory.clone(),
+            surfaces: Arc::new(self.clone()),
             backend: gpu_executor::nvn::client(backend, mailbox),
         })
     }
@@ -1565,6 +1566,68 @@ fn write_u64(output: &mut [u8], offset: usize, value: u64) -> Result<(), u32> {
         .ok_or(NV_BAD_PARAMETER)?
         .copy_from_slice(&value.to_le_bytes());
     Ok(())
+}
+
+struct ExportedSurfacePool {
+    session: NvDrvSession,
+    owner: NvMapOwner,
+    handle: NvMapHandle,
+}
+impl nixe_nvn::ExportedPool for ExportedSurfacePool {
+    fn handle(&self) -> u32 {
+        self.handle.raw()
+    }
+}
+impl Drop for ExportedSurfacePool {
+    fn drop(&mut self) {
+        let _ = self
+            .session
+            .state
+            .lock()
+            .unwrap()
+            .nvmap
+            .free(self.owner, self.handle);
+    }
+}
+impl nixe_nvn::SurfaceExporter for NvDrvSession {
+    fn export(
+        &self,
+        memory: &nixe_memory::AddressSpace,
+        address: u64,
+        bytes: u64,
+    ) -> nixe_nvn::Result<Box<dyn nixe_nvn::ExportedPool>> {
+        let size = u32::try_from(bytes).map_err(|_| "NvMap surface pool exceeds 4 GiB")?;
+        let address = GuestVirtualAddress::new(address);
+        let ranges = memory
+            .capture(address, bytes, nixe_memory::MemoryPermissions::READ)
+            .map_err(|e| e.to_string())?;
+        let mut state = self.state.lock().unwrap();
+        let owner = NvMapOwner::new(
+            state
+                .client_identity
+                .ok_or("NvMap client is not initialized")?
+                .process_id,
+        );
+        let handle = state
+            .nvmap
+            .create(owner, size)
+            .map_err(|e| format!("NvMap create: {e:?}"))?;
+        if let Err(e) = state.nvmap.allocate(
+            owner,
+            handle,
+            NvMapAllocationMetadata::new(0, 0, 4096, 0),
+            NvMapCpuMapping::new(memory.identity(), address),
+            ranges.into(),
+        ) {
+            let _ = state.nvmap.free(owner, handle);
+            return Err(format!("NvMap allocation: {e:?}").into());
+        }
+        Ok(Box::new(ExportedSurfacePool {
+            session: self.clone(),
+            owner,
+            handle,
+        }))
+    }
 }
 
 #[cfg(test)]

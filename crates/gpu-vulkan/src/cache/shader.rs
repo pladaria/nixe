@@ -78,6 +78,15 @@ pub struct ShaderArtifact {
     pub stages: Box<[Arc<CompiledStage>]>,
 }
 impl ShaderArtifact {
+    pub(crate) fn vertex_input_mask(&self) -> Option<u32> {
+        let vertex = self
+            .stages
+            .iter()
+            .find(|stage| stage.stage == ShaderStage::Vertex)?;
+        let loads = &vertex.guest.as_ref()?.info.loads;
+        Some((0..32).fold(0, |mask, i| mask | (u32::from(loads.generic(i)) << i)))
+    }
+
     pub fn new<S: Into<Arc<CompiledStage>>>(stages: Box<[S]>) -> Self {
         Self {
             stages: stages.into_iter().map(Into::into).collect(),

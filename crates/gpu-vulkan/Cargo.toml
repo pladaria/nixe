@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytemuck.workspace = true
 nixe-nvn.workspace = true
 nixe-memory.workspace = true
 smallvec = "1"

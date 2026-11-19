@@ -1,5 +1,5 @@
 use super::*;
-use bytemuck::{Pod, Zeroable};
+
 use nixe_scheduler::{EventObject, ReadableEventObject, SchedulerState};
 use std::{
     collections::HashMap,
@@ -76,83 +76,33 @@ struct Window {
     interval: u32,
     deadline: Option<Instant>,
 }
-#[repr(C)]
-#[derive(Clone, Copy, Default, Pod, Zeroable)]
-struct WindowBuilder {
-    device: u64,
-    native: u64,
-    count: u32,
-    interval: u32,
-    textures: [u64; 4],
-}
-pub fn set_device(c: &Call) -> Result<u64> {
-    c.write(c.args[0], &c.args[1])?;
-    Ok(0)
-}
-pub fn defaults(c: &Call) -> Result<u64> {
-    c.write(c.args[0] + 8, &[65536u64, 262144, 0, 0, 0])?;
-    Ok(0)
-}
-fn set_size(c: &Call, offset: u64) -> Result<u64> {
-    c.write(c.args[0] + offset, &c.args[1])?;
-    Ok(0)
-}
-pub fn command_bytes(c: &Call) -> Result<u64> {
-    set_size(c, 8)
-}
-pub fn compute_bytes(c: &Call) -> Result<u64> {
-    set_size(c, 16)
-}
-pub fn threshold(c: &Call) -> Result<u64> {
-    set_size(c, 24)
-}
-pub fn queue_bytes(c: &Call) -> Result<u64> {
-    let [cmd, compute]: [u64; 2] = c.read(c.args[0] + 8)?;
-    // @SIMPLIFICATION The native queue owns its host submission storage. Reserve the advertised
-    // control memory plus the command and compute budgets in the guest.
-    Ok((cmd + compute + 16384).next_multiple_of(4096))
-}
-pub fn queue_memory(c: &Call) -> Result<u64> {
-    c.write(c.args[0] + 32, &[c.args[1], c.args[2]])?;
-    Ok(0)
-}
+
 pub fn initialize(c: &Call) -> Result<u64> {
-    c.session
-        .queues
-        .lock()
-        .unwrap()
-        .state
-        .insert(c.args[0], Default::default());
+    c.session.queues.lock().unwrap().state.insert(
+        c.args[0],
+        command::State::for_device(c, c.read(c.args[1])?)?,
+    );
     Ok(1)
 }
-pub fn window_defaults(c: &Call) -> Result<u64> {
-    let b = WindowBuilder {
-        interval: 1,
-        ..Default::default()
-    };
-    c.write_bytes(c.args[0] + 8, &bytemuck::bytes_of(&b)[8..])?;
+
+pub fn finalize(c: &Call) -> Result<u64> {
+    let mut queues = c.session.queues.lock().unwrap();
+    queues.state.remove(&c.args[0]);
+    c.session.graphics()?.backend.finalize_queue(c.args[0])?;
     Ok(0)
 }
-pub fn native_window(c: &Call) -> Result<u64> {
-    c.write(c.args[0] + 8, &c.args[1])?;
-    Ok(0)
-}
-pub fn textures(c: &Call) -> Result<u64> {
-    let n = c.args[1] as u32 as usize;
-    if !(1..=4).contains(&n) {
-        return Err(format!("unsupported window texture count {n}").into());
-    }
-    let mut tex = [0u64; 4];
-    c.read_bytes(c.args[2], bytemuck::cast_slice_mut(&mut tex[..n]))?;
-    c.write(c.args[0] + 24, &tex)?;
-    c.write(c.args[0] + 16, &(n as u32))?;
-    Ok(0)
-}
+
 pub fn window_initialize(c: &Call) -> Result<u64> {
     let b: WindowBuilder = c.read(c.args[1])?;
     let textures = b
         .textures
-        .get(..b.count as usize)
+        .get(
+            ..if b.active == 0 {
+                b.count
+            } else {
+                b.active.min(b.count)
+            } as usize,
+        )
         .filter(|s| !s.is_empty())
         .ok_or("invalid window textures")?
         .to_vec();
@@ -245,19 +195,19 @@ fn acquire_slot(c: &Call, window: u64) -> Result<u64> {
     Ok(0)
 }
 pub fn submit(c: &Call) -> Result<u64> {
-    let mut ops = Vec::new();
+    let mut ops = Submission::default();
     {
         let mut queues = c.session.queues.lock().unwrap();
         let q = queues.state.get_mut(&c.args[0]).ok_or("unknown queue")?;
         for i in 0..c.args[1] as u32 {
             q.replay(c, c.read(c.args[2] + u64::from(i) * 8)?, &mut ops)?
         }
+        c.session.graphics()?.backend.submit(c.args[0], ops)?;
     }
-    c.session.graphics()?.backend.submit(ops)?;
     Ok(0)
 }
 pub fn present(c: &Call) -> Result<u64> {
-    let (texture, interval) = {
+    let (texture, interval, flip_vertical) = {
         let q = c.session.queues.lock().unwrap();
         let w = q.windows.get(&c.args[1]).ok_or("unknown window")?;
         (
@@ -265,11 +215,27 @@ pub fn present(c: &Call) -> Result<u64> {
                 .get(c.args[2] as u32 as usize)
                 .ok_or("invalid window texture index")?,
             w.interval,
+            !q.state
+                .get(&c.args[0])
+                .ok_or("unknown queue")?
+                .pipeline
+                .upper_left,
         )
     };
     c.session
         .graphics()?
         .backend
-        .present(c.read(texture)?, interval)?;
+        .present(c.read(texture)?, interval, flip_vertical)?;
+    Ok(0)
+}
+
+pub fn interval(c: &Call) -> Result<u64> {
+    let mut queues = c.session.queues.lock().unwrap();
+    let w = queues.windows.get_mut(&c.args[0]).ok_or("unknown window")?;
+    let interval = c.args[1] as u32;
+    if w.interval != interval {
+        w.interval = interval;
+        w.deadline = None;
+    }
     Ok(0)
 }

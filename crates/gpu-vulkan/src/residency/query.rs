@@ -175,6 +175,7 @@ impl Residency<'_> {
             &self.runtime.device_memory,
             address,
             bytes.len() as u64,
+            false,
         );
         let query = Arc::new(Query {
             address,

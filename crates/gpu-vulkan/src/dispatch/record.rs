@@ -438,6 +438,35 @@ impl Dispatch {
             Ok(())
         });
     }
+    pub(crate) fn begin_predicate(&mut self, buffer: vk::Buffer) {
+        let begin = self
+            .conditional
+            .as_ref()
+            .unwrap()
+            .fp()
+            .cmd_begin_conditional_rendering_ext;
+        self.recorder.record(move |context| {
+            let info = vk::ConditionalRenderingBeginInfoEXT::default().buffer(buffer);
+            unsafe {
+                begin(context.command, &info);
+            }
+            Ok(())
+        });
+    }
+    pub(crate) fn end_predicate(&mut self) {
+        let end = self
+            .conditional
+            .as_ref()
+            .unwrap()
+            .fp()
+            .cmd_end_conditional_rendering_ext;
+        self.recorder.record(move |context| {
+            unsafe {
+                end(context.command);
+            }
+            Ok(())
+        });
+    }
     pub unsafe fn cmd_draw(
         &mut self,
         vertices: u32,

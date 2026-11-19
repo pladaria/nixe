@@ -1,0 +1,9 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) readonly buffer Records { uint words[]; };
+layout(std430, binding = 1) writeonly buffer Predicate { uint result; };
+layout(push_constant) uniform Compare { uint first; uint invert; };
+void main() {
+    bool equal = words[first] == words[first + 4] && words[first + 1] == words[first + 5];
+    result = uint(equal) ^ invert;
+}

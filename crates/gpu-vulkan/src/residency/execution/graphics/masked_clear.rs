@@ -27,6 +27,7 @@ impl Residency<'_> {
         mask: u32,
         value: vk::ClearDepthStencilValue,
         clear_depth: bool,
+        predicate: Option<&Arc<crate::memory::AllocatedBuffer>>,
     ) -> Result<WorkTicket, VulkanError> {
         if !clear::contains_rect(targets.area, rect.rect)
             || rect.layer_count != 1
@@ -141,8 +142,9 @@ impl Residency<'_> {
         parameters.stencil_write_mask = [mask & 255; 2];
         parameters.stencil_reference = [value.stencil & 255; 2];
         self.validate_dynamic_parameters(parameters)?;
-        self.draw(
-            graphics,
+        self.draw_bound(
+            &graphics.program,
+            &graphics.parameters,
             targets,
             Draw::Direct {
                 vertices: 3,
@@ -151,6 +153,10 @@ impl Residency<'_> {
                 first_instance: 0,
             },
             &value.depth.to_ne_bytes(),
+            HostDrawState {
+                predicate,
+                ..Default::default()
+            },
         )
     }
 }

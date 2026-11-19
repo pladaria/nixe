@@ -1,7 +1,72 @@
 //! Owned inputs for native host utility shaders. Guest cache banks and descriptor
 //! queues do not pass through this capture API.
 use super::*;
+impl HostBinding {
+    fn same_selection(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::NullBuffer, Self::NullBuffer) => true,
+            (Self::UniformBytes(a), Self::UniformBytes(b)) => Arc::ptr_eq(a, b),
+            (
+                Self::Buffer {
+                    buffer: a,
+                    offset: x,
+                    size: m,
+                },
+                Self::Buffer {
+                    buffer: b,
+                    offset: y,
+                    size: n,
+                },
+            ) => a.id == b.id && Arc::ptr_eq(&a.native, &b.native) && x == y && m == n,
+            (
+                Self::TexelBuffer {
+                    buffer: a,
+                    offset: x,
+                    size: m,
+                    format: f,
+                    element_bytes: e,
+                },
+                Self::TexelBuffer {
+                    buffer: b,
+                    offset: y,
+                    size: n,
+                    format: g,
+                    element_bytes: h,
+                },
+            ) => {
+                a.id == b.id
+                    && Arc::ptr_eq(&a.native, &b.native)
+                    && x == y
+                    && m == n
+                    && f == g
+                    && e == h
+            }
+            (Self::Image(a), Self::Image(b)) => a.id == b.id && Arc::ptr_eq(&a.native, &b.native),
+            (
+                Self::CombinedImageSampler {
+                    image: a,
+                    sampler: x,
+                },
+                Self::CombinedImageSampler {
+                    image: b,
+                    sampler: y,
+                },
+            ) => a.id == b.id && Arc::ptr_eq(&a.native, &b.native) && x.identity() == y.identity(),
+            (Self::Sampler(a), Self::Sampler(b)) => a.identity() == b.identity(),
+            _ => false,
+        }
+    }
+}
 impl Residency<'_> {
+    pub(crate) fn new_nvn_program(
+        &self,
+        pipeline: NativePipeline,
+    ) -> Result<HostProgram, VulkanError> {
+        let capacity = pipeline.layout.key.bindings.len();
+        let mut program = self.new_host_program(pipeline)?;
+        program.direct_entries = Some(Vec::with_capacity(capacity));
+        Ok(program)
+    }
     fn new_host_program(&self, pipeline: NativePipeline) -> Result<HostProgram, VulkanError> {
         if !Arc::ptr_eq(&pipeline.owner, &self.runtime.device.owner) {
             return Err(VulkanError::InvalidResource(
@@ -14,6 +79,7 @@ impl Residency<'_> {
             pipeline,
             record: Default::default(),
             bindings: Vec::new(),
+            direct_entries: None,
             unaligned_uniforms: 0,
         })
     }
@@ -30,6 +96,66 @@ impl Residency<'_> {
         self.finish_host_capture(&mut program)?;
         Ok(program)
     }
+    pub(crate) fn update_host_binding(
+        &self,
+        program: &mut HostProgram,
+        index: usize,
+        input: &HostBinding,
+    ) -> Result<(), VulkanError> {
+        if program
+            .bindings
+            .get(index)
+            .is_none_or(|old| !old.same_selection(input))
+        {
+            self.capture_host_binding(program, index, input)?;
+            if let Some(entries) = &mut program.direct_entries {
+                let entry = match input {
+                    HostBinding::UniformBytes(_) => crate::cache::DescriptorEntry {
+                        buffer: Default::default(),
+                    },
+                    HostBinding::Buffer {
+                        buffer,
+                        offset,
+                        size,
+                    } => {
+                        let dynamic = program
+                            .pipeline
+                            .layout
+                            .dynamic_bindings
+                            .binary_search(&index)
+                            .ok()
+                            .map_or(0, |i| u64::from(program.dynamic_offsets[i]));
+                        crate::cache::DescriptorEntry {
+                            buffer: vk::DescriptorBufferInfo::default()
+                                .buffer(buffer.native.handle)
+                                .offset(*offset - dynamic)
+                                .range(*size),
+                        }
+                    }
+                    HostBinding::CombinedImageSampler { image, sampler } => {
+                        crate::cache::DescriptorEntry {
+                            image: vk::DescriptorImageInfo::default()
+                                .image_view(image.native.handle)
+                                .image_layout(vk::ImageLayout::GENERAL)
+                                .sampler(sampler.handle),
+                        }
+                    }
+                    _ => {
+                        return Err(VulkanError::InvalidResource(
+                            "unsupported NVN descriptor binding",
+                        ));
+                    }
+                };
+                if index == entries.len() {
+                    entries.push(entry);
+                } else {
+                    entries[index] = entry;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Like Eden's binding updates, changing a range does not rebuild an access
     /// list. The recorder consumes the native slots and compiled shader roles.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
@@ -126,6 +252,18 @@ impl Residency<'_> {
         binding: &HostBinding,
     ) -> Result<(), VulkanError> {
         match binding {
+            HostBinding::UniformBytes(bytes) => {
+                if !matches!(
+                    kind,
+                    vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                ) || bytes.is_empty()
+                    || bytes.len() > 65536
+                {
+                    return Err(VulkanError::InvalidResource(
+                        "invalid inline uniform binding",
+                    ));
+                }
+            }
             HostBinding::NullBuffer => {
                 if !self.runtime.device.profile().null_descriptor
                     || !matches!(

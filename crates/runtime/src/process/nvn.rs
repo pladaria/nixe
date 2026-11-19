@@ -79,6 +79,7 @@ type Procedure = (Box<str>, Option<nixe_nvn::Handler>);
 
 struct Hle {
     session: nixe_nvn::Session,
+    version_ready: OnceLock<()>,
     title: u64,
     platform: TargetPlatform,
     procedures: Box<[OnceLock<Procedure>]>,
@@ -86,7 +87,8 @@ struct Hle {
 impl Hle {
     fn new(platform: TargetPlatform, title: u64) -> Self {
         Self {
-            session: nixe_nvn::Session::new(platform),
+            session: nixe_nvn::Session::new(),
+            version_ready: OnceLock::new(),
             platform,
             title,
             procedures: (0..SLOTS).map(|_| OnceLock::new()).collect(),
@@ -190,14 +192,19 @@ impl NvnHooks {
         }
     }
 
+    fn guest_base(&self) -> u64 {
+        self.base + if self.count_calls { END } else { COUNTERS } as u64
+    }
+
     pub fn end(&self) -> u64 {
-        self.base
-            + if self.bootstrap.is_empty() {
-                0
-            } else if self.count_calls {
-                END as u64
+        if self.bootstrap.is_empty() {
+            return self.base;
+        }
+        self.guest_base()
+            + if self.hle.is_some() {
+                nixe_nvn::GUEST_CODE.len() as u64 + 4096
             } else {
-                COUNTERS as u64
+                0
             }
     }
 
@@ -245,9 +252,22 @@ impl NvnHooks {
         )?;
         memory.map_zeroed(
             GuestVirtualAddress::new(self.base + DESCRIPTORS as u64),
-            self.end() - self.base - DESCRIPTORS as u64,
+            self.guest_base() - self.base - DESCRIPTORS as u64,
             super::builder::kernel_mapping(MemoryKind::Data, MemoryPermissions::READ_WRITE),
         )?;
+        if self.hle.is_some() {
+            let base = self.guest_base();
+            memory.map_initialized(
+                GuestVirtualAddress::new(base),
+                nixe_nvn::GUEST_CODE,
+                super::builder::kernel_mapping(MemoryKind::Data, MemoryPermissions::READ_EXECUTE),
+            )?;
+            memory.map_zeroed(
+                GuestVirtualAddress::new(base + nixe_nvn::GUEST_CODE.len() as u64),
+                4096,
+                super::builder::kernel_mapping(MemoryKind::Data, MemoryPermissions::READ_WRITE),
+            )?;
+        }
         let mut registry = self.registry.lock().unwrap();
         for &original in &self.bootstrap {
             self.bind(memory, &mut registry, BOOTSTRAP, original)?;
@@ -297,14 +317,23 @@ impl NvnHooks {
         // when two API names are aliases for the same implementation.
         let target = self.original_target(reg, target);
         let name_id = reg.names.get(name).copied().unwrap_or(reg.names.len());
+        if name_id >= SLOTS {
+            return Err(MappingError::InvalidRange);
+        }
         let effective = if replace {
             let hle = self.hle.as_ref().unwrap();
-            let entry = hle
-                .procedures
-                .get(name_id)
-                .ok_or(MappingError::InvalidRange)?;
-            entry.get_or_init(|| (name.into(), nixe_nvn::resolve(hle.platform, name)));
-            self.base + (HOST_ENTRIES + name_id * 8) as u64
+            if let Some(offset) =
+                nixe_nvn::guest_offset(hle.platform == TargetPlatform::Switch2, name)
+            {
+                self.guest_base() + offset as u64
+            } else {
+                let entry = hle
+                    .procedures
+                    .get(name_id)
+                    .ok_or(MappingError::InvalidRange)?;
+                entry.get_or_init(|| (name.into(), nixe_nvn::resolve(hle.platform, name)));
+                self.base + (HOST_ENTRIES + name_id * 8) as u64
+            }
         } else {
             target
         };
@@ -372,7 +401,28 @@ impl NvnHooks {
             && pc == self.base + (QUERY_VERSION + 13 * 4) as u64
         {
             let version = [state.read_x(x(0)) as u32, state.read_x(x(1)) as u32];
-            hle.session.api_version.get_or_init(|| version);
+            memory
+                .space()
+                .write(
+                    GuestVirtualAddress::new(self.guest_base() + nixe_nvn::GUEST_CODE.len() as u64),
+                    &(u64::from(version[0]) | (u64::from(version[1]) << 32)).to_le_bytes(),
+                )
+                .map_err(|e| e.to_string())?
+                .into_ready()
+                .map_err(|_| "NVN version storage is unavailable")?;
+            hle.version_ready.get_or_init(|| ());
+        } else if let Some(hle) = &self.hle
+            && pc == self.guest_base() + nixe_nvn::GUEST_ERROR_PC as u64
+        {
+            let text = |address: u64, length: u64| {
+                let start = address.checked_sub(self.guest_base())? as usize;
+                let bytes = nixe_nvn::GUEST_CODE.get(start..start.checked_add(length as usize)?)?;
+                std::str::from_utf8(bytes).ok()
+            };
+            let name = text(state.read_x(x(0)), state.read_x(x(1))).unwrap_or("NVN");
+            let reason =
+                text(state.read_x(x(2)), state.read_x(x(3))).unwrap_or("invalid guest error");
+            return Err(format!("NVN HLE {name} (title={:016X}): {reason}", hle.title).into());
         } else if let Some(hle) = &self.hle
             && let Some(offset) = pc.checked_sub(self.base + HOST_ENTRIES as u64)
             && offset.is_multiple_of(8)
@@ -389,7 +439,6 @@ impl NvnHooks {
                     session: &hle.session,
                     memory: memory.space(),
                     args: std::array::from_fn(|i| state.read_x(x(i as u8))),
-                    float: &|i| f32::from_bits(state.vector(i).unwrap() as u32),
                     pending: Default::default(),
                 };
                 let value = handler(&call)?;
@@ -426,8 +475,7 @@ impl NvnHooks {
                 state.write_x(x(0), wrapped);
                 if name.as_deref() == Some("nvnDeviceGetInteger")
                     && self.hle.as_ref().is_some_and(|h| {
-                        h.platform == TargetPlatform::Switch1
-                            && h.session.api_version.get().is_none()
+                        h.platform == TargetPlatform::Switch1 && h.version_ready.get().is_none()
                     })
                 {
                     state.write_x(x(1), self.original_target(&reg, target));
@@ -606,6 +654,45 @@ mod tests {
                 ("nvnZ".into(), 1)
             ]
         );
+    }
+
+    #[test]
+    fn counting_wraps_the_same_guest_or_host_procedure() {
+        for count_calls in [false, true] {
+            let memory = process_memory();
+            let hooks = NvnHooks {
+                base: 0x40_0000,
+                bootstrap: vec![0x20_0000],
+                registry: Mutex::default(),
+                count_calls,
+                hle: Some(Hle::new(TargetPlatform::Switch1, 42)),
+            };
+            hooks.install(&memory).unwrap();
+            let mut registry = hooks.registry.lock().unwrap();
+            for name in ["nvnCommandBufferDrawElements", "nvnQueueSubmitCommands"] {
+                let entry = hooks.bind(&memory, &mut registry, name, 0x21_0000).unwrap();
+                let expected = if name == "nvnQueueSubmitCommands" {
+                    hooks.base + (HOST_ENTRIES + registry.names[name] * 8) as u64
+                } else {
+                    hooks.guest_base() + nixe_nvn::guest_offset(false, name).unwrap() as u64
+                };
+                if count_calls {
+                    let slot = registry.slots[&(registry.names[name], 0x21_0000)];
+                    assert_eq!(entry, hooks.base + (ENTRIES + slot * 8) as u64);
+                    let address = hooks.base + (DESCRIPTORS + slot * DESCRIPTOR_BYTES) as u64;
+                    let mut bytes = [0; 8];
+                    memory
+                        .space()
+                        .read_into(GuestVirtualAddress::new(address), &mut bytes)
+                        .unwrap()
+                        .into_ready()
+                        .unwrap();
+                    assert_eq!(u64::from_le_bytes(bytes), expected);
+                } else {
+                    assert_eq!(entry, expected);
+                }
+            }
+        }
     }
 
     #[test]

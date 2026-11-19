@@ -128,6 +128,31 @@ impl GraphicsState {
 }
 
 impl GraphicsState {
+    pub(crate) fn retain_vertex_inputs(&mut self, locations: u32) {
+        self.vertex_attributes = self
+            .vertex_attributes
+            .iter()
+            .filter(|a| locations & (1 << a.location) != 0)
+            .copied()
+            .collect();
+        let bindings = self
+            .vertex_attributes
+            .iter()
+            .fold(0u32, |mask, a| mask | (1 << a.binding));
+        self.vertex_bindings = self
+            .vertex_bindings
+            .iter()
+            .filter(|b| bindings & (1 << b.binding) != 0)
+            .copied()
+            .collect();
+        self.vertex_divisors = self
+            .vertex_divisors
+            .iter()
+            .filter(|(b, _)| bindings & (1 << b) != 0)
+            .copied()
+            .collect();
+    }
+
     pub(crate) fn normalized(mut self, dynamic: &[vk::DynamicState]) -> Self {
         if dynamic.contains(&vk::DynamicState::CULL_MODE) {
             self.cull = vk::CullModeFlags::NONE;

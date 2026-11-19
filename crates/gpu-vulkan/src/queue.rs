@@ -164,7 +164,8 @@ pub(crate) struct Slot {
     pub bound_graphics_layout: vk::PipelineLayout,
     pub bound_compute: usize,
     pub bound_graphics: usize,
-    pub vertex_channel: Option<u64>,
+    pub geometry_owner: Option<GeometryOwner>,
+    pub index_binding: Option<(vk::Buffer, u64, vk::IndexType)>,
     pub push_layout: vk::PipelineLayout,
     pub push_stages: vk::ShaderStageFlags,
     pub push_bytes: Vec<u8>,
@@ -194,7 +195,8 @@ impl Slot {
             bound_graphics_layout: vk::PipelineLayout::null(),
             bound_compute: 0,
             bound_graphics: 0,
-            vertex_channel: None,
+            geometry_owner: None,
+            index_binding: None,
             push_layout: vk::PipelineLayout::null(),
             push_stages: vk::ShaderStageFlags::empty(),
             push_bytes: Vec::new(),
@@ -559,7 +561,8 @@ impl QueueState {
         slot.tick = tick;
         slot.bound_compute = 0;
         slot.bound_graphics = 0;
-        slot.vertex_channel = None;
+        slot.geometry_owner = None;
+        slot.index_binding = None;
         slot.push_layout = vk::PipelineLayout::null();
         slot.push_stages = vk::ShaderStageFlags::empty();
         slot.push_bytes.clear();
@@ -633,6 +636,18 @@ impl QueueState {
             self.completed.max(self.progress.completed()),
         )?;
         Ok(slice)
+    }
+    pub(crate) fn retain_predicate(&mut self, buffer: &Arc<AllocatedBuffer>) {
+        let slot = &mut self.slots[self
+            .recording
+            .expect("predicate requires active command buffer")];
+        if !slot
+            .retired_buffers
+            .last()
+            .is_some_and(|last| Arc::ptr_eq(last, buffer))
+        {
+            slot.retired_buffers.push(Arc::clone(buffer));
+        }
     }
     pub(crate) fn staging_buffer(&self, slice: &Slice) -> &Arc<AllocatedBuffer> {
         self.staging.buffer(slice)
@@ -1057,3 +1072,9 @@ impl Drop for VulkanDevice {
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GeometryOwner {
+    Channel(u64),
+    StaticPipeline(usize),
+}

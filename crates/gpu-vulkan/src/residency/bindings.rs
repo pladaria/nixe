@@ -263,6 +263,18 @@ impl Residency<'_> {
         slot: u32,
         vertex: Option<VertexBuffer>,
     ) -> Result<(), VulkanError> {
+        if self
+            .runtime
+            .buffer_bindings
+            .channel
+            .vertex_buffers
+            .get(slot as usize)
+            .copied()
+            .flatten()
+            == vertex
+        {
+            return Ok(());
+        }
         if let Some(vertex) = vertex {
             self.check_buffer_range(vertex.buffer, vertex.offset, vertex.size)?;
             if vertex.binding != slot
@@ -294,7 +306,7 @@ impl Residency<'_> {
     /// the cold LUT path that replaces storage after finishing a scheduler prefix.
     pub(crate) fn bind_host_geometry_buffers(
         &mut self,
-        channel: Option<u64>,
+        channel: Option<crate::queue::GeometryOwner>,
         enabled: u32,
         draw: Draw,
         native_index: Option<&NativeIndexBuffer>,
@@ -349,6 +361,13 @@ impl Residency<'_> {
                 ));
             }
         }
+        let recording = self.runtime.device.submission.recording.unwrap();
+        let selected = &mut self.runtime.device.submission.slots[recording].index_binding;
+        let binding = (buffer, offset, kind);
+        if *selected == Some(binding) {
+            return Ok(());
+        }
+        *selected = Some(binding);
         self.runtime.device.submission.statistics.index_binds += 1;
         unsafe {
             self.runtime
@@ -364,17 +383,17 @@ impl Residency<'_> {
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L810-L860
     fn bind_host_vertex_buffers(
         &mut self,
-        channel: Option<u64>,
+        channel: Option<crate::queue::GeometryOwner>,
         mut enabled: u32,
         stride: impl Fn(u32) -> u32,
     ) -> Result<(), VulkanError> {
         let work = self.runtime.device.current_work();
         let recording = self.runtime.device.submission.recording.unwrap();
         let slot = &mut self.runtime.device.submission.slots[recording];
-        if channel.is_none() || slot.vertex_channel != channel {
+        if channel.is_none() || slot.geometry_owner != channel {
             self.runtime.buffer_bindings.channel.dirty_vertex_buffers |= enabled;
         }
-        slot.vertex_channel = channel;
+        slot.geometry_owner = channel;
         let mut first = 0;
         let mut buffers = smallvec::SmallVec::<[vk::Buffer; 32]>::new();
         let mut offsets = smallvec::SmallVec::<[u64; 32]>::new();
@@ -459,6 +478,9 @@ impl Residency<'_> {
         }
     }
     pub fn bind_index_buffer(&mut self, index: Option<IndexBuffer>) -> Result<(), VulkanError> {
+        if self.runtime.buffer_bindings.channel.index_buffer == index {
+            return Ok(());
+        }
         if let Some(index) = index {
             let element = match index.kind {
                 vk::IndexType::UINT16 => 2,

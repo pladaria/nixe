@@ -695,17 +695,29 @@ impl Residency<'_> {
         if entry.dma.mixed_authority {
             self.runtime.device_memory.invalidate_read_areas();
         }
-        for &(address, bytes) in &entry.maps {
-            if !entry.gpu_modified {
-                self.runtime.device_memory.mark_gpu_written(address, bytes);
-            } else {
-                self.runtime
-                    .device_memory
-                    .invalidate_command_pages(address, bytes);
+        let memory = &self.runtime.device_memory;
+        let generation = [memory.generation(), memory.command_generation()];
+        // An image's mapped extent is fixed at creation. Newly registered
+        // command pages and changes of physical mapping both invalidate a miss.
+        let check_commands = generation[1] != 0 && entry.command_free != Some(generation);
+        if !entry.gpu_modified || check_commands {
+            let mut overlaps = false;
+            for &(address, bytes) in &entry.maps {
+                if !entry.gpu_modified {
+                    memory.mark_gpu_written(address, bytes);
+                }
+                if check_commands
+                    && self.caches.command_pages.draw_write(
+                        memory,
+                        address,
+                        bytes,
+                        entry.gpu_modified,
+                    )
+                {
+                    overlaps = true;
+                }
             }
-            self.caches
-                .command_pages
-                .draw_write(&self.runtime.device_memory, address, bytes);
+            entry.command_free = (!overlaps).then_some(generation);
         }
         entry.gpu_modified = true;
         Ok(())

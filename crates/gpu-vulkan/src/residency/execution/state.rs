@@ -1,4 +1,32 @@
 use super::*;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DynamicValues {
+    viewport: [u32; 6],
+    scissor: vk::Rect2D,
+    width: u32,
+    bias: [u32; 3],
+    blend: [u32; 4],
+    bounds: [u32; 2],
+    compare: [u32; 2],
+    write: [u32; 2],
+    reference: [u32; 2],
+}
+impl DynamicValues {
+    fn single(p: &GraphicsParameters) -> Self {
+        let v = p.viewports[0];
+        Self {
+            viewport: [v.x, v.y, v.width, v.height, v.min_depth, v.max_depth].map(f32::to_bits),
+            scissor: p.scissors[0],
+            width: p.line_width.to_bits(),
+            bias: p.depth_bias.map(f32::to_bits),
+            blend: p.blend_constants.map(f32::to_bits),
+            bounds: p.depth_bounds.map(f32::to_bits),
+            compare: p.stencil_compare_mask,
+            write: p.stencil_write_mask,
+            reference: p.stencil_reference,
+        }
+    }
+}
 pub struct GraphicsParameters {
     pub state: GraphicsState,
     pub(crate) vertex_input: crate::native::VertexInput,
@@ -181,6 +209,73 @@ impl Residency<'_> {
         self.runtime.device.submission.slots[index]
             .graphics_state
             .parameters_id = Some(identity);
+        Ok(())
+    }
+    pub(super) fn graphics_state_nvn(
+        &mut self,
+        pipeline: &NativePipeline,
+        p: &GraphicsParameters,
+        owner: u64,
+    ) -> Result<(), VulkanError> {
+        let index = self.runtime.device.recording_slot()?;
+        let next = DynamicValues::single(p);
+        let previous = self.runtime.device.submission.slots[index]
+            .graphics_state
+            .nvn;
+        if let Some((id, old)) = previous
+            && id == owner
+        {
+            if old == next {
+                return Ok(());
+            }
+            self.validate_dynamic_parameters(p)?;
+            let raw = &mut self.runtime.device.dispatch;
+            unsafe {
+                if old.viewport != next.viewport {
+                    raw.cmd_set_viewport(0, &p.viewports);
+                }
+                if old.scissor != next.scissor {
+                    raw.cmd_set_scissor(0, &p.scissors);
+                }
+                if old.width != next.width {
+                    raw.cmd_set_line_width(p.line_width);
+                }
+                if old.bias != next.bias {
+                    raw.cmd_set_depth_bias(p.depth_bias[0], p.depth_bias[1], p.depth_bias[2]);
+                }
+                if old.blend != next.blend {
+                    raw.cmd_set_blend_constants(&p.blend_constants);
+                }
+                for (i, face) in [vk::StencilFaceFlags::FRONT, vk::StencilFaceFlags::BACK]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if old.compare[i] != next.compare[i] {
+                        raw.cmd_set_stencil_compare_mask(face, next.compare[i]);
+                    }
+                    if old.write[i] != next.write[i] {
+                        raw.cmd_set_stencil_write_mask(face, next.write[i]);
+                    }
+                    if old.reference[i] != next.reference[i] {
+                        raw.cmd_set_stencil_reference(face, next.reference[i]);
+                    }
+                }
+                if old.bounds != next.bounds
+                    && pipeline
+                        .dynamic_states
+                        .contains(&vk::DynamicState::DEPTH_BOUNDS)
+                {
+                    raw.cmd_set_depth_bounds(p.depth_bounds[0], p.depth_bounds[1]);
+                }
+            }
+            self.runtime.device.submission.statistics.graphics_updates += 1;
+        } else {
+            self.validate_dynamic_parameters(p)?;
+            self.graphics_state(pipeline, p)?;
+        }
+        self.runtime.device.submission.slots[index]
+            .graphics_state
+            .nvn = Some((owner, next));
         Ok(())
     }
     pub(crate) fn graphics_state(

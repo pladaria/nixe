@@ -2,6 +2,100 @@
 use super::commands::plane_range;
 use super::*;
 impl Residency<'_> {
+    /// Upload tightly packed guest texels directly from the resident GPU buffer.
+    pub(crate) fn upload_packed_region(
+        &mut self,
+        image: ImageId,
+        [mip, layer]: [u32; 2],
+        source: u64,
+        [x, y, z, w, h, d]: [u32; 6],
+    ) -> Result<(), VulkanError> {
+        if w == 0 || h == 0 || d == 0 {
+            return Ok(());
+        }
+        self.runtime.constructing.push(Resource::Image(image));
+        let retained = self.runtime.constructing.len() - 1;
+        let result = (|| {
+            self.scale_image(image, false, false)?;
+            let entry = self.texture_cache.get(image);
+            let volume = entry.description.image_type == vk::ImageType::TYPE_3D;
+            let plane = entry
+                .planes
+                .iter()
+                .find(|p| p.mip_level == mip && p.array_layer == layer)
+                .copied()
+                .ok_or(VulkanError::InvalidResource("missing target plane"))?;
+            if plane.aspect != vk::ImageAspectFlags::COLOR {
+                return Err(VulkanError::InvalidResource(
+                    "packed transfer to depth/stencil image",
+                ));
+            }
+            let end_layer = if volume {
+                (entry.description.extent.depth >> mip).max(1)
+            } else {
+                entry.description.array_layers - layer
+            };
+            if x.checked_add(w).is_none_or(|n| n > plane.extent.width)
+                || y.checked_add(h).is_none_or(|n| n > plane.extent.height)
+                || z.checked_add(d).is_none_or(|n| n > end_layer)
+            {
+                return Err(VulkanError::InvalidResource(
+                    "packed image copy out of bounds",
+                ));
+            }
+            let bytes = u64::from(w.div_ceil(plane.block_extent.width))
+                * u64::from(h.div_ceil(plane.block_extent.height))
+                * u64::from(d)
+                * u64::from(plane.bytes_per_block);
+            let buffer = self.device_buffer(
+                source,
+                bytes,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                true,
+                false,
+            )?;
+            self.runtime
+                .constructing
+                .push(Resource::Buffer(buffer.buffer));
+            self.prepare_image(image, true, false)?;
+            let layers = plane
+                .layers()
+                .base_array_layer(if volume { layer } else { layer + z })
+                .layer_count(if volume { 1 } else { d });
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(buffer.offset)
+                .image_subresource(layers)
+                .image_offset(vk::Offset3D {
+                    x: x as i32,
+                    y: y as i32,
+                    z: if volume { z as i32 } else { 0 },
+                })
+                .image_extent(vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: if volume { d } else { 1 },
+                });
+            let src = self.use_buffer(buffer.buffer, buffer.offset, bytes)?;
+            let planes = self.texture_cache.get(image).planes.clone();
+            let selected = planes.iter().copied().filter(|p| {
+                p.mip_level == mip
+                    && (layers.base_array_layer..layers.base_array_layer + layers.layer_count)
+                        .contains(&p.array_layer)
+            });
+            let (dst, layout) = self.image_planes_transfer(image, selected)?;
+            self.runtime.barriers.emit(&mut self.runtime.device)?;
+            unsafe {
+                self.runtime
+                    .device
+                    .dispatch
+                    .copy_buffer_to_image(src, dst, layout, &[region]);
+            }
+            Ok(())
+        })();
+        self.runtime.constructing.truncate(retained);
+        result
+    }
+
     pub(super) fn transfer_planes(
         &self,
         source: ImageId,

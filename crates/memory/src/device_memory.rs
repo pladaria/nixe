@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
-        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
 };
 mod reader;
@@ -237,7 +237,7 @@ pub(crate) struct Inner {
     owner_read_invalidations: AtomicU64,
     command_versions: Box<[OnceLock<Box<CommandVersions>>]>,
     command_blocks: Box<[AtomicU64]>,
-    has_command_pages: AtomicBool,
+    command_generation: AtomicU64,
     read_generation: AtomicU64,
     // Pin coverage is serialized independently of table readers. Cache
     // invalidation may inspect the original backing before taking its writer.
@@ -249,6 +249,7 @@ pub(crate) struct Inner {
 }
 #[derive(Debug)]
 struct CommandVersions {
+    published: AtomicU64,
     mask: AtomicU64,
     // Low bit: the full physical page is synchronized to RAM. Higher bits:
     // content generation. Host stores preserve synchronization; GPU producers
@@ -396,7 +397,7 @@ impl DeviceMemory {
             command_blocks: (0..physical_pages.div_ceil(4096))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
-            has_command_pages: AtomicBool::new(false),
+            command_generation: AtomicU64::new(0),
             read_generation: AtomicU64::new(1),
             generation: AtomicU64::new(1),
             counts: (0..1usize << (address_bits - LEAF_SHIFT))
@@ -460,11 +461,13 @@ impl DeviceMemory {
             written = true;
             let versions = self.0.command_versions[page / 64].get_or_init(|| {
                 Box::new(CommandVersions {
+                    published: AtomicU64::new(0),
                     mask: AtomicU64::new(0),
                     versions: std::array::from_fn(|_| AtomicU64::new(0)),
                 })
             });
-            if versions.versions[page % 64].load(Ordering::Acquire) == 0 {
+            let bit = 1 << (page % 64);
+            if versions.published.load(Ordering::Acquire) & bit == 0 {
                 let _ = versions.versions[page % 64].compare_exchange(
                     0,
                     2,
@@ -474,11 +477,17 @@ impl DeviceMemory {
                 versions.mask.fetch_or(1 << (page % 64), Ordering::Release);
                 self.0.command_blocks[page / 4096]
                     .fetch_or(1 << (page / 64 % 64), Ordering::Release);
-                self.0.has_command_pages.store(true, Ordering::Release);
+                // A registration returning on another core must also observe
+                // the index and invalidate earlier negative coverage results.
+                self.0.command_generation.fetch_add(1, Ordering::Release);
+                versions.published.fetch_or(bit, Ordering::Release);
             }
             false
         });
         written
+    }
+    pub fn command_generation(&self) -> u64 {
+        self.0.command_generation.load(Ordering::Acquire)
     }
     pub fn command_version(&self, physical_page: u64) -> u64 {
         self.command_page_state(physical_page).0
@@ -499,7 +508,7 @@ impl DeviceMemory {
     /// empty 16 MiB ranges; the leaves select individual pages. Both indexes
     /// are monotonic, so aliases and mapping retirement cannot clear a writer.
     pub fn visit_command_pages(&self, address: u64, bytes: u64, mut visit: impl FnMut(u64, u64)) {
-        if bytes == 0 || !self.0.has_command_pages.load(Ordering::Acquire) {
+        if bytes == 0 || self.command_generation() == 0 {
             return;
         }
         let end = address + bytes;
@@ -542,13 +551,27 @@ impl DeviceMemory {
         }
     }
     pub fn invalidate_command_pages(&self, address: u64, bytes: u64) {
+        self.visit_command_writes(address, bytes, true, |_| {});
+    }
+    /// Notify retained readers after a GPU write has invalidated the version.
+    /// First producers already advance the version in mark_gpu_written.
+    pub fn visit_command_writes(
+        &self,
+        address: u64,
+        bytes: u64,
+        advance: bool,
+        mut visit: impl FnMut(u64),
+    ) {
         self.visit_command_pages(address, bytes, |_, physical| {
-            let page = (physical / PAGE_SIZE) as usize;
-            self.0.command_versions[page / 64].get().unwrap().versions[page % 64]
-                .fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
+            if advance {
+                let page = (physical / PAGE_SIZE) as usize;
+                let version =
+                    &self.0.command_versions[page / 64].get().unwrap().versions[page % 64];
+                let _ = version.fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
                     Some((state.wrapping_add(2)) & !1)
-                })
-                .ok();
+                });
+            }
+            visit(physical);
         });
     }
     /// A RAM store invalidates retained GPU copies without making an already
@@ -1284,6 +1307,65 @@ mod tests {
             .unwrap()
             .into();
         (space, inputs)
+    }
+
+    #[test]
+    fn scatter_reads_leave_gpu_cached_words_for_the_coherency_owner() {
+        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
+        let (space, input) = cpu_pages(&machine, 0x10000, 2 * PAGE_SIZE);
+        let first = crate::GuestVirtualAddress::new(0x10000);
+        let second = first.checked_add(PAGE_SIZE).unwrap();
+        space
+            .write_value(first, 4, 17)
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        space
+            .write_value(second, 4, 42)
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        let device = DeviceMemory::new(machine, 34);
+        let reservation = device.reserve(PAGE_SIZE * 2, PAGE_SIZE).unwrap();
+        let _mapping = device.map(reservation.address(), input, true).unwrap();
+        let cached = reservation.address() + PAGE_SIZE;
+        device
+            .update_pages_cached_count(cached, PAGE_SIZE, 1)
+            .unwrap();
+        let mut words = [(first, 0), (second, 0), (first, 0)];
+        assert_eq!(space.read_direct_words(&mut words).unwrap(), 1);
+        assert_eq!(words.map(|(_, word)| word), [17, 0, 0]);
+        device
+            .update_pages_cached_count(cached, PAGE_SIZE, -1)
+            .unwrap();
+        assert_eq!(space.read_direct_words(&mut words[1..]).unwrap(), 2);
+        assert_eq!(words.map(|(_, word)| word), [17, 42, 17]);
+    }
+
+    #[test]
+    fn registering_an_alias_invalidates_negative_command_page_coverage() {
+        let machine = Machine::new(4 * PAGE_SIZE).unwrap();
+        let (_space, input) = cpu_pages(&machine, 0x10000, 2 * PAGE_SIZE);
+        let memory = DeviceMemory::new(machine, 34);
+        let _image = memory.map(0x10000, input.clone(), true).unwrap();
+        let _alias = memory.map(0x30000, input, true).unwrap();
+        memory.mark_gpu_written(0x10000, 2 * PAGE_SIZE);
+        assert_eq!(memory.command_generation(), 0);
+        assert!(memory.register_command_pages(0x31000, PAGE_SIZE));
+        let generation = memory.command_generation();
+        assert!(generation > 0);
+        assert!(memory.register_command_pages(0x11000, PAGE_SIZE));
+        assert_eq!(memory.command_generation(), generation);
+        let physical = memory.physical_address(0x31000).unwrap().get();
+        memory.sync_command_pages(0x31000, PAGE_SIZE);
+        let (version, synced) = memory.command_page_state(physical);
+        assert!(synced);
+        let mut visited = Vec::new();
+        memory.visit_command_writes(0x10000, 2 * PAGE_SIZE, true, |page| {
+            visited.push(page);
+            assert_eq!(memory.command_page_state(page), (version + 1, false));
+        });
+        assert_eq!(visited, [physical]);
     }
 
     #[test]

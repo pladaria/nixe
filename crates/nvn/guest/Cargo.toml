@@ -1,0 +1,18 @@
+[package]
+name = "nixe-nvn-guest"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+# Built for the guest ISA independently of the host workspace.
+[workspace]
+
+[dependencies]
+arrayvec = { version = "0.7", default-features = false }
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

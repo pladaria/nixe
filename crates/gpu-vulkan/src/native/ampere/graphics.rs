@@ -805,7 +805,7 @@ impl NativeExecution<'_> {
                 continue 'draw;
             }
             self.residency.bind_host_geometry_buffers(
-                Some(source.channel),
+                Some(crate::queue::GeometryOwner::Channel(source.channel)),
                 enabled,
                 draw,
                 None,
@@ -894,6 +894,7 @@ impl NativeExecution<'_> {
                 descriptors,
                 draw,
                 push.as_bytes(),
+                None,
                 r.get(0x1514) != 0,
                 |aspect| {
                     Ok(crate::residency::execution::attachment_read_only(
@@ -1008,38 +1009,11 @@ impl Pipeline {
         let shader =
             crate::cache::compile_guest(pools, programs, configuration, Some(&key.runtime()))
                 .map_err(compilation)?;
-        let vertex = shader
-            .stages
-            .iter()
-            .find(|stage| stage.stage == nixe_gpu::ShaderStage::Vertex)
-            .and_then(|stage| stage.guest.as_ref())
+        let vertex_attributes = shader
+            .vertex_input_mask()
             .ok_or_else(|| compilation("native pipeline has no vertex shader"))?;
-        let vertex_attributes = (0..32).fold(0, |mask, i| {
-            mask | (u32::from(vertex.info.loads.generic(i)) << i)
-        });
         let mut graphics = key.graphics.clone();
-        graphics.vertex_attributes = graphics
-            .vertex_attributes
-            .iter()
-            .filter(|a| vertex_attributes & (1 << a.location) != 0)
-            .cloned()
-            .collect();
-        let bindings = graphics
-            .vertex_attributes
-            .iter()
-            .fold(0, |mask, a| mask | (1 << a.binding));
-        graphics.vertex_bindings = graphics
-            .vertex_bindings
-            .iter()
-            .filter(|b| bindings & (1 << b.binding) != 0)
-            .cloned()
-            .collect();
-        graphics.vertex_divisors = graphics
-            .vertex_divisors
-            .iter()
-            .filter(|(b, _)| bindings & (1 << b) != 0)
-            .copied()
-            .collect();
+        graphics.retain_vertex_inputs(vertex_attributes);
         let recipe = PipelineRecipe::Graphics {
             shader: Arc::clone(&shader),
             state: graphics,

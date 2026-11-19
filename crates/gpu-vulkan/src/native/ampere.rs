@@ -567,6 +567,7 @@ impl NativeExecution<'_> {
                         stencil: r.get(0xda0) & 255,
                     },
                     aspects.contains(vk::ImageAspectFlags::DEPTH),
+                    None,
                 )?;
             }
             Ok(())

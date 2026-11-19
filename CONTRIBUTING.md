@@ -52,6 +52,12 @@ production compatibility paths solely to keep obsolete tests passing.
 
 When implementation relies on external technical references, link them in a nearby comment.
 
+NVN HLE procedures that operate on guest registers and memory live in
+`crates/nvn/guest`. After changing those procedures or their shared ABI, run
+`python3 scripts/build-nvn-guest.py` and include the regenerated AArch64 image and
+entry offsets in the change. Use `--check` to verify both outputs. Regeneration
+requires the `aarch64-unknown-linux-gnu` Rust target, rustfmt and Python's pyelftools.
+
 ## Language and contents
 
 Use English for source code, comments, documentation, and commits. Do not include copyrighted games, firmware,

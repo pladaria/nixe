@@ -152,6 +152,16 @@ impl Residency<'_> {
         clear_rect: vk::ClearRect,
         clears: &[vk::ClearAttachment],
     ) -> Result<WorkTicket, VulkanError> {
+        self.clear_framebuffer_if(targets, clear_rect, clears, None)
+    }
+
+    pub(crate) fn clear_framebuffer_if(
+        &mut self,
+        targets: &Arc<PreparedTargets>,
+        clear_rect: vk::ClearRect,
+        clears: &[vk::ClearAttachment],
+        predicate: Option<&Arc<crate::memory::AllocatedBuffer>>,
+    ) -> Result<WorkTicket, VulkanError> {
         let rect = clear_rect.rect;
         if !contains_rect(targets.area, rect)
             || clear_rect.layer_count == 0
@@ -233,7 +243,8 @@ impl Residency<'_> {
                     .active_render_pass
                     .is_some()
             });
-            let can_defer = !active
+            let can_defer = predicate.is_none()
+                && !active
                 && clear_rect.base_array_layer == 0
                 && clear_rect.layer_count == targets.framebuffer.layers
                 && rect == targets.area
@@ -269,11 +280,18 @@ impl Residency<'_> {
                 }
             } else {
                 self.runtime.device.request_render_pass(targets)?;
+                if let Some(buffer) = predicate {
+                    self.runtime.device.submission.retain_predicate(buffer);
+                    self.runtime.device.dispatch.begin_predicate(buffer.handle);
+                }
                 unsafe {
                     self.runtime
                         .device
                         .dispatch
                         .cmd_clear_attachments(&actual, &[clear_rect]);
+                }
+                if predicate.is_some() {
+                    self.runtime.device.dispatch.end_predicate();
                 }
             }
             Ok(self.runtime.device.current_work())

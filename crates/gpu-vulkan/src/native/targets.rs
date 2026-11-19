@@ -17,6 +17,14 @@ impl super::NativeExecution<'_> {
         info: &nixe_gpu::native::ImageInfo,
         space: &(impl nixe_gpu::native::ImageAddressSpace + ?Sized),
     ) -> Result<crate::ImageViewId, crate::VulkanError> {
+        self.image_target_layers(info, space, None)
+    }
+    pub(super) fn image_target_layers(
+        &mut self,
+        info: &nixe_gpu::native::ImageInfo,
+        space: &(impl nixe_gpu::native::ImageAddressSpace + ?Sized),
+        slices: Option<(u32, u32)>,
+    ) -> Result<crate::ImageViewId, crate::VulkanError> {
         let (image, [base_mip, base_layer]) = self.find_or_insert_image(info, space)?;
         let aspects = self
             .residency
@@ -49,9 +57,9 @@ impl super::NativeExecution<'_> {
                 aspects,
                 base_mip,
                 mip_count: 1,
-                base_layer,
+                base_layer: base_layer + slices.map_or(0, |s| s.0),
                 layer_count: if info.description.dimension() == nixe_gpu::ImageDimension::Three {
-                    info.description.extent().depth
+                    slices.map_or(info.description.extent().depth, |s| s.1)
                 } else {
                     u32::from(info.description.array_layers())
                 },

@@ -1036,6 +1036,32 @@ impl AddressSpace {
         }
         Ok(kinds)
     }
+    /// Read the ordinary-RAM prefix of a scatter list under one mapping admission.
+    /// The first word requiring coherent or cross-page access is left to the caller.
+    pub fn read_direct_words(
+        &self,
+        words: &mut [(GuestVirtualAddress, u32)],
+    ) -> Result<usize, MemoryError> {
+        let _access = self.quiescence.enter_host()?;
+        for (i, (address, word)) in words.iter_mut().enumerate() {
+            self.range(*address, 4)?;
+            let at = address.get();
+            if at % PAGE_SIZE > PAGE_SIZE - 4 {
+                return Ok(i);
+            }
+            // Admission retains the PTE and its backing until the scalar load completes.
+            let entry = unsafe { self.raw_entry(at) };
+            if entry & MARKED != 0 || entry == 0 {
+                require_entry(entry, *address, MemoryPermissions::READ)?;
+                if entry_cached(entry) {
+                    return Ok(i);
+                }
+            }
+            *word = unsafe { crate::raw::read_value(entry_pointer(entry, at), 4) } as u32;
+        }
+        Ok(words.len())
+    }
+
     pub fn read_into(
         &self,
         start: GuestVirtualAddress,

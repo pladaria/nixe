@@ -14,6 +14,7 @@ pub(crate) struct DynamicState {
 /// All other setters consume their individual engine flags directly.
 #[derive(Default)]
 pub(crate) struct CommandState {
+    pub(crate) nvn: Option<(u64, crate::residency::execution::DynamicValues)>,
     pub(crate) parameters_id: Option<u64>,
     rescaled: bool,
     initialized: bool,
@@ -26,6 +27,7 @@ pub(crate) struct CommandState {
 }
 impl CommandState {
     pub(crate) fn invalidate(&mut self) {
+        self.nvn = None;
         self.parameters_id = None;
         self.topology = None;
         self.stencil_reset = true;
@@ -49,6 +51,7 @@ pub(in crate::native) fn record(
     let resolution = residency.resolution();
     let device = &mut residency.runtime.device;
     let command = &mut device.submission.slots[index].graphics_state;
+    command.nvn = None;
     command.parameters_id = None;
     let first = !command.initialized;
     let topology_changed = first || command.topology != Some(draw.topology);

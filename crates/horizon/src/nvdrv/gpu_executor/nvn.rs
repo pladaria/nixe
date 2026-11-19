@@ -1,44 +1,67 @@
 use super::*;
-use nixe_nvn::{Fence, Operation, Texture};
+use nixe_nvn::{Fence, Submission, Texture};
 pub(super) enum Work {
-    Submit(Vec<Operation>),
+    Submit(u64, Submission),
     Flush,
-    Fence(Arc<Fence>),
-    AcquireFence(Arc<Fence>),
-    Present(Texture, u32, Option<nixe_video::FrameMailbox>, u64),
+    Drain,
+    FinalizeQueue(u64),
+    Fence(nixe_gpu::FenceAction),
+    AcquireFence(nixe_gpu::FenceAction),
+    Present(Texture, u32, bool, Option<nixe_video::FrameMailbox>, u64),
 }
 pub(super) struct Request {
     work: Work,
-    reply: mpsc::SyncSender<nixe_nvn::Result<()>>,
+    reply: Option<mpsc::SyncSender<nixe_nvn::Result<()>>>,
+    _permit: Option<GpuFrontendPermit>,
 }
 impl Request {
-    pub(super) fn run(self, backend: &mut impl nixe_gpu::GpuPresentation) {
+    pub(super) fn run(
+        self,
+        backend: &mut impl nixe_gpu::GpuPresentation,
+    ) -> Result<(), nixe_gpu::BackendRuntimeError> {
         let result = match self.work {
-            Work::Submit(commands) => backend.nvn_submit(commands),
+            Work::Submit(queue, commands) => backend.nvn_submit(queue, commands),
             Work::Flush => backend.flush(),
-            Work::Fence(fence) => backend.submit(Some(signal(fence))),
-            Work::AcquireFence(fence) => backend.nvn_acquire_fence(signal(fence)),
-            Work::Present(t, interval, mailbox, sequence) => {
-                backend.nvn_present(t, interval).map(|image| {
+            Work::Drain => Ok(()),
+            Work::FinalizeQueue(queue) => backend.nvn_finalize_queue(queue),
+            Work::Fence(action) => backend.submit(Some(action)),
+            Work::AcquireFence(action) => backend.nvn_acquire_fence(action),
+            Work::Present(t, interval, flip_vertical, mailbox, sequence) => backend
+                .nvn_present(t, interval, flip_vertical)
+                .map(|image| {
                     if let Some(mailbox) = mailbox {
                         mailbox.publish(Arc::new(nixe_video::PresentationFrame::new(
                             image, sequence,
                         )))
                     }
-                })
-            }
+                }),
         };
-        let _ = self.reply.send(result.map_err(|e| e.to_string().into()));
+        if let Some(reply) = self.reply {
+            let _ = reply.send(result.as_ref().copied().map_err(|e| e.to_string().into()));
+        }
+        result
+    }
+}
+/// The owner may stop before recording the fence, or before its timeline callback.
+struct PendingSignal(Option<Arc<Fence>>);
+impl PendingSignal {
+    fn finish(&mut self, result: nixe_nvn::Result<()>) {
+        if let Some(fence) = self.0.take() {
+            fence.signal(result);
+        }
+    }
+}
+impl Drop for PendingSignal {
+    fn drop(&mut self) {
+        if let Some(fence) = self.0.take() {
+            fence.signal(Err("GPU owner stopped before NVN fence completion".into()));
+        }
     }
 }
 fn signal(fence: Arc<Fence>) -> nixe_gpu::FenceAction {
+    let mut pending = PendingSignal(Some(fence));
     Box::new(move |result| {
-        fence.signal(
-            result
-                .as_ref()
-                .map(|_| ())
-                .map_err(|e| e.to_string().into()),
-        );
+        pending.finish(result.as_ref().copied().map_err(|e| e.to_string().into()));
         result
     })
 }
@@ -61,37 +84,83 @@ impl Client {
     fn execute(&self, work: Work) -> nixe_nvn::Result<()> {
         let backend = self.backend.upgrade().ok_or("GPU owner stopped")?;
         backend.require_healthy().map_err(|e| e.to_string())?;
-        let (reply, done) = mpsc::sync_channel(1);
+        // Bound queued work, including small control packets. When full, let
+        // this caller wait behind its own request without overtaking older lists.
+        let charge = match &work {
+            Work::Submit(_, ops) => ops
+                .operations
+                .capacity()
+                .saturating_mul(size_of::<nixe_nvn::Operation>())
+                .saturating_add(
+                    ops.draws
+                        .capacity()
+                        .saturating_mul(size_of::<nixe_nvn::Draw>()),
+                )
+                .saturating_add(ops.update_bytes),
+            _ => 0,
+        }
+        .max(MAX_GPU_INGRESS_BYTES / 64);
+        let permit = match backend.budget.reserve(charge).ok_or("GPU owner stopped")? {
+            GpuSubmissionAdmission::Ready(permit) => Some(permit),
+            GpuSubmissionAdmission::Pending(_) => None,
+        };
+        let wait = permit.is_none() || matches!(work, Work::Drain);
+        let (reply, done) = if wait {
+            let (tx, rx) = mpsc::sync_channel(1);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         backend
             .sender
             .lock()
             .unwrap()
             .as_ref()
             .ok_or("GPU owner stopped")?
-            .send(GpuMessage::Nvn(Request { work, reply }))
+            .send(GpuMessage::Nvn(Request {
+                work,
+                reply,
+                _permit: permit,
+            }))
             .map_err(|_| "GPU owner stopped")?;
-        done.recv()
-            .map_err(|_| "GPU owner stopped before NVN execution")?
+        if let Some(done) = done {
+            done.recv()
+                .map_err(|_| "GPU owner stopped before NVN execution")?
+        } else {
+            Ok(())
+        }
     }
 }
 impl nixe_nvn::Backend for Client {
-    fn submit(&self, ops: Vec<Operation>) -> nixe_nvn::Result<()> {
-        self.execute(Work::Submit(ops))
+    fn submit(&self, queue: u64, ops: Submission) -> nixe_nvn::Result<()> {
+        self.execute(Work::Submit(queue, ops))
+    }
+    fn drain(&self) -> nixe_nvn::Result<()> {
+        self.execute(Work::Drain)
+    }
+    fn finalize_queue(&self, queue: u64) -> nixe_nvn::Result<()> {
+        self.execute(Work::FinalizeQueue(queue))
     }
     fn acquire_fence(&self, f: Arc<Fence>) -> nixe_nvn::Result<()> {
-        self.execute(Work::AcquireFence(f))
+        self.execute(Work::AcquireFence(signal(f)))
     }
     fn fence(&self, f: Arc<Fence>) -> nixe_nvn::Result<()> {
-        self.execute(Work::Fence(f))
+        self.execute(Work::Fence(signal(f)))
     }
     fn flush(&self) -> nixe_nvn::Result<()> {
         self.execute(Work::Flush)
     }
-    fn present(&self, t: Texture, interval: u32) -> nixe_nvn::Result<()> {
+    fn present(&self, t: Texture, interval: u32, flip_vertical: bool) -> nixe_nvn::Result<()> {
         let seq = self
             .sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        self.execute(Work::Present(t, interval, self.mailbox.clone(), seq))
+        self.execute(Work::Present(
+            t,
+            interval,
+            flip_vertical,
+            self.mailbox.clone(),
+            seq,
+        ))
     }
 }

@@ -1,50 +1,122 @@
 //! Record values in the guest-provided command memory. EndRecording returns a
 //! control-memory handle; a submit reads the command bytes as they stand then.
 use super::*;
-use bytemuck::{Pod, Zeroable};
+
 use smallvec::SmallVec;
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Pod, Zeroable)]
-#[repr(C)]
-pub struct Range {
-    pub address: u64,
-    pub size: u64,
+
+#[derive(Copy, Clone, Debug)]
+pub struct Dynamic {
+    pub depth_bounds: [f32; 2],
+    pub depth_bias: [f32; 3],
+    pub line_width: f32,
+    pub stencil_ref: [u32; 2],
+    pub stencil_compare: [u32; 2],
+    pub stencil_write: [u32; 2],
 }
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Pod, Zeroable)]
-#[repr(C)]
-pub struct VertexStream {
-    pub stride: u32,
-    pub divisor: u32,
+impl Default for Dynamic {
+    fn default() -> Self {
+        Self {
+            depth_bounds: [0., 1.],
+            depth_bias: [0.; 3],
+            line_width: 1.,
+            stencil_ref: [0; 2],
+            stencil_compare: [u32::MAX; 2],
+            stencil_write: [u32::MAX; 2],
+        }
+    }
 }
-#[derive(Clone, Copy, Debug)]
-pub struct Sampled {
-    pub stage: u32,
-    pub slot: u32,
-    pub texture: Texture,
-    pub sampler: Sampler,
+/// Immutable pipeline inputs shared by draws until the queue selects different state.
+#[derive(Clone, Default, Debug, PartialEq, Eq, Hash)]
+pub struct DrawPipeline {
+    pub shaders: SmallVec<[Shader; 2]>,
+    pub streams: SmallVec<[VertexStream; 2]>,
+    pub attributes: SmallVec<[u32; 4]>,
+    pub primitive: u32,
+    pub upper_left: bool,
+    pub minus_one_to_one: bool,
+    pub samples: u32,
+    pub color_formats: SmallVec<[Option<u16>; 1]>,
+    pub depth_format: Option<u16>,
+    pub raster: RasterState,
+    pub shapes: Arc<[TextureShape]>,
+}
+#[derive(Clone, Debug, Default)]
+pub struct Attachments {
+    pub colors: SmallVec<[Option<Texture>; 1]>,
+    pub depth: Option<Texture>,
 }
 #[derive(Debug)]
 pub struct Draw {
-    pub target: Texture,
-    pub depth_target: Option<Texture>,
-    pub raster: RasterState,
+    pub pipeline: Arc<DrawPipeline>,
+    pub dynamic: Dynamic,
+    pub bindings: Bindings,
+    pub attachments: Arc<Attachments>,
     pub flip_y: bool,
     pub depth_range: [f32; 2],
     pub blend_color: [f32; 4],
     pub indices: Option<(u32, u64, i32)>,
     pub viewport: [i32; 4],
     pub scissor: [i32; 4],
-    pub shaders: SmallVec<[Shader; 2]>,
-    pub attributes: SmallVec<[u32; 4]>,
-    pub streams: SmallVec<[VertexStream; 2]>,
-    pub vertices: SmallVec<[(u32, Range); 2]>,
-    pub uniforms: SmallVec<[(u32, u32, Range); 2]>,
-    pub textures: SmallVec<[Sampled; 2]>,
-    pub primitive: u32,
+    pub vertices: Arc<Vec<(u32, Range)>>,
+
     pub first: u32,
     pub count: u32,
+    pub first_instance: u32,
+    pub instances: u32,
+}
+impl std::ops::Deref for Draw {
+    type Target = DrawPipeline;
+    fn deref(&self) -> &DrawPipeline {
+        &self.pipeline
+    }
+}
+impl Draw {
+    pub fn extent(&self) -> [u32; 2] {
+        self.attachments
+            .colors
+            .iter()
+            .flatten()
+            .chain(self.attachments.depth.iter())
+            .map(|t| {
+                [
+                    (t.width >> t.first_level).max(1),
+                    (t.height >> t.first_level).max(1),
+                ]
+            })
+            .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1])])
+            .unwrap_or_else(|| {
+                [
+                    self.viewport[0].saturating_add(self.viewport[2]).max(1) as u32,
+                    self.viewport[1].saturating_add(self.viewport[3]).max(1) as u32,
+                ]
+            })
+    }
 }
 #[derive(Debug)]
 pub enum Operation {
+    CopyTexture {
+        source: u64,
+        target: Texture,
+        region: [u32; 6],
+        flags: u32,
+    },
+    Dispatch {
+        shader: Shader,
+        groups: [u32; 3],
+        bindings: Bindings,
+    },
+    Report {
+        kind: u32,
+        address: u64,
+    },
+    RenderEnable {
+        mode: u32,
+        address: u64,
+    },
+    Update {
+        address: u64,
+        bytes: Box<[u8]>,
+    },
     Barrier(u32),
     Clear {
         target: Texture,
@@ -59,271 +131,75 @@ pub enum Operation {
         stencil: u8,
         mask: u8,
     },
-    Draw(Box<Draw>),
+    Draw(usize),
 }
-#[derive(Clone, Copy, Default, Pod, Zeroable)]
-#[repr(C)]
-struct Recorder {
-    command: u64,
-    position: u64,
-    inline_flags: u64,
-    limit: u64,
-    control: u64,
-    control_end: u64,
-    begin: u64,
-    recording: u64,
+#[derive(Debug, Default)]
+pub struct Submission {
+    pub update_bytes: usize,
+    pub operations: Vec<Operation>,
+    pub draws: Vec<Draw>,
 }
-pub fn initialize(c: &Call) -> Result<u64> {
-    c.write(c.args[0], &Recorder::default())?;
-    Ok(1)
-}
-pub fn add_commands(c: &Call) -> Result<u64> {
-    let pool: pool::Pool = c.read(c.args[1])?;
-    let start = pool
-        .cpu
-        .checked_add(c.args[2])
-        .ok_or("command address overflow")?;
-    if c.args[2] > pool.bytes || c.args[3] > pool.bytes - c.args[2] {
-        return Err("command memory exceeds pool".into());
-    }
-    let mut r: Recorder = c.read(c.args[0])?;
-    if r.recording != 0 {
-        return Err("adding another command segment during recording is unsupported".into());
-    }
-    r.command = start;
-    r.position = start;
-    r.limit = start + c.args[3];
-    c.write(c.args[0], &r)?;
-    Ok(0)
-}
-pub fn add_control(c: &Call) -> Result<u64> {
-    let end = c.args[1]
-        .checked_add(c.args[2])
-        .ok_or("control memory overflow")?;
-    c.write(c.args[0] + 32, &[c.args[1], end])?;
-    Ok(0)
-}
-pub fn begin(c: &Call) -> Result<u64> {
-    let r: Recorder = c.read(c.args[0])?;
-    if r.recording != 0 {
-        return Err("already recording".into());
-    }
-    c.write(c.args[0] + 48, &[r.position, 1])?;
-    Ok(0)
-}
-pub fn end(c: &Call) -> Result<u64> {
-    let r: Recorder = c.read(c.args[0])?;
-    if r.recording == 0 || r.control_end.saturating_sub(r.control) < 16 {
-        return Err("no recording or insufficient control memory".into());
-    }
-    c.write(
-        r.control,
-        &Range {
-            address: r.begin,
-            size: r.position - r.begin,
-        },
-    )?;
-    c.write(c.args[0] + 32, &(r.control + 16))?;
-    c.write(c.args[0] + 56, &0u64)?;
-    Ok(r.control)
-}
-// The record tag is a guest word. Match its value without constructing an
-// enum from unchecked guest bytes.
-mod op {
-    pub const SAMPLER_POOL: u32 = 0;
-    pub const TEXTURE_POOL: u32 = 1;
-    pub const TARGETS: u32 = 2;
-    pub const SCISSOR: u32 = 3;
-    pub const VIEWPORT: u32 = 4;
-    pub const BARRIER: u32 = 5;
-    pub const CLEAR: u32 = 6;
-    pub const PROGRAM: u32 = 7;
-    pub const ATTRIBUTES: u32 = 8;
-    pub const STREAMS: u32 = 9;
-    pub const VERTEX: u32 = 10;
-    pub const UNIFORM: u32 = 11;
-    pub const TEXTURE: u32 = 12;
-    pub const DRAW: u32 = 13;
-    pub const INDEXED: u32 = 14;
-    pub const DEPTH_RANGE: u32 = 15;
-    pub const SWIZZLES: u32 = 16;
-    pub const CLEAR_DEPTH: u32 = 17;
-    pub const BLEND_COLOR: u32 = 18;
-    pub const BLEND: u32 = 19;
-    pub const COLOR: u32 = 20;
-    pub const MASK: u32 = 21;
-    pub const DEPTH: u32 = 22;
-    pub const POLY: u32 = 23;
-}
-fn record(c: &Call, op: u32, words: &[u64]) -> Result<u64> {
-    let r: Recorder = c.read(c.args[0])?;
-    let bytes = 8 * (1 + words.len()) as u64;
-    if r.recording == 0 || r.limit.saturating_sub(r.position) < bytes {
-        return Err("command memory exhausted or outside recording".into());
-    }
-    let mut record = [0u64; 34];
-    record[0] = (op as u64) | ((words.len() as u64) << 32);
-    record[1..=words.len()].copy_from_slice(words);
-    c.write_bytes(r.position, bytemuck::cast_slice(&record[..1 + words.len()]))?;
-    c.write(c.args[0] + 8, &(r.position + bytes))?;
-    Ok(0)
-}
-macro_rules! simple {
-    ($name:ident,$op:ident,$n:literal) => {
-        pub fn $name(c: &Call) -> Result<u64> {
-            record(c, op::$op, &c.args[1..=$n])
-        }
-    };
-}
-fn bind_pool(c: &Call, op: u32) -> Result<u64> {
-    let pool: pool::DescriptorPool = c.read(c.args[1])?;
-    record(c, op, &[pool.base, pool.count.into()])
-}
-pub fn sampler_pool(c: &Call) -> Result<u64> {
-    bind_pool(c, op::SAMPLER_POOL)
-}
-pub fn texture_pool(c: &Call) -> Result<u64> {
-    bind_pool(c, op::TEXTURE_POOL)
-}
-pub fn program(c: &Call) -> Result<u64> {
-    if c.args[2] != 3 {
-        return Err("only a vertex/fragment stage group is supported".into());
-    }
-    let p: program::Program = c.read(c.args[1])?;
-    let stages = p
-        .stages
-        .get(..p.count as usize)
-        .ok_or("invalid program stage count")?;
-    record(c, op::PROGRAM, bytemuck::cast_slice(stages))
-}
-simple!(scissor, SCISSOR, 4);
-simple!(viewport, VIEWPORT, 4);
-simple!(barrier, BARRIER, 1);
-simple!(vertex, VERTEX, 3);
-simple!(uniform, UNIFORM, 4);
-simple!(draw, DRAW, 3);
-simple!(indexed, INDEXED, 5);
-macro_rules! bind_state {
-    ($fn:ident,$tag:ident,$ty:ty) => {
-        pub fn $fn(c: &Call) -> Result<u64> {
-            record(c, op::$tag, &[c.read::<$ty>(c.args[1])? as u64])
-        }
-    };
-}
-bind_state!(blend, BLEND, u64);
-bind_state!(color, COLOR, u32);
-bind_state!(mask, MASK, u32);
-bind_state!(depth, DEPTH, u32);
-bind_state!(poly, POLY, u32);
-pub fn blend_color(c: &Call) -> Result<u64> {
-    record(c, op::BLEND_COLOR, &c.read::<[u64; 2]>(c.args[1])?)
-}
-pub fn depth_range(c: &Call) -> Result<u64> {
-    record(
-        c,
-        op::DEPTH_RANGE,
-        &[bytemuck::cast([(c.float)(0), (c.float)(1)])],
-    )
-}
-pub fn clear_depth(c: &Call) -> Result<u64> {
-    record(
-        c,
-        op::CLEAR_DEPTH,
-        &[
-            (c.float)(0).to_bits() as u64,
-            c.args[1],
-            c.args[2],
-            c.args[3],
-        ],
-    )
-}
-pub fn swizzles(c: &Call) -> Result<u64> {
-    if c.args[1] != 0 || c.args[2] != 1 {
-        return Err("multiple viewport swizzles are unsupported".into());
-    }
-    let sw: [u32; 4] = c.read(c.args[3])?;
-    let flip = match sw {
-        [0, 2, 4, 6] => false,
-        [0, 3, 4, 6] => true,
-        _ => return Err(format!("unsupported viewport swizzle {sw:?}").into()),
-    };
-    record(c, op::SWIZZLES, &[flip.into()])
-}
-pub fn texture(c: &Call) -> Result<u64> {
-    record(
-        c,
-        op::TEXTURE,
-        &[(c.args[1] as u32 as u64) | (c.args[2] << 32), c.args[3]],
-    )
-}
-pub fn targets(c: &Call) -> Result<u64> {
-    if c.args[1] != 1 {
-        return Err("only one color attachment is supported".into());
-    }
-    let view = if c.args[3] == 0 {
-        0
-    } else {
-        c.read(c.args[3])?
-    };
-    let color = texels::view(c, c.read(c.args[2])?, view)?;
-    let depth = if c.args[4] != 0 {
-        texels::view(c, c.args[4], c.args[5])?
-    } else {
-        Texture::default()
-    };
-    record(c, op::TARGETS, bytemuck::cast_slice(&[color, depth]))
-}
-pub fn clear(c: &Call) -> Result<u64> {
-    let rgba: [u64; 2] = c.read(c.args[2])?;
-    record(c, op::CLEAR, &[c.args[1], rgba[0], rgba[1], c.args[3]])
-}
-fn array(c: &Call, op: u32, stride: usize) -> Result<u64> {
-    let n = c.args[1] as u32 as usize;
-    if n > 32 {
-        return Err("too many vertex inputs".into());
-    }
-    let mut buf = [0u64; 33];
-    buf[0] = n as u64;
-    c.read_bytes(
-        c.args[2],
-        &mut bytemuck::cast_slice_mut(&mut buf[1..])[..n * stride],
-    )?;
-    record(c, op, &buf[..1 + (n * stride).div_ceil(8)])
-}
-pub fn attributes(c: &Call) -> Result<u64> {
-    array(c, op::ATTRIBUTES, 4)
-}
-pub fn streams(c: &Call) -> Result<u64> {
-    array(c, op::STREAMS, 8)
-}
+
 #[derive(Default)]
 pub(crate) struct State {
-    target: Option<Texture>,
-    depth_target: Option<Texture>,
+    attachments: Arc<Attachments>,
     raster: RasterState,
+    dynamic: Dynamic,
+    bindings: [bindings::BindingState; 2],
     flip_y: bool,
+    pub(crate) pipeline: Arc<DrawPipeline>,
     depth_range: Option<[f32; 2]>,
     blend_color: [f32; 4],
     viewport: [i32; 4],
     scissor: [i32; 4],
     shaders: SmallVec<[Shader; 2]>,
-    texture_pool: pool::DescriptorPool,
-    sampler_pool: pool::DescriptorPool,
+    texture_pool: DescriptorPool,
+    sampler_pool: DescriptorPool,
     scratch: Vec<u64>,
-    attributes: Vec<u32>,
-    streams: Vec<VertexStream>,
-    vertices: Vec<(u32, Range)>,
-    uniforms: Vec<(u32, u32, Range)>,
-    textures: Vec<(u32, u32, u64)>,
+    vertices: Arc<Vec<(u32, Range)>>,
 }
 impl State {
-    pub(crate) fn replay(&mut self, c: &Call, handle: u64, ops: &mut Vec<Operation>) -> Result<()> {
-        let r: Range = c.read(handle)?;
-        if !r.size.is_multiple_of(8) || r.size > 64 << 20 {
-            return Err("invalid command list length".into());
+    pub fn for_device(c: &Call, dev: u64) -> Result<Self> {
+        let [origin, depth]: [u32; 2] = c.read(dev + 4)?;
+        Ok(Self {
+            pipeline: Arc::new(DrawPipeline {
+                upper_left: origin == 1,
+                minus_one_to_one: depth == 0,
+                samples: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn replay(&mut self, c: &Call, handle: u64, batch: &mut Submission) -> Result<()> {
+        let mut chain = SmallVec::<[u64; 8]>::new();
+        chain.push(handle);
+        while let Some(at) = chain.pop() {
+            let Range { address, size } = c.read(at)?;
+            if size & END == 0 && size & LINK == 0 {
+                chain.push(at + CONTROL_SIZE)
+            }
+            match size & !END {
+                CALL => {
+                    if chain.len() > 256 {
+                        return Err("excessive command list nesting".into());
+                    }
+                    chain.push(address);
+                }
+                LINK => chain.push(address),
+                0 => {}
+                bytes if bytes.is_multiple_of(8) && bytes <= 64 << 20 => {
+                    self.scratch.resize(bytes as usize / 8, 0);
+                    c.read_bytes(address, bytemuck::cast_slice_mut(&mut self.scratch))?;
+                    self.decode(c, batch)?;
+                }
+                _ => return Err("invalid control entry".into()),
+            }
         }
-        self.scratch.resize(r.size as usize / 8, 0);
-        c.read_bytes(r.address, bytemuck::cast_slice_mut(&mut self.scratch))?;
+        Ok(())
+    }
+    fn decode(&mut self, c: &Call, batch: &mut Submission) -> Result<()> {
         let mut commands = self.scratch.as_slice();
         while let Some((&h, tail)) = commands.split_first() {
             let n = (h >> 32) as usize;
@@ -333,34 +209,156 @@ impl State {
             commands = next;
             let op = h as u32;
             match op {
-                op::SAMPLER_POOL if n == 2 => {
-                    self.sampler_pool = pool::DescriptorPool::new(w[0], w[1] as u32)
+                op::COPY_TEXTURE if n == 5 + size_of::<Texture>() / 8 => {
+                    let end = n - 3;
+                    let target = bytemuck::pod_read_unaligned(bytemuck::cast_slice(&w[2..end]));
+                    let region = bytemuck::pod_read_unaligned(bytemuck::cast_slice(&w[end..]));
+                    batch.operations.push(Operation::CopyTexture {
+                        source: w[0],
+                        target,
+                        region,
+                        flags: w[1] as u32,
+                    })
                 }
-                op::TEXTURE_POOL if n == 2 => {
-                    self.texture_pool = pool::DescriptorPool::new(w[0], w[1] as u32)
+                op::DISPATCH if n == 3 => {
+                    let shader = *self
+                        .shaders
+                        .iter()
+                        .find(|s| s.stage == 5)
+                        .ok_or("dispatch without compute program")?;
+                    batch.operations.push(Operation::Dispatch {
+                        shader,
+                        groups: std::array::from_fn(|i| w[i] as u32),
+                        bindings: self.bindings[1].snapshot(
+                            c,
+                            self.texture_pool,
+                            self.sampler_pool,
+                        )?,
+                    })
                 }
-                op::TARGETS if n == 8 => {
-                    let [color, depth]: [Texture; 2] =
-                        bytemuck::pod_read_unaligned(bytemuck::cast_slice(w));
-                    self.target = Some(color);
-                    self.depth_target = (depth.address != 0).then_some(depth);
+                op::REPORT if n == 2 => batch.operations.push(Operation::Report {
+                    kind: w[0] as u32,
+                    address: w[1],
+                }),
+                op::CONDITION if n == 2 => batch.operations.push(Operation::RenderEnable {
+                    mode: w[0] as u32,
+                    address: w[1],
+                }),
+                op::UPDATE if n >= 2 && w[1].div_ceil(8) == (n - 2) as u64 => {
+                    batch.update_bytes = batch.update_bytes.saturating_add(w[1] as usize);
+                    batch.operations.push(Operation::Update {
+                        address: w[0],
+                        bytes: bytemuck::cast_slice(&w[2..])[..w[1] as usize].into(),
+                    })
+                }
+                op::SAMPLER_POOL | op::TEXTURE_POOL if n == 2 => {
+                    let pool = if op == op::SAMPLER_POOL {
+                        &mut self.sampler_pool
+                    } else {
+                        &mut self.texture_pool
+                    };
+                    let next = DescriptorPool::new(w[0], w[1] as u32);
+                    if (pool.base, pool.count) != (next.base, next.count) {
+                        *pool = next;
+                        for bindings in &mut self.bindings {
+                            bindings.pool_changed();
+                        }
+                    }
+                }
+                op::TARGETS
+                    if n != 0
+                        && n.is_multiple_of(size_of::<Texture>() / 8)
+                        && n <= 9 * size_of::<Texture>() / 8 =>
+                {
+                    let (depth, colors) = bytemuck::cast_slice::<u64, Texture>(w)
+                        .split_first()
+                        .unwrap();
+                    let depth = (depth.address != 0).then_some(*depth);
+                    let n = colors
+                        .iter()
+                        .rposition(|t| t.address != 0)
+                        .map_or(0, |i| i + 1);
+                    let colors = colors[..n].iter().map(|t| (t.address != 0).then_some(*t));
+                    if depth == self.attachments.depth
+                        && colors.clone().eq(self.attachments.colors.iter().copied())
+                    {
+                        continue;
+                    }
+                    let targets = Arc::make_mut(&mut self.attachments);
+                    targets.depth = depth;
+                    targets.colors.clear();
+                    targets.colors.extend(colors);
+                    let samples = targets
+                        .colors
+                        .iter()
+                        .flatten()
+                        .chain(depth.iter())
+                        .next()
+                        .map_or(1, |t| t.samples.max(1));
+                    let depth = depth.map(|t| t.format);
+                    let formats = targets.colors.iter().map(|t| t.map(|t| t.format));
+                    if self.pipeline.samples != samples
+                        || self.pipeline.depth_format != depth
+                        || !formats
+                            .clone()
+                            .eq(self.pipeline.color_formats.iter().copied())
+                    {
+                        let pipeline = Arc::make_mut(&mut self.pipeline);
+                        pipeline.samples = samples;
+                        pipeline.depth_format = depth;
+                        pipeline.color_formats.clear();
+                        pipeline.color_formats.extend(formats);
+                    }
                 }
                 op::BLEND if n == 1 => {
                     let blend = w[0].to_le_bytes();
-                    if blend[0] == 0 {
-                        self.raster.blend = blend;
-                    }
+                    *self
+                        .raster
+                        .blend
+                        .get_mut(usize::from(blend[0]))
+                        .ok_or("invalid blend target")? = blend;
                 }
-                op::COLOR if n == 1 => self.raster.blend_enable = w[0] as u32,
+                op::COLOR if n == 1 => {
+                    self.raster.blend_enable = w[0] as u32 & 255;
+                    self.raster.logic = (w[0] >> 8) as u8
+                }
                 op::MASK if n == 1 => self.raster.channel_mask = w[0] as u32,
                 op::POLY if n == 1 => self.raster.polygon = (w[0] as u32).to_le_bytes(),
-                op::DEPTH if n == 1 => self.raster.depth = (w[0] as u32).to_le_bytes(),
+                op::DEPTH if n == 1 => {
+                    self.raster.depth = (w[0] as u32).to_le_bytes();
+                    self.raster.stencil = bytemuck::cast((w[0] >> 32) as u32);
+                }
+                op::MULTISAMPLE if n == 1 => self.raster.multisample = w[0] as u32,
+                op::CLAMP if n == 1 => self.raster.depth_clamp = w[0] != 0,
+                op::DISCARD if n == 1 => self.raster.raster_discard = w[0] != 0,
+                op::BOUNDS if n == 2 => {
+                    self.raster.depth_bounds = w[0] != 0;
+                    self.dynamic.depth_bounds = bytemuck::cast(w[1]);
+                }
+                op::LINE if n == 1 => self.dynamic.line_width = f32::from_bits(w[0] as u32),
+                op::POINT if n == 1 => self.raster.point_size = w[0] as u32,
+                op::OFFSET if n == 2 => {
+                    let [units, clamp]: [f32; 2] = bytemuck::cast(w[0]);
+                    self.dynamic.depth_bias = [units, clamp, f32::from_bits(w[1] as u32)]
+                }
+                op::REF | op::WRITE_MASK | op::COMPARE_MASK if n == 2 => {
+                    let values = match op {
+                        op::REF => &mut self.dynamic.stencil_ref,
+                        op::WRITE_MASK => &mut self.dynamic.stencil_write,
+                        _ => &mut self.dynamic.stencil_compare,
+                    };
+                    for (i, v) in values.iter_mut().enumerate() {
+                        if w[0] & (1 << i) != 0 {
+                            *v = w[1] as u32
+                        }
+                    }
+                }
                 op::DEPTH_RANGE if n == 1 => self.depth_range = Some(bytemuck::cast(w[0])),
                 op::SWIZZLES if n == 1 => self.flip_y = w[0] != 0,
                 op::BLEND_COLOR if n == 2 => self.blend_color = bytemuck::cast([w[0], w[1]]),
                 op::CLEAR_DEPTH if n == 4 => {
-                    if let Some(target) = self.depth_target {
-                        ops.push(Operation::ClearDepth {
+                    if let Some(target) = self.attachments.depth {
+                        batch.operations.push(Operation::ClearDepth {
                             target,
                             scissor: self.scissor,
                             depth: (w[1] != 0).then(|| f32::from_bits(w[0] as u32)),
@@ -371,25 +369,52 @@ impl State {
                 }
                 op::VIEWPORT if n == 4 => self.viewport = std::array::from_fn(|i| w[i] as i32),
                 op::SCISSOR if n == 4 => self.scissor = std::array::from_fn(|i| w[i] as i32),
-                op::BARRIER if n == 1 => ops.push(Operation::Barrier(w[0] as u32)),
-                op::CLEAR if n == 4 && w[0] == 0 => ops.push(Operation::Clear {
-                    target: self.target.ok_or("no color attachment bound")?,
-                    scissor: self.scissor,
-                    color: bytemuck::cast([w[1], w[2]]),
-                    mask: w[3] as u32,
-                }),
-                op::PROGRAM if n.is_multiple_of(3) && n <= 18 => {
-                    self.shaders = SmallVec::from_slice(bytemuck::cast_slice(w))
+                op::BARRIER if n == 1 => batch.operations.push(Operation::Barrier(w[0] as u32)),
+                op::CLEAR if n == 4 && w[0] < 8 => {
+                    if let Some(&Some(target)) = self.attachments.colors.get(w[0] as usize) {
+                        batch.operations.push(Operation::Clear {
+                            target,
+                            scissor: self.scissor,
+                            color: bytemuck::cast([w[1], w[2]]),
+                            mask: w[3] as u32,
+                        });
+                    }
+                }
+                op::PROGRAM if n >= 1 && (n - 1).is_multiple_of(size_of::<Shader>() / 8) => {
+                    self.shaders.retain(|s| w[0] & (1 << s.stage) == 0);
+                    self.shaders.extend(
+                        bytemuck::cast_slice::<u64, Shader>(&w[1..])
+                            .iter()
+                            .filter(|s| w[0] & (1 << s.stage) != 0)
+                            .copied(),
+                    );
+                    self.shaders.sort_by_key(|s| s.stage);
+                    self.bindings[0]
+                        .select_shaders(self.shaders.iter().copied().filter(|s| s.stage != 5));
+                    self.bindings[1]
+                        .select_shaders(self.shaders.iter().copied().filter(|s| s.stage == 5));
+                    let graphics = self.shaders.iter().copied().filter(|s| s.stage != 5);
+                    if !graphics.clone().eq(self.pipeline.shaders.iter().copied()) {
+                        let pipeline = Arc::make_mut(&mut self.pipeline);
+                        pipeline.shaders.clear();
+                        pipeline.shaders.extend(graphics);
+                    }
                 }
                 op::ATTRIBUTES if n > 0 && w[0] <= 32 && n == 1 + (w[0] as usize).div_ceil(2) => {
-                    self.attributes.clear();
-                    self.attributes
-                        .extend_from_slice(&bytemuck::cast_slice(&w[1..n])[..w[0] as usize]);
+                    let values = &bytemuck::cast_slice(&w[1..n])[..w[0] as usize];
+                    if self.pipeline.attributes.as_slice() != values {
+                        let pipeline = Arc::make_mut(&mut self.pipeline);
+                        pipeline.attributes.clear();
+                        pipeline.attributes.extend_from_slice(values);
+                    }
                 }
                 op::STREAMS if n > 0 && w[0] <= 32 && n == 1 + w[0] as usize => {
-                    self.streams.clear();
-                    self.streams
-                        .extend_from_slice(bytemuck::cast_slice(&w[1..n]));
+                    let values = bytemuck::cast_slice(&w[1..n]);
+                    if self.pipeline.streams.as_slice() != values {
+                        let pipeline = Arc::make_mut(&mut self.pipeline);
+                        pipeline.streams.clear();
+                        pipeline.streams.extend_from_slice(values);
+                    }
                 }
                 op::VERTEX if n == 3 => {
                     let item = (
@@ -399,59 +424,80 @@ impl State {
                             size: w[2],
                         },
                     );
-                    put(&mut self.vertices, item, |v| v.0 == item.0);
+                    match self.vertices.iter().position(|v| v.0 == item.0) {
+                        Some(i) if self.vertices[i] == item => {}
+                        Some(i) => Arc::make_mut(&mut self.vertices)[i] = item,
+                        None => Arc::make_mut(&mut self.vertices).push(item),
+                    }
                 }
-                op::UNIFORM if n == 4 => {
-                    let item = (
-                        w[0] as u32,
+                op::UNIFORM | op::STORAGE if n == 4 => {
+                    let stage = w[0] as u32;
+                    self.bindings[usize::from(stage == 5)].bind_buffer(
+                        op == op::STORAGE,
+                        stage,
                         w[1] as u32,
                         Range {
                             address: w[2],
                             size: w[3],
                         },
                     );
-                    put(&mut self.uniforms, item, |v| v.0 == item.0 && v.1 == item.1);
+                }
+                op::DEFERRED if n == 4 => {
+                    let stage = w[0] as u32;
+                    let first = w[1] as u32;
+                    for i in 0..w[2] as u32 {
+                        let handle = c.read(w[3] + 8 * u64::from(i))?;
+                        self.bindings[usize::from(stage == 5)].bind_texture(
+                            stage,
+                            first + i,
+                            handle,
+                        );
+                    }
                 }
                 op::TEXTURE if n == 2 => {
-                    let item = (w[0] as u32, (w[0] >> 32) as u32, w[1]);
-                    put(&mut self.textures, item, |v| v.0 == item.0 && v.1 == item.1);
+                    let stage = w[0] as u32;
+                    self.bindings[usize::from(stage == 5)].bind_texture(
+                        stage,
+                        (w[0] >> 32) as u32,
+                        w[1],
+                    );
                 }
                 op::DRAW | op::INDEXED
-                    if (op == op::DRAW && n == 3) || (op == op::INDEXED && n == 5) =>
+                    if (op == op::DRAW && n == 5) || (op == op::INDEXED && n == 7) =>
                 {
-                    let shaders = self.shaders.clone();
-                    let textures = self
-                        .textures
-                        .iter()
-                        .map(|&(stage, slot, h)| {
-                            Ok(Sampled {
-                                stage,
-                                slot,
-                                texture: c.read(self.texture_pool.slot(h as u32 & 0xfffff)?)?,
-                                sampler: c.read(self.sampler_pool.slot(h as u32 >> 20)?)?,
-                            })
-                        })
-                        .collect::<Result<_>>()?;
-                    ops.push(Operation::Draw(Box::new(Draw {
-                        target: self.target.ok_or("no color attachment bound")?,
-                        depth_target: self.depth_target,
-                        raster: self.raster,
-                        flip_y: self.flip_y,
+                    let bindings =
+                        self.bindings[0].snapshot(c, self.texture_pool, self.sampler_pool)?;
+                    let shapes = &bindings.sampled.shapes;
+                    let primitive = w[0] as u32;
+                    if self.pipeline.raster != self.raster
+                        || self.pipeline.primitive != primitive
+                        || !(Arc::ptr_eq(&self.pipeline.shapes, shapes)
+                            || self.pipeline.shapes == *shapes)
+                    {
+                        let pipeline = Arc::make_mut(&mut self.pipeline);
+                        pipeline.raster = self.raster;
+                        pipeline.primitive = primitive;
+                        pipeline.shapes = shapes.clone();
+                    }
+                    batch.operations.push(Operation::Draw(batch.draws.len()));
+                    batch.draws.push(Draw {
+                        pipeline: self.pipeline.clone(),
+                        attachments: self.attachments.clone(),
+                        dynamic: self.dynamic,
+                        bindings,
+                        flip_y: self.flip_y ^ self.pipeline.upper_left,
                         depth_range: self.depth_range.unwrap_or([0., 1.]),
                         blend_color: self.blend_color,
                         indices: (op == op::INDEXED).then(|| (w[1] as u32, w[3], w[4] as i32)),
                         viewport: self.viewport,
                         scissor: self.scissor,
-                        shaders,
-                        attributes: SmallVec::from_slice(&self.attributes),
-                        streams: SmallVec::from_slice(&self.streams),
-                        vertices: SmallVec::from_slice(&self.vertices),
-                        uniforms: SmallVec::from_slice(&self.uniforms),
-                        textures,
-                        primitive: w[0] as u32,
+                        vertices: self.vertices.clone(),
+
                         first: w[1] as u32,
                         count: w[2] as u32,
-                    })));
+                        first_instance: w[n - 2] as u32,
+                        instances: w[n - 1] as u32,
+                    });
                 }
                 _ => {
                     return Err(
@@ -461,12 +507,5 @@ impl State {
             }
         }
         Ok(())
-    }
-}
-fn put<T>(slots: &mut Vec<T>, value: T, matches: impl FnMut(&T) -> bool) {
-    if let Some(i) = slots.iter().position(matches) {
-        slots[i] = value
-    } else {
-        slots.push(value)
     }
 }

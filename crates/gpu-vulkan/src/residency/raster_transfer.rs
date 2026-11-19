@@ -9,6 +9,17 @@ impl Residency<'_> {
         rect: vk::Rect2D,
         value: vk::ClearValue,
     ) -> Result<WorkTicket, VulkanError> {
+        self.clear_view_rect_if(view, plane, rect, value, None)
+    }
+
+    pub(crate) fn clear_view_rect_if(
+        &mut self,
+        view: ImageViewId,
+        plane: usize,
+        rect: vk::Rect2D,
+        value: vk::ClearValue,
+        predicate: Option<&Arc<crate::memory::AllocatedBuffer>>,
+    ) -> Result<WorkTicket, VulkanError> {
         let id = self.texture_cache.views[view].image;
         let selected = self.image_view_description(view)?;
         let p = self.checked_image_rect(id, plane, rect)?;
@@ -19,7 +30,10 @@ impl Residency<'_> {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
         };
         if !description.usage.contains(usage) {
-            if selected.format != description.format || rect != transfers::full_rect(p) {
+            if predicate.is_some()
+                || selected.format != description.format
+                || rect != transfers::full_rect(p)
+            {
                 return Err(VulkanError::InvalidResource(
                     "partial image clear requires native attachment usage",
                 ));
@@ -32,12 +46,12 @@ impl Residency<'_> {
             };
         }
         let physical = self.image_rect(id, rect);
-        let invalidate = self.is_full_image_clear(id, p, physical, p.aspect);
+        let invalidate = predicate.is_none() && self.is_full_image_clear(id, p, physical, p.aspect);
         self.prepare_image(id, true, invalidate)?;
         let view = self.image_view(id, selected)?;
         let targets = self.framebuffer_for_view(view)?;
         let rect = self.image_rect(id, rect);
-        self.clear_framebuffer(
+        self.clear_framebuffer_if(
             &targets,
             vk::ClearRect::default()
                 .rect(rect)
@@ -47,6 +61,7 @@ impl Residency<'_> {
                 .aspect_mask(p.aspect)
                 .color_attachment(0)
                 .clear_value(value)],
+            predicate,
         )
     }
     #[allow(clippy::too_many_arguments)]

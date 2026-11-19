@@ -741,7 +741,9 @@ impl ScreenRenderer {
             cache.device_mut().dispatch.end_rendering();
         }
         // Host UI changed raw vertex binds; invalidate the current guest channel.
-        cache.device_mut().submission.slots[slot].vertex_channel = None;
+        let slot = &mut cache.device_mut().submission.slots[slot];
+        slot.geometry_owner = None;
+        slot.index_binding = None;
         draw_result?;
         self.free_textures(ui);
         Ok(())

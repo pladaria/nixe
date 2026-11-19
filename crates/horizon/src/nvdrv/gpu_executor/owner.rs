@@ -174,12 +174,12 @@ where
     }
     fn service_control(&mut self, message: GpuMessage) -> Result<(), GpuExecutorFailure> {
         let result = match message {
-            GpuMessage::Nvn(request) => {
-                if let Some(backend) = self.backend.borrow_mut().as_mut() {
-                    request.run(backend)
-                }
-                Ok(())
-            }
+            GpuMessage::Nvn(request) => match self.backend.borrow_mut().as_mut() {
+                Some(backend) => request.run(backend),
+                None => Err(nixe_gpu::BackendRuntimeError::Backend(
+                    "NVN GPU owner unavailable".into(),
+                )),
+            },
             GpuMessage::RequestComposite {
                 composite,
                 fences,

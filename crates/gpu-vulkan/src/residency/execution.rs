@@ -14,7 +14,8 @@ pub use graphics::{
     VertexBuffer,
 };
 pub(crate) use graphics::{DeferredClear, RenderPassState, ShaderImage, attachment_read_only};
-pub(crate) use graphics::{MaskedClearPipelines, NativeIndexBuffer};
+pub(crate) use graphics::{HostDrawState, MaskedClearPipelines, NativeIndexBuffer};
+pub(crate) use state::DynamicValues;
 pub use state::{GraphicsParameters, HostGraphics};
 
 pub(crate) fn shader_accesses(
@@ -97,6 +98,8 @@ pub struct HostImage {
 }
 #[derive(Clone)]
 pub enum HostBinding {
+    /// Immutable host constants streamed when the command is recorded.
+    UniformBytes(Arc<[u8]>),
     NullBuffer,
     TexelBuffer {
         buffer: HostBuffer,
@@ -134,12 +137,13 @@ pub(super) enum HostBindingAccess {
 /// banks and DescriptorQueue directly; it never constructs this object.
 pub struct HostProgram {
     binding_revision: AtomicU64,
-    pub(super) pipeline: NativePipeline,
+    pub(crate) pipeline: NativePipeline,
     // Explicit host bindings are owned by the host texture cache.
     record: std::cell::RefCell<ProgramRecord>,
     // Explicit host resources use owned captures; guest resources use residency
     // use ticks and the native execution owner's persistent sampler cache.
     bindings: Vec<HostBinding>,
+    direct_entries: Option<Vec<crate::cache::DescriptorEntry>>,
     unaligned_uniforms: usize,
     dynamic_offsets: Vec<u32>,
 }
@@ -212,7 +216,9 @@ impl Residency<'_> {
                     scope,
                 })
             }
-            HostBinding::NullBuffer | HostBinding::Sampler(_) => None,
+            HostBinding::NullBuffer | HostBinding::UniformBytes(_) | HostBinding::Sampler(_) => {
+                None
+            }
         }
     }
     fn canonical_resource(
@@ -221,7 +227,9 @@ impl Residency<'_> {
         index: usize,
     ) -> Result<DescriptorResource, VulkanError> {
         let mut resource = match &program.bindings[index] {
-            HostBinding::NullBuffer => DescriptorResource::NullBuffer,
+            HostBinding::NullBuffer | HostBinding::UniformBytes(_) => {
+                DescriptorResource::NullBuffer
+            }
             HostBinding::Buffer {
                 buffer,
                 offset,
@@ -300,6 +308,7 @@ impl Residency<'_> {
                     streamed: false,
                 }),
                 bindings: Vec::new(),
+                direct_entries: None,
                 unaligned_uniforms: 0,
             },
             parameters,
@@ -372,6 +381,19 @@ impl Residency<'_> {
         if program.bindings.is_empty() || program.pipeline.layout.uniform_bindings.is_empty() {
             // Host descriptors and layouts without uniforms need no per-use
             // uniform selection.
+            if let Some(entries) = &program.direct_entries
+                && !entries.is_empty()
+            {
+                let queue = &mut self.runtime.descriptor_queue;
+                queue.acquire(&mut self.runtime.device.dispatch, entries.len())?;
+                queue.write_entries(0, entries);
+                self.runtime
+                    .device
+                    .submission
+                    .statistics
+                    .descriptor_payload_captures += 1;
+                return Ok(self.guest_descriptor_update());
+            }
             return Ok(DescriptorQueue {
                 dynamic_offsets: None,
                 record: None,
@@ -391,6 +413,21 @@ impl Residency<'_> {
         // writes still use the native buffer or an aligned device-side copy.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L932
         for (slot, uniform) in program.pipeline.layout.uniform_bindings.iter().enumerate() {
+            if let HostBinding::UniformBytes(bytes) = &program.bindings[uniform.resource] {
+                let alignment = self
+                    .runtime
+                    .device
+                    .profile()
+                    .limits
+                    .min_uniform_buffer_offset_alignment;
+                let slice = self
+                    .runtime
+                    .device
+                    .submission
+                    .reserve_upload_aligned(bytes, alignment)?;
+                updates[slot] = Some(slice);
+                continue;
+            }
             let Some(HostBindingAccess::Buffer {
                 id,
                 offset,
@@ -448,10 +485,16 @@ impl Residency<'_> {
         let mut dynamic_offsets = std::mem::take(&mut self.runtime.descriptor_offsets);
         dynamic_offsets.clear();
         dynamic_offsets.extend_from_slice(&program.dynamic_offsets);
+        let direct = program.direct_entries.as_deref();
+        if let Some(entries) = direct {
+            let queue = &mut self.runtime.descriptor_queue;
+            queue.acquire(&mut self.runtime.device.dispatch, entries.len())?;
+            queue.write_entries(0, entries);
+        }
         let mut selected = program.record.borrow_mut();
         let mut resources = std::mem::take(&mut self.runtime.descriptor_resources);
         resources.clear();
-        if selected.current.is_none() {
+        if direct.is_none() && selected.current.is_none() {
             self.canonical_resources(program, &mut resources)?;
         }
         let limits = &self.runtime.device.profile().limits;
@@ -478,6 +521,14 @@ impl Residency<'_> {
                     });
                     (Some(buffer), offset, *size)
                 }
+                HostBinding::UniformBytes(bytes) => {
+                    let slice = update.as_ref().expect("inline uniform upload");
+                    (
+                        Some(self.runtime.device.submission.staging.buffer(slice)),
+                        slice.offset,
+                        bytes.len() as u64,
+                    )
+                }
                 HostBinding::NullBuffer => (None, 0, 0),
                 _ => {
                     return Err(VulkanError::InvalidResource(
@@ -499,6 +550,22 @@ impl Residency<'_> {
                 };
                 dynamic_offsets[dynamic] = value;
                 offset = base;
+            }
+            if direct.is_some() {
+                self.runtime.descriptor_queue.write(
+                    slot.resource,
+                    crate::cache::DescriptorEntry {
+                        buffer: vk::DescriptorBufferInfo::default()
+                            .buffer(buffer.map_or(vk::Buffer::null(), |b| b.handle))
+                            .offset(offset)
+                            .range(if buffer.is_some() {
+                                range
+                            } else {
+                                vk::WHOLE_SIZE
+                            }),
+                    },
+                );
+                continue;
             }
             let unchanged = selected.current.as_ref().is_some_and(|record| {
                 match (&record.resources[slot.resource], buffer) {
@@ -530,6 +597,20 @@ impl Residency<'_> {
                     DescriptorResource::NullBuffer
                 };
             }
+        }
+        if direct.is_some() {
+            self.runtime.uniform_updates = updates;
+            self.runtime.descriptor_resources = resources;
+            self.runtime
+                .device
+                .submission
+                .statistics
+                .descriptor_payload_captures += 1;
+            return Ok(DescriptorQueue {
+                dynamic_offsets: Some(dynamic_offsets),
+                record: None,
+                update: Some(self.runtime.descriptor_queue.update_data()),
+            });
         }
         let changed = !resources.is_empty();
         let result = if changed {
@@ -772,6 +853,7 @@ impl Residency<'_> {
         self.runtime.barriers.emit(&mut self.runtime.device)?;
         let record = match streams.record {
             Some(record) => Some(record),
+            None if streams.update.is_some() => None,
             None => self.host_descriptor_record(program)?,
         };
         self.runtime.device.configure_pipeline(

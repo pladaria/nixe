@@ -227,10 +227,28 @@ impl NativeExecution<'_> {
             }
         }
         let (image, base) = self.find_or_insert_image(&info, space)?;
+        // A packed TIC selects depth or stencil through a format-specific
+        // component. Vulkan exposes the selected aspect in R.
+        let format = info.description.format();
+        let aspect = nixe_gpu::nvidia::sampled_aspect(format, info.swizzle)
+            .map_err(VulkanError::InvalidResource)?;
+        let mut components = info.swizzle;
+        if matches!(
+            format,
+            nixe_gpu::ImageFormat::Depth24UnormStencil8Uint
+                | nixe_gpu::ImageFormat::Depth32FloatStencil8Uint
+        ) {
+            for c in &mut components.0 {
+                if *c == nixe_gpu::ComponentSwizzle::Green {
+                    *c = nixe_gpu::ComponentSwizzle::Red;
+                }
+            }
+        }
         let view = self.sampled_view(
             image,
             info.description,
-            info.swizzle,
+            components,
+            aspect,
             base,
             view_kind & 1 != 0,
         )?;

@@ -210,6 +210,7 @@ impl Residency<'_> {
             maps: maps.iter().collect(),
             cached,
             modification_tick: 0,
+            command_free: None,
             gpu_modified: false,
             forced_flushed: false,
             dma_downloaded: false,

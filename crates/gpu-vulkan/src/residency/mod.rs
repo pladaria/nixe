@@ -8,6 +8,7 @@ pub(crate) mod cache_owners;
 mod command_pages;
 mod multi_range;
 mod pointer_table;
+pub(crate) mod predicate;
 mod quad_indices;
 pub(crate) mod query;
 mod uniform_stream;
@@ -102,6 +103,7 @@ struct BufferEntry {
     used: sync::UsageTracker,
 }
 pub(crate) struct ImageEntry {
+    command_free: Option<[u64; 2]>,
     synchronized: bool,
     aliases_current: bool,
     aliases: Vec<image::ImageAlias>,

@@ -395,16 +395,7 @@ impl PipelineCache {
         let shader = crate::cache::compile_guest(pools, programs, configuration, Some(&runtime))
             .map_err(compilation)?;
         let shader = Self::graphics_shader(&key, profile, shader)?;
-        let vertex_attributes = shader
-            .stages
-            .iter()
-            .find(|stage| stage.stage == nixe_gpu::ShaderStage::Vertex)
-            .and_then(|stage| stage.guest.as_ref())
-            .map_or(0, |stage| {
-                (0..32).fold(0, |mask, location| {
-                    mask | (u32::from(stage.info.loads.generic(location)) << location)
-                })
-            });
+        let vertex_attributes = shader.vertex_input_mask().unwrap_or(0);
         let state = key.graphics(profile, vertex_attributes)?;
         let recipe = PipelineRecipe::Graphics {
             shader: Arc::clone(&shader),

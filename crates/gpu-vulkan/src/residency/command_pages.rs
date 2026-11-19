@@ -26,14 +26,16 @@ impl CommandPages {
         device: &nixe_memory::device_memory::DeviceMemory,
         address: u64,
         bytes: u64,
-    ) {
+        advance: bool,
+    ) -> bool {
         let mut pages = None;
-        device.visit_command_pages(address, bytes, |_, physical| {
+        device.visit_command_writes(address, bytes, advance, |physical| {
             let pages = pages.get_or_insert_with(|| self.pages.lock().unwrap());
             let page = pages.entry(physical).or_default();
             page.drawn = true;
             page.copy = None;
         });
+        pages.is_some()
     }
     pub(super) fn read(
         &self,
@@ -166,7 +168,7 @@ impl BufferCache {
     pub(super) fn note_command_write(&mut self, buffer: BufferId, address: u64, bytes: u64) {
         if !self.collect_command_copies {
             self.command_pages
-                .draw_write(&self.device_memory, address, bytes);
+                .draw_write(&self.device_memory, address, bytes, false);
             return;
         }
         self.device_memory

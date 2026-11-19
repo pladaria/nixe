@@ -3,52 +3,113 @@ use bytemuck::{Pod, Zeroable};
 use nixe_memory::{DeviceHeapMapping, GuestVirtualAddress, MemoryPermissions};
 use std::collections::HashMap;
 
-pub(crate) type Mappings = HashMap<u64, Arc<DeviceHeapMapping>>;
-
+use nixe_memory::device_memory::{DeviceMapping, DeviceReservation};
+pub(crate) type Mappings = HashMap<u64, Mapping>;
+pub(crate) enum Mapping {
+    Physical {
+        _pin: Arc<DeviceHeapMapping>,
+        exported: Option<Box<dyn ExportedPool>>,
+    },
+    Virtual {
+        pages: HashMap<u64, DeviceMapping>,
+        _reservation: DeviceReservation,
+    },
+}
+const TILE: u64 = 65536;
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct Builder {
-    device: u64,
-    storage: u64,
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct Request {
+    pool: u64,
+    physical: u64,
+    virtual_offset: u64,
     bytes: u64,
-    flags: u32,
-    padding: u32,
+    class: i32,
+    pad: i32,
 }
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub(crate) struct Pool {
-    pub cpu: u64,
-    pub gpu: u64,
-    pub bytes: u64,
-    pub flags: u32,
-    padding: u32,
+
+pub fn map_virtual(c: &Call) -> Result<u64> {
+    // Previously submitted lists must resolve their GPU addresses before unmapping.
+    c.session.graphics()?.backend.drain()?;
+    let dest: Pool = c.read(c.args[0])?;
+    let device = c.session.graphics()?.heap.device();
+    let mut mappings = c.session.pools.lock().unwrap();
+    let Some(Mapping::Virtual { pages, .. }) = mappings.get_mut(&c.args[0]) else {
+        return Ok(0);
+    };
+    for i in 0..c.args[1] as u32 {
+        let r: Request = c.read(c.args[2] + u64::from(i) * 40)?;
+        if !(r.physical | r.virtual_offset | r.bytes).is_multiple_of(TILE)
+            || r.virtual_offset
+                .checked_add(r.bytes)
+                .is_none_or(|end| end > dest.bytes)
+        {
+            return Ok(0);
+        }
+        let physical = if r.pool != 0 {
+            let p: Pool = c.read(r.pool)?;
+            if p.flags & 0x100 == 0
+                || r.physical
+                    .checked_add(r.bytes)
+                    .is_none_or(|end| end > p.bytes)
+            {
+                return Ok(0);
+            }
+            Some(p.cpu + r.physical)
+        } else {
+            None
+        };
+        for off in (0..r.bytes).step_by(TILE as usize) {
+            let va = dest.gpu + r.virtual_offset + off;
+            let ranges = physical
+                .map(|cpu| {
+                    c.memory.capture(
+                        GuestVirtualAddress::new(cpu + off),
+                        TILE,
+                        MemoryPermissions::READ,
+                    )
+                })
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            pages.remove(&va);
+            if let Some(ranges) = ranges {
+                let pin = device
+                    .map(va, ranges.into(), true)
+                    .map_err(|e| e.to_string())?;
+                pages.insert(va, pin);
+            }
+        }
+    }
+    Ok(1)
 }
-pub fn defaults(c: &Call) -> Result<u64> {
-    c.write_bytes(
-        c.args[0] + 8,
-        &bytemuck::bytes_of(&Builder {
-            flags: 0x21,
-            ..Builder::zeroed()
-        })[8..],
-    )?;
-    Ok(0)
-}
-pub fn set_device(c: &Call) -> Result<u64> {
-    c.write(c.args[0], &c.args[1])?;
-    Ok(0)
-}
-pub fn storage(c: &Call) -> Result<u64> {
-    c.write(c.args[0] + 8, &[c.args[1], c.args[2]])?;
-    Ok(0)
-}
-pub fn flags(c: &Call) -> Result<u64> {
-    c.write(c.args[0] + 24, &(c.args[1] as u32))?;
-    Ok(0)
-}
+
 pub fn initialize(c: &Call) -> Result<u64> {
     let b: Builder = c.read(c.args[1])?;
     if b.flags & 0x200 != 0 {
-        return Err("virtual memory pools are unsupported".into());
+        let reserve = c
+            .session
+            .graphics()?
+            .heap
+            .device()
+            .reserve(b.bytes, TILE)
+            .map_err(|e| e.to_string())?;
+        c.write(
+            c.args[0],
+            &Pool {
+                cpu: 0,
+                gpu: reserve.address(),
+                bytes: b.bytes,
+                flags: b.flags,
+                padding: 0,
+            },
+        )?;
+        c.session.pools.lock().unwrap().insert(
+            c.args[0],
+            Mapping::Virtual {
+                pages: Default::default(),
+                _reservation: reserve,
+            },
+        );
+        return Ok(1);
     }
     let address = GuestVirtualAddress::new(b.storage);
     let ranges = c
@@ -69,45 +130,16 @@ pub fn initialize(c: &Call) -> Result<u64> {
         padding: 0,
     };
     c.write(c.args[0], &pool)?;
-    c.session.pools.lock().unwrap().insert(c.args[0], mapping);
-    Ok(1)
-}
-pub fn map(c: &Call) -> Result<u64> {
-    let p: Pool = c.read(c.args[0])?;
-    Ok(if p.flags & 1 != 0 { 0 } else { p.cpu })
-}
-pub fn address(c: &Call) -> Result<u64> {
-    c.read(c.args[0] + 8)
-}
-pub fn flush(_: &Call) -> Result<u64> {
-    // @SIMPLIFICATION CPU writes already dirty the shared physical buffer/image caches. Submission
-    // drains those invalidations before consuming the pool; mapping needs no upload.
-    Ok(0)
-}
-#[repr(C)]
-#[derive(Clone, Copy, Default, Pod, Zeroable)]
-pub(crate) struct DescriptorPool {
-    pub base: u64,
-    pub count: u32,
-    padding: u32,
-}
-pub fn descriptor_pool(c: &Call) -> Result<u64> {
-    let p: Pool = c.read(c.args[1])?;
-    let off = c.args[2];
-    let count = c.args[3] as u32;
-    if off > p.bytes || u64::from(count) * 32 > p.bytes - off {
-        return Err("descriptor pool exceeds memory pool".into());
-    }
-    c.write(
+    c.session.pools.lock().unwrap().insert(
         c.args[0],
-        &DescriptorPool {
-            base: p.cpu + off,
-            count,
-            padding: 0,
+        Mapping::Physical {
+            _pin: mapping,
+            exported: None,
         },
-    )?;
+    );
     Ok(1)
 }
+
 impl DescriptorPool {
     pub fn new(base: u64, count: u32) -> Self {
         Self {
@@ -128,6 +160,25 @@ pub(crate) fn slot(c: &Call, pointer: u64, index: u32) -> Result<u64> {
     pool.slot(index)
 }
 pub fn finalize(c: &Call) -> Result<u64> {
+    // Previously submitted lists must resolve their GPU addresses before unmapping.
+    c.session.graphics()?.backend.drain()?;
     c.session.pools.lock().unwrap().remove(&c.args[0]);
     Ok(0)
+}
+
+pub(crate) fn surface_handle(c: &Call, object: u64) -> Result<u32> {
+    let mut pools = c.session.pools.lock().unwrap();
+    let Some(Mapping::Physical { exported, .. }) = pools.get_mut(&object) else {
+        return Err("surface requires a physically backed pool".into());
+    };
+    if exported.is_none() {
+        let p: Pool = c.read(object)?;
+        *exported = Some(
+            c.session
+                .graphics()?
+                .surfaces
+                .export(c.memory, p.cpu, p.bytes)?,
+        )
+    }
+    Ok(exported.as_ref().unwrap().handle())
 }

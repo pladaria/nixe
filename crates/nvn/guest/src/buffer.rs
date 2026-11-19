@@ -16,7 +16,7 @@ pub fn initialize(c: &Call) -> Result<u64> {
     if pool == 0 {
         return Ok(0);
     }
-    let p: pool::Pool = c.read(pool)?;
+    let p: Pool = c.read(pool)?;
     if p.flags & 0x100 != 0 {
         return Ok(0);
     }

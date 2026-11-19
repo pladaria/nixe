@@ -53,6 +53,7 @@ pub struct DeviceProfile {
     pub separate_depth_stencil_layouts: bool,
     pub transform_feedback: bool,
     pub provoking_vertex_last: bool,
+    pub conditional_rendering: bool,
     pub index_uint8: bool,
     pub primitive_restart: [bool; 2], // list, patch list
     pub fill_rectangle: bool,
@@ -314,6 +315,7 @@ optional_features! {
     feedback: vk::PhysicalDeviceTransformFeedbackFeaturesEXT<'static> => fixed!(ash::ext::transform_feedback::NAME),
     feedback_layout: vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT<'static> => fixed!(ash::ext::attachment_feedback_loop_layout::NAME),
     feedback_dynamic: vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT<'static> => fixed!(ash::ext::attachment_feedback_loop_dynamic_state::NAME),
+    conditional: vk::PhysicalDeviceConditionalRenderingFeaturesEXT<'static> => |_, e: &ExtensionSet| supported(e, ash::ext::conditional_rendering::NAME),
     index8: vk::PhysicalDeviceIndexTypeUint8FeaturesKHR<'static> => |_, e: &ExtensionSet| supported(e, ash::khr::index_type_uint8::NAME).or_else(|| supported(e, ash::ext::index_type_uint8::NAME)),
     list_restart: vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT<'static> => fixed!(ash::ext::primitive_topology_list_restart::NAME),
     custom_border: vk::PhysicalDeviceCustomBorderColorFeaturesEXT<'static> => fixed!(ash::ext::custom_border_color::NAME),
@@ -629,6 +631,7 @@ impl FeatureSet {
             separate_depth_stencil_layouts: self.v12.separate_depth_stencil_layouts != 0,
             transform_feedback: self.feedback.transform_feedback != 0,
             provoking_vertex_last: self.provoking.provoking_vertex_last != 0,
+            conditional_rendering: self.conditional.conditional_rendering != 0,
             index_uint8: self.index8.index_type_uint8 != 0,
             primitive_restart: [
                 self.list_restart.primitive_topology_list_restart != 0,

@@ -143,10 +143,16 @@ pub trait GpuExecution: OwnerMemory + 'static {
 pub trait GpuPresentation: GpuExecution {
     fn nvn_submit(
         &mut self,
-        _commands: Vec<nixe_nvn::Operation>,
+        _queue: u64,
+        _commands: nixe_nvn::Submission,
     ) -> Result<(), BackendRuntimeError> {
         Err(BackendRuntimeError::Backend(
             "NVN command execution unavailable".into(),
+        ))
+    }
+    fn nvn_finalize_queue(&mut self, _queue: u64) -> Result<(), BackendRuntimeError> {
+        Err(BackendRuntimeError::Backend(
+            "NVN queues unavailable".into(),
         ))
     }
     fn nvn_acquire_fence(&mut self, _action: FenceAction) -> Result<(), BackendRuntimeError> {
@@ -158,6 +164,7 @@ pub trait GpuPresentation: GpuExecution {
         &mut self,
         _texture: nixe_nvn::Texture,
         _interval: u32,
+        _flip_vertical: bool,
     ) -> Result<ResidentImage, BackendRuntimeError> {
         Err(BackendRuntimeError::Backend(
             "NVN presentation unavailable".into(),

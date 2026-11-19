@@ -223,6 +223,7 @@ impl NativeExecution<'_> {
         native: ImageId,
         description: nixe_gpu::ImageDescription,
         components: nixe_gpu::Swizzle,
+        aspect: nixe_gpu::native::GuestImageAspect,
         [base_mip, base_layer]: [u32; 2],
         arrayed: bool,
     ) -> Result<ImageViewId, VulkanError> {
@@ -232,18 +233,8 @@ impl NativeExecution<'_> {
                 "multisample sampling requires a multisample shader image binding",
             ));
         }
-        // A depth/stencil view exposes one selected aspect as R. Preserve
-        // constants while remapping that aspect's logical channel.
-        // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L2563-L2571
-        let aspect = nixe_gpu::nvidia::sampled_aspect(description.format(), components)
-            .map_err(VulkanError::InvalidResource)?;
-        let combined = matches!(
-            description.format(),
-            F::Depth24UnormStencil8Uint | F::Depth32FloatStencil8Uint
-        );
         let swizzle = components.0.map(|c| match c {
             ComponentSwizzle::Red => vk::ComponentSwizzle::R,
-            ComponentSwizzle::Green if combined => vk::ComponentSwizzle::R,
             ComponentSwizzle::Green => vk::ComponentSwizzle::G,
             ComponentSwizzle::Blue => vk::ComponentSwizzle::B,
             ComponentSwizzle::Alpha => vk::ComponentSwizzle::A,
@@ -360,7 +351,7 @@ impl NativeExecution<'_> {
                     .unwrap_or(vk::CompareOp::ALWAYS),
             );
         let samples_border = address_modes.contains(&vk::SamplerAddressMode::CLAMP_TO_BORDER);
-        let (border, custom_border) = sampler_border(s, samples_border);
+        let (border, custom_border) = sampler_border(s.border_color, samples_border);
         let info = info.border_color(border);
         let sampler = self.residency.texture_cache.samplers.get_extended(
             &info,
@@ -562,15 +553,15 @@ pub(super) fn rect(r: nixe_gpu::ScissorRect) -> vk::Rect2D {
     }
 }
 
-fn sampler_border(
-    s: &nixe_gpu::SamplerDescription,
+pub(super) fn sampler_border(
+    color: Option<[u32; 4]>,
     samples_border: bool,
 ) -> (vk::BorderColor, Option<CustomBorderColor>) {
     let core = vk::BorderColor::FLOAT_TRANSPARENT_BLACK;
     if !samples_border {
         return (core, None);
     }
-    match s.border_color {
+    match color {
         None | Some([0, 0, 0, 0]) => (core, None),
         Some([0, 0, 0, 0x3f800000]) => (vk::BorderColor::FLOAT_OPAQUE_BLACK, None),
         Some([0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000]) => {

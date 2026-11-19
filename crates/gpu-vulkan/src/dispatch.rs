@@ -37,6 +37,7 @@ struct BlendingDispatch {
 }
 
 pub(crate) struct Dispatch {
+    conditional: Option<ash::ext::conditional_rendering::Device>,
     recorder: Recorder,
     pub dynamic_mask: u16,
 }
@@ -195,6 +196,9 @@ impl Dispatch {
             objects,
         )?;
         Ok(Self {
+            conditional: profile
+                .conditional_rendering
+                .then(|| ash::ext::conditional_rendering::Device::new(instance, device)),
             recorder,
             dynamic_mask,
         })

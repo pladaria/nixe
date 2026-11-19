@@ -930,9 +930,14 @@ fn owner_memory_error(error: BackendRuntimeError) -> Arc<nixe_memory::MemoryErro
 impl nixe_gpu::GpuPresentation for NativeGpuExecution {
     fn nvn_submit(
         &mut self,
-        commands: Vec<nixe_nvn::Operation>,
+        queue: u64,
+        commands: nixe_nvn::Submission,
     ) -> Result<(), BackendRuntimeError> {
-        self.submit_nvn(commands)
+        self.submit_nvn(queue, commands)
+    }
+    fn nvn_finalize_queue(&mut self, queue: u64) -> Result<(), BackendRuntimeError> {
+        self.state.nvn.finalize_queue(queue);
+        Ok(())
     }
     fn nvn_acquire_fence(
         &mut self,
@@ -951,8 +956,13 @@ impl nixe_gpu::GpuPresentation for NativeGpuExecution {
         &mut self,
         t: nixe_nvn::Texture,
         interval: u32,
+        flip_vertical: bool,
     ) -> Result<ResidentImage, BackendRuntimeError> {
-        self.composite_image(nvn::presentation(t).map_err(runtime)?, interval, None)
+        self.composite_image(
+            nvn::presentation(t, flip_vertical).map_err(runtime)?,
+            interval,
+            None,
+        )
     }
     type Conversion = NativeNv12Conversion;
     type ImageRequest = nixe_gpu_maxwell::PresentationImageRequest;

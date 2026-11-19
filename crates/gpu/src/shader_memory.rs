@@ -29,6 +29,11 @@ impl ShaderInfo {
         self.valid.load(Ordering::Acquire)
     }
 }
+impl nixe_nvn::ShaderValidity for ShaderInfo {
+    fn is_valid(&self) -> bool {
+        self.is_valid()
+    }
+}
 struct Entry {
     isa: nixe_shader_recompiler::environment::ShaderIsa,
     address: u64,

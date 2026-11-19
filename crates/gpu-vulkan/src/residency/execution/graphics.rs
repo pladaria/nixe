@@ -3,6 +3,12 @@ mod clear;
 mod masked_clear;
 pub(crate) use clear::{DeferredClear, RenderPassState};
 pub(crate) use masked_clear::MaskedClearPipelines;
+#[derive(Default)]
+pub(crate) struct HostDrawState<'a> {
+    pub parameter_owner: Option<u64>,
+    pub geometry_owner: Option<crate::queue::GeometryOwner>,
+    pub predicate: Option<&'a Arc<crate::memory::AllocatedBuffer>>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VertexBuffer {
     pub binding: u32,
@@ -217,12 +223,10 @@ impl PreparedTargets {
                 .view
                 .range
                 .aspect_mask(sync::native_image_aspects(a.format));
-            // A 2D array view of volume slices still addresses one 3D mip
-            // for synchronization, as Eden MakeSubresourceRange does.
-            // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+            // A slice attachment shares its entire 3D mip's synchronization scope.
             if a.image_type == vk::ImageType::TYPE_3D {
                 range.base_array_layer = 0;
-                range.layer_count = 1;
+                range.layer_count = vk::REMAINING_ARRAY_LAYERS;
             }
             if !images
                 .iter()
@@ -797,7 +801,14 @@ impl Residency<'_> {
         draw: Draw,
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
-        self.draw_bound(&graphics.program, &graphics.parameters, targets, draw, push)
+        self.draw_bound(
+            &graphics.program,
+            &graphics.parameters,
+            targets,
+            draw,
+            push,
+            HostDrawState::default(),
+        )
     }
 
     pub(crate) fn draw_bound(
@@ -807,6 +818,11 @@ impl Residency<'_> {
         targets: &Arc<PreparedTargets>,
         draw: Draw,
         push: &[u8],
+        HostDrawState {
+            parameter_owner,
+            geometry_owner,
+            predicate,
+        }: HostDrawState<'_>,
     ) -> Result<WorkTicket, VulkanError> {
         // Host utilities accept independently constructed pipeline/framebuffer
         // captures. Guest draws derive both from their owning caches directly.
@@ -849,7 +865,7 @@ impl Residency<'_> {
                     .vertex_bindings
                     .iter()
                     .fold(0u32, |mask, binding| mask | (1 << binding.binding));
-                self.bind_host_geometry_buffers(None, enabled, draw, None, |binding| {
+                self.bind_host_geometry_buffers(geometry_owner, enabled, draw, None, |binding| {
                     parameters
                         .state
                         .vertex_bindings
@@ -940,9 +956,15 @@ impl Residency<'_> {
                 descriptors,
                 draw,
                 push,
+                predicate,
                 false,
                 |aspect| Ok(attachment_read_only(aspect, &parameters.state)),
-                |residency| residency.graphics_state(&program.pipeline, parameters),
+                |residency| match parameter_owner {
+                    Some(owner) => {
+                        residency.graphics_state_nvn(&program.pipeline, parameters, owner)
+                    }
+                    None => residency.graphics_state(&program.pipeline, parameters),
+                },
             )?;
             if !draw.is_empty() {
                 self.host_program_written(program)?;
@@ -961,6 +983,7 @@ impl Residency<'_> {
         descriptors: DescriptorQueue,
         draw: Draw,
         push: &[u8],
+        predicate: Option<&Arc<crate::memory::AllocatedBuffer>>,
         count_samples: bool,
         read_only: impl Fn(vk::ImageAspectFlags) -> Result<bool, VulkanError>,
         record_state: impl FnOnce(&mut Self) -> Result<(), VulkanError>,
@@ -1099,6 +1122,10 @@ impl Residency<'_> {
                 unsafe {
                     if !empty {
                         device.submission.statistics.draw_calls += 1;
+                        if let Some(buffer) = predicate {
+                            device.submission.retain_predicate(buffer);
+                            raw.begin_predicate(buffer.handle);
+                        }
                         {
                             match draw {
                                 Draw::Direct {
@@ -1146,6 +1173,9 @@ impl Residency<'_> {
                                     }
                                 }
                             }
+                        }
+                        if predicate.is_some() {
+                            raw.end_predicate();
                         }
                     }
                 }
