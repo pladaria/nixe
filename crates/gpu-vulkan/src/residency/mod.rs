@@ -329,6 +329,8 @@ pub(crate) struct ResidencyRuntime {
     dma_copy_regions: Vec<vk::BufferImageCopy>,
     descriptor_offsets: Vec<u32>,
     uniform_updates: Vec<Option<crate::queue::Slice>>,
+    host_uniform_uploads: Vec<buffer::UniformUpload>,
+    uniform_scratch: Vec<u8>,
     streamed_uses: Vec<usize>,
 }
 impl VulkanResidency {
@@ -397,6 +399,8 @@ impl VulkanResidency {
                 dma_copy_regions: Vec::new(),
                 descriptor_offsets: Vec::new(),
                 uniform_updates: Vec::new(),
+                host_uniform_uploads: Vec::new(),
+                uniform_scratch: Vec::new(),
                 streamed_uses: Vec::new(),
             },
         };
@@ -787,6 +791,10 @@ impl Residency<'_> {
             self.write_buffer(range.buffer, range.offset + 8, &timestamp.to_le_bytes())?;
         }
         Ok(())
+    }
+    pub(crate) fn has_recorded_work(&self) -> bool {
+        let device = &self.runtime.device;
+        !self.runtime.barriers.is_empty() || device.submission.has_recorded_work(&device.dispatch)
     }
     pub fn flush(&mut self) -> Result<WorkTicket, VulkanError> {
         self.flush_with_sync(&[], &[])

@@ -48,6 +48,14 @@ pub(super) struct BufferStreamRequest {
     pub size: u64,
     pub alignment: u64,
 }
+/// A staging slice belongs to its allocating command buffer. Only slices for
+/// the current tick can be selected again; the allocator owns retirement.
+#[derive(Default)]
+pub(super) struct UniformUpload {
+    pub(super) immutable: Option<(Arc<[u8]>, u64, crate::queue::Slice)>,
+    guest: Option<(u64, crate::queue::Slice)>,
+    bytes: Vec<u8>,
+}
 pub(super) type BufferStream = Option<crate::queue::Slice>;
 impl Residency<'_> {
     /// Match the cache/stream preference over recent guest frames, independently
@@ -430,12 +438,10 @@ impl Residency<'_> {
     /// stay dirty and do not install page observers or quiesce running cores.
     pub(super) fn stream_buffer(
         &mut self,
+        slot: usize,
         request: BufferStreamRequest,
     ) -> Result<BufferStream, VulkanError> {
         self.check_buffer_range(request.id, request.offset, request.size)?;
-        if request.size > 64 * 1024 {
-            return Ok(None);
-        }
         let entry = self.buffer_cache.get(request.id);
         let [full] = entry.contents.geometry.as_slice() else {
             return Ok(None);
@@ -455,33 +461,60 @@ impl Residency<'_> {
         }) {
             return Ok(None);
         }
-        let mapping = full.mapping();
-        let address = entry.device_address;
-        let slice = self.runtime.device.submission.reserve_slice(
-            request.size,
-            crate::queue::staging::Usage::Upload,
-            request.alignment.max(4),
-        )?;
-        unsafe {
-            self.runtime
+        let address = entry.device_address.map(|address| address + request.offset);
+        if request.offset.is_multiple_of(request.alignment)
+            && address.is_some_and(|address| {
+                !self
+                    .buffer_cache
+                    .memory_tracker
+                    .cpu_modified(address, request.size)
+            })
+            && !entry.invalid.intersects(request.offset, request.size)
+        {
+            // The resident allocation already holds these bytes. The normal
+            // buffer-use path installs its dependency and retains it for the draw.
+            return Ok(None);
+        }
+        let runtime = &mut self.runtime;
+        let tick = runtime.device.current_work().tick();
+        let data = &mut runtime.uniform_scratch;
+        let size = request.size as usize;
+        if data.len() < size {
+            data.resize(size, 0);
+        }
+        let capture = &mut data[..size];
+        if let Some(address) = address {
+            runtime
+                .device_reader
+                .read_block_unsafe(address, capture)
+                .map_err(memory_error)?;
+        } else {
+            full.mapping()
+                .capture_stream(request.offset, capture)
+                .map_err(memory_error)?;
+        }
+        runtime.statistics.uniform_read_bytes += request.size;
+        let kept = &mut runtime.host_uniform_uploads[slot];
+        let slice = if let Some((previous, slice)) = kept.guest
+            && previous == tick
+            && slice.offset.is_multiple_of(request.alignment)
+            && slice.size == request.size
+            && kept.bytes[..size] == *capture
+        {
+            runtime.statistics.uniform_reuses += 1;
+            slice
+        } else {
+            let slice = runtime
                 .device
                 .submission
-                .staging
-                .write_with(&slice, |bytes| {
-                    if let Some(address) = address {
-                        self.runtime
-                            .device_reader
-                            .read_block_unsafe(address + request.offset, bytes)
-                            .map_err(memory_error)
-                    } else {
-                        mapping
-                            .capture_stream(request.offset, bytes)
-                            .map_err(memory_error)
-                    }
-                })?;
-        }
+                .reserve_upload_aligned(capture, request.alignment.max(4))?;
+            std::mem::swap(&mut kept.bytes, data);
+            kept.guest = Some((tick, slice));
+            runtime.statistics.cpu_streamed_bytes += request.size;
+            runtime.statistics.uniform_uploads += 1;
+            slice
+        };
         self.touch(Resource::Buffer(request.id));
-        self.runtime.statistics.cpu_streamed_bytes += request.size;
         Ok(Some(slice))
     }
     pub(super) fn aligned_uniform_copy(

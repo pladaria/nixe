@@ -18,8 +18,10 @@ pub(super) struct Cache {
     conditions: crate::residency::predicate::RenderConditions,
     pipelines: HashMap<Arc<nixe_nvn::DrawPipeline>, Rc<shader::Pipeline>>,
     selected_pipeline: Option<(Arc<nixe_nvn::DrawPipeline>, Rc<shader::Pipeline>)>,
-    queues: HashMap<u64, selections::Queue>,
+    queues: HashMap<u64, (nixe_nvn::CommandState, selections::Queue)>,
     driver_banks: shader::DriverBanks,
+    shaders: HashMap<shader::ShaderKey, Rc<shader::Compiled>>,
+    sampled: resources::SampledSelections,
     compute: HashMap<(nixe_nvn::Shader, Shapes), Rc<shader::Program>>,
     compiler: Option<nixe_shader_recompiler::Compiler>,
 }
@@ -91,161 +93,178 @@ impl NativeGpuExecution {
         let mut n = self.execution();
         n.flush_work().map_err(runtime)?;
         n.state.nvn.conditions.begin_list();
-        let mut selections = n.state.nvn.queues.remove(&queue).unwrap_or_default();
-        for op in commands.operations {
-            match op {
-                Operation::CopyTexture {
-                    source,
-                    target,
-                    region,
-                    flags,
-                } => {
-                    if flags & !3 != 0 {
-                        return Err(runtime(error(format!(
-                            "unsupported buffer-to-texture copy flags {flags:#x}"
-                        ))));
-                    }
-                    let mut region = region;
-                    if target.target == 2 {
-                        region[2] = region[2]
-                            .checked_add(u32::from(target.first_layer))
-                            .ok_or_else(|| runtime(error("volume slice overflow")))?;
-                    }
-                    let info = resources::info(target).map_err(runtime)?;
-                    let (id, base) = n
-                        .find_or_insert_image(&info, &resources::PoolSpace)
-                        .map_err(runtime)?;
-                    n.residency
-                        .upload_packed_region(id, base, source, region)
-                        .map_err(runtime)?;
+        let (mut state, mut selections) = n
+            .state
+            .nvn
+            .queues
+            .remove(&queue)
+            .unwrap_or_else(|| (nixe_nvn::CommandState::new(&commands), Default::default()));
+        let mut order = 0;
+        for record in commands.records() {
+            let Some(op) = state.apply(record).map_err(|e| runtime(error(e)))? else {
+                continue;
+            };
+            if let Operation::Barrier(flags) = op {
+                if flags & !0x1ff != 0 {
+                    return Err(runtime(error(format!(
+                        "unsupported NVN barrier bits {flags:#x}"
+                    ))));
                 }
-                Operation::Report { kind, address } => {
-                    if !matches!(kind, 0 | 16) {
-                        return Err(runtime(error(format!("unsupported NVN counter {kind}"))));
-                    }
-                    // @SIMPLIFICATION Sample the host monotonic clock at ordered command
-                    // issue. Publish the report through the GPU buffer timeline.
-                    let elapsed = n
-                        .state
-                        .nvn
-                        .clock
-                        .get_or_insert_with(std::time::Instant::now)
-                        .elapsed();
-                    let ticks = (elapsed.as_nanos() * 384 / 625) as u64;
-                    n.write_nvn_buffer(address, bytemuck::bytes_of(&[0u64, ticks]))
-                        .map_err(runtime)?;
-                    n.state
-                        .nvn
-                        .conditions
-                        .timestamp(n.residency.device_memory(), address);
-                }
-                Operation::Dispatch {
-                    shader,
-                    groups,
-                    bindings,
-                } => n
-                    .dispatch_nvn(shader, groups, &bindings, &mut selections.compute)
-                    .map_err(runtime)?,
-                Operation::Update { address, bytes } => {
-                    n.write_nvn_buffer(address, &bytes).map_err(runtime)?
-                }
-                Operation::RenderEnable { mode, address } => {
-                    n.residency
-                        .set_nvn_condition(
-                            &mut n.state.nvn.conditions,
-                            n.compiler,
-                            queue,
-                            mode,
-                            address,
-                        )
-                        .map_err(runtime)?;
-                }
-                Operation::Clear {
-                    target,
-                    scissor,
-                    color,
-                    mask,
-                } => {
-                    let Some(predicate) = n.state.nvn.conditions.draw(queue) else {
-                        continue;
-                    };
-                    if mask != 15 {
-                        return Err(runtime(error(format!(
-                            "unsupported NVN clear mask {mask:#x}"
-                        ))));
-                    }
-                    let view = resources::target_view(&mut n, target).map_err(runtime)?;
-                    let r = rect(
-                        scissor,
-                        [
-                            (target.width >> target.first_level).max(1),
-                            (target.height >> target.first_level).max(1),
-                        ],
-                    );
-                    if r.extent.width > 0 && r.extent.height > 0 {
-                        n.residency
-                            .clear_view_rect_if(
-                                view,
-                                0,
-                                r,
-                                vk::ClearValue {
-                                    color: vk::ClearColorValue { float32: color },
-                                },
-                                predicate.as_ref(),
-                            )
-                            .map_err(runtime)?;
-                    }
-                }
-                Operation::ClearDepth {
-                    target,
-                    scissor,
-                    depth,
-                    stencil,
-                    mask,
-                } => {
-                    let Some(predicate) = n.state.nvn.conditions.draw(queue) else {
-                        continue;
-                    };
-                    n.clear_nvn_depth(target, scissor, depth, stencil, mask, predicate.as_ref())
-                        .map_err(runtime)?;
-                }
-                Operation::Barrier(flags) => {
-                    // Cache-only bits need no GPU-wide idle. Shader page tracking, fresh
-                    // descriptor reads and resource access scopes own those dependencies.
-                    if flags & !0x1ff != 0 {
-                        return Err(runtime(error(format!(
-                            "unsupported NVN barrier bits {flags:#x}"
-                        ))));
-                    }
-                    if flags & 0x109 != 0 {
-                        n.residency.order_device().map_err(runtime)?;
-                    }
-                    if flags & 7 != 0 {
-                        n.residency.order_fragments(true).map_err(runtime)?;
-                    }
-                    if flags & 0x100 != 0 {
-                        // The L2 flush and system-memory invalidation follow the WFI.
-                        // Resource tracking owns visibility once pending clears are materialized.
-                        n.residency
-                            .runtime
-                            .device
-                            .realize_deferred_clear()
-                            .map_err(runtime)?;
-                    }
-                }
-                Operation::Draw(d) => {
-                    if let Some(predicate) = n.state.nvn.conditions.draw(queue) {
-                        n.draw_nvn(&commands.draws[d], predicate.as_ref(), &mut selections)
-                            .map_err(runtime)?;
-                    }
-                }
+                // Cache invalidations are covered by coherent shader/descriptor and
+                // resource reads. State changes between two orders issue no GPU work.
+                order |= flags & 0x10f;
+                continue;
             }
+            if order != 0 {
+                n.residency.order_nvn(order).map_err(runtime)?;
+                order = 0;
+            }
+            n.issue_nvn(queue, op, &mut selections)?;
         }
-        n.state.nvn.queues.insert(queue, selections);
-        n.end_command_list()
+        if order != 0 {
+            n.residency.order_nvn(order).map_err(runtime)?;
+        }
+        n.state.nvn.queues.insert(queue, (state, selections));
+        let device = n.residency.device_mut();
+        if device.submission.finish_nvn_list(&device.dispatch) {
+            n.flush()?;
+        }
+        Ok(())
     }
 }
 impl NativeExecution<'_> {
+    fn issue_nvn(
+        &mut self,
+        queue: u64,
+        op: Operation<'_>,
+        selections: &mut selections::Queue,
+    ) -> Result<(), BackendRuntimeError> {
+        match op {
+            Operation::CopyTexture {
+                source,
+                target,
+                region,
+                flags,
+            } => {
+                if flags & !3 != 0 {
+                    return Err(runtime(error(format!(
+                        "unsupported buffer-to-texture copy flags {flags:#x}"
+                    ))));
+                }
+                let mut region = region;
+                if target.target == 2 {
+                    region[2] = region[2]
+                        .checked_add(u32::from(target.first_layer))
+                        .ok_or_else(|| runtime(error("volume slice overflow")))?;
+                }
+                let info = resources::info(target).map_err(runtime)?;
+                let (id, base) = self
+                    .find_or_insert_image(&info, &resources::PoolSpace)
+                    .map_err(runtime)?;
+                self.residency
+                    .upload_packed_region(id, base, source, region)
+                    .map_err(runtime)?;
+            }
+            Operation::Report { kind, address } => {
+                if !matches!(kind, 0 | 16) {
+                    return Err(runtime(error(format!("unsupported NVN counter {kind}"))));
+                }
+                // @SIMPLIFICATION Sample the host monotonic clock at ordered command
+                // issue. Publish the report through the GPU buffer timeline.
+                let elapsed = self
+                    .state
+                    .nvn
+                    .clock
+                    .get_or_insert_with(std::time::Instant::now)
+                    .elapsed();
+                let ticks = (elapsed.as_nanos() * 384 / 625) as u64;
+                self.write_nvn_buffer(address, bytemuck::bytes_of(&[0u64, ticks]))
+                    .map_err(runtime)?;
+                self.state
+                    .nvn
+                    .conditions
+                    .timestamp(self.residency.device_memory(), address);
+            }
+            Operation::Dispatch {
+                shader,
+                groups,
+                bindings,
+            } => self
+                .dispatch_nvn(shader, groups, &bindings, &mut selections.compute)
+                .map_err(runtime)?,
+            Operation::Update { address, bytes } => {
+                self.write_nvn_buffer(address, bytes).map_err(runtime)?
+            }
+            Operation::RenderEnable { mode, address } => {
+                self.residency
+                    .set_nvn_condition(
+                        &mut self.state.nvn.conditions,
+                        self.compiler,
+                        queue,
+                        mode,
+                        address,
+                    )
+                    .map_err(runtime)?;
+            }
+            Operation::Clear {
+                target,
+                scissor,
+                color,
+                mask,
+            } => {
+                let Some(predicate) = self.state.nvn.conditions.draw(queue) else {
+                    return Ok(());
+                };
+                if mask != 15 {
+                    return Err(runtime(error(format!(
+                        "unsupported NVN clear mask {mask:#x}"
+                    ))));
+                }
+                let view = resources::target_view(self, target).map_err(runtime)?;
+                let r = rect(
+                    scissor,
+                    [
+                        (target.width >> target.first_level).max(1),
+                        (target.height >> target.first_level).max(1),
+                    ],
+                );
+                if r.extent.width > 0 && r.extent.height > 0 {
+                    self.residency
+                        .clear_view_rect_if(
+                            view,
+                            0,
+                            r,
+                            vk::ClearValue {
+                                color: vk::ClearColorValue { float32: color },
+                            },
+                            predicate.as_ref(),
+                        )
+                        .map_err(runtime)?;
+                }
+            }
+            Operation::ClearDepth {
+                target,
+                scissor,
+                depth,
+                stencil,
+                mask,
+            } => {
+                let Some(predicate) = self.state.nvn.conditions.draw(queue) else {
+                    return Ok(());
+                };
+                self.clear_nvn_depth(target, scissor, depth, stencil, mask, predicate.as_ref())
+                    .map_err(runtime)?;
+            }
+            Operation::Barrier(_) => unreachable!("orders are coalesced at submit"),
+            Operation::Draw(d) => {
+                if let Some(predicate) = self.state.nvn.conditions.draw(queue) {
+                    self.draw_nvn(&d, predicate.as_ref(), selections)
+                        .map_err(runtime)?;
+                }
+            }
+        }
+        Ok(())
+    }
     fn clear_nvn_depth(
         &mut self,
         t: Texture,
@@ -329,9 +348,9 @@ impl NativeExecution<'_> {
             .nvn
             .selected_pipeline
             .as_ref()
-            .filter(|(key, _)| Arc::ptr_eq(key, &d.pipeline))
+            .filter(|(key, _)| Arc::ptr_eq(key, d.pipeline))
             .map(|(_, p)| p)
-            .or_else(|| self.state.nvn.pipelines.get(&d.pipeline))
+            .or_else(|| self.state.nvn.pipelines.get(d.pipeline))
             .filter(|p| p.accepts(&d.bindings, self.residency.device_memory().generation()));
         let pipeline = if let Some(p) = selected {
             p.clone()
@@ -408,7 +427,7 @@ impl NativeExecution<'_> {
                 .collect::<Result<_, VulkanError>>()?;
             let p = Rc::new(shader::compile(self, d, state)?);
             if p.usage.shapes != d.pipeline.shapes {
-                let mut projected = (*d.pipeline).clone();
+                let mut projected = d.pipeline.as_ref().clone();
                 projected.shapes = p.usage.shapes.clone();
                 self.state
                     .nvn
@@ -426,7 +445,7 @@ impl NativeExecution<'_> {
             .nvn
             .selected_pipeline
             .as_ref()
-            .is_some_and(|(key, p)| Arc::ptr_eq(key, &d.pipeline) && Rc::ptr_eq(p, &pipeline))
+            .is_some_and(|(key, p)| Arc::ptr_eq(key, d.pipeline) && Rc::ptr_eq(p, &pipeline))
         {
             self.state.nvn.selected_pipeline = Some((d.pipeline.clone(), pipeline.clone()));
         }
@@ -570,7 +589,7 @@ impl NativeExecution<'_> {
         {
             p.clone()
         } else {
-            let p = Rc::new(shader::prepare(self, &[shader], b, None)?);
+            let p = Rc::new(shader::compute(self, shader, b)?);
             if key.1 != p.usage.shapes {
                 self.state
                     .nvn

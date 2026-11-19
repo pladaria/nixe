@@ -21,10 +21,10 @@ impl Request {
     ) -> Result<(), nixe_gpu::BackendRuntimeError> {
         let result = match self.work {
             Work::Submit(queue, commands) => backend.nvn_submit(queue, commands),
-            Work::Flush => backend.flush(),
+            Work::Flush => backend.nvn_flush(None),
             Work::Drain => Ok(()),
             Work::FinalizeQueue(queue) => backend.nvn_finalize_queue(queue),
-            Work::Fence(action) => backend.submit(Some(action)),
+            Work::Fence(action) => backend.nvn_flush(Some(action)),
             Work::AcquireFence(action) => backend.nvn_acquire_fence(action),
             Work::Present(t, interval, flip_vertical, mailbox, sequence) => backend
                 .nvn_present(t, interval, flip_vertical)
@@ -87,16 +87,7 @@ impl Client {
         // Bound queued work, including small control packets. When full, let
         // this caller wait behind its own request without overtaking older lists.
         let charge = match &work {
-            Work::Submit(_, ops) => ops
-                .operations
-                .capacity()
-                .saturating_mul(size_of::<nixe_nvn::Operation>())
-                .saturating_add(
-                    ops.draws
-                        .capacity()
-                        .saturating_mul(size_of::<nixe_nvn::Draw>()),
-                )
-                .saturating_add(ops.update_bytes),
+            Work::Submit(_, ops) => ops.allocation_bytes(),
             _ => 0,
         }
         .max(MAX_GPU_INGRESS_BYTES / 64);

@@ -62,37 +62,79 @@ pub struct BufferBindings {
     pub storage: Ranges,
 }
 
-impl BufferBindings {
-    fn table(&self, storage: bool) -> &Ranges {
+#[derive(Debug, Default)]
+pub struct BufferState {
+    uniforms: Ranges,
+    pub driver: Arc<BufferBindings>,
+}
+impl BufferState {
+    fn table(&self, storage: bool, stage: u32) -> &Ranges {
         if storage {
-            &self.storage
+            &self.driver.storage
+        } else if stage == 5 {
+            &self.driver.uniforms
         } else {
             &self.uniforms
         }
     }
     pub fn get(&self, storage: bool, stage: u32, slot: u32) -> Option<Range> {
-        let table = self.table(storage);
-        let i = table
+        let table = self.table(storage, stage);
+        table
             .binary_search_by_key(&(stage, slot), |x| (x.0, x.1))
-            .ok()?;
-        Some(table[i].2)
+            .ok()
+            .map(|i| table[i].2)
+    }
+    pub(crate) fn bind(&mut self, storage: bool, stage: u32, slot: u32, range: Range) {
+        let table = self.table(storage, stage);
+        let pos = table.binary_search_by_key(&(stage, slot), |x| (x.0, x.1));
+        if pos.is_ok_and(|i| table[i].2 == range) {
+            return;
+        }
+        let table = if storage {
+            &mut Arc::make_mut(&mut self.driver).storage
+        } else if stage == 5 {
+            &mut Arc::make_mut(&mut self.driver).uniforms
+        } else {
+            &mut self.uniforms
+        };
+        match pos {
+            Ok(i) => table[i].2 = range,
+            Err(i) => table.insert(i, (stage, slot, range)),
+        }
     }
 }
-
+#[derive(Debug)]
+pub struct Bindings<'a> {
+    pub buffers: &'a BufferState,
+    pub textures: &'a CapturedBindings,
+}
+impl std::ops::Deref for Bindings<'_> {
+    type Target = CapturedBindings;
+    fn deref(&self) -> &Self::Target {
+        self.textures
+    }
+}
 #[derive(Clone, Default, Debug)]
-pub struct Bindings {
+pub struct CapturedBindings {
     pub sampled: Arc<SampledBindings>,
-    pub buffers: Arc<BufferBindings>,
-    /// The driver bank exposes storage and compute-uniform addresses only.
-    pub driver_buffers: Arc<BufferBindings>,
     pub handles: Arc<Vec<(Slot, u64)>>,
     pub usage_slot: UsageSlot,
     pub captured: Option<Arc<ShaderUsage>>,
 }
 
+impl CapturedBindings {
+    pub(crate) fn same_selection(&self, previous: &Self) -> bool {
+        Arc::ptr_eq(&self.sampled, &previous.sampled)
+            && Arc::ptr_eq(&self.handles, &previous.handles)
+            && Arc::ptr_eq(&self.usage_slot, &previous.usage_slot)
+            && self.captured.as_ref().map(Arc::as_ptr)
+                == previous.captured.as_ref().map(Arc::as_ptr)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct BindingState {
-    current: Bindings,
+    current: CapturedBindings,
     programs: std::collections::HashMap<SmallVec<[Shader; 2]>, UsageSlot>,
     shaders: SmallVec<[Shader; 2]>,
     active: Vec<(Slot, u64)>,
@@ -113,27 +155,6 @@ impl BindingState {
             .entry(self.shaders.clone())
             .or_default()
             .clone();
-    }
-
-    pub fn bind_buffer(&mut self, storage: bool, stage: u32, slot: u32, range: Range) {
-        let table = self.current.buffers.table(storage);
-        let pos = table.binary_search_by_key(&(stage, slot), |x| (x.0, x.1));
-        if pos.is_ok_and(|i| table[i].2 == range) {
-            return;
-        }
-        let buffers = Arc::make_mut(&mut self.current.buffers);
-        let table = if storage {
-            &mut buffers.storage
-        } else {
-            &mut buffers.uniforms
-        };
-        match pos {
-            Ok(i) => table[i].2 = range,
-            Err(i) => table.insert(i, (stage, slot, range)),
-        }
-        if storage || stage == 5 {
-            self.current.driver_buffers = self.current.buffers.clone();
-        }
     }
 
     pub fn bind_texture(&mut self, stage: u32, slot: u32, handle: u64) {
@@ -160,7 +181,7 @@ impl BindingState {
         c: &Call,
         texture_pool: DescriptorPool,
         sampler_pool: DescriptorPool,
-    ) -> Result<Bindings> {
+    ) -> Result<&CapturedBindings> {
         let known = self.current.usage_slot.get().cloned();
         if let Some(usage) = &known
             && usage.current(c.session.graphics()?.heap.device().generation())
@@ -168,7 +189,7 @@ impl BindingState {
             self.capture(c, texture_pool, sampler_pool, Some(&usage.shapes))?;
             if self.current.sampled.shapes == usage.shapes {
                 self.current.captured = known;
-                return Ok(self.current.clone());
+                return Ok(&self.current);
             }
         }
         if known.is_some() {
@@ -178,7 +199,7 @@ impl BindingState {
         }
         self.capture(c, texture_pool, sampler_pool, None)?;
         self.current.captured = None;
-        Ok(self.current.clone())
+        Ok(&self.current)
     }
 
     fn capture(
@@ -347,23 +368,13 @@ mod tests {
         c.write(0x1800, &sid).unwrap();
         let mut state = BindingState::default();
         state.bind_texture(1, 0, 1);
-        let first = state.snapshot(&c, textures, samplers).unwrap();
+        let first = state.snapshot(&c, textures, samplers).unwrap().clone();
         state.bind_texture(1, 0, 1);
-        let range = Range {
-            address: 0x8000,
-            size: 128,
-        };
-        state.bind_buffer(false, 1, 2, range);
-        let buffers = state.snapshot(&c, textures, samplers).unwrap();
-        assert!(Arc::ptr_eq(&first.sampled, &buffers.sampled));
-        assert!(first.buffers.get(false, 1, 2).is_none());
-        state.bind_buffer(false, 1, 2, range);
         c.write(0x4020, &new_id).unwrap();
-        let changed = state.snapshot(&c, textures, samplers).unwrap();
+        let changed = state.snapshot(&c, textures, samplers).unwrap().clone();
         assert_eq!(first.sampled.get(1, 0).unwrap().texture, texture);
         assert_eq!(changed.sampled.get(1, 0).unwrap().texture, new_texture);
         assert!(Arc::ptr_eq(&changed.sampled.shapes, &first.sampled.shapes));
-        assert!(Arc::ptr_eq(&changed.buffers, &buffers.buffers));
         // A warm program consumes one of two bound slots. The other raw
         // handle remains visible to ordinary reads of driver constant bank 2.
         state.bind_texture(1, 4, 1);
@@ -387,11 +398,11 @@ mod tests {
         c.write(0x1ffe, &session.textures.lock().unwrap().intern(typed))
             .unwrap();
         state.pool_changed();
-        let switched = state.snapshot(&c, split, samplers).unwrap();
+        let switched = state.snapshot(&c, split, samplers).unwrap().clone();
         assert_eq!(switched.sampled.get(1, 0).unwrap().texture, typed);
         assert_ne!(switched.sampled.shapes, changed.sampled.shapes);
         state.bind_texture(1, 0, 0);
-        let unbound = state.snapshot(&c, split, samplers).unwrap();
+        let unbound = state.snapshot(&c, split, samplers).unwrap().clone();
         assert!(unbound.sampled.entries.is_empty());
         assert!(unbound.sampled.shapes.is_empty());
         assert!(switched.sampled.get(1, 0).is_some());

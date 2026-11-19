@@ -147,7 +147,6 @@ impl Default for Sampler {
     }
 }
 
-pub(crate) const CALL: u64 = 1 << 62;
 pub(crate) const LINK: u64 = 1 << 61;
 pub(crate) const END: u64 = 1 << 63;
 pub(crate) const CONTROL_SIZE: u64 = 16;

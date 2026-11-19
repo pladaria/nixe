@@ -155,6 +155,9 @@ pub trait GpuPresentation: GpuExecution {
             "NVN queues unavailable".into(),
         ))
     }
+    fn nvn_flush(&mut self, action: Option<FenceAction>) -> Result<(), BackendRuntimeError> {
+        self.submit(action)
+    }
     fn nvn_acquire_fence(&mut self, _action: FenceAction) -> Result<(), BackendRuntimeError> {
         Err(BackendRuntimeError::Backend(
             "NVN presentation unavailable".into(),

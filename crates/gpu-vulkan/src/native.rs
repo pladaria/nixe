@@ -939,6 +939,25 @@ impl nixe_gpu::GpuPresentation for NativeGpuExecution {
         self.state.nvn.finalize_queue(queue);
         Ok(())
     }
+    fn nvn_flush(
+        &mut self,
+        action: Option<nixe_gpu::FenceAction>,
+    ) -> Result<(), BackendRuntimeError> {
+        let mut n = self.execution();
+        let work = if n.residency.has_recorded_work() {
+            n.flush()?
+        } else {
+            let q = &n.residency.device().submission;
+            q.ticket(q.scheduled)
+        };
+        if action.is_some() {
+            n.state
+                .fences
+                .queue(Some(work), false, action)
+                .map_err(runtime)?;
+        }
+        Ok(())
+    }
     fn nvn_acquire_fence(
         &mut self,
         action: nixe_gpu::FenceAction,

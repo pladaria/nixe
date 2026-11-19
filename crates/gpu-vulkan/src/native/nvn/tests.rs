@@ -48,9 +48,11 @@ fn counter_comparison_snapshots_device_writes_in_queue_order()
         swizzle: [2, 3, 4, 5],
         ..Default::default()
     };
-    let counters = |a: u64, b: u64| Operation::Update {
+    let different = [7u64, 0, (1u64 << 32) | 7];
+    let equal = [7u64, 0, 7];
+    let counters = |words| Operation::Update {
         address,
-        bytes: bytemuck::cast_slice(&[a, 0, b]).into(),
+        bytes: bytemuck::cast_slice(words),
     };
     let compare = |mode| Operation::RenderEnable { mode, address };
     let clear = |color, scissor| Operation::Clear {
@@ -62,26 +64,47 @@ fn counter_comparison_snapshots_device_writes_in_queue_order()
     let full = [0, 0, 8, 4];
     let red = [1., 0., 0., 1.];
     let green = [0., 1., 0., 1.];
-    let list = |operations| nixe_nvn::Submission {
-        operations,
-        ..Default::default()
-    };
-    gpu.submit_nvn(
-        1,
-        list(vec![
-            counters(7, (1u64 << 32) | 7),
+    let mut selected = selections::Queue::default();
+    {
+        let mut native = gpu.execution();
+        for op in [
+            counters(&different),
             compare(1),
-            counters(7, 7),
+            counters(&equal),
             clear(green, full),
             compare(1),
             clear(red, full),
-        ]),
-    )?;
-    if conditional {
-        assert!(matches!(gpu.state.nvn.conditions.draw(1), Some(Some(_))));
+        ] {
+            native.issue_nvn(1, op, &mut selected)?;
+        }
+        if conditional {
+            assert!(matches!(native.state.nvn.conditions.draw(1), Some(Some(_))));
+        }
+        native.issue_nvn(
+            2,
+            clear(red, [4, 0, 4, 4]),
+            &mut selections::Queue::default(),
+        )?;
+        native.issue_nvn(1, clear(red, full), &mut selected)?;
     }
-    gpu.submit_nvn(2, list(vec![clear(red, [4, 0, 4, 4])]))?;
-    gpu.submit_nvn(1, list(vec![clear(red, full)]))?;
+    // The explicit flush submits the draws. Both later fences must observe
+    // that same GPU prefix in FIFO order even if it is still in flight.
+    use nixe_gpu::GpuPresentation;
+    gpu.nvn_flush(None)?;
+    let submitted = gpu.residency.device().scheduled_tick();
+    let (send, done) = std::sync::mpsc::channel();
+    for i in 0..2 {
+        let send = send.clone();
+        gpu.nvn_flush(Some(Box::new(move |result| {
+            let _ = send.send(i);
+            result
+        })))?;
+    }
+    gpu.nvn_flush(None)?;
+    assert_eq!(gpu.residency.device().scheduled_tick(), submitted);
+    for i in 0..2 {
+        assert_eq!(done.recv_timeout(Duration::from_secs(5))?, i);
+    }
     gpu.residency.access().flush_read_span(framebuffer, 128)?;
     let mut pixels = [0; 128];
     memory

@@ -23,8 +23,8 @@ mod state;
 mod texels;
 mod texture;
 
-pub use bindings::{Bindings, Sampled, TextureShape};
-pub use command::{Attachments, Draw, DrawPipeline, Operation, Submission};
+pub use bindings::{Bindings, BufferBindings, Sampled, TextureShape};
+pub use command::{Attachments, CommandState, Draw, DrawPipeline, Operation, Submission};
 pub use layout::{Layout, Mip};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_memory::{AddressSpace, DeviceHeapMemory};

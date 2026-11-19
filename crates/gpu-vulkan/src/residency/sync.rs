@@ -112,6 +112,56 @@ impl Barriers {
     }
 }
 impl Residency<'_> {
+    /// Express the guest's execution and visibility requirements in one dependency.
+    /// A fragment order may cross pixels; keep that dependency framebuffer-global.
+    pub(crate) fn order_nvn(&mut self, bits: u32) -> Result<(), VulkanError> {
+        use vk::AccessFlags2 as Access;
+        use vk::PipelineStageFlags2 as Stage;
+        let pixels = Stage::FRAGMENT_SHADER
+            | Stage::EARLY_FRAGMENT_TESTS
+            | Stage::LATE_FRAGMENT_TESTS
+            | Stage::COLOR_ATTACHMENT_OUTPUT;
+        let full = bits & 0x101 != 0;
+        let indirect = bits & 8 != 0;
+        if full || indirect {
+            self.sync_query_values()?;
+        }
+        let mut src = Stage::empty();
+        let mut dst = Stage::empty();
+        let mut access = Access::empty();
+        if full {
+            src = Stage::ALL_COMMANDS;
+            dst = Stage::ALL_COMMANDS;
+            access = Access::MEMORY_READ | Access::MEMORY_WRITE;
+        } else {
+            if bits & 6 != 0 {
+                src |= pixels;
+                dst |= pixels;
+                access |= Access::MEMORY_READ | Access::MEMORY_WRITE;
+            }
+            if indirect {
+                src |= Stage::ALL_COMMANDS;
+                dst |= Stage::DRAW_INDIRECT;
+                access |= Access::INDIRECT_COMMAND_READ;
+            }
+        }
+        self.runtime.device.end_rendering()?;
+        let barrier = vk::MemoryBarrier2::default()
+            .src_stage_mask(src)
+            .src_access_mask(Access::MEMORY_WRITE)
+            .dst_stage_mask(dst)
+            .dst_access_mask(access);
+        let barriers = &mut self.runtime.barriers.images;
+        unsafe {
+            self.runtime.device.dispatch.barrier(
+                &vk::DependencyInfo::default()
+                    .memory_barriers(std::slice::from_ref(&barrier))
+                    .image_memory_barriers(barriers),
+            );
+        }
+        barriers.clear();
+        Ok(())
+    }
     /// Order pixel producers without submitting or waiting on the host. Memory
     /// stays GPU-resident; physical cache publication is owned by fences/accesses.
     pub(crate) fn order_fragments(&mut self, before_depth: bool) -> Result<(), VulkanError> {

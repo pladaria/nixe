@@ -40,7 +40,7 @@ impl Queue {
         if self
             .selection
             .as_ref()
-            .is_none_or(|old| !Arc::ptr_eq(old, &draw.attachments))
+            .is_none_or(|old| !Arc::ptr_eq(old, draw.attachments))
         {
             for (i, selection) in self.attachments.iter_mut().enumerate() {
                 let texture = if i == 8 {
@@ -130,6 +130,14 @@ impl NativeExecution<'_> {
             self.residency.device_memory().generation(),
             self.residency.texture_cache.binding_revision,
         );
+        if let Some(program) = &mut selected.program
+            && program.pipeline.identity() != pipeline.native.identity()
+            && program.pipeline.layout.key == pipeline.native.layout.key
+        {
+            // The new pipeline owns access scopes and Vulkan bind state. Equal
+            // descriptor layouts can consume the already resolved physical slots.
+            program.pipeline = pipeline.native.clone();
+        }
         if selected
             .program
             .as_ref()

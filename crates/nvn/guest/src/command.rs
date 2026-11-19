@@ -125,7 +125,13 @@ pub fn add_control(c: &Call) -> Result<u64> {
         return Err("control segment too small");
     }
     if r.recording != 0 && r.last != 0 {
-        r.entry(c, c.args[1], LINK)?;
+        c.write(
+            r.control,
+            &Range {
+                address: c.args[1],
+                size: LINK,
+            },
+        )?;
     }
     r.control = c.args[1];
     r.control_base = r.control;
@@ -148,30 +154,113 @@ pub fn begin(c: &Call) -> Result<u64> {
     c.write(c.args[0], &r)?;
     Ok(0)
 }
+// A call retains the source command ranges. The application can reuse their
+// control storage as soon as this function returns. A copy owns the bytes too.
+// https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/hle_nvn.c#L1237
 pub fn call_commands(c: &Call) -> Result<u64> {
+    append_commands::<false>(c)
+}
+pub fn copy_commands(c: &Call) -> Result<u64> {
+    append_commands::<true>(c)
+}
+fn append_commands<const COPY: bool>(c: &Call) -> Result<u64> {
     let mut r: Recorder = c.read(c.args[0])?;
     if r.recording == 0 {
         return Err("outside recording");
     }
-    let count = u64::from(c.args[1] as u32);
-    let entries = count + u64::from(r.position > r.begin);
-    if !r.has_control(entries) {
-        return r.request(c, 1, (entries + 1) * 16);
-    }
-    r.close_range(c)?;
-    for i in 0..count {
-        let handle: u64 = c.read(c.args[2] + 8 * i)?;
-        r.entry(c, handle, CALL)?
+    for i in 0..u64::from(c.args[1] as u32) {
+        let mut cursor: u64 = c.read(c.args[2] + 8 * i)?;
+        loop {
+            let Range { address, size } = c.read(cursor)?;
+            if size == LINK {
+                cursor = address;
+                continue;
+            }
+            let bytes = size & !END;
+            if bytes != 0 {
+                if COPY {
+                    r.copy_range(c, address, bytes)?;
+                } else {
+                    if r.position > r.begin {
+                        r.ensure_control(c)?;
+                        r.close_range(c)?;
+                    }
+                    r.ensure_control(c)?;
+                    r.entry(c, address, bytes)?;
+                }
+            }
+            if size & END != 0 {
+                break;
+            }
+            cursor += CONTROL_SIZE;
+        }
     }
     c.write(c.args[0], &r)?;
     Ok(0)
+}
+impl Recorder {
+    #[cold]
+    fn refill_now(&mut self, c: &Call, event: u64, bytes: u64) -> Result<()> {
+        if self.callback == 0 || (event == 0 && self.callback_enabled == 0) {
+            return Err("NVN recording memory exhausted without refill callback");
+        }
+        c.write(c.args[0], self)?;
+        let callback: unsafe extern "C" fn(u64, u64, u64, u64) =
+            unsafe { core::mem::transmute(self.callback) };
+        unsafe { callback(c.args[0], event, bytes, self.callback_data) };
+        *self = c.read(c.args[0])?;
+        Ok(())
+    }
+    fn ensure_control(&mut self, c: &Call) -> Result<()> {
+        if !self.has_control(1) {
+            self.refill_now(c, 1, 2 * CONTROL_SIZE)?;
+            if !self.has_control(1) {
+                return Err("insufficient control memory after refill");
+            }
+        }
+        Ok(())
+    }
+    fn copy_range(&mut self, c: &Call, mut source: u64, mut bytes: u64) -> Result<()> {
+        while bytes != 0 {
+            let available = self.limit - self.position;
+            let mut n = bytes;
+            if n > available {
+                n = 0;
+                while n < bytes {
+                    let header: u64 = c.read(source + n)?;
+                    let record = ((header >> 32) + 1) * 8;
+                    if record > bytes - n {
+                        return Err("truncated copied command");
+                    }
+                    if record > available - n {
+                        if n == 0 {
+                            self.refill_now(c, 0, record)?;
+                            if self.limit - self.position < record {
+                                return Err("insufficient command memory after refill");
+                            }
+                        }
+                        break;
+                    }
+                    n += record;
+                }
+            }
+            if n == 0 {
+                continue;
+            }
+            unsafe { core::ptr::copy(source as *const u8, self.position as *mut u8, n as usize) };
+            self.position += n;
+            source += n;
+            bytes -= n;
+        }
+        Ok(())
+    }
 }
 pub fn end(c: &Call) -> Result<u64> {
     let mut r: Recorder = c.read(c.args[0])?;
     if r.recording == 0 {
         return Err("outside recording");
     }
-    if !r.has_control(1) {
+    if (r.position > r.begin || r.last == 0) && !r.has_control(1) {
         return r.request(c, 1, 32);
     }
     r.close_range(c)?;

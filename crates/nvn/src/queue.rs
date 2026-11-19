@@ -66,9 +66,30 @@ impl PendingWait {
 }
 #[derive(Default)]
 pub(crate) struct Queues {
-    state: HashMap<u64, command::State>,
+    state: HashMap<u64, Arc<Queue>>,
     syncs: HashMap<u64, Arc<Fence>>,
     windows: HashMap<u64, Window>,
+}
+struct Queue {
+    upper_left: bool,
+    minus_one_to_one: bool,
+    capture: Mutex<Option<command::Capture>>,
+}
+fn queue(c: &Call) -> Result<Arc<Queue>> {
+    c.session
+        .queues
+        .lock()
+        .unwrap()
+        .state
+        .get(&c.args[0])
+        .cloned()
+        .ok_or_else(|| "unknown queue".into())
+}
+impl Queue {
+    fn ordered<T>(&self, work: impl FnOnce(&mut command::Capture) -> Result<T>) -> Result<T> {
+        let mut capture = self.capture.lock().unwrap();
+        work(capture.as_mut().ok_or("queue finalized")?)
+    }
 }
 struct Window {
     textures: Vec<u64>,
@@ -78,16 +99,33 @@ struct Window {
 }
 
 pub fn initialize(c: &Call) -> Result<u64> {
-    c.session.queues.lock().unwrap().state.insert(
-        c.args[0],
-        command::State::for_device(c, c.read(c.args[1])?)?,
-    );
+    let device: u64 = c.read(c.args[1])?;
+    let [origin, depth]: [u32; 2] = c.read(device + 4)?;
+    let queue = Arc::new(Queue {
+        upper_left: origin == 1,
+        minus_one_to_one: depth == 0,
+        capture: Mutex::new(Some(command::Capture::default())),
+    });
+    c.session
+        .queues
+        .lock()
+        .unwrap()
+        .state
+        .insert(c.args[0], queue);
     Ok(1)
 }
 
 pub fn finalize(c: &Call) -> Result<u64> {
-    let mut queues = c.session.queues.lock().unwrap();
-    queues.state.remove(&c.args[0]);
+    let queue = c
+        .session
+        .queues
+        .lock()
+        .unwrap()
+        .state
+        .remove(&c.args[0])
+        .ok_or("unknown queue")?;
+    let mut capture = queue.capture.lock().unwrap();
+    capture.take();
     c.session.graphics()?.backend.finalize_queue(c.args[0])?;
     Ok(0)
 }
@@ -129,10 +167,17 @@ pub fn fence(c: &Call) -> Result<u64> {
         )
         .into());
     }
-    let f = Arc::new(Fence::default());
-    c.session.graphics()?.backend.fence(f.clone())?;
-    c.session.queues.lock().unwrap().syncs.insert(c.args[1], f);
-    Ok(0)
+    queue(c)?.ordered(|_| {
+        let fence = Arc::new(Fence::default());
+        c.session.graphics()?.backend.fence(fence.clone())?;
+        c.session
+            .queues
+            .lock()
+            .unwrap()
+            .syncs
+            .insert(c.args[1], fence);
+        Ok(0)
+    })
 }
 pub fn wait(c: &Call) -> Result<u64> {
     let f = c
@@ -154,7 +199,7 @@ pub fn wait(c: &Call) -> Result<u64> {
     Ok(0)
 }
 pub fn flush(c: &Call) -> Result<u64> {
-    c.session.graphics()?.backend.flush()?;
+    queue(c)?.ordered(|_| c.session.graphics()?.backend.flush())?;
     Ok(0)
 }
 pub fn acquire(c: &Call) -> Result<u64> {
@@ -195,19 +240,18 @@ fn acquire_slot(c: &Call, window: u64) -> Result<u64> {
     Ok(0)
 }
 pub fn submit(c: &Call) -> Result<u64> {
-    let mut ops = Submission::default();
-    {
-        let mut queues = c.session.queues.lock().unwrap();
-        let q = queues.state.get_mut(&c.args[0]).ok_or("unknown queue")?;
+    let q = queue(c)?;
+    q.ordered(|capture| {
+        let mut submission = Submission::new(q.upper_left, q.minus_one_to_one);
         for i in 0..c.args[1] as u32 {
-            q.replay(c, c.read(c.args[2] + u64::from(i) * 8)?, &mut ops)?
+            capture.list(c, c.read(c.args[2] + u64::from(i) * 8)?, &mut submission)?;
         }
-        c.session.graphics()?.backend.submit(c.args[0], ops)?;
-    }
+        c.session.graphics()?.backend.submit(c.args[0], submission)
+    })?;
     Ok(0)
 }
 pub fn present(c: &Call) -> Result<u64> {
-    let (texture, interval, flip_vertical) = {
+    let (texture, interval, queue) = {
         let q = c.session.queues.lock().unwrap();
         let w = q.windows.get(&c.args[1]).ok_or("unknown window")?;
         (
@@ -215,17 +259,15 @@ pub fn present(c: &Call) -> Result<u64> {
                 .get(c.args[2] as u32 as usize)
                 .ok_or("invalid window texture index")?,
             w.interval,
-            !q.state
-                .get(&c.args[0])
-                .ok_or("unknown queue")?
-                .pipeline
-                .upper_left,
+            q.state.get(&c.args[0]).cloned().ok_or("unknown queue")?,
         )
     };
-    c.session
-        .graphics()?
-        .backend
-        .present(c.read(texture)?, interval, flip_vertical)?;
+    queue.ordered(|_| {
+        c.session
+            .graphics()?
+            .backend
+            .present(c.read(texture)?, interval, !queue.upper_left)
+    })?;
     Ok(0)
 }
 

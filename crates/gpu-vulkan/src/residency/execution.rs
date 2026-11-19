@@ -407,6 +407,11 @@ impl Residency<'_> {
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L932
         updates.resize_with(program.pipeline.layout.uniform_bindings.len(), || None);
         debug_assert!(updates.iter().all(Option::is_none));
+        if self.runtime.host_uniform_uploads.len() < updates.len() {
+            self.runtime
+                .host_uniform_uploads
+                .resize_with(updates.len(), Default::default);
+        }
         // Eden selects streaming from this uniform range's GPU modifications.
         // Read-only aliases and adjacent bindings do not change its contents.
         // stream_buffer checks exact producers before capturing RAM; prior GPU
@@ -420,11 +425,23 @@ impl Residency<'_> {
                     .profile()
                     .limits
                     .min_uniform_buffer_offset_alignment;
-                let slice = self
-                    .runtime
-                    .device
-                    .submission
-                    .reserve_upload_aligned(bytes, alignment)?;
+                let tick = self.runtime.device.current_work().tick();
+                let kept = &mut self.runtime.host_uniform_uploads[slot].immutable;
+                let slice = if let Some((source, previous, slice)) = kept
+                    && *previous == tick
+                    && Arc::ptr_eq(source, bytes)
+                {
+                    self.runtime.statistics.uniform_keeps += 1;
+                    *slice
+                } else {
+                    let slice = self
+                        .runtime
+                        .device
+                        .submission
+                        .reserve_upload_aligned(bytes, alignment)?;
+                    *kept = Some((bytes.clone(), tick, slice));
+                    slice
+                };
                 updates[slot] = Some(slice);
                 continue;
             }
@@ -452,7 +469,7 @@ impl Residency<'_> {
             {
                 continue;
             }
-            let Some(update) = self.stream_buffer(request)? else {
+            let Some(update) = self.stream_buffer(slot, request)? else {
                 continue;
             };
             updates[slot] = Some(update);

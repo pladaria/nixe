@@ -30,18 +30,41 @@ impl std::ops::Deref for Pipeline {
     }
 }
 pub(super) struct Program {
-    pub usage: Arc<nixe_nvn::ShaderUsage>,
+    compiled: Rc<Compiled>,
     pub native: NativePipeline,
-    pub inputs: Vec<Input>,
     pub push: usize,
 }
-impl Program {
+impl std::ops::Deref for Program {
+    type Target = Compiled;
+    fn deref(&self) -> &Compiled {
+        &self.compiled
+    }
+}
+pub(super) struct Compiled {
+    artifact: Arc<crate::cache::ShaderArtifact>,
+    pub usage: Arc<nixe_nvn::ShaderUsage>,
+    pub inputs: Vec<Input>,
+}
+// All stages link and assign descriptor numbers together. Fixed-function
+// pipeline variants with the same compiler inputs share the linked result.
+#[derive(Clone, Hash, PartialEq, Eq)]
+pub(super) struct ShaderKey {
+    stages: smallvec::SmallVec<[nixe_nvn::Shader; 2]>,
+    shapes: Shapes,
+    vertex_types: [AttributeType; 32],
+    topology: InputTopology,
+    point_size: u32,
+    minus_one_to_one: bool,
+}
+impl Compiled {
     pub fn accepts(&self, b: &nixe_nvn::Bindings, generation: u64) -> bool {
         match &b.captured {
             Some(source) => Arc::ptr_eq(source, &self.usage) || self.usage.same_code(source),
             None => self.usage.current(generation),
         }
     }
+}
+impl Program {
     pub fn publish_usage(&self, b: &nixe_nvn::Bindings) {
         if b.usage_slot.get().is_none() {
             let _ = b.usage_slot.set(self.usage.clone());
@@ -169,12 +192,46 @@ pub(super) fn compile(
         runtime.vertex_input_types[attribute.location as usize] =
             resources::vertex_input_type(attribute.format);
     }
-    let core = prepare(
-        native,
-        &draw.shaders,
-        &draw.bindings,
-        Some((&runtime, &mut state)),
-    )?;
+    let key = ShaderKey {
+        stages: draw.shaders.clone(),
+        shapes: draw.pipeline.shapes.clone(),
+        vertex_types: runtime.vertex_input_types,
+        topology: runtime.input_topology,
+        point_size: runtime.point_size.to_bits(),
+        minus_one_to_one: runtime.ndc_minus_one_to_one,
+    };
+    let compiled = match native.state.nvn.shaders.get(&key) {
+        Some(cached)
+            if cached.accepts(
+                &draw.bindings,
+                native.residency.device_memory().generation(),
+            ) =>
+        {
+            cached.clone()
+        }
+        _ => {
+            let compiled = Rc::new(translate(
+                native,
+                &draw.shaders,
+                &draw.bindings,
+                Some(&runtime),
+            )?);
+            if key.shapes != compiled.usage.shapes {
+                let mut projected = key.clone();
+                projected.shapes = compiled.usage.shapes.clone();
+                native.state.nvn.shaders.insert(projected, compiled.clone());
+            }
+            native.state.nvn.shaders.insert(key, compiled.clone());
+            compiled
+        }
+    };
+    state.retain_vertex_inputs(
+        compiled
+            .artifact
+            .vertex_input_mask()
+            .ok_or_else(|| error("NVN graphics pipeline has no vertex shader"))?,
+    );
+    let core = link(native, compiled, Some(&state))?;
     let pipeline = &core.native;
     let [width, height] = draw.extent();
     let vertex_buffer_mask = state
@@ -198,12 +255,12 @@ pub(super) fn compile(
         parameters: parameters.into(),
     })
 }
-pub(super) fn prepare(
+fn translate(
     native: &mut NativeExecution<'_>,
     stages: &[nixe_nvn::Shader],
     bindings: &nixe_nvn::Bindings,
-    graphics: Option<(&GraphicsRuntimeState, &mut GraphicsState)>,
-) -> Result<Program, VulkanError> {
+    graphics: Option<&GraphicsRuntimeState>,
+) -> Result<Compiled, VulkanError> {
     if native.state.nvn.compiler.is_none() {
         native.state.nvn.compiler = Some(ir::Compiler::new().map_err(error)?);
     }
@@ -304,9 +361,7 @@ pub(super) fn prepare(
         );
     }
     let config = &native.residency.device().profile().shader_compiler;
-    let shader =
-        crate::cache::compile_guest(compiler, &ids, config, graphics.as_ref().map(|g| g.0))
-            .map_err(error)?;
+    let shader = crate::cache::compile_guest(compiler, &ids, config, graphics).map_err(error)?;
     let mut inputs = Vec::new();
     for stage in &shader.stages {
         let id = match stage.stage {
@@ -384,20 +439,6 @@ pub(super) fn prepare(
         }
     }
     inputs.sort_by_key(|i| i.0);
-    let recipe = if let Some((_, state)) = graphics {
-        state.retain_vertex_inputs(
-            shader
-                .vertex_input_mask()
-                .ok_or_else(|| error("NVN graphics pipeline has no vertex shader"))?,
-        );
-        PipelineRecipe::Graphics {
-            shader,
-            state: state.clone(),
-        }
-    } else {
-        PipelineRecipe::Compute(shader)
-    };
-    let native = native.compiler.request(recipe).map_err(error)?;
     consumed.sort_unstable();
     consumed.dedup();
     let shapes = consumed
@@ -410,7 +451,8 @@ pub(super) fn prepare(
             Ok((stage, slot, t.texture.format, t.texture.target_kind()))
         })
         .collect::<Result<Arc<[_]>, VulkanError>>()?;
-    Ok(Program {
+    Ok(Compiled {
+        artifact: shader,
         usage: Arc::new(nixe_nvn::ShaderUsage {
             stages: sources.into_boxed_slice(),
             shapes,
@@ -420,17 +462,47 @@ pub(super) fn prepare(
                 .map_or(generation, |v| v.mapping_generation),
         }),
         inputs: inputs.into_iter().map(|i| i.1).collect(),
+    })
+}
+fn link(
+    owner: &mut NativeExecution<'_>,
+    compiled: Rc<Compiled>,
+    graphics: Option<&GraphicsState>,
+) -> Result<Program, VulkanError> {
+    let shader = compiled.artifact.clone();
+    let recipe = match graphics {
+        Some(state) => PipelineRecipe::Graphics {
+            shader,
+            state: state.clone(),
+        },
+        None => PipelineRecipe::Compute(shader),
+    };
+    let native = owner.compiler.request(recipe).map_err(error)?;
+    Ok(Program {
+        compiled,
         push: native.layout.key.push_bytes as usize,
         native,
     })
+}
+pub(super) fn compute(
+    owner: &mut NativeExecution<'_>,
+    shader: nixe_nvn::Shader,
+    bindings: &nixe_nvn::Bindings,
+) -> Result<Program, VulkanError> {
+    let compiled = Rc::new(translate(owner, &[shader], bindings, None)?);
+    link(owner, compiled, None)
 }
 
 // Driver constant banks are indexed by the compiled shader, independent of the
 // public uniform slots. Addresses here are guest GPU addresses.
 #[derive(Default)]
 pub(super) struct DriverBanks([[Option<DriverBank>; 2]; 6]);
+enum DriverSource {
+    Handles(Arc<Vec<((u32, u32), u64)>>),
+    Buffers(Arc<nixe_nvn::BufferBindings>),
+}
 struct DriverBank {
-    bindings: nixe_nvn::Bindings,
+    source: DriverSource,
     groups: [u32; 3],
     first_instance: u32,
     samples: u32,
@@ -450,9 +522,9 @@ impl DriverBanks {
         if let Some(p) = slot.as_ref()
             && p.bytes.len() == size
             && if bank == 2 {
-                Arc::ptr_eq(&p.bindings.handles, &b.handles)
+                matches!(&p.source, DriverSource::Handles(h) if Arc::ptr_eq(h,&b.handles))
             } else {
-                Arc::ptr_eq(&p.bindings.driver_buffers, &b.driver_buffers)
+                matches!(&p.source, DriverSource::Buffers(v) if Arc::ptr_eq(v,&b.buffers.driver))
                     && p.groups == groups
                     && p.first_instance == first_instance
                     && p.samples == samples
@@ -462,7 +534,11 @@ impl DriverBanks {
         }
         let bytes = driver_uniform(stage, bank, b, groups, first_instance, samples, size);
         *slot = Some(DriverBank {
-            bindings: b.clone(),
+            source: if bank == 2 {
+                DriverSource::Handles(b.handles.clone())
+            } else {
+                DriverSource::Buffers(b.buffers.driver.clone())
+            },
             groups,
             first_instance,
             samples,
@@ -494,8 +570,8 @@ fn driver_uniform(
             words[0x200 / 4..0x20c / 4].copy_from_slice(&groups)
         }
         for (table, storage) in [
-            (&b.driver_buffers.storage, true),
-            (&b.driver_buffers.uniforms, false),
+            (&b.buffers.driver.storage, true),
+            (&b.buffers.driver.uniforms, false),
         ] {
             for &(s, slot, r) in table {
                 if slot >= 16 || (!storage && s != 5) {

@@ -242,27 +242,114 @@ pub(super) fn target_view(
     let slices = (t.target == 2).then(|| (u32::from(t.first_layer), t.layer_count()));
     native.image_target_layers(&info, &PoolSpace, slices)
 }
+#[derive(Default)]
+pub(super) struct SampledSelections {
+    images: HashMap<u32, SampledImage>,
+    samplers: HashMap<u32, (nixe_nvn::Sampler, crate::cache::Sampler)>,
+}
+struct SampledImage {
+    source: Texture,
+    info: Rc<ImageInfo>,
+    views: [Option<((u64, u64), ImageViewId)>; 2],
+}
+impl SampledImage {
+    fn new(source: Texture) -> Result<Self, VulkanError> {
+        Ok(Self {
+            source,
+            info: Rc::new(info(source)?),
+            views: [None; 2],
+        })
+    }
+}
 pub(super) fn binding(
     native: &mut NativeExecution<'_>,
     input: &nixe_nvn::Sampled,
     arrayed: bool,
 ) -> Result<HostBinding, VulkanError> {
-    let info = info(input.texture)?;
-    let (image, base) = native.find_or_insert_image(&info, &PoolSpace)?;
-    native.residency.prepare_image(image, false, false)?;
+    let [texture_id, sampler_id] = input.descriptor_ids();
+    let epoch = (
+        native.residency.device_memory().generation(),
+        native.residency.texture_cache.binding_revision,
+    );
+    let images = &mut native.state.nvn.sampled.images;
+    let selected = match images.entry(texture_id) {
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            let selected = entry.into_mut();
+            if selected.source != input.texture {
+                *selected = SampledImage::new(input.texture)?;
+            }
+            selected
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(SampledImage::new(input.texture)?)
+        }
+    };
+    let index = usize::from(arrayed);
+    let view = match selected.views[index] {
+        Some((generation, view)) if generation == epoch => view,
+        _ => {
+            let info = selected.info.clone();
+            let (image, base) = native.find_or_insert_image(&info, &PoolSpace)?;
+            native.residency.prepare_image(image, false, false)?;
+            let view = sampled_view(native, input.texture, &info, image, base, arrayed)?;
+            let epoch = (
+                native.residency.device_memory().generation(),
+                native.residency.texture_cache.binding_revision,
+            );
+            native
+                .state
+                .nvn
+                .sampled
+                .images
+                .get_mut(&texture_id)
+                .unwrap()
+                .views[index] = Some((epoch, view));
+            view
+        }
+    };
+    let sampler = match native.state.nvn.sampled.samplers.get(&sampler_id) {
+        Some((s, sampler)) if *s == input.sampler => sampler.clone(),
+        _ => {
+            let sampler = sampled_sampler(native, input.sampler)?;
+            native
+                .state
+                .nvn
+                .sampled
+                .samplers
+                .insert(sampler_id, (input.sampler, sampler.clone()));
+            sampler
+        }
+    };
+    Ok(HostBinding::CombinedImageSampler {
+        image: native.residency.host_image(view)?,
+        sampler,
+    })
+}
+fn sampled_view(
+    native: &mut NativeExecution<'_>,
+    texture: Texture,
+    info: &ImageInfo,
+    image: ImageId,
+    base: [u32; 2],
+    arrayed: bool,
+) -> Result<ImageViewId, VulkanError> {
     // NVN specifies depth/stencil mode independently of component swizzles.
     use nixe_gpu::native::GuestImageAspect;
     let aspect = match info.description.format() {
         ImageFormat::Depth24UnormStencil8Uint | ImageFormat::Depth32FloatStencil8Uint
-            if input.texture.stencil != 0 =>
+            if texture.stencil != 0 =>
         {
             GuestImageAspect::Stencil
         }
         f if f.is_depth_stencil() => GuestImageAspect::Depth,
         _ => GuestImageAspect::Color,
     };
-    let view = native.sampled_view(image, info.description, info.swizzle, aspect, base, arrayed)?;
-    let s = input.sampler;
+    native.sampled_view(image, info.description, info.swizzle, aspect, base, arrayed)
+}
+fn sampled_sampler(
+    native: &mut NativeExecution<'_>,
+    s: nixe_nvn::Sampler,
+) -> Result<crate::cache::Sampler, VulkanError> {
     let mode = |v| {
         Ok(match v {
             0 => {
@@ -337,10 +424,7 @@ pub(super) fn binding(
             },
         )?
         .clone();
-    Ok(HostBinding::CombinedImageSampler {
-        image: native.residency.host_image(view)?,
-        sampler,
-    })
+    Ok(sampler)
 }
 
 /// Shader inputs follow the converted Vulkan attribute type. Normalized and

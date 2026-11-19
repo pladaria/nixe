@@ -165,6 +165,7 @@ exports! {
         CommandBufferGetControlMemoryUsed => control_used,
         CommandBufferFinalize => finalize,
         CommandBufferCallCommands => call_commands,
+        CommandBufferCopyCommands => copy_commands,
         CommandBufferBindTexturesDeferred => deferred,
         CommandBufferDrawElements => elements,
         CommandBufferDrawElementsInstanced => indexed_instances,

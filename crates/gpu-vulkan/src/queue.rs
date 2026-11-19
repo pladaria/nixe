@@ -656,13 +656,22 @@ impl QueueState {
     fn current_tick(&self) -> u64 {
         self.scheduled + 1
     }
+    pub(crate) fn has_recorded_work(&self, dispatch: &crate::dispatch::Dispatch) -> bool {
+        self.deferred_clear.is_some() || dispatch.record_serial() != self.submitted_serial
+    }
     /// Empty contexts keep their tick for explicit fences. Command-list ends
     /// submit only actual recorded work, and nearby lists may share that tick.
     pub(crate) fn finish_command_list(&mut self, dispatch: &crate::dispatch::Dispatch) -> bool {
-        if self.deferred_clear.is_none() && dispatch.record_serial() == self.submitted_serial {
+        if !self.has_recorded_work(dispatch) {
             return false;
         }
         !self.defer_flush()
+    }
+    /// An explicit NVN flush or fence seals the pending prefix. The owner's
+    /// idle hook submits it when the guest leaves the queue without a flush.
+    pub(crate) fn finish_nvn_list(&mut self, dispatch: &crate::dispatch::Dispatch) -> bool {
+        self.flush_pending |= self.has_recorded_work(dispatch);
+        dispatch.record_serial().wrapping_sub(self.submitted_serial) >= 4096
     }
     pub(crate) fn defer_flush(&mut self) -> bool {
         if self
