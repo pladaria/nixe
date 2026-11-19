@@ -6,16 +6,25 @@ use nixe_nvn::{Range, Sampled};
 use nixe_shader_recompiler::{
     self as ir, artifact::ResourceSource, environment::*, passes::GraphicsRuntimeState, types::*,
 };
+mod disk;
+pub(in crate::native) use disk::Archive;
+#[derive(Clone)]
 pub(super) enum Input {
     Driver(u32, u32, usize),
     Texture {
         stage: u32,
         slot: u32,
-        arrayed: bool,
+        ty: TextureType,
+    },
+    Image {
+        stage: u32,
+        slot: u32,
+        ty: TextureType,
+        format: ir::types::ImageFormat,
     },
     Uniform(u32, u32, u64),
     Storage(u32, u32),
-    Constants(Range),
+    Constants(u32, u64),
 }
 pub(super) struct Pipeline {
     pub id: u64,
@@ -30,7 +39,7 @@ impl std::ops::Deref for Pipeline {
     }
 }
 pub(super) struct Program {
-    compiled: Rc<Compiled>,
+    pub(super) compiled: Rc<Compiled>,
     pub native: NativePipeline,
     pub push: usize,
 }
@@ -41,9 +50,108 @@ impl std::ops::Deref for Program {
     }
 }
 pub(super) struct Compiled {
-    artifact: Arc<crate::cache::ShaderArtifact>,
     pub usage: Arc<nixe_nvn::ShaderUsage>,
+    translation: Rc<Translation>,
+}
+impl std::ops::Deref for Compiled {
+    type Target = Translation;
+    fn deref(&self) -> &Translation {
+        &self.translation
+    }
+}
+pub(super) struct Translation {
+    artifact: Arc<crate::cache::ShaderArtifact>,
+    stages: StageIds,
+    vertex_mask: Option<u32>,
     pub inputs: Vec<Input>,
+    pub dependencies: Dependencies,
+}
+#[derive(Default)]
+pub(super) struct Dependencies {
+    pub sampled: u128,
+    pub handles: u128,
+    pub driver: u128,
+    pub buffers: HashMap<(bool, u32, u32), u128>,
+}
+impl Dependencies {
+    fn new(inputs: &[Input]) -> Self {
+        let mut result = Self::default();
+        for (i, input) in inputs.iter().take(128).enumerate() {
+            let bit = 1 << i;
+            match *input {
+                Input::Texture { .. } | Input::Image { .. } => result.sampled |= bit,
+                Input::Driver(_, 2, _) => result.handles |= bit,
+                Input::Driver(..) => result.driver |= bit,
+                Input::Uniform(s, b, _) => *result.buffers.entry((false, s, b)).or_default() |= bit,
+                Input::Storage(s, b) => *result.buffers.entry((true, s, b)).or_default() |= bit,
+                Input::Constants(..) => {}
+            }
+        }
+        result
+    }
+}
+type StageIds = smallvec::SmallVec<[usize; 2]>;
+
+// The graphics owner admits requests in order. Its cached handle represents both
+// an in-flight build and the finished pipeline. Guest resource origins and
+// dynamic parameters remain with the individual Program and Pipeline.
+#[derive(Default)]
+pub(super) struct PhysicalPipelines {
+    modules: rustc_hash::FxHashMap<ModuleKey, usize>,
+    pipelines: rustc_hash::FxHashMap<(StageIds, Option<GraphicsState>), NativePipeline>,
+}
+
+struct ModuleKey(Arc<crate::cache::CompiledStage>);
+impl ModuleKey {
+    fn bindings(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            u32,
+            u32,
+            nixe_gpu::shader_module::DescriptorKind,
+            bool,
+            bool,
+        ),
+    > {
+        self.0
+            .module
+            .bindings
+            .iter()
+            .map(|b| (b.binding, b.count, b.kind, b.readable, b.writable))
+    }
+}
+impl PartialEq for ModuleKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.stage == other.0.stage
+            && self.0.module.push_constant_bytes == other.0.module.push_constant_bytes
+            && self.0.module.words == other.0.module.words
+            && self.bindings().eq(other.bindings())
+    }
+}
+impl Eq for ModuleKey {}
+impl std::hash::Hash for ModuleKey {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        self.0.stage.hash(hasher);
+        self.0.module.push_constant_bytes.hash(hasher);
+        self.0.module.words.hash(hasher);
+        for item in self.bindings() {
+            item.hash(hasher);
+        }
+    }
+}
+impl PhysicalPipelines {
+    fn intern_stage(&mut self, stage: &Arc<crate::cache::CompiledStage>) -> usize {
+        let next = self.modules.len();
+        *self.modules.entry(ModuleKey(stage.clone())).or_insert(next)
+    }
+    fn intern(&mut self, artifact: &crate::cache::ShaderArtifact) -> StageIds {
+        artifact
+            .stages
+            .iter()
+            .map(|stage| self.intern_stage(stage))
+            .collect()
+    }
 }
 // All stages link and assign descriptor numbers together. Fixed-function
 // pipeline variants with the same compiler inputs share the linked result.
@@ -52,6 +160,7 @@ pub(super) struct ShaderKey {
     stages: smallvec::SmallVec<[nixe_nvn::Shader; 2]>,
     shapes: Shapes,
     vertex_types: [AttributeType; 32],
+    color_types: [AttributeType; 8],
     topology: InputTopology,
     point_size: u32,
     minus_one_to_one: bool,
@@ -89,11 +198,10 @@ fn slot(offset: u32) -> Option<u32> {
         .map(|o| o / 8)
 }
 impl EnvironmentReader<'_> {
-    fn texture(&self, h: TextureHandle) -> ir::Result<&Sampled> {
+    fn texture(&self, h: TextureHandle) -> Option<&Sampled> {
         self.textures
             .iter()
             .find(|t| t.stage == self.stage && t.slot == h.0)
-            .ok_or_else(|| unsupported(format!("NVN unbound texture slot {}", h.0)))
     }
 }
 impl Environment for EnvironmentReader<'_> {
@@ -135,7 +243,10 @@ impl Environment for EnvironmentReader<'_> {
         )))
     }
     fn read_texture_type(&mut self, h: TextureHandle) -> ir::Result<TextureType> {
-        match self.texture(h)?.texture.target_kind() {
+        let Some(t) = self.texture(h) else {
+            return Ok(TextureType::Color2D);
+        };
+        match t.texture.target_kind() {
             0 => Ok(TextureType::Color1D),
             2 => Ok(TextureType::Color3D),
             3 => Ok(TextureType::ColorArray1D),
@@ -150,8 +261,10 @@ impl Environment for EnvironmentReader<'_> {
         }
     }
     fn read_texture_pixel_format(&mut self, h: TextureHandle) -> ir::Result<TexturePixelFormat> {
-        resources::shader_format(self.texture(h)?.texture.format)
-            .map_err(|e| unsupported(e.to_string()))
+        let Some(t) = self.texture(h) else {
+            return Ok(TexturePixelFormat::A8B8G8R8_UNORM);
+        };
+        resources::shader_format(t.texture.format).map_err(|e| unsupported(e.to_string()))
     }
     fn is_texture_pixel_format_integer(&mut self, h: TextureHandle) -> ir::Result<bool> {
         self.read_texture_pixel_format(h).map(|f| {
@@ -184,6 +297,14 @@ pub(super) fn compile(
             1..=3 => InputTopology::Lines,
             _ => InputTopology::Triangles,
         },
+        use_integer_fragment_outputs: true,
+        color_output_types: std::array::from_fn(|i| {
+            match state.colors.get(i).map(|(f, _)| images::color_kind(*f)) {
+                Some(1) => AttributeType::UnsignedInt,
+                Some(2) => AttributeType::SignedInt,
+                _ => AttributeType::Float,
+            }
+        }),
         point_size: f32::from_bits(draw.raster.point_size),
         ndc_minus_one_to_one: draw.minus_one_to_one,
         ..Default::default()
@@ -196,6 +317,7 @@ pub(super) fn compile(
         stages: draw.shaders.clone(),
         shapes: draw.pipeline.shapes.clone(),
         vertex_types: runtime.vertex_input_types,
+        color_types: runtime.color_output_types,
         topology: runtime.input_topology,
         point_size: runtime.point_size.to_bits(),
         minus_one_to_one: runtime.ndc_minus_one_to_one,
@@ -227,8 +349,7 @@ pub(super) fn compile(
     };
     state.retain_vertex_inputs(
         compiled
-            .artifact
-            .vertex_input_mask()
+            .vertex_mask
             .ok_or_else(|| error("NVN graphics pipeline has no vertex shader"))?,
     );
     let core = link(native, compiled, Some(&state))?;
@@ -238,7 +359,12 @@ pub(super) fn compile(
         .vertex_bindings
         .iter()
         .fold(0u32, |mask, b| mask | (1 << b.binding));
-    let parameters = GraphicsParameters::new(state, vk::Extent2D { width, height });
+    let mut parameters = GraphicsParameters::new(state, vk::Extent2D { width, height });
+    if draw.viewport_count > 1 {
+        let count = usize::from(draw.viewport_count);
+        parameters.viewports = vec![parameters.viewports[0]; count].into();
+        parameters.scissors = vec![parameters.scissors[0]; count].into();
+    }
     native
         .residency
         .validate_static_parameters(pipeline, &parameters)?;
@@ -261,18 +387,9 @@ fn translate(
     bindings: &nixe_nvn::Bindings,
     graphics: Option<&GraphicsRuntimeState>,
 ) -> Result<Compiled, VulkanError> {
-    if native.state.nvn.compiler.is_none() {
-        native.state.nvn.compiler = Some(ir::Compiler::new().map_err(error)?);
-    }
-    let compiler = native.state.nvn.compiler.as_mut().unwrap();
-    compiler.reset().map_err(error)?;
-    let mut sources = Vec::with_capacity(stages.len());
-    let mut consumed = Vec::new();
     let generation = native.residency.device_memory().generation();
-    let textures = &bindings.sampled.entries;
-    let mut ids = Vec::new();
-    let mut constants = [Range::default(); 6];
     let reader = native.residency.device_memory().reader();
+    let mut sources = Vec::with_capacity(stages.len());
     for (index, shader) in stages.iter().enumerate() {
         let source = if let Some(capture) = &bindings.captured {
             capture.stages[index].clone()
@@ -300,12 +417,50 @@ fn translate(
                 .map_err(error)?;
             nixe_nvn::StageSource {
                 shader: *shader,
+                code_digest: <sha2::Sha256 as sha2::Digest>::digest(&code).into(),
                 bytes: code.into(),
                 version,
             }
         };
         sources.push(source);
-        let code = sources.last().unwrap().bytes.as_ref();
+    }
+    let usage = |sources: Vec<_>, shapes| {
+        Arc::new(nixe_nvn::ShaderUsage {
+            stages: sources.into_boxed_slice(),
+            shapes,
+            mapping_generation: bindings
+                .captured
+                .as_ref()
+                .map_or(generation, |v| v.mapping_generation),
+        })
+    };
+    let key = native
+        .state
+        .nvn
+        .archive
+        .as_ref()
+        .map(|_| disk::source_key(&sources, graphics));
+    if let Some((translation, shapes)) = key
+        .as_ref()
+        .and_then(|key| native.state.nvn.archive.as_ref()?.lookup(key, bindings))
+    {
+        return Ok(Compiled {
+            translation,
+            usage: usage(sources, shapes),
+        });
+    }
+    if native.state.nvn.compiler.is_none() {
+        native.state.nvn.compiler = Some(ir::Compiler::new().map_err(error)?);
+    }
+    let compiler = native.state.nvn.compiler.as_mut().unwrap();
+    compiler.reset().map_err(error)?;
+    let mut consumed = Vec::new();
+    let textures = &bindings.sampled.entries;
+    let mut ids = Vec::new();
+    let mut constants = [Range::default(); 6];
+    for source in &sources {
+        let shader = &source.shader;
+        let code = source.bytes.as_ref();
         let config = &native.residency.device().profile().shader_compiler;
         let h = shader.header as usize;
         let id = shader.stage as usize;
@@ -392,7 +547,7 @@ fn translate(
                 ResourceSource::ConstantBuffer(c) if c.index.0 == 1 => {
                     let mut range = constants[id as usize];
                     range.size = range.size.min(uniform_bound(c.index.0));
-                    Input::Constants(range)
+                    Input::Constants(id, range.size)
                 }
                 ResourceSource::StorageBuffer(d)
                     if d.cbuf_index.0 == 0 && d.pointer_table.is_none() =>
@@ -416,6 +571,17 @@ fn translate(
                         Input::Storage(id, bytes / 16)
                     }
                 }
+                ResourceSource::Image(i) if i.cbuf_index.0 == 2 && i.handle_program.is_none() => {
+                    let slot = slot(i.cbuf_offset.0)
+                        .ok_or_else(|| error("invalid NVN image handle offset"))?;
+                    consumed.push((id, slot));
+                    Input::Image {
+                        stage: id,
+                        slot,
+                        ty: i.texture_type,
+                        format: i.format,
+                    }
+                }
                 ResourceSource::Texture(t)
                     if t.cbuf_index.0 == 2 && !t.has_secondary && t.handle_program.is_none() =>
                 {
@@ -425,12 +591,7 @@ fn translate(
                     Input::Texture {
                         stage: id,
                         slot,
-                        arrayed: matches!(
-                            t.texture_type,
-                            TextureType::ColorArray1D
-                                | TextureType::ColorArray2D
-                                | TextureType::ColorArrayCube
-                        ),
+                        ty: t.texture_type,
                     }
                 }
                 s => return Err(error(format!("unsupported NVN program binding {s:?}"))),
@@ -444,40 +605,58 @@ fn translate(
     let shapes = consumed
         .into_iter()
         .map(|(stage, slot)| {
-            let t = bindings
+            // Retain absent dependencies so binding a texture later recompiles
+            // specializations that depend on its target or component type.
+            bindings
                 .sampled
                 .get(stage, slot)
-                .ok_or_else(|| error(format!("unbound shader dependency {stage}:{slot}")))?;
-            Ok((stage, slot, t.texture.format, t.texture.target_kind()))
+                .map_or((stage, slot, 0, 0), |t| t.shape())
         })
-        .collect::<Result<Arc<[_]>, VulkanError>>()?;
-    Ok(Compiled {
+        .collect();
+    let inputs: Vec<_> = inputs.into_iter().map(|i| i.1).collect();
+    let translation = Rc::new(Translation {
+        vertex_mask: shader.vertex_input_mask(),
+        stages: native.state.nvn.physical.intern(&shader),
         artifact: shader,
-        usage: Arc::new(nixe_nvn::ShaderUsage {
-            stages: sources.into_boxed_slice(),
-            shapes,
-            mapping_generation: bindings
-                .captured
-                .as_ref()
-                .map_or(generation, |v| v.mapping_generation),
-        }),
-        inputs: inputs.into_iter().map(|i| i.1).collect(),
-    })
+        dependencies: Dependencies::new(&inputs),
+        inputs,
+    });
+    let usage = usage(sources, shapes);
+    if let (Some(key), Some(archive)) = (key, &mut native.state.nvn.archive) {
+        archive.remember(key, usage.shapes.clone(), translation.clone());
+    }
+    Ok(Compiled { usage, translation })
 }
 fn link(
     owner: &mut NativeExecution<'_>,
     compiled: Rc<Compiled>,
     graphics: Option<&GraphicsState>,
 ) -> Result<Program, VulkanError> {
-    let shader = compiled.artifact.clone();
-    let recipe = match graphics {
-        Some(state) => PipelineRecipe::Graphics {
-            shader,
-            state: state.clone(),
-        },
-        None => PipelineRecipe::Compute(shader),
+    let state = graphics
+        .cloned()
+        .map(|s| owner.compiler.normalize_graphics(s));
+    let key = (compiled.stages.clone(), state);
+    let native = match owner.state.nvn.physical.pipelines.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let shader = compiled.artifact.clone();
+            let recipe = match graphics {
+                Some(state) => PipelineRecipe::Graphics {
+                    shader,
+                    state: state.clone(),
+                },
+                None => PipelineRecipe::Compute(shader),
+            };
+            let pipeline = owner
+                .compiler
+                .request_with_layout(recipe, true)
+                .map_err(error)?;
+            if let Some(archive) = &mut owner.state.nvn.archive {
+                archive.record_pipeline(&compiled.translation, entry.key().1.as_ref());
+            }
+            entry.insert(pipeline).clone()
+        }
     };
-    let native = owner.compiler.request(recipe).map_err(error)?;
     Ok(Program {
         compiled,
         push: native.layout.key.push_bytes as usize,
@@ -498,7 +677,7 @@ pub(super) fn compute(
 #[derive(Default)]
 pub(super) struct DriverBanks([[Option<DriverBank>; 2]; 6]);
 enum DriverSource {
-    Handles(Arc<Vec<((u32, u32), u64)>>),
+    Handles(Arc<nixe_nvn::TextureHandles>),
     Buffers(Arc<nixe_nvn::BufferBindings>),
 }
 struct DriverBank {
@@ -559,7 +738,8 @@ fn driver_uniform(
     let mut words = [0u32; 512];
     if bank == 2 {
         for &((s, slot), handle) in b.handles.iter() {
-            if s == stage && slot < 32 {
+            if s == stage && slot < nixe_nvn::IMAGE_HANDLE_BASE_SLOT + nixe_nvn::IMAGE_HANDLE_SLOTS
+            {
                 let at = 8 + slot as usize * 2;
                 words[at] = handle as u32;
                 words[at + 1] = (handle >> 32) as u32
@@ -611,4 +791,44 @@ fn driver_uniform(
         }
     }
     bytemuck::cast_slice(&words)[..size].into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_identity_distinguishes_native_bindings_and_ignores_guest_resource_ids() {
+        use crate::cache::CompiledStage;
+        use nixe_gpu::{
+            ShaderStage,
+            shader_module::{Binding, DescriptorKind, Module, ResourceId},
+        };
+
+        let stage = |guest_resource, descriptor_binding| {
+            Arc::new(CompiledStage::new(
+                ShaderStage::Fragment,
+                Module {
+                    words: Box::new([0x07230203, 0x00010000, 0, 1, 0]),
+                    bindings: Box::new([Binding {
+                        binding: descriptor_binding,
+                        resource: ResourceId::new(guest_resource),
+                        sampler: None,
+                        count: 1,
+                        kind: DescriptorKind::UniformBuffer,
+                        readable: true,
+                        writable: false,
+                    }]),
+                    push_constant_bytes: 0,
+                },
+                None,
+                0,
+                None,
+            ))
+        };
+        let mut physical = PhysicalPipelines::default();
+        let first = physical.intern_stage(&stage(7, 0));
+        assert_eq!(first, physical.intern_stage(&stage(13, 0)));
+        assert_ne!(first, physical.intern_stage(&stage(7, 1)));
+    }
 }

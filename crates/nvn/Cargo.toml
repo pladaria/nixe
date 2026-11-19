@@ -10,3 +10,6 @@ nixe-memory.workspace = true
 nixe-cpu.workspace = true
 bytemuck = { workspace = true, features = ["derive"] }
 smallvec = "1"
+
+[features]
+execution-trace = ["nixe-memory/execution-trace"]

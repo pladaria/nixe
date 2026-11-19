@@ -245,7 +245,7 @@ pub(super) fn target_view(
 #[derive(Default)]
 pub(super) struct SampledSelections {
     images: HashMap<u32, SampledImage>,
-    samplers: HashMap<u32, (nixe_nvn::Sampler, crate::cache::Sampler)>,
+    samplers: HashMap<(u32, bool), (nixe_nvn::Sampler, crate::cache::Sampler)>,
 }
 struct SampledImage {
     source: Texture,
@@ -261,12 +261,27 @@ impl SampledImage {
         })
     }
 }
-pub(super) fn binding(
+pub(super) fn null_binding(native: &mut NativeExecution<'_>) -> Result<HostBinding, VulkanError> {
+    // A combined descriptor still requires a valid sampler with a null image view.
+    if let Some((_, sampler)) = native.state.nvn.sampled.samplers.get(&(0, false)) {
+        return Ok(HostBinding::Sampler(sampler.clone()));
+    }
+    let desc = nixe_nvn::Sampler::default();
+    let sampler = sampled_sampler(native, desc, false)?;
+    native
+        .state
+        .nvn
+        .sampled
+        .samplers
+        .insert((0, false), (desc, sampler.clone()));
+    Ok(HostBinding::Sampler(sampler))
+}
+pub(super) fn descriptor_view(
     native: &mut NativeExecution<'_>,
     input: &nixe_nvn::Sampled,
     arrayed: bool,
-) -> Result<HostBinding, VulkanError> {
-    let [texture_id, sampler_id] = input.descriptor_ids();
+) -> Result<ImageViewId, VulkanError> {
+    let texture_id = input.descriptor_ids()[0];
     let epoch = (
         native.residency.device_memory().generation(),
         native.residency.texture_cache.binding_revision,
@@ -285,7 +300,7 @@ pub(super) fn binding(
         }
     };
     let index = usize::from(arrayed);
-    let view = match selected.views[index] {
+    Ok(match selected.views[index] {
         Some((generation, view)) if generation == epoch => view,
         _ => {
             let info = selected.info.clone();
@@ -306,17 +321,34 @@ pub(super) fn binding(
                 .views[index] = Some((epoch, view));
             view
         }
-    };
-    let sampler = match native.state.nvn.sampled.samplers.get(&sampler_id) {
+    })
+}
+pub(super) fn binding(
+    native: &mut NativeExecution<'_>,
+    input: &nixe_nvn::Sampled,
+    arrayed: bool,
+) -> Result<HostBinding, VulkanError> {
+    let sampler_id = input.descriptor_ids()[1];
+    let view = descriptor_view(native, input, arrayed)?;
+    let format = native.residency.image_view_description(view)?.format;
+    let force_nearest = input.sampler.comparison == 0
+        && !native
+            .residency
+            .device()
+            .format_properties(format)
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
+    let key = (sampler_id, force_nearest);
+    let sampler = match native.state.nvn.sampled.samplers.get(&key) {
         Some((s, sampler)) if *s == input.sampler => sampler.clone(),
         _ => {
-            let sampler = sampled_sampler(native, input.sampler)?;
+            let sampler = sampled_sampler(native, input.sampler, force_nearest)?;
             native
                 .state
                 .nvn
                 .sampled
                 .samplers
-                .insert(sampler_id, (input.sampler, sampler.clone()));
+                .insert(key, (input.sampler, sampler.clone()));
             sampler
         }
     };
@@ -349,6 +381,7 @@ fn sampled_view(
 fn sampled_sampler(
     native: &mut NativeExecution<'_>,
     s: nixe_nvn::Sampler,
+    force_nearest: bool,
 ) -> Result<crate::cache::Sampler, VulkanError> {
     let mode = |v| {
         Ok(match v {
@@ -370,16 +403,16 @@ fn sampled_sampler(
         })
     };
     let filter = |v| {
-        Ok(match v {
-            0 => vk::Filter::NEAREST,
-            1 => vk::Filter::LINEAR,
-            n => return Err(error(format!("unsupported NVN filter {n}"))),
+        Ok(match (v, force_nearest) {
+            (0, _) | (1, true) => vk::Filter::NEAREST,
+            (1, false) => vk::Filter::LINEAR,
+            (n, _) => return Err(error(format!("unsupported NVN filter {n}"))),
         })
     };
     let create = vk::SamplerCreateInfo::default()
         .min_filter(filter(s.min & 1)?)
         .mag_filter(filter(s.mag)?)
-        .mipmap_mode(if s.min >= 4 {
+        .mipmap_mode(if s.min >= 4 && !force_nearest {
             vk::SamplerMipmapMode::LINEAR
         } else {
             vk::SamplerMipmapMode::NEAREST
@@ -395,7 +428,7 @@ fn sampled_sampler(
             f32::from_bits(s.lod[1])
         })
         .mip_lod_bias(f32::from_bits(s.bias))
-        .anisotropy_enable(f32::from_bits(s.aniso) > 1.)
+        .anisotropy_enable(!force_nearest && f32::from_bits(s.aniso) > 1.)
         .max_anisotropy(f32::from_bits(s.aniso))
         .compare_enable(s.comparison != 0)
         .compare_op(vk::CompareOp::from_raw(i32::from(s.function) - 1))

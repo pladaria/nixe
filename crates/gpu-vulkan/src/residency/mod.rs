@@ -796,9 +796,11 @@ impl Residency<'_> {
         let device = &self.runtime.device;
         !self.runtime.barriers.is_empty() || device.submission.has_recorded_work(&device.dispatch)
     }
+    #[cfg_attr(feature = "execution-trace", track_caller)]
     pub fn flush(&mut self) -> Result<WorkTicket, VulkanError> {
         self.flush_with_sync(&[], &[])
     }
+    #[cfg_attr(feature = "execution-trace", track_caller)]
     pub(crate) fn flush_with_sync(
         &mut self,
         waits: &[vk::SemaphoreSubmitInfo<'_>],

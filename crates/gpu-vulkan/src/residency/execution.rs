@@ -143,12 +143,14 @@ pub struct HostProgram {
     // Explicit host resources use owned captures; guest resources use residency
     // use ticks and the native execution owner's persistent sampler cache.
     bindings: Vec<HostBinding>,
-    direct_entries: Option<Vec<crate::cache::DescriptorEntry>>,
+    direct_entries: Option<std::cell::RefCell<Vec<crate::cache::DescriptorEntry>>>,
     unaligned_uniforms: usize,
     dynamic_offsets: Vec<u32>,
 }
 #[derive(Default)]
 struct ProgramRecord {
+    payload: Option<(u64, u64, crate::cache::DescriptorUpdate)>,
+    uniforms: Vec<(vk::Buffer, u64, u64)>,
     current: Option<Arc<BindingRecord>>,
     streamed: bool,
 }
@@ -306,6 +308,7 @@ impl Residency<'_> {
                 record: std::cell::RefCell::new(ProgramRecord {
                     current: Some(record),
                     streamed: false,
+                    ..Default::default()
                 }),
                 bindings: Vec::new(),
                 direct_entries: None,
@@ -376,23 +379,43 @@ impl Residency<'_> {
             _ => true,
         }
     }
+    fn nvn_payload(
+        &mut self,
+        entries: &[crate::cache::DescriptorEntry],
+        record: &mut ProgramRecord,
+    ) -> Result<crate::cache::DescriptorUpdate, VulkanError> {
+        let tick = self.runtime.device.current_work().tick();
+        let queue = &mut self.runtime.descriptor_queue;
+        let stats = &mut self.runtime.device.submission.statistics;
+        if let Some((previous, generation, data)) = record.payload
+            && previous == tick
+            && generation == queue.generation()
+        {
+            stats.descriptor_payload_hits += 1;
+            return Ok(data);
+        }
+        queue.acquire(&mut self.runtime.device.dispatch, entries.len())?;
+        queue.write_entries(0, entries);
+        let data = queue.update_data();
+        record.payload = Some((tick, queue.generation(), data));
+        stats.descriptor_payload_captures += 1;
+        Ok(data)
+    }
     fn stream_graphics(&mut self, program: &HostProgram) -> Result<DescriptorQueue, VulkanError> {
         self.runtime.streamed_uses.clear();
         if program.bindings.is_empty() || program.pipeline.layout.uniform_bindings.is_empty() {
             // Host descriptors and layouts without uniforms need no per-use
             // uniform selection.
             if let Some(entries) = &program.direct_entries
-                && !entries.is_empty()
+                && !entries.borrow().is_empty()
             {
-                let queue = &mut self.runtime.descriptor_queue;
-                queue.acquire(&mut self.runtime.device.dispatch, entries.len())?;
-                queue.write_entries(0, entries);
-                self.runtime
-                    .device
-                    .submission
-                    .statistics
-                    .descriptor_payload_captures += 1;
-                return Ok(self.guest_descriptor_update());
+                let update =
+                    self.nvn_payload(&entries.borrow(), &mut program.record.borrow_mut())?;
+                return Ok(DescriptorQueue {
+                    dynamic_offsets: None,
+                    record: None,
+                    update: Some(update),
+                });
             }
             return Ok(DescriptorQueue {
                 dynamic_offsets: None,
@@ -502,13 +525,17 @@ impl Residency<'_> {
         let mut dynamic_offsets = std::mem::take(&mut self.runtime.descriptor_offsets);
         dynamic_offsets.clear();
         dynamic_offsets.extend_from_slice(&program.dynamic_offsets);
-        let direct = program.direct_entries.as_deref();
-        if let Some(entries) = direct {
-            let queue = &mut self.runtime.descriptor_queue;
-            queue.acquire(&mut self.runtime.device.dispatch, entries.len())?;
-            queue.write_entries(0, entries);
-        }
+        let mut direct = program
+            .direct_entries
+            .as_ref()
+            .map(|entries| entries.borrow_mut());
         let mut selected = program.record.borrow_mut();
+        if direct.is_some() {
+            selected.uniforms.resize(
+                program.pipeline.layout.uniform_bindings.len(),
+                (vk::Buffer::null(), 0, 0),
+            );
+        }
         let mut resources = std::mem::take(&mut self.runtime.descriptor_resources);
         resources.clear();
         if direct.is_none() && selected.current.is_none() {
@@ -568,20 +595,26 @@ impl Residency<'_> {
                 dynamic_offsets[dynamic] = value;
                 offset = base;
             }
-            if direct.is_some() {
-                self.runtime.descriptor_queue.write(
-                    slot.resource,
-                    crate::cache::DescriptorEntry {
-                        buffer: vk::DescriptorBufferInfo::default()
-                            .buffer(buffer.map_or(vk::Buffer::null(), |b| b.handle))
-                            .offset(offset)
-                            .range(if buffer.is_some() {
-                                range
-                            } else {
-                                vk::WHOLE_SIZE
-                            }),
+            if let Some(entries) = direct.as_mut() {
+                let value = (
+                    buffer.map_or(vk::Buffer::null(), |b| b.handle),
+                    offset,
+                    if buffer.is_some() {
+                        range
+                    } else {
+                        vk::WHOLE_SIZE
                     },
                 );
+                if selected.uniforms[index] != value {
+                    selected.uniforms[index] = value;
+                    selected.payload = None;
+                    entries[slot.resource] = crate::cache::DescriptorEntry {
+                        buffer: vk::DescriptorBufferInfo::default()
+                            .buffer(value.0)
+                            .offset(value.1)
+                            .range(value.2),
+                    };
+                }
                 continue;
             }
             let unchanged = selected.current.as_ref().is_some_and(|record| {
@@ -615,18 +648,14 @@ impl Residency<'_> {
                 };
             }
         }
-        if direct.is_some() {
+        if let Some(entries) = direct {
             self.runtime.uniform_updates = updates;
             self.runtime.descriptor_resources = resources;
-            self.runtime
-                .device
-                .submission
-                .statistics
-                .descriptor_payload_captures += 1;
+            let update = self.nvn_payload(&entries, &mut selected)?;
             return Ok(DescriptorQueue {
                 dynamic_offsets: Some(dynamic_offsets),
                 record: None,
-                update: Some(self.runtime.descriptor_queue.update_data()),
+                update: Some(update),
             });
         }
         let changed = !resources.is_empty();
@@ -659,13 +688,16 @@ impl Residency<'_> {
         // Synchronize current cache selections before recording shader access.
         // Overlapping bindings share the cache-owned modified ranges.
         let mut images: smallvec::SmallVec<[ImageId; 16]> = smallvec::SmallVec::new();
+        let mut used = smallvec::SmallVec::<[HostBindingAccess; 16]>::new();
+        let mut streamed = self.runtime.streamed_uses.iter().copied().peekable();
         for index in 0..program.bindings.len() {
-            if self.runtime.streamed_uses.binary_search(&index).is_ok() {
-                continue;
+            if streamed.next_if_eq(&index).is_none()
+                && let Some(resource) = self.host_binding_usage(program, index)
+            {
+                used.push(resource);
             }
-            let Some(resource) = self.host_binding_usage(program, index) else {
-                continue;
-            };
+        }
+        for &resource in &used {
             match resource {
                 HostBindingAccess::Buffer {
                     id,
@@ -690,13 +722,7 @@ impl Residency<'_> {
                 }
             }
         }
-        for index in 0..program.bindings.len() {
-            if self.runtime.streamed_uses.binary_search(&index).is_ok() {
-                continue;
-            }
-            let Some(resource) = self.host_binding_usage(program, index) else {
-                continue;
-            };
+        for &resource in &used {
             match resource {
                 HostBindingAccess::Buffer {
                     id, offset, size, ..

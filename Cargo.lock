@@ -1464,6 +1464,7 @@ dependencies = [
  "raw-window-handle",
  "rspirv",
  "rustc-hash",
+ "sha2",
  "smallvec",
  "tempfile",
  "x11-dl",

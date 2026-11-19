@@ -28,11 +28,41 @@ macro_rules! set {
 set!(target, target, |c: &Call| c.args[1] as u8);
 set!(format, format, |c: &Call| c.args[1] as u16);
 set!(mode, mode, |c: &Call| c.args[1] as u8);
-set!(levels, first, |c: &Call| [c.args[1] as u8, c.args[2] as u8]);
-set!(layers, layer, |c: &Call| [
-    c.args[1] as u16,
-    c.args[2] as u16
-]);
+// Each range has its own presence bit, including an explicitly selected zero range.
+pub fn levels(c: &Call) -> Result<u64> {
+    let mut v: View = c.read(c.args[0])?;
+    v.first = c.args[1] as u8;
+    v.levels = c.args[2] as u8;
+    v.range_flags |= 1;
+    c.write(c.args[0], &v)?;
+    Ok(0)
+}
+pub fn layers(c: &Call) -> Result<u64> {
+    let mut v: View = c.read(c.args[0])?;
+    v.layer = c.args[1] as u16;
+    v.layers = c.args[2] as u16;
+    v.range_flags |= 2;
+    c.write(c.args[0], &v)?;
+    Ok(0)
+}
+pub fn get_levels(c: &Call) -> Result<u64> {
+    let v: View = c.read(c.args[0])?;
+    c.write(c.args[1], &u32::from(v.first))?;
+    c.write(c.args[2], &u32::from(v.levels))?;
+    Ok(u64::from(v.range_flags & 1 != 0))
+}
+pub fn get_layers(c: &Call) -> Result<u64> {
+    let v: View = c.read(c.args[0])?;
+    c.write(c.args[1], &u32::from(v.layer))?;
+    c.write(c.args[2], &u32::from(v.layers))?;
+    Ok(u64::from(v.range_flags & 2 != 0))
+}
+pub fn get_target(c: &Call) -> Result<u64> {
+    let v: View = c.read(c.args[0])?;
+    let set = v.target != 255;
+    c.write(c.args[1], &u32::from(if set { v.target } else { 0 }))?;
+    Ok(u64::from(set))
+}
 set!(swizzle, swizzle, |c: &Call| [
     c.args[1] as u8,
     c.args[2] as u8,

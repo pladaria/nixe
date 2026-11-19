@@ -37,7 +37,7 @@ pub struct View {
     pub layer: u16,
     pub layers: u16,
     pub swizzle: [u8; 4],
-    pub pad: u16,
+    pub range_flags: u16,
 }
 
 #[repr(C)]
@@ -147,9 +147,37 @@ impl Default for Sampler {
     }
 }
 
+// c[2] texture and image handles share eight-byte rows starting at 0x20.
+// https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/dmsh_abi.h#L12-L17
+pub const IMAGE_HANDLE_BASE_SLOT: u32 = (0x120 - 0x20) / 8;
+pub const IMAGE_HANDLE_SLOTS: u32 = 8;
+
 pub(crate) const LINK: u64 = 1 << 61;
+pub(crate) const CALLED: u64 = 1 << 62;
 pub(crate) const END: u64 = 1 << 63;
 pub(crate) const CONTROL_SIZE: u64 = 16;
+
+// The upper word is the distance to the next submit-visible record in this range.
+pub(crate) fn record_tag(header: u64) -> u32 {
+    header as u8 as u32
+}
+pub(crate) fn record_words(header: u64) -> usize {
+    ((header as u32) >> 8) as usize
+}
+#[inline(always)]
+pub(crate) fn needs_capture(tag: u32) -> bool {
+    matches!(
+        tag,
+        op::SAMPLER_POOL
+            | op::TEXTURE_POOL
+            | op::PROGRAM
+            | op::TEXTURE
+            | op::DEFERRED
+            | op::DRAW
+            | op::INDEXED
+            | op::DISPATCH
+    )
+}
 
 // The record tag is a guest word. Match its value without constructing an
 // enum from unchecked guest bytes.
@@ -195,6 +223,12 @@ pub(crate) mod op {
     pub const UPDATE: u32 = 38;
     pub const DISPATCH: u32 = 39;
     pub const COPY_TEXTURE: u32 = 40;
+    pub const VIEWPORTS: u32 = 41;
+    pub const SCISSORS: u32 = 42;
+    pub const DEPTH_RANGES: u32 = 43;
+    pub const CLEAR_IMAGE: u32 = 44;
+    pub const COPY_IMAGES: u32 = 45;
+    pub const CONSERVATIVE: u32 = 46;
 }
 
 pub const BLEND: [u8; 8] = [0, 2, 1, 2, 1, 1, 1, 0];

@@ -448,11 +448,16 @@ fn run_machine(
             ..Default::default()
         };
         let cache_load_stop = Arc::clone(&frontend_stop_requested);
+        let hle = process.uses_nvn_hle();
+        let nvn_directory = cache_directory.clone();
+        let nvn_stop = Arc::clone(&cache_load_stop);
         let maxwell = move |renderer: std::rc::Rc<
             std::cell::RefCell<Option<nixe_gpu_vulkan::NativeGpuExecution>>,
         >| {
             let mut frontend = nixe_gpu_vulkan::MaxwellVulkanRasterizer::new(renderer);
-            frontend.load_disk_resources(&cache_directory, &cache_load_stop);
+            if !hle {
+                frontend.load_disk_resources(&cache_directory, &cache_load_stop);
+            }
             frontend
         };
         let native_memory = device_memory.device().clone();
@@ -465,6 +470,9 @@ fn run_machine(
                 nixe_gpu_vulkan::BufferDownloadPolicy::OnRead,
             )
             .map_err(|error| nixe_gpu::BackendRuntimeError::Backend(error.to_string().into()))?;
+            if hle {
+                renderer.load_nvn_disk_resources(&nvn_directory, &nvn_stop);
+            }
             if let Some(client) = native_presentation {
                 renderer
                     .attach_presentation(client, vsync)

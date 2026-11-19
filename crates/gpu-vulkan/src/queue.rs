@@ -224,6 +224,8 @@ pub struct RecordingStatistics {
     pub graphics_updates: u64,
     pub rendering_scopes: u64,
     pub draw_calls: u64,
+    #[cfg(feature = "execution-trace")]
+    pub(crate) draw_sample_frame: u64,
 }
 pub(crate) struct QueueState {
     pub(crate) samples: queries::Samples,
@@ -249,6 +251,7 @@ pub(crate) struct QueueState {
     next_slot: usize,
     pub scheduled: u64,
     submitted_serial: u64,
+    nvn_operations: u32,
     last_flush: Option<Instant>,
     pub(crate) flush_pending: bool,
     pub completed: u64,
@@ -300,6 +303,7 @@ impl QueueState {
             recording_wait_ns: 0,
             scheduled: 0,
             submitted_serial: 0,
+            nvn_operations: 0,
             last_flush: None,
             flush_pending: false,
             completed: 0,
@@ -669,9 +673,18 @@ impl QueueState {
     }
     /// An explicit NVN flush or fence seals the pending prefix. The owner's
     /// idle hook submits it when the guest leaves the queue without a flush.
-    pub(crate) fn finish_nvn_list(&mut self, dispatch: &crate::dispatch::Dispatch) -> bool {
+    pub(crate) fn finish_nvn_list(&mut self, dispatch: &crate::dispatch::Dispatch) {
         self.flush_pending |= self.has_recorded_work(dispatch);
-        dispatch.record_serial().wrapping_sub(self.submitted_serial) >= 4096
+    }
+    /// Bound long command streams in guest operations. Pipeline and descriptor
+    /// binds emitted for one draw belong to that same operation.
+    pub(crate) fn nvn_prefix_full(&mut self, dispatch: &crate::dispatch::Dispatch) -> bool {
+        self.nvn_operations += 1;
+        if self.nvn_operations < 4096 {
+            return false;
+        }
+        self.nvn_operations = 0;
+        self.has_recorded_work(dispatch)
     }
     pub(crate) fn defer_flush(&mut self) -> bool {
         if self
@@ -684,6 +697,7 @@ impl QueueState {
             false
         }
     }
+    #[cfg_attr(feature = "execution-trace", track_caller)]
     pub unsafe fn flush(
         &mut self,
         queue: vk::Queue,
@@ -729,6 +743,17 @@ impl QueueState {
         // Capture native parameters now. The worker closes and submits this
         // command buffer in FIFO order while the owner prepares following work.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_scheduler.cpp
+        #[cfg(feature = "execution-trace")]
+        {
+            let location = std::panic::Location::caller();
+            let file = location
+                .file()
+                .bytes()
+                .fold(0xcbf29ce484222325u64, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+                });
+            nixe_gpu::trace::event("vulkan_submit_site", tick, file, u64::from(location.line()));
+        }
         nixe_gpu::trace::event("queue_schedule", tick, 0, 0);
         let result = dispatch.submit(crate::dispatch::QueueSubmission {
             queue,
@@ -769,6 +794,7 @@ impl QueueState {
         self.progress.scheduled_successfully(tick);
         self.last_flush = Some(Instant::now());
         self.flush_pending = false;
+        self.nvn_operations = 0;
         self.recording = None;
         self.allocate_context(dispatch)?;
         Ok(self.ticket(tick))
@@ -982,6 +1008,7 @@ impl VulkanDevice {
         self.submission.ticket(self.submission.current_tick())
     }
     /// Submit recorded commands and signal the single timeline, without waiting.
+    #[cfg_attr(feature = "execution-trace", track_caller)]
     pub fn flush(&mut self) -> Result<WorkTicket, VulkanError> {
         self.realize_deferred_clear()?;
         unsafe {

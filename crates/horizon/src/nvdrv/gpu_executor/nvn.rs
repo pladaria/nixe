@@ -5,9 +5,16 @@ pub(super) enum Work {
     Flush,
     Drain,
     FinalizeQueue(u64),
-    Fence(nixe_gpu::FenceAction),
+    Fence(nixe_gpu::FenceAction, bool),
     AcquireFence(nixe_gpu::FenceAction),
-    Present(Texture, u32, bool, Option<nixe_video::FrameMailbox>, u64),
+    Present(
+        Texture,
+        u32,
+        bool,
+        [u32; 4],
+        Option<nixe_video::FrameMailbox>,
+        u64,
+    ),
 }
 pub(super) struct Request {
     work: Work,
@@ -21,13 +28,13 @@ impl Request {
     ) -> Result<(), nixe_gpu::BackendRuntimeError> {
         let result = match self.work {
             Work::Submit(queue, commands) => backend.nvn_submit(queue, commands),
-            Work::Flush => backend.nvn_flush(None),
+            Work::Flush => backend.nvn_flush(false, None),
             Work::Drain => Ok(()),
             Work::FinalizeQueue(queue) => backend.nvn_finalize_queue(queue),
-            Work::Fence(action) => backend.nvn_flush(Some(action)),
+            Work::Fence(action, flush_for_cpu) => backend.nvn_flush(flush_for_cpu, Some(action)),
             Work::AcquireFence(action) => backend.nvn_acquire_fence(action),
-            Work::Present(t, interval, flip_vertical, mailbox, sequence) => backend
-                .nvn_present(t, interval, flip_vertical)
+            Work::Present(t, interval, flip_vertical, crop, mailbox, sequence) => backend
+                .nvn_present(t, interval, flip_vertical, crop)
                 .map(|image| {
                     if let Some(mailbox) = mailbox {
                         mailbox.publish(Arc::new(nixe_video::PresentationFrame::new(
@@ -135,13 +142,19 @@ impl nixe_nvn::Backend for Client {
     fn acquire_fence(&self, f: Arc<Fence>) -> nixe_nvn::Result<()> {
         self.execute(Work::AcquireFence(signal(f)))
     }
-    fn fence(&self, f: Arc<Fence>) -> nixe_nvn::Result<()> {
-        self.execute(Work::Fence(signal(f)))
+    fn fence(&self, f: Arc<Fence>, flush_for_cpu: bool) -> nixe_nvn::Result<()> {
+        self.execute(Work::Fence(signal(f), flush_for_cpu))
     }
     fn flush(&self) -> nixe_nvn::Result<()> {
         self.execute(Work::Flush)
     }
-    fn present(&self, t: Texture, interval: u32, flip_vertical: bool) -> nixe_nvn::Result<()> {
+    fn present(
+        &self,
+        t: Texture,
+        interval: u32,
+        flip_vertical: bool,
+        crop: [u32; 4],
+    ) -> nixe_nvn::Result<()> {
         let seq = self
             .sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -150,6 +163,7 @@ impl nixe_nvn::Backend for Client {
             t,
             interval,
             flip_vertical,
+            crop,
             self.mailbox.clone(),
             seq,
         ))

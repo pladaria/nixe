@@ -526,6 +526,11 @@ pub struct NvnCallReport {
 }
 
 impl RunnableProcess {
+    pub fn uses_nvn_hle(&self) -> bool {
+        self.nvn
+            .as_ref()
+            .is_some_and(|hooks| hooks.hle.is_some() && !hooks.bootstrap.is_empty())
+    }
     pub fn nvn_session(&self) -> Option<&nixe_nvn::Session> {
         self.nvn.as_ref()?.hle.as_ref().map(|h| &h.session)
     }

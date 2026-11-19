@@ -1,6 +1,7 @@
 // Entrypoints exported with the guest AAPCS64 ABI.
 exports! {
     sampler {
+        SamplerFinalize => finalize,
         SamplerInitialize => initialize,
         SamplerGetBorderColor => get_border,
         SamplerGetCompare => get_compare,
@@ -25,6 +26,9 @@ exports! {
         MemoryPoolSetDebugLabel => label,
     },
     texels {
+        TextureViewGetLevels => get_levels,
+        TextureViewGetLayers => get_layers,
+        TextureViewGetTarget => get_target,
         TextureViewSetLayers => layers,
         TextureViewSetSwizzle => swizzle,
         TextureViewSetDepthStencilMode => mode,
@@ -75,6 +79,7 @@ exports! {
         BufferGetAddress => address,
     },
     device {
+        DeviceFinalizeCommandHandle => finalize_handle,
         DeviceSetDepthMode => depth_mode,
         DeviceSetWindowOriginMode => origin,
         DeviceRegisterFastClearColor => fast_clear,
@@ -82,6 +87,8 @@ exports! {
         DeviceBuilderSetFlags => flags,
         DeviceBuilderSetDefaults => defaults,
         DeviceGetTextureHandle => texture_handle,
+        DeviceGetImageHandle => image_handle,
+        DeviceGetTexelFetchHandle => texel_fetch_handle,
         DeviceGetTextureHandleAmpere => texture_handle_ampere,
         DeviceGetInteger => integer,
     },
@@ -108,6 +115,7 @@ exports! {
         TextureBuilderGetStorageClass => storage_class,
         TextureBuilderGetZCullStorageSize => zcull,
         SamplerBuilderSetDevice => set_device,
+        TextureGetDepth => get_depth,
         TextureGetWidth => width,
         TextureGetHeight => height,
         TextureGetFormat => get_format,
@@ -129,6 +137,7 @@ exports! {
         TextureInitialize => initialize,
     },
     program {
+        ProgramFinalize => finalize,
         ProgramInitialize => initialize,
     },
     vertex {
@@ -189,6 +198,12 @@ exports! {
         CommandBufferSetTexturePool => texture_pool,
         CommandBufferSetRenderTargets => targets,
         CommandBufferSetScissor => scissor,
+        CommandBufferSetViewports => viewports,
+        CommandBufferSetScissors => scissors,
+        CommandBufferSetDepthRanges => depth_ranges,
+        CommandBufferSetConservativeRasterEnable => conservative,
+        CommandBufferClearTexture => clear_texture,
+        CommandBufferCopyTextureToTexture => copy_images,
         CommandBufferSetViewport => viewport,
         CommandBufferBarrier => barrier,
         CommandBufferClearColor => clear,
@@ -198,9 +213,13 @@ exports! {
         CommandBufferBindVertexBuffer => vertex,
         CommandBufferBindUniformBuffer => uniform,
         CommandBufferBindTexture => texture,
+        CommandBufferBindImage => image,
         CommandBufferDrawArrays => draw,
     },
     queue {
+        WindowSetPresentInterval => interval,
+        WindowGetPresentInterval => get_interval,
+        WindowSetCrop => crop,
         WindowBuilderSetPresentInterval => builder_interval,
         WindowBuilderSetNumActiveTextures => active,
         QueueBuilderSetControlMemorySize => control_bytes,

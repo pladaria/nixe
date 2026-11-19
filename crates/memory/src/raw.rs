@@ -222,6 +222,31 @@ pub(crate) unsafe fn capture(mut source: *const u8, destination: &mut [u8]) {
     }
 }
 /// # Safety
+/// The retained ordinary RAM interval must cover all the expected words.
+pub(crate) unsafe fn matches_words(mut source: *const u8, mut expected: &[u64]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    while expected.len() >= 2 {
+        let mask: u32;
+        unsafe {
+            asm!("movdqu xmm0, [{src}]", "movdqu xmm1, [{dst}]", "pcmpeqb xmm0, xmm1",
+                 "pmovmskb {mask:e}, xmm0", src = in(reg) source, dst = in(reg) expected.as_ptr(),
+                 mask = lateout(reg) mask, out("xmm0") _, out("xmm1") _, options(readonly,nostack,preserves_flags));
+        }
+        if mask != 0xffff {
+            return false;
+        }
+        source = unsafe { source.add(16) };
+        expected = &expected[2..];
+    }
+    for word in expected {
+        if unsafe { load(source, 8) } != *word {
+            return false;
+        }
+        source = unsafe { source.add(8) };
+    }
+    true
+}
+/// # Safety
 /// The destination is admitted/tracked guest RAM with stable physical lifetime.
 /// Source is owned host memory, disjoint from the guest backing.
 #[inline]

@@ -913,6 +913,13 @@ impl Residency<'_> {
                                     .sampler(sampler.handle),
                             })
                         }
+                        HostBinding::Sampler(sampler) => images.push(ShaderImage {
+                            view: None,
+                            descriptor,
+                            native: vk::DescriptorImageInfo::default()
+                                .sampler(sampler.handle)
+                                .image_layout(vk::ImageLayout::GENERAL),
+                        }),
                         _ => unreachable!("compiled shader image slot"),
                     }
                 }
@@ -1122,6 +1129,29 @@ impl Residency<'_> {
                 unsafe {
                     if !empty {
                         device.submission.statistics.draw_calls += 1;
+                        #[cfg(feature = "execution-trace")]
+                        {
+                            let frame = device.submission.statistics.draw_sample_frame;
+                            if frame.is_multiple_of(128) {
+                                let (kind, n, instances) = match draw {
+                                    Draw::Direct {
+                                        vertices,
+                                        instances,
+                                        ..
+                                    } => (0, vertices, instances),
+                                    Draw::Indexed {
+                                        indices, instances, ..
+                                    } => (1, indices, instances),
+                                    Draw::Indirect { count, .. } => (2, count, 0),
+                                };
+                                nixe_gpu::trace::event(
+                                    "gpu_draw_sample",
+                                    frame * 4 + kind,
+                                    n.into(),
+                                    instances.into(),
+                                );
+                            }
+                        }
                         if let Some(buffer) = predicate {
                             device.submission.retain_predicate(buffer);
                             raw.begin_predicate(buffer.handle);

@@ -155,7 +155,11 @@ pub trait GpuPresentation: GpuExecution {
             "NVN queues unavailable".into(),
         ))
     }
-    fn nvn_flush(&mut self, action: Option<FenceAction>) -> Result<(), BackendRuntimeError> {
+    fn nvn_flush(
+        &mut self,
+        _flush_for_cpu: bool,
+        action: Option<FenceAction>,
+    ) -> Result<(), BackendRuntimeError> {
         self.submit(action)
     }
     fn nvn_acquire_fence(&mut self, _action: FenceAction) -> Result<(), BackendRuntimeError> {
@@ -168,6 +172,7 @@ pub trait GpuPresentation: GpuExecution {
         _texture: nixe_nvn::Texture,
         _interval: u32,
         _flip_vertical: bool,
+        _crop: [u32; 4],
     ) -> Result<ResidentImage, BackendRuntimeError> {
         Err(BackendRuntimeError::Backend(
             "NVN presentation unavailable".into(),

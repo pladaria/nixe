@@ -458,6 +458,7 @@ impl NativeExecution<'_> {
         }
         Ok(())
     }
+    #[cfg_attr(feature = "execution-trace", track_caller)]
     fn flush(&mut self) -> Result<WorkTicket, BackendRuntimeError> {
         self.state.draw_counter = 0;
         self.state.last_draw = None;
@@ -612,6 +613,16 @@ impl NativeExecution<'_> {
                 stats.sampled_slot_keeps,
                 stats.descriptor_selection_invalidations,
             );
+        }
+        #[cfg(feature = "execution-trace")]
+        self.state.nvn.trace_frame();
+        #[cfg(feature = "execution-trace")]
+        {
+            self.residency
+                .device_mut()
+                .submission
+                .statistics
+                .draw_sample_frame += 1;
         }
         let reuse = self.state.statistics.reuse;
         nixe_gpu::trace::event(
@@ -941,10 +952,24 @@ impl nixe_gpu::GpuPresentation for NativeGpuExecution {
     }
     fn nvn_flush(
         &mut self,
+        flush_for_cpu: bool,
         action: Option<nixe_gpu::FenceAction>,
     ) -> Result<(), BackendRuntimeError> {
+        if flush_for_cpu {
+            self.residency.caches.sync_guest_memory();
+        }
         let mut n = self.execution();
+        if flush_for_cpu {
+            n.residency.commit_texture_downloads().map_err(runtime)?;
+            n.residency.commit_buffer_downloads().map_err(runtime)?;
+        }
         let work = if n.residency.has_recorded_work() {
+            nixe_gpu::trace::event(
+                "nvn_queue_flush",
+                n.residency.device().current_work().tick(),
+                u64::from(action.is_some()),
+                u64::from(flush_for_cpu),
+            );
             n.flush()?
         } else {
             let q = &n.residency.device().submission;
@@ -953,8 +978,13 @@ impl nixe_gpu::GpuPresentation for NativeGpuExecution {
         if action.is_some() {
             n.state
                 .fences
-                .queue(Some(work), false, action)
+                .queue(Some(work), flush_for_cpu, action)
                 .map_err(runtime)?;
+        }
+        drop(n);
+        if flush_for_cpu {
+            nixe_gpu::OwnerMemory::invalidate_gpu_cache(self)
+                .map_err(BackendRuntimeError::Memory)?;
         }
         Ok(())
     }
@@ -976,9 +1006,10 @@ impl nixe_gpu::GpuPresentation for NativeGpuExecution {
         t: nixe_nvn::Texture,
         interval: u32,
         flip_vertical: bool,
+        crop: [u32; 4],
     ) -> Result<ResidentImage, BackendRuntimeError> {
         self.composite_image(
-            nvn::presentation(t, flip_vertical).map_err(runtime)?,
+            nvn::presentation(t, flip_vertical, crop).map_err(runtime)?,
             interval,
             None,
         )

@@ -141,6 +141,8 @@ impl Compiler {
             .provoking_vertex_mode(s.provoking);
         let mut lines = vk::PipelineRasterizationLineStateCreateInfoEXT::default()
             .line_rasterization_mode(s.line_mode);
+        let mut conservative = vk::PipelineRasterizationConservativeStateCreateInfoEXT::default()
+            .conservative_rasterization_mode(vk::ConservativeRasterizationModeEXT::OVERESTIMATE);
         let mut raster = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(s.polygon)
             .cull_mode(s.cull)
@@ -151,6 +153,9 @@ impl Compiler {
             .depth_bias_enable(s.depth_bias);
         // Native modes replace WebGPU index rotation and line approximations.
         // https://docs.vulkan.org/refpages/latest/refpages/source/VkPipelineRasterizationProvokingVertexStateCreateInfoEXT.html
+        if s.conservative_raster {
+            raster = raster.push_next(&mut conservative);
+        }
         if s.provoking != vk::ProvokingVertexModeEXT::FIRST_VERTEX {
             raster = raster.push_next(&mut provoking);
         }

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sha2.workspace = true
 bytemuck.workspace = true
 nixe-nvn.workspace = true
 nixe-memory.workspace = true
@@ -28,6 +29,7 @@ tempfile.workspace = true
 cc = "1"
 
 [features]
+execution-trace = ["nixe-memory/execution-trace", "nixe-nvn/execution-trace"]
 performance-counters = ["nixe-gpu/performance-counters", "nixe-memory/performance-counters"]
 
 [dev-dependencies]

@@ -31,6 +31,14 @@ pub fn timestamp(c: &Call) -> Result<u64> {
 pub fn texture_handle(c: &Call) -> Result<u64> {
     Ok(((c.args[1] as i32 | (c.args[2] as i32) << 20) as i64 as u64) | (1 << 32))
 }
+// An image handle is the signed texture pool index in a 64-bit return register.
+// https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/hle_nvn.c#L242
+pub fn image_handle(c: &Call) -> Result<u64> {
+    Ok(c.args[1] as i32 as i64 as u64)
+}
+pub fn texel_fetch_handle(c: &Call) -> Result<u64> {
+    Ok(image_handle(c)? | (1 << 32))
+}
 pub fn texture_handle_ampere(c: &Call) -> Result<u64> {
     Ok((c.args[1] as i32 as i64 as u64) | ((c.args[2] as i32 as i64 as u64) << 20))
 }
@@ -67,5 +75,10 @@ pub fn integer(c: &Call) -> Result<u64> {
         *X1.get(property).ok_or("unsupported NVN device property")?
     };
     c.write(c.args[2], &value)?;
+    Ok(0)
+}
+
+// Command handles refer to caller-owned control and command memory.
+pub fn finalize_handle(_: &Call) -> Result<u64> {
     Ok(0)
 }

@@ -7,6 +7,7 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 
 type Slot = (u32, u32);
+pub type TextureHandles = Vec<(Slot, u64)>;
 pub type TextureShape = (u32, u32, u16, u8);
 
 #[derive(Clone, Copy, Debug)]
@@ -28,7 +29,7 @@ impl Sampled {
         (self.stage, self.slot) == key && self.handle == handle && self.ids == ids
     }
 
-    fn shape(&self) -> TextureShape {
+    pub fn shape(&self) -> TextureShape {
         (
             self.stage,
             self.slot,
@@ -65,9 +66,37 @@ pub struct BufferBindings {
 #[derive(Debug, Default)]
 pub struct BufferState {
     uniforms: Ranges,
+    dirty: std::cell::Cell<DirtyBuffers>,
     pub driver: Arc<BufferBindings>,
 }
+#[derive(Default, Clone, Copy, Debug)]
+pub struct DirtyBuffers {
+    masks: [[u32; 6]; 2],
+    overflow: bool,
+}
+impl DirtyBuffers {
+    pub fn slots(&self) -> Option<impl Iterator<Item = (bool, u32, u32)> + '_> {
+        (!self.overflow).then(|| {
+            self.masks.iter().enumerate().flat_map(|(kind, stages)| {
+                stages.iter().enumerate().flat_map(move |(stage, &mask)| {
+                    let mut mask = mask;
+                    std::iter::from_fn(move || {
+                        if mask == 0 {
+                            return None;
+                        }
+                        let slot = mask.trailing_zeros();
+                        mask &= mask - 1;
+                        Some((kind != 0, stage as u32, slot))
+                    })
+                })
+            })
+        })
+    }
+}
 impl BufferState {
+    pub fn take_dirty(&self) -> DirtyBuffers {
+        self.dirty.take()
+    }
     fn table(&self, storage: bool, stage: u32) -> &Ranges {
         if storage {
             &self.driver.storage
@@ -89,6 +118,12 @@ impl BufferState {
         let pos = table.binary_search_by_key(&(stage, slot), |x| (x.0, x.1));
         if pos.is_ok_and(|i| table[i].2 == range) {
             return;
+        }
+        let dirty = self.dirty.get_mut();
+        if stage < 6 && slot < 32 {
+            dirty.masks[storage as usize][stage as usize] |= 1 << slot;
+        } else {
+            dirty.overflow = true;
         }
         let table = if storage {
             &mut Arc::make_mut(&mut self.driver).storage
@@ -117,7 +152,7 @@ impl std::ops::Deref for Bindings<'_> {
 #[derive(Clone, Default, Debug)]
 pub struct CapturedBindings {
     pub sampled: Arc<SampledBindings>,
-    pub handles: Arc<Vec<(Slot, u64)>>,
+    pub handles: Arc<TextureHandles>,
     pub usage_slot: UsageSlot,
     pub captured: Option<Arc<ShaderUsage>>,
 }
@@ -141,6 +176,7 @@ pub(crate) struct BindingState {
     projected: Option<Arc<[TextureShape]>>,
     addresses_dirty: bool,
     words: Vec<(GuestVirtualAddress, u32)>,
+    word_indices: Vec<usize>,
 }
 
 impl BindingState {
@@ -187,7 +223,14 @@ impl BindingState {
             && usage.current(c.session.graphics()?.heap.device().generation())
         {
             self.capture(c, texture_pool, sampler_pool, Some(&usage.shapes))?;
-            if self.current.sampled.shapes == usage.shapes {
+            if self.current.sampled.shapes == usage.shapes
+                || self
+                    .current
+                    .sampled
+                    .shapes
+                    .iter()
+                    .eq(usage.shapes.iter().filter(|s| s.2 != 0))
+            {
                 self.current.captured = known;
                 return Ok(&self.current);
             }
@@ -209,6 +252,10 @@ impl BindingState {
         sampler_pool: DescriptorPool,
         projection: Option<&Arc<[TextureShape]>>,
     ) -> Result<()> {
+        // Texel fetch uses reserved sampler zero. Its pool bytes belong to the
+        // driver and are never an application sampler ID. Image handles likewise
+        // carry only a texture index.
+        let sampler_index = |handle: u64| handle as u32 >> 20;
         let changed = match (&self.projected, projection) {
             (Some(old), Some(new)) => !Arc::ptr_eq(old, new),
             (None, None) => false,
@@ -229,13 +276,28 @@ impl BindingState {
             }
 
             self.words.clear();
+            self.word_indices.clear();
+            // Multiple shader slots often refer to the same pool entry. One
+            // coherent read of each address suffices for this capture.
+            let mut select_word = |address: u64| {
+                let address = GuestVirtualAddress::new(address);
+                let index = self
+                    .words
+                    .iter()
+                    .position(|w| w.0 == address)
+                    .unwrap_or_else(|| {
+                        self.words.push((address, 0));
+                        self.words.len() - 1
+                    });
+                self.word_indices.push(index);
+            };
             for &(_, handle) in &self.active {
                 let texture = texture_pool.slot(handle as u32 & 0xfffff)?;
-                let sampler = sampler_pool.slot(handle as u32 >> 20)?;
-                self.words.extend([
-                    (GuestVirtualAddress::new(texture), 0),
-                    (GuestVirtualAddress::new(sampler), 0),
-                ]);
+                select_word(texture);
+                if sampler_index(handle) != 0 {
+                    let sampler = sampler_pool.slot(sampler_index(handle))?;
+                    select_word(sampler);
+                }
             }
             self.addresses_dirty = false;
         }
@@ -256,17 +318,26 @@ impl BindingState {
             remaining = tail;
         }
 
+        let mut words = self.word_indices.iter().map(|&i| self.words[i].1);
         let mut slots = self
             .active
             .iter()
-            .zip(self.words.chunks_exact(2))
+            .map(|entry @ &(_, handle)| {
+                let texture = words.next().unwrap();
+                let sampler = if sampler_index(handle) != 0 {
+                    words.next().unwrap()
+                } else {
+                    0
+                };
+                (entry, [texture, sampler])
+            })
             .enumerate();
         let sampled = &self.current.sampled;
-        let first_change = slots.find(|&(i, (&(key, handle), words))| {
+        let first_change = slots.find(|&(i, (&(key, handle), ids))| {
             sampled
                 .entries
                 .get(i)
-                .is_none_or(|s| !s.matches(key, handle, [words[0].1, words[1].1]))
+                .is_none_or(|s| !s.matches(key, handle, ids))
         });
         if first_change.is_none() && sampled.entries.len() == self.active.len() {
             return Ok(());
@@ -277,8 +348,7 @@ impl BindingState {
         sampled.entries.truncate(self.active.len());
         let mut textures = None;
         let mut samplers = None;
-        for (i, (&((stage, slot), handle), words)) in first_change.into_iter().chain(slots) {
-            let ids = [words[0].1, words[1].1];
+        for (i, (&((stage, slot), handle), ids)) in first_change.into_iter().chain(slots) {
             let previous = sampled.entries.get(i);
             if previous.is_some_and(|s| s.matches((stage, slot), handle, ids)) {
                 continue;
@@ -287,13 +357,20 @@ impl BindingState {
                 Some(s) if s.ids[0] == ids[0] => s.texture,
                 _ => textures
                     .get_or_insert_with(|| c.session.textures.lock().unwrap())
-                    .get(ids[0])?,
+                    .get(ids[0]).ok_or_else(|| format!(
+                        "unknown texture descriptor {:#x} at stage {stage}, row {slot}, pool {:#x}, index {}",
+                        ids[0], texture_pool.base, handle as u32 & 0xfffff
+                    ))?,
             };
             let sampler = match previous {
-                Some(s) if s.ids[1] == ids[1] => s.sampler,
+                Some(s) if ids[1] != 0 && s.ids[1] == ids[1] => s.sampler,
+                _ if sampler_index(handle) == 0 => Sampler::default(),
                 _ => samplers
                     .get_or_insert_with(|| c.session.samplers.lock().unwrap())
-                    .get(ids[1])?,
+                    .get(ids[1]).ok_or_else(|| format!(
+                        "unknown sampler descriptor {:#x} at stage {stage}, row {slot}, pool {:#x}, index {}",
+                        ids[1], sampler_pool.base, sampler_index(handle)
+                    ))?,
             };
             let next = Sampled {
                 stage,
@@ -363,13 +440,14 @@ mod tests {
         let new_id = session.textures.lock().unwrap().intern(new_texture);
         let sid = session.samplers.lock().unwrap().intern(Sampler::default());
         let textures = DescriptorPool::new(0x1000, 2);
-        let samplers = DescriptorPool::new(0x1800, 1);
+        let samplers = DescriptorPool::new(0x1800, 2);
         c.write(0x1020, &id).unwrap();
-        c.write(0x1800, &sid).unwrap();
+        c.write(0x1820, &sid).unwrap();
+        let sampled_handle = (1 << 20) | 1;
         let mut state = BindingState::default();
-        state.bind_texture(1, 0, 1);
+        state.bind_texture(1, 0, sampled_handle);
         let first = state.snapshot(&c, textures, samplers).unwrap().clone();
-        state.bind_texture(1, 0, 1);
+        state.bind_texture(1, 0, sampled_handle);
         c.write(0x4020, &new_id).unwrap();
         let changed = state.snapshot(&c, textures, samplers).unwrap().clone();
         assert_eq!(first.sampled.get(1, 0).unwrap().texture, texture);
@@ -377,7 +455,7 @@ mod tests {
         assert!(Arc::ptr_eq(&changed.sampled.shapes, &first.sampled.shapes));
         // A warm program consumes one of two bound slots. The other raw
         // handle remains visible to ordinary reads of driver constant bank 2.
-        state.bind_texture(1, 4, 1);
+        state.bind_texture(1, 4, sampled_handle);
         let used: Arc<[TextureShape]> = Arc::from([changed.sampled.get(1, 0).unwrap().shape()]);
         state.capture(&c, textures, samplers, Some(&used)).unwrap();
         assert_eq!(state.words.len(), 2);
@@ -404,6 +482,33 @@ mod tests {
         state.bind_texture(1, 0, 0);
         let unbound = state.snapshot(&c, split, samplers).unwrap().clone();
         assert!(unbound.sampled.entries.is_empty());
+
+        // Compute may bind an image and fetch its texels without a sampler pool.
+        state.bind_texture(5, 0, (1 << 32) | 1);
+        state.bind_texture(5, crate::IMAGE_HANDLE_BASE_SLOT, 1);
+        c.write(0x1800, &u32::MAX).unwrap();
+        state.snapshot(&c, textures, samplers).unwrap();
+        state.pool_changed();
+        let images = state
+            .snapshot(&c, textures, DescriptorPool::default())
+            .unwrap()
+            .clone();
+        for row in [0, crate::IMAGE_HANDLE_BASE_SLOT] {
+            assert_eq!(
+                images.sampled.get(5, row).unwrap().descriptor_ids(),
+                [id, 0]
+            );
+        }
+        // Switching from texel fetch to an unregistered application sampler
+        // must not inherit the reserved sampler just because both IDs are zero.
+        c.write(0x1820, &0u32).unwrap();
+        state.bind_texture(5, 0, sampled_handle);
+        assert!(
+            state
+                .snapshot(&c, textures, samplers)
+                .unwrap_err()
+                .contains("unknown sampler descriptor")
+        );
         assert!(unbound.sampled.shapes.is_empty());
         assert!(switched.sampled.get(1, 0).is_some());
     }

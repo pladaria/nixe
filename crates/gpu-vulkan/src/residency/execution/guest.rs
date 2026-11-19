@@ -39,6 +39,11 @@ impl Residency<'_> {
             &mut self.runtime.device.dispatch,
             pipeline.layout.key.bindings.len(),
         )?;
+        self.runtime
+            .device
+            .submission
+            .statistics
+            .descriptor_payload_captures += 1;
         self.runtime.buffer_bindings.channel.streamed_uniforms = [0; 6];
         Ok(())
     }

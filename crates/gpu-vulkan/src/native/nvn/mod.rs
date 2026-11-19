@@ -5,6 +5,7 @@ mod selections;
 mod shader;
 #[cfg(test)]
 mod tests;
+mod transfer;
 use super::*;
 use nixe_nvn::{Operation, Texture};
 
@@ -14,6 +15,10 @@ use std::rc::Rc;
 pub(super) struct Cache {
     initialized: bool,
     next_pipeline: u64,
+    #[cfg(feature = "execution-trace")]
+    draw_counts: [u64; 3],
+    #[cfg(feature = "execution-trace")]
+    slots: [u64; 3],
     clock: Option<std::time::Instant>,
     conditions: crate::residency::predicate::RenderConditions,
     pipelines: HashMap<Arc<nixe_nvn::DrawPipeline>, Rc<shader::Pipeline>>,
@@ -21,11 +26,22 @@ pub(super) struct Cache {
     queues: HashMap<u64, (nixe_nvn::CommandState, selections::Queue)>,
     driver_banks: shader::DriverBanks,
     shaders: HashMap<shader::ShaderKey, Rc<shader::Compiled>>,
+    physical: shader::PhysicalPipelines,
+    archive: Option<shader::Archive>,
     sampled: resources::SampledSelections,
     compute: HashMap<(nixe_nvn::Shader, Shapes), Rc<shader::Program>>,
     compiler: Option<nixe_shader_recompiler::Compiler>,
 }
 impl Cache {
+    #[cfg(feature = "execution-trace")]
+    pub(super) fn trace_frame(&self) {
+        if self.initialized {
+            let [direct, skipped, predicated] = self.draw_counts;
+            nixe_gpu::trace::event("frame_nvn_draws", direct, skipped, predicated);
+            let [total, visited, changed] = self.slots;
+            nixe_gpu::trace::event("frame_nvn_slots", total, visited, changed);
+        }
+    }
     pub(super) fn finalize_queue(&mut self, queue: u64) {
         self.conditions.remove(queue);
         self.queues.remove(&queue);
@@ -38,14 +54,20 @@ fn error(e: impl std::fmt::Display) -> VulkanError {
 pub(super) fn presentation(
     t: Texture,
     flip_vertical: bool,
+    crop: [u32; 4],
 ) -> Result<NativePresentationImage, VulkanError> {
     let (geometry, layout) = resources::layout(t)?;
+    let [left, top, width, height] = if crop[2] == 0 || crop[3] == 0 {
+        [0, 0, t.width, t.height]
+    } else {
+        crop
+    };
     Ok(NativePresentationImage {
         crop: nixe_gpu::FrameCrop {
-            left: 0,
-            top: 0,
-            width: t.width,
-            height: t.height,
+            left,
+            top,
+            width,
+            height,
         },
         transform: nixe_gpu::FrameTransform {
             flip_vertical,
@@ -57,9 +79,11 @@ pub(super) fn presentation(
         row_pitch: geometry.pitch,
         extent: [t.width, t.height],
         format: match t.format {
-            0x25 => nixe_gpu::PresentationImageFormat::Rgba8,
+            0x25 | 0x38 => nixe_gpu::PresentationImageFormat::Rgba8,
+            0x6d | 0x37 => nixe_gpu::PresentationImageFormat::Rgbx8,
+            0x9a | 0x9c => nixe_gpu::PresentationImageFormat::Bgra8,
             0x95 => nixe_gpu::PresentationImageFormat::Rgb565,
-            _ => return Err(error("unsupported NVN present format")),
+            id => return Err(error(format!("unsupported NVN present format {id:#x}"))),
         },
         allow_canonical_import: false,
     })
@@ -91,7 +115,6 @@ impl NativeGpuExecution {
         }
         nixe_gpu::OwnerMemory::invalidate_gpu_cache(self).map_err(BackendRuntimeError::Memory)?;
         let mut n = self.execution();
-        n.flush_work().map_err(runtime)?;
         n.state.nvn.conditions.begin_list();
         let (mut state, mut selections) = n
             .state
@@ -101,7 +124,10 @@ impl NativeGpuExecution {
             .unwrap_or_else(|| (nixe_nvn::CommandState::new(&commands), Default::default()));
         let mut order = 0;
         for record in commands.records() {
-            let Some(op) = state.apply(record).map_err(|e| runtime(error(e)))? else {
+            let Some(op) = state
+                .apply(record.map_err(|e| runtime(error(e)))?)
+                .map_err(|e| runtime(error(e)))?
+            else {
                 continue;
             };
             if let Operation::Barrier(flags) = op {
@@ -120,15 +146,17 @@ impl NativeGpuExecution {
                 order = 0;
             }
             n.issue_nvn(queue, op, &mut selections)?;
+            let device = n.residency.device_mut();
+            if device.submission.nvn_prefix_full(&device.dispatch) {
+                n.flush()?;
+            }
         }
         if order != 0 {
             n.residency.order_nvn(order).map_err(runtime)?;
         }
         n.state.nvn.queues.insert(queue, (state, selections));
         let device = n.residency.device_mut();
-        if device.submission.finish_nvn_list(&device.dispatch) {
-            n.flush()?;
-        }
+        device.submission.finish_nvn_list(&device.dispatch);
         Ok(())
     }
 }
@@ -140,6 +168,21 @@ impl NativeExecution<'_> {
         selections: &mut selections::Queue,
     ) -> Result<(), BackendRuntimeError> {
         match op {
+            Operation::ClearImage {
+                texture,
+                region,
+                color,
+                mask,
+            } => self
+                .clear_nvn_image(texture, region, color, mask)
+                .map_err(runtime)?,
+            Operation::CopyImages {
+                textures,
+                regions,
+                flags,
+            } => self
+                .copy_nvn_images(textures, regions, flags)
+                .map_err(runtime)?,
             Operation::CopyTexture {
                 source,
                 target,
@@ -257,7 +300,17 @@ impl NativeExecution<'_> {
             }
             Operation::Barrier(_) => unreachable!("orders are coalesced at submit"),
             Operation::Draw(d) => {
-                if let Some(predicate) = self.state.nvn.conditions.draw(queue) {
+                let condition = self.state.nvn.conditions.draw(queue);
+                #[cfg(feature = "execution-trace")]
+                {
+                    let index = match &condition {
+                        None => 1,
+                        Some(Some(_)) => 2,
+                        Some(None) => 0,
+                    };
+                    self.state.nvn.draw_counts[index] += 1;
+                }
+                if let Some(predicate) = condition {
                     self.draw_nvn(&d, predicate.as_ref(), selections)
                         .map_err(runtime)?;
                 }
@@ -533,15 +586,18 @@ impl NativeExecution<'_> {
             break (targets, draw);
         };
         let mut params = pipeline.parameters.borrow_mut();
-        let [x, y, w, h] = d.viewport;
-        params.viewports[0] = vk::Viewport {
-            x: x as f32,
-            y: if d.flip_y { (y + h) as f32 } else { y as f32 },
-            width: w as f32,
-            height: if d.flip_y { -(h as f32) } else { h as f32 },
-            min_depth: d.depth_range[0],
-            max_depth: d.depth_range[1],
-        };
+        for (i, v) in d.viewports.iter().enumerate() {
+            let [x, y, w, h] = v.rect;
+            params.viewports[i] = vk::Viewport {
+                x,
+                y: if d.flip_y { y + h } else { y },
+                width: w,
+                height: if d.flip_y { -h } else { h },
+                min_depth: v.depth[0],
+                max_depth: v.depth[1],
+            };
+            params.scissors[i] = rect(v.scissor, extent);
+        }
         params.depth_bounds = d.dynamic.depth_bounds;
         params.depth_bias = d.dynamic.depth_bias;
         params.line_width = d.dynamic.line_width;
@@ -549,7 +605,6 @@ impl NativeExecution<'_> {
         params.stencil_compare_mask = d.dynamic.stencil_compare;
         params.stencil_write_mask = d.dynamic.stencil_write;
         params.blend_constants = d.blend_color;
-        params.scissors[0] = rect(d.scissor, extent);
 
         let constants = state::ShaderConstants::default();
         self.residency.draw_bound(

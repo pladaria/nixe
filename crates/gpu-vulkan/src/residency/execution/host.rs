@@ -64,7 +64,7 @@ impl Residency<'_> {
     ) -> Result<HostProgram, VulkanError> {
         let capacity = pipeline.layout.key.bindings.len();
         let mut program = self.new_host_program(pipeline)?;
-        program.direct_entries = Some(Vec::with_capacity(capacity));
+        program.direct_entries = Some(Vec::with_capacity(capacity).into());
         Ok(program)
     }
     fn new_host_program(&self, pipeline: NativePipeline) -> Result<HostProgram, VulkanError> {
@@ -109,7 +109,29 @@ impl Residency<'_> {
         {
             self.capture_host_binding(program, index, input)?;
             if let Some(entries) = &mut program.direct_entries {
+                let entries = entries.get_mut();
+                let record = program.record.get_mut();
+                record.payload = None;
+                if let Ok(slot) = program
+                    .pipeline
+                    .layout
+                    .uniform_bindings
+                    .binary_search_by_key(&index, |u| u.resource)
+                    && let Some(previous) = record.uniforms.get_mut(slot)
+                {
+                    *previous = (vk::Buffer::null(), 0, 0);
+                }
                 let entry = match input {
+                    HostBinding::Image(view) => crate::cache::DescriptorEntry {
+                        image: vk::DescriptorImageInfo::default()
+                            .image_view(view.native.handle)
+                            .image_layout(vk::ImageLayout::GENERAL),
+                    },
+                    HostBinding::Sampler(sampler) => crate::cache::DescriptorEntry {
+                        image: vk::DescriptorImageInfo::default()
+                            .sampler(sampler.handle)
+                            .image_layout(vk::ImageLayout::GENERAL),
+                    },
                     HostBinding::UniformBytes(_) => crate::cache::DescriptorEntry {
                         buffer: Default::default(),
                     },
@@ -319,6 +341,14 @@ impl Residency<'_> {
                         "shader image requires sampled/storage usage",
                     ));
                 }
+            }
+            HostBinding::Sampler(_)
+                if kind == vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                    && !self.runtime.device.profile().null_descriptor =>
+            {
+                return Err(VulkanError::InvalidResource(
+                    "null sampled image requires nullDescriptor",
+                ));
             }
             HostBinding::Sampler(_) => {}
         }

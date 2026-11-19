@@ -2,7 +2,9 @@
 //! while object storage and procedure resolution stay in the guest ABI.
 mod abi;
 use abi::*;
-pub use abi::{Range, Sampler, Shader, Texture, VertexStream};
+pub use abi::{
+    IMAGE_HANDLE_BASE_SLOT, IMAGE_HANDLE_SLOTS, Range, Sampler, Shader, Texture, VertexStream,
+};
 pub use guest_image::{GUEST_CODE, GUEST_ERROR_PC, guest_offset};
 mod bindings;
 mod command;
@@ -23,7 +25,9 @@ mod state;
 mod texels;
 mod texture;
 
-pub use bindings::{Bindings, BufferBindings, Sampled, TextureShape};
+pub use bindings::{
+    Bindings, BufferBindings, Sampled, SampledBindings, TextureHandles, TextureShape,
+};
 pub use command::{Attachments, CommandState, Draw, DrawPipeline, Operation, Submission};
 pub use layout::{Layout, Mip};
 use nixe_cpu::platform::TargetPlatform;
@@ -40,9 +44,15 @@ pub trait Backend: Send + Sync {
     fn drain(&self) -> Result<()>;
     fn finalize_queue(&self, queue: u64) -> Result<()>;
     fn acquire_fence(&self, fence: Arc<Fence>) -> Result<()>;
-    fn fence(&self, fence: Arc<Fence>) -> Result<()>;
+    fn fence(&self, fence: Arc<Fence>, flush_for_cpu: bool) -> Result<()>;
     fn flush(&self) -> Result<()>;
-    fn present(&self, texture: Texture, interval: u32, flip_vertical: bool) -> Result<()>;
+    fn present(
+        &self,
+        texture: Texture,
+        interval: u32,
+        flip_vertical: bool,
+        crop: [u32; 4],
+    ) -> Result<()>;
 }
 
 /// An NvMap handle exported to other guest drivers (e.g. video decoding).
@@ -76,11 +86,8 @@ impl<T: Eq + std::hash::Hash + Copy> Descriptors<T> {
             self.values.len() as u32
         })
     }
-    fn get(&self, id: u32) -> Result<T> {
-        self.values
-            .get(id.wrapping_sub(1) as usize)
-            .copied()
-            .ok_or_else(|| "uninitialized descriptor".into())
+    fn get(&self, id: u32) -> Option<T> {
+        self.values.get(id.wrapping_sub(1) as usize).copied()
     }
 }
 pub struct Session {
@@ -151,13 +158,13 @@ procedures! {
     texture {
         TextureGetNvRmSurfaceNVX => nv_surface,
         TexturePoolRegisterTexture => register_texture,
+        TexturePoolRegisterImage => register_texture,
     },
     program {
         ProgramSetShadersExt => shaders_ext,
         ProgramSetShaders => shaders,
     },
     queue {
-        WindowSetPresentInterval => interval,
         WindowAcquireTexture => window_acquire,
         WindowInitialize => window_initialize,
         QueueInitialize => initialize,

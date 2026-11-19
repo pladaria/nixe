@@ -263,6 +263,7 @@ impl Residency<'_> {
         }
         let descriptors = &mut self.runtime.compute_pass_descriptor_queue;
         descriptors.acquire(&mut device.dispatch, 2)?;
+        device.submission.statistics.descriptor_payload_captures += 1;
         for (i, info) in [(source, base, offset + 24), (result.handle, 0, 4)]
             .into_iter()
             .enumerate()

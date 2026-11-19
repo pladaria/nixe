@@ -57,6 +57,7 @@ pub struct DeviceProfile {
     pub index_uint8: bool,
     pub primitive_restart: [bool; 2], // list, patch list
     pub fill_rectangle: bool,
+    pub conservative_raster: bool,
     pub depth_range_unrestricted: bool,
     pub custom_border_color: bool,
     pub custom_border_color_without_format: bool,
@@ -341,6 +342,9 @@ impl FeatureSet {
         }
         if ext.contains(ash::ext::shader_stencil_export::NAME) {
             self.names.push(ash::ext::shader_stencil_export::NAME);
+        }
+        if ext.contains(ash::ext::conservative_rasterization::NAME) {
+            self.names.push(ash::ext::conservative_rasterization::NAME);
         }
         if ext.contains(ash::nv::fill_rectangle::NAME) {
             self.names.push(ash::nv::fill_rectangle::NAME);
@@ -637,6 +641,9 @@ impl FeatureSet {
                 self.list_restart.primitive_topology_list_restart != 0,
                 self.list_restart.primitive_topology_patch_list_restart != 0,
             ],
+            conservative_raster: self
+                .names
+                .contains(&ash::ext::conservative_rasterization::NAME),
             fill_rectangle: self.names.contains(&ash::nv::fill_rectangle::NAME),
             depth_range_unrestricted: self
                 .names

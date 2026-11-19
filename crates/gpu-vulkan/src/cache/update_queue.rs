@@ -12,6 +12,7 @@ pub(crate) struct UpdateDescriptorQueue {
     payload: Box<[UnsafeCell<DescriptorEntry>]>,
     frame_payload_size: usize,
     frame: usize,
+    generation: u64,
     cursor: usize,
     upload_start: usize,
     entries: usize,
@@ -54,6 +55,7 @@ impl UpdateDescriptorQueue {
             .collect(),
             frame_payload_size,
             frame: 0,
+            generation: 0,
             cursor: 0,
             upload_start: 0,
             entries: 0,
@@ -85,6 +87,7 @@ impl UpdateDescriptorQueue {
             // Acquire reuses the frame reservation only after accepted native
             // updates have read it. This waits for recording, not GPU execution.
             dispatch.wait_worker()?;
+            self.generation += 1;
             self.cursor = start;
         }
         self.upload_start = self.cursor;
@@ -110,6 +113,9 @@ impl UpdateDescriptorQueue {
             );
         }
     }
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
     pub(crate) fn update_data(&self) -> DescriptorUpdate {
         DescriptorUpdate {
             data: NonNull::new(self.payload[self.upload_start].get()).unwrap(),
@@ -119,6 +125,7 @@ impl UpdateDescriptorQueue {
     /// Called after the frame producer's WaitWorker, as synchronous
     /// PresentManager::Present followed by RasterizerVulkan::TickFrame.
     pub(crate) fn tick_frame(&mut self) {
+        self.generation += 1;
         self.frame = (self.frame + 1) % FRAMES_IN_FLIGHT;
         self.cursor = self.frame * self.frame_payload_size;
         self.upload_start = self.cursor;

@@ -144,6 +144,7 @@ pub fn window_initialize(c: &Call) -> Result<u64> {
         .filter(|s| !s.is_empty())
         .ok_or("invalid window textures")?
         .to_vec();
+    c.write(c.args[0], &[b.interval, 0, 0, 0, 0])?;
     c.session.queues.lock().unwrap().windows.insert(
         c.args[0],
         Window {
@@ -160,7 +161,7 @@ pub fn sync_initialize(c: &Call) -> Result<u64> {
     Ok(1)
 }
 pub fn fence(c: &Call) -> Result<u64> {
-    if c.args[2] != 0 || c.args[3] != 0 {
+    if c.args[2] != 0 || c.args[3] & !1 != 0 {
         return Err(format!(
             "unsupported fence condition {} or flags {:#x}",
             c.args[2], c.args[3]
@@ -169,7 +170,10 @@ pub fn fence(c: &Call) -> Result<u64> {
     }
     queue(c)?.ordered(|_| {
         let fence = Arc::new(Fence::default());
-        c.session.graphics()?.backend.fence(fence.clone())?;
+        c.session
+            .graphics()?
+            .backend
+            .fence(fence.clone(), c.args[3] & 1 != 0)?;
         c.session
             .queues
             .lock()
@@ -219,6 +223,7 @@ pub fn window_acquire(c: &Call) -> Result<u64> {
     acquire_slot(c, c.args[0])
 }
 fn acquire_slot(c: &Call, window: u64) -> Result<u64> {
+    let interval: u32 = c.read(window)?;
     let (index, deadline) = {
         let mut q = c.session.queues.lock().unwrap();
         let w = q.windows.get_mut(&window).ok_or("unknown window")?;
@@ -229,6 +234,10 @@ fn acquire_slot(c: &Call, window: u64) -> Result<u64> {
         // @SIMPLIFICATION Pace the default 60 Hz window at acquire. The host
         // compositor owns its independent copy and can finish it asynchronously.
         let now = Instant::now();
+        if w.interval != interval {
+            w.interval = interval;
+            w.deadline = None;
+        }
         let t = w.deadline.unwrap_or(now).max(now);
         w.deadline = Some(t + Duration::from_nanos(16_666_667 * u64::from(w.interval)));
         (index, t)
@@ -246,38 +255,31 @@ pub fn submit(c: &Call) -> Result<u64> {
         for i in 0..c.args[1] as u32 {
             capture.list(c, c.read(c.args[2] + u64::from(i) * 8)?, &mut submission)?;
         }
+        #[cfg(feature = "execution-trace")]
+        capture.trace_submit(submission.block_count());
         c.session.graphics()?.backend.submit(c.args[0], submission)
     })?;
     Ok(0)
 }
 pub fn present(c: &Call) -> Result<u64> {
-    let (texture, interval, queue) = {
+    let [interval, x, y, width, height]: [u32; 5] = c.read(c.args[1])?;
+    let (texture, queue) = {
         let q = c.session.queues.lock().unwrap();
         let w = q.windows.get(&c.args[1]).ok_or("unknown window")?;
         (
             *w.textures
                 .get(c.args[2] as u32 as usize)
                 .ok_or("invalid window texture index")?,
-            w.interval,
             q.state.get(&c.args[0]).cloned().ok_or("unknown queue")?,
         )
     };
     queue.ordered(|_| {
-        c.session
-            .graphics()?
-            .backend
-            .present(c.read(texture)?, interval, !queue.upper_left)
+        c.session.graphics()?.backend.present(
+            c.read(texture)?,
+            interval,
+            !queue.upper_left,
+            [x, y, width, height],
+        )
     })?;
-    Ok(0)
-}
-
-pub fn interval(c: &Call) -> Result<u64> {
-    let mut queues = c.session.queues.lock().unwrap();
-    let w = queues.windows.get_mut(&c.args[0]).ok_or("unknown window")?;
-    let interval = c.args[1] as u32;
-    if w.interval != interval {
-        w.interval = interval;
-        w.deadline = None;
-    }
     Ok(0)
 }

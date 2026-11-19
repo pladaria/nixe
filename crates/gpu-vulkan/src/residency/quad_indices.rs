@@ -373,6 +373,7 @@ impl Residency<'_> {
         self.runtime
             .compute_pass_descriptor_queue
             .acquire(&mut device.dispatch, 2)?;
+        device.submission.statistics.descriptor_payload_captures += 1;
         self.runtime.compute_pass_descriptor_queue.write(
             0,
             DescriptorEntry {

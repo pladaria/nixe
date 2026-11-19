@@ -90,17 +90,20 @@ fn counter_comparison_snapshots_device_writes_in_queue_order()
     // The explicit flush submits the draws. Both later fences must observe
     // that same GPU prefix in FIFO order even if it is still in flight.
     use nixe_gpu::GpuPresentation;
-    gpu.nvn_flush(None)?;
+    gpu.nvn_flush(false, None)?;
     let submitted = gpu.residency.device().scheduled_tick();
     let (send, done) = std::sync::mpsc::channel();
     for i in 0..2 {
         let send = send.clone();
-        gpu.nvn_flush(Some(Box::new(move |result| {
-            let _ = send.send(i);
-            result
-        })))?;
+        gpu.nvn_flush(
+            false,
+            Some(Box::new(move |result| {
+                let _ = send.send(i);
+                result
+            })),
+        )?;
     }
-    gpu.nvn_flush(None)?;
+    gpu.nvn_flush(false, None)?;
     assert_eq!(gpu.residency.device().scheduled_tick(), submitted);
     for i in 0..2 {
         assert_eq!(done.recv_timeout(Duration::from_secs(5))?, i);

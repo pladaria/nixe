@@ -484,6 +484,8 @@ impl DescriptorCache {
                         ));
                     }
                 }
+                (vk::DescriptorType::COMBINED_IMAGE_SAMPLER, DescriptorResource::Sampler(_))
+                    if self.null_descriptor => {}
                 (vk::DescriptorType::SAMPLER, DescriptorResource::Sampler(_)) => {}
                 _ => {
                     return Err(VulkanError::InvalidResource(
@@ -528,7 +530,9 @@ impl DescriptorCache {
                         .sampler(sampler.handle);
                 }
                 DescriptorResource::Sampler(sampler) => {
-                    entry.image = vk::DescriptorImageInfo::default().sampler(sampler.handle);
+                    entry.image = vk::DescriptorImageInfo::default()
+                        .sampler(sampler.handle)
+                        .image_layout(vk::ImageLayout::GENERAL);
                 }
                 DescriptorResource::TexelBuffer {
                     buffer,
@@ -864,7 +868,6 @@ impl VulkanDevice {
             // identity must not suppress the next captured-record binding.
             *bound = 0;
             self.submission.statistics.descriptor_binds += 1;
-            self.submission.statistics.descriptor_payload_captures += 1;
         } else if let Some(record) = record {
             let identity = Arc::as_ptr(record) as usize;
             if layout.push_descriptor

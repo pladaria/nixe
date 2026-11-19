@@ -35,6 +35,7 @@ pub struct DrawPipeline {
     pub upper_left: bool,
     pub minus_one_to_one: bool,
     pub samples: u32,
+    pub viewport_count: u8,
     pub color_formats: SmallVec<[Option<u16>; 1]>,
     pub depth_format: Option<u16>,
     pub raster: RasterState,
@@ -45,6 +46,21 @@ pub struct Attachments {
     pub colors: SmallVec<[Option<Texture>; 1]>,
     pub depth: Option<Texture>,
 }
+#[derive(Debug, Copy, Clone)]
+pub struct Viewport {
+    pub rect: [f32; 4],
+    pub depth: [f32; 2],
+    pub scissor: [i32; 4],
+}
+impl Default for Viewport {
+    fn default() -> Self {
+        Self {
+            rect: [0., 0., 1., 1.],
+            depth: [0., 1.],
+            scissor: [0; 4],
+        }
+    }
+}
 #[derive(Debug)]
 pub struct Draw<'a> {
     pub pipeline: &'a Arc<DrawPipeline>,
@@ -52,11 +68,10 @@ pub struct Draw<'a> {
     pub bindings: Bindings<'a>,
     pub attachments: &'a Arc<Attachments>,
     pub flip_y: bool,
-    pub depth_range: [f32; 2],
+    pub viewports: &'a [Viewport],
     pub blend_color: [f32; 4],
     pub indices: Option<(u32, u64, i32)>,
-    pub viewport: [i32; 4],
-    pub scissor: [i32; 4],
+
     pub vertices: &'a [(u32, Range)],
 
     pub first: u32,
@@ -86,14 +101,29 @@ impl Draw<'_> {
             .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1])])
             .unwrap_or_else(|| {
                 [
-                    self.viewport[0].saturating_add(self.viewport[2]).max(1) as u32,
-                    self.viewport[1].saturating_add(self.viewport[3]).max(1) as u32,
+                    (self.viewports[0].rect[0] + self.viewports[0].rect[2])
+                        .ceil()
+                        .max(1.) as u32,
+                    (self.viewports[0].rect[1] + self.viewports[0].rect[3])
+                        .ceil()
+                        .max(1.) as u32,
                 ]
             })
     }
 }
 #[derive(Debug)]
 pub enum Operation<'a> {
+    ClearImage {
+        texture: Texture,
+        region: [u32; 6],
+        color: [f32; 4],
+        mask: u32,
+    },
+    CopyImages {
+        textures: [Texture; 2],
+        regions: [[u32; 6]; 2],
+        flags: u32,
+    },
     CopyTexture {
         source: u64,
         target: Texture,
@@ -138,10 +168,49 @@ struct BindingRun {
     bindings: bindings::CapturedBindings,
     uses: usize,
 }
+#[derive(Debug)]
+struct CommandBlock {
+    words: Vec<u64>,
+    end: usize,
+    called_offsets: Option<Vec<u32>>,
+}
+impl CommandBlock {
+    fn new(words: Vec<u64>, called: bool) -> Self {
+        let mut end = words.len();
+        let called_offsets = called.then(|| {
+            // A caller retains a byte range. Later recordings may start at other
+            // boundaries. Index its current complete commands once per snapshot.
+            let mut offsets = Vec::new();
+            let mut index = 0;
+            while index < end {
+                let header = words[index];
+                let next = index + 1 + record_words(header);
+                if next > end {
+                    // @SIMPLIFICATION A called range ending inside a replacement
+                    // record executes only its complete prefix.
+                    // https://github.com/seedds/nxnative/blob/a366365/docs/reference/nvn-objects.md#a-called-recording-recorded-over-before-its-caller-is-submitted
+                    end = index;
+                    break;
+                }
+                if needs_capture(record_tag(header)) {
+                    offsets.push(index as u32);
+                }
+                index = next;
+            }
+            offsets
+        });
+        Self {
+            words,
+            end,
+            called_offsets,
+        }
+    }
+}
 /// Immutable words and submit-visible descriptors for the graphics owner.
 #[derive(Debug, Default)]
 pub struct Submission {
-    words: Vec<u64>,
+    blocks: SmallVec<[Arc<CommandBlock>; 4]>,
+    retained_bytes: usize,
     captures: Vec<BindingRun>,
     upper_left: bool,
     minus_one_to_one: bool,
@@ -154,29 +223,45 @@ impl Submission {
             ..Default::default()
         }
     }
-    pub fn allocation_bytes(&self) -> usize {
-        self.words.capacity() * size_of::<u64>()
-            + self.captures.capacity() * size_of::<BindingRun>()
+    #[cfg(feature = "execution-trace")]
+    pub(crate) fn block_count(&self) -> usize {
+        self.blocks.len()
     }
-    pub fn records(&self) -> impl Iterator<Item = Record<'_>> {
-        let mut words = self.words.as_slice();
+    pub fn allocation_bytes(&self) -> usize {
+        self.retained_bytes + self.captures.capacity() * size_of::<BindingRun>()
+    }
+    pub fn records(&self) -> impl Iterator<Item = Result<Record<'_>>> {
+        let mut blocks = self.blocks.iter();
+        let mut words: &[u64] = &[];
         let mut captures = self
             .captures
             .iter()
             .flat_map(|run| std::iter::repeat_n(&run.bindings, run.uses));
         std::iter::from_fn(move || {
+            while words.is_empty() {
+                let block = blocks.next()?;
+                words = &block.words[..block.end];
+            }
             let (&h, tail) = words.split_first()?;
-            // Capture validated the length before publishing this immutable block.
-            let (args, rest) = tail.split_at((h >> 32) as usize);
+            let Some((args, rest)) = tail.split_at_checked(record_words(h)) else {
+                words = &[];
+                return Some(Err("truncated NVN command record".into()));
+            };
             words = rest;
-            let tag = h as u32;
-            let bindings = matches!(tag, op::DRAW | op::INDEXED | op::DISPATCH)
-                .then(|| captures.next().unwrap());
-            Some(Record {
+            let tag = record_tag(h);
+            let bindings = if matches!(tag, op::DRAW | op::INDEXED | op::DISPATCH) {
+                let Some(capture) = captures.next() else {
+                    return Some(Err("missing submit-visible NVN bindings".into()));
+                };
+                Some(capture)
+            } else {
+                None
+            };
+            Some(Ok(Record {
                 tag,
                 args,
                 bindings,
-            })
+            }))
         })
     }
 }
@@ -189,10 +274,20 @@ pub struct Record<'a> {
 pub(crate) struct Capture {
     bindings: [bindings::BindingState; 2],
     shaders: SmallVec<[Shader; 2]>,
+    blocks: std::collections::HashMap<Range, Arc<CommandBlock>>,
+    retained_bytes: u64,
+    #[cfg(feature = "execution-trace")]
+    capture_counts: [u64; 4],
     texture_pool: DescriptorPool,
     sampler_pool: DescriptorPool,
 }
 impl Capture {
+    #[cfg(feature = "execution-trace")]
+    pub(crate) fn trace_submit(&mut self, blocks: usize) {
+        let [copied, visited, reused, hits] = std::mem::take(&mut self.capture_counts);
+        nixe_memory::trace::event("nvn_command_capture", copied, visited, blocks as u64);
+        nixe_memory::trace::event("nvn_command_reuse", reused, hits, 0);
+    }
     pub(crate) fn list(&mut self, c: &Call, mut at: u64, batch: &mut Submission) -> Result<()> {
         loop {
             let Range { address, size } = c.read(at)?;
@@ -200,16 +295,64 @@ impl Capture {
                 at = address;
                 continue;
             }
-            let bytes = size & !END;
+            let bytes = size & !(END | CALLED);
             if !bytes.is_multiple_of(8) || bytes > 64 << 20 {
                 return Err("invalid control entry".into());
             }
             if bytes != 0 {
-                let start = batch.words.len();
-                batch.words.resize(start + bytes as usize / 8, 0);
-                let block = &mut batch.words[start..];
-                c.read_bytes(address, bytemuck::cast_slice_mut(block))?;
-                self.observe(c, block, &mut batch.captures)?;
+                let key = Range {
+                    address,
+                    size: size & !END,
+                };
+                let previous = self.blocks.get(&key);
+                let block = if let Some(block) = previous
+                    && c.memory
+                        .matches_direct_words(
+                            nixe_memory::GuestVirtualAddress::new(address),
+                            &block.words,
+                        )
+                        .map_err(|e| e.to_string())?
+                {
+                    #[cfg(feature = "execution-trace")]
+                    {
+                        self.capture_counts[2] += bytes;
+                        self.capture_counts[3] += 1;
+                    }
+                    Arc::clone(block)
+                } else {
+                    #[cfg(feature = "execution-trace")]
+                    {
+                        self.capture_counts[0] += bytes;
+                    }
+                    let mut words = vec![0; bytes as usize / 8];
+                    c.read_bytes(address, bytemuck::cast_slice_mut(&mut words))?;
+                    let block = Arc::new(CommandBlock::new(words, size & CALLED != 0));
+                    // Bound retained guest recordings even for queues that never present.
+                    if self.retained_bytes + bytes > 32 << 20 || self.blocks.len() >= 4096 {
+                        self.blocks.clear();
+                        self.retained_bytes = 0;
+                    }
+                    if bytes <= 32 << 20 && self.blocks.insert(key, block.clone()).is_none() {
+                        self.retained_bytes += bytes;
+                    }
+                    block
+                };
+                if let Some(offsets) = &block.called_offsets {
+                    for &index in offsets {
+                        let i = index as usize;
+                        let header = block.words[i];
+                        self.observe_record(
+                            c,
+                            record_tag(header),
+                            &block.words[i + 1..i + 1 + record_words(header)],
+                            &mut batch.captures,
+                        )?;
+                    }
+                } else {
+                    self.observe(c, &block.words, &mut batch.captures)?;
+                }
+                batch.retained_bytes += bytes as usize;
+                batch.blocks.push(block);
             }
             if size & END != 0 {
                 return Ok(());
@@ -224,73 +367,89 @@ impl Capture {
         captures: &mut Vec<BindingRun>,
     ) -> Result<()> {
         while let Some((&header, tail)) = words.split_first() {
-            let n = (header >> 32) as usize;
-            let (w, next) = tail
-                .split_at_checked(n)
-                .ok_or("truncated NVN command record")?;
-            words = next;
-            let op = header as u32;
-            match op {
-                op::SAMPLER_POOL | op::TEXTURE_POOL if n == 2 => {
-                    let pool = if op == op::SAMPLER_POOL {
-                        &mut self.sampler_pool
-                    } else {
-                        &mut self.texture_pool
-                    };
-                    let next = DescriptorPool::new(w[0], w[1] as u32);
-                    if (pool.base, pool.count) != (next.base, next.count) {
-                        *pool = next;
-                        for bindings in &mut self.bindings {
-                            bindings.pool_changed();
-                        }
+            let n = record_words(header);
+            let w = tail.get(..n).ok_or("truncated NVN command record")?;
+            let skip = (header >> 32) as usize;
+            words = if skip == 0 {
+                &[]
+            } else {
+                words
+                    .get(skip..)
+                    .filter(|v| !v.is_empty() && skip > n)
+                    .ok_or("invalid NVN capture offset")?
+            };
+            self.observe_record(c, record_tag(header), w, captures)?;
+        }
+        Ok(())
+    }
+    fn observe_record(
+        &mut self,
+        c: &Call,
+        op: u32,
+        w: &[u64],
+        captures: &mut Vec<BindingRun>,
+    ) -> Result<()> {
+        #[cfg(feature = "execution-trace")]
+        {
+            self.capture_counts[1] += 1;
+        }
+        let n = w.len();
+        match op {
+            op::SAMPLER_POOL | op::TEXTURE_POOL if n == 2 => {
+                let pool = if op == op::SAMPLER_POOL {
+                    &mut self.sampler_pool
+                } else {
+                    &mut self.texture_pool
+                };
+                let next = DescriptorPool::new(w[0], w[1] as u32);
+                if (pool.base, pool.count) != (next.base, next.count) {
+                    *pool = next;
+                    for bindings in &mut self.bindings {
+                        bindings.pool_changed();
                     }
                 }
-                op::DEFERRED if n == 4 => {
-                    let stage = w[0] as u32;
-                    let first = w[1] as u32;
-                    for i in 0..w[2] as u32 {
-                        let handle = c.read(w[3] + 8 * u64::from(i))?;
-                        self.bindings[usize::from(stage == 5)].bind_texture(
-                            stage,
-                            first + i,
-                            handle,
-                        );
-                    }
-                }
-                op::TEXTURE if n == 2 => {
-                    let stage = w[0] as u32;
-                    self.bindings[usize::from(stage == 5)].bind_texture(
-                        stage,
-                        (w[0] >> 32) as u32,
-                        w[1],
-                    );
-                }
-                op::PROGRAM if n >= 1 && (n - 1).is_multiple_of(size_of::<Shader>() / 8) => {
-                    select_stages(&mut self.shaders, w);
-                    self.bindings[0]
-                        .select_shaders(self.shaders.iter().copied().filter(|s| s.stage != 5));
-                    self.bindings[1]
-                        .select_shaders(self.shaders.iter().copied().filter(|s| s.stage == 5));
-                }
-                op::DRAW | op::INDEXED | op::DISPATCH => {
-                    let current = self.bindings[usize::from(op == op::DISPATCH)].snapshot(
-                        c,
-                        self.texture_pool,
-                        self.sampler_pool,
-                    )?;
-                    if let Some(last) = captures.last_mut()
-                        && current.same_selection(&last.bindings)
-                    {
-                        last.uses += 1;
-                    } else {
-                        captures.push(BindingRun {
-                            bindings: current.clone(),
-                            uses: 1,
-                        });
-                    }
-                }
-                _ => {}
             }
+            op::DEFERRED if n == 4 => {
+                let stage = w[0] as u32;
+                let first = w[1] as u32;
+                for i in 0..w[2] as u32 {
+                    let handle = c.read(w[3] + 8 * u64::from(i))?;
+                    self.bindings[usize::from(stage == 5)].bind_texture(stage, first + i, handle);
+                }
+            }
+            op::TEXTURE if n == 2 => {
+                let stage = w[0] as u32;
+                self.bindings[usize::from(stage == 5)].bind_texture(
+                    stage,
+                    (w[0] >> 32) as u32,
+                    w[1],
+                );
+            }
+            op::PROGRAM if n >= 1 && (n - 1).is_multiple_of(size_of::<Shader>() / 8) => {
+                select_stages(&mut self.shaders, w);
+                self.bindings[0]
+                    .select_shaders(self.shaders.iter().copied().filter(|s| s.stage != 5));
+                self.bindings[1]
+                    .select_shaders(self.shaders.iter().copied().filter(|s| s.stage == 5));
+            }
+            op::DRAW | op::INDEXED | op::DISPATCH => {
+                let current = self.bindings[usize::from(op == op::DISPATCH)].snapshot(
+                    c,
+                    self.texture_pool,
+                    self.sampler_pool,
+                )?;
+                if let Some(last) = captures.last_mut()
+                    && current.same_selection(&last.bindings)
+                {
+                    last.uses += 1;
+                } else {
+                    captures.push(BindingRun {
+                        bindings: current.clone(),
+                        uses: 1,
+                    });
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -314,10 +473,9 @@ pub struct CommandState {
     buffers: [bindings::BufferState; 2],
     flip_y: bool,
     pipeline: Arc<DrawPipeline>,
-    depth_range: Option<[f32; 2]>,
+    viewports: [Viewport; 16],
     blend_color: [f32; 4],
-    viewport: [i32; 4],
-    scissor: [i32; 4],
+
     shaders: SmallVec<[Shader; 2]>,
     vertices: Vec<(u32, Range)>,
 }
@@ -328,6 +486,7 @@ impl CommandState {
                 upper_left: submission.upper_left,
                 minus_one_to_one: submission.minus_one_to_one,
                 samples: 1,
+                viewport_count: 1,
                 ..Default::default()
             }),
             ..Default::default()
@@ -341,6 +500,23 @@ impl CommandState {
         } = record;
         let n = w.len();
         match op {
+            op::CLEAR_IMAGE if n == size_of::<Texture>() / 8 + 6 => {
+                let (texture, tail) = w.split_at(size_of::<Texture>() / 8);
+                return Ok(Some(Operation::ClearImage {
+                    texture: bytemuck::pod_read_unaligned(bytemuck::cast_slice(texture)),
+                    region: bytemuck::cast([tail[0], tail[1], tail[2]]),
+                    color: bytemuck::cast([tail[3], tail[4]]),
+                    mask: tail[5] as u32,
+                }));
+            }
+            op::COPY_IMAGES if n == 2 * size_of::<Texture>() / 8 + 7 => {
+                let (textures, tail) = w.split_at(2 * size_of::<Texture>() / 8);
+                return Ok(Some(Operation::CopyImages {
+                    textures: bytemuck::pod_read_unaligned(bytemuck::cast_slice(textures)),
+                    regions: bytemuck::pod_read_unaligned(bytemuck::cast_slice(&tail[..6])),
+                    flags: tail[6] as u32,
+                }));
+            }
             op::COPY_TEXTURE if n == 5 + size_of::<Texture>() / 8 => {
                 let end = n - 3;
                 let target = bytemuck::pod_read_unaligned(bytemuck::cast_slice(&w[2..end]));
@@ -473,28 +649,54 @@ impl CommandState {
                     }
                 }
             }
-            op::DEPTH_RANGE if n == 1 => self.depth_range = Some(bytemuck::cast(w[0])),
+            op::CONSERVATIVE if n == 1 => self.raster.conservative_raster = w[0] as u8 != 0,
+            op::DEPTH_RANGE if n == 1 => self.viewports[0].depth = bytemuck::cast(w[0]),
+            op::VIEWPORTS | op::SCISSORS | op::DEPTH_RANGES if n >= 1 => {
+                let stride = if op == op::DEPTH_RANGES { 1 } else { 2 };
+                let first = w[0] as usize;
+                let count = (n - 1) / stride;
+                let end = first
+                    .checked_add(count)
+                    .filter(|&end| end <= 16 && (n - 1).is_multiple_of(stride))
+                    .ok_or("invalid viewport range")?;
+                if end > usize::from(self.pipeline.viewport_count) {
+                    Arc::make_mut(&mut self.pipeline).viewport_count = end as u8;
+                }
+                for (viewport, words) in self.viewports[first..end]
+                    .iter_mut()
+                    .zip(w[1..].chunks_exact(stride))
+                {
+                    match op {
+                        op::VIEWPORTS => viewport.rect = bytemuck::cast([words[0], words[1]]),
+                        op::SCISSORS => viewport.scissor = bytemuck::cast([words[0], words[1]]),
+                        _ => viewport.depth = bytemuck::cast(words[0]),
+                    }
+                }
+            }
             op::SWIZZLES if n == 1 => self.flip_y = w[0] != 0,
             op::BLEND_COLOR if n == 2 => self.blend_color = bytemuck::cast([w[0], w[1]]),
             op::CLEAR_DEPTH if n == 4 => {
                 if let Some(target) = self.attachments.depth {
                     return Ok(Some(Operation::ClearDepth {
                         target,
-                        scissor: self.scissor,
+                        scissor: self.viewports[0].scissor,
                         depth: (w[1] != 0).then(|| f32::from_bits(w[0] as u32)),
                         stencil: w[2] as u8,
                         mask: w[3] as u8,
                     }));
                 }
             }
-            op::VIEWPORT if n == 4 => self.viewport = std::array::from_fn(|i| w[i] as i32),
-            op::SCISSOR if n == 4 => self.scissor = std::array::from_fn(|i| w[i] as i32),
+            op::VIEWPORT if n == 2 => {
+                self.viewports[0].rect =
+                    bytemuck::cast::<_, [i32; 4]>([w[0], w[1]]).map(|v| v as f32)
+            }
+            op::SCISSOR if n == 2 => self.viewports[0].scissor = bytemuck::cast([w[0], w[1]]),
             op::BARRIER if n == 1 => return Ok(Some(Operation::Barrier(w[0] as u32))),
             op::CLEAR if n == 4 && w[0] < 8 => {
                 if let Some(&Some(target)) = self.attachments.colors.get(w[0] as usize) {
                     return Ok(Some(Operation::Clear {
                         target,
-                        scissor: self.scissor,
+                        scissor: self.viewports[0].scissor,
                         color: bytemuck::cast([w[1], w[2]]),
                         mask: w[3] as u32,
                     }));
@@ -539,15 +741,15 @@ impl CommandState {
                     None => self.vertices.push(item),
                 }
             }
-            op::UNIFORM | op::STORAGE if n == 4 => {
+            op::UNIFORM | op::STORAGE if n == 3 => {
                 let stage = w[0] as u32;
                 self.buffers[usize::from(stage == 5)].bind(
                     op == op::STORAGE,
                     stage,
-                    w[1] as u32,
+                    (w[0] >> 32) as u32,
                     Range {
-                        address: w[2],
-                        size: w[3],
+                        address: w[1],
+                        size: w[2],
                     },
                 );
             }
@@ -555,7 +757,7 @@ impl CommandState {
             op::TEXTURE if n == 2 => {}
             op::DEFERRED if n == 4 => {}
             op::DRAW | op::INDEXED
-                if (op == op::DRAW && n == 5) || (op == op::INDEXED && n == 7) =>
+                if (op == op::DRAW && n == 3) || (op == op::INDEXED && n == 4) =>
             {
                 let bindings = Bindings {
                     textures: bindings.unwrap(),
@@ -579,17 +781,16 @@ impl CommandState {
                     dynamic: self.dynamic,
                     bindings,
                     flip_y: self.flip_y ^ self.pipeline.upper_left,
-                    depth_range: self.depth_range.unwrap_or([0., 1.]),
+                    viewports: &self.viewports[..usize::from(self.pipeline.viewport_count)],
                     blend_color: self.blend_color,
-                    indices: (op == op::INDEXED).then(|| (w[1] as u32, w[3], w[4] as i32)),
-                    viewport: self.viewport,
-                    scissor: self.scissor,
+                    indices: (op == op::INDEXED)
+                        .then(|| ((w[0] >> 32) as u32, w[2], (w[1] >> 32) as i32)),
                     vertices: &self.vertices,
 
-                    first: w[1] as u32,
-                    count: w[2] as u32,
-                    first_instance: w[n - 2] as u32,
-                    instances: w[n - 1] as u32,
+                    first: (w[0] >> 32) as u32,
+                    count: w[1] as u32,
+                    first_instance: w[n - 1] as u32,
+                    instances: (w[n - 1] >> 32) as u32,
                 })));
             }
             _ => {
@@ -604,6 +805,42 @@ impl CommandState {
 mod tests {
     use super::*;
     use nixe_memory::{AddressWidth, GuestVirtualAddress, Machine, MemoryPermissions, PAGE_SIZE};
+
+    #[test]
+    fn called_ranges_follow_current_record_boundaries_and_stop_at_the_cut() {
+        let h = |tag, n: u32| u64::from(tag | (n << 8));
+        // A different recording now occupies this called range. Its stored
+        // capture links describe a different control list.
+        let block = CommandBlock::new(
+            vec![
+                h(op::BARRIER, 1),
+                0,
+                h(op::TEXTURE, 2),
+                0,
+                4,
+                h(op::DRAW, 3),
+                1,
+                3,
+                1 << 32,
+                h(op::TARGETS, 24),
+                0,
+            ],
+            true,
+        );
+        assert_eq!(block.called_offsets.as_deref(), Some(&[2, 5][..]));
+        assert_eq!(block.end, 9);
+        let empty = CommandBlock::new(vec![h(op::TARGETS, 24)], true);
+        assert_eq!(empty.end, 0);
+        let mut submission = Submission::default();
+        submission.blocks.push(Arc::new(empty));
+        submission.blocks.push(Arc::new(CommandBlock::new(
+            vec![h(op::BARRIER, 1), 1],
+            false,
+        )));
+        let mut records = submission.records();
+        assert_eq!(records.next().unwrap().unwrap().tag, op::BARRIER);
+        assert!(records.next().is_none());
+    }
 
     #[test]
     fn queued_commands_own_guest_bytes_and_apply_buffer_state_in_draw_order() {
@@ -630,28 +867,23 @@ mod tests {
             args: [0; 8],
             pending: Default::default(),
         };
-        let header = |tag, n: u64| u64::from(tag) | n << 32;
+        let header = |tag, n: u64, skip: u64| u64::from(tag) | n << 8 | skip << 32;
         let mut capture = Capture::default();
         let mut first = Submission::new(true, false);
         let mut second = Submission::new(true, false);
         let mut recording = [
-            header(op::UNIFORM, 4),
+            header(op::UNIFORM, 3, 4),
             1,
-            0,
             0x6000,
             128,
-            header(op::DRAW, 5),
+            header(op::DRAW, 3, 4),
             4,
-            0,
             3,
-            0,
-            1,
-            header(op::DRAW, 5),
+            1u64 << 32,
+            header(op::DRAW, 3, 0),
             4,
-            0,
             6,
-            0,
-            1,
+            1u64 << 32,
         ];
         call.write(
             0x1000,
@@ -663,17 +895,26 @@ mod tests {
         .unwrap();
         call.write(0x1100, &recording).unwrap();
         capture.list(&call, 0x1000, &mut first).unwrap();
-        recording[3] = 0x7000;
+        let mut repeated = Submission::default();
+        capture.list(&call, 0x1000, &mut repeated).unwrap();
+        assert!(Arc::ptr_eq(&first.blocks[0], &repeated.blocks[0]));
+        recording[2] = 0x7000;
         call.write(0x1100, &recording).unwrap();
         capture.list(&call, 0x1000, &mut second).unwrap();
         call.write(0x1100, &[0u64; 17]).unwrap();
         let mut state = CommandState::new(&first);
         for (submission, address) in [(&first, 0x6000), (&second, 0x7000)] {
             let mut records = submission.records();
-            assert!(state.apply(records.next().unwrap()).unwrap().is_none());
+            assert!(
+                state
+                    .apply(records.next().unwrap().unwrap())
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(submission.captures.len(), 1);
             for count in [3, 6] {
-                let Some(Operation::Draw(draw)) = state.apply(records.next().unwrap()).unwrap()
+                let Some(Operation::Draw(draw)) =
+                    state.apply(records.next().unwrap().unwrap()).unwrap()
                 else {
                     panic!("expected a draw")
                 };

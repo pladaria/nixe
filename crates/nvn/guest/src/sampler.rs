@@ -94,3 +94,8 @@ pub fn get_border(c: &Call) -> Result<u64> {
     c.write(c.args[1], &read(c)?.border)?;
     Ok(0)
 }
+
+pub fn finalize(c: &Call) -> Result<u64> {
+    c.write(c.args[0], &Sampler::default())?;
+    Ok(0)
+}

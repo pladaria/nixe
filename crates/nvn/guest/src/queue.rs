@@ -68,3 +68,18 @@ fn set_size(c: &Call, offset: u64) -> Result<u64> {
     c.write(c.args[0] + offset, &c.args[1])?;
     Ok(0)
 }
+
+pub fn interval(c: &Call) -> Result<u64> {
+    c.write(c.args[0], &(c.args[1] as u32))?;
+    Ok(0)
+}
+pub fn get_interval(c: &Call) -> Result<u64> {
+    Ok(c.read::<u32>(c.args[0])?.into())
+}
+pub fn crop(c: &Call) -> Result<u64> {
+    c.write(
+        c.args[0] + 4,
+        &core::array::from_fn::<_, 4, _>(|i| c.args[i + 1] as i32),
+    )?;
+    Ok(0)
+}

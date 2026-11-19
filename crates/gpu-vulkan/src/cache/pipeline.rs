@@ -96,6 +96,7 @@ struct Compiler {
     triangle_fans: bool,
     primitive_restart: [bool; 2],
     fill_rectangle: bool,
+    conservative_raster: bool,
     vertex_divisor: bool,
     vertex_zero_divisor: bool,
     max_vertex_divisor: u32,
@@ -198,6 +199,7 @@ impl PipelineCompiler {
                 formats: device.profile().formats,
                 dynamic: dynamic.into_boxed_slice(),
                 fill_rectangle: device.profile().fill_rectangle,
+                conservative_raster: device.profile().conservative_raster,
                 vertex_divisor: device.profile().dynamic_state.vertex_divisor,
                 vertex_zero_divisor: device.profile().dynamic_state.vertex_zero_divisor,
                 max_vertex_divisor: device.profile().dynamic_state.max_vertex_divisor,
@@ -220,7 +222,14 @@ impl PipelineCompiler {
         self.compiler.normalize(state)
     }
     pub fn request(&self, recipe: PipelineRecipe) -> Result<NativePipeline, CompileError> {
-        let pipeline = self.prepare(recipe)?;
+        self.request_with_layout(recipe, false)
+    }
+    pub(crate) fn request_with_layout(
+        &self,
+        recipe: PipelineRecipe,
+        guest_layout: bool,
+    ) -> Result<NativePipeline, CompileError> {
+        let pipeline = self.prepare(recipe, guest_layout)?;
         let compiler = Arc::clone(&self.compiler);
         let building = pipeline.clone();
         self.pool
@@ -232,12 +241,16 @@ impl PipelineCompiler {
         recipe: PipelineRecipe,
         worker: usize,
     ) -> Result<NativePipeline, CompileError> {
-        let pipeline = self.prepare(recipe)?;
+        let pipeline = self.prepare(recipe, false)?;
         Self::finish(&self.compiler, &pipeline, worker);
         pipeline.handle().map_err(|e| (*e).clone())?;
         Ok(pipeline)
     }
-    fn prepare(&self, recipe: PipelineRecipe) -> Result<NativePipeline, CompileError> {
+    fn prepare(
+        &self,
+        recipe: PipelineRecipe,
+        guest_layout: bool,
+    ) -> Result<NativePipeline, CompileError> {
         let (shader, state) = match recipe {
             PipelineRecipe::Compute(shader) => (shader, None),
             PipelineRecipe::Graphics { shader, state } => (shader, Some(state)),
@@ -253,7 +266,7 @@ impl PipelineCompiler {
             vk::PipelineBindPoint::COMPUTE
         };
         let key = LayoutKey::reflect(&shader)?;
-        let layout = if shader.stages.iter().all(|stage| stage.guest.is_some()) {
+        let layout = if guest_layout || shader.stages.iter().all(|stage| stage.guest.is_some()) {
             self.compiler.layouts.create_guest(key, bind_point)?
         } else {
             self.compiler.layouts.create(key)?
@@ -547,6 +560,11 @@ impl Compiler {
                     .into(),
                 ));
             }
+        }
+        if s.conservative_raster && !self.conservative_raster {
+            return Err(CompileError::Failed(
+                "conservative rasterization requires VK_EXT_conservative_rasterization".into(),
+            ));
         }
         if s.polygon == vk::PolygonMode::FILL_RECTANGLE_NV && !self.fill_rectangle {
             return Err(CompileError::Failed(

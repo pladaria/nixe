@@ -32,5 +32,5 @@ nixe-video.workspace = true
 nixe-video-winit.workspace = true
 
 [features]
-execution-trace = ["nixe-memory/execution-trace"]
+execution-trace = ["nixe-gpu-vulkan/execution-trace"]
 performance-counters = ["nixe-scheduler/performance-counters", "nixe-gpu-vulkan/performance-counters", "nixe-gpu/performance-counters", "nixe-horizon/performance-counters", "nixe-cpu-jit/performance-counters", "nixe-audio/performance-counters", "nixe-video-winit/performance-counters"]

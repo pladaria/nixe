@@ -14,6 +14,7 @@ pub trait ShaderValidity: Send + Sync + Debug {
 pub struct StageSource {
     pub shader: Shader,
     pub bytes: Arc<[u8]>,
+    pub code_digest: [u8; 32],
     pub version: Arc<dyn ShaderValidity>,
 }
 

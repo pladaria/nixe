@@ -139,3 +139,7 @@ pub fn finalize(c: &Call) -> Result<u64> {
     c.write(c.args[0], &Texture::default())?;
     Ok(0)
 }
+
+pub fn get_depth(c: &Call) -> Result<u64> {
+    Ok(c.read::<Texture>(c.args[0])?.depth.into())
+}

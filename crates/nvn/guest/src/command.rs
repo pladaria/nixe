@@ -20,7 +20,7 @@ struct Recorder {
     begin: u64,
     first: u64,
     last: u64,
-    reserved: u64,
+    capture_anchor: u64,
     device: u64,
     callback: u64,
     callback_data: u64,
@@ -64,7 +64,8 @@ impl Recorder {
     fn close_range(&mut self, c: &Call) -> Result<()> {
         if self.position > self.begin {
             self.entry(c, self.begin, self.position - self.begin)?;
-            self.begin = self.position
+            self.begin = self.position;
+            self.capture_anchor = self.position;
         }
         Ok(())
     }
@@ -115,6 +116,7 @@ pub fn add_commands(c: &Call) -> Result<u64> {
     r.command = p.cpu + c.args[2];
     r.position = r.command;
     r.begin = r.position;
+    r.capture_anchor = r.position;
     r.limit = r.command + c.args[3].min(remaining);
     c.write(c.args[0], &r)?;
     Ok(0)
@@ -149,6 +151,7 @@ pub fn begin(c: &Call) -> Result<u64> {
     }
     r.recording = 1;
     r.begin = r.position;
+    r.capture_anchor = r.position;
     r.first = 0;
     r.last = 0;
     c.write(c.args[0], &r)?;
@@ -176,17 +179,17 @@ fn append_commands<const COPY: bool>(c: &Call) -> Result<u64> {
                 cursor = address;
                 continue;
             }
-            let bytes = size & !END;
+            let bytes = size & !(END | CALLED);
             if bytes != 0 {
                 if COPY {
-                    r.copy_range(c, address, bytes)?;
+                    r.copy_range(c, address, bytes, size & CALLED != 0)?;
                 } else {
                     if r.position > r.begin {
                         r.ensure_control(c)?;
                         r.close_range(c)?;
                     }
                     r.ensure_control(c)?;
-                    r.entry(c, address, bytes)?;
+                    r.entry(c, address, bytes | CALLED)?;
                 }
             }
             if size & END != 0 {
@@ -220,37 +223,58 @@ impl Recorder {
         }
         Ok(())
     }
-    fn copy_range(&mut self, c: &Call, mut source: u64, mut bytes: u64) -> Result<()> {
+    fn copy_range(
+        &mut self,
+        c: &Call,
+        mut source: u64,
+        mut bytes: u64,
+        called: bool,
+    ) -> Result<()> {
+        if !called && bytes <= self.limit - self.position {
+            // A complete source range already contains its submit offsets.
+            if self.position != self.begin {
+                self.ensure_control(c)?;
+                self.close_range(c)?;
+            }
+            self.ensure_control(c)?;
+            unsafe {
+                core::ptr::copy(
+                    source as *const u8,
+                    self.position as *mut u8,
+                    bytes as usize,
+                )
+            };
+            self.position += bytes;
+            return self.close_range(c);
+        }
+        // A callback may split this range at a different record boundary.
+        // Rebuild its links in the destination and keep each record indivisible.
         while bytes != 0 {
-            let available = self.limit - self.position;
-            let mut n = bytes;
-            if n > available {
-                n = 0;
-                while n < bytes {
-                    let header: u64 = c.read(source + n)?;
-                    let record = ((header >> 32) + 1) * 8;
-                    if record > bytes - n {
-                        return Err("truncated copied command");
-                    }
-                    if record > available - n {
-                        if n == 0 {
-                            self.refill_now(c, 0, record)?;
-                            if self.limit - self.position < record {
-                                return Err("insufficient command memory after refill");
-                            }
-                        }
-                        break;
-                    }
-                    n += record;
+            let header: u64 = c.read(source)?;
+            let size = (record_words(header) as u64 + 1) * 8;
+            if size > bytes {
+                if called {
+                    break;
+                }
+                return Err("truncated copied command");
+            }
+            if size > self.limit - self.position {
+                self.refill_now(c, 0, size)?;
+                if size > self.limit - self.position {
+                    return Err("insufficient command memory after refill");
                 }
             }
-            if n == 0 {
-                continue;
+            unsafe {
+                core::ptr::copy(source as *const u8, self.position as *mut u8, size as usize)
+            };
+            c.write(self.position + 4, &0u32)?;
+            if needs_capture(record_tag(header)) {
+                link_capture(c, self.position, self.capture_anchor)?;
+                self.capture_anchor = self.position;
             }
-            unsafe { core::ptr::copy(source as *const u8, self.position as *mut u8, n as usize) };
-            self.position += n;
-            source += n;
-            bytes -= n;
+            self.position += size;
+            source += size;
+            bytes -= size;
         }
         Ok(())
     }
@@ -273,6 +297,15 @@ pub fn end(c: &Call) -> Result<u64> {
     c.write(c.args[0], &r)?;
     Ok(r.first)
 }
+#[inline(always)]
+fn link_capture(c: &Call, position: u64, anchor: u64) -> Result<()> {
+    if anchor != position {
+        let words =
+            u32::try_from((position - anchor) / 8).map_err(|_| "command range too large")?;
+        c.write(anchor + 4, &words)?;
+    }
+    Ok(())
+}
 fn reserve(c: &Call, op: u32, words: usize) -> Result<Option<u64>> {
     let object = c.args[0];
     let position: u64 = c.read(object)?;
@@ -285,7 +318,12 @@ fn reserve(c: &Call, op: u32, words: usize) -> Result<Option<u64>> {
         c.read::<Recorder>(object)?.request(c, 0, bytes)?;
         return Ok(None);
     }
-    c.write(position, &(u64::from(op) | ((words as u64) << 32)))?;
+    if needs_capture(op) {
+        let field = object + core::mem::offset_of!(Recorder, capture_anchor) as u64;
+        link_capture(c, position, c.read(field)?)?;
+        c.write(field, &position)?;
+    }
+    c.write(position, &(u64::from(op) | ((words as u64) << 8)))?;
     c.write(object, &(position + bytes))?;
     Ok(Some(position + 8))
 }
@@ -329,15 +367,40 @@ pub fn program(c: &Call) -> Result<u64> {
     }
     Ok(0)
 }
-simple!(scissor, SCISSOR, 4);
-simple!(viewport, VIEWPORT, 4);
+fn pair(low: u64, high: u64) -> u64 {
+    u64::from(low as u32) | (high << 32)
+}
+macro_rules! rectangle {
+    ($name:ident,$tag:ident) => {
+        pub fn $name(c: &Call) -> Result<u64> {
+            record(
+                c,
+                op::$tag,
+                &[pair(c.args[1], c.args[2]), pair(c.args[3], c.args[4])],
+            )
+        }
+    };
+}
+rectangle!(scissor, SCISSOR);
+rectangle!(viewport, VIEWPORT);
+macro_rules! buffer_binding {
+    ($name:ident,$tag:ident) => {
+        pub fn $name(c: &Call) -> Result<u64> {
+            record(
+                c,
+                op::$tag,
+                &[pair(c.args[1], c.args[2]), c.args[3], c.args[4]],
+            )
+        }
+    };
+}
 simple!(barrier, BARRIER, 1);
 simple!(vertex, VERTEX, 3);
-simple!(uniform, UNIFORM, 4);
+buffer_binding!(uniform, UNIFORM);
 simple!(dispatch, DISPATCH, 3);
 simple!(deferred, DEFERRED, 4);
 simple!(report, REPORT, 2);
-simple!(storage, STORAGE, 4);
+buffer_binding!(storage, STORAGE);
 simple!(condition, CONDITION, 2);
 pub fn enable_render(c: &Call) -> Result<u64> {
     record(
@@ -367,24 +430,43 @@ pub fn update(c: &Call) -> Result<u64> {
     }
     Ok(0)
 }
-simple!(indexed_instances, INDEXED, 7);
-simple!(draw_instances, DRAW, 5);
-pub fn elements(c: &Call) -> Result<u64> {
+fn indexed_draw(c: &Call, base: u64, first: u64, instances: u64) -> Result<u64> {
     record(
         c,
         op::INDEXED,
-        &[c.args[1], c.args[2], c.args[3], c.args[4], 0, 0, 1],
+        &[
+            pair(c.args[1], c.args[2]),
+            pair(c.args[3], base),
+            c.args[4],
+            pair(first, instances),
+        ],
     )
+}
+pub fn indexed_instances(c: &Call) -> Result<u64> {
+    indexed_draw(c, c.args[5], c.args[6], c.args[7])
+}
+pub fn elements(c: &Call) -> Result<u64> {
+    indexed_draw(c, 0, 0, 1)
 }
 pub fn indexed(c: &Call) -> Result<u64> {
+    indexed_draw(c, c.args[5], 0, 1)
+}
+fn array_draw(c: &Call, first: u64, instances: u64) -> Result<u64> {
     record(
         c,
-        op::INDEXED,
-        &[c.args[1], c.args[2], c.args[3], c.args[4], c.args[5], 0, 1],
+        op::DRAW,
+        &[
+            pair(c.args[1], c.args[2]),
+            u64::from(c.args[3] as u32),
+            pair(first, instances),
+        ],
     )
 }
+pub fn draw_instances(c: &Call) -> Result<u64> {
+    array_draw(c, c.args[4], c.args[5])
+}
 pub fn draw(c: &Call) -> Result<u64> {
-    record(c, op::DRAW, &[c.args[1], c.args[2], c.args[3], 0, 1])
+    array_draw(c, 0, 1)
 }
 macro_rules! bind_state {
     ($fn:ident,$tag:ident,$ty:ty) => {
@@ -457,10 +539,23 @@ pub fn swizzles(c: &Call) -> Result<u64> {
     record(c, op::SWIZZLES, &[flip.into()])
 }
 pub fn texture(c: &Call) -> Result<u64> {
+    bind_handle(c, c.args[2] as u32)
+}
+pub fn image(c: &Call) -> Result<u64> {
+    let slot = c.args[2] as u32;
+    if slot >= IMAGE_HANDLE_SLOTS {
+        return Err("invalid storage image slot");
+    }
+    bind_handle(c, IMAGE_HANDLE_BASE_SLOT + slot)
+}
+fn bind_handle(c: &Call, row: u32) -> Result<u64> {
     record(
         c,
         op::TEXTURE,
-        &[(c.args[1] as u32 as u64) | (c.args[2] << 32), c.args[3]],
+        &[
+            u64::from(c.args[1] as u32) | (u64::from(row) << 32),
+            c.args[3],
+        ],
     )
 }
 pub fn targets(c: &Call) -> Result<u64> {
@@ -521,4 +616,61 @@ pub fn attributes(c: &Call) -> Result<u64> {
 }
 pub fn streams(c: &Call) -> Result<u64> {
     array(c, op::STREAMS, 8)
+}
+
+// Record pointed-to values now, as the original SDK does when emitting methods.
+fn viewport_array(c: &Call, tag: u32, stride: usize) -> Result<u64> {
+    let first = c.args[1] as u32;
+    let count = c.args[2] as u32;
+    if first > 16 || count > 16 - first {
+        return Err("invalid viewport array range");
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    let words = count as usize * stride;
+    if let Some(dst) = reserve(c, tag, 1 + words)? {
+        c.write(dst, &u64::from(first))?;
+        let src = c.args[3] as *const u8;
+        unsafe {
+            core::ptr::copy(src, (dst + 8) as *mut u8, words * 8);
+        }
+    }
+    Ok(0)
+}
+pub fn viewports(c: &Call) -> Result<u64> {
+    viewport_array(c, op::VIEWPORTS, 2)
+}
+pub fn scissors(c: &Call) -> Result<u64> {
+    viewport_array(c, op::SCISSORS, 2)
+}
+pub fn depth_ranges(c: &Call) -> Result<u64> {
+    viewport_array(c, op::DEPTH_RANGES, 1)
+}
+simple!(conservative, CONSERVATIVE, 1);
+pub fn clear_texture(c: &Call) -> Result<u64> {
+    let texture = texels::view(c, c.args[1], c.args[2])?;
+    let region: [u32; 6] = c.read(c.args[3])?;
+    let color: [u32; 4] = c.read(c.args[4])?;
+    if let Some(dst) = reserve(c, op::CLEAR_IMAGE, size_of::<Texture>() / 8 + 6)? {
+        c.write(dst, &texture)?;
+        let tail = dst + size_of::<Texture>() as u64;
+        c.write(tail, &region)?;
+        c.write(tail + 24, &color)?;
+        c.write(tail + 40, &c.args[5])?;
+    }
+    Ok(0)
+}
+pub fn copy_images(c: &Call) -> Result<u64> {
+    let source = texels::view(c, c.args[1], c.args[2])?;
+    let target = texels::view(c, c.args[4], c.args[5])?;
+    let source_region: [u32; 6] = c.read(c.args[3])?;
+    let target_region: [u32; 6] = c.read(c.args[6])?;
+    if let Some(dst) = reserve(c, op::COPY_IMAGES, 2 * size_of::<Texture>() / 8 + 7)? {
+        c.write(dst, &[source, target])?;
+        let tail = dst + 2 * size_of::<Texture>() as u64;
+        c.write(tail, &[source_region, target_region])?;
+        c.write(tail + 48, &c.args[7])?;
+    }
+    Ok(0)
 }

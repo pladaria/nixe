@@ -1,6 +1,8 @@
 use super::*;
 
 pub(super) fn apply(state: &mut GraphicsState, d: &nixe_nvn::Draw) -> Result<(), VulkanError> {
+    state.conservative_raster = d.raster.conservative_raster;
+    state.viewport_count = u32::from(d.viewport_count);
     let r = d.raster;
     for (slot, (_, blend)) in Arc::make_mut(&mut state.colors).iter_mut().enumerate() {
         let [_, sr, dr, sa, da, er, ea, _] = r.blend[slot];

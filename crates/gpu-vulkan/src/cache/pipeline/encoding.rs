@@ -19,7 +19,7 @@ impl Reader<'_> {
             _ => None,
         }
     }
-    fn list<T>(
+    pub(crate) fn list<T>(
         &mut self,
         limit: usize,
         mut read: impl FnMut(&mut Self) -> Option<T>,
@@ -97,7 +97,7 @@ impl GraphicsState {
             self.cull.as_raw(),
             self.front_face.as_raw() as u32,
             self.depth_clamp as u32,
-            self.raster_discard as u32,
+            u32::from(self.raster_discard) | (u32::from(self.conservative_raster) << 1),
             self.depth_bias as u32,
             self.depth_test as u32,
             self.depth_write as u32,
@@ -161,6 +161,7 @@ impl GraphicsState {
         };
         let front = stencil()?;
         let back = stencil()?;
+        let raster_flags;
         Some(Self {
             vertex_bindings,
             vertex_attributes,
@@ -180,7 +181,14 @@ impl GraphicsState {
             cull: vk::CullModeFlags::from_raw(r.u32()?),
             front_face: vk::FrontFace::from_raw(r.u32()? as i32),
             depth_clamp: r.boolean()?,
-            raster_discard: r.boolean()?,
+            raster_discard: {
+                raster_flags = r.u32()?;
+                if raster_flags & !3 != 0 {
+                    return None;
+                }
+                raster_flags & 1 != 0
+            },
+            conservative_raster: raster_flags & 2 != 0,
             depth_bias: r.boolean()?,
             depth_test: r.boolean()?,
             depth_write: r.boolean()?,
