@@ -4,10 +4,23 @@ pub(super) fn apply(state: &mut GraphicsState, d: &nixe_nvn::Draw) -> Result<(),
     state.conservative_raster = d.raster.conservative_raster;
     state.viewport_count = u32::from(d.viewport_count);
     let r = d.raster;
-    for (slot, (_, blend)) in Arc::make_mut(&mut state.colors).iter_mut().enumerate() {
-        let [_, sr, dr, sa, da, er, ea, _] = r.blend[slot];
+    for (slot, (format, blend)) in Arc::make_mut(&mut state.colors).iter_mut().enumerate() {
+        let [_, sr, dr, sa, da, er, ea, advanced] = r.blend[slot];
         blend.enabled = (r.blend_enable >> slot) & 1 != 0;
         blend.write_mask = vk::ColorComponentFlags::from_raw((r.channel_mask >> (4 * slot)) & 15);
+        if advanced != 0 {
+            if blend.enabled && *format != vk::Format::UNDEFINED {
+                [
+                    blend.src_color,
+                    blend.dst_color,
+                    blend.src_alpha,
+                    blend.dst_alpha,
+                ] = porter_duff_factors(advanced)?;
+                blend.color_op = vk::BlendOp::ADD;
+                blend.alpha_op = vk::BlendOp::ADD;
+            }
+            continue;
+        }
         let factor = |n| {
             Ok(match n {
                 1 => vk::BlendFactor::ZERO,
@@ -43,12 +56,6 @@ pub(super) fn apply(state: &mut GraphicsState, d: &nixe_nvn::Draw) -> Result<(),
         };
         blend.color_op = equation(er)?;
         blend.alpha_op = equation(ea)?;
-        if r.blend[slot][7] != 0 {
-            return Err(error(format!(
-                "unsupported NVN advanced blend mode {}",
-                r.blend[slot][7]
-            )));
-        }
     }
     state.cull = vk::CullModeFlags::from_raw(u32::from(r.polygon[0]));
     // The queue's window origin controls front-face winding independently of viewport swizzles.
@@ -96,4 +103,32 @@ pub(super) fn apply(state: &mut GraphicsState, d: &nixe_nvn::Draw) -> Result<(),
         state.depth_compare = vk::CompareOp::from_raw(i32::from(r.depth[2]) - 1);
     }
     Ok(())
+}
+
+fn porter_duff_factors(mode: u8) -> Result<[vk::BlendFactor; 4], VulkanError> {
+    use vk::BlendFactor as F;
+    // NVN's default premultiplied, uncorrelated Porter-Duff modes use additive
+    // fixed-function blending. Each pair weights source and destination.
+    // https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/nvn_mtl.m#L8861-L8890
+    let (src, dst) = match mode {
+        0x05 => (F::ZERO, F::ZERO),
+        0x06 => (F::ONE, F::ZERO),
+        0x07 => (F::ZERO, F::ONE),
+        0x08 => (F::ONE, F::ONE_MINUS_SRC_ALPHA),
+        0x09 => (F::ONE_MINUS_DST_ALPHA, F::ONE),
+        0x0a => (F::DST_ALPHA, F::ZERO),
+        0x0b => (F::ZERO, F::SRC_ALPHA),
+        0x0c => (F::ONE_MINUS_DST_ALPHA, F::ZERO),
+        0x0d => (F::ZERO, F::ONE_MINUS_SRC_ALPHA),
+        0x0e => (F::DST_ALPHA, F::ONE_MINUS_SRC_ALPHA),
+        0x0f => (F::ONE_MINUS_DST_ALPHA, F::SRC_ALPHA),
+        0x10 => (F::ONE_MINUS_DST_ALPHA, F::ONE_MINUS_SRC_ALPHA),
+        _ => return Err(error(format!("unsupported NVN advanced blend mode {mode}"))),
+    };
+    let (src_alpha, dst_alpha) = match mode {
+        0x0e => (F::ZERO, F::ONE),
+        0x0f => (F::ONE, F::ZERO),
+        _ => (src, dst),
+    };
+    Ok([src, dst, src_alpha, dst_alpha])
 }

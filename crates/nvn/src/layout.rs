@@ -107,8 +107,27 @@ impl Texture {
         }
         .max(1)
     }
+    pub fn view_extent(&self) -> [u32; 2] {
+        let w = (self.width >> self.first_level).max(1);
+        let h = if matches!(self.target, 0 | 3 | 10) {
+            1
+        } else {
+            (self.height >> self.first_level).max(1)
+        };
+        if self.block_view == 0 {
+            return [w, h];
+        }
+        [
+            w.div_ceil(u32::from(self.block_view & 15) + 1),
+            h.div_ceil(u32::from(self.block_view >> 4) + 1),
+        ]
+    }
     pub fn layout(&self) -> core::result::Result<Layout, &'static str> {
-        let (bpp, bw, bh) = self.block()?;
+        let (bpp, mut bw, mut bh) = self.block()?;
+        if self.block_view != 0 {
+            bw = u32::from(self.block_view & 15) + 1;
+            bh = u32::from(self.block_view >> 4) + 1;
+        }
         if self.width == 0
             || self.width > 1 << 27
             || self.height > 65536

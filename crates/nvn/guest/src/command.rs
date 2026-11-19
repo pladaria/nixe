@@ -88,7 +88,7 @@ macro_rules! recorder_field {
 recorder_field!(memory_callback, callback, |c: &Call| c.args[1]);
 recorder_field!(callback_data, callback_data, |c: &Call| c.args[1]);
 recorder_field!(callback_enabled, callback_enabled, |c: &Call| u8::from(
-    c.args[1] as u32 != 0
+    c.args[1] as u8 != 0
 ));
 pub fn command_used(c: &Call) -> Result<u64> {
     let r: Recorder = c.read(c.args[0])?;
@@ -400,6 +400,12 @@ buffer_binding!(uniform, UNIFORM);
 simple!(dispatch, DISPATCH, 3);
 simple!(deferred, DEFERRED, 4);
 simple!(report, REPORT, 2);
+simple!(reset_counter, RESET_COUNTER, 1);
+pub fn tiled_cache_hint(_: &Call) -> Result<u64> {
+    // @SIMPLIFICATION Vulkan manages on-chip tile binning and flushing. Resource
+    // visibility is expressed separately by NVN barriers and attachment dependencies.
+    Ok(0)
+}
 buffer_binding!(storage, STORAGE);
 simple!(condition, CONDITION, 2);
 pub fn enable_render(c: &Call) -> Result<u64> {

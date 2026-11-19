@@ -1,7 +1,7 @@
 // Entrypoints exported with the guest AAPCS64 ABI.
 exports! {
     sampler {
-        SamplerFinalize => finalize,
+        SamplerCompare => equal,
         SamplerInitialize => initialize,
         SamplerGetBorderColor => get_border,
         SamplerGetCompare => get_compare,
@@ -18,6 +18,11 @@ exports! {
         SamplerBuilderSetLodClamp => lod,
         SamplerBuilderSetMaxAnisotropy => aniso,
         SamplerBuilderSetReductionFilter => reduction,
+    },
+    objects {
+        BufferFinalize => finalize,
+        SamplerFinalize => finalize,
+        TextureFinalize => finalize,
     },
     debug {
         BufferSetDebugLabel => label,
@@ -74,7 +79,6 @@ exports! {
         BufferBuilderSetStorage => storage,
         BufferBuilderSetDefaults => defaults,
         BufferInitialize => initialize,
-        BufferFinalize => finalize,
         BufferMap => map,
         BufferGetAddress => address,
     },
@@ -102,10 +106,13 @@ exports! {
         MemoryPoolMap => map,
         MemoryPoolGetBufferAddress => address,
         MemoryPoolFlushMappedRange => flush,
+        MemoryPoolInvalidateMappedRange => invalidate,
         TexturePoolInitialize => descriptor_pool,
         SamplerPoolInitialize => descriptor_pool,
     },
     texture {
+        TextureCompare => equal,
+        TextureGetZCullStorageSize => zcull,
         TextureGetFlags => get_flags,
         TextureBuilderSetWidth => set_width,
         TextureBuilderSetHeight => set_height,
@@ -113,7 +120,7 @@ exports! {
         TextureBuilderSetSwizzle => swizzle,
         TextureBuilderSetPackagedTextureLayout => packaged,
         TextureBuilderGetStorageClass => storage_class,
-        TextureBuilderGetZCullStorageSize => zcull,
+        TextureBuilderGetZCullStorageSize => builder_zcull,
         SamplerBuilderSetDevice => set_device,
         TextureGetDepth => get_depth,
         TextureGetWidth => width,
@@ -121,7 +128,6 @@ exports! {
         TextureGetFormat => get_format,
         TextureGetTarget => get_target,
         TextureBuilderSetDepth => depth,
-        TextureFinalize => finalize,
         TextureBuilderSetDevice => set_device,
         TextureBuilderSetDefaults => defaults,
         TextureBuilderSetFlags => flags,
@@ -151,6 +157,9 @@ exports! {
     command {
         CommandBufferCopyBufferToTexture => copy_texture,
         CommandBufferDispatchCompute => dispatch,
+        CommandBufferSetTiledCacheAction => tiled_cache_hint,
+        CommandBufferSetTiledCacheTileSize => tiled_cache_hint,
+        CommandBufferResetCounter => reset_counter,
         CommandBufferReportCounter => report,
         CommandBufferSetRenderEnable => enable_render,
         CommandBufferSetRenderEnableConditional => condition,

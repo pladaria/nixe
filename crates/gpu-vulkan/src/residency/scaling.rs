@@ -114,6 +114,9 @@ impl Residency<'_> {
         &mut self,
         resolution: crate::ResolutionScaling,
     ) -> Result<(), VulkanError> {
+        if self.resolution() == resolution {
+            return Ok(());
+        }
         let images: Vec<_> = self
             .texture_cache
             .images
@@ -139,6 +142,7 @@ impl Residency<'_> {
                 entry.scaled_initialized = false;
             }
             self.runtime.device.resolution_scale = resolution;
+            self.texture_cache.binding_revision += 1;
             for slot in &mut self.runtime.device.submission.slots {
                 slot.graphics_state = Default::default();
             }
@@ -190,20 +194,55 @@ impl Residency<'_> {
         if !self.resolution().active {
             return Ok(());
         }
-        let ids: smallvec::SmallVec<[_; 9]> = self
-            .texture_cache
-            .bindings
-            .channel
-            .render_targets
-            .views
+        let views = self.texture_cache.bindings.channel.render_targets.views;
+        let ids = self.target_images(&views);
+        let rescaled = self.rescale_target_images(&ids)?;
+        let bank = &mut self.texture_cache.bindings.channel;
+        if bank.rescaled != rescaled {
+            bank.rescaled = rescaled;
+            bank.render_targets_changed();
+        }
+        Ok(())
+    }
+    fn target_images(&self, views: &[Option<ImageViewId>; 9]) -> smallvec::SmallVec<[ImageId; 9]> {
+        views
             .iter()
             .flatten()
             .map(|&view| self.texture_cache.views[view].image)
-            .collect();
+            .collect()
+    }
+    pub(crate) fn render_scale_frame(&self) -> u64 {
+        self.texture_cache.frame_tick
+    }
+    pub(crate) fn prepare_scaling_view(&mut self, view: ImageViewId) -> Result<bool, VulkanError> {
+        let Some(ready) = self.sampled_image_ready(view) else {
+            return Ok(false);
+        };
+        if !ready {
+            let revision = self.texture_cache.binding_revision;
+            self.prepare_image(self.texture_cache.views[view].image, false, false)?;
+            return Ok(self.texture_cache.binding_revision == revision);
+        }
+        Ok(true)
+    }
+    pub(crate) fn rescale_explicit_targets(
+        &mut self,
+        views: &[Option<ImageViewId>; 9],
+    ) -> Result<bool, VulkanError> {
+        let ids = self.target_images(views);
+        let retained = self.runtime.constructing.len();
+        self.runtime
+            .constructing
+            .extend(ids.iter().copied().map(Resource::Image));
+        let result = self.rescale_target_images(&ids);
+        self.runtime.constructing.truncate(retained);
+        result
+    }
+    fn rescale_target_images(&mut self, ids: &[ImageId]) -> Result<bool, VulkanError> {
         let mut can_rescale = !ids.is_empty();
         let mut any_rescaled = false;
         let mut rating = 0;
-        for &id in &ids {
+        for &id in ids {
             can_rescale &= self.texture_cache.image_can_rescale(id);
             let entry = self.texture_cache.get(id);
             any_rescaled |= entry.rescaled
@@ -222,18 +261,13 @@ impl Residency<'_> {
             rating
         };
         let next_tick = self.texture_cache.frame_tick + 1;
-        for id in ids {
+        for &id in ids {
             let entry = &mut self.texture_cache.images[id];
             entry.scale_rating = rating;
             entry.scale_tick = next_tick;
             self.scale_image(id, rescaled, false)?;
         }
-        let bank = &mut self.texture_cache.bindings.channel;
-        if bank.rescaled != rescaled {
-            bank.rescaled = rescaled;
-            bank.render_targets_changed();
-        }
-        Ok(())
+        Ok(rescaled)
     }
     pub(super) fn match_image_scales(
         &mut self,
@@ -263,16 +297,24 @@ impl Residency<'_> {
         if self.texture_cache.image_can_rescale(source) {
             self.scale_image(source, true, false)?;
             if resolve {
-                self.texture_cache.images[destination].can_rescale = true;
-                let aliases: smallvec::SmallVec<[_; 8]> = self
-                    .texture_cache
-                    .get(destination)
-                    .aliases
-                    .iter()
-                    .map(|a| a.image)
+                let targets: smallvec::SmallVec<[_; 8]> = std::iter::once(destination)
+                    .chain(
+                        self.texture_cache
+                            .get(destination)
+                            .aliases
+                            .iter()
+                            .map(|a| a.image),
+                    )
                     .collect();
-                for id in aliases {
-                    self.texture_cache.images[id].can_rescale = true;
+                for id in targets {
+                    let image = &mut self.texture_cache.images[id];
+                    if !image
+                        .cached
+                        .as_ref()
+                        .is_some_and(|cached| cached.storage_access())
+                    {
+                        image.can_rescale = true;
+                    }
                 }
             }
         }

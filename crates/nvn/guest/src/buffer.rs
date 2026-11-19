@@ -20,7 +20,11 @@ pub fn initialize(c: &Call) -> Result<u64> {
     if p.flags & 0x100 != 0 {
         return Ok(0);
     }
-    let cpu = if p.flags & 1 != 0 { 0 } else { p.cpu + offset };
+    let cpu = if p.cpu == 0 || p.flags & 1 != 0 {
+        0
+    } else {
+        p.cpu + offset
+    };
     c.write(c.args[0], &[cpu, p.gpu + offset])?;
     Ok(1)
 }
@@ -29,8 +33,4 @@ pub fn map(c: &Call) -> Result<u64> {
 }
 pub fn address(c: &Call) -> Result<u64> {
     c.read(c.args[0] + 8)
-}
-pub fn finalize(c: &Call) -> Result<u64> {
-    c.write(c.args[0], &[0u64; 2])?;
-    Ok(0)
 }

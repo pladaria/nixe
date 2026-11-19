@@ -65,7 +65,7 @@ timezone = "Europe/Madrid"
 [diagnostics]
 # Count guest NVN API calls and write dump/nvn/<title>/<timestamp>-calls.csv on exit.
 # Sorted by invocation count (highest first), then by function name. Disabled by default.
-count_nvn_calls = true
+count_nvn_calls = false
 # Minimum severity emitted by the CLI logger.
 log_level = "debug"
 # Preserve each Horizon guest log packet's severity. A concrete level forces

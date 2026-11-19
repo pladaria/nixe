@@ -50,6 +50,7 @@ mod targets;
 mod texels;
 mod vertex_format;
 use crate::residency::color_blit_pipeline;
+pub(crate) use nvn::NVN_IMAGE_SPACE_ID;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeExecutionStatistics {

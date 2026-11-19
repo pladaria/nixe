@@ -267,6 +267,7 @@ pub fn sampled_image_info(
         } else {
             ImagePacking::Native
         },
+        storage: false,
         sample_grid: match description.samples() {
             SampleCount::One => [1, 1],
             SampleCount::Four => [2, 2],

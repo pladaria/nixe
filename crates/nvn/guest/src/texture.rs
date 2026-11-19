@@ -9,14 +9,12 @@ pub fn defaults(c: &Call) -> Result<u64> {
         c.args[0] + 8,
         &Texture {
             target: 1,
-            depth: 1,
-            width: 1,
-            height: 1,
             swizzle: [2, 3, 4, 5],
             levels: 1,
             ..Default::default()
         },
     )?;
+    c.write(c.args[0] + 8 + size_of::<Texture>() as u64, &[0u64; 2])?;
     Ok(0)
 }
 macro_rules! setter {
@@ -41,19 +39,16 @@ pub fn size(c: &Call) -> Result<u64> {
         c.args[0] + 8 + core::mem::offset_of!(Texture, width) as u64,
         &[c.args[1] as u32, c.args[2] as u32],
     )?;
+    c.write(
+        c.args[0] + 8 + core::mem::offset_of!(Texture, depth) as u64,
+        &1u32,
+    )?;
     Ok(0)
 }
 pub fn storage(c: &Call) -> Result<u64> {
-    let p: Pool = c.read(c.args[1])?;
     c.write(
         c.args[0] + 8 + size_of::<Texture>() as u64,
-        &[p.cpu + c.args[2], c.args[2], c.args[1]],
-    )?;
-    c.write(
-        c.args[0] + 8,
-        &p.gpu
-            .checked_add(c.args[2])
-            .ok_or("texture address overflows")?,
+        &[c.args[2], c.args[1]],
     )?;
     Ok(0)
 }
@@ -66,12 +61,25 @@ pub fn storage_size(c: &Call) -> Result<u64> {
     Ok(c.read::<Texture>(c.args[0] + 8)?.layout()?.bytes)
 }
 pub fn initialize(c: &Call) -> Result<u64> {
-    let t: Texture = c.read(c.args[1] + 8)?;
+    let builder = c.args[1];
+    let [offset, pool]: [u64; 2] = c.read(builder + 8 + size_of::<Texture>() as u64)?;
+    if pool == 0 {
+        return Ok(0);
+    }
+    let p: Pool = c.read(pool)?;
+    if p.flags & 0x100 != 0 {
+        return Ok(0);
+    }
+    let mut t: Texture = c.read(builder + 8)?;
     t.layout()?;
+    t.address = p
+        .gpu
+        .checked_add(offset)
+        .ok_or("texture address overflows")?;
     c.write(c.args[0], &t)?;
     c.write(
         c.args[0] + size_of::<Texture>() as u64,
-        &c.read::<[u64; 3]>(c.args[1] + 8 + size_of::<Texture>() as u64)?,
+        &[p.cpu + offset, offset, pool, c.read::<u64>(builder)?],
     )?;
     Ok(1)
 }
@@ -112,16 +120,31 @@ pub fn storage_class(_: &Call) -> Result<u64> {
     // resource layout and depth compression are selected separately by Vulkan.
     Ok(0)
 }
-// @SIMPLIFICATION Host rendering owns its hierarchical depth state. Return a nonzero,
-// tile-sized save area for guest allocators without storing hardware ZCull metadata.
+fn zcull_size(t: Texture) -> u64 {
+    if !(matches!(t.format, 0x32..=0x36) || t.format == 0x31 && t.flags & 0x400 != 0) {
+        return 0;
+    }
+    // Maxwell has one 32-byte region entry per 32x32 pixels and layer,
+    // plus the region and subregion headers advertised by nvhost-ctrl-gpu.
+    // @SIMPLIFICATION Use ordinary ZCull storage for adaptive targets. Host
+    // hierarchical depth stays on the device and never spills adaptive data here.
+    let tiles = u64::from(t.width.div_ceil(32)) * u64::from(t.height.div_ceil(32));
+    0x20 * tiles * u64::from(t.depth.max(1)) + 0x20 + 0xc0
+}
+pub fn builder_zcull(c: &Call) -> Result<u64> {
+    Ok(zcull_size(c.read(c.args[0] + 8)?))
+}
 pub fn zcull(c: &Call) -> Result<u64> {
-    let t: Texture = c.read(c.args[0] + 8)?;
-    Ok((u64::from(t.width.div_ceil(32))
-        * u64::from(t.height.div_ceil(32))
-        * u64::from(t.depth.max(1))
-        * 8)
-    .next_multiple_of(256)
-    .max(256))
+    Ok(zcull_size(c.read(c.args[0])?))
+}
+pub fn equal(c: &Call) -> Result<u64> {
+    let metadata = size_of::<Texture>() as u64 + 8;
+    // Equal addresses can come from different pools. Object identity includes the
+    // offset, pool and device in addition to the texture description and swizzle.
+    Ok(
+        (c.read::<[u64; 3]>(c.args[0] + metadata)? == c.read::<[u64; 3]>(c.args[1] + metadata)?
+            && c.read::<Texture>(c.args[0])? == c.read::<Texture>(c.args[1])?) as u64,
+    )
 }
 pub fn width(c: &Call) -> Result<u64> {
     Ok(c.read::<Texture>(c.args[0])?.width.into())
@@ -134,10 +157,6 @@ pub fn get_format(c: &Call) -> Result<u64> {
 }
 pub fn get_target(c: &Call) -> Result<u64> {
     Ok(c.read::<Texture>(c.args[0])?.target.into())
-}
-pub fn finalize(c: &Call) -> Result<u64> {
-    c.write(c.args[0], &Texture::default())?;
-    Ok(0)
 }
 
 pub fn get_depth(c: &Call) -> Result<u64> {

@@ -51,26 +51,46 @@ const X1: [u32; 105] = [
     65535, 65535, 256, 16383,
 ];
 
-// The host publishes these once, before returning the SDK version resolver.
+// The resolver fills these device-independent versions from the linked SDK.
 core::arch::global_asm!(
     ".pushsection .nvn_version,\"aw\",%nobits",
     ".global nixe_nvn_version",
     ".hidden nixe_nvn_version",
     "nixe_nvn_version:",
-    ".zero 8",
+    ".zero 24",
     ".popsection"
 );
-fn sdk_version(property: usize) -> u32 {
-    let address: *const u32;
+fn sdk_versions() -> *const core::sync::atomic::AtomicU32 {
+    let address;
     unsafe {
         core::arch::asm!("adr {address}, nixe_nvn_version", address = out(reg) address, options(pure, nomem, nostack));
-        address.add(property).read()
     }
+    address
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nixe_nvn_query_versions(
+    replacement: u64,
+    sdk_query: extern "C" fn(u64, u32, &mut u32),
+) -> u64 {
+    for (i, property) in [0, 1, 46, 47, 48, 49].into_iter().enumerate() {
+        let mut value = 0;
+        sdk_query(0, property, &mut value);
+        // Concurrent first resolutions query the same SDK.
+        unsafe { (*sdk_versions().add(i)).store(value, core::sync::atomic::Ordering::Relaxed) };
+    }
+    replacement
+}
+
 pub fn integer(c: &Call) -> Result<u64> {
     let property = c.args[1] as u32 as usize;
-    let value = if property < 2 {
-        sdk_version(property)
+    let version = match property {
+        0..=1 => Some(property),
+        46..=49 => Some(property - 44),
+        _ => None,
+    };
+    let value = if let Some(i) = version {
+        unsafe { (*sdk_versions().add(i)).load(core::sync::atomic::Ordering::Relaxed) }
     } else {
         *X1.get(property).ok_or("unsupported NVN device property")?
     };

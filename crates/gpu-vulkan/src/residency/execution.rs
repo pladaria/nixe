@@ -147,6 +147,16 @@ pub struct HostProgram {
     unaligned_uniforms: usize,
     dynamic_offsets: Vec<u32>,
 }
+impl HostProgram {
+    pub(crate) fn image_binding_view(&self, index: usize) -> Option<ImageViewId> {
+        match &self.bindings[index] {
+            HostBinding::Image(image) | HostBinding::CombinedImageSampler { image, .. } => {
+                Some(image.id)
+            }
+            _ => None,
+        }
+    }
+}
 #[derive(Default)]
 struct ProgramRecord {
     payload: Option<(u64, u64, crate::cache::DescriptorUpdate)>,
@@ -684,7 +694,11 @@ impl Residency<'_> {
             update: None,
         })
     }
-    fn host_program_access(&mut self, program: &HostProgram) -> Result<(), VulkanError> {
+    fn host_program_access(
+        &mut self,
+        program: &HostProgram,
+        images_prepared: bool,
+    ) -> Result<(), VulkanError> {
         // Synchronize current cache selections before recording shader access.
         // Overlapping bindings share the cache-owned modified ranges.
         let mut images: smallvec::SmallVec<[ImageId; 16]> = smallvec::SmallVec::new();
@@ -715,7 +729,7 @@ impl Residency<'_> {
                     }
                 }
                 HostBindingAccess::Image { id, .. } => {
-                    if !images.contains(&id) {
+                    if !images_prepared && !images.contains(&id) {
                         self.prepare_image(id, false, false)?;
                         images.push(id);
                     }
@@ -845,12 +859,21 @@ impl Residency<'_> {
         dispatch: Dispatch,
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
+        self.dispatch_bound(program, dispatch, push, false)
+    }
+    pub(crate) fn dispatch_bound(
+        &mut self,
+        program: &HostProgram,
+        dispatch: Dispatch,
+        push: &[u8],
+        images_prepared: bool,
+    ) -> Result<WorkTicket, VulkanError> {
         let retained = self.runtime.constructing.len();
         self.retain_host_program(program);
         if let Dispatch::Indirect { buffer, .. } = dispatch {
             self.runtime.constructing.push(Resource::Buffer(buffer));
         }
-        let result = self.dispatch_inner(program, dispatch, push);
+        let result = self.dispatch_inner(program, dispatch, push, images_prepared);
         self.runtime.constructing.truncate(retained);
         result
     }
@@ -859,6 +882,7 @@ impl Residency<'_> {
         program: &HostProgram,
         dispatch: Dispatch,
         push: &[u8],
+        images_prepared: bool,
     ) -> Result<WorkTicket, VulkanError> {
         if program.pipeline.bind_point != vk::PipelineBindPoint::COMPUTE {
             return Err(VulkanError::InvalidResource(
@@ -886,7 +910,7 @@ impl Residency<'_> {
             }
         }
         let streams = self.stream_graphics(program)?;
-        self.host_program_access(program)?;
+        self.host_program_access(program, images_prepared)?;
         let indirect = match dispatch {
             Dispatch::Indirect { buffer, offset } => {
                 Some(self.indirect_buffer(buffer, offset, 12)?)

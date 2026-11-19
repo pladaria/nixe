@@ -5,7 +5,7 @@ use abi::*;
 pub use abi::{
     IMAGE_HANDLE_BASE_SLOT, IMAGE_HANDLE_SLOTS, Range, Sampler, Shader, Texture, VertexStream,
 };
-pub use guest_image::{GUEST_CODE, GUEST_ERROR_PC, guest_offset};
+pub use guest_image::{GUEST_CODE, GUEST_ERROR_PC, QUERY_VERSIONS_OFFSET, guest_offset};
 mod bindings;
 mod command;
 mod device;
@@ -16,6 +16,7 @@ mod view;
 type MipList = smallvec::SmallVec<[Mip; 1]>;
 mod memory;
 mod pool;
+pub use pool::PoolBounds;
 mod program;
 mod queue;
 mod sampler;
@@ -26,7 +27,7 @@ mod texels;
 mod texture;
 
 pub use bindings::{
-    Bindings, BufferBindings, Sampled, SampledBindings, TextureHandles, TextureShape,
+    BUFFER_STAGES, Bindings, Sampled, SampledBindings, TextureHandles, TextureShape,
 };
 pub use command::{Attachments, CommandState, Draw, DrawPipeline, Operation, Submission};
 pub use layout::{Layout, Mip};

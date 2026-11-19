@@ -87,13 +87,7 @@ fn transfer(c: &Call, upload: bool) -> Result<u64> {
     let [x, y, z, w, h, d]: [u32; 6] = c.read(c.args[2])?;
     let l = t.layout()?;
     let m = l.mips[t.first_level as usize];
-    let level = t.first_level;
-    let width = (t.width >> level).max(1);
-    let height = if t.target == 3 {
-        1
-    } else {
-        (t.height >> level).max(1)
-    };
+    let [width, height] = t.view_extent();
     let depth = t.layer_count();
     if x > width || w > width - x || y > height || h > height - y || z > depth || d > depth - z {
         return Err("texture region outside selected subresource");

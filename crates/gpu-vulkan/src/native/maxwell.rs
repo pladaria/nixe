@@ -261,6 +261,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             .change_resolution(resolution)
             .map_err(compilation)?;
         self.pipelines.change_resolution(resolution);
+        renderer.state.nvn.change_resolution();
         log::info!(
             "render resolution scale changed to {}x",
             resolution.up_factor

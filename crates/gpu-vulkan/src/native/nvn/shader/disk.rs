@@ -34,8 +34,11 @@ const MAX_RECORD: u64 = 64 << 20;
 pub(super) fn source_key(
     sources: &[nixe_nvn::StageSource],
     graphics: Option<&GraphicsRuntimeState>,
+    resolution: crate::ResolutionScaling,
 ) -> Digest {
     let mut hash = Sha256::new();
+    hash.update(resolution.up_scale.to_le_bytes());
+    hash.update(resolution.down_shift.to_le_bytes());
     for source in sources {
         let shader = nixe_nvn::Shader {
             address: 0,
@@ -176,8 +179,13 @@ impl Input {
                     word(out, v);
                 }
             }
-            Input::Texture { stage, slot, ty } => {
-                for v in [1, stage, slot, ty as u32] {
+            Input::Texture {
+                stage,
+                slot,
+                ty,
+                scale_index,
+            } => {
+                for v in [1, stage, slot, ty as u32, scale_index as u32] {
                     word(out, v);
                 }
             }
@@ -186,8 +194,9 @@ impl Input {
                 slot,
                 ty,
                 format,
+                scale_index,
             } => {
-                for v in [2, stage, slot, ty as u32, format as u32] {
+                for v in [2, stage, slot, ty as u32, format as u32, scale_index as u32] {
                     word(out, v);
                 }
             }
@@ -218,12 +227,14 @@ impl Input {
                 stage,
                 slot: r.u32()?,
                 ty: TextureType::try_from(r.u32()?).ok()?,
+                scale_index: r.u32()? as usize,
             },
             2 => Self::Image {
                 stage,
                 slot: r.u32()?,
                 ty: TextureType::try_from(r.u32()?).ok()?,
                 format: ir::types::ImageFormat::try_from(r.u32()?).ok()?,
+                scale_index: r.u32()? as usize,
             },
             3 => Self::Uniform(stage, r.u32()?, r.u64()?),
             4 => Self::Storage(stage, r.u32()?),
@@ -429,7 +440,7 @@ impl NativeGpuExecution {
         let start = Instant::now();
         let profile = self.device_profile();
         let mut h = Sha256::new();
-        h.update(b"Nixe NVN artifact 1");
+        h.update(b"Nixe NVN artifact 2");
         h.update(ir::artifact::ARTIFACT_ABI_VERSION.to_le_bytes());
         h.update(profile.pipeline_cache_uuid);
         h.update(profile.driver_version.to_le_bytes());

@@ -55,87 +55,93 @@ impl SampledBindings {
     }
 }
 
-type Ranges = SmallVec<[(u32, u32, Range); 2]>;
+pub const BUFFER_STAGES: usize = 6;
+const BUFFER_SLOTS: usize = 16;
 
-#[derive(Clone, Default, Debug)]
-pub struct BufferBindings {
-    pub uniforms: Ranges,
-    pub storage: Ranges,
+#[derive(Debug, Default)]
+struct StageBuffers {
+    ranges: [Range; BUFFER_SLOTS],
+    bound: u16,
 }
 
 #[derive(Debug, Default)]
 pub struct BufferState {
-    uniforms: Ranges,
+    tables: [[StageBuffers; BUFFER_STAGES]; 2],
     dirty: std::cell::Cell<DirtyBuffers>,
-    pub driver: Arc<BufferBindings>,
+    driver_revision: u64,
 }
+
 #[derive(Default, Clone, Copy, Debug)]
-pub struct DirtyBuffers {
-    masks: [[u32; 6]; 2],
-    overflow: bool,
-}
+pub struct DirtyBuffers([[u16; BUFFER_STAGES]; 2]);
 impl DirtyBuffers {
-    pub fn slots(&self) -> Option<impl Iterator<Item = (bool, u32, u32)> + '_> {
-        (!self.overflow).then(|| {
-            self.masks.iter().enumerate().flat_map(|(kind, stages)| {
-                stages.iter().enumerate().flat_map(move |(stage, &mask)| {
-                    let mut mask = mask;
-                    std::iter::from_fn(move || {
-                        if mask == 0 {
-                            return None;
-                        }
-                        let slot = mask.trailing_zeros();
-                        mask &= mask - 1;
-                        Some((kind != 0, stage as u32, slot))
-                    })
-                })
+    pub fn slots(&self) -> impl Iterator<Item = (bool, usize, usize)> + '_ {
+        self.0.iter().enumerate().flat_map(|(kind, stages)| {
+            stages.iter().enumerate().flat_map(move |(stage, &mask)| {
+                bound_slots(mask).map(move |slot| (kind != 0, stage, slot))
             })
         })
     }
 }
+
+fn bound_slots(mut mask: u16) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        if mask == 0 {
+            return None;
+        }
+        let slot = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        Some(slot)
+    })
+}
+
 impl BufferState {
     pub fn take_dirty(&self) -> DirtyBuffers {
         self.dirty.take()
     }
-    fn table(&self, storage: bool, stage: u32) -> &Ranges {
-        if storage {
-            &self.driver.storage
-        } else if stage == 5 {
-            &self.driver.uniforms
-        } else {
-            &self.uniforms
-        }
+
+    pub fn driver_revision(&self) -> u64 {
+        self.driver_revision
     }
+
+    pub fn stage_ranges(
+        &self,
+        storage: bool,
+        stage: usize,
+    ) -> impl Iterator<Item = (usize, Range)> + '_ {
+        let table = &self.tables[storage as usize][stage];
+        bound_slots(table.bound).map(|slot| (slot, table.ranges[slot]))
+    }
+
     pub fn get(&self, storage: bool, stage: u32, slot: u32) -> Option<Range> {
-        let table = self.table(storage, stage);
-        table
-            .binary_search_by_key(&(stage, slot), |x| (x.0, x.1))
-            .ok()
-            .map(|i| table[i].2)
+        let stage = self.tables[storage as usize].get(stage as usize)?;
+        let range = *stage.ranges.get(slot as usize)?;
+        (stage.bound & (1 << slot) != 0).then_some(range)
     }
-    pub(crate) fn bind(&mut self, storage: bool, stage: u32, slot: u32, range: Range) {
-        let table = self.table(storage, stage);
-        let pos = table.binary_search_by_key(&(stage, slot), |x| (x.0, x.1));
-        if pos.is_ok_and(|i| table[i].2 == range) {
-            return;
+
+    pub(crate) fn bind(
+        &mut self,
+        storage: bool,
+        stage: u32,
+        slot: u32,
+        range: Range,
+    ) -> Result<()> {
+        let stage = stage as usize;
+        let slot = slot as usize;
+        if stage >= BUFFER_STAGES || slot >= BUFFER_SLOTS {
+            return Err(format!("invalid NVN buffer slot {stage}:{slot}").into());
         }
-        let dirty = self.dirty.get_mut();
-        if stage < 6 && slot < 32 {
-            dirty.masks[storage as usize][stage as usize] |= 1 << slot;
-        } else {
-            dirty.overflow = true;
+        let table = &mut self.tables[storage as usize][stage];
+        let bit = 1 << slot;
+        let previous = &mut table.ranges[slot];
+        if table.bound & bit == 0 || *previous != range {
+            *previous = range;
+            table.bound |= bit;
+            self.dirty.get_mut().0[storage as usize][stage] |= bit;
+            if storage || stage == 5 {
+                self.driver_revision = self.driver_revision.wrapping_add(1);
+            }
         }
-        let table = if storage {
-            &mut Arc::make_mut(&mut self.driver).storage
-        } else if stage == 5 {
-            &mut Arc::make_mut(&mut self.driver).uniforms
-        } else {
-            &mut self.uniforms
-        };
-        match pos {
-            Ok(i) => table[i].2 = range,
-            Err(i) => table.insert(i, (stage, slot, range)),
-        }
+        Ok(())
     }
 }
 #[derive(Debug)]

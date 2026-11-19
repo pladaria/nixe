@@ -20,6 +20,8 @@ pub struct ImageInfo {
     pub maybe_unaligned_layer_stride: u64,
     pub size: u64,
     pub packing: ImagePacking,
+    /// Image instructions can write coordinates in the native guest grid.
+    pub storage: bool,
     pub sample_grid: [u32; 2],
 }
 

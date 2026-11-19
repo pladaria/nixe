@@ -129,6 +129,9 @@ impl Residency<'_> {
             ));
         }
         let mut maps = RangeSet::default();
+        let reactive_download = guest_source
+            .as_ref()
+            .is_some_and(|source| source.address_space == crate::native::NVN_IMAGE_SPACE_ID);
         let cached = if let Some(source) = guest_source {
             for (address, bytes) in source.maps {
                 maps.insert(address, bytes);
@@ -213,6 +216,7 @@ impl Residency<'_> {
             command_free: None,
             gpu_modified: false,
             forced_flushed: false,
+            reactive_download,
             dma_downloaded: false,
             dma: Default::default(),
             contents: Contents {

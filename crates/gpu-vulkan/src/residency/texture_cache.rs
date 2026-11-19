@@ -36,9 +36,13 @@ impl CachedImage {
     pub(super) fn packing(&self) -> nixe_gpu::native::ImagePacking {
         self.info.packing
     }
+    pub(super) fn storage_access(&self) -> bool {
+        self.info.storage
+    }
     pub(super) fn can_rescale(&self, depth: bool) -> bool {
         let info = &self.info;
-        matches!(info.layout, ImageMemoryLayout::BlockLinear(block) | ImageMemoryLayout::BlockLinearAmpere(block) if block.block_depth_log2 == 0)
+        !info.storage
+            && matches!(info.layout, ImageMemoryLayout::BlockLinear(block) | ImageMemoryLayout::BlockLinearAmpere(block) if block.block_depth_log2 == 0)
             && info.description.dimension() == ImageDimension::Two
             && info.description.mip_levels() == 1
             && (info.description.extent().height > 288 || depth)
@@ -679,6 +683,12 @@ impl Residency<'_> {
                 .picked = false;
         }
         if let Some((id, _)) = found {
+            if info.storage {
+                let entry = &mut self.texture_cache.images[id];
+                entry.cached.as_mut().unwrap().info.storage = true;
+                entry.can_rescale = false;
+                self.scale_image(id, false, false)?;
+            }
             self.touch(Resource::Image(id));
             self.runtime.statistics.cache_hits += 1;
         }
@@ -692,7 +702,7 @@ impl Residency<'_> {
         }
         self.texture_cache.advance_image_modification(id);
         let entry = &mut self.texture_cache.images[id];
-        if entry.dma.mixed_authority {
+        if entry.dma.mixed_authority || (entry.reactive_download && !entry.gpu_modified) {
             self.runtime.device_memory.invalidate_read_areas();
         }
         let memory = &self.runtime.device_memory;

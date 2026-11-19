@@ -302,6 +302,7 @@ fn surface(r: &Registers, base: u32) -> Result<ImageInfo> {
         maybe_unaligned_layer_stride: size,
         size,
         packing: ImagePacking::Native,
+        storage: false,
         sample_grid: [1, 1],
     };
     // Only capture the addressed slice's enclosing byte range, including its

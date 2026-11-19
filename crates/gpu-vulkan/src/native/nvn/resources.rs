@@ -6,7 +6,7 @@ use nixe_gpu::{
 pub(super) struct PoolSpace;
 impl ImageAddressSpace for PoolSpace {
     fn image_space_id(&self) -> u64 {
-        u64::MAX
+        NVN_IMAGE_SPACE_ID
     }
     fn image_device_address(&self, address: u64) -> Result<Option<u64>, nixe_memory::MemoryError> {
         Ok(Some(address))
@@ -148,14 +148,17 @@ pub(super) fn shader_format(
 ) -> Result<nixe_shader_recompiler::types::TexturePixelFormat, VulkanError> {
     Ok(formats(id)?.1)
 }
-pub(super) fn info(t: Texture) -> Result<ImageInfo, VulkanError> {
+pub(super) fn info(t: Texture, sampled: bool) -> Result<ImageInfo, VulkanError> {
     let l = t.layout().map_err(error)?;
     let f = format(t.format)?;
     let dim = match if t.target == 2 { 2 } else { t.target_kind() } {
         0 | 3 => ImageDimension::One,
         1 | 4 | 5 | 6 | 7 => ImageDimension::Two,
         2 => ImageDimension::Three,
-        8 | 9 => ImageDimension::Cube,
+        // Attachments and copies operate on individual faces as 2D array layers.
+        // Only a sampled cube view needs a complete group of six faces.
+        8 | 9 if sampled => ImageDimension::Cube,
+        8 | 9 => ImageDimension::Two,
         k => return Err(error(format!("unsupported NVN texture target {k}"))),
     };
     let base = t.first_level as usize;
@@ -174,13 +177,10 @@ pub(super) fn info(t: Texture) -> Result<ImageInfo, VulkanError> {
         .get(base + levels as usize)
         .map_or(l.layer_stride, |m| m.offset);
     let size = u64::from(layers - 1) * l.layer_stride + end - mip.offset;
+    let [width, height] = t.view_extent();
     let extent = ImageExtent {
-        width: (t.width >> base).max(1),
-        height: if dim == ImageDimension::One {
-            1
-        } else {
-            (t.height >> base).max(1)
-        },
+        width,
+        height,
         depth: if dim == ImageDimension::Three {
             (t.depth >> base).max(1)
         } else {
@@ -231,6 +231,7 @@ pub(super) fn info(t: Texture) -> Result<ImageInfo, VulkanError> {
         maybe_unaligned_layer_stride: l.layer_stride,
         size,
         packing: ImagePacking::Native,
+        storage: t.flags & nixe_nvn::Texture::IMAGE != 0,
         sample_grid: grid,
     })
 }
@@ -238,7 +239,7 @@ pub(super) fn target_view(
     native: &mut NativeExecution<'_>,
     t: Texture,
 ) -> Result<ImageViewId, VulkanError> {
-    let info = info(t)?;
+    let info = info(t, false)?;
     let slices = (t.target == 2).then(|| (u32::from(t.first_layer), t.layer_count()));
     native.image_target_layers(&info, &PoolSpace, slices)
 }
@@ -256,7 +257,7 @@ impl SampledImage {
     fn new(source: Texture) -> Result<Self, VulkanError> {
         Ok(Self {
             source,
-            info: Rc::new(info(source)?),
+            info: Rc::new(info(source, true)?),
             views: [None; 2],
         })
     }

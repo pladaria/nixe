@@ -98,6 +98,12 @@ struct Window {
     deadline: Option<Instant>,
 }
 
+fn native_present_interval(requested: u32) -> u32 {
+    // The SDK keeps the requested signed interval in the window object.
+    // Its native window paces and queues buffers with a minimum of one tick.
+    (requested as i32).max(1) as u32
+}
+
 pub fn initialize(c: &Call) -> Result<u64> {
     let device: u64 = c.read(c.args[1])?;
     let [origin, depth]: [u32; 2] = c.read(device + 4)?;
@@ -150,7 +156,7 @@ pub fn window_initialize(c: &Call) -> Result<u64> {
         Window {
             textures,
             next: 0,
-            interval: b.interval,
+            interval: native_present_interval(b.interval),
             deadline: None,
         },
     );
@@ -223,7 +229,7 @@ pub fn window_acquire(c: &Call) -> Result<u64> {
     acquire_slot(c, c.args[0])
 }
 fn acquire_slot(c: &Call, window: u64) -> Result<u64> {
-    let interval: u32 = c.read(window)?;
+    let interval = native_present_interval(c.read(window)?);
     let (index, deadline) = {
         let mut q = c.session.queues.lock().unwrap();
         let w = q.windows.get_mut(&window).ok_or("unknown window")?;
@@ -251,12 +257,15 @@ fn acquire_slot(c: &Call, window: u64) -> Result<u64> {
 pub fn submit(c: &Call) -> Result<u64> {
     let q = queue(c)?;
     q.ordered(|capture| {
-        let mut submission = Submission::new(q.upper_left, q.minus_one_to_one);
+        let bounds = c.session.pools.lock().unwrap().snapshot();
+        let mut submission = Submission::new(q.upper_left, q.minus_one_to_one, bounds);
+        let span = nixe_memory::trace::span("nvn_list_capture", c.args[1], 0, 0);
         for i in 0..c.args[1] as u32 {
             capture.list(c, c.read(c.args[2] + u64::from(i) * 8)?, &mut submission)?;
         }
         #[cfg(feature = "execution-trace")]
         capture.trace_submit(submission.block_count());
+        drop(span);
         c.session.graphics()?.backend.submit(c.args[0], submission)
     })?;
     Ok(0)
@@ -276,7 +285,7 @@ pub fn present(c: &Call) -> Result<u64> {
     queue.ordered(|_| {
         c.session.graphics()?.backend.present(
             c.read(texture)?,
-            interval,
+            native_present_interval(interval),
             !queue.upper_left,
             [x, y, width, height],
         )

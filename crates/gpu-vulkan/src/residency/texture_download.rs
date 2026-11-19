@@ -103,7 +103,10 @@ impl TextureCache {
                 // Native reads cannot wait for publication while admitted.
                 // Leave this image untouched so the suspended caller still
                 // observes the required reactive download.
-                if !REACTIVE && !entry.forced_flushed {
+                // NVN renders to an explicit framebuffer without the Maxwell
+                // bind-time scheduling of learned fence downloads.
+                let preemptive = entry.forced_flushed && !entry.reactive_download;
+                if !REACTIVE && !preemptive {
                     return None;
                 }
                 found = true;
@@ -111,11 +114,13 @@ impl TextureCache {
                     area.start = area.start.min(base);
                     area.end = area.end.max(base + size);
                 }
-                for &view in &entry.views {
-                    self.views[view].downloaded = true;
+                if !entry.reactive_download {
+                    for &view in &entry.views {
+                        self.views[view].downloaded = true;
+                    }
+                    entry.forced_flushed = true;
                 }
-                area.preemptive &= entry.forced_flushed;
-                entry.forced_flushed = true;
+                area.preemptive &= preemptive;
             }
         }
         if !found && !exact_read {

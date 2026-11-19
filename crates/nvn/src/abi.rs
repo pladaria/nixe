@@ -23,7 +23,12 @@ pub struct Texture {
     pub first_layer: u16,
     pub view_layers: u16,
     pub view_target: u8,
-    pub reserved: u8,
+    /// Original compressed block dimensions minus one, packed in two nibbles for a raw block view.
+    pub block_view: u8,
+}
+
+impl Texture {
+    pub const IMAGE: u32 = 0x4;
 }
 
 #[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -229,6 +234,7 @@ pub(crate) mod op {
     pub const CLEAR_IMAGE: u32 = 44;
     pub const COPY_IMAGES: u32 = 45;
     pub const CONSERVATIVE: u32 = 46;
+    pub const RESET_COUNTER: u32 = 47;
 }
 
 pub const BLEND: [u8; 8] = [0, 2, 1, 2, 1, 1, 1, 0];

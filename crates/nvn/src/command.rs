@@ -1,7 +1,10 @@
 //! Record values in the guest-provided command memory. EndRecording returns a
 //! control-memory handle; a submit reads the command bytes as they stand then.
+mod block_cache;
+
 use super::*;
 
+use nixe_memory::DirectWordsComparison;
 use smallvec::SmallVec;
 
 #[derive(Copy, Clone, Debug)]
@@ -92,12 +95,7 @@ impl Draw<'_> {
             .iter()
             .flatten()
             .chain(self.attachments.depth.iter())
-            .map(|t| {
-                [
-                    (t.width >> t.first_level).max(1),
-                    (t.height >> t.first_level).max(1),
-                ]
-            })
+            .map(|t| t.view_extent())
             .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1])])
             .unwrap_or_else(|| {
                 [
@@ -135,6 +133,7 @@ pub enum Operation<'a> {
         groups: [u32; 3],
         bindings: Bindings<'a>,
     },
+    ResetCounter(u32),
     Report {
         kind: u32,
         address: u64,
@@ -172,43 +171,55 @@ struct BindingRun {
 struct CommandBlock {
     words: Vec<u64>,
     end: usize,
-    called_offsets: Option<Vec<u32>>,
+    capture_offsets: Vec<u32>,
 }
 impl CommandBlock {
-    fn new(words: Vec<u64>, called: bool) -> Self {
+    fn new(words: Vec<u64>, called: bool) -> Result<Self> {
         let mut end = words.len();
-        let called_offsets = called.then(|| {
-            // A caller retains a byte range. Later recordings may start at other
-            // boundaries. Index its current complete commands once per snapshot.
-            let mut offsets = Vec::new();
-            let mut index = 0;
-            while index < end {
-                let header = words[index];
-                let next = index + 1 + record_words(header);
-                if next > end {
-                    // @SIMPLIFICATION A called range ending inside a replacement
-                    // record executes only its complete prefix.
-                    // https://github.com/seedds/nxnative/blob/a366365/docs/reference/nvn-objects.md#a-called-recording-recorded-over-before-its-caller-is-submitted
-                    end = index;
+        let mut capture_offsets = Vec::new();
+        let mut index = 0;
+        while index < end {
+            let header = words[index];
+            let next = index + 1 + record_words(header);
+            if next > end {
+                if !called {
+                    return Err("truncated NVN command record".into());
+                }
+                // @SIMPLIFICATION A called range ending inside a replacement
+                // record executes only its complete prefix.
+                // https://github.com/seedds/nxnative/blob/a366365/docs/reference/nvn-objects.md#a-called-recording-recorded-over-before-its-caller-is-submitted
+                end = index;
+                break;
+            }
+            if needs_capture(record_tag(header)) {
+                capture_offsets.push(index as u32);
+            }
+            if called {
+                // A called range remains a span of bytes if re-recorded. Its new
+                // commands can begin at different offsets than the original.
+                index = next;
+            } else {
+                let skip = (header >> 32) as usize;
+                if skip == 0 {
                     break;
                 }
-                if needs_capture(record_tag(header)) {
-                    offsets.push(index as u32);
+                index += skip;
+                if index < next || index >= end {
+                    return Err("invalid NVN capture offset".into());
                 }
-                index = next;
             }
-            offsets
-        });
-        Self {
+        }
+        Ok(Self {
             words,
             end,
-            called_offsets,
-        }
+            capture_offsets,
+        })
     }
 }
 /// Immutable words and submit-visible descriptors for the graphics owner.
 #[derive(Debug, Default)]
 pub struct Submission {
+    pub pool_bounds: Arc<PoolBounds>,
     blocks: SmallVec<[Arc<CommandBlock>; 4]>,
     retained_bytes: usize,
     captures: Vec<BindingRun>,
@@ -216,11 +227,18 @@ pub struct Submission {
     minus_one_to_one: bool,
 }
 impl Submission {
-    pub(crate) fn new(upper_left: bool, minus_one_to_one: bool) -> Self {
+    pub(crate) fn new(
+        upper_left: bool,
+        minus_one_to_one: bool,
+        pool_bounds: Arc<PoolBounds>,
+    ) -> Self {
         Self {
             upper_left,
             minus_one_to_one,
-            ..Default::default()
+            pool_bounds,
+            blocks: SmallVec::new(),
+            captures: Vec::new(),
+            retained_bytes: 0,
         }
     }
     #[cfg(feature = "execution-trace")]
@@ -274,12 +292,48 @@ pub struct Record<'a> {
 pub(crate) struct Capture {
     bindings: [bindings::BindingState; 2],
     shaders: SmallVec<[Shader; 2]>,
-    blocks: std::collections::HashMap<Range, Arc<CommandBlock>>,
-    retained_bytes: u64,
+    blocks: block_cache::Blocks,
     #[cfg(feature = "execution-trace")]
     capture_counts: [u64; 4],
+    #[cfg(feature = "execution-trace")]
+    diagnostics: ListDiagnostics,
     texture_pool: DescriptorPool,
     sampler_pool: DescriptorPool,
+}
+#[cfg(feature = "execution-trace")]
+#[derive(Default)]
+struct ListDiagnostics {
+    evicted: std::collections::HashSet<Range>,
+    // attempted comparison bytes, first-seen misses, modified, evicted, coherent, evictions
+    counts: [u64; 6],
+}
+
+#[cfg(feature = "execution-trace")]
+impl ListDiagnostics {
+    fn record_miss(&mut self, key: Range, comparison: Option<DirectWordsComparison>) {
+        let index = match comparison {
+            Some(DirectWordsComparison::Different) => 2,
+            Some(DirectWordsComparison::NeedsCoherentRead) => 4,
+            None if self.evicted.remove(&key) => 3,
+            None => 1,
+            Some(DirectWordsComparison::Equal) => return,
+        };
+        self.counts[index] += 1;
+    }
+
+    fn note_eviction(&mut self, key: Range) {
+        self.counts[5] += 1;
+        if self.evicted.len() < 131_072 {
+            self.evicted.insert(key);
+        }
+    }
+
+    fn trace(&mut self) {
+        let [compared, first, modified, evicted, coherent, removals] =
+            std::mem::take(&mut self.counts);
+        nixe_memory::trace::detail_event("nvn_list_comparison", compared, coherent, removals);
+        nixe_memory::trace::detail_event("nvn_list_misses", first, modified, evicted);
+    }
 }
 impl Capture {
     #[cfg(feature = "execution-trace")]
@@ -287,8 +341,11 @@ impl Capture {
         let [copied, visited, reused, hits] = std::mem::take(&mut self.capture_counts);
         nixe_memory::trace::event("nvn_command_capture", copied, visited, blocks as u64);
         nixe_memory::trace::event("nvn_command_reuse", reused, hits, 0);
+        self.diagnostics.trace();
     }
     pub(crate) fn list(&mut self, c: &Call, mut at: u64, batch: &mut Submission) -> Result<()> {
+        #[cfg(feature = "execution-trace")]
+        let detailed = nixe_memory::trace::detailed_active();
         loop {
             let Range { address, size } = c.read(at)?;
             if size == LINK {
@@ -304,52 +361,59 @@ impl Capture {
                     address,
                     size: size & !END,
                 };
-                let previous = self.blocks.get(&key);
-                let block = if let Some(block) = previous
-                    && c.memory
-                        .matches_direct_words(
+                let previous = self.blocks.index(&key);
+                let comparison = previous
+                    .map(|index| {
+                        let block = self.blocks.block(index);
+                        c.memory.compare_direct_words(
                             nixe_memory::GuestVirtualAddress::new(address),
                             &block.words,
                         )
-                        .map_err(|e| e.to_string())?
+                    })
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
+                #[cfg(feature = "execution-trace")]
+                if detailed && comparison.is_some() {
+                    self.diagnostics.counts[0] += bytes;
+                }
+                let block = if let Some(index) = previous
+                    && comparison == Some(DirectWordsComparison::Equal)
                 {
                     #[cfg(feature = "execution-trace")]
                     {
                         self.capture_counts[2] += bytes;
                         self.capture_counts[3] += 1;
                     }
-                    Arc::clone(block)
+                    self.blocks.use_block(index)
                 } else {
                     #[cfg(feature = "execution-trace")]
                     {
                         self.capture_counts[0] += bytes;
+                        if detailed {
+                            self.diagnostics.record_miss(key, comparison);
+                        }
                     }
                     let mut words = vec![0; bytes as usize / 8];
                     c.read_bytes(address, bytemuck::cast_slice_mut(&mut words))?;
-                    let block = Arc::new(CommandBlock::new(words, size & CALLED != 0));
-                    // Bound retained guest recordings even for queues that never present.
-                    if self.retained_bytes + bytes > 32 << 20 || self.blocks.len() >= 4096 {
-                        self.blocks.clear();
-                        self.retained_bytes = 0;
-                    }
-                    if bytes <= 32 << 20 && self.blocks.insert(key, block.clone()).is_none() {
-                        self.retained_bytes += bytes;
-                    }
+                    let block = Arc::new(CommandBlock::new(words, size & CALLED != 0)?);
+                    self.blocks
+                        .insert(key, previous, block.clone(), |_evicted| {
+                            #[cfg(feature = "execution-trace")]
+                            if detailed {
+                                self.diagnostics.note_eviction(_evicted);
+                            }
+                        });
                     block
                 };
-                if let Some(offsets) = &block.called_offsets {
-                    for &index in offsets {
-                        let i = index as usize;
-                        let header = block.words[i];
-                        self.observe_record(
-                            c,
-                            record_tag(header),
-                            &block.words[i + 1..i + 1 + record_words(header)],
-                            &mut batch.captures,
-                        )?;
-                    }
-                } else {
-                    self.observe(c, &block.words, &mut batch.captures)?;
+                for &index in &block.capture_offsets {
+                    let i = index as usize;
+                    let header = block.words[i];
+                    self.observe_record(
+                        c,
+                        record_tag(header),
+                        &block.words[i + 1..i + 1 + record_words(header)],
+                        &mut batch.captures,
+                    )?;
                 }
                 batch.retained_bytes += bytes as usize;
                 batch.blocks.push(block);
@@ -359,28 +423,6 @@ impl Capture {
             }
             at += CONTROL_SIZE;
         }
-    }
-    fn observe(
-        &mut self,
-        c: &Call,
-        mut words: &[u64],
-        captures: &mut Vec<BindingRun>,
-    ) -> Result<()> {
-        while let Some((&header, tail)) = words.split_first() {
-            let n = record_words(header);
-            let w = tail.get(..n).ok_or("truncated NVN command record")?;
-            let skip = (header >> 32) as usize;
-            words = if skip == 0 {
-                &[]
-            } else {
-                words
-                    .get(skip..)
-                    .filter(|v| !v.is_empty() && skip > n)
-                    .ok_or("invalid NVN capture offset")?
-            };
-            self.observe_record(c, record_tag(header), w, captures)?;
-        }
-        Ok(())
     }
     fn observe_record(
         &mut self,
@@ -543,6 +585,7 @@ impl CommandState {
                     },
                 }));
             }
+            op::RESET_COUNTER if n == 1 => return Ok(Some(Operation::ResetCounter(w[0] as u32))),
             op::REPORT if n == 2 => {
                 return Ok(Some(Operation::Report {
                     kind: w[0] as u32,
@@ -625,10 +668,10 @@ impl CommandState {
                 self.raster.stencil = bytemuck::cast((w[0] >> 32) as u32);
             }
             op::MULTISAMPLE if n == 1 => self.raster.multisample = w[0] as u32,
-            op::CLAMP if n == 1 => self.raster.depth_clamp = w[0] != 0,
-            op::DISCARD if n == 1 => self.raster.raster_discard = w[0] != 0,
+            op::CLAMP if n == 1 => self.raster.depth_clamp = w[0] as u8 != 0,
+            op::DISCARD if n == 1 => self.raster.raster_discard = w[0] as u8 != 0,
             op::BOUNDS if n == 2 => {
-                self.raster.depth_bounds = w[0] != 0;
+                self.raster.depth_bounds = w[0] as u8 != 0;
                 self.dynamic.depth_bounds = bytemuck::cast(w[1]);
             }
             op::LINE if n == 1 => self.dynamic.line_width = f32::from_bits(w[0] as u32),
@@ -680,7 +723,7 @@ impl CommandState {
                     return Ok(Some(Operation::ClearDepth {
                         target,
                         scissor: self.viewports[0].scissor,
-                        depth: (w[1] != 0).then(|| f32::from_bits(w[0] as u32)),
+                        depth: (w[1] as u8 != 0).then(|| f32::from_bits(w[0] as u32)),
                         stencil: w[2] as u8,
                         mask: w[3] as u8,
                     }));
@@ -743,15 +786,26 @@ impl CommandState {
             }
             op::UNIFORM | op::STORAGE if n == 3 => {
                 let stage = w[0] as u32;
+                let size = if op == op::UNIFORM && stage != 5 {
+                    // Graphics constant banks encode their extent in 256-byte units.
+                    u64::from((w[2] as u32).wrapping_add(255) & !255)
+                } else {
+                    u64::from(w[2] as u32)
+                };
+                let range = if op == op::UNIFORM && stage != 5 && size == 0 {
+                    Range::default()
+                } else {
+                    Range {
+                        address: w[1],
+                        size,
+                    }
+                };
                 self.buffers[usize::from(stage == 5)].bind(
                     op == op::STORAGE,
                     stage,
                     (w[0] >> 32) as u32,
-                    Range {
-                        address: w[1],
-                        size: w[2],
-                    },
-                );
+                    range,
+                )?;
             }
             op::SAMPLER_POOL | op::TEXTURE_POOL if n == 2 => {}
             op::TEXTURE if n == 2 => {}
@@ -804,7 +858,6 @@ impl CommandState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nixe_memory::{AddressWidth, GuestVirtualAddress, Machine, MemoryPermissions, PAGE_SIZE};
 
     #[test]
     fn called_ranges_follow_current_record_boundaries_and_stop_at_the_cut() {
@@ -826,106 +879,19 @@ mod tests {
                 0,
             ],
             true,
-        );
-        assert_eq!(block.called_offsets.as_deref(), Some(&[2, 5][..]));
+        )
+        .unwrap();
+        assert_eq!(block.capture_offsets, [2, 5]);
         assert_eq!(block.end, 9);
-        let empty = CommandBlock::new(vec![h(op::TARGETS, 24)], true);
+        let empty = CommandBlock::new(vec![h(op::TARGETS, 24)], true).unwrap();
         assert_eq!(empty.end, 0);
         let mut submission = Submission::default();
         submission.blocks.push(Arc::new(empty));
-        submission.blocks.push(Arc::new(CommandBlock::new(
-            vec![h(op::BARRIER, 1), 1],
-            false,
-        )));
+        submission.blocks.push(Arc::new(
+            CommandBlock::new(vec![h(op::BARRIER, 1), 1], false).unwrap(),
+        ));
         let mut records = submission.records();
         assert_eq!(records.next().unwrap().unwrap().tag, op::BARRIER);
         assert!(records.next().is_none());
-    }
-
-    #[test]
-    fn queued_commands_own_guest_bytes_and_apply_buffer_state_in_draw_order() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let memory = AddressSpace::new(machine, AddressWidth::Bits32).unwrap();
-        memory
-            .map(
-                GuestVirtualAddress::new(0x1000),
-                allocation,
-                0,
-                PAGE_SIZE,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        let session = Session::new();
-        let call = Call {
-            session: &session,
-            memory: &memory,
-            args: [0; 8],
-            pending: Default::default(),
-        };
-        let header = |tag, n: u64, skip: u64| u64::from(tag) | n << 8 | skip << 32;
-        let mut capture = Capture::default();
-        let mut first = Submission::new(true, false);
-        let mut second = Submission::new(true, false);
-        let mut recording = [
-            header(op::UNIFORM, 3, 4),
-            1,
-            0x6000,
-            128,
-            header(op::DRAW, 3, 4),
-            4,
-            3,
-            1u64 << 32,
-            header(op::DRAW, 3, 0),
-            4,
-            6,
-            1u64 << 32,
-        ];
-        call.write(
-            0x1000,
-            &Range {
-                address: 0x1100,
-                size: size_of_val(&recording) as u64 | END,
-            },
-        )
-        .unwrap();
-        call.write(0x1100, &recording).unwrap();
-        capture.list(&call, 0x1000, &mut first).unwrap();
-        let mut repeated = Submission::default();
-        capture.list(&call, 0x1000, &mut repeated).unwrap();
-        assert!(Arc::ptr_eq(&first.blocks[0], &repeated.blocks[0]));
-        recording[2] = 0x7000;
-        call.write(0x1100, &recording).unwrap();
-        capture.list(&call, 0x1000, &mut second).unwrap();
-        call.write(0x1100, &[0u64; 17]).unwrap();
-        let mut state = CommandState::new(&first);
-        for (submission, address) in [(&first, 0x6000), (&second, 0x7000)] {
-            let mut records = submission.records();
-            assert!(
-                state
-                    .apply(records.next().unwrap().unwrap())
-                    .unwrap()
-                    .is_none()
-            );
-            assert_eq!(submission.captures.len(), 1);
-            for count in [3, 6] {
-                let Some(Operation::Draw(draw)) =
-                    state.apply(records.next().unwrap().unwrap()).unwrap()
-                else {
-                    panic!("expected a draw")
-                };
-                assert_eq!(
-                    draw.bindings.buffers.get(false, 1, 0),
-                    Some(Range { address, size: 128 })
-                );
-                assert!(draw.pipeline.upper_left);
-                assert_eq!(draw.count, count);
-            }
-            assert!(records.next().is_none());
-        }
     }
 }

@@ -9,16 +9,38 @@ type Geometry = Option<(Range, BufferRange, u64)>;
 #[derive(Default)]
 pub(super) struct Queue {
     epoch: Epoch,
+    pub count_samples: bool,
     pub graphics: Program,
     pub compute: Program,
     pub index: Geometry,
     pub vertices: [Geometry; 32],
     selection: Option<Arc<nixe_nvn::Attachments>>,
     attachments: [Option<(Texture, ImageViewId)>; 9],
-    framebuffer: Option<([u32; 2], Arc<PreparedTargets>)>,
+    framebuffer: Option<Framebuffer>,
+}
+
+struct Framebuffer {
+    size: [u32; 2],
+    targets: Arc<PreparedTargets>,
+    rescaled: bool,
+    scale_frame: u64,
 }
 
 impl Queue {
+    pub(super) fn new(id: u64) -> Self {
+        Self {
+            graphics: Program {
+                owner: id,
+                ..Default::default()
+            },
+            compute: Program {
+                owner: id,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     pub(super) fn invalidate(&mut self, epoch: Epoch) {
         if self.epoch != epoch {
             self.epoch = epoch;
@@ -36,7 +58,7 @@ impl Queue {
         draw: &nixe_nvn::Draw,
         extent: [u32; 2],
         epoch: Epoch,
-    ) -> Result<Option<Arc<PreparedTargets>>, VulkanError> {
+    ) -> Result<Option<(Arc<PreparedTargets>, bool)>, VulkanError> {
         if self
             .selection
             .as_ref()
@@ -62,20 +84,51 @@ impl Queue {
         {
             return Ok(None);
         }
-        if let Some((size, framebuffer)) = &self.framebuffer
-            && *size == extent
-        {
-            return Ok(Some(framebuffer.clone()));
-        }
+        let scaling = native.residency.resolution().active;
+        let frame = native.residency.render_scale_frame();
         let views = self.attachments.map(|a| a.map(|s| s.1));
+        if scaling {
+            for &view in views.iter().flatten() {
+                if !native.residency.prepare_scaling_view(view)? {
+                    return Ok(None);
+                }
+            }
+        }
+        let recheck_scale = scaling
+            && self
+                .framebuffer
+                .as_ref()
+                .is_none_or(|fb| !fb.rescaled && fb.scale_frame != frame);
+        let rescaled = if recheck_scale {
+            let rescaled = native.residency.rescale_explicit_targets(&views)?;
+            if native.residency.texture_cache.binding_revision != epoch.1 {
+                // Promotion retires these views. Select the new physical views
+                // before capturing either the framebuffer or the descriptors.
+                return Ok(None);
+            }
+            rescaled
+        } else {
+            self.framebuffer.as_ref().is_some_and(|fb| fb.rescaled)
+        };
+        if let Some(fb) = &mut self.framebuffer
+            && fb.size == extent
+        {
+            fb.scale_frame = frame;
+            return Ok(Some((fb.targets.clone(), rescaled)));
+        }
         let framebuffer = native.residency.framebuffer_for_views(views, extent)?;
         if native.residency.texture_cache.binding_revision != epoch.1
             || native.residency.device_memory().generation() != epoch.0
         {
             return Ok(None);
         }
-        self.framebuffer = Some((extent, framebuffer.clone()));
-        Ok(Some(framebuffer))
+        self.framebuffer = Some(Framebuffer {
+            size: extent,
+            targets: framebuffer.clone(),
+            rescaled,
+            scale_frame: frame,
+        });
+        Ok(Some((framebuffer, rescaled)))
     }
 }
 
@@ -105,14 +158,35 @@ pub(super) fn geometry(
 
 #[derive(Default)]
 pub(super) struct Program {
+    owner: u64,
+    pool_bounds: Option<Arc<nixe_nvn::PoolBounds>>,
     pub program: Option<HostProgram>,
     slots: Vec<Binding>,
     shader: Option<Rc<shader::Compiled>>,
     sampled: Option<Arc<nixe_nvn::SampledBindings>>,
     handles: Option<Arc<nixe_nvn::TextureHandles>>,
-    driver: Option<Arc<nixe_nvn::BufferBindings>>,
+    driver_revision: Option<u64>,
     driver_args: ([u32; 3], u32, u32),
     epoch: Epoch,
+}
+
+impl Program {
+    pub(super) fn use_pools(&mut self, bounds: &Arc<nixe_nvn::PoolBounds>) {
+        if self
+            .pool_bounds
+            .as_ref()
+            .is_none_or(|old| !Arc::ptr_eq(old, bounds))
+        {
+            if self
+                .slots
+                .iter()
+                .any(|s| matches!(s, Binding::Buffer(r) if r.size == 0 && r.address != 0))
+            {
+                self.slots.clear();
+            }
+            self.pool_bounds = Some(bounds.clone());
+        }
+    }
 }
 
 enum Binding {
@@ -123,6 +197,35 @@ enum Binding {
 }
 
 impl NativeExecution<'_> {
+    pub(super) fn nvn_scaled_images(
+        &mut self,
+        selected: &Program,
+        pipeline: &shader::Program,
+    ) -> Result<Option<state::ShaderConstants>, VulkanError> {
+        let program = selected.program.as_ref().unwrap();
+        let mut constants = state::ShaderConstants::default();
+        for &descriptor in &program.pipeline.image_bindings {
+            let Some(view) = program.image_binding_view(descriptor) else {
+                continue;
+            };
+            if !self.residency.prepare_scaling_view(view)? {
+                return Ok(None);
+            }
+            if self.residency.image_is_rescaled(view) {
+                match pipeline.inputs[descriptor] {
+                    shader::Input::Texture { scale_index, .. } => {
+                        constants.set_image_scaled(false, scale_index);
+                    }
+                    shader::Input::Image { scale_index, .. } => {
+                        constants.set_image_scaled(true, scale_index);
+                    }
+                    _ => unreachable!("NVN image binding"),
+                }
+            }
+        }
+        Ok(Some(constants))
+    }
+
     pub(super) fn nvn_bindings(
         &mut self,
         selected: &mut Program,
@@ -165,16 +268,12 @@ impl NativeExecution<'_> {
             || pipeline.inputs.len() > 128;
         let mut mask = 0u128;
         if !all {
-            mask = dirty.slots().map_or(u128::MAX, |slots| {
-                slots.fold(0, |m, slot| {
-                    m | pipeline
-                        .dependencies
-                        .buffers
-                        .get(&slot)
-                        .copied()
-                        .unwrap_or(0)
-                })
-            });
+            for (storage, stage, slot) in dirty.slots() {
+                mask |= pipeline.dependencies.buffers[storage as usize][stage]
+                    .get(slot)
+                    .copied()
+                    .unwrap_or(0);
+            }
         }
         fn changed<T>(old: &mut Option<Arc<T>>, new: &Arc<T>) -> bool {
             if old.as_ref().is_some_and(|v| Arc::ptr_eq(v, new)) {
@@ -190,8 +289,10 @@ impl NativeExecution<'_> {
             mask |= pipeline.dependencies.handles;
         }
         let args = (groups, first_instance, samples);
-        if changed(&mut selected.driver, &bindings.buffers.driver) || selected.driver_args != args {
+        let driver = bindings.buffers.driver_revision();
+        if selected.driver_revision != Some(driver) || selected.driver_args != args {
             mask |= pipeline.dependencies.driver;
+            selected.driver_revision = Some(driver);
             selected.driver_args = args;
         }
         if all {
@@ -231,7 +332,7 @@ impl NativeExecution<'_> {
             let (key, binding) = match *input {
                 shader::Input::Driver(stage, bank, size) => {
                     let binding = self.state.nvn.driver_banks.select(
-                        (stage, bank),
+                        (stage, bank, selected.owner),
                         size,
                         bindings,
                         groups,
@@ -251,6 +352,7 @@ impl NativeExecution<'_> {
                     slot,
                     ty,
                     format,
+                    ..
                 } => {
                     use nixe_shader_recompiler::types::TextureType as T;
                     let input = bindings.sampled.get(stage, slot).ok_or_else(|| {
@@ -272,7 +374,9 @@ impl NativeExecution<'_> {
                         HostBinding::Image(self.residency.host_image(view)?),
                     )
                 }
-                shader::Input::Texture { stage, slot, ty } => {
+                shader::Input::Texture {
+                    stage, slot, ty, ..
+                } => {
                     use nixe_shader_recompiler::types::TextureType as T;
                     let arrayed =
                         matches!(ty, T::ColorArray1D | T::ColorArray2D | T::ColorArrayCube);
@@ -311,9 +415,7 @@ impl NativeExecution<'_> {
                     let range = match *input {
                         shader::Input::Uniform(stage, slot, size) => {
                             let mut range =
-                                bindings.buffers.get(false, stage, slot).ok_or_else(|| {
-                                    error(format!("unbound uniform slot {stage}:{slot}"))
-                                })?;
+                                bindings.buffers.get(false, stage, slot).unwrap_or_default();
                             range.size = range.size.min(size);
                             range
                         }
@@ -339,7 +441,34 @@ impl NativeExecution<'_> {
                     if matches!(previous, Some(Binding::Buffer(old)) if *old == range) {
                         continue;
                     }
-                    (Binding::Buffer(range), self.nvn_buffer(range, storage)?)
+                    // A zero extent leaves the storage pointer live in the driver
+                    // bank. Vulkan requires a byte range for the backing descriptor.
+                    let mut physical = range;
+                    if storage && physical.address != 0 && physical.size == 0 {
+                        let remaining = selected
+                            .pool_bounds
+                            .as_ref()
+                            .and_then(|p| p.remaining(physical.address))
+                            .ok_or_else(|| {
+                                error(format!(
+                                    "unmapped NVN storage address {:#x}",
+                                    physical.address
+                                ))
+                            })?;
+                        let limit = self
+                            .residency
+                            .device()
+                            .profile()
+                            .limits
+                            .max_storage_buffer_range;
+                        physical.size = remaining.min(u64::from(limit));
+                    }
+                    let binding = if physical.size == 0 {
+                        HostBinding::NullBuffer
+                    } else {
+                        self.nvn_buffer(physical, storage)?
+                    };
+                    (Binding::Buffer(range), binding)
                 }
             };
             #[cfg(feature = "execution-trace")]

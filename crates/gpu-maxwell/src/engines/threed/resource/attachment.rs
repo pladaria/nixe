@@ -119,6 +119,7 @@ impl AttachmentInfo {
             } else {
                 ImagePacking::Native
             },
+            storage: false,
             sample_grid: match samples {
                 SampleCount::One => [1, 1],
                 SampleCount::Four => [2, 2],

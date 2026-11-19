@@ -54,25 +54,15 @@ const DISPATCH: &[u32] = &[
 // The guest returns through LR after the private SVC writes x0.
 const CALL_HOST: &[u32] = &[0xd4000001 | NVN_SVC << 5, 0xd65f03c0]; // svc; ret
 
-// Query the linked SDK's two version constants once, during resolution.
-// These queries accept a null device. Preserve the replacement and resolver LR.
+// x0 is the replacement, x1 the SDK query and x2 the embedded version probe.
+// Notify the resolver after the probe publishes all six constants.
 const QUERY_VERSION: usize = 128;
+const QUERY_VERSION_DONE: usize = QUERY_VERSION + 2 * 4;
 const VERSION_WORDS: &[u32] = &[
-    0xa9be7be0, // stp x0, x30, [sp, #-32]!
-    0xf9000be1, // str x1, [sp, #16]   original SDK query
-    0xaa0103e9, // mov x9, x1
-    0xaa1f03e0, // mov x0, xzr
-    0x2a1f03e1, // mov w1, wzr        major
-    0x910063e2, // add x2, sp, #24
-    0xd63f0120, // blr x9
-    0xf9400be9, // ldr x9, [sp, #16]
-    0xaa1f03e0, // mov x0, xzr
-    0x52800021, // mov w1, #1         minor
-    0x910073e2, // add x2, sp, #28
-    0xd63f0120, // blr x9
-    0x294307e0, // ldp w0, w1, [sp, #24]
+    0xa9bf7bfd, // stp x29, x30, [sp, #-16]!
+    0xd63f0040, // blr x2
     0xd4000001 | NVN_SVC << 5,
-    0xa8c27be0, // ldp x0, x30, [sp], #32
+    0xa8c17bfd, // ldp x29, x30, [sp], #16
     0xd65f03c0, // ret
 ];
 type Procedure = (Box<str>, Option<nixe_nvn::Handler>);
@@ -398,18 +388,8 @@ impl NvnHooks {
                 return Ok(Svc::Returned);
             }
         } else if let Some(hle) = &self.hle
-            && pc == self.base + (QUERY_VERSION + 13 * 4) as u64
+            && pc == self.base + QUERY_VERSION_DONE as u64
         {
-            let version = [state.read_x(x(0)) as u32, state.read_x(x(1)) as u32];
-            memory
-                .space()
-                .write(
-                    GuestVirtualAddress::new(self.guest_base() + nixe_nvn::GUEST_CODE.len() as u64),
-                    &(u64::from(version[0]) | (u64::from(version[1]) << 32)).to_le_bytes(),
-                )
-                .map_err(|e| e.to_string())?
-                .into_ready()
-                .map_err(|_| "NVN version storage is unavailable")?;
             hle.version_ready.get_or_init(|| ());
         } else if let Some(hle) = &self.hle
             && pc == self.guest_base() + nixe_nvn::GUEST_ERROR_PC as u64
@@ -479,6 +459,10 @@ impl NvnHooks {
                     })
                 {
                     state.write_x(x(1), self.original_target(&reg, target));
+                    state.write_x(
+                        x(2),
+                        self.guest_base() + nixe_nvn::QUERY_VERSIONS_OFFSET as u64,
+                    );
                     return Ok(true);
                 }
             } else if self.hle.is_some() {

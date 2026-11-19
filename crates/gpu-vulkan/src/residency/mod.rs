@@ -113,6 +113,7 @@ pub(crate) struct ImageEntry {
     modification_tick: u64,
     gpu_modified: bool,
     forced_flushed: bool,
+    reactive_download: bool,
     dma_downloaded: bool,
     dma: dma_upload::DmaImage,
     contents: Contents,
@@ -742,9 +743,7 @@ impl Residency<'_> {
     ) -> Result<WorkTicket, VulkanError> {
         let size = bytes.len() as u64;
         self.check_buffer_range(id, offset, size)?;
-        if self.buffer_cache.get(id).device_address.is_some() {
-            self.ensure_buffer_range(id, offset, size)?;
-        }
+        self.synchronize_buffer_overwrite(id, offset, size)?;
         let slice = self
             .runtime
             .device
@@ -771,6 +770,15 @@ impl Residency<'_> {
             mapping,
             vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
         )?;
+        self.write_sample_report(range, short, timestamp)
+    }
+
+    pub(crate) fn write_sample_report(
+        &mut self,
+        range: BufferRange,
+        short: bool,
+        timestamp: u64,
+    ) -> Result<(), VulkanError> {
         let size = if short { 4 } else { 16 };
         self.ensure_buffer_range(range.buffer, range.offset, size)?;
         let output = self.use_buffer(range.buffer, range.offset, size)?;

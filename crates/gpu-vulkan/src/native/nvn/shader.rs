@@ -15,12 +15,14 @@ pub(super) enum Input {
         stage: u32,
         slot: u32,
         ty: TextureType,
+        scale_index: usize,
     },
     Image {
         stage: u32,
         slot: u32,
         ty: TextureType,
         format: ir::types::ImageFormat,
+        scale_index: usize,
     },
     Uniform(u32, u32, u64),
     Storage(u32, u32),
@@ -71,7 +73,7 @@ pub(super) struct Dependencies {
     pub sampled: u128,
     pub handles: u128,
     pub driver: u128,
-    pub buffers: HashMap<(bool, u32, u32), u128>,
+    pub buffers: [[Vec<u128>; nixe_nvn::BUFFER_STAGES]; 2],
 }
 impl Dependencies {
     fn new(inputs: &[Input]) -> Self {
@@ -82,8 +84,15 @@ impl Dependencies {
                 Input::Texture { .. } | Input::Image { .. } => result.sampled |= bit,
                 Input::Driver(_, 2, _) => result.handles |= bit,
                 Input::Driver(..) => result.driver |= bit,
-                Input::Uniform(s, b, _) => *result.buffers.entry((false, s, b)).or_default() |= bit,
-                Input::Storage(s, b) => *result.buffers.entry((true, s, b)).or_default() |= bit,
+                Input::Uniform(stage, slot, _) | Input::Storage(stage, slot) => {
+                    let kind = usize::from(matches!(*input, Input::Storage(..)));
+                    let mask = &mut result.buffers[kind][stage as usize];
+                    let slot = slot as usize;
+                    if mask.len() <= slot {
+                        mask.resize(slot + 1, 0);
+                    }
+                    mask[slot] |= bit;
+                }
                 Input::Constants(..) => {}
             }
         }
@@ -434,12 +443,13 @@ fn translate(
                 .map_or(generation, |v| v.mapping_generation),
         })
     };
+    let resolution = native.residency.resolution();
     let key = native
         .state
         .nvn
         .archive
         .as_ref()
-        .map(|_| disk::source_key(&sources, graphics));
+        .map(|_| disk::source_key(&sources, graphics, resolution));
     if let Some((translation, shapes)) = key
         .as_ref()
         .and_then(|key| native.state.nvn.archive.as_ref()?.lookup(key, bindings))
@@ -458,10 +468,11 @@ fn translate(
     let textures = &bindings.sampled.entries;
     let mut ids = Vec::new();
     let mut constants = [Range::default(); 6];
+    let mut config = native.residency.device().profile().shader_compiler.clone();
+    config.settings.resolution_info = resolution;
     for source in &sources {
         let shader = &source.shader;
         let code = source.bytes.as_ref();
-        let config = &native.residency.device().profile().shader_compiler;
         let h = shader.header as usize;
         let id = shader.stage as usize;
         let (stage, sph) = if id == 5 {
@@ -515,9 +526,10 @@ fn translate(
                 .map_err(error)?,
         );
     }
-    let config = &native.residency.device().profile().shader_compiler;
-    let shader = crate::cache::compile_guest(compiler, &ids, config, graphics).map_err(error)?;
+    let shader = crate::cache::compile_guest(compiler, &ids, &config, graphics).map_err(error)?;
     let mut inputs = Vec::new();
+    let mut texture_base = 0;
+    let mut image_base = 0;
     for stage in &shader.stages {
         let id = match stage.stage {
             nixe_gpu::ShaderStage::Vertex => 0,
@@ -526,6 +538,12 @@ fn translate(
             _ => return Err(error("unsupported NVN shader stage")),
         };
         let metadata = stage.guest.as_ref().unwrap();
+        if resolution.active
+            && (texture_base + metadata.info.texture_descriptors.len() > 128
+                || image_base + metadata.info.image_descriptors.len() > 64)
+        {
+            return Err(error("NVN image descriptors exceed the rescaling mask ABI"));
+        }
         // Indirect constant-buffer offsets carry the full-bank bound from the
         // compiler. Storage-buffer descriptors keep the complete guest range.
         let uniform_bound =
@@ -580,6 +598,7 @@ fn translate(
                         slot,
                         ty: i.texture_type,
                         format: i.format,
+                        scale_index: image_base + binding.resource_index.0 as usize,
                     }
                 }
                 ResourceSource::Texture(t)
@@ -592,12 +611,15 @@ fn translate(
                         stage: id,
                         slot,
                         ty: t.texture_type,
+                        scale_index: texture_base + binding.resource_index.0 as usize,
                     }
                 }
                 s => return Err(error(format!("unsupported NVN program binding {s:?}"))),
             };
             inputs.push((binding.binding.0, source));
         }
+        texture_base += metadata.info.texture_descriptors.len();
+        image_base += metadata.info.image_descriptors.len();
     }
     inputs.sort_by_key(|i| i.0);
     consumed.sort_unstable();
@@ -678,7 +700,7 @@ pub(super) fn compute(
 pub(super) struct DriverBanks([[Option<DriverBank>; 2]; 6]);
 enum DriverSource {
     Handles(Arc<nixe_nvn::TextureHandles>),
-    Buffers(Arc<nixe_nvn::BufferBindings>),
+    Buffers { owner: u64, revision: u64 },
 }
 struct DriverBank {
     source: DriverSource,
@@ -690,7 +712,7 @@ struct DriverBank {
 impl DriverBanks {
     pub(super) fn select(
         &mut self,
-        (stage, bank): (u32, u32),
+        (stage, bank, owner): (u32, u32, u64),
         size: usize,
         b: &nixe_nvn::Bindings,
         groups: [u32; 3],
@@ -698,12 +720,13 @@ impl DriverBanks {
         samples: u32,
     ) -> HostBinding {
         let slot = &mut self.0[stage as usize][usize::from(bank == 2)];
+        let revision = b.buffers.driver_revision();
         if let Some(p) = slot.as_ref()
             && p.bytes.len() == size
             && if bank == 2 {
                 matches!(&p.source, DriverSource::Handles(h) if Arc::ptr_eq(h,&b.handles))
             } else {
-                matches!(&p.source, DriverSource::Buffers(v) if Arc::ptr_eq(v,&b.buffers.driver))
+                matches!(p.source, DriverSource::Buffers { owner: old, revision: v } if old == owner && v == revision)
                     && p.groups == groups
                     && p.first_instance == first_instance
                     && p.samples == samples
@@ -716,7 +739,7 @@ impl DriverBanks {
             source: if bank == 2 {
                 DriverSource::Handles(b.handles.clone())
             } else {
-                DriverSource::Buffers(b.buffers.driver.clone())
+                DriverSource::Buffers { owner, revision }
             },
             groups,
             first_instance,
@@ -749,23 +772,15 @@ fn driver_uniform(
         if stage == 5 {
             words[0x200 / 4..0x20c / 4].copy_from_slice(&groups)
         }
-        for (table, storage) in [
-            (&b.buffers.driver.storage, true),
-            (&b.buffers.driver.uniforms, false),
+        for (stage, storage, base) in [
+            (0, true, 0x110),
+            (1, true, 0x510),
+            (2, true, 0x410),
+            (5, true, 0x310),
+            (5, false, 0x210),
         ] {
-            for &(s, slot, r) in table {
-                if slot >= 16 || (!storage && s != 5) {
-                    continue;
-                }
-                let base = match (s, storage) {
-                    (0, true) => 0x110,
-                    (1, true) => 0x510,
-                    (2, true) => 0x410,
-                    (5, true) => 0x310,
-                    (5, false) => 0x210,
-                    _ => continue,
-                };
-                let at = base / 4 + 4 * slot as usize;
+            for (slot, r) in b.buffers.stage_ranges(storage, stage) {
+                let at = base / 4 + 4 * slot;
                 words[at..at + 3].copy_from_slice(&[
                     r.address as u32,
                     (r.address >> 32) as u32,

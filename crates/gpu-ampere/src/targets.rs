@@ -191,6 +191,7 @@ pub fn target(r: &Registers, slot: usize) -> Result<Option<ImageInfo>> {
                 .ok_or("target size overflow")?
         },
         packing,
+        storage: false,
         sample_grid,
     }))
 }

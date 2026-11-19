@@ -23,8 +23,8 @@ field!(depth, 0, |_: &Call| [
     u32::from_le_bytes(DEPTH),
     0x0007_0007
 ]);
-field!(test, 0, |c: &Call| u8::from(c.args[1] as u32 != 0));
-field!(write, 1, |c: &Call| u8::from(c.args[1] as u32 != 0));
+field!(test, 0, |c: &Call| u8::from(c.args[1] as u8 != 0));
+field!(write, 1, |c: &Call| u8::from(c.args[1] as u8 != 0));
 field!(compare, 2, |c: &Call| c.args[1] as u8);
 field!(color, 0, |_: &Call| 0x300u32);
 field!(mask, 0, |_: &Call| u32::MAX);
@@ -42,25 +42,27 @@ fn update(c: &Call, width: u32, bits: u32) -> Result<u64> {
     Ok(0)
 }
 pub fn enable(c: &Call) -> Result<u64> {
-    update(c, 1, u32::from(c.args[2] as u32 != 0))
+    update(c, 1, u32::from(c.args[2] as u8 != 0))
 }
 pub fn channels(c: &Call) -> Result<u64> {
     let bits = c.args[2..6]
         .iter()
         .enumerate()
-        .fold(0, |v, (i, &a)| v | (u32::from(a as u32 != 0) << i));
+        .fold(0, |v, (i, &a)| v | (u32::from(a as u8 != 0) << i));
     update(c, 4, bits)
 }
 
 field!(advanced, 7, |c: &Call| c.args[1] as u8);
 field!(polygon_mode, 2, |c: &Call| c.args[1] as u8);
 field!(polygon_offset, 3, |c: &Call| c.args[1] as u8);
-field!(stencil_test, 3, |c: &Call| c.args[1] as u8);
+field!(stencil_test, 3, |c: &Call| u8::from(c.args[1] as u8 != 0));
 field!(logic, 1, |c: &Call| c.args[1] as u8);
 field!(multisample, 0, |_: &Call| 0u32);
-field!(multisample_enable, 0, |c: &Call| c.args[1] as u8);
+field!(multisample_enable, 0, |c: &Call| u8::from(
+    c.args[1] as u8 != 0
+));
 field!(samples, 1, |c: &Call| c.args[1] as u8);
-field!(coverage, 2, |c: &Call| c.args[1] as u8);
+field!(coverage, 2, |c: &Call| u8::from(c.args[1] as u8 != 0));
 fn stencil_fields(c: &Call, mask: u16, bits: u16) -> Result<u64> {
     let mut faces: [u16; 2] = c.read(c.args[0] + 4)?;
     for (i, s) in faces.iter_mut().enumerate() {

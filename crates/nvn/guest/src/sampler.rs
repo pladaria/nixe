@@ -3,9 +3,28 @@
 use super::*;
 
 pub fn initialize(c: &Call) -> Result<u64> {
+    c.write(c.args[0], &c.read::<u64>(c.args[1])?)?;
     let s: Sampler = c.read(c.args[1] + 8)?;
     c.write(c.args[0] + 8, &s)?;
     Ok(1)
+}
+
+pub fn equal(c: &Call) -> Result<u64> {
+    let a: Sampler = c.read(c.args[0] + 8)?;
+    let b: Sampler = c.read(c.args[1] + 8)?;
+    // Border components can be integer or floating-point payloads. The LOD
+    // fields and anisotropy use numeric float equality in the object API.
+    Ok((c.read::<u64>(c.args[0])? == c.read::<u64>(c.args[1])?
+        && a.min == b.min
+        && a.mag == b.mag
+        && a.wrap == b.wrap
+        && a.comparison == b.comparison
+        && a.function == b.function
+        && a.reduction == b.reduction
+        && a.border == b.border
+        && a.lod.map(f32::from_bits) == b.lod.map(f32::from_bits)
+        && f32::from_bits(a.bias) == f32::from_bits(b.bias)
+        && f32::from_bits(a.aniso) == f32::from_bits(b.aniso)) as u64)
 }
 
 pub fn defaults(c: &Call) -> Result<u64> {
@@ -92,10 +111,5 @@ pub fn get_reduction(c: &Call) -> Result<u64> {
 }
 pub fn get_border(c: &Call) -> Result<u64> {
     c.write(c.args[1], &read(c)?.border)?;
-    Ok(0)
-}
-
-pub fn finalize(c: &Call) -> Result<u64> {
-    c.write(c.args[0], &Sampler::default())?;
     Ok(0)
 }

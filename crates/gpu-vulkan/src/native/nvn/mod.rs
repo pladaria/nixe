@@ -15,6 +15,7 @@ use std::rc::Rc;
 pub(super) struct Cache {
     initialized: bool,
     next_pipeline: u64,
+    next_queue: u64,
     #[cfg(feature = "execution-trace")]
     draw_counts: [u64; 3],
     #[cfg(feature = "execution-trace")]
@@ -23,7 +24,7 @@ pub(super) struct Cache {
     conditions: crate::residency::predicate::RenderConditions,
     pipelines: HashMap<Arc<nixe_nvn::DrawPipeline>, Rc<shader::Pipeline>>,
     selected_pipeline: Option<(Arc<nixe_nvn::DrawPipeline>, Rc<shader::Pipeline>)>,
-    queues: HashMap<u64, (nixe_nvn::CommandState, selections::Queue)>,
+    queues: HashMap<u64, (Box<nixe_nvn::CommandState>, selections::Queue)>,
     driver_banks: shader::DriverBanks,
     shaders: HashMap<shader::ShaderKey, Rc<shader::Compiled>>,
     physical: shader::PhysicalPipelines,
@@ -33,6 +34,12 @@ pub(super) struct Cache {
     compiler: Option<nixe_shader_recompiler::Compiler>,
 }
 impl Cache {
+    pub(super) fn change_resolution(&mut self) {
+        self.selected_pipeline = None;
+        self.pipelines.clear();
+        self.compute.clear();
+        self.shaders.clear();
+    }
     #[cfg(feature = "execution-trace")]
     pub(super) fn trace_frame(&self) {
         if self.initialized {
@@ -47,6 +54,7 @@ impl Cache {
         self.queues.remove(&queue);
     }
 }
+pub(crate) const NVN_IMAGE_SPACE_ID: u64 = u64::MAX;
 type Shapes = Arc<[nixe_nvn::TextureShape]>;
 fn error(e: impl std::fmt::Display) -> VulkanError {
     VulkanError::Compilation(e.to_string().into())
@@ -116,12 +124,15 @@ impl NativeGpuExecution {
         nixe_gpu::OwnerMemory::invalidate_gpu_cache(self).map_err(BackendRuntimeError::Memory)?;
         let mut n = self.execution();
         n.state.nvn.conditions.begin_list();
-        let (mut state, mut selections) = n
-            .state
-            .nvn
-            .queues
-            .remove(&queue)
-            .unwrap_or_else(|| (nixe_nvn::CommandState::new(&commands), Default::default()));
+        let (mut state, mut selections) = n.state.nvn.queues.remove(&queue).unwrap_or_else(|| {
+            n.state.nvn.next_queue += 1;
+            (
+                Box::new(nixe_nvn::CommandState::new(&commands)),
+                selections::Queue::new(n.state.nvn.next_queue),
+            )
+        });
+        selections.graphics.use_pools(&commands.pool_bounds);
+        selections.compute.use_pools(&commands.pool_bounds);
         let mut order = 0;
         for record in commands.records() {
             let Some(op) = state
@@ -200,7 +211,7 @@ impl NativeExecution<'_> {
                         .checked_add(u32::from(target.first_layer))
                         .ok_or_else(|| runtime(error("volume slice overflow")))?;
                 }
-                let info = resources::info(target).map_err(runtime)?;
+                let info = resources::info(target, false).map_err(runtime)?;
                 let (id, base) = self
                     .find_or_insert_image(&info, &resources::PoolSpace)
                     .map_err(runtime)?;
@@ -208,8 +219,27 @@ impl NativeExecution<'_> {
                     .upload_packed_region(id, base, source, region)
                     .map_err(runtime)?;
             }
+            Operation::ResetCounter(kind) => {
+                match kind {
+                    1 => {
+                        self.residency
+                            .device_mut()
+                            .reset_samples_passed()
+                            .map_err(runtime)?;
+                        selections.count_samples = true;
+                    }
+                    // Pipeline statistics have no observable value until ReportCounter.
+                    // An unsupported report is diagnosed there, even after a reset.
+                    2..=15 => {}
+                    _ => {
+                        return Err(runtime(error(format!(
+                            "unsupported NVN counter reset {kind}"
+                        ))));
+                    }
+                }
+            }
             Operation::Report { kind, address } => {
-                if !matches!(kind, 0 | 16) {
+                if !matches!(kind, 0 | 1 | 16) {
                     return Err(runtime(error(format!("unsupported NVN counter {kind}"))));
                 }
                 // @SIMPLIFICATION Sample the host monotonic clock at ordered command
@@ -221,6 +251,23 @@ impl NativeExecution<'_> {
                     .get_or_insert_with(std::time::Instant::now)
                     .elapsed();
                 let ticks = (elapsed.as_nanos() * 384 / 625) as u64;
+                if kind == 1 {
+                    let range = self
+                        .residency
+                        .device_buffer(
+                            address,
+                            16,
+                            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+                            false,
+                            false,
+                        )
+                        .map_err(runtime)?;
+                    self.residency
+                        .write_sample_report(range, false, ticks)
+                        .map_err(runtime)?;
+                    selections.count_samples = true;
+                    return Ok(());
+                }
                 self.write_nvn_buffer(address, bytemuck::bytes_of(&[0u64, ticks]))
                     .map_err(runtime)?;
                 self.state
@@ -264,13 +311,7 @@ impl NativeExecution<'_> {
                     ))));
                 }
                 let view = resources::target_view(self, target).map_err(runtime)?;
-                let r = rect(
-                    scissor,
-                    [
-                        (target.width >> target.first_level).max(1),
-                        (target.height >> target.first_level).max(1),
-                    ],
-                );
+                let r = rect(scissor, target.view_extent());
                 if r.extent.width > 0 && r.extent.height > 0 {
                     self.residency
                         .clear_view_rect_if(
@@ -327,19 +368,12 @@ impl NativeExecution<'_> {
         mask: u8,
         predicate: Option<&Arc<crate::memory::AllocatedBuffer>>,
     ) -> Result<(), VulkanError> {
-        let r = rect(
-            scissor,
-            [
-                (t.width >> t.first_level).max(1),
-                (t.height >> t.first_level).max(1),
-            ],
-        );
+        let r = rect(scissor, t.view_extent());
         if r.extent.width == 0 || r.extent.height == 0 || (depth.is_none() && mask == 0) {
             return Ok(());
         }
         let view = resources::target_view(self, t)?;
         let image = self.residency.texture_cache.views[view].image;
-        let r = self.residency.image_rect(image, r);
         let mut aspects = vk::ImageAspectFlags::empty();
         if depth.is_some() {
             aspects |= vk::ImageAspectFlags::DEPTH;
@@ -350,12 +384,19 @@ impl NativeExecution<'_> {
         let plane = self.residency.texture_cache.get(image).planes[0];
         let discard = predicate.is_none()
             && mask == 255
-            && self.residency.is_full_image_clear(image, plane, r, aspects);
+            && self.residency.is_full_image_clear(
+                image,
+                plane,
+                self.residency.image_rect(image, r),
+                aspects,
+            );
         let selected = self.residency.image_view_description(view)?;
         self.residency.prepare_image(image, true, discard)?;
         let view = self.residency.image_view(image, selected)?;
         let targets = self.residency.framebuffer_for_view(view)?;
-        let r = vk::ClearRect::default().rect(r).layer_count(1);
+        let r = vk::ClearRect::default()
+            .rect(self.residency.image_rect(image, r))
+            .layer_count(1);
         let value = vk::ClearDepthStencilValue {
             depth: depth.unwrap_or(0.),
             stencil: stencil.into(),
@@ -506,7 +547,8 @@ impl NativeExecution<'_> {
         // Resolving an adjacent range may merge buffers and retire earlier
         // selections. Capture descriptors and framebuffer only after the full
         // draw's resource set has stabilized.
-        let (targets, draw) = loop {
+        let resolution = self.residency.resolution();
+        let (targets, draw, mut constants, rescaled) = loop {
             let revision = self.residency.texture_cache.binding_revision;
             let generation = self.residency.device_memory().generation();
             let epoch = (generation, revision);
@@ -580,23 +622,38 @@ impl NativeExecution<'_> {
                     }),
                 )?;
             }
-            let Some(targets) = selections.targets(self, d, extent, epoch)? else {
+            let Some((targets, rescaled)) = selections.targets(self, d, extent, epoch)? else {
                 continue;
             };
-            break (targets, draw);
+            let constants = if resolution.active {
+                let Some(constants) = self.nvn_scaled_images(&selections.graphics, &pipeline)?
+                else {
+                    continue;
+                };
+                constants
+            } else {
+                state::ShaderConstants::default()
+            };
+            break (targets, draw, constants, rescaled);
         };
         let mut params = pipeline.parameters.borrow_mut();
+        let factor = if rescaled { resolution.up_factor } else { 1. };
         for (i, v) in d.viewports.iter().enumerate() {
             let [x, y, w, h] = v.rect;
             params.viewports[i] = vk::Viewport {
-                x,
-                y: if d.flip_y { y + h } else { y },
-                width: w,
-                height: if d.flip_y { -h } else { h },
+                x: x * factor,
+                y: if d.flip_y { y + h } else { y } * factor,
+                width: w * factor,
+                height: if d.flip_y { -h } else { h } * factor,
                 min_depth: v.depth[0],
                 max_depth: v.depth[1],
             };
-            params.scissors[i] = rect(v.scissor, extent);
+            let scissor = rect(v.scissor, extent);
+            params.scissors[i] = if rescaled {
+                self.residency.scale_rect(scissor)
+            } else {
+                scissor
+            };
         }
         params.depth_bounds = d.dynamic.depth_bounds;
         params.depth_bias = d.dynamic.depth_bias;
@@ -606,7 +663,9 @@ impl NativeExecution<'_> {
         params.stencil_write_mask = d.dynamic.stencil_write;
         params.blend_constants = d.blend_color;
 
-        let constants = state::ShaderConstants::default();
+        if rescaled {
+            constants.set_render_scale(resolution);
+        }
         self.residency.draw_bound(
             selections.graphics.program.as_ref().unwrap(),
             &params,
@@ -614,11 +673,13 @@ impl NativeExecution<'_> {
             draw,
             &constants.as_bytes()[..pipeline.push],
             crate::residency::execution::HostDrawState {
+                images_prepared: resolution.active,
                 geometry_owner: Some(crate::queue::GeometryOwner::StaticPipeline(
                     pipeline.native.identity(),
                 )),
                 predicate,
                 parameter_owner: Some(pipeline.id),
+                count_samples: selections.count_samples,
             },
         )?;
         self.state.statistics.draws += 1;
@@ -655,26 +716,33 @@ impl NativeExecution<'_> {
             p
         };
         pipeline.publish_usage(b);
-        loop {
+        let scaling = self.residency.resolution().active;
+        let push = loop {
             let epoch = (
                 self.residency.device_memory().generation(),
                 self.residency.texture_cache.binding_revision,
             );
             self.nvn_bindings(selected, &pipeline, b, groups, 0, 1)?;
             if epoch
-                == (
+                != (
                     self.residency.device_memory().generation(),
                     self.residency.texture_cache.binding_revision,
                 )
             {
-                break;
+                continue;
             }
-        }
-        let push = state::ShaderConstants::default();
-        self.residency.dispatch(
+            if !scaling {
+                break state::ShaderConstants::default();
+            }
+            if let Some(constants) = self.nvn_scaled_images(selected, &pipeline)? {
+                break constants;
+            }
+        };
+        self.residency.dispatch_bound(
             selected.program.as_ref().unwrap(),
             crate::Dispatch::Direct(groups),
             &push.as_bytes()[..pipeline.push],
+            scaling,
         )?;
         self.state.statistics.dispatches += 1;
         Ok(())
@@ -688,7 +756,35 @@ impl NativeExecution<'_> {
                 false,
                 false,
             )?;
+            #[cfg(feature = "execution-trace")]
+            let original = nixe_gpu::trace::detailed_active().then(|| {
+                (
+                    self.residency.statistics().cpu_uploaded_bytes,
+                    self.residency
+                        .device()
+                        .submission
+                        .recording
+                        .is_some_and(|slot| {
+                            self.residency.device().submission.slots[slot]
+                                .active_render_pass
+                                .is_some()
+                        }),
+                )
+            });
             self.residency.write_buffer(b.buffer, b.offset, bytes)?;
+            #[cfg(feature = "execution-trace")]
+            if let Some((uploaded, in_pass)) = original {
+                let submission = &self.residency.device().submission;
+                let still_in_pass = submission
+                    .recording
+                    .is_some_and(|slot| submission.slots[slot].active_render_pass.is_some());
+                nixe_gpu::trace::detail_event(
+                    "nvn_buffer_write",
+                    bytes.len() as u64,
+                    self.residency.statistics().cpu_uploaded_bytes - uploaded,
+                    u64::from(in_pass && !still_in_pass),
+                );
+            }
         }
         Ok(())
     }

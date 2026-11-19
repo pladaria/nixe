@@ -487,23 +487,6 @@ impl Frames {
             Arc::clone(&self.raw_image.as_ref().unwrap().view)
         };
         let resolution = cache.resolution();
-        let render_extent = if source.transform.rotate_90_clockwise {
-            [source.crop.height, source.crop.width]
-        } else {
-            [source.crop.width, source.crop.height]
-        }
-        .map(|v| resolution.scale(v));
-        if self.last_resolution != Some((source.extent, render_extent)) {
-            log::info!(
-                "render resolution: framebuffer={}x{}, output={}x{}, scale={}",
-                source.extent[0],
-                source.extent[1],
-                render_extent[0],
-                render_extent[1],
-                resolution.up_factor
-            );
-            self.last_resolution = Some((source.extent, render_extent));
-        }
         let mut image_extent = source.extent;
         let mut crop = source.crop;
         if let Some(id) = id {
@@ -524,6 +507,26 @@ impl Frames {
                 crop.width = right - crop.left;
                 crop.height = bottom - crop.top;
             }
+        }
+        let render_extent = if source.transform.rotate_90_clockwise {
+            [crop.height, crop.width]
+        } else {
+            [crop.width, crop.height]
+        };
+        if self.last_resolution != Some((source.extent, render_extent)) {
+            log::info!(
+                "render resolution: framebuffer={}x{}, output={}x{}, scale={}",
+                source.extent[0],
+                source.extent[1],
+                render_extent[0],
+                render_extent[1],
+                if image_extent == source.extent {
+                    1.
+                } else {
+                    resolution.up_factor
+                }
+            );
+            self.last_resolution = Some((source.extent, render_extent));
         }
         let layer_image = render::LayerImage {
             view,

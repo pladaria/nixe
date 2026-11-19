@@ -19,10 +19,11 @@ mod support {
     ));
 }
 
-struct Space;
+struct Space(u64);
+const SPACE: Space = Space(1);
 impl ImageAddressSpace for Space {
     fn image_space_id(&self) -> u64 {
-        1
+        self.0
     }
     fn image_device_address(&self, a: u64) -> Result<Option<u64>, MemoryError> {
         Ok(Some(a))
@@ -63,8 +64,65 @@ fn info(address: u64, format: ImageFormat, w: u32, h: u32, layout: ImageMemoryLa
         maybe_unaligned_layer_stride: 4096,
         size: 4096,
         packing: ImagePacking::Native,
+        storage: false,
         sample_grid: [1, 1],
     }
+}
+
+#[test]
+fn explicit_render_targets_publish_each_gpu_version_on_demand() -> Result<(), VulkanError> {
+    let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4 << 20)?.allocate(4096)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let address = 0x10000;
+    let _mapping = memory.map(
+        address,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 4096)?]),
+        true,
+    )?;
+    let mut cache = VulkanResidency::new(
+        memory.clone(),
+        device,
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let mut r = cache.access();
+    let render_target = r.insert_guest_image(
+        &info(
+            address,
+            ImageFormat::R32Uint,
+            1,
+            1,
+            ImageMemoryLayout::PitchLinear {
+                row_pitch: 128,
+                layer_stride: 4096,
+            },
+        ),
+        &Space(crate::native::NVN_IMAGE_SPACE_ID),
+    )?;
+    for value in [0x1020_3040u32, 0x5060_7080] {
+        r.clear_color_image(
+            render_target,
+            0,
+            vk::ClearColorValue {
+                uint32: [value, 0, 0, 0],
+            },
+        )?;
+        assert!(r.texture_cache.flush_area::<false>(address, 4).is_none());
+        let area = r.texture_cache.flush_area::<true>(address, 4).unwrap();
+        assert!(!area.preemptive);
+        r.download_texture_memory(area.start, area.end - area.start)?;
+        let mut word = [0; 4];
+        memory.reader().read_block_unsafe(address, &mut word)?;
+        assert_eq!(u32::from_le_bytes(word), value);
+    }
+    drop(r);
+    validation.check()?;
+    Ok(())
 }
 
 #[test]
@@ -105,7 +163,7 @@ fn check_alias(format: ImageFormat) -> Result<(), VulkanError> {
         block_depth_log2: 0,
         layer_stride: 4096,
     });
-    let target = r.insert_guest_image(&info(dst, ImageFormat::R8Unorm, 64, 6, tiled), &Space)?;
+    let target = r.insert_guest_image(&info(dst, ImageFormat::R8Unorm, 64, 6, tiled), &SPACE)?;
     let other = r.insert_guest_image(
         &info(
             alias,
@@ -117,7 +175,7 @@ fn check_alias(format: ImageFormat) -> Result<(), VulkanError> {
                 layer_stride: 4096,
             },
         ),
-        &Space,
+        &SPACE,
     )?;
     let clear = |r: &mut Residency<'_>, byte: u8| {
         let bits = u32::from_le_bytes([byte; 4]);
@@ -200,7 +258,7 @@ fn check_alias(format: ImageFormat) -> Result<(), VulkanError> {
             .copy_from_slice(&expected_dma.bytes[at..at + len]);
         at += len;
     }
-    assert!(r.accelerate_dma(&copy, &Space)?);
+    assert!(r.accelerate_dma(&copy, &SPACE)?);
     assert!(r.texture_cache.get(other).dma.pending());
     assert_eq!(r.statistics().native_readback_bytes, 0);
     let area = r
@@ -251,7 +309,7 @@ fn check_alias(format: ImageFormat) -> Result<(), VulkanError> {
     );
     // A clear wins over all older patches; a later fence must publish the clear.
     clear(&mut r, 0x2b)?;
-    assert!(r.accelerate_dma(&copy, &Space)?);
+    assert!(r.accelerate_dma(&copy, &SPACE)?);
     assert!(r.texture_cache.get(other).dma.pending());
     clear(&mut r, 0x39)?;
     assert!(!r.texture_cache.get(other).dma.pending());
@@ -265,7 +323,7 @@ fn check_alias(format: ImageFormat) -> Result<(), VulkanError> {
         .push(texture_download::PendingDownload::Image(other));
     r.commit_texture_downloads()?;
     let last_fence = r.texture_visibility_work().unwrap();
-    assert!(r.accelerate_dma(&copy, &Space)?);
+    assert!(r.accelerate_dma(&copy, &SPACE)?);
     if format.is_depth_stencil() {
         r.scale_image(other, true, false)?;
     }
@@ -339,7 +397,7 @@ fn inline_upload_preserves_gpu_texels_and_supersedes_an_earlier_fence() -> Resul
     };
     let image = r.insert_guest_image(
         &info(image_address, ImageFormat::R32Uint, 64, 16, layout),
-        &Space,
+        &SPACE,
     )?;
     r.clear_color_image(
         image,

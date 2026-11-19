@@ -590,13 +590,45 @@ impl Residency<'_> {
         }
         self.runtime.constructing.push(Resource::Buffer(id));
         let result = if let Some(address) = self.buffer_cache.get(id).device_address {
-            self.synchronize_device_buffer(id, address, offset, size)
+            self.synchronize_device_buffer(id, address, offset, size, None)
         } else {
             self.upload_host_buffer(id, offset, size)
         };
         self.unpin(Resource::Buffer(id));
         result
     }
+    pub(super) fn synchronize_buffer_overwrite(
+        &mut self,
+        id: BufferId,
+        offset: u64,
+        size: u64,
+    ) -> Result<(), VulkanError> {
+        if !self.buffer_cache.binding_current(id) {
+            return Err(VulkanError::InvalidResource(
+                "buffer binding has retired physical coverage",
+            ));
+        }
+        let Some(address) = self.buffer_cache.get(id).device_address else {
+            return Ok(());
+        };
+        let written = address + offset;
+        if !self.buffer_cache.memory_tracker.cpu_modified(written, size) {
+            return Ok(());
+        }
+        // The write marks exactly these bytes GPU-owned. Preserve the CPU
+        // contents of the remaining dirty page intervals before that happens.
+        self.runtime.constructing.push(Resource::Buffer(id));
+        let result = self.synchronize_device_buffer(
+            id,
+            address,
+            offset,
+            size,
+            Some((written, written + size)),
+        );
+        self.unpin(Resource::Buffer(id));
+        result
+    }
+
     /// SynchronizeBuffer consumes CPU page ranges, subtracting exact GPU
     /// modified bytes. Ordinary RAM uploads do not resolve physical producers.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L1740-L1772
@@ -606,6 +638,7 @@ impl Residency<'_> {
         address: u64,
         offset: u64,
         size: u64,
+        overwritten: Option<(u64, u64)>,
     ) -> Result<(), VulkanError> {
         let uploads = self
             .buffer_cache
@@ -613,8 +646,8 @@ impl Residency<'_> {
             .take_uploads(address + offset, size);
         let mut copies = smallvec::SmallVec::<[vk::BufferCopy; 8]>::new();
         let mut packed = 0;
-        let mut add = |start: u64, end: u64| {
-            if start == end {
+        let mut copy_span = |start: u64, end: u64| {
+            if start >= end {
                 return;
             }
             copies.push(
@@ -624,6 +657,17 @@ impl Residency<'_> {
                     .size(end - start),
             );
             packed += end - start;
+        };
+        let mut add = |start: u64, end: u64| {
+            if let Some((first, limit)) = overwritten
+                && start < limit
+                && first < end
+            {
+                copy_span(start, first);
+                copy_span(limit, end);
+            } else {
+                copy_span(start, end);
+            }
         };
         for (start, size) in uploads {
             let mut cursor = start;

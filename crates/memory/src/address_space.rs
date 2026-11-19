@@ -405,6 +405,13 @@ pub fn capture_subrange(
     }
     Ok(selected)
 }
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum DirectWordsComparison {
+    Equal,
+    Different,
+    NeedsCoherentRead,
+}
+
 pub struct AddressSpace {
     id: AddressSpaceId,
     arena: VirtualArena,
@@ -1064,13 +1071,13 @@ impl AddressSpace {
 
     /// Compare a retained snapshot to ordinary RAM without copying it. Device-owned
     /// pages need a coherent read and therefore cannot establish a direct hit.
-    pub fn matches_direct_words(
+    pub fn compare_direct_words(
         &self,
         start: GuestVirtualAddress,
         words: &[u64],
-    ) -> Result<bool, MemoryError> {
+    ) -> Result<DirectWordsComparison, MemoryError> {
         if !start.get().is_multiple_of(8) {
-            return Ok(false);
+            return Ok(DirectWordsComparison::NeedsCoherentRead);
         }
         let end = self.range(start, size_of_val(words) as u64)?;
         let _access = self.quiescence.enter_host()?;
@@ -1080,18 +1087,18 @@ impl AddressSpace {
             if entry & MARKED != 0 || entry == 0 {
                 require_entry(entry, GuestVirtualAddress::new(at), MemoryPermissions::READ)?;
                 if entry_cached(entry) {
-                    return Ok(false);
+                    return Ok(DirectWordsComparison::NeedsCoherentRead);
                 }
             }
             let n = ((PAGE_SIZE - at % PAGE_SIZE).min(end - at) / 8) as usize;
             let i = ((at - start.get()) / 8) as usize;
             // Admission keeps this entire physical page alive during the comparison.
             if !unsafe { crate::raw::matches_words(entry_pointer(entry, at), &words[i..i + n]) } {
-                return Ok(false);
+                return Ok(DirectWordsComparison::Different);
             }
             at += n as u64 * 8;
         }
-        Ok(true)
+        Ok(DirectWordsComparison::Equal)
     }
     pub fn read_into(
         &self,

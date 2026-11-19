@@ -59,6 +59,13 @@ impl Call {
         Ok(())
     }
 }
+mod objects {
+    use super::*;
+    // These objects borrow pool storage. Registered descriptors own their values.
+    pub fn finalize(_: &Call) -> Result<u64> {
+        Ok(0)
+    }
+}
 mod debug {
     use super::*;
     // Debug labels are optional annotations on opaque objects.

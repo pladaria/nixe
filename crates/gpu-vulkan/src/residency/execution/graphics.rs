@@ -5,6 +5,8 @@ pub(crate) use clear::{DeferredClear, RenderPassState};
 pub(crate) use masked_clear::MaskedClearPipelines;
 #[derive(Default)]
 pub(crate) struct HostDrawState<'a> {
+    pub images_prepared: bool,
+    pub count_samples: bool,
     pub parameter_owner: Option<u64>,
     pub geometry_owner: Option<crate::queue::GeometryOwner>,
     pub predicate: Option<&'a Arc<crate::memory::AllocatedBuffer>>,
@@ -819,6 +821,8 @@ impl Residency<'_> {
         draw: Draw,
         push: &[u8],
         HostDrawState {
+            images_prepared,
+            count_samples,
             parameter_owner,
             geometry_owner,
             predicate,
@@ -883,7 +887,7 @@ impl Residency<'_> {
                 }
             } else {
                 let descriptors = self.stream_graphics(program)?;
-                self.host_program_access(program)?;
+                self.host_program_access(program, images_prepared)?;
                 descriptors
             };
             if !draw.is_empty() && descriptors.record.is_none() && descriptors.update.is_none() {
@@ -935,6 +939,11 @@ impl Residency<'_> {
             {
                 if let AttachmentSource::Canonical { view, .. } = a.description.source {
                     let image = self.texture_cache.views[view].image;
+                    if images_prepared {
+                        self.mark_image_modified(image)?;
+                        self.touch(Resource::Image(image));
+                        continue;
+                    }
                     let clear_aspects = if a.plane.aspect == vk::ImageAspectFlags::COLOR {
                         if a.description.load == vk::AttachmentLoadOp::CLEAR {
                             vk::ImageAspectFlags::COLOR
@@ -964,7 +973,7 @@ impl Residency<'_> {
                 draw,
                 push,
                 predicate,
-                false,
+                count_samples,
                 |aspect| Ok(attachment_read_only(aspect, &parameters.state)),
                 |residency| match parameter_owner {
                     Some(owner) => {

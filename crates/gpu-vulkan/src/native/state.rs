@@ -27,6 +27,14 @@ impl Default for ShaderConstants {
     }
 }
 impl ShaderConstants {
+    pub(super) fn set_render_scale(&mut self, scale: crate::ResolutionScaling) {
+        self.0[nixe_shader_recompiler::host_abi::DOWN_FACTOR_OFFSET as usize / 4] =
+            scale.down_factor.to_bits();
+    }
+    pub(super) fn set_image_scaled(&mut self, storage: bool, index: usize) {
+        let base = if storage { 4 } else { 0 };
+        self.0[base + index / 32] |= 1 << (index % 32);
+    }
     pub(super) fn set_instance_offset(&mut self, offset: u32) {
         self.0[nixe_shader_recompiler::host_abi::INSTANCE_OFFSET as usize / 4] = offset;
     }
@@ -48,13 +56,11 @@ impl ShaderConstants {
                 .view
                 .is_some_and(|view| residency.image_is_rescaled(view))
             {
-                let base = if slot.storage_format.is_some() { 4 } else { 0 };
-                constants.0[base + slot.rescaling_index / 32] |= 1 << (slot.rescaling_index % 32);
+                constants.set_image_scaled(slot.storage_format.is_some(), slot.rescaling_index);
             }
         }
         if residency.is_rescaling() {
-            constants.0[nixe_shader_recompiler::host_abi::DOWN_FACTOR_OFFSET as usize / 4] =
-                residency.resolution().down_factor.to_bits();
+            constants.set_render_scale(residency.resolution());
         }
         constants
     }
