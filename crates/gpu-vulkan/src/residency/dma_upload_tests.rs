@@ -180,7 +180,7 @@ fn nvn_buffer_upload_uses_independent_row_and_layer_strides() -> Result<(), Vulk
             }
         }
         memory.write_block_unsafe(source, WriteSource::Bytes(&data))?;
-        r.upload_buffer_region(
+        r.copy_buffer_image_region::<true>(
             id,
             [0, 0],
             source,
@@ -189,6 +189,7 @@ fn nvn_buffer_upload_uses_independent_row_and_layer_strides() -> Result<(), Vulk
                 row: 12,
                 image: layer_stride as u32,
             },
+            [false; 2],
         )?;
         r.download_image_memory(id)?;
         for layer in 0..2 {
@@ -201,6 +202,25 @@ fn nvn_buffer_upload_uses_independent_row_and_layer_strides() -> Result<(), Vulk
             }
         }
     }
+    let download = source + 128;
+    let mut expected = [0xee; 64];
+    memory.write_block_unsafe(download, WriteSource::Bytes(&expected))?;
+    r.copy_buffer_image_region::<false>(
+        id,
+        [0, 0],
+        download,
+        [0, 0, 0, 2, 2, 2],
+        nixe_nvn::CopyStrides { row: 12, image: 32 },
+        [true, true],
+    )?;
+    for (offset, value) in [(0, 35), (12, 34), (32, 33), (44, 32)] {
+        expected[offset..offset + 8].fill(value);
+    }
+    r.read_buffer_memory(download, expected.len() as u64)?;
+    let mut actual = [0; 64];
+    memory.reader().read_block_unsafe(download, &mut actual)?;
+    assert_eq!(actual, expected);
+
     let region = vk::Rect2D {
         offset: vk::Offset2D::default(),
         extent: vk::Extent2D {

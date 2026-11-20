@@ -20,6 +20,53 @@ fn rectangle([x, y, _, width, height, _]: [u32; 6]) -> nixe_gpu::ScissorRect {
     }
 }
 impl NativeExecution<'_> {
+    pub(super) fn copy_nvn_buffer_image(
+        &mut self,
+        buffer: u64,
+        texture: Texture,
+        mut region: [u32; 6],
+        strides: nixe_nvn::CopyStrides,
+        flags: u32,
+        upload: bool,
+    ) -> Result<(), VulkanError> {
+        if flags & !(if upload { 3 } else { 0x1f }) != 0 {
+            return Err(error(format!(
+                "unsupported NVN buffer/image copy flags {flags:#x}"
+            )));
+        }
+        if texture.target == 3 {
+            // NVN locates layers of a 1D array on the Y axis of the copy region.
+            region = [region[0], 0, region[1], region[3], 1, region[4]];
+        }
+        if region[3..].contains(&0) {
+            return Ok(());
+        }
+        if region[2]
+            .checked_add(region[5])
+            .is_none_or(|end| end > texture.layer_count())
+        {
+            return Err(error("NVN buffer/image copy exceeds selected layers"));
+        }
+        if texture.target == 2 {
+            region[2] += u32::from(texture.first_layer);
+        }
+        let info = resources::info(texture, false)?;
+        let (id, base) = self.find_or_insert_image(&info, &resources::PoolSpace)?;
+        if upload {
+            self.residency
+                .copy_buffer_image_region::<true>(id, base, buffer, region, strides, [false; 2])
+        } else {
+            // The SDK reverses the destination pitch for Y and Z in this command.
+            self.residency.copy_buffer_image_region::<false>(
+                id,
+                base,
+                buffer,
+                region,
+                strides,
+                [flags & 8 != 0, flags & 16 != 0],
+            )
+        }
+    }
     pub(super) fn clear_nvn_image(
         &mut self,
         t: Texture,

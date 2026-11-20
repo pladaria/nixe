@@ -137,8 +137,8 @@ impl Residency<'_> {
                 || v.x + v.width > limits.viewport_bounds_range[1]
                 || v.y.min(v.y + v.height) < limits.viewport_bounds_range[0]
                 || v.y.max(v.y + v.height) > limits.viewport_bounds_range[1]
-                || !(0. ..=1.).contains(&v.min_depth)
-                || !(0. ..=1.).contains(&v.max_depth)
+                || (!profile.depth_range_unrestricted
+                    && (!(0. ..=1.).contains(&v.min_depth) || !(0. ..=1.).contains(&v.max_depth)))
             {
                 return Err(VulkanError::InvalidResource(
                     "viewport is non-finite or exceeds enabled host bounds",

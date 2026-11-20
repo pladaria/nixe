@@ -155,7 +155,8 @@ exports! {
         VertexStreamStateSetDivisor => divisor,
     },
     command {
-        CommandBufferCopyBufferToTexture => copy_texture,
+        CommandBufferCopyBufferToTexture => copy_buffer_to_texture,
+        CommandBufferCopyTextureToBuffer => copy_texture_to_buffer,
         CommandBufferSetCopyRowStride => set_copy_row_stride,
         CommandBufferSetCopyImageStride => set_copy_image_stride,
         CommandBufferGetCopyRowStride => get_copy_row_stride,

@@ -2,6 +2,22 @@
 
 use bytemuck::{Pod, Zeroable};
 
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct DepthTransform {
+    pub scale: f32,
+    pub translate: f32,
+}
+
+impl DepthTransform {
+    pub fn viewport_range(self, minus_one_to_one: bool) -> [f32; 2] {
+        [
+            self.translate - if minus_one_to_one { self.scale } else { 0. },
+            self.translate + self.scale,
+        ]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Pod, Zeroable)]
 #[repr(C)]
 pub struct Texture {
@@ -234,7 +250,7 @@ pub(crate) mod op {
     pub const STORAGE: u32 = 37;
     pub const UPDATE: u32 = 38;
     pub const DISPATCH: u32 = 39;
-    pub const COPY_TEXTURE: u32 = 40;
+    pub const COPY_BUFFER_TO_TEXTURE: u32 = 40;
     pub const VIEWPORTS: u32 = 41;
     pub const SCISSORS: u32 = 42;
     pub const DEPTH_RANGES: u32 = 43;
@@ -242,6 +258,7 @@ pub(crate) mod op {
     pub const COPY_IMAGES: u32 = 45;
     pub const CONSERVATIVE: u32 = 46;
     pub const RESET_COUNTER: u32 = 47;
+    pub const COPY_TEXTURE_TO_BUFFER: u32 = 48;
 }
 
 pub const BLEND: [u8; 8] = [0, 2, 1, 2, 1, 1, 1, 0];

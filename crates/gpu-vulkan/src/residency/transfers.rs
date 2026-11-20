@@ -1,15 +1,16 @@
 //! Native transfers and exact canonical write footprints.
-use super::commands::plane_range;
 use super::*;
+use super::{commands::plane_range, sync::native_image_aspects};
 impl Residency<'_> {
-    /// Upload guest texels directly from the resident GPU buffer.
-    pub(crate) fn upload_buffer_region(
+    /// Copy between the native image and the resident guest buffer.
+    pub(crate) fn copy_buffer_image_region<const UPLOAD: bool>(
         &mut self,
         image: ImageId,
         [mip, layer]: [u32; 2],
-        source: u64,
+        address: u64,
         [x, y, z, w, h, d]: [u32; 6],
         strides: nixe_nvn::CopyStrides,
+        [mirror_y, mirror_z]: [bool; 2],
     ) -> Result<(), VulkanError> {
         if w == 0 || h == 0 || d == 0 {
             return Ok(());
@@ -19,17 +20,33 @@ impl Residency<'_> {
         let result = (|| {
             let entry = self.texture_cache.get(image);
             let volume = entry.description.image_type == vk::ImageType::TYPE_3D;
-            let plane = entry
+            let plane_index = entry
                 .planes
                 .iter()
-                .find(|p| p.mip_level == mip && p.array_layer == layer)
-                .copied()
-                .ok_or(VulkanError::InvalidResource("missing target plane"))?;
-            if plane.aspect != vk::ImageAspectFlags::COLOR
-                || entry.description.samples != vk::SampleCountFlags::TYPE_1
+                .position(|p| p.mip_level == mip && p.array_layer == layer)
+                .ok_or(VulkanError::InvalidResource(
+                    "missing buffer/image copy plane",
+                ))?;
+            let plane = self.checked_image_rect(
+                image,
+                plane_index,
+                vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: x as i32,
+                        y: y as i32,
+                    },
+                    extent: vk::Extent2D {
+                        width: w,
+                        height: h,
+                    },
+                },
+            )?;
+            if entry.description.samples != vk::SampleCountFlags::TYPE_1
+                || entry.decoded.is_some()
+                || native_image_aspects(entry.description.format) != plane.aspect
             {
                 return Err(VulkanError::InvalidResource(
-                    "buffer upload requires a single-sample color image",
+                    "buffer/image copy requires a native single-sample, single-aspect format",
                 ));
             }
             let end_layer = if volume {
@@ -37,12 +54,9 @@ impl Residency<'_> {
             } else {
                 entry.description.array_layers - layer
             };
-            if x.checked_add(w).is_none_or(|n| n > plane.extent.width)
-                || y.checked_add(h).is_none_or(|n| n > plane.extent.height)
-                || z.checked_add(d).is_none_or(|n| n > end_layer)
-            {
+            if z.checked_add(d).is_none_or(|n| n > end_layer) {
                 return Err(VulkanError::InvalidResource(
-                    "buffer-to-image copy out of bounds",
+                    "buffer/image copy exceeds image layers",
                 ));
             }
             let block_bytes = u64::from(plane.bytes_per_block);
@@ -58,33 +72,61 @@ impl Residency<'_> {
             } else {
                 u64::from(strides.image)
             };
+            let slice_bytes = (rows - 1) * row + tight_row;
+            let offset_alignment = if plane.aspect == vk::ImageAspectFlags::COLOR {
+                block_bytes
+            } else {
+                4
+            };
             if row < tight_row
+                || row > i32::MAX as u64
                 || !row.is_multiple_of(block_bytes)
+                || (d > 1 && !UPLOAD && image_pitch < slice_bytes)
                 || (d > 1 && !image_pitch.is_multiple_of(block_bytes))
+                || (mirror_y && rows > 1 && !row.is_multiple_of(offset_alignment))
             {
                 return Err(VulkanError::InvalidResource(
-                    "unaligned or undersized buffer-to-image stride",
+                    "unaligned or undersized buffer/image copy stride",
                 ));
             }
-            let bytes = u64::from(d - 1) * image_pitch + (rows - 1) * row + tight_row;
-            let full = mip == 0
+            let bytes = u64::from(d - 1)
+                .checked_mul(image_pitch)
+                .and_then(|n| n.checked_add(slice_bytes))
+                .ok_or(VulkanError::InvalidResource(
+                    "buffer/image copy size overflow",
+                ))?;
+            let tightly_packed = row == tight_row && (d == 1 || image_pitch == slice_bytes);
+            let discard_image = UPLOAD
+                && mip == 0
                 && entry.description.mip_levels == 1
                 && [x, y, z, layer] == [0; 4]
                 && w == plane.extent.width
                 && h == plane.extent.height
                 && d == end_layer;
             let buffer = self.device_buffer(
-                source,
+                address,
                 bytes,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                true,
+                if UPLOAD {
+                    vk::BufferUsageFlags::TRANSFER_SRC
+                } else {
+                    vk::BufferUsageFlags::TRANSFER_DST
+                },
+                UPLOAD || !tightly_packed,
                 false,
             )?;
             self.runtime
                 .constructing
                 .push(Resource::Buffer(buffer.buffer));
-            self.prepare_image(image, true, full)?;
-            self.scale_image(image, false, full)?;
+            if !buffer.offset.is_multiple_of(offset_alignment) {
+                return Err(VulkanError::InvalidResource(
+                    "unaligned buffer/image copy address",
+                ));
+            }
+            self.prepare_image(image, UPLOAD, discard_image)?;
+            self.scale_image(image, false, discard_image)?;
+            if !UPLOAD && tightly_packed {
+                self.synchronize_buffer_overwrite(buffer.buffer, buffer.offset, bytes)?;
+            }
             let layers = plane
                 .layers()
                 .base_array_layer(if volume { layer } else { layer + z })
@@ -93,7 +135,7 @@ impl Residency<'_> {
                 0
             } else {
                 u32::try_from(row / block_bytes * u64::from(plane.block_extent.width)).map_err(
-                    |_| VulkanError::InvalidResource("buffer-to-image row length overflow"),
+                    |_| VulkanError::InvalidResource("buffer/image copy row length overflow"),
                 )?
             };
             let region = vk::BufferImageCopy::default()
@@ -114,18 +156,27 @@ impl Residency<'_> {
             // Otherwise batch one region per slice without repacking the buffer.
             // https://docs.vulkan.org/refpages/latest/refpages/source/VkBufferImageCopy.html
             let mut regions = smallvec::SmallVec::<[vk::BufferImageCopy; 1]>::new();
-            if d == 1 || image_pitch == row * rows {
+            let single_slice = d == 1 || (!mirror_z && image_pitch == row * rows);
+            if !mirror_y && single_slice {
                 regions.push(region);
-            } else if let Some(height) =
-                u32::try_from(image_pitch / row * u64::from(plane.block_extent.height))
-                    .ok()
-                    .filter(|&height| image_pitch.is_multiple_of(row) && height >= h)
+            } else if !mirror_y
+                && !mirror_z
+                && image_pitch.is_multiple_of(row)
+                && let Ok(height) =
+                    u32::try_from(image_pitch / row * u64::from(plane.block_extent.height))
+                && height >= h
             {
                 regions.push(region.buffer_image_height(height));
             } else {
-                regions.extend((0..d).map(|slice| {
-                    let mut region =
-                        region.buffer_offset(buffer.offset + u64::from(slice) * image_pitch);
+                if d > 1 && !image_pitch.is_multiple_of(offset_alignment) {
+                    return Err(VulkanError::InvalidResource(
+                        "unaligned buffer/image copy slice",
+                    ));
+                }
+                for slice in 0..d {
+                    let destination_slice = if mirror_z { d - 1 - slice } else { slice };
+                    let mut region = region
+                        .buffer_offset(buffer.offset + u64::from(destination_slice) * image_pitch);
                     if volume {
                         region.image_offset.z += slice as i32;
                         region.image_extent.depth = 1;
@@ -133,23 +184,61 @@ impl Residency<'_> {
                         region.image_subresource.base_array_layer += slice;
                         region.image_subresource.layer_count = 1;
                     }
-                    region
-                }));
+                    if !mirror_y {
+                        regions.push(region);
+                        continue;
+                    }
+                    for i in 0..rows {
+                        let dy = i as u32 * plane.block_extent.height;
+                        let mut region =
+                            region.buffer_offset(region.buffer_offset + (rows - 1 - i) * row);
+                        region.image_offset.y += dy as i32;
+                        region.image_extent.height = plane.block_extent.height.min(h - dy);
+                        regions.push(region);
+                    }
+                }
             }
-            let src = self.use_buffer(buffer.buffer, buffer.offset, bytes)?;
-            let planes = self.texture_cache.get(image).planes.clone();
-            let selected = planes.iter().copied().filter(|p| {
-                p.mip_level == mip
-                    && (layers.base_array_layer..layers.base_array_layer + layers.layer_count)
-                        .contains(&p.array_layer)
-            });
-            let (dst, layout) = self.image_planes_transfer(image, selected)?;
+            let native_buffer = self.use_buffer(buffer.buffer, buffer.offset, bytes)?;
+            let (native_image, range) = self.transfer_image(
+                image,
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(layers.aspect_mask)
+                    .base_mip_level(mip)
+                    .level_count(1)
+                    .base_array_layer(layers.base_array_layer)
+                    .layer_count(layers.layer_count),
+            )?;
             self.runtime.barriers.emit(&mut self.runtime.device)?;
             unsafe {
-                self.runtime
-                    .device
-                    .dispatch
-                    .copy_buffer_to_image(src, dst, layout, &regions);
+                let dispatch = &mut self.runtime.device.dispatch;
+                if UPLOAD {
+                    dispatch.copy_buffer_to_image(native_buffer, native_image, range, &regions);
+                } else {
+                    dispatch.copy_image_to_buffer(native_image, range, native_buffer, &regions);
+                }
+            }
+            if !UPLOAD {
+                // Publish the GPU-written intervals through normal buffer coherency.
+                // Row and slice padding retain their previous producers.
+                if tightly_packed {
+                    self.finish_buffer_write(buffer.buffer, buffer.offset, bytes)?;
+                } else {
+                    for slice in 0..u64::from(d) {
+                        let offset = buffer.offset + slice * image_pitch;
+                        if row == tight_row {
+                            self.finish_buffer_write(buffer.buffer, offset, slice_bytes)?;
+                        } else {
+                            for y in 0..rows {
+                                self.finish_buffer_write(
+                                    buffer.buffer,
+                                    offset + y * row,
+                                    tight_row,
+                                )?;
+                            }
+                        }
+                    }
+                }
+                self.runtime.statistics.gpu_copied_bytes += u64::from(d) * rows * tight_row;
             }
             Ok(())
         })();

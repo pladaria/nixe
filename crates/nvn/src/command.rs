@@ -122,12 +122,13 @@ pub enum Operation<'a> {
         regions: [[u32; 6]; 2],
         flags: u32,
     },
-    CopyTexture {
-        source: u64,
-        target: Texture,
+    CopyBufferImage {
+        buffer: u64,
+        texture: Texture,
         region: [u32; 6],
         flags: u32,
         strides: CopyStrides,
+        upload: bool,
     },
     Dispatch {
         shader: Shader,
@@ -524,6 +525,18 @@ pub struct CommandState {
 }
 impl CommandState {
     pub fn new(submission: &Submission) -> Self {
+        // The queue initializes the clip mode and the viewport Z registers separately.
+        let transform = if submission.minus_one_to_one {
+            DepthTransform {
+                scale: 1.,
+                translate: 0.5,
+            }
+        } else {
+            DepthTransform {
+                scale: 0.5,
+                translate: 0.,
+            }
+        };
         Self {
             pipeline: Arc::new(DrawPipeline {
                 upper_left: submission.upper_left,
@@ -532,6 +545,10 @@ impl CommandState {
                 viewport_count: 1,
                 ..Default::default()
             }),
+            viewports: [Viewport {
+                depth: transform.viewport_range(submission.minus_one_to_one),
+                ..Viewport::default()
+            }; 16],
             ..Default::default()
         }
     }
@@ -560,22 +577,23 @@ impl CommandState {
                     flags: tail[6] as u32,
                 }));
             }
-            op::COPY_TEXTURE
+            op::COPY_BUFFER_TO_TEXTURE | op::COPY_TEXTURE_TO_BUFFER
                 if matches!(n.checked_sub(5 + size_of::<Texture>() / 8), Some(0 | 1)) =>
             {
                 let end = 2 + size_of::<Texture>() / 8;
-                let target = bytemuck::pod_read_unaligned(bytemuck::cast_slice(&w[2..end]));
+                let texture = bytemuck::pod_read_unaligned(bytemuck::cast_slice(&w[2..end]));
                 let region = bytemuck::pod_read_unaligned(bytemuck::cast_slice(&w[end..end + 3]));
                 let strides = w
                     .get(end + 3)
                     .copied()
                     .map_or_else(CopyStrides::default, bytemuck::cast);
-                return Ok(Some(Operation::CopyTexture {
-                    source: w[0],
-                    target,
+                return Ok(Some(Operation::CopyBufferImage {
+                    buffer: w[0],
+                    texture,
                     region,
                     flags: w[1] as u32,
                     strides,
+                    upload: op == op::COPY_BUFFER_TO_TEXTURE,
                 }));
             }
             op::DISPATCH if n == 3 => {
@@ -701,7 +719,10 @@ impl CommandState {
                 }
             }
             op::CONSERVATIVE if n == 1 => self.raster.conservative_raster = w[0] as u8 != 0,
-            op::DEPTH_RANGE if n == 1 => self.viewports[0].depth = bytemuck::cast(w[0]),
+            op::DEPTH_RANGE if n == 1 => {
+                self.viewports[0].depth = bytemuck::cast::<_, DepthTransform>(w[0])
+                    .viewport_range(self.pipeline.minus_one_to_one);
+            }
             op::VIEWPORTS | op::SCISSORS | op::DEPTH_RANGES if n >= 1 => {
                 let stride = if op == op::DEPTH_RANGES { 1 } else { 2 };
                 let first = w[0] as usize;
@@ -720,7 +741,10 @@ impl CommandState {
                     match op {
                         op::VIEWPORTS => viewport.rect = bytemuck::cast([words[0], words[1]]),
                         op::SCISSORS => viewport.scissor = bytemuck::cast([words[0], words[1]]),
-                        _ => viewport.depth = bytemuck::cast(words[0]),
+                        _ => {
+                            viewport.depth = bytemuck::cast::<_, DepthTransform>(words[0])
+                                .viewport_range(self.pipeline.minus_one_to_one);
+                        }
                     }
                 }
             }
@@ -866,6 +890,45 @@ impl CommandState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_range_records_keep_the_mode_used_to_record_them() {
+        let submission = Submission {
+            minus_one_to_one: true,
+            ..Submission::default()
+        };
+        let mut state = CommandState::new(&submission);
+        assert_eq!(state.viewports[0].depth, [-0.5, 1.5]);
+        let transform = |scale, translate| bytemuck::cast(DepthTransform { scale, translate });
+        state
+            .apply(Record {
+                tag: op::DEPTH_RANGE,
+                args: &[transform(1., 0.)],
+                bindings: None,
+            })
+            .unwrap();
+        state
+            .apply(Record {
+                tag: op::DEPTH_RANGES,
+                args: &[1, transform(-0.25, 0.5), transform(0.25, 0.25)],
+                bindings: None,
+            })
+            .unwrap();
+        assert_eq!(state.viewports[0].depth, [-1., 1.]);
+        assert_eq!(state.viewports[1].depth, [0.75, 0.25]);
+        assert_eq!(state.viewports[2].depth, [0., 0.5]);
+
+        let mut state = CommandState::new(&Submission::default());
+        assert_eq!(state.viewports[0].depth, [0., 0.5]);
+        state
+            .apply(Record {
+                tag: op::DEPTH_RANGE,
+                args: &[transform(0.5, 0.25)],
+                bindings: None,
+            })
+            .unwrap();
+        assert_eq!(state.viewports[0].depth, [0.25, 0.75]);
+    }
 
     #[test]
     fn called_ranges_follow_current_record_boundaries_and_stop_at_the_cut() {

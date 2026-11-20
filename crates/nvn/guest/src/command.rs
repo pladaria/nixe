@@ -538,11 +538,32 @@ pub fn blend_color(c: &Call) -> Result<u64> {
     record(c, op::BLEND_COLOR, &c.read::<[u64; 2]>(c.args[1])?)
 }
 pub fn depth_range(c: &Call) -> Result<u64> {
+    let transform = depth_transform([c.float[0], c.float[1]], depth_clip_mode(c)?);
     record(
         c,
         op::DEPTH_RANGE,
-        &[bytemuck::cast([c.float[0], c.float[1]])],
+        &[bytemuck::cast(transform)],
     )
+}
+fn depth_clip_mode(c: &Call) -> Result<bool> {
+    // The SDK reads the device mode while recording the Z scale and offset.
+    // The queue's clip range is programmed independently at initialization.
+    let device: u64 = c.read(c.args[0] + core::mem::offset_of!(Recorder, device) as u64)?;
+    Ok(c.read::<u32>(device + 8)? != 1)
+}
+fn depth_transform([near, far]: [f32; 2], minus_one_to_one: bool) -> DepthTransform {
+    let span = far - near;
+    if minus_one_to_one {
+        DepthTransform {
+            scale: span * 0.5,
+            translate: (near + far) * 0.5,
+        }
+    } else {
+        DepthTransform {
+            scale: span,
+            translate: near,
+        }
+    }
 }
 pub fn clear_depth(c: &Call) -> Result<u64> {
     record(
@@ -626,17 +647,25 @@ fn array(c: &Call, op: u32, stride: usize) -> Result<u64> {
     )?;
     record(c, op, &buf[..1 + (n * stride).div_ceil(8)])
 }
-pub fn copy_texture(c: &Call) -> Result<u64> {
-    let t = texels::view(c, c.args[2], c.args[3])?;
-    let region: [u32; 6] = c.read(c.args[4])?;
+pub fn copy_buffer_to_texture(c: &Call) -> Result<u64> {
+    let [_, buffer, texture, view, region, ..] = c.args;
+    copy_buffer_image(c, op::COPY_BUFFER_TO_TEXTURE, buffer, [texture, view, region])
+}
+pub fn copy_texture_to_buffer(c: &Call) -> Result<u64> {
+    let [_, texture, view, region, buffer, ..] = c.args;
+    copy_buffer_image(c, op::COPY_TEXTURE_TO_BUFFER, buffer, [texture, view, region])
+}
+fn copy_buffer_image(c: &Call, tag: u32, buffer: u64, [texture, view, region]: [u64; 3]) -> Result<u64> {
+    let t = texels::view(c, texture, view)?;
+    let region: [u32; 6] = c.read(region)?;
     let strides: CopyStrides = c.read(c.args[0] + COPY_STRIDES)?;
     let strided = strides != CopyStrides::default();
     if let Some(dst) = reserve(
         c,
-        op::COPY_TEXTURE,
+        tag,
         5 + size_of::<Texture>() / 8 + usize::from(strided),
     )? {
-        c.write(dst, &[c.args[1], c.args[5]])?;
+        c.write(dst, &[buffer, u64::from(c.args[5] as u32)])?;
         c.write(dst + 16, &t)?;
         let tail = dst + 16 + size_of::<Texture>() as u64;
         c.write(tail, &region)?;
@@ -680,7 +709,23 @@ pub fn scissors(c: &Call) -> Result<u64> {
     viewport_array(c, op::SCISSORS, 2)
 }
 pub fn depth_ranges(c: &Call) -> Result<u64> {
-    viewport_array(c, op::DEPTH_RANGES, 1)
+    let first = c.args[1] as u32;
+    let count = c.args[2] as u32;
+    if first > 16 || count > 16 - first {
+        return Err("invalid viewport array range");
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    let minus_one_to_one = depth_clip_mode(c)?;
+    if let Some(dst) = reserve(c, op::DEPTH_RANGES, 1 + count as usize)? {
+        c.write(dst, &u64::from(first))?;
+        for i in 0..u64::from(count) {
+            let range = c.read(c.args[3] + i * 8)?;
+            c.write(dst + 8 + i * 8, &depth_transform(range, minus_one_to_one))?;
+        }
+    }
+    Ok(0)
 }
 simple!(conservative, CONSERVATIVE, 1);
 pub fn clear_texture(c: &Call) -> Result<u64> {

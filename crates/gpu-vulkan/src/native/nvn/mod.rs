@@ -194,30 +194,15 @@ impl NativeExecution<'_> {
             } => self
                 .copy_nvn_images(textures, regions, flags)
                 .map_err(runtime)?,
-            Operation::CopyTexture {
-                source,
-                target,
+            Operation::CopyBufferImage {
+                buffer,
+                texture,
                 region,
                 flags,
                 strides,
+                upload,
             } => {
-                if flags & !3 != 0 {
-                    return Err(runtime(error(format!(
-                        "unsupported buffer-to-texture copy flags {flags:#x}"
-                    ))));
-                }
-                let mut region = region;
-                if target.target == 2 {
-                    region[2] = region[2]
-                        .checked_add(u32::from(target.first_layer))
-                        .ok_or_else(|| runtime(error("volume slice overflow")))?;
-                }
-                let info = resources::info(target, false).map_err(runtime)?;
-                let (id, base) = self
-                    .find_or_insert_image(&info, &resources::PoolSpace)
-                    .map_err(runtime)?;
-                self.residency
-                    .upload_buffer_region(id, base, source, region, strides)
+                self.copy_nvn_buffer_image(buffer, texture, region, strides, flags, upload)
                     .map_err(runtime)?;
             }
             Operation::ResetCounter(kind) => {
@@ -639,15 +624,21 @@ impl NativeExecution<'_> {
         };
         let mut params = pipeline.parameters.borrow_mut();
         let factor = if rescaled { resolution.up_factor } else { 1. };
+        let unrestricted_depth = self.residency.device().profile().depth_range_unrestricted;
         for (i, v) in d.viewports.iter().enumerate() {
             let [x, y, w, h] = v.rect;
+            let [near, far] = if unrestricted_depth {
+                v.depth
+            } else {
+                v.depth.map(|z| z.clamp(0., 1.))
+            };
             params.viewports[i] = vk::Viewport {
                 x: x * factor,
                 y: if d.flip_y { y + h } else { y } * factor,
                 width: w * factor,
                 height: if d.flip_y { -h } else { h } * factor,
-                min_depth: v.depth[0],
-                max_depth: v.depth[1],
+                min_depth: near,
+                max_depth: far,
             };
             let scissor = rect(v.scissor, extent);
             params.scissors[i] = if rescaled {
