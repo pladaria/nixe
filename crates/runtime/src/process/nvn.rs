@@ -69,7 +69,6 @@ type Procedure = (Box<str>, Option<nixe_nvn::Handler>);
 
 struct Hle {
     session: nixe_nvn::Session,
-    version_ready: OnceLock<()>,
     title: u64,
     platform: TargetPlatform,
     procedures: Box<[OnceLock<Procedure>]>,
@@ -78,7 +77,6 @@ impl Hle {
     fn new(platform: TargetPlatform, title: u64) -> Self {
         Self {
             session: nixe_nvn::Session::new(),
-            version_ready: OnceLock::new(),
             platform,
             title,
             procedures: (0..SLOTS).map(|_| OnceLock::new()).collect(),
@@ -390,7 +388,17 @@ impl NvnHooks {
         } else if let Some(hle) = &self.hle
             && pc == self.base + QUERY_VERSION_DONE as u64
         {
-            hle.version_ready.get_or_init(|| ());
+            let mut major = [0; 4];
+            memory
+                .space()
+                .read_into(
+                    GuestVirtualAddress::new(self.guest_base() + nixe_nvn::GUEST_CODE.len() as u64),
+                    &mut major,
+                )
+                .map_err(|e| e.to_string())?
+                .into_ready()
+                .map_err(|_| "NVN SDK version is unavailable in CPU memory")?;
+            hle.session.record_sdk_api_major(u32::from_le_bytes(major));
         } else if let Some(hle) = &self.hle
             && pc == self.guest_base() + nixe_nvn::GUEST_ERROR_PC as u64
         {
@@ -455,7 +463,7 @@ impl NvnHooks {
                 state.write_x(x(0), wrapped);
                 if name.as_deref() == Some("nvnDeviceGetInteger")
                     && self.hle.as_ref().is_some_and(|h| {
-                        h.platform == TargetPlatform::Switch1 && h.version_ready.get().is_none()
+                        h.platform == TargetPlatform::Switch1 && h.session.sdk_api_major().is_none()
                     })
                 {
                     state.write_x(x(1), self.original_target(&reg, target));

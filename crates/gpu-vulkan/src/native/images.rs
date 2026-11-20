@@ -422,6 +422,7 @@ impl NativeExecution<'_> {
         linear: bool,
         resolve: bool,
         sampling: Option<([i64; 2], [i64; 2])>,
+        mirror: [bool; 2],
     ) -> Result<(), VulkanError> {
         let source = self.residency.texture_cache.views[source_view].image;
         let destination = self.residency.texture_cache.views[destination_view].image;
@@ -448,9 +449,9 @@ impl NativeExecution<'_> {
                     .runtime
                     .constructing
                     .push(Resource::Image(destination));
-                if src.width != dst.width || src.height != dst.height {
+                if src.width != dst.width || src.height != dst.height || mirror != [false; 2] {
                     return Err(VulkanError::InvalidResource(
-                        "multisample resolve cannot scale rectangles",
+                        "multisample resolve cannot scale or mirror rectangles",
                     ));
                 }
                 self.residency.resolve_image(
@@ -533,6 +534,7 @@ impl NativeExecution<'_> {
                 } else {
                     vk::Filter::NEAREST
                 },
+                mirror,
             )?;
             Ok(())
         })();

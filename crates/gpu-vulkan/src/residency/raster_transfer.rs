@@ -73,6 +73,7 @@ impl Residency<'_> {
         source_rect: vk::Rect2D,
         destination_rect: vk::Rect2D,
         filter: vk::Filter,
+        mirror: [bool; 2],
     ) -> Result<WorkTicket, VulkanError> {
         let descriptions = [
             self.texture_cache.get(source).description,
@@ -80,7 +81,8 @@ impl Residency<'_> {
         ];
         // Preserve encoded bits for equal-format, unscaled nearest transfers.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
-        if source_rect.extent == destination_rect.extent
+        if mirror == [false; 2]
+            && source_rect.extent == destination_rect.extent
             && filter == vk::Filter::NEAREST
             && self.texture_cache.get(source).rescaled
                 == self.texture_cache.get(destination).rescaled
@@ -185,10 +187,17 @@ impl Residency<'_> {
         };
         let mut regions = smallvec::SmallVec::<[vk::ImageBlit; 2]>::new();
         for &(src, dst) in &selected {
+            let [mut start, mut end] = corners(source_rect, src.depth_slice);
+            if mirror[0] {
+                std::mem::swap(&mut start.x, &mut end.x);
+            }
+            if mirror[1] {
+                std::mem::swap(&mut start.y, &mut end.y);
+            }
             let next = vk::ImageBlit::default()
                 .src_subresource(src.layers())
                 .dst_subresource(dst.layers())
-                .src_offsets(corners(source_rect, src.depth_slice))
+                .src_offsets([start, end])
                 .dst_offsets(corners(destination_rect, dst.depth_slice));
             // A packed depth/stencil transfer shares the hardware operation,
             // as TextureCacheRuntime::BlitImage does in the reference renderer.

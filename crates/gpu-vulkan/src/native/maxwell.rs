@@ -694,6 +694,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
                             linear,
                             resolve,
                             sampling,
+                            [false; 2],
                         )?;
                         Ok(())
                     })();

@@ -128,6 +128,13 @@ pub struct Range {
     pub size: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct CopyStrides {
+    pub row: u32,
+    pub image: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct VertexStream {

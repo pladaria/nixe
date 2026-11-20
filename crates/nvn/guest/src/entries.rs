@@ -156,6 +156,10 @@ exports! {
     },
     command {
         CommandBufferCopyBufferToTexture => copy_texture,
+        CommandBufferSetCopyRowStride => set_copy_row_stride,
+        CommandBufferSetCopyImageStride => set_copy_image_stride,
+        CommandBufferGetCopyRowStride => get_copy_row_stride,
+        CommandBufferGetCopyImageStride => get_copy_image_stride,
         CommandBufferDispatchCompute => dispatch,
         CommandBufferSetTiledCacheAction => tiled_cache_hint,
         CommandBufferSetTiledCacheTileSize => tiled_cache_hint,

@@ -11,13 +11,22 @@ pub fn nv_surface(c: &Call) -> Result<u64> {
     let t: Texture = c.read(c.args[0])?;
     let [_, offset, pool]: [u64; 3] = c.read(c.args[0] + size_of::<Texture>() as u64)?;
     let l = t.layout()?;
-    let color: u64 = match t.format {
-        1 => 0x000f12400408,
-        0x0d => 0x000f10880710,
-        0x25 | 0x38 => 0x000200a62120,
-        0x3c => 0x000215101210,
-        0x9a | 0x9c => 0x000201a22120,
-        0x6d => 0x000214a62120,
+    // NVN 53 exports the original NvColorFormat codes. The client library
+    // uses the numeric code to select its VIC input/output surface format.
+    let legacy = c.session.sdk_api_major() == Some(53);
+    let color: u64 = match (legacy, t.format) {
+        (true, 1) => 0x000e09200408,
+        (true, 0x0d) => 0x000e08440710,
+        (true, 0x25 | 0x38) => 0x000100532120,
+        (true, 0x3c) => 0x00010a881210,
+        (true, 0x9a | 0x9c) => 0x000108332120,
+        (true, 0x6d) => 0x00010a532120,
+        (false, 1) => 0x000f12400408,
+        (false, 0x0d) => 0x000f10880710,
+        (false, 0x25 | 0x38) => 0x000200a62120,
+        (false, 0x3c) => 0x000215101210,
+        (false, 0x9a | 0x9c) => 0x000201a22120,
+        (false, 0x6d) => 0x000214a62120,
         _ => 0,
     };
     let linear = t.flags & 0x50 != 0;
@@ -28,7 +37,8 @@ pub fn nv_surface(c: &Call) -> Result<u64> {
     words[3] = (color >> 32) as u32;
     words[4] = if linear { 1 } else { 3 };
     words[5] = l.pitch;
-    words[6] = pool::surface_handle(c, pool)?;
+    let handle = pool::surface_handle(c, pool)?;
+    words[6] = handle;
     words[7] = u32::try_from(offset).map_err(|_| "NvRmSurface offset overflow")?;
     if !linear {
         words[8] = 0xfe;
@@ -37,7 +47,7 @@ pub fn nv_surface(c: &Call) -> Result<u64> {
     words[14] = l.bytes as u32;
     words[15] = (l.bytes >> 32) as u32;
     c.write(c.args[2], &words)?;
-    Ok(0)
+    Ok(u64::from(handle))
 }
 
 #[cfg(test)]

@@ -78,7 +78,7 @@ file_system_access_log = true
 [audio]
 output = "stereo"
 # Host volume: 0 mutes output, 100 is full volume. Defaults to 100.
-volume = 0
+volume = 10
 
 [video]
 # Filter for fitting the game image to the window; does not change render resolution.

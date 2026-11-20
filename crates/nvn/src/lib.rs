@@ -3,7 +3,8 @@
 mod abi;
 use abi::*;
 pub use abi::{
-    IMAGE_HANDLE_BASE_SLOT, IMAGE_HANDLE_SLOTS, Range, Sampler, Shader, Texture, VertexStream,
+    CopyStrides, IMAGE_HANDLE_BASE_SLOT, IMAGE_HANDLE_SLOTS, Range, Sampler, Shader, Texture,
+    VertexStream,
 };
 pub use guest_image::{GUEST_CODE, GUEST_ERROR_PC, QUERY_VERSIONS_OFFSET, guest_offset};
 mod bindings;
@@ -93,6 +94,7 @@ impl<T: Eq + std::hash::Hash + Copy> Descriptors<T> {
 }
 pub struct Session {
     graphics: OnceLock<Graphics>,
+    sdk_api_major: OnceLock<u32>,
     pools: Mutex<pool::Mappings>,
     queues: Mutex<queue::Queues>,
     samplers: Mutex<Descriptors<Sampler>>,
@@ -107,11 +109,18 @@ impl Session {
     pub fn new() -> Self {
         Self {
             graphics: OnceLock::new(),
+            sdk_api_major: OnceLock::new(),
             pools: Default::default(),
             queues: Default::default(),
             samplers: Default::default(),
             textures: Default::default(),
         }
+    }
+    pub fn sdk_api_major(&self) -> Option<u32> {
+        self.sdk_api_major.get().copied()
+    }
+    pub fn record_sdk_api_major(&self, version: u32) {
+        self.sdk_api_major.get_or_init(|| version);
     }
     pub fn attach(&self, graphics: Graphics) -> Result<()> {
         self.graphics

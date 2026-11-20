@@ -2,13 +2,14 @@
 use super::commands::plane_range;
 use super::*;
 impl Residency<'_> {
-    /// Upload tightly packed guest texels directly from the resident GPU buffer.
-    pub(crate) fn upload_packed_region(
+    /// Upload guest texels directly from the resident GPU buffer.
+    pub(crate) fn upload_buffer_region(
         &mut self,
         image: ImageId,
         [mip, layer]: [u32; 2],
         source: u64,
         [x, y, z, w, h, d]: [u32; 6],
+        strides: nixe_nvn::CopyStrides,
     ) -> Result<(), VulkanError> {
         if w == 0 || h == 0 || d == 0 {
             return Ok(());
@@ -16,7 +17,6 @@ impl Residency<'_> {
         self.runtime.constructing.push(Resource::Image(image));
         let retained = self.runtime.constructing.len() - 1;
         let result = (|| {
-            self.scale_image(image, false, false)?;
             let entry = self.texture_cache.get(image);
             let volume = entry.description.image_type == vk::ImageType::TYPE_3D;
             let plane = entry
@@ -25,9 +25,11 @@ impl Residency<'_> {
                 .find(|p| p.mip_level == mip && p.array_layer == layer)
                 .copied()
                 .ok_or(VulkanError::InvalidResource("missing target plane"))?;
-            if plane.aspect != vk::ImageAspectFlags::COLOR {
+            if plane.aspect != vk::ImageAspectFlags::COLOR
+                || entry.description.samples != vk::SampleCountFlags::TYPE_1
+            {
                 return Err(VulkanError::InvalidResource(
-                    "packed transfer to depth/stencil image",
+                    "buffer upload requires a single-sample color image",
                 ));
             }
             let end_layer = if volume {
@@ -40,13 +42,37 @@ impl Residency<'_> {
                 || z.checked_add(d).is_none_or(|n| n > end_layer)
             {
                 return Err(VulkanError::InvalidResource(
-                    "packed image copy out of bounds",
+                    "buffer-to-image copy out of bounds",
                 ));
             }
-            let bytes = u64::from(w.div_ceil(plane.block_extent.width))
-                * u64::from(h.div_ceil(plane.block_extent.height))
-                * u64::from(d)
-                * u64::from(plane.bytes_per_block);
+            let block_bytes = u64::from(plane.bytes_per_block);
+            let rows = u64::from(h.div_ceil(plane.block_extent.height));
+            let tight_row = u64::from(w.div_ceil(plane.block_extent.width)) * block_bytes;
+            let row = if strides.row == 0 {
+                tight_row
+            } else {
+                u64::from(strides.row)
+            };
+            let image_pitch = if strides.image == 0 {
+                row * rows
+            } else {
+                u64::from(strides.image)
+            };
+            if row < tight_row
+                || !row.is_multiple_of(block_bytes)
+                || (d > 1 && !image_pitch.is_multiple_of(block_bytes))
+            {
+                return Err(VulkanError::InvalidResource(
+                    "unaligned or undersized buffer-to-image stride",
+                ));
+            }
+            let bytes = u64::from(d - 1) * image_pitch + (rows - 1) * row + tight_row;
+            let full = mip == 0
+                && entry.description.mip_levels == 1
+                && [x, y, z, layer] == [0; 4]
+                && w == plane.extent.width
+                && h == plane.extent.height
+                && d == end_layer;
             let buffer = self.device_buffer(
                 source,
                 bytes,
@@ -57,13 +83,22 @@ impl Residency<'_> {
             self.runtime
                 .constructing
                 .push(Resource::Buffer(buffer.buffer));
-            self.prepare_image(image, true, false)?;
+            self.prepare_image(image, true, full)?;
+            self.scale_image(image, false, full)?;
             let layers = plane
                 .layers()
                 .base_array_layer(if volume { layer } else { layer + z })
                 .layer_count(if volume { 1 } else { d });
+            let row_length = if row == tight_row {
+                0
+            } else {
+                u32::try_from(row / block_bytes * u64::from(plane.block_extent.width)).map_err(
+                    |_| VulkanError::InvalidResource("buffer-to-image row length overflow"),
+                )?
+            };
             let region = vk::BufferImageCopy::default()
                 .buffer_offset(buffer.offset)
+                .buffer_row_length(row_length)
                 .image_subresource(layers)
                 .image_offset(vk::Offset3D {
                     x: x as i32,
@@ -75,6 +110,32 @@ impl Residency<'_> {
                     height: h,
                     depth: if volume { d } else { 1 },
                 });
+            // Vulkan can encode a slice pitch as a whole number of block rows.
+            // Otherwise batch one region per slice without repacking the buffer.
+            // https://docs.vulkan.org/refpages/latest/refpages/source/VkBufferImageCopy.html
+            let mut regions = smallvec::SmallVec::<[vk::BufferImageCopy; 1]>::new();
+            if d == 1 || image_pitch == row * rows {
+                regions.push(region);
+            } else if let Some(height) =
+                u32::try_from(image_pitch / row * u64::from(plane.block_extent.height))
+                    .ok()
+                    .filter(|&height| image_pitch.is_multiple_of(row) && height >= h)
+            {
+                regions.push(region.buffer_image_height(height));
+            } else {
+                regions.extend((0..d).map(|slice| {
+                    let mut region =
+                        region.buffer_offset(buffer.offset + u64::from(slice) * image_pitch);
+                    if volume {
+                        region.image_offset.z += slice as i32;
+                        region.image_extent.depth = 1;
+                    } else {
+                        region.image_subresource.base_array_layer += slice;
+                        region.image_subresource.layer_count = 1;
+                    }
+                    region
+                }));
+            }
             let src = self.use_buffer(buffer.buffer, buffer.offset, bytes)?;
             let planes = self.texture_cache.get(image).planes.clone();
             let selected = planes.iter().copied().filter(|p| {
@@ -88,7 +149,7 @@ impl Residency<'_> {
                 self.runtime
                     .device
                     .dispatch
-                    .copy_buffer_to_image(src, dst, layout, &[region]);
+                    .copy_buffer_to_image(src, dst, layout, &regions);
             }
             Ok(())
         })();

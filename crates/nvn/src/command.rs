@@ -127,6 +127,7 @@ pub enum Operation<'a> {
         target: Texture,
         region: [u32; 6],
         flags: u32,
+        strides: CopyStrides,
     },
     Dispatch {
         shader: Shader,
@@ -559,15 +560,22 @@ impl CommandState {
                     flags: tail[6] as u32,
                 }));
             }
-            op::COPY_TEXTURE if n == 5 + size_of::<Texture>() / 8 => {
-                let end = n - 3;
+            op::COPY_TEXTURE
+                if matches!(n.checked_sub(5 + size_of::<Texture>() / 8), Some(0 | 1)) =>
+            {
+                let end = 2 + size_of::<Texture>() / 8;
                 let target = bytemuck::pod_read_unaligned(bytemuck::cast_slice(&w[2..end]));
-                let region = bytemuck::pod_read_unaligned(bytemuck::cast_slice(&w[end..]));
+                let region = bytemuck::pod_read_unaligned(bytemuck::cast_slice(&w[end..end + 3]));
+                let strides = w
+                    .get(end + 3)
+                    .copied()
+                    .map_or_else(CopyStrides::default, bytemuck::cast);
                 return Ok(Some(Operation::CopyTexture {
                     source: w[0],
                     target,
                     region,
                     flags: w[1] as u32,
+                    strides,
                 }));
             }
             op::DISPATCH if n == 3 => {

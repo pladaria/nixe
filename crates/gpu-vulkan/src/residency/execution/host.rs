@@ -135,6 +135,9 @@ impl Residency<'_> {
                     HostBinding::UniformBytes(_) => crate::cache::DescriptorEntry {
                         buffer: Default::default(),
                     },
+                    HostBinding::NullBuffer => crate::cache::DescriptorEntry {
+                        buffer: vk::DescriptorBufferInfo::default().range(vk::WHOLE_SIZE),
+                    },
                     HostBinding::Buffer {
                         buffer,
                         offset,

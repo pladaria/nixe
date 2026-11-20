@@ -326,6 +326,7 @@ impl NativeExecution<'_> {
                 operation.linear,
                 false,
                 Some((operation.first, operation.step)),
+                [false; 2],
             )?;
             Ok(true)
         })();

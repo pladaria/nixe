@@ -419,10 +419,12 @@ impl NativeExecution<'_> {
                             range.size = range.size.min(size);
                             range
                         }
-                        shader::Input::Storage(stage, slot) => bindings
-                            .buffers
-                            .get(true, stage, slot)
-                            .ok_or_else(|| error(format!("unbound storage slot {stage}:{slot}")))?,
+                        // Reflected slots may be unused by the current shader invocation.
+                        // The driver bank already represents absent ranges with a null address.
+                        // https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/nvn_mtl.m#L13330-L13334
+                        shader::Input::Storage(stage, slot) => {
+                            bindings.buffers.get(true, stage, slot).unwrap_or_default()
+                        }
                         shader::Input::Constants(stage, size) => {
                             let shader = &pipeline
                                 .usage

@@ -51,12 +51,15 @@ impl NativeExecution<'_> {
         regions: [[u32; 6]; 2],
         flags: u32,
     ) -> Result<(), VulkanError> {
-        if flags & !3 != 0 {
+        if flags & !0x1f != 0 {
             return Err(error(format!(
                 "unsupported NVN texture copy flags {flags:#x}"
             )));
         }
         let [src, dst] = regions;
+        // Copy flags reverse the source region independently on each axis.
+        // https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/nvn_mtl.m#L16581-L16583
+        let mirror = [flags & 4 != 0, flags & 8 != 0];
         if src[5] != dst[5] {
             return Err(error("NVN texture copy requires equal layer counts"));
         }
@@ -65,8 +68,13 @@ impl NativeExecution<'_> {
         }
         for z in 0..src[5] {
             let get = |i: usize| {
+                let slice = if i == 0 && flags & 16 != 0 {
+                    src[5] - 1 - z
+                } else {
+                    z
+                };
                 regions[i][2]
-                    .checked_add(z)
+                    .checked_add(slice)
                     .ok_or_else(|| error("NVN copy layer range overflow"))
             };
             let retained = self.residency.runtime.constructing.len();
@@ -80,7 +88,8 @@ impl NativeExecution<'_> {
                         .constructing
                         .push(crate::residency::Resource::Image(image));
                 }
-                if textures[0].format == textures[1].format
+                if mirror == [false; 2]
+                    && textures[0].format == textures[1].format
                     && textures[0].samples.max(1) == textures[1].samples.max(1)
                     && src[3..5] == dst[3..5]
                 {
@@ -116,6 +125,7 @@ impl NativeExecution<'_> {
                     flags & 1 != 0,
                     textures[0].samples > 1 && textures[1].samples <= 1,
                     None,
+                    mirror,
                 )
             })();
             self.residency.runtime.constructing.truncate(retained);

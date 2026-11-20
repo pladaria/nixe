@@ -24,6 +24,7 @@ struct Recorder {
     device: u64,
     callback: u64,
     callback_data: u64,
+    copy_strides: CopyStrides,
 }
 const _: () = assert!(
     core::mem::offset_of!(Recorder, begin) == 64
@@ -90,6 +91,24 @@ recorder_field!(callback_data, callback_data, |c: &Call| c.args[1]);
 recorder_field!(callback_enabled, callback_enabled, |c: &Call| u8::from(
     c.args[1] as u8 != 0
 ));
+// The SDK stores two 32-bit pitches on the command buffer and reads them when
+// recording each transfer. A setter never consumes command memory.
+// https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/hle_nvn.c#L1692-L1705
+const COPY_STRIDES: u64 = core::mem::offset_of!(Recorder, copy_strides) as u64;
+pub fn set_copy_row_stride(c: &Call) -> Result<u64> {
+    c.write(c.args[0] + COPY_STRIDES, &(c.args[1] as u32))?;
+    Ok(0)
+}
+pub fn set_copy_image_stride(c: &Call) -> Result<u64> {
+    c.write(c.args[0] + COPY_STRIDES + 4, &(c.args[1] as u32))?;
+    Ok(0)
+}
+pub fn get_copy_row_stride(c: &Call) -> Result<u64> {
+    c.read::<u32>(c.args[0] + COPY_STRIDES).map(u64::from)
+}
+pub fn get_copy_image_stride(c: &Call) -> Result<u64> {
+    c.read::<u32>(c.args[0] + COPY_STRIDES + 4).map(u64::from)
+}
 pub fn command_used(c: &Call) -> Result<u64> {
     let r: Recorder = c.read(c.args[0])?;
     Ok(r.position - r.command)
@@ -610,10 +629,20 @@ fn array(c: &Call, op: u32, stride: usize) -> Result<u64> {
 pub fn copy_texture(c: &Call) -> Result<u64> {
     let t = texels::view(c, c.args[2], c.args[3])?;
     let region: [u32; 6] = c.read(c.args[4])?;
-    if let Some(dst) = reserve(c, op::COPY_TEXTURE, 5 + size_of::<Texture>() / 8)? {
+    let strides: CopyStrides = c.read(c.args[0] + COPY_STRIDES)?;
+    let strided = strides != CopyStrides::default();
+    if let Some(dst) = reserve(
+        c,
+        op::COPY_TEXTURE,
+        5 + size_of::<Texture>() / 8 + usize::from(strided),
+    )? {
         c.write(dst, &[c.args[1], c.args[5]])?;
         c.write(dst + 16, &t)?;
-        c.write(dst + 16 + size_of::<Texture>() as u64, &region)?;
+        let tail = dst + 16 + size_of::<Texture>() as u64;
+        c.write(tail, &region)?;
+        if strided {
+            c.write(tail + size_of::<[u32; 6]>() as u64, &strides)?;
+        }
     }
     Ok(0)
 }

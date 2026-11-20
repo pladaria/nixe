@@ -126,6 +126,110 @@ fn explicit_render_targets_publish_each_gpu_version_on_demand() -> Result<(), Vu
 }
 
 #[test]
+fn nvn_buffer_upload_uses_independent_row_and_layer_strides() -> Result<(), VulkanError> {
+    let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4 << 20)?.allocate(4 * 4096)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let source = 0x10000;
+    let target = source + 2 * 4096;
+    let _mapping = memory.map(
+        source,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 4 * 4096)?]),
+        true,
+    )?;
+    let mut cache = VulkanResidency::new(
+        memory.clone(),
+        device,
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let mut r = cache.access();
+    let mut image = info(
+        target,
+        ImageFormat::R32Uint,
+        2,
+        2,
+        ImageMemoryLayout::PitchLinear {
+            row_pitch: 128,
+            layer_stride: 4096,
+        },
+    );
+    image.description = ImageDescription::new(
+        ImageDimension::Two,
+        ImageExtent::new(2, 2, 1).unwrap(),
+        ImageFormat::R32Uint,
+        ImageKind::Color,
+        1,
+        2,
+        SampleCount::One,
+    )
+    .unwrap();
+    image.size = 2 * 4096;
+    let id = r.insert_guest_image(&image, &SPACE)?;
+    for (index, layer_stride) in [36, 32].into_iter().enumerate() {
+        let source = source + index as u64 * 4096;
+        let mut data = [0xff; 56];
+        for layer in 0..2 {
+            for row in 0..2 {
+                let offset = layer * layer_stride + row * 12;
+                data[offset..offset + 8].fill((layer_stride + layer * 2 + row) as u8);
+            }
+        }
+        memory.write_block_unsafe(source, WriteSource::Bytes(&data))?;
+        r.upload_buffer_region(
+            id,
+            [0, 0],
+            source,
+            [0, 0, 0, 2, 2, 2],
+            nixe_nvn::CopyStrides {
+                row: 12,
+                image: layer_stride as u32,
+            },
+        )?;
+        r.download_image_memory(id)?;
+        for layer in 0..2 {
+            for row in 0..2 {
+                let mut bytes = [0; 8];
+                memory
+                    .reader()
+                    .read_block_unsafe(target + layer * 4096 + row * 128, &mut bytes)?;
+                assert_eq!(bytes, [(layer_stride as u64 + layer * 2 + row) as u8; 8]);
+            }
+        }
+    }
+    let region = vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent: vk::Extent2D {
+            width: 2,
+            height: 2,
+        },
+    };
+    r.blit_image(
+        id,
+        id,
+        &[(0, 1)],
+        region,
+        region,
+        vk::Filter::NEAREST,
+        [false, true],
+    )?;
+    r.download_image_memory(id)?;
+    for (row, expected) in [33, 32].into_iter().enumerate() {
+        let mut bytes = [0; 8];
+        memory
+            .reader()
+            .read_block_unsafe(target + 4096 + row as u64 * 128, &mut bytes)?;
+        assert_eq!(bytes, [expected; 8]);
+    }
+    validation.check()?;
+    Ok(())
+}
+
+#[test]
 fn dma_preserves_partial_color_alias_and_fence_order() -> Result<(), VulkanError> {
     check_alias(ImageFormat::R32Uint)
 }

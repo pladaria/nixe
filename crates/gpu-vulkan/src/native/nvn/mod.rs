@@ -199,6 +199,7 @@ impl NativeExecution<'_> {
                 target,
                 region,
                 flags,
+                strides,
             } => {
                 if flags & !3 != 0 {
                     return Err(runtime(error(format!(
@@ -216,7 +217,7 @@ impl NativeExecution<'_> {
                     .find_or_insert_image(&info, &resources::PoolSpace)
                     .map_err(runtime)?;
                 self.residency
-                    .upload_packed_region(id, base, source, region)
+                    .upload_buffer_region(id, base, source, region, strides)
                     .map_err(runtime)?;
             }
             Operation::ResetCounter(kind) => {
