@@ -1,0 +1,11 @@
+@nsobid-A6CE40DC3AEDB1BECACD2F1FF4515307C7F2E63
+
+# Kirby and the Forgotten Land (01004D300C5AE000), Switch 1, v1.1.0.
+# Port of theboy181's v1.0.0 60 FPS patch to the matching frame-timing routine.
+# https://github.com/theboy181/switch-ptchtxt-mods
+
+@flag offset_shift 0x100
+@enabled
+00533CD8 0D000014 // Select the frame-interval case at main+0x533D0C.
+00533D18 36008052 // Use a single refresh interval.
+@stop
