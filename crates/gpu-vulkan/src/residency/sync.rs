@@ -6,11 +6,15 @@ use super::*;
 /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/usage_tracker.h
 pub(super) struct UsageTracker {
     pages: Vec<u64>,
+    // A contiguous run of fully marked words in the bitmap. Large, overlapping
+    // bindings can reuse this coverage without scanning or filling those words.
+    full_pages: std::ops::Range<usize>,
 }
 impl UsageTracker {
     pub fn new(size: u64) -> Self {
         Self {
             pages: vec![0; size.div_ceil(4096) as usize],
+            full_pages: 0..0,
         }
     }
     fn bounds(offset: u64, size: u64) -> (usize, usize, u64, u64) {
@@ -40,12 +44,32 @@ impl UsageTracker {
         }
         self.pages[first] |= first_mask;
         self.pages[last] |= last_mask;
-        // Only the edge words need masks. Large vertex windows mark whole
-        // interior pages in bulk, as Eden's UsageTracker::Track does.
-        self.pages[first + 1..last].fill(u64::MAX);
+        let start = first + 1;
+        if start < last {
+            self.mark_full_pages(start, last);
+        }
+    }
+    fn mark_full_pages(&mut self, start: usize, end: usize) {
+        let full = &mut self.full_pages;
+        if end < full.start || start > full.end {
+            self.pages[start..end].fill(u64::MAX);
+            if end - start > full.len() {
+                *full = start..end;
+            }
+            return;
+        }
+        if start < full.start {
+            self.pages[start..full.start].fill(u64::MAX);
+            full.start = start;
+        }
+        if end > full.end {
+            self.pages[full.end..end].fill(u64::MAX);
+            full.end = end;
+        }
     }
     pub fn reset(&mut self) {
         self.pages.fill(0);
+        self.full_pages = 0..0;
     }
 }
 
@@ -371,5 +395,38 @@ mod tests {
         tracker.mark(SIZE - 1, 1);
         assert!(!tracker.used(64, SIZE / 64 * 64 - 64));
         assert!(tracker.used(64, SIZE - 64));
+    }
+
+    #[test]
+    fn usage_accumulates_overlapping_and_disjoint_marks_until_reset() {
+        const PAGE: u64 = 4096;
+        const SIZE: u64 = PAGE * 24;
+        let mut tracker = UsageTracker::new(SIZE);
+        let mut marked = vec![false; (SIZE / 64) as usize];
+        let ranges = [
+            (4 * PAGE + 63, 5 * PAGE + 3),
+            (5 * PAGE, 3 * PAGE),
+            (3 * PAGE + 1, 6 * PAGE),
+            (8 * PAGE + 3, 3 * PAGE + 1),
+            (PAGE + 64, 64),
+            (13 * PAGE, 2 * PAGE + 1),
+            (16 * PAGE, 7 * PAGE + 5),
+            (9 * PAGE, 8 * PAGE),
+        ];
+
+        for _ in 0..2 {
+            assert!(!tracker.used(0, SIZE));
+            for (offset, size) in ranges {
+                tracker.mark(offset, size);
+                let first = (offset / 64) as usize;
+                let last = ((offset + size - 1) / 64) as usize;
+                marked[first..=last].fill(true);
+                for (block, &expected) in marked.iter().enumerate() {
+                    assert_eq!(tracker.used(block as u64 * 64, 1), expected);
+                }
+            }
+            tracker.reset();
+            marked.fill(false);
+        }
     }
 }
