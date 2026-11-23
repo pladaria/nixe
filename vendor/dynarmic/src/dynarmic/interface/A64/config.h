@@ -193,6 +193,14 @@ struct UserConfig {
     /// dynarmic.
     std::uint32_t cntfrq_el0 = 600000000;
 
+    /// Optional x64 wall-clock counter. While running, the aligned atomic word
+    /// contains the host TSC value corresponding to guest time zero. Bit 63
+    /// marks a paused clock and the remaining bits hold elapsed TSC ticks.
+    /// The client keeps the word alive for the JIT's lifetime and supplies a
+    /// Q0.64 multiplier from TSC ticks to guest ticks.
+    const std::uint64_t* cntpct_tsc_base = nullptr;
+    std::uint64_t cntpct_tsc_multiplier = 0;
+
     /// CTR_EL0<27:24> is log2 of the cache writeback granule in words.
     /// CTR_EL0<23:20> is log2 of the exclusives reservation granule in words.
     /// CTR_EL0<19:16> is log2 of the smallest data/unified cacheline in words.

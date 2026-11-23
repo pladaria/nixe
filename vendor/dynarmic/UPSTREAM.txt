@@ -86,6 +86,10 @@ Nixe adaptations
 - backend/x64/a64_emit_x64.cpp checks halt and budget conditions at linked,
   indirect and return transitions to bound scheduler preemption and memory
   transitions.
+- backend/x64/a64_emit_x64.cpp emits wall-clock CNTPCT reads inline when the
+  client supplies a stable host TSC, a shared atomic clock base and a fixed-point
+  frequency multiplier. The sample retries across pause/resume publication.
+  Other clocks and host backends retain the counter callback.
 - frontend/A64/translate/impl/sys_dc.cpp ends blocks after cache operations.
   Nixe applies ownership transitions after releasing its execution lease.
 - ir/opt/a64_get_set_elimination_pass.cpp, ir/opt/passes.h and both A64

@@ -13,6 +13,7 @@ use nixe_cpu::{
 };
 use nixe_cpu_direct_memory::NativeWorker;
 use nixe_memory::{AddressSpace, GuestVirtualAddress, MemoryError};
+use nixe_scheduler::{TscCounter, VirtualClock};
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock, Weak,
     atomic::{AtomicBool, Ordering},
@@ -22,6 +23,7 @@ pub struct Process {
     cpu: ProcessCpuContext,
     space: Arc<AddressSpace>,
     frequency: u32,
+    inline_counter: Option<TscCounter>,
     stopped: AtomicBool,
     controls: Mutex<Vec<CpuControl>>,
     waits: Mutex<Vec<Weak<Notification>>>,
@@ -79,6 +81,7 @@ impl Process {
         cpu: ProcessCpuContext,
         space: Arc<AddressSpace>,
         timer_frequency: u64,
+        clock: Option<&VirtualClock>,
     ) -> Result<Arc<Self>, JitError> {
         if cpu.address_space_id() != space.identity() {
             return Err(JitError::Failure(
@@ -95,14 +98,12 @@ impl Process {
             cpu,
             space,
             frequency,
+            inline_counter: clock.and_then(|clock| clock.tsc_counter(frequency)),
             stopped: AtomicBool::new(false),
             controls: Mutex::new(Vec::new()),
             waits: Mutex::new(Vec::new()),
             failure: OnceLock::new(),
         }))
-    }
-    pub const fn timer_frequency(&self) -> u64 {
-        self.frequency as u64
     }
     pub fn create_thread(self: &Arc<Self>) -> Result<Thread, JitError> {
         if self.stopped.load(Ordering::Acquire) {
@@ -113,6 +114,7 @@ impl Process {
             Configuration {
                 cpu: self.cpu,
                 timer_frequency: self.frequency,
+                inline_counter: self.inline_counter.clone(),
             },
         )?;
         let mut controls = self.controls.lock().unwrap();

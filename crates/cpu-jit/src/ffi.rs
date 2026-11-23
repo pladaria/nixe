@@ -27,6 +27,8 @@ unsafe extern "C" {
         ctr: u32,
         dczid: u32,
         extended_isa: bool,
+        counter_base: *const u64,
+        counter_multiplier: u64,
     ) -> *mut c_void;
     pub fn nixe_dynarmic_destroy(core: *mut c_void);
     pub fn nixe_dynarmic_halt(core: *mut c_void);

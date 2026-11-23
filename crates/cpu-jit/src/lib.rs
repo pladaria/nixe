@@ -37,6 +37,8 @@ struct Native {
     space: Arc<nixe_memory::AddressSpace>,
     context_owned: AtomicBool,
     interrupt: Arc<NativeInterrupt>,
+    // Generated code embeds the address of the shared clock word.
+    _inline_counter: Option<nixe_scheduler::TscCounter>,
     #[cfg(debug_assertions)]
     owner_thread: std::thread::ThreadId,
 }

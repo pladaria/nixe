@@ -1400,6 +1400,7 @@ dependencies = [
  "nixe-cpu",
  "nixe-cpu-direct-memory",
  "nixe-memory",
+ "nixe-scheduler",
 ]
 
 [[package]]
@@ -1612,6 +1613,9 @@ dependencies = [
 [[package]]
 name = "nixe-scheduler"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "nixe-shader-recompiler"

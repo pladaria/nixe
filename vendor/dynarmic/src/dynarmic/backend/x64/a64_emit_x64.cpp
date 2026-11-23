@@ -747,6 +747,33 @@ void A64EmitX64::EmitA64GetCNTFRQ(A64EmitContext& ctx, IR::Inst* inst) {
 }
 
 void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
+    if (conf.wall_clock_cntpct && conf.cntpct_tsc_base) {
+        const auto low = ctx.reg_alloc.ScratchGpr(HostLoc::RAX);
+        const auto high = ctx.reg_alloc.ScratchGpr(HostLoc::RDX);
+        const auto address = ctx.reg_alloc.ScratchGpr();
+        const auto base = ctx.reg_alloc.ScratchGpr();
+        Xbyak::Label retry;
+        code.mov(address, reinterpret_cast<std::uintptr_t>(conf.cntpct_tsc_base));
+        code.L(retry);
+        code.mov(base, qword[address]);
+        code.lfence();
+        code.rdtsc();
+        code.lfence();
+        code.shl(high, 32);
+        code.or_(low, high);
+        code.sub(low, base);
+        // Retry if pause or resume changed the origin during the sample.
+        code.cmp(base, qword[address]);
+        code.jne(retry);
+        code.test(base, base);
+        code.cmovs(low, base);
+        code.btr(low, 63);
+        code.mov(high, conf.cntpct_tsc_multiplier);
+        code.mul(high);
+        ctx.reg_alloc.DefineValue(inst, high);
+        return;
+    }
+
     ctx.reg_alloc.HostCall(inst);
     if (!conf.wall_clock_cntpct) {
         code.UpdateTicks();

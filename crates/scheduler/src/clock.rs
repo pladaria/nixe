@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod tsc;
+
 /// Initial wall-clock policy selected by the application runtime.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum VirtualClockMode {
@@ -18,9 +21,9 @@ pub enum VirtualClockMode {
 struct VirtualClockState {
     mode: VirtualClockMode,
     wall_anchor: i64,
-    monotonic_anchor: Instant,
+    host: HostClock,
     scheduler_time_ns: AtomicU64,
-    // Running: accumulated paused nanoseconds. Paused: flag + frozen elapsed.
+    // Running: host counter at virtual time zero. Paused: flag + frozen elapsed.
     // One atomic word keeps reads lock-free and transitions indivisible.
     pause: AtomicU64,
     timer_epoch: Mutex<u64>,
@@ -28,6 +31,69 @@ struct VirtualClockState {
 }
 
 const PAUSED: u64 = 1 << 63;
+
+#[derive(Debug)]
+enum HostClock {
+    Monotonic(Instant),
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    Tsc(tsc::Scale),
+}
+
+impl HostClock {
+    fn new(mode: VirtualClockMode) -> (Self, u64) {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if mode == VirtualClockMode::Realtime
+            && let Some(scale) = tsc::Scale::host()
+        {
+            let base = tsc::read();
+            if base < PAUSED {
+                return (Self::Tsc(scale), base);
+            }
+        }
+        let _ = mode;
+        (Self::Monotonic(Instant::now()), 0)
+    }
+
+    fn sample(&self) -> u64 {
+        match self {
+            Self::Monotonic(anchor) => {
+                anchor.elapsed().as_nanos().min(u128::from(PAUSED - 1)) as u64
+            }
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Self::Tsc(_) => tsc::read(),
+        }
+    }
+
+    fn nanoseconds(&self, elapsed: u64) -> u64 {
+        match self {
+            Self::Monotonic(_) => elapsed,
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            Self::Tsc(scale) => scale.nanoseconds(elapsed),
+        }
+    }
+}
+
+/// The shared running base or paused value and the scale for an inline x64 counter.
+/// Retain this handle for as long as generated code can read the base.
+#[derive(Clone)]
+pub struct TscCounter {
+    state: Arc<VirtualClockState>,
+    multiplier: u64,
+}
+
+impl TscCounter {
+    /// Bit 63 marks a paused clock. The low bits are then frozen elapsed TSC ticks.
+    /// While running, the word is the TSC value mapped to virtual time zero.
+    pub fn base_ptr(&self) -> *const u64 {
+        self.state.pause.as_ptr().cast_const()
+    }
+
+    /// The high half of an unsigned product by this value gives guest ticks.
+    pub const fn multiplier(&self) -> u64 {
+        self.multiplier
+    }
+}
+
 fn pause_transition(state: u64, now: u64, paused: bool) -> u64 {
     if paused {
         PAUSED | now.saturating_sub(state)
@@ -39,7 +105,7 @@ fn pause_transition(state: u64, now: u64, paused: bool) -> u64 {
 /// One cloneable clock source shared by the scheduler and emulated services.
 ///
 /// Realtime mode samples `SystemTime` only at construction. Subsequent reads
-/// use `Instant`, so host wall-clock adjustments cannot make guest time move
+/// use a monotonic host counter, so host wall-clock adjustments cannot make guest time move
 /// backwards.
 #[derive(Clone)]
 pub struct VirtualClock {
@@ -54,13 +120,14 @@ impl VirtualClock {
             VirtualClockMode::Realtime => host_unix_seconds(),
             VirtualClockMode::Fixed { unix_seconds } => unix_seconds,
         };
+        let (host, base) = HostClock::new(mode);
         Self {
             state: Arc::new(VirtualClockState {
                 mode,
                 wall_anchor,
-                monotonic_anchor: Instant::now(),
+                host,
                 scheduler_time_ns: AtomicU64::new(0),
-                pause: AtomicU64::new(0),
+                pause: AtomicU64::new(base),
                 timer_epoch: Mutex::new(0),
                 timer_changed: Condvar::new(),
             }),
@@ -78,35 +145,50 @@ impl VirtualClock {
     /// Returns monotonic elapsed time since this clock was created.
     #[must_use]
     pub fn elapsed(&self) -> Duration {
+        Duration::from_nanos(self.elapsed_ns())
+    }
+
+    /// Returns monotonic elapsed time in nanoseconds.
+    #[must_use]
+    pub fn elapsed_ns(&self) -> u64 {
         match self.state.mode {
-            VirtualClockMode::Realtime => self.host_elapsed(),
-            VirtualClockMode::Fixed { .. } => {
-                Duration::from_nanos(self.state.scheduler_time_ns.load(Ordering::Acquire))
-            }
+            VirtualClockMode::Realtime => self.host_elapsed_ns(),
+            VirtualClockMode::Fixed { .. } => self.state.scheduler_time_ns.load(Ordering::Acquire),
         }
+    }
+
+    /// Returns an inline counter only when this clock uses the host TSC.
+    #[must_use]
+    pub fn tsc_counter(&self, frequency: u32) -> Option<TscCounter> {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let HostClock::Tsc(scale) = self.state.host {
+            return Some(TscCounter {
+                state: Arc::clone(&self.state),
+                multiplier: scale.multiplier(u64::from(frequency))?,
+            });
+        }
+        let _ = frequency;
+        None
     }
 
     /// Host service time excluding pauses, also available with a fixed guest clock.
     #[must_use]
     pub fn host_elapsed(&self) -> Duration {
-        loop {
-            let state = self.state.pause.load(Ordering::Acquire);
-            if state & PAUSED != 0 {
-                return Duration::from_nanos(state & !PAUSED);
-            }
-            let now = self.host_elapsed_ns();
-            if self.state.pause.load(Ordering::Acquire) == state {
-                return Duration::from_nanos(now.saturating_sub(state));
-            }
-        }
+        Duration::from_nanos(self.host_elapsed_ns())
     }
 
     fn host_elapsed_ns(&self) -> u64 {
-        self.state
-            .monotonic_anchor
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(PAUSED - 1)) as u64
+        let host = &self.state.host;
+        loop {
+            let state = self.state.pause.load(Ordering::Acquire);
+            if state & PAUSED != 0 {
+                return host.nanoseconds(state & !PAUSED);
+            }
+            let now = host.sample();
+            if self.state.pause.load(Ordering::Acquire) == state {
+                return host.nanoseconds(now.saturating_sub(state));
+            }
+        }
     }
 
     /// Freezes/resumes the shared process clock, excluding host pause duration.
@@ -117,7 +199,7 @@ impl VirtualClock {
             return;
         }
         // The epoch mutex serializes writers; atomic publication is for readers.
-        let next = pause_transition(state, self.host_elapsed_ns(), paused);
+        let next = pause_transition(state, self.state.host.sample(), paused);
         self.state.pause.store(next, Ordering::Release);
         *epoch = epoch.wrapping_add(1);
         self.state.timer_changed.notify_all();
@@ -141,9 +223,7 @@ impl VirtualClock {
     pub fn scheduler_time_ns(&self) -> u64 {
         let scheduled = self.state.scheduler_time_ns.load(Ordering::Acquire);
         match self.state.mode {
-            VirtualClockMode::Realtime => {
-                scheduled.max(self.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
-            }
+            VirtualClockMode::Realtime => scheduled.max(self.host_elapsed_ns()),
             VirtualClockMode::Fixed { .. } => scheduled,
         }
     }

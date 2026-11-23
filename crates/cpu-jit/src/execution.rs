@@ -25,6 +25,7 @@ pub struct Core {
 pub struct Configuration {
     pub cpu: nixe_cpu::profile::ProcessCpuContext,
     pub timer_frequency: u32,
+    pub inline_counter: Option<nixe_scheduler::TscCounter>,
 }
 /// Bridge event, decoded by the CPU execution loop after Run has returned.
 pub struct Event {
@@ -64,6 +65,12 @@ impl Core {
             Some(nixe_cpu::semantics::a64::RuntimeRegisterRead::Constant(value)) => value as u32,
             _ => unreachable!("CPU profile defines CTR_EL0 and DCZID_EL0"),
         };
+        let (counter_base, counter_multiplier) = configuration
+            .inline_counter
+            .as_ref()
+            .map_or((std::ptr::null(), 0), |counter| {
+                (counter.base_ptr(), counter.multiplier())
+            });
         let pointer = unsafe {
             ffi::nixe_dynarmic_create(
                 ffi::Callbacks {
@@ -79,6 +86,8 @@ impl Core {
                 register(0xd53b0020),
                 register(0xd53b00e0),
                 configuration.cpu.platform() == nixe_cpu::platform::TargetPlatform::Switch2,
+                counter_base,
+                counter_multiplier,
             )
         };
         if pointer.is_null() {
@@ -92,6 +101,7 @@ impl Core {
             space: Arc::clone(&space),
             context_owned: AtomicBool::new(false),
             interrupt: interrupt.clone(),
+            _inline_counter: configuration.inline_counter,
             #[cfg(debug_assertions)]
             owner_thread: std::thread::current().id(),
         });

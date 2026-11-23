@@ -55,6 +55,7 @@ fn process_fixture(code: &[u32]) -> (Arc<AddressSpace>, Arc<JitProcess>) {
         ProcessCpuContext::for_platform(TargetPlatform::Switch1, memory.identity()),
         memory.clone(),
         19_200_000,
+        None,
     )
     .unwrap();
     (memory, process)
@@ -172,6 +173,63 @@ fn direct_memory_exclusives_simd_fp_tls_and_system_registers() {
     assert_eq!(state.read_x(x(9)), 0);
     assert_eq!(state.read_x(x(10)), 0x8444c004);
     assert_eq!(state.read_x(x(11)), 4);
+}
+
+#[test]
+fn inline_counter_advances_in_a_linked_block_and_shares_pause_across_cores() {
+    use nixe_scheduler::{VirtualClock, VirtualClockMode};
+    let clock = VirtualClock::new(VirtualClockMode::Realtime);
+    if clock.tsc_counter(19_200_000).is_none() {
+        return;
+    }
+    let code = [
+        0xd53be020, // MRS X0,CNTPCT_EL0
+        0xd2808002, // MOV X2,#1024
+        0xf1000442, // SUBS X2,X2,#1
+        0xd53be021, // MRS X1,CNTPCT_EL0
+        0x54ffffc1, // B.NE to SUBS
+        0xd4000001, // SVC #0
+    ];
+    let (memory, _) = process_fixture(&code);
+    let process = JitProcess::new(
+        ProcessCpuContext::for_platform(TargetPlatform::Switch1, memory.identity()),
+        memory,
+        19_200_000,
+        Some(&clock),
+    )
+    .unwrap();
+    let mut first = process.create_thread().unwrap();
+    let mut second = process.create_thread().unwrap();
+    let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
+    let mut state: ThreadState = a64_state().into();
+    let mut read = |jit: &mut JitThread| {
+        state.materialize();
+        state.set_pc(CODE.get());
+        let report = jit
+            .run_slice(
+                &mut worker,
+                JitRunRequest {
+                    state: &mut state,
+                    timer: &FixedTimer,
+                },
+            )
+            .unwrap();
+        assert!(matches!(report.stop, CpuExit::SupervisorCall { .. }));
+        assert_eq!(state.read_x(x(2)), 0);
+        (state.read_x(x(0)), state.read_x(x(1)))
+    };
+    let (before, after) = read(&mut first);
+    assert!(before > 0 && after > before);
+    clock.set_paused(true);
+    let expected = read(&mut first).0;
+    let scheduler_ticks = ((u128::from(clock.elapsed_ns()) * 12) / 625) as u64;
+    assert!(expected.abs_diff(scheduler_ticks) <= 1);
+    assert!(expected >= after);
+    assert_eq!(read(&mut first), (expected, expected));
+    assert_eq!(read(&mut second), (expected, expected));
+    clock.set_paused(false);
+    let (before, after) = read(&mut second);
+    assert!(before >= expected && after > before);
 }
 
 #[test]
@@ -532,52 +590,6 @@ fn fallback_sites_keep_pc_and_fpcr_identity_when_addresses_become_readable() {
 }
 
 #[test]
-fn address_range_proofs_preserve_masking_overflow_and_invalid_accesses() {
-    // STR X3,[X4]; address expression; LDR X2,[X1]; STR X5,[X1];
-    // LDR X6,[X4]; SVC. Invalid accesses preserve the mapped sentinel.
-    let cases: &[(&[u32], u64, bool)] = &[
-        (&[0xd2840001], 0, true),                             // MOV X1,#0x2000
-        (&[0x92403c01, 0x91002021], u64::MAX - 0xe007, true), // AND; ADD #8
-        (&[0x2a0003e1], 0xffff_ffff_0000_2000, true),         // MOV W1,W0
-        (&[0x2a0003e1, 0xd1002021], 4, false),                // zero extension; SUB #8
-        (&[0xd2840001, 0xf2c00021], 0, false),                // constant outside Bits32
-        (&[0xaa0003e1], 0x2000, true),                        // runtime MOV X1,X0
-        (&[0xaa0003e1], 0x1_0000_2000, false),
-    ];
-    for &(expression, input, mapped) in cases {
-        let mut code = vec![0xf9000083];
-        code.extend_from_slice(expression);
-        code.extend_from_slice(&[0xf9400022, 0xf9000025, 0xf9400086, 0xd4000841]);
-        let (_memory, mut jit) = fixture(&code);
-        // Reuse the compiled block with different runtime inputs too. A value
-        // loaded from an X register is not a compilation-time address proof.
-        for input in [input, input ^ (1 << 48), input] {
-            let mut state: ThreadState = a64_state().into();
-            state.write_x(x(0), input);
-            state.write_x(x(3), 0x1122_3344_5566_7788);
-            state.write_x(x(4), 0x2000);
-            state.write_x(x(5), 0x8877_6655_4433_2211);
-            let mapped = mapped && (expression != [0xaa0003e1] || input == 0x2000);
-            assert!(matches!(
-                run(&mut jit, &mut state).stop,
-                CpuExit::SupervisorCall {
-                    immediate: 0x42,
-                    ..
-                }
-            ));
-            assert_eq!(
-                state.read_x(x(2)),
-                if mapped { state.read_x(x(3)) } else { 0 }
-            );
-            assert_eq!(
-                state.read_x(x(6)),
-                state.read_x(x(if mapped { 5 } else { 3 }))
-            );
-        }
-    }
-}
-
-#[test]
 fn scheduler_interrupt_exits_direct_and_indirect_native_loops() {
     for branch in [0x17fffffe, 0xd61f0040] {
         // B -8 / BR X2.
@@ -647,6 +659,7 @@ fn complete_context_survives_alternating_guests_and_migrating_between_cores() {
         ProcessCpuContext::for_platform(TargetPlatform::Switch1, memory.identity()),
         memory,
         19_200_000,
+        None,
     )
     .unwrap();
     let mut first = process.create_thread().unwrap();

@@ -56,11 +56,10 @@ impl RunnableProcess {
     pub(crate) fn has_native_threads(&self) -> bool {
         self.native_cores.load(std::sync::atomic::Ordering::Acquire) != 0
     }
-    pub(crate) fn execution_environment(&self) -> (crate::VirtualClock, u64) {
-        (
-            self.scheduler.clock().clone(),
-            self.execution.timer_frequency(),
-        )
+    pub(crate) fn execution_environment(
+        &self,
+    ) -> (crate::VirtualClock, nixe_cpu::platform::TargetPlatform) {
+        (self.scheduler.clock().clone(), self.cpu.platform())
     }
     pub fn finish_process(
         &self,

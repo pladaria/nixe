@@ -57,6 +57,7 @@ fn fixture(words: &[u32]) -> Arc<Process> {
         ProcessCpuContext::new(TargetPlatform::Switch1, space.identity()),
         space,
         19_200_000,
+        None,
     )
     .unwrap()
 }

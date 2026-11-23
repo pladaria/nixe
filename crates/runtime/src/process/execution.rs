@@ -89,12 +89,12 @@ impl Error for ProcessTeardownFailure {}
 
 struct RuntimeTimer<'a> {
     clock: &'a VirtualClock,
-    frequency: u64,
+    platform: nixe_cpu::platform::TargetPlatform,
 }
 pub(crate) struct CoreExecution {
     pub(crate) thread: GuestCpuState,
     pub(crate) virtual_clock: VirtualClock,
-    pub(crate) architectural_timer_frequency: u64,
+    pub(crate) platform: nixe_cpu::platform::TargetPlatform,
 }
 impl CoreExecution {
     pub(crate) fn run(
@@ -104,7 +104,7 @@ impl CoreExecution {
     ) -> Result<ExecutionReport, CpuFault> {
         let timer = RuntimeTimer {
             clock: &self.virtual_clock,
-            frequency: self.architectural_timer_frequency,
+            platform: self.platform,
         };
         thread.run_slice(
             worker,
@@ -117,15 +117,16 @@ impl CoreExecution {
 }
 impl ArchitecturalTimer for RuntimeTimer<'_> {
     fn snapshot(&self) -> TimerSnapshot {
-        let ticks = self
-            .clock
-            .elapsed()
-            .as_nanos()
-            .saturating_mul(u128::from(self.frequency))
-            / 1_000_000_000;
+        use nixe_cpu::platform::TargetPlatform;
+        let nanos = self.clock.elapsed_ns();
+        let counter = match self.platform {
+            // Split the quotient and remainder to support the full elapsed range.
+            TargetPlatform::Switch1 => (nanos / 625) * 12 + ((nanos % 625) * 12) / 625,
+            TargetPlatform::Switch2 => nanos >> 5,
+        };
         TimerSnapshot {
-            counter: u64::try_from(ticks).unwrap_or(u64::MAX),
-            frequency: self.frequency,
+            counter,
+            frequency: self.platform.counter_frequency().into(),
         }
     }
 }

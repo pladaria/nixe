@@ -106,6 +106,7 @@ fn main() {
         ProcessCpuContext::for_platform(TargetPlatform::Switch1, memory.identity()),
         memory,
         19_200_000,
+        None,
     )
     .unwrap();
     let mut cores = [

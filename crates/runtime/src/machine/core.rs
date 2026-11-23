@@ -329,14 +329,14 @@ pub(crate) fn run_guest<D: ExceptionDispatcher>(
 ) -> Completion {
     let process = thread.owner().expect("kernel thread owns process").clone();
     let generation = process.generation();
-    let (clock, frequency) = process.execution_environment();
+    let (clock, platform) = process.execution_environment();
     let mut guest = GuestExecution {
         execution: CoreExecution {
             thread: thread
                 .take_state()
                 .expect("first guest context owns saved registers"),
             virtual_clock: clock,
-            architectural_timer_frequency: frequency,
+            platform,
         },
         thread: thread.clone(),
     };

@@ -6,7 +6,7 @@ mod lifecycle;
 mod scheduler;
 mod topology;
 
-pub use clock::{VirtualClock, VirtualClockMode};
+pub use clock::{TscCounter, VirtualClock, VirtualClockMode};
 pub use identity::{GuestThreadId, ProcessId, VirtualCpuId, WakeGeneration};
 pub use lifecycle::{
     LifecycleTransitionError, ProcessLifecycle, ThreadLifecycle, transition_process,

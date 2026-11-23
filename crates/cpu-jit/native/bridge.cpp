@@ -64,7 +64,7 @@ struct Core final : Dynarmic::A64::UserCallbacks {
 
   Core(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table, size_t address_bits,
        std::uint32_t frequency, std::uint32_t ctr, std::uint32_t dczid,
-       bool extended_isa)
+       bool extended_isa, const std::uint64_t *counter_base, std::uint64_t counter_multiplier)
       : callbacks(cb) {
     Dynarmic::A64::UserConfig conf{};
     conf.callbacks = this;
@@ -82,6 +82,8 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.tpidr_el0 = &tpidr;
     conf.tpidrro_el0 = &tpidrro;
     conf.cntfrq_el0 = frequency;
+    conf.cntpct_tsc_base = counter_base;
+    conf.cntpct_tsc_multiplier = counter_multiplier;
     conf.ctr_el0 = ctr;
     conf.dczid_el0 = dczid;
     conf.wall_clock_cntpct = true;
@@ -256,9 +258,11 @@ bool nixe_dynarmic_resolve_fault(std::uint64_t pc, std::uint64_t *call,
 const char *nixe_dynarmic_error() noexcept { return last_error.c_str(); }
 void *nixe_dynarmic_create(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table,
                            size_t bits, std::uint32_t frequency, std::uint32_t ctr,
-                           std::uint32_t dczid, bool extended_isa) noexcept {
+                           std::uint32_t dczid, bool extended_isa, const std::uint64_t *counter_base,
+                           std::uint64_t counter_multiplier) noexcept {
   try {
-    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid, extended_isa);
+    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid, extended_isa,
+                    counter_base, counter_multiplier);
   } catch (const std::exception &e) {
     last_error = e.what();
     return nullptr;

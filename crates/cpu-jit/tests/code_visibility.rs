@@ -50,6 +50,7 @@ fn fixture(words: &[u32]) -> (Arc<AddressSpace>, Arc<JitProcess>) {
         ProcessCpuContext::for_platform(TargetPlatform::Switch1, space.identity()),
         space.clone(),
         19_200_000,
+        None,
     )
     .unwrap();
     (space, process)

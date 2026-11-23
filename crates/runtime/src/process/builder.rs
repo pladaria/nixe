@@ -362,6 +362,7 @@ impl ProcessBuilder {
             cpu,
             Arc::clone(memory.space()),
             u64::from(self.config.target_platform.counter_frequency()),
+            Some(self.kernel.clock()),
         )
         .map_err(|error| ProcessBuildError::new(ProcessBuildStage::CpuInitialization, error))?;
         let process = RunnableProcess {
