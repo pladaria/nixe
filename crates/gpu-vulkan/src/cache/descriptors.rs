@@ -833,7 +833,9 @@ impl VulkanDevice {
                 "push constants must cover the compiled ABI within host size/alignment limits",
             ));
         }
-        let entries = entries.filter(|entries| !entries.is_empty());
+        use crate::queue::DescriptorBinding;
+
+        let mut entries = entries.filter(|entries| !entries.is_empty());
         let record = record.filter(|_| entries.is_none());
         let index = self.recording_slot()?;
         let slot = &mut self.submission.slots[index];
@@ -863,13 +865,24 @@ impl VulkanDevice {
             )
         };
         let mut bind_record = None;
-        if entries.is_some() {
-            // A queued update can disturb a previous set's layout. Its old
-            // identity must not suppress the next captured-record binding.
-            *bound = 0;
-            self.submission.statistics.descriptor_binds += 1;
+        if let Some(update) = entries {
+            // A queue reservation is immutable for its generation, including
+            // when a later draw reuses the same staging selections.
+            let selection = Some(DescriptorBinding::Queued(update));
+            if *bound == selection
+                && *bound_layout == layout.handle
+                && *bound_offsets == dynamic_offsets
+            {
+                entries = None;
+            } else {
+                *bound = selection;
+                *bound_layout = layout.handle;
+                bound_offsets.clear();
+                bound_offsets.extend_from_slice(dynamic_offsets);
+                self.submission.statistics.descriptor_binds += 1;
+            }
         } else if let Some(record) = record {
-            let identity = Arc::as_ptr(record) as usize;
+            let identity = Some(DescriptorBinding::Record(Arc::as_ptr(record) as usize));
             if layout.push_descriptor
                 || *bound != identity
                 || *bound_layout != layout.handle

@@ -28,10 +28,48 @@ impl Default for Slot {
     }
 }
 
+/// Host programs select staging by descriptor slot. A dirty source can still
+/// reuse identical bytes, while a clean source skips the RAM read altogether.
+#[derive(Default)]
+pub(super) struct HostUniformUpload {
+    pub(super) immutable: Option<(Arc<[u8]>, u64, crate::queue::Slice)>,
+    guest: Option<(u64, crate::queue::Slice)>,
+    pub(super) bytes: Vec<u8>,
+    source: Option<(u64, u64)>,
+}
+impl HostUniformUpload {
+    pub(super) fn current(
+        &self,
+        tick: u64,
+        size: u64,
+        alignment: u64,
+    ) -> Option<crate::queue::Slice> {
+        let (previous, slice) = self.guest?;
+        (previous == tick && slice.size == size && slice.offset.is_multiple_of(alignment))
+            .then_some(slice)
+    }
+    pub(super) fn keep(
+        &self,
+        source: Option<(u64, u64)>,
+        tick: u64,
+        size: u64,
+        alignment: u64,
+    ) -> Option<crate::queue::Slice> {
+        if source.is_some() && self.source == source {
+            return self.current(tick, size, alignment);
+        }
+        None
+    }
+}
+
 pub(super) struct UniformStreams {
     slots: Box<[Slot]>,
     scratch: [u8; MAX_BYTES],
     clean: [u32; STAGES],
+    pub(super) host: Vec<HostUniformUpload>,
+    pub(super) host_scratch: Vec<u8>,
+    host_epoch: u64,
+    host_live: bool,
     // Half-open ranges for inline data and CPU/GPU notifications. Never spills.
     writes: smallvec::SmallVec<[(u64, u64); MAX_WRITES]>,
     writes_need_aliases: bool,
@@ -46,6 +84,10 @@ impl UniformStreams {
             slots: (0..STAGES * SLOTS).map(|_| Slot::default()).collect(),
             scratch: [0; MAX_BYTES],
             clean: [0; STAGES],
+            host: Vec::new(),
+            host_scratch: Vec::new(),
+            host_epoch: 0,
+            host_live: false,
             writes: Default::default(),
             writes_need_aliases: false,
             sync,
@@ -56,8 +98,28 @@ impl UniformStreams {
     }
     pub(crate) fn invalidate(&mut self) {
         self.clean = [0; STAGES];
+        self.invalidate_host();
         self.writes.clear();
         self.writes_need_aliases = false;
+    }
+    pub(super) fn invalidate_host(&mut self) {
+        self.host_epoch += 1;
+        self.host_live = false;
+    }
+    pub(super) fn host_epoch(&self) -> u64 {
+        self.host_epoch
+    }
+    pub(super) fn remember_host(
+        &mut self,
+        index: usize,
+        tick: u64,
+        slice: crate::queue::Slice,
+        source: Option<(u64, u64)>,
+    ) {
+        let slot = &mut self.host[index];
+        slot.guest = Some((tick, slice));
+        slot.source = source;
+        self.host_live |= source.is_some();
     }
     fn begin(
         &mut self,
@@ -84,7 +146,7 @@ impl UniformStreams {
         }
     }
     fn note_write(&mut self, address: u64, size: u64, aliases: bool) {
-        if size == 0 || self.clean == [0; STAGES] {
+        if size == 0 || (!self.host_live && self.clean == [0; STAGES]) {
             return;
         }
         let end = address + size;
@@ -126,6 +188,15 @@ impl UniformStreams {
         if self.writes.is_empty() {
             return;
         }
+        let written = |address, size| {
+            Self::written(
+                &self.writes,
+                self.writes_need_aliases,
+                device,
+                address,
+                size,
+            )
+        };
         for stage in 0..STAGES {
             let mut mask = self.clean[stage];
             while mask != 0 {
@@ -136,27 +207,51 @@ impl UniformStreams {
                     self.clean[stage] &= !(1 << index);
                     continue;
                 }
-                let overlaps = |begin: u64, size: u64| {
-                    self.writes
-                        .iter()
-                        .any(|&(address, end)| address < begin + size && begin < end)
-                };
-                let mut written = overlaps(slot.address, slot.size as u64);
-                if !written && self.writes_need_aliases {
-                    // Resolve aliases of the small retained range, never every
-                    // page of a potentially large GPU destination. CPU write
-                    // notifications already contain all device aliases.
-                    device.apply_device_aliases(slot.address, slot.size as u64, |at, bytes| {
-                        written = written || overlaps(at, bytes);
-                    });
-                }
-                if written {
+                if written(slot.address, slot.size as u64) {
                     self.clean[stage] &= !(1 << index);
+                }
+            }
+        }
+        if self.host_live {
+            self.host_live = false;
+            for slot in &mut self.host {
+                if let Some((epoch, address)) = slot.source
+                    && let Some((previous, slice)) = slot.guest
+                    && epoch == self.host_epoch
+                    && previous == tick
+                {
+                    if written(address, slice.size) {
+                        slot.source = None;
+                    } else {
+                        self.host_live = true;
+                    }
                 }
             }
         }
         self.writes.clear();
         self.writes_need_aliases = false;
+    }
+    fn written(
+        writes: &[(u64, u64)],
+        aliases: bool,
+        device: &nixe_memory::device_memory::DeviceMemory,
+        address: u64,
+        size: u64,
+    ) -> bool {
+        let overlaps = |begin: u64, size: u64| {
+            writes
+                .iter()
+                .any(|&(address, end)| address < begin + size && begin < end)
+        };
+        let mut written = overlaps(address, size);
+        if !written && aliases {
+            // Resolve aliases of the small retained range, never every page of
+            // a large destination. CPU notifications already visit all aliases.
+            device.apply_device_aliases(address, size, |at, bytes| {
+                written = written || overlaps(at, bytes);
+            });
+        }
+        written
     }
 }
 
@@ -170,6 +265,27 @@ impl BufferCache {
 }
 
 impl Residency<'_> {
+    /// CPU-visible NVN ordering boundaries can expose stores to streamed pages
+    /// with no resident upload to protect them. Drop the source identity only.
+    pub(crate) fn invalidate_nvn_uniforms(&mut self) {
+        self.buffer_cache.uniform_streams.invalidate_host();
+    }
+    pub(crate) fn uniform_sync(&self) -> Arc<AtomicU64> {
+        self.caches.guest_memory_sync()
+    }
+    pub(super) fn prepare_host_uniforms(&mut self, slots: usize, nvn: bool) {
+        let streams = &mut self.buffer_cache.uniform_streams;
+        if nvn {
+            streams.apply_writes(
+                &self.runtime.device_memory,
+                self.runtime.device.current_work().tick(),
+            );
+        }
+        if streams.host.len() < slots {
+            streams.host.resize_with(slots, Default::default);
+        }
+    }
+
     pub(super) fn kept_uniform<const STAGE: usize>(
         &mut self,
         index: usize,
@@ -292,5 +408,72 @@ impl Residency<'_> {
         slot.address = address;
         streams.clean[STAGE] |= 1 << index;
         Ok(slice)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixe_memory::{AllocationRange, PAGE_SIZE, WriteSource, device_memory::DeviceMemory};
+
+    mod support {
+        use crate as nixe_gpu_vulkan;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/device.rs"
+        ));
+    }
+
+    #[test]
+    fn nvn_uniform_keep_expires_on_aliased_writes_and_queue_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+            return Ok(());
+        };
+        let machine = Machine::new(16 << 20)?;
+        let allocation = machine.account(4 << 20)?.allocate(PAGE_SIZE)?;
+        let source = DeviceMemory::new(machine, 32);
+        let backing = Arc::from([AllocationRange::new(allocation.pin(), 0, PAGE_SIZE)?]);
+        let _input = source.map(0x10000, Arc::clone(&backing), true)?;
+        let _alias = source.map(0x20000, backing, true)?;
+        let mut cache = VulkanResidency::new(
+            source.clone(),
+            device,
+            64 << 20,
+            BufferDownloadPolicy::OnRead,
+        )?;
+        let mut r = cache.access();
+        let range = r.device_buffer(
+            0x10004,
+            16,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            false,
+            false,
+        )?;
+        let request = buffer::BufferStreamRequest {
+            id: range.buffer,
+            offset: range.offset,
+            size: range.size,
+            alignment: 256,
+        };
+        let load = |r: &mut Residency<'_>| -> Result<_, VulkanError> {
+            r.prepare_host_uniforms(1, true);
+            Ok(r.stream_buffer(0, request, true)?.unwrap())
+        };
+        let first = load(&mut r)?;
+        assert_eq!(load(&mut r)?.offset, first.offset);
+        assert_eq!(r.statistics().uniform_read_bytes, 16);
+
+        source.write_block_unsafe(0x20004, WriteSource::Bytes(&[1; 16]))?;
+        r.buffer_cache.note_uniform_gpu_write(0x20004, 16);
+        let updated = load(&mut r)?;
+        assert_ne!(first.offset, updated.offset);
+        assert_eq!(r.statistics().uniform_read_bytes, 32);
+
+        r.invalidate_nvn_uniforms();
+        assert_eq!(load(&mut r)?.offset, updated.offset);
+        assert_eq!(r.statistics().uniform_read_bytes, 48);
+        assert_eq!(r.statistics().uniform_uploads, 2);
+        Ok(())
     }
 }

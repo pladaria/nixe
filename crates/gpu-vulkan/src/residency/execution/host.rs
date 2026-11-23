@@ -81,7 +81,6 @@ impl Residency<'_> {
             record: Default::default(),
             bindings: Vec::new(),
             direct_entries: None,
-            unaligned_uniforms: 0,
         })
     }
     pub fn prepare_host_program(
@@ -113,15 +112,6 @@ impl Residency<'_> {
                 let entries = entries.get_mut();
                 let record = program.record.get_mut();
                 record.payload = None;
-                if let Ok(slot) = program
-                    .pipeline
-                    .layout
-                    .uniform_bindings
-                    .binary_search_by_key(&index, |u| u.resource)
-                    && let Some(previous) = record.uniforms.get_mut(slot)
-                {
-                    *previous = (vk::Buffer::null(), 0, 0);
-                }
                 let entry = match input {
                     HostBinding::Image(view) => crate::cache::DescriptorEntry {
                         image: vk::DescriptorImageInfo::default()
@@ -225,13 +215,6 @@ impl Residency<'_> {
             vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
         );
         let limits = &self.runtime.device.profile().limits;
-        let alignment = limits.min_uniform_buffer_offset_alignment;
-        let unaligned = |binding: &HostBinding| {
-            uniform
-                && matches!(binding, HostBinding::Buffer { offset, .. } if !offset.is_multiple_of(alignment))
-        };
-        let was_unaligned = program.bindings.get(index).is_some_and(unaligned);
-        let now_unaligned = unaligned(binding);
         if !self.input_binding_current(binding) {
             return Err(VulkanError::InvalidResource(
                 "program selects a retired native binding",
@@ -286,8 +269,6 @@ impl Residency<'_> {
                     "initial program slots are not in order",
                 ))? = binding.clone();
         }
-        program.unaligned_uniforms =
-            program.unaligned_uniforms + usize::from(now_unaligned) - usize::from(was_unaligned);
         Ok(())
     }
     fn finish_host_capture(&self, program: &mut HostProgram) -> Result<(), VulkanError> {

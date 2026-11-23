@@ -147,6 +147,12 @@ pub(crate) fn align_up(value: u64, alignment: u64) -> Option<u64> {
         .map(|v| v & !(alignment - 1))
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DescriptorBinding {
+    Record(usize),
+    Queued(crate::cache::DescriptorUpdate),
+}
+
 pub(crate) struct Slot {
     timing: Option<timing::Queries>,
     frame: Option<u64>,
@@ -157,7 +163,7 @@ pub(crate) struct Slot {
     pub framebuffers: Vec<Arc<crate::render_pass::Framebuffer>>,
     pub framebuffer_handles: rustc_hash::FxHashSet<vk::Framebuffer>,
     pub retained_views: Vec<Arc<crate::AllocatedImageView>>,
-    pub bound_graphics_binding: usize,
+    pub bound_graphics_binding: Option<DescriptorBinding>,
     pub bound_compute_offsets: Vec<u32>,
     pub bound_graphics_offsets: Vec<u32>,
     pub bound_compute_layout: vk::PipelineLayout,
@@ -172,7 +178,7 @@ pub(crate) struct Slot {
     pub active_render_pass: Option<crate::residency::execution::RenderPassState>,
     pub graphics_state: crate::native::maxwell::dynamic_state::CommandState,
     pub feedback_aspects: Option<vk::ImageAspectFlags>,
-    pub bound_compute_binding: usize,
+    pub bound_compute_binding: Option<DescriptorBinding>,
 }
 impl Slot {
     fn new(native: Arc<crate::dispatch::CommandSlot>) -> Result<Self, VulkanError> {
@@ -188,7 +194,7 @@ impl Slot {
             framebuffers: Vec::new(),
             framebuffer_handles: Default::default(),
             retained_views: Vec::new(),
-            bound_graphics_binding: 0,
+            bound_graphics_binding: None,
             bound_compute_offsets: Vec::new(),
             bound_graphics_offsets: Vec::new(),
             bound_compute_layout: vk::PipelineLayout::null(),
@@ -203,7 +209,7 @@ impl Slot {
             active_render_pass: None,
             graphics_state: Default::default(),
             feedback_aspects: None,
-            bound_compute_binding: 0,
+            bound_compute_binding: None,
         };
         Ok(slot)
     }
@@ -572,8 +578,8 @@ impl QueueState {
         slot.push_bytes.clear();
         slot.graphics_state = Default::default();
         slot.feedback_aspects = None;
-        slot.bound_compute_binding = 0;
-        slot.bound_graphics_binding = 0;
+        slot.bound_compute_binding = None;
+        slot.bound_graphics_binding = None;
         slot.bound_compute_offsets.clear();
         slot.bound_graphics_offsets.clear();
         slot.bound_compute_layout = vk::PipelineLayout::null();

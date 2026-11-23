@@ -48,15 +48,6 @@ pub(super) struct BufferStreamRequest {
     pub size: u64,
     pub alignment: u64,
 }
-/// A staging slice belongs to its allocating command buffer. Only slices for
-/// the current tick can be selected again; the allocator owns retirement.
-#[derive(Default)]
-pub(super) struct UniformUpload {
-    pub(super) immutable: Option<(Arc<[u8]>, u64, crate::queue::Slice)>,
-    guest: Option<(u64, crate::queue::Slice)>,
-    bytes: Vec<u8>,
-}
-pub(super) type BufferStream = Option<crate::queue::Slice>;
 impl Residency<'_> {
     /// Match the cache/stream preference over recent guest frames, independently
     /// of host presentation frequency. Alignment copies remain mandatory.
@@ -143,6 +134,7 @@ impl Residency<'_> {
         }
         let changed = self.runtime.device_memory.take_changes();
         self.buffer_cache.device_mapping_generation = generation;
+        self.buffer_cache.uniform_streams.invalidate_host();
         let mut seen = smallvec::SmallVec::<[SlotId; 16]>::new();
         for (address, bytes) in changed.iter() {
             self.buffer_cache.write_memory(address, bytes);
@@ -440,9 +432,23 @@ impl Residency<'_> {
         &mut self,
         slot: usize,
         request: BufferStreamRequest,
-    ) -> Result<BufferStream, VulkanError> {
-        self.check_buffer_range(request.id, request.offset, request.size)?;
-        let entry = self.buffer_cache.get(request.id);
+        nvn: bool,
+    ) -> Result<Option<crate::queue::Slice>, VulkanError> {
+        let cache = &mut *self.buffer_cache;
+        let entry = &cache.buffers[request.id];
+        let address = entry.device_address.map(|address| address + request.offset);
+        let tick = self.runtime.device.current_work().tick();
+        let streams = &mut cache.uniform_streams;
+        let key = if nvn {
+            address.map(|address| (streams.host_epoch(), address))
+        } else {
+            None
+        };
+        if let Some(slice) = streams.host[slot].keep(key, tick, request.size, request.alignment) {
+            self.runtime.statistics.uniform_keeps += 1;
+            self.touch(Resource::Buffer(request.id));
+            return Ok(Some(slice));
+        }
         let [full] = entry.contents.geometry.as_slice() else {
             return Ok(None);
         };
@@ -454,21 +460,14 @@ impl Residency<'_> {
         }
         // Stream only CPU-owned bytes, using the same DAddr dirty tracker as
         // SynchronizeBuffer. Physical producer searches are unnecessary here.
-        if entry.device_address.is_some_and(|address| {
-            self.buffer_cache
-                .gpu_modified_ranges
-                .intersects(address + request.offset, request.size)
-        }) {
+        if address
+            .is_some_and(|address| cache.gpu_modified_ranges.intersects(address, request.size))
+        {
             return Ok(None);
         }
-        let address = entry.device_address.map(|address| address + request.offset);
         if request.offset.is_multiple_of(request.alignment)
-            && address.is_some_and(|address| {
-                !self
-                    .buffer_cache
-                    .memory_tracker
-                    .cpu_modified(address, request.size)
-            })
+            && address
+                .is_some_and(|address| !cache.memory_tracker.cpu_modified(address, request.size))
             && !entry.invalid.intersects(request.offset, request.size)
         {
             // The resident allocation already holds these bytes. The normal
@@ -476,8 +475,7 @@ impl Residency<'_> {
             return Ok(None);
         }
         let runtime = &mut self.runtime;
-        let tick = runtime.device.current_work().tick();
-        let data = &mut runtime.uniform_scratch;
+        let data = &mut streams.host_scratch;
         let size = request.size as usize;
         if data.len() < size {
             data.resize(size, 0);
@@ -494,11 +492,8 @@ impl Residency<'_> {
                 .map_err(memory_error)?;
         }
         runtime.statistics.uniform_read_bytes += request.size;
-        let kept = &mut runtime.host_uniform_uploads[slot];
-        let slice = if let Some((previous, slice)) = kept.guest
-            && previous == tick
-            && slice.offset.is_multiple_of(request.alignment)
-            && slice.size == request.size
+        let kept = &mut streams.host[slot];
+        let slice = if let Some(slice) = kept.current(tick, request.size, request.alignment)
             && kept.bytes[..size] == *capture
         {
             runtime.statistics.uniform_reuses += 1;
@@ -509,11 +504,11 @@ impl Residency<'_> {
                 .submission
                 .reserve_upload_aligned(capture, request.alignment.max(4))?;
             std::mem::swap(&mut kept.bytes, data);
-            kept.guest = Some((tick, slice));
             runtime.statistics.cpu_streamed_bytes += request.size;
             runtime.statistics.uniform_uploads += 1;
             slice
         };
+        streams.remember_host(slot, tick, slice, key);
         self.touch(Resource::Buffer(request.id));
         Ok(Some(slice))
     }

@@ -146,6 +146,7 @@ impl NativeGpuExecution {
         }
         nixe_gpu::OwnerMemory::invalidate_gpu_cache(self).map_err(BackendRuntimeError::Memory)?;
         let mut n = self.execution();
+        n.residency.invalidate_nvn_uniforms();
         n.state.nvn.conditions.begin_list();
         let (mut state, mut selections) = n.state.nvn.queues.remove(&queue).unwrap_or_else(|| {
             n.state.nvn.next_queue += 1;
@@ -170,6 +171,9 @@ impl NativeGpuExecution {
                         "unsupported NVN barrier bits {flags:#x}"
                     ))));
                 }
+                if flags != 0 {
+                    n.residency.invalidate_nvn_uniforms();
+                }
                 // Cache invalidations are covered by coherent shader/descriptor and
                 // resource reads. State changes between two orders issue no GPU work.
                 order |= flags & 0x10f;
@@ -180,6 +184,7 @@ impl NativeGpuExecution {
                 order = 0;
             }
             if let Operation::FenceSync(flush_for_cpu) = op {
+                n.residency.invalidate_nvn_uniforms();
                 let sync = commands
                     .next_fence(cursor)
                     .ok_or_else(|| runtime(error("NVN fence receipt is missing")))?;
@@ -198,6 +203,7 @@ impl NativeGpuExecution {
                 value,
             } = op
             {
+                n.residency.invalidate_nvn_uniforms();
                 if let Some(wait) = n.wait_nvn_event(address, mode, value).map_err(runtime)? {
                     log::trace!(
                         "NVN queue {queue:#x} suspended on event {address:#x} mode={mode} expected={value:#x}"

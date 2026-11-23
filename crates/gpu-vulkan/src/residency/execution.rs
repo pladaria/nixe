@@ -122,7 +122,7 @@ pub enum HostBinding {
     Sampler(Sampler),
 }
 #[derive(Clone, Copy)]
-pub(super) enum HostBindingAccess {
+enum HostBindingAccess<'a> {
     Buffer {
         id: BufferId,
         offset: u64,
@@ -133,6 +133,7 @@ pub(super) enum HostBindingAccess {
         id: ImageId,
         scope: AccessScope,
     },
+    PointerTable(&'a [BufferRange]),
 }
 /// Host utility shader captures. Guest Configure uses cache-owned hardware
 /// banks and DescriptorQueue directly; it never constructs this object.
@@ -145,7 +146,6 @@ pub struct HostProgram {
     // use ticks and the native execution owner's persistent sampler cache.
     bindings: Vec<HostBinding>,
     direct_entries: Option<std::cell::RefCell<Vec<crate::cache::DescriptorEntry>>>,
-    unaligned_uniforms: usize,
     dynamic_offsets: Vec<u32>,
 }
 impl HostProgram {
@@ -161,7 +161,6 @@ impl HostProgram {
 #[derive(Default)]
 struct ProgramRecord {
     payload: Option<(u64, u64, crate::cache::DescriptorUpdate)>,
-    uniforms: Vec<(vk::Buffer, u64, u64)>,
     current: Option<Arc<BindingRecord>>,
     streamed: bool,
 }
@@ -201,8 +200,11 @@ impl Residency<'_> {
             native: Arc::clone(&view.native),
         })
     }
-    fn host_binding_usage(&self, program: &HostProgram, index: usize) -> Option<HostBindingAccess> {
+    fn host_binding_usage(program: &HostProgram, index: usize) -> Option<HostBindingAccess<'_>> {
         let scope = program.pipeline.resources[index];
+        if let HostBinding::PointerTable(binding) = &program.bindings[index] {
+            return Some(HostBindingAccess::PointerTable(&binding.targets));
+        }
         if scope.stages.is_empty() {
             return None;
         }
@@ -329,7 +331,6 @@ impl Residency<'_> {
                 }),
                 bindings: Vec::new(),
                 direct_entries: None,
-                unaligned_uniforms: 0,
             },
             parameters,
         )
@@ -446,105 +447,14 @@ impl Residency<'_> {
                 update: None,
             });
         }
-        let mut updates = std::mem::take(&mut self.runtime.uniform_updates);
-        // The layout already assigns each uniform its descriptor slot. Keep a
-        // direct indexed selection through streaming, realignment and binding,
-        // as Eden's BindHostGraphicsUniformBuffer does for its binding_index.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L932
-        updates.resize_with(program.pipeline.layout.uniform_bindings.len(), || None);
-        debug_assert!(updates.iter().all(Option::is_none));
-        if self.runtime.host_uniform_uploads.len() < updates.len() {
-            self.runtime
-                .host_uniform_uploads
-                .resize_with(updates.len(), Default::default);
-        }
-        // Eden selects streaming from this uniform range's GPU modifications.
-        // Read-only aliases and adjacent bindings do not change its contents.
-        // stream_buffer checks exact producers before capturing RAM; prior GPU
-        // writes still use the native buffer or an aligned device-side copy.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h#L932
-        for (slot, uniform) in program.pipeline.layout.uniform_bindings.iter().enumerate() {
-            if let HostBinding::UniformBytes(bytes) = &program.bindings[uniform.resource] {
-                let alignment = self
-                    .runtime
-                    .device
-                    .profile()
-                    .limits
-                    .min_uniform_buffer_offset_alignment;
-                let tick = self.runtime.device.current_work().tick();
-                let kept = &mut self.runtime.host_uniform_uploads[slot].immutable;
-                let slice = if let Some((source, previous, slice)) = kept
-                    && *previous == tick
-                    && Arc::ptr_eq(source, bytes)
-                {
-                    self.runtime.statistics.uniform_keeps += 1;
-                    *slice
-                } else {
-                    let slice = self
-                        .runtime
-                        .device
-                        .submission
-                        .reserve_upload_aligned(bytes, alignment)?;
-                    *kept = Some((bytes.clone(), tick, slice));
-                    slice
-                };
-                updates[slot] = Some(slice);
-                continue;
-            }
-            let Some(HostBindingAccess::Buffer {
-                id,
-                offset,
-                size,
-                scope,
-            }) = self.host_binding_usage(program, uniform.resource)
-            else {
-                continue;
-            };
-            if size > 64 * 1024 {
-                continue;
-            }
-            let request = buffer::BufferStreamRequest {
-                id,
-                offset,
-                size,
-                alignment: scope.buffer_alignment(&self.runtime.device.profile().limits),
-            };
-            self.runtime.buffer_bindings.channel.uniform_cache_shots[0] += 1;
-            if request.offset.is_multiple_of(request.alignment)
-                && request.size > self.runtime.buffer_bindings.channel.uniform_stream_limit
-            {
-                continue;
-            }
-            let Some(update) = self.stream_buffer(slot, request)? else {
-                continue;
-            };
-            updates[slot] = Some(update);
-            self.runtime.streamed_uses.push(uniform.resource);
-        }
+        let nvn = program.direct_entries.is_some();
+        self.prepare_host_uniforms(program.pipeline.layout.uniform_bindings.len(), nvn);
         let uniform_alignment = self
             .runtime
             .device
             .profile()
             .limits
             .min_uniform_buffer_offset_alignment;
-        if program.unaligned_uniforms != 0 {
-            for (index, slot) in program.pipeline.layout.uniform_bindings.iter().enumerate() {
-                let HostBinding::Buffer {
-                    buffer: id,
-                    offset: source,
-                    size,
-                } = &program.bindings[slot.resource]
-                else {
-                    continue;
-                };
-                let offset = updates[index]
-                    .as_ref()
-                    .map_or(*source, |update| update.offset);
-                if !offset.is_multiple_of(uniform_alignment) {
-                    updates[index] = Some(self.aligned_uniform_copy(id.id, *source, *size)?);
-                }
-            }
-        }
         let mut dynamic_offsets = std::mem::take(&mut self.runtime.descriptor_offsets);
         dynamic_offsets.clear();
         dynamic_offsets.extend_from_slice(&program.dynamic_offsets);
@@ -553,56 +463,101 @@ impl Residency<'_> {
             .as_ref()
             .map(|entries| entries.borrow_mut());
         let mut selected = program.record.borrow_mut();
-        if direct.is_some() {
-            selected.uniforms.resize(
-                program.pipeline.layout.uniform_bindings.len(),
-                (vk::Buffer::null(), 0, 0),
-            );
-        }
         let mut resources = std::mem::take(&mut self.runtime.descriptor_resources);
         resources.clear();
         if direct.is_none() && selected.current.is_none() {
             self.canonical_resources(program, &mut resources)?;
         }
-        let limits = &self.runtime.device.profile().limits;
         // Uniform slots update offsets directly. Clone immutable images,
         // samplers and other buffers only when a native descriptor base changes.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
         for (index, slot) in program.pipeline.layout.uniform_bindings.iter().enumerate() {
-            // Consume the selection now so no streamed buffer survives into a
-            // later draw or a program with a different uniform layout.
-            let update = updates[index].take();
-            let canonical = &program.bindings[slot.resource];
-            let (buffer, mut offset, range) = match canonical {
+            let (native, source_offset, range, update) = match &program.bindings[slot.resource] {
                 HostBinding::Buffer {
-                    buffer: id,
+                    buffer,
                     offset,
                     size,
                 } => {
-                    let native = &self.buffer_cache.get(id.id).native;
-                    let (buffer, offset) = update.as_ref().map_or((native, *offset), |update| {
-                        (
-                            self.runtime.device.submission.staging.buffer(update),
-                            update.offset,
-                        )
-                    });
-                    (Some(buffer), offset, *size)
+                    let scope = program.pipeline.resources[slot.resource];
+                    let mut update = None;
+                    if !scope.stages.is_empty() && *size <= 64 * 1024 {
+                        let alignment =
+                            scope.buffer_alignment(&self.runtime.device.profile().limits);
+                        self.runtime.buffer_bindings.channel.uniform_cache_shots[0] += 1;
+                        if !offset.is_multiple_of(alignment)
+                            || *size <= self.runtime.buffer_bindings.channel.uniform_stream_limit
+                        {
+                            update = self.stream_buffer(
+                                index,
+                                buffer::BufferStreamRequest {
+                                    id: buffer.id,
+                                    offset: *offset,
+                                    size: *size,
+                                    alignment,
+                                },
+                                nvn,
+                            )?;
+                            if update.is_some() {
+                                self.runtime.streamed_uses.push(slot.resource);
+                            }
+                        }
+                    }
+                    if !update
+                        .as_ref()
+                        .map_or(*offset, |slice| slice.offset)
+                        .is_multiple_of(uniform_alignment)
+                    {
+                        update = Some(self.aligned_uniform_copy(buffer.id, *offset, *size)?);
+                    }
+                    (Some(&buffer.native), *offset, *size, update)
                 }
                 HostBinding::UniformBytes(bytes) => {
-                    let slice = update.as_ref().expect("inline uniform upload");
-                    (
-                        Some(self.runtime.device.submission.staging.buffer(slice)),
-                        slice.offset,
-                        bytes.len() as u64,
-                    )
+                    let tick = self.runtime.device.current_work().tick();
+                    let kept = &mut self.buffer_cache.uniform_streams.host[index].immutable;
+                    let slice = if let Some((source, previous, slice)) = kept
+                        && *previous == tick
+                        && Arc::ptr_eq(source, bytes)
+                    {
+                        self.runtime.statistics.uniform_keeps += 1;
+                        *slice
+                    } else {
+                        let slice = self
+                            .runtime
+                            .device
+                            .submission
+                            .reserve_upload_aligned(bytes, uniform_alignment)?;
+                        *kept = Some((bytes.clone(), tick, slice));
+                        slice
+                    };
+                    (None, 0, bytes.len() as u64, Some(slice))
                 }
-                HostBinding::NullBuffer => (None, 0, 0),
+                HostBinding::NullBuffer => (None, 0, 0, None),
                 _ => {
                     return Err(VulkanError::InvalidResource(
                         "uniform descriptor requires a buffer",
                     ));
                 }
             };
+            let mut offset = update.as_ref().map_or(source_offset, |slice| slice.offset);
+            if let Some(entries) = direct.as_mut()
+                && slot.dynamic_offset.is_none()
+            {
+                let handle = update.as_ref().map_or_else(
+                    || native.map_or(vk::Buffer::null(), |buffer| buffer.handle),
+                    |slice| slice.buffer,
+                );
+                Self::select_uniform_entry(
+                    &mut entries[slot.resource],
+                    &mut selected,
+                    handle,
+                    offset,
+                    range,
+                );
+                continue;
+            }
+            let buffer = update.as_ref().map_or(native, |slice| {
+                Some(self.runtime.device.submission.staging.buffer(slice))
+            });
             if let Some(dynamic) = slot.dynamic_offset {
                 let (base, value) = if let Some(buffer) = buffer {
                     program.pipeline.layout.split_buffer_offset(
@@ -610,7 +565,7 @@ impl Residency<'_> {
                         buffer.size(),
                         offset,
                         range,
-                        limits,
+                        &self.runtime.device.profile().limits,
                     )?
                 } else {
                     (0, 0)
@@ -619,25 +574,14 @@ impl Residency<'_> {
                 offset = base;
             }
             if let Some(entries) = direct.as_mut() {
-                let value = (
-                    buffer.map_or(vk::Buffer::null(), |b| b.handle),
+                let handle = buffer.map_or(vk::Buffer::null(), |buffer| buffer.handle);
+                Self::select_uniform_entry(
+                    &mut entries[slot.resource],
+                    &mut selected,
+                    handle,
                     offset,
-                    if buffer.is_some() {
-                        range
-                    } else {
-                        vk::WHOLE_SIZE
-                    },
+                    range,
                 );
-                if selected.uniforms[index] != value {
-                    selected.uniforms[index] = value;
-                    selected.payload = None;
-                    entries[slot.resource] = crate::cache::DescriptorEntry {
-                        buffer: vk::DescriptorBufferInfo::default()
-                            .buffer(value.0)
-                            .offset(value.1)
-                            .range(value.2),
-                    };
-                }
                 continue;
             }
             let unchanged = selected.current.as_ref().is_some_and(|record| {
@@ -672,7 +616,6 @@ impl Residency<'_> {
             }
         }
         if let Some(entries) = direct {
-            self.runtime.uniform_updates = updates;
             self.runtime.descriptor_resources = resources;
             let update = self.nvn_payload(&entries, &mut selected)?;
             return Ok(DescriptorQueue {
@@ -693,9 +636,7 @@ impl Residency<'_> {
             Ok(Arc::clone(selected.current.as_ref().unwrap()))
         };
         resources.clear();
-        debug_assert!(updates.iter().all(Option::is_none));
         self.runtime.descriptor_resources = resources;
-        self.runtime.uniform_updates = updates;
         let record = result?;
         if changed {
             selected.current = Some(Arc::clone(&record));
@@ -707,48 +648,68 @@ impl Residency<'_> {
             update: None,
         })
     }
+    fn select_uniform_entry(
+        entry: &mut crate::cache::DescriptorEntry,
+        record: &mut ProgramRecord,
+        handle: vk::Buffer,
+        offset: u64,
+        range: u64,
+    ) {
+        let range = if handle == vk::Buffer::null() {
+            vk::WHOLE_SIZE
+        } else {
+            range
+        };
+        // SAFETY: uniform slots are populated with buffer info during binding capture.
+        let previous = unsafe { entry.buffer };
+        if (previous.buffer, previous.offset, previous.range) != (handle, offset, range) {
+            *entry = crate::cache::DescriptorEntry {
+                buffer: vk::DescriptorBufferInfo::default()
+                    .buffer(handle)
+                    .offset(offset)
+                    .range(range),
+            };
+            record.payload = None;
+        }
+    }
     fn host_program_access(
         &mut self,
         program: &HostProgram,
         images_prepared: bool,
     ) -> Result<(), VulkanError> {
-        let mut used = std::mem::take(&mut self.runtime.host_binding_accesses);
-        let mut streamed = self.runtime.streamed_uses.iter().copied().peekable();
-        for index in 0..program.bindings.len() {
-            if streamed.next_if_eq(&index).is_some() {
-                continue;
-            }
-            if let Some(resource) = self.host_binding_usage(program, index) {
-                used.push(resource);
-            } else if let HostBinding::PointerTable(binding) = &program.bindings[index] {
-                let scope = program.pipeline.resources[index];
-                used.extend(
-                    binding
-                        .targets
-                        .iter()
-                        .map(|range| HostBindingAccess::Buffer {
-                            id: range.buffer,
-                            offset: range.offset,
-                            size: range.size,
-                            scope,
-                        }),
-                );
-            }
+        if program.bindings.is_empty() {
+            return Ok(());
         }
-        let result = self.synchronize_host_bindings(&used, images_prepared);
-        used.clear();
-        self.runtime.host_binding_accesses = used;
+        let mut streamed = std::mem::take(&mut self.runtime.streamed_uses);
+        let result = self.synchronize_host_bindings(program, &streamed, images_prepared);
+        streamed.clear();
+        self.runtime.streamed_uses = streamed;
         result
     }
     fn synchronize_host_bindings(
         &mut self,
-        used: &[HostBindingAccess],
+        program: &HostProgram,
+        streamed: &[usize],
         images_prepared: bool,
     ) -> Result<(), VulkanError> {
-        // Synchronize current cache selections before recording shader access.
-        // Overlapping bindings share the cache-owned modified ranges.
+        let accesses = || {
+            let mut streamed = streamed.iter().copied().peekable();
+            program
+                .pipeline
+                .access_bindings
+                .iter()
+                .filter_map(move |&index| {
+                    if streamed.next_if_eq(&index).is_some() {
+                        None
+                    } else {
+                        Self::host_binding_usage(program, index)
+                    }
+                })
+        };
+        // Finish imports before marking uses. Overlapping bindings can share
+        // pending uploads, and preparing a later alias must precede shader writes.
         let mut images: smallvec::SmallVec<[ImageId; 16]> = smallvec::SmallVec::new();
-        for &resource in used {
+        for resource in accesses() {
             match resource {
                 HostBindingAccess::Buffer {
                     id,
@@ -765,6 +726,11 @@ impl Residency<'_> {
                         self.runtime.buffer_bindings.channel.uniform_cache_hits[0] += 1;
                     }
                 }
+                HostBindingAccess::PointerTable(ranges) => {
+                    for range in ranges {
+                        self.ensure_buffer_range(range.buffer, range.offset, range.size)?;
+                    }
+                }
                 HostBindingAccess::Image { id, .. } => {
                     if !images_prepared && !images.contains(&id) {
                         self.prepare_image(id, false, false)?;
@@ -773,12 +739,17 @@ impl Residency<'_> {
                 }
             }
         }
-        for &resource in used {
+        for resource in accesses() {
             match resource {
                 HostBindingAccess::Buffer {
                     id, offset, size, ..
                 } => {
                     self.use_buffer(id, offset, size)?;
+                }
+                HostBindingAccess::PointerTable(ranges) => {
+                    for range in ranges {
+                        self.use_buffer(range.buffer, range.offset, range.size)?;
+                    }
                 }
                 HostBindingAccess::Image { id, scope, .. } => {
                     if scope.writes() {
@@ -797,28 +768,16 @@ impl Residency<'_> {
         if program.bindings.is_empty() {
             return Ok(());
         }
-        if !program.pipeline.shader_writes {
-            return Ok(());
-        }
-        for index in 0..program.bindings.len() {
-            if self.runtime.streamed_uses.binary_search(&index).is_ok() {
-                continue;
-            }
-            if let HostBinding::PointerTable(binding) = &program.bindings[index]
-                && program.pipeline.resources[index].writes()
-            {
-                for range in &binding.targets {
-                    self.finish_buffer_write(range.buffer, range.offset, range.size)?;
-                }
-                continue;
-            }
-            match self.host_binding_usage(program, index) {
+        for &index in &program.pipeline.written_buffers {
+            match Self::host_binding_usage(program, index) {
                 Some(HostBindingAccess::Buffer {
-                    id,
-                    offset,
-                    size,
-                    scope,
-                }) if scope.writes() => self.finish_buffer_write(id, offset, size)?,
+                    id, offset, size, ..
+                }) => self.finish_buffer_write(id, offset, size)?,
+                Some(HostBindingAccess::PointerTable(ranges)) => {
+                    for range in ranges {
+                        self.finish_buffer_write(range.buffer, range.offset, range.size)?;
+                    }
+                }
                 _ => {}
             }
         }

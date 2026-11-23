@@ -44,6 +44,8 @@ pub struct NativePipelineData {
     pub(crate) graphics: Option<GraphicsState>,
     pub(crate) resources: Box<[crate::residency::AccessScope]>,
     pub(crate) image_bindings: Box<[usize]>,
+    pub(crate) access_bindings: Box<[usize]>,
+    pub(crate) written_buffers: Box<[usize]>,
     pub(crate) shader_writes: bool,
 }
 impl NativePipelineData {
@@ -292,6 +294,32 @@ impl PipelineCompiler {
             bind_point,
             dynamic_states,
             shader_writes: resources.iter().any(|scope| scope.writes()),
+            access_bindings: layout
+                .key
+                .bindings
+                .iter()
+                .enumerate()
+                .filter_map(|(i, binding)| {
+                    (binding.kind != vk::DescriptorType::SAMPLER).then_some(i)
+                })
+                .collect(),
+            written_buffers: layout
+                .key
+                .bindings
+                .iter()
+                .zip(&resources)
+                .enumerate()
+                .filter_map(|(i, (binding, scope))| {
+                    (scope.writes()
+                        && matches!(
+                            binding.kind,
+                            vk::DescriptorType::STORAGE_BUFFER
+                                | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                                | vk::DescriptorType::STORAGE_TEXEL_BUFFER
+                        ))
+                    .then_some(i)
+                })
+                .collect(),
             image_bindings: layout
                 .key
                 .bindings

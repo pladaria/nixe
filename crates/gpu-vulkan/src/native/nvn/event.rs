@@ -45,6 +45,7 @@ impl NativeExecution<'_> {
         self.residency.flush_read_span(address, 4)?;
         let word = EventWord::capture(self.residency.device_memory(), address).map_err(error)?;
         let events = self.state.nvn.events.clone();
+        let uniform_sync = self.residency.uniform_sync();
         let serial = events.record(&word, signal, value);
         // @SIMPLIFICATION Publish all locations at the end of the native
         // prefix, retaining execution ordering and atomic CPU visibility.
@@ -61,6 +62,7 @@ impl NativeExecution<'_> {
             Some(Box::new(move |result| {
                 result?;
                 events.publish(word, signal, value, Some(serial));
+                uniform_sync.fetch_add(1, std::sync::atomic::Ordering::Release);
                 Ok(())
             })),
         )

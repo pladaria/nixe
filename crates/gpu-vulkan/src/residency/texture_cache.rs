@@ -714,6 +714,7 @@ impl Residency<'_> {
             let mut overlaps = false;
             for &(address, bytes) in &entry.maps {
                 if !entry.gpu_modified {
+                    self.buffer_cache.note_uniform_gpu_write(address, bytes);
                     memory.mark_gpu_written(address, bytes);
                 }
                 if check_commands

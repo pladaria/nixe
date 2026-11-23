@@ -339,11 +339,7 @@ pub(crate) struct ResidencyRuntime {
     compute_pass_descriptor_queue: crate::cache::UpdateDescriptorQueue,
     dma_copy_regions: Vec<vk::BufferImageCopy>,
     descriptor_offsets: Vec<u32>,
-    uniform_updates: Vec<Option<crate::queue::Slice>>,
-    host_uniform_uploads: Vec<buffer::UniformUpload>,
-    uniform_scratch: Vec<u8>,
     streamed_uses: Vec<usize>,
-    host_binding_accesses: Vec<execution::HostBindingAccess>,
 }
 impl VulkanResidency {
     pub(crate) fn shader_cache(&self) -> nixe_gpu::shader_memory::ShaderCache {
@@ -410,11 +406,7 @@ impl VulkanResidency {
                 ),
                 dma_copy_regions: Vec::new(),
                 descriptor_offsets: Vec::new(),
-                uniform_updates: Vec::new(),
-                host_uniform_uploads: Vec::new(),
-                uniform_scratch: Vec::new(),
                 streamed_uses: Vec::new(),
-                host_binding_accesses: Vec::new(),
             },
         };
         cache.access().maintain_budget(true)?;

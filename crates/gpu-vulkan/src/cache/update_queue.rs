@@ -20,10 +20,11 @@ pub(crate) struct UpdateDescriptorQueue {
 
 /// A native recording parameter, not an owner of guest memory or a copied list.
 /// Its queue outlives recording; frame rotation and overflow wait for the worker.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct DescriptorUpdate {
     data: NonNull<DescriptorEntry>,
     entries: usize,
+    generation: u64,
 }
 // SAFETY: native jobs only read initialized reservations. The GPU owner does
 // not overwrite them until WaitWorker, and residency drains recording on drop.
@@ -120,6 +121,7 @@ impl UpdateDescriptorQueue {
         DescriptorUpdate {
             data: NonNull::new(self.payload[self.upload_start].get()).unwrap(),
             entries: self.entries,
+            generation: self.generation,
         }
     }
     /// Called after the frame producer's WaitWorker, as synchronous
