@@ -234,6 +234,9 @@ struct UserConfig {
     /// A set bit at this position routes access to the memory callback before
     /// consuming the pointer. Used by rasterizer-cached and checked pages.
     std::optional<std::uint8_t> page_table_marked_bit = std::nullopt;
+    /// x64 can use a separate marked bit for reads. If absent, reads use the
+    /// common marked bit too.
+    std::optional<std::uint8_t> page_table_read_marked_bit = std::nullopt;
     /// Determines what happens if the guest accesses an entry that is off the end of the
     /// page table. If true, Dynarmic will silently mirror page_table's address space. If
     /// false, accessing memory outside of page_table bounds will result in a call to the

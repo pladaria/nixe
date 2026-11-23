@@ -480,6 +480,10 @@ impl BufferCache {
         let (begin, end) = download.bounds();
         let _landing = memory.begin_gpu_download(begin, end);
         for (address, bytes) in memory.pending_gpu_dirty_memory().iter() {
+            #[cfg(feature = "performance-counters")]
+            if download.write_ranges.intersects(address, bytes) {
+                memory.note_download_write_overlap();
+            }
             download.write_ranges.subtract(address, bytes);
         }
         for (address, bytes) in self.write_download(download)?.iter() {
@@ -493,6 +497,10 @@ impl BufferCache {
         let (begin, end) = read.download.bounds();
         let _landing = memory.begin_gpu_download(begin, end);
         for (address, bytes) in memory.pending_gpu_dirty_memory().iter() {
+            #[cfg(feature = "performance-counters")]
+            if read.download.write_ranges.intersects(address, bytes) {
+                memory.note_download_write_overlap();
+            }
             read.download.write_ranges.subtract(address, bytes);
             read.clean_ranges.subtract(address, bytes);
             self.read_download_ranges.subtract(address, bytes);

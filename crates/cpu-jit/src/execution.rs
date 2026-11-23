@@ -82,6 +82,7 @@ impl Core {
                 space.native_data_base().as_ptr() as usize,
                 space.native_page_table_base() as usize,
                 space.width().bits() as usize,
+                nixe_memory::PageEntry::READ_MARKED_BIT,
                 configuration.timer_frequency,
                 register(0xd53b0020),
                 register(0xd53b00e0),

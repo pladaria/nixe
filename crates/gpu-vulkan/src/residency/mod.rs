@@ -272,6 +272,16 @@ pub struct ResidencyStatistics {
     #[cfg(feature = "performance-counters")]
     pub descriptor_mapping_retries: u64,
     #[cfg(feature = "performance-counters")]
+    pub descriptor_kind_reads: [u64; 2],
+    #[cfg(feature = "performance-counters")]
+    pub descriptor_kind_changes: [u64; 2],
+    #[cfg(feature = "performance-counters")]
+    pub descriptor_kind_relocations: [u64; 2],
+    #[cfg(feature = "performance-counters")]
+    pub descriptor_coherence_samples: [u64; 2],
+    #[cfg(feature = "performance-counters")]
+    pub descriptor_coherence_ns: [u64; 2],
+    #[cfg(feature = "performance-counters")]
     pub descriptor_selection_invalidations: u64,
     #[cfg(feature = "performance-counters")]
     pub sampled_slot_resolves: u64,

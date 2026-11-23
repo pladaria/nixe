@@ -608,6 +608,29 @@ impl NativeExecution<'_> {
                 stats.descriptor_fragmented_reads,
                 stats.descriptor_mapping_retries,
             );
+            for (index, name) in ["frame_image_descriptors", "frame_sampler_descriptors"]
+                .into_iter()
+                .enumerate()
+            {
+                nixe_gpu::trace::event(
+                    name,
+                    stats.descriptor_kind_reads[index],
+                    stats.descriptor_kind_changes[index],
+                    stats.descriptor_kind_relocations[index],
+                );
+            }
+            nixe_gpu::trace::event(
+                "frame_image_descriptor_coherence",
+                stats.descriptor_coherence_samples[0],
+                stats.descriptor_coherence_ns[0],
+                0,
+            );
+            nixe_gpu::trace::event(
+                "frame_sampler_descriptor_coherence",
+                stats.descriptor_coherence_samples[1],
+                stats.descriptor_coherence_ns[1],
+                0,
+            );
             nixe_gpu::trace::event(
                 "frame_sampled_slots",
                 stats.sampled_slot_resolves,

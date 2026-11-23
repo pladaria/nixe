@@ -44,6 +44,7 @@ impl Residency<'_> {
         #[cfg(feature = "performance-counters")]
         {
             self.runtime.statistics.descriptor_reads += 1;
+            self.runtime.statistics.descriptor_kind_reads[T::DIAGNOSTIC_INDEX] += 1;
         }
         loop {
             let mut mapping = identity(memory, &self.runtime.device_memory);
@@ -73,6 +74,8 @@ impl Residency<'_> {
                     #[cfg(feature = "performance-counters")]
                     {
                         self.runtime.statistics.descriptor_relocations += 1;
+                        self.runtime.statistics.descriptor_kind_relocations[T::DIAGNOSTIC_INDEX] +=
+                            1;
                     }
                     let source = locate(memory, &self.runtime.device_memory, address)?;
                     if matches!(mapping, DescriptorMapping::Guarded(_)) {
@@ -96,7 +99,18 @@ impl Residency<'_> {
                     {
                         self.runtime.statistics.descriptor_contiguous_reads += 1;
                     }
+                    #[cfg(feature = "performance-counters")]
+                    let sample = self.runtime.statistics.descriptor_kind_reads[T::DIAGNOSTIC_INDEX]
+                        .is_multiple_of(256)
+                        .then(std::time::Instant::now);
                     self.flush_read_span(device, 32)?;
+                    #[cfg(feature = "performance-counters")]
+                    if let Some(start) = sample {
+                        self.runtime.statistics.descriptor_coherence_samples
+                            [T::DIAGNOSTIC_INDEX] += 1;
+                        self.runtime.statistics.descriptor_coherence_ns[T::DIAGNOSTIC_INDEX] +=
+                            start.elapsed().as_nanos() as u64;
+                    }
                     // GSV's guard pins its device mappings. On Maxwell the texture
                     // cache lock holds off physical retirement until this read ends.
                     unsafe { host.read_array() }
@@ -139,6 +153,7 @@ impl Residency<'_> {
                 #[cfg(feature = "performance-counters")]
                 {
                     self.runtime.statistics.descriptor_changes += 1;
+                    self.runtime.statistics.descriptor_kind_changes[T::DIAGNOSTIC_INDEX] += 1;
                 }
                 entry.bytes = bytes;
                 entry.value = None;

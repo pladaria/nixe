@@ -164,8 +164,15 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst, const std::
     } else {
         // Use page table
         ASSERT(conf.page_table);
-        const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr);
-        EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+        if constexpr (bitsize == 128) {
+            if (ordered) {
+                code.test(vaddr, 15);
+                code.jnz(*abort, code.T_NEAR);
+            }
+        }
+        const auto src_ptr = EmitVAddrLookup(code, ctx, ordered && bitsize == 128 ? 8 : bitsize,
+                                             *abort, vaddr, PageTableAccess::Read);
+        EmitPageTableRead<bitsize>(code, value_idx, src_ptr, ordered);
 
         ColdEmits(code, ctx).emplace_back([=, this, &ctx] {
             code.L(*abort);
@@ -288,7 +295,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst, const std:
     } else {
         // Use page table
         ASSERT(conf.page_table);
-        const auto dest_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr);
+        const auto dest_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr, PageTableAccess::Write);
         EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
 
         ColdEmits(code, ctx).emplace_back([=, this, &ctx] {
@@ -414,8 +421,8 @@ void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
 
 template<std::size_t bitsize, auto callback>
 void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* inst) {
-    ASSERT(conf.global_monitor && conf.fastmem_pointer);
-    if (!exception_handler.SupportsFastmem()) {
+    ASSERT(conf.global_monitor);
+    if (!conf.page_table && (!conf.fastmem_pointer || !exception_handler.SupportsFastmem())) {
         EmitExclusiveReadMemory<bitsize, callback>(ctx, inst);
         return;
     }
@@ -471,6 +478,20 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
                 code.jmp(*end, code.T_NEAR);
             });
         }
+    } else if (conf.page_table) {
+        const auto abort = ctx.GenLabel(), end = ctx.GenLabel();
+        if constexpr (bitsize > 8) {
+            code.test(vaddr, u32(bitsize / 8 - 1));
+            code.jnz(*abort, code.T_NEAR);
+        }
+        const auto src_ptr = EmitVAddrLookup(code, ctx, 8, *abort, vaddr, PageTableAccess::Read, tmp);
+        EmitPageTableRead<bitsize>(code, value_idx, src_ptr, ordered);
+        code.L(*end);
+        ColdEmits(code, ctx).emplace_back([=, this] {
+            code.L(*abort);
+            code.call(wrapped_fn);
+            code.jmp(*end, code.T_NEAR);
+        });
     } else {
         code.call(wrapped_fn);
     }
@@ -491,8 +512,8 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
 template<std::size_t bitsize, auto callback>
 void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* inst) {
-    ASSERT(conf.global_monitor && conf.fastmem_pointer);
-    if (!exception_handler.SupportsFastmem()) {
+    ASSERT(conf.global_monitor);
+    if (!conf.page_table && (!conf.fastmem_pointer || !exception_handler.SupportsFastmem())) {
         EmitExclusiveWriteMemory<bitsize, callback>(ctx, inst);
         return;
     }
@@ -551,11 +572,22 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     }
 
     const auto fastmem_marker = ShouldFastmem(ctx, inst);
-    if (fastmem_marker) {
+    if (fastmem_marker || conf.page_table) {
         const auto abort = ctx.GenLabel();
         bool require_abort_handling = false;
 
-        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, tmp);
+        const auto dest_ptr = [&] {
+            if (fastmem_marker) {
+                return EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, tmp);
+            }
+            // The expected value is already in RAX (and RDX for a pair).
+            // Natural alignment keeps the CAS within the validated page.
+            if constexpr (bitsize > 8) {
+                code.test(vaddr, u32(bitsize / 8 - 1));
+                code.jnz(*abort, code.T_NEAR);
+            }
+            return EmitVAddrLookup(code, ctx, 8, *abort, vaddr, PageTableAccess::Write, tmp);
+        }();
 
         const auto location = code.getCurr();
 
@@ -591,14 +623,16 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
             code.L(*abort);
             code.call(wrapped_fn);
 
-            fastmem_patch_info.emplace(
-                mcl::bit_cast<u64>(location),
-                FastmemPatchInfo{
-                    mcl::bit_cast<u64>(code.getCurr()),
-                    mcl::bit_cast<u64>(wrapped_fn),
-                    *fastmem_marker,
-                    conf.recompile_on_exclusive_fastmem_failure,
-                });
+            if (fastmem_marker) {
+                fastmem_patch_info.emplace(
+                    mcl::bit_cast<u64>(location),
+                    FastmemPatchInfo{
+                        mcl::bit_cast<u64>(code.getCurr()),
+                        mcl::bit_cast<u64>(wrapped_fn),
+                        *fastmem_marker,
+                        conf.recompile_on_exclusive_fastmem_failure,
+                    });
+            }
 
             code.cmp(al, 0);
             code.setz(status.cvt8());

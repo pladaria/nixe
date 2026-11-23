@@ -78,12 +78,16 @@ void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsi
     });
 }
 
+enum class PageTableAccess { Read, Write };
+
 template<typename EmitContext>
-Xbyak::RegExp EmitVAddrLookup(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr);
+Xbyak::RegExp EmitVAddrLookup(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort,
+                            Xbyak::Reg64 vaddr, PageTableAccess access, std::optional<Xbyak::Reg64> scratch = std::nullopt);
 
 template<>
-[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A32EmitContext>(BlockOfCode& code, A32EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr) {
-    const Xbyak::Reg64 page = ctx.reg_alloc.ScratchGpr();
+[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A32EmitContext>(BlockOfCode& code, A32EmitContext& ctx, size_t bitsize, Xbyak::Label& abort,
+                                                            Xbyak::Reg64 vaddr, PageTableAccess, std::optional<Xbyak::Reg64> scratch) {
+    const Xbyak::Reg64 page = scratch ? *scratch : ctx.reg_alloc.ScratchGpr();
     const Xbyak::Reg32 tmp = ctx.conf.absolute_offset_page_table && ctx.conf.page_table_pointer_mask == 0 ? page.cvt32() : ctx.reg_alloc.ScratchGpr().cvt32();
 
     EmitDetectMisalignedVAddr(code, ctx, bitsize, abort, vaddr, tmp.cvt64());
@@ -118,12 +122,17 @@ template<>
 }
 
 template<>
-[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr) {
+[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, size_t bitsize, Xbyak::Label& abort,
+                                                            Xbyak::Reg64 vaddr, PageTableAccess access, std::optional<Xbyak::Reg64> scratch) {
     const size_t valid_page_index_bits = ctx.conf.page_table_address_space_bits - page_bits;
     const size_t unused_top_bits = 64 - ctx.conf.page_table_address_space_bits;
 
-    const Xbyak::Reg64 page = ctx.reg_alloc.ScratchGpr();
-    const Xbyak::Reg64 tmp = ctx.conf.absolute_offset_page_table && ctx.conf.page_table_pointer_mask == 0 ? page : ctx.reg_alloc.ScratchGpr();
+    const auto mask = ctx.conf.page_table_pointer_mask;
+    const auto immediate = static_cast<s32>(mask);
+    const bool immediate_mask = static_cast<u64>(immediate) == mask;
+    const Xbyak::Reg64 page = scratch ? *scratch : ctx.reg_alloc.ScratchGpr();
+    const Xbyak::Reg64 tmp =
+        ctx.conf.absolute_offset_page_table && immediate_mask ? page : ctx.reg_alloc.ScratchGpr();
 
     EmitDetectMisalignedVAddr(code, ctx, bitsize, abort, vaddr, tmp);
 
@@ -156,18 +165,24 @@ template<>
         code.jnz(abort, code.T_NEAR);
     }
     code.mov(page, qword[r14 + tmp * sizeof(void*)]);
-    // Consume the marked atomic pointer exactly as Eden's page-table path.
-    // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
-    if (ctx.conf.page_table_marked_bit) {
-        code.bt(page, *ctx.conf.page_table_marked_bit);
-        code.jc(abort, code.T_NEAR);
+    const auto marked_bit = access == PageTableAccess::Read && ctx.conf.page_table_read_marked_bit
+                              ? ctx.conf.page_table_read_marked_bit
+                              : ctx.conf.page_table_marked_bit;
+    if (marked_bit) {
+        if (*marked_bit < 8) {
+            code.test(page.cvt8(), u8(1U << *marked_bit));
+            code.jnz(abort, code.T_NEAR);
+        } else {
+            code.bt(page, *marked_bit);
+            code.jc(abort, code.T_NEAR);
+        }
     }
-    if (ctx.conf.page_table_pointer_mask == 0) {
+    if (mask == 0) {
         code.test(page, page);
-    } else if (std::in_range<s32>(ctx.conf.page_table_pointer_mask)) {
-        code.and_(page, static_cast<s32>(ctx.conf.page_table_pointer_mask));
+    } else if (immediate_mask) {
+        code.and_(page, immediate);
     } else {
-        code.mov(tmp, ctx.conf.page_table_pointer_mask);
+        code.mov(tmp, mask);
         code.and_(page, tmp);
     }
     code.jz(abort, code.T_NEAR);
@@ -296,6 +311,20 @@ const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::Reg
         ASSERT_FALSE("Invalid bitsize");
     }
     return fastmem_location;
+}
+
+template<std::size_t bitsize>
+void EmitPageTableRead(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
+    if constexpr (bitsize < 128) {
+        if (ordered) {
+            code.mfence();
+        }
+        // The canonical pointer also serves guest read-only pages. Use a load
+        // for ordered scalar reads, as in the native callback.
+        EmitReadMemoryMov<bitsize>(code, value_idx, addr, false);
+    } else {
+        EmitReadMemoryMov<bitsize>(code, value_idx, addr, ordered);
+    }
 }
 
 template<std::size_t bitsize>

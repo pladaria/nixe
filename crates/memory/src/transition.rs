@@ -385,6 +385,11 @@ impl NativeAdmission<'_> {
             .iter()
             .any(|&extent| !binding.interface.can_collect_cpu_write(extent))
         {
+            #[cfg(feature = "performance-counters")]
+            {
+                use crate::cpu_writes::{WriteCounter, count_write};
+                count_write(WriteCounter::OrderedPage, 1);
+            }
             return Ok(false);
         }
         self.cpu_writes().write(

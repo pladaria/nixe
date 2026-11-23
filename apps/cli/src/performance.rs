@@ -46,6 +46,7 @@ impl Capture {
                 ("CapturedPhysicalBytes", tracking.captured_bytes),
             ];
             values.extend(nixe_gpu::metrics::snapshot());
+            values.extend(memory.write_counters());
             values.extend(nixe_cpu_jit::metrics::snapshot());
             values.extend(nixe_audio::metrics::snapshot());
             values.extend(nixe_video_winit::metrics::snapshot());

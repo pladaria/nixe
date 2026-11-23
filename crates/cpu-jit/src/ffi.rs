@@ -23,6 +23,7 @@ unsafe extern "C" {
         arena: usize,
         page_table: usize,
         bits: usize,
+        page_table_read_marked_bit: u8,
         frequency: u32,
         ctr: u32,
         dczid: u32,

@@ -13,6 +13,58 @@ const BLOCK_BYTES: u64 = 1 << BLOCK_BITS;
 const ALIGN_BITS: u32 = 6;
 const ALIGN_BYTES: u64 = 1 << ALIGN_BITS;
 type WriteBatch = Arc<Vec<(u64, u64)>>;
+
+#[cfg(feature = "performance-counters")]
+macro_rules! write_counters {
+    ($($name:ident),+ $(,)?) => {
+        #[derive(Clone, Copy)]
+        pub(crate) enum WriteCounter { $($name),+ }
+
+        static WRITE_COUNTERS: [(&str, AtomicU64); [$(stringify!($name)),+].len()] = [
+            $((concat!("CpuWrite", stringify!($name)), AtomicU64::new(0))),+
+        ];
+    };
+}
+
+#[cfg(feature = "performance-counters")]
+write_counters!(
+    NativeUntracked,
+    NativeCrossPage,
+    NativePageDenied,
+    NativeCollected,
+    OrderedPage,
+    AlreadyDirty,
+    AddedBits,
+    NewBlock,
+    ChangedBlock,
+    MultipleDestinations,
+    NoDestination,
+    LandingWait,
+    DownloadOverlap,
+    Gathers,
+    EmptyGathers,
+    GatheredRanges,
+);
+
+#[cfg(feature = "performance-counters")]
+pub(crate) fn count_write(counter: WriteCounter, amount: u64) {
+    WRITE_COUNTERS[counter as usize]
+        .1
+        .fetch_add(amount, Ordering::Relaxed);
+}
+
+#[cfg(feature = "performance-counters")]
+impl Machine {
+    pub fn write_counters(&self) -> impl Iterator<Item = (&'static str, u64)> {
+        WRITE_COUNTERS
+            .iter()
+            .map(|(name, value)| (*name, value.load(Ordering::Relaxed)))
+    }
+
+    pub fn note_download_write_overlap(&self) {
+        count_write(WriteCounter::DownloadOverlap, 1);
+    }
+}
 #[derive(Default)]
 pub(crate) struct CpuWrites {
     enabled: AtomicBool,
@@ -55,6 +107,8 @@ impl Landing {
         {
             return;
         }
+        #[cfg(feature = "performance-counters")]
+        count_write(WriteCounter::LandingWait, 1);
         while self.sequence.load(Ordering::Acquire) == sequence {
             std::thread::yield_now();
         }
@@ -127,6 +181,8 @@ impl Machine {
         // Snapshotters take this mutex only to copy metadata, never to wait on
         // an invalidation callback (which could be waiting for their cache lock).
         let owner = self.cpu_writes();
+        #[cfg(feature = "performance-counters")]
+        count_write(WriteCounter::Gathers, 1);
         let batch = {
             let mut applying = owner.applying.lock().unwrap();
             let mut ranges = Vec::new();
@@ -134,8 +190,12 @@ impl Machine {
                 core.gather(&mut |address, bytes| ranges.push((address, bytes)));
             }
             if ranges.is_empty() {
+                #[cfg(feature = "performance-counters")]
+                count_write(WriteCounter::EmptyGathers, 1);
                 return Ok(());
             }
+            #[cfg(feature = "performance-counters")]
+            count_write(WriteCounter::GatheredRanges, ranges.len() as u64);
             let ranges = Arc::new(ranges);
             applying.push(Arc::clone(&ranges));
             ApplyingWrites { owner, ranges }
@@ -226,6 +286,8 @@ impl CpuWriteCollector {
                 let current = self.current.load(Ordering::Acquire);
                 if current >> 32 == next >> 32 {
                     if current | next == current {
+                        #[cfg(feature = "performance-counters")]
+                        count_write(WriteCounter::AlreadyDirty, 1);
                         break;
                     }
                     if self
@@ -238,6 +300,8 @@ impl CpuWriteCollector {
                         )
                         .is_ok()
                     {
+                        #[cfg(feature = "performance-counters")]
+                        count_write(WriteCounter::AddedBits, 1);
                         break;
                     }
                 } else if current == EMPTY {
@@ -246,6 +310,8 @@ impl CpuWriteCollector {
                         .compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed)
                         .is_ok()
                     {
+                        #[cfg(feature = "performance-counters")]
+                        count_write(WriteCounter::NewBlock, 1);
                         break;
                     }
                 } else {
@@ -254,6 +320,8 @@ impl CpuWriteCollector {
                     if previous != EMPTY {
                         journal.back.push(previous);
                     }
+                    #[cfg(feature = "performance-counters")]
+                    count_write(WriteCounter::ChangedBlock, 1);
                     break;
                 }
             }
@@ -292,10 +360,22 @@ impl CpuWriteCollector {
             return Ok(false);
         }
         for &extent in extents {
+            #[cfg(feature = "performance-counters")]
+            let mut destinations = 0;
             device.apply_on_physical(extent, scratch, |address, bytes| {
+                #[cfg(feature = "performance-counters")]
+                {
+                    destinations += 1;
+                }
                 self.collect(address, bytes);
                 machine.cpu_writes().landing.wait(address, bytes);
             });
+            #[cfg(feature = "performance-counters")]
+            match destinations {
+                0 => count_write(WriteCounter::NoDestination, 1),
+                1 => (),
+                _ => count_write(WriteCounter::MultipleDestinations, 1),
+            }
         }
         write();
         Ok(true)

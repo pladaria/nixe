@@ -160,6 +160,56 @@ fn paired_exclusives_preserve_both_lanes() {
 }
 
 #[test]
+fn page_table_exclusives_and_reads_follow_permissions_after_fastmem_faults() {
+    // LDXP X2,X3,[X1]; STXP W4,X0,X5,[X1]; LDR X6,[X1]; SVC.
+    let (memory, process) = fixture(&[0xc87f0c22, 0xc8241420, 0xf9400026, 0xd4000001]);
+    let mut jit = process.create_thread().unwrap();
+    let mut unmapped = state();
+    unmapped.write_x(x(1), 0x7000);
+    assert!(matches!(
+        run(&mut jit, &mut unmapped),
+        CpuExit::SupervisorCall { .. }
+    ));
+    assert_eq!(unmapped.read_x(x(2)), 0);
+    assert_eq!(unmapped.read_x(x(3)), 0);
+    assert_eq!(unmapped.read_x(x(6)), 0);
+    unmapped.materialize();
+
+    let original = (43_u128 << 64) | 31;
+    let replacement = (9_u128 << 64) | 7;
+    for (permissions, loaded, stored) in [
+        (MemoryPermissions::READ, original, original),
+        (MemoryPermissions::NONE, 0, original),
+        (MemoryPermissions::READ_WRITE, original, replacement),
+    ] {
+        memory.protect(DATA, PAGE_SIZE, permissions).unwrap();
+        memory
+            .write_value(ALIAS, 16, original)
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        let mut state = state();
+        assert!(matches!(
+            run(&mut jit, &mut state),
+            CpuExit::SupervisorCall { .. }
+        ));
+        assert_eq!(state.read_x(x(2)), loaded as u64);
+        assert_eq!(state.read_x(x(3)), (loaded >> 64) as u64);
+        if permissions == MemoryPermissions::READ_WRITE {
+            assert_eq!(state.read_x(x(4)), 0);
+        }
+        assert_eq!(
+            state.read_x(x(6)),
+            if loaded == 0 { 0 } else { stored as u64 }
+        );
+        assert_eq!(
+            memory.read_value(ALIAS, 16).unwrap().into_ready().unwrap(),
+            stored
+        );
+    }
+}
+
+#[test]
 fn ordinary_alias_writes_use_expected_value_cas_without_store_instrumentation() {
     // Eden's normal stores do not update the exclusive monitor. A changed
     // observed value must fail, while same-value/ABA may commit by host CAS.

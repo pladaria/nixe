@@ -67,11 +67,16 @@ impl MappedPage {
 #[repr(transparent)]
 pub struct PageEntry(AtomicU64);
 const _: () = assert!(std::mem::size_of::<PageEntry>() == 8);
+impl PageEntry {
+    /// An entry with this bit set requires a checked or coherent data read.
+    pub const READ_MARKED_BIT: u8 = 6;
+}
 // PageEntryData stores the physical pointer relative to its process VA. The
-// marked bit routes cached/checked pages through the CPU memory owner; the
-// standard Dynarmic page-table path consumes the same atomic word directly.
+// access marks route checked permissions and cached pages through the memory
+// owner. Read-only RAM can expose its pointer for reads but not writes.
 // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/common/page_table.h
 const MARKED: u64 = 1;
+const READ_MARKED: u64 = 1 << PageEntry::READ_MARKED_BIT;
 const PAGE_TYPE_SHIFT: u32 = 1;
 const MEMORY: u64 = 1;
 const CHECKED: u64 = 2;
@@ -604,6 +609,13 @@ impl AddressSpace {
             | (u64::from(entry.permissions.bits()) << PERMISSION_SHIFT)
             | (page_type << PAGE_TYPE_SHIFT)
             | if page_type == MEMORY { 0 } else { MARKED }
+            | if page_type == RASTERIZER_CACHED
+                || !entry.permissions.contains(MemoryPermissions::READ)
+            {
+                READ_MARKED
+            } else {
+                0
+            }
     }
     // New mappings are installed under native/host exclusion. Existing entries
     // may change tracking under the mapping writer while native cores continue.
@@ -1058,7 +1070,7 @@ impl AddressSpace {
             }
             // Admission retains the PTE and its backing until the scalar load completes.
             let entry = unsafe { self.raw_entry(at) };
-            if entry & MARKED != 0 || entry == 0 {
+            if entry & READ_MARKED != 0 || entry == 0 {
                 require_entry(entry, *address, MemoryPermissions::READ)?;
                 if entry_cached(entry) {
                     return Ok(i);
@@ -1084,7 +1096,7 @@ impl AddressSpace {
         let mut at = start.get();
         while at < end {
             let entry = unsafe { self.raw_entry(at) };
-            if entry & MARKED != 0 || entry == 0 {
+            if entry & READ_MARKED != 0 || entry == 0 {
                 require_entry(entry, GuestVirtualAddress::new(at), MemoryPermissions::READ)?;
                 if entry_cached(entry) {
                     return Ok(DirectWordsComparison::NeedsCoherentRead);
@@ -1222,6 +1234,11 @@ impl AddressSpace {
         }
         let first = start.get() & !(PAGE_SIZE - 1);
         let count = (end - first).div_ceil(PAGE_SIZE) as usize;
+        #[cfg(feature = "performance-counters")]
+        if count > 1 {
+            use crate::cpu_writes::{WriteCounter, count_write};
+            count_write(WriteCounter::NativeCrossPage, 1);
+        }
         let mut cached_collection = false;
         let mut physical_pages = [ArenaOffset::new(0); 2];
         let mut pointers = [std::ptr::null_mut(); 2];
@@ -1247,6 +1264,11 @@ impl AddressSpace {
                     || native.cpu_writes().last_gpu_page.load(Ordering::Acquire)
                         != physical / PAGE_SIZE
                 {
+                    #[cfg(feature = "performance-counters")]
+                    {
+                        use crate::cpu_writes::{WriteCounter, count_write};
+                        count_write(WriteCounter::NativePageDenied, 1);
+                    }
                     return Ok(false);
                 }
             }
@@ -1289,9 +1311,20 @@ impl AddressSpace {
                     bytes: end.min(page + PAGE_SIZE) - start.get().max(page),
                 });
             }
-            return native.collect_write(&extents, write);
+            let result = native.collect_write(&extents, write);
+            #[cfg(feature = "performance-counters")]
+            if matches!(result, Ok(true)) {
+                use crate::cpu_writes::{WriteCounter, count_write};
+                count_write(WriteCounter::NativeCollected, 1);
+            }
+            return result;
         }
         // Native execution retains the mappings until this store completes.
+        #[cfg(feature = "performance-counters")]
+        {
+            use crate::cpu_writes::{WriteCounter, count_write};
+            count_write(WriteCounter::NativeUntracked, 1);
+        }
         write();
         Ok(true)
     }
@@ -1380,7 +1413,7 @@ impl AddressSpace {
         }
         let raw = unsafe { self.raw_entry(start.get()) };
         let source = entry_pointer(raw, start.get());
-        if raw & MARKED != 0 || raw == 0 {
+        if raw & READ_MARKED != 0 || raw == 0 {
             require_entry(raw, start, MemoryPermissions::READ)?;
             if entry_cached(raw) {
                 let base = self

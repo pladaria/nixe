@@ -63,7 +63,7 @@ struct Core final : Dynarmic::A64::UserCallbacks {
   std::unique_ptr<Dynarmic::A64::Jit> jit;
 
   Core(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table, size_t address_bits,
-       std::uint32_t frequency, std::uint32_t ctr, std::uint32_t dczid,
+       std::uint8_t page_table_read_marked_bit, std::uint32_t frequency, std::uint32_t ctr, std::uint32_t dczid,
        bool extended_isa, const std::uint64_t *counter_base, std::uint64_t counter_multiplier)
       : callbacks(cb) {
     Dynarmic::A64::UserConfig conf{};
@@ -121,6 +121,7 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.page_table_address_space_bits = address_bits;
     conf.page_table_pointer_mask = ~std::uint64_t{0xfff};
     conf.page_table_marked_bit = std::uint8_t{0};
+    conf.page_table_read_marked_bit = page_table_read_marked_bit;
     conf.silently_mirror_page_table = false;
     conf.absolute_offset_page_table = true;
     conf.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;
@@ -257,11 +258,12 @@ bool nixe_dynarmic_resolve_fault(std::uint64_t pc, std::uint64_t *call,
 }
 const char *nixe_dynarmic_error() noexcept { return last_error.c_str(); }
 void *nixe_dynarmic_create(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table,
-                           size_t bits, std::uint32_t frequency, std::uint32_t ctr,
+                           size_t bits, std::uint8_t page_table_read_marked_bit,
+                           std::uint32_t frequency, std::uint32_t ctr,
                            std::uint32_t dczid, bool extended_isa, const std::uint64_t *counter_base,
                            std::uint64_t counter_multiplier) noexcept {
   try {
-    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid, extended_isa,
+    return new Core(cb, arena, page_table, bits, page_table_read_marked_bit, frequency, ctr, dczid, extended_isa,
                     counter_base, counter_multiplier);
   } catch (const std::exception &e) {
     last_error = e.what();

@@ -90,6 +90,11 @@ Nixe adaptations
   client supplies a stable host TSC, a shared atomic clock base and a fixed-point
   frequency multiplier. The sample retries across pause/resume publication.
   Other clocks and host backends retain the counter callback.
+- backend/x64/emit_x64_memory uses the canonical page table for exclusive
+  loads and compare/exchange after fastmem deoptimization. A64 accepts a
+  separate read mark so ordinary read-only pages remain directly readable.
+  Marked, absent and unsupported unaligned accesses retain their callbacks.
+  Sign-extended pointer masks use an immediate and one address register.
 - frontend/A64/translate/impl/sys_dc.cpp ends blocks after cache operations.
   Nixe applies ownership transitions after releasing its execution lease.
 - ir/opt/a64_get_set_elimination_pass.cpp, ir/opt/passes.h and both A64

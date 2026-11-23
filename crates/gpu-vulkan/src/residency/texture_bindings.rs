@@ -106,6 +106,8 @@ pub(crate) enum DescriptorSource {
     Virtual(u64),
 }
 pub(crate) trait BoundDescriptor {
+    #[cfg(feature = "performance-counters")]
+    const DIAGNOSTIC_INDEX: usize;
     fn invalidate_selection(&mut self);
 }
 pub(crate) struct ImageDescriptor {
@@ -114,6 +116,8 @@ pub(crate) struct ImageDescriptor {
     pub(crate) info: Option<nixe_gpu::native::ImageInfo>,
 }
 impl BoundDescriptor for ImageDescriptor {
+    #[cfg(feature = "performance-counters")]
+    const DIAGNOSTIC_INDEX: usize = 0;
     fn invalidate_selection(&mut self) {
         self.views = [None; 4];
     }
@@ -124,6 +128,8 @@ pub(crate) struct SamplerDescriptor {
     pub(crate) variants: [Option<vk::Sampler>; 8],
 }
 impl BoundDescriptor for SamplerDescriptor {
+    #[cfg(feature = "performance-counters")]
+    const DIAGNOSTIC_INDEX: usize = 1;
     fn invalidate_selection(&mut self) {}
 }
 /// Channel selections and texture contents share the actual texture-cache
