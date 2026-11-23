@@ -37,7 +37,7 @@ impl Residency<'_> {
     pub(crate) fn reduce_semaphore(
         &mut self,
         pipeline: &NativePipeline,
-        target: &[nixe_memory::AllocationRange],
+        mapping: Arc<PhysicalMapping>,
         payload: u32,
         operation: u32,
         signed: bool,
@@ -46,7 +46,6 @@ impl Residency<'_> {
             return Err(VulkanError::InvalidResource("invalid semaphore reduction"));
         }
         self.caches.sync_guest_memory();
-        let mapping = PhysicalMapping::new(target)?;
         if mapping.bytes() != 4 {
             return Err(VulkanError::InvalidResource(
                 "semaphore reduction requires one word",

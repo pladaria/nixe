@@ -896,38 +896,10 @@ impl Residency<'_> {
             if descriptors.dynamic_offsets.is_none() {
                 descriptors.dynamic_offsets = Some(program.dynamic_offsets.clone());
             }
-            let mut images = smallvec::SmallVec::<[ShaderImage; 16]>::new();
-            for &descriptor in &program.pipeline.image_bindings {
-                if let Some(binding) = program.bindings.get(descriptor) {
-                    match binding {
-                        HostBinding::Image(view) => images.push(ShaderImage {
-                            view: Some(view.id),
-                            descriptor,
-                            native: vk::DescriptorImageInfo::default()
-                                .image_view(view.native.handle)
-                                .image_layout(vk::ImageLayout::GENERAL),
-                        }),
-                        HostBinding::CombinedImageSampler { image, sampler } => {
-                            images.push(ShaderImage {
-                                view: Some(image.id),
-                                descriptor,
-                                native: vk::DescriptorImageInfo::default()
-                                    .image_view(image.native.handle)
-                                    .image_layout(vk::ImageLayout::GENERAL)
-                                    .sampler(sampler.handle),
-                            })
-                        }
-                        HostBinding::Sampler(sampler) => images.push(ShaderImage {
-                            view: None,
-                            descriptor,
-                            native: vk::DescriptorImageInfo::default()
-                                .sampler(sampler.handle)
-                                .image_layout(vk::ImageLayout::GENERAL),
-                        }),
-                        _ => unreachable!("compiled shader image slot"),
-                    }
-                }
-            }
+            let images =
+                program.pipeline.image_bindings.iter().filter_map(|&index| {
+                    program.image_binding_view(index).map(|view| (view, index))
+                });
             // Host helpers prepare their explicit attachments here. Guest
             // targets are prepared before framebuffer capture by their owner.
             // https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/video_core/texture_cache/texture_cache.h#L457-L490
@@ -968,7 +940,7 @@ impl Residency<'_> {
             let result = self.record_draw_inner(
                 &program.pipeline,
                 targets,
-                &images,
+                images,
                 descriptors,
                 draw,
                 push,
@@ -995,7 +967,7 @@ impl Residency<'_> {
         &mut self,
         pipeline: &NativePipeline,
         targets: &Arc<PreparedTargets>,
-        images: &[ShaderImage],
+        images: impl Iterator<Item = (ImageViewId, usize)>,
         descriptors: DescriptorQueue,
         draw: Draw,
         push: &[u8],
@@ -1008,12 +980,9 @@ impl Residency<'_> {
         // does; there is no second draw-owned set of descriptor/geometry slots.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
         let mut feedback_aspects = vk::ImageAspectFlags::empty();
-        for image in images {
-            let Some(view) = image.view else {
-                continue;
-            };
+        for (view, descriptor) in images {
             let range = self.texture_cache.views[view].native.range;
-            let scope = pipeline.resources[image.descriptor];
+            let scope = pipeline.resources[descriptor];
             let aspects = self.draw_feedback(
                 self.texture_cache.views[view].image,
                 range,

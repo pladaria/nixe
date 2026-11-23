@@ -1,6 +1,7 @@
 //! Inputs consulted while translating a shader. A submitted draw that projects
 //! its descriptors onto these slots also pins the corresponding shader bytes.
 use crate::{Shader, TextureShape};
+use nixe_memory::device_memory::DeviceMemory;
 use std::{
     fmt::Debug,
     sync::{Arc, OnceLock},
@@ -22,12 +23,16 @@ pub struct StageSource {
 pub struct ShaderUsage {
     pub stages: Box<[StageSource]>,
     pub shapes: Arc<[TextureShape]>,
-    pub mapping_generation: u64,
+    /// A mapped shader is invalidated by writes or unmaps of its own pages.
+    /// Filling an unmapped part of a sparse shader has no unmap notification.
+    pub sparse_generation: Option<u64>,
 }
 
 impl ShaderUsage {
-    pub fn current(&self, generation: u64) -> bool {
-        self.mapping_generation == generation && self.stages.iter().all(|s| s.version.is_valid())
+    pub fn current(&self, memory: &DeviceMemory) -> bool {
+        self.sparse_generation
+            .is_none_or(|generation| generation == memory.generation())
+            && self.stages.iter().all(|s| s.version.is_valid())
     }
     pub fn same_code(&self, other: &Self) -> bool {
         self.stages.len() == other.stages.len()

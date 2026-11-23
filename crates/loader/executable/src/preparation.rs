@@ -98,25 +98,48 @@ impl PreparedModule {
         &mut self,
         metadata: &crate::NsoMetadata,
         name: &[u8],
-        mut replacement: impl FnMut(u64) -> Option<u64>,
+        replacement: impl FnOnce(u64) -> Option<u64>,
     ) {
-        let Some(ro) = self.mappings.iter_mut().find(|m| {
+        let Some((section, offset, address, _)) = self.nso_export(metadata, name, 2) else {
+            return;
+        };
+        if let Some(new) = replacement(address) {
+            self.mappings[section].bytes[offset + 8..offset + 16]
+                .copy_from_slice(&new.wrapping_sub(self.image_base).to_le_bytes());
+        }
+    }
+
+    /// Locate a defined, writable u32 exported to another guest module.
+    pub fn nso_u32_export(&self, metadata: &crate::NsoMetadata, name: &[u8]) -> Option<u64> {
+        let (_, _, address, size) = self.nso_export(metadata, name, 1)?;
+        (size == 4
+            && self.mappings.iter().any(|m| {
+                m.permissions.is_writable()
+                    && m.guest_address <= address
+                    && address + 4 <= m.guest_end()
+            }))
+        .then_some(address)
+    }
+
+    fn nso_export(
+        &self,
+        metadata: &crate::NsoMetadata,
+        name: &[u8],
+        kind: u8,
+    ) -> Option<(usize, usize, u64, u64)> {
+        let (section, ro) = self.mappings.iter().enumerate().find(|(_, m)| {
             m.permissions.is_readable()
                 && !m.permissions.is_writable()
                 && !m.permissions.is_executable()
-        }) else {
-            return;
-        };
+        })?;
         let strings = metadata.dynamic_string_table();
         let symbols = metadata.dynamic_symbol_table();
         let mut at = symbols.offset() as usize;
         for _ in 0..symbols.size() / 24 {
-            let Some(sym) = ro.bytes.get(at..at + 24) else {
-                break;
-            };
+            let sym = ro.bytes.get(at..at + 24)?;
             let name_at = u32::from_le_bytes(sym[..4].try_into().unwrap()) as usize;
             let value = u64::from_le_bytes(sym[8..16].try_into().unwrap());
-            if sym[4] & 15 == 2
+            if sym[4] & 15 == kind
                 && sym[6..8] != [0, 0]
                 && name_at + name.len() < strings.size() as usize
                 && ro
@@ -127,13 +150,13 @@ impl PreparedModule {
                             .is_some_and(|end| end.first() == Some(&0))
                     })
                 && value < self.image_extent
-                && let Some(new) = replacement(self.image_base + value)
             {
-                ro.bytes[at + 8..at + 16]
-                    .copy_from_slice(&new.wrapping_sub(self.image_base).to_le_bytes());
+                let size = u64::from_le_bytes(sym[16..24].try_into().unwrap());
+                return Some((section, at, self.image_base + value, size));
             }
             at += 24;
         }
+        None
     }
 
     /// Returns the source executable format.

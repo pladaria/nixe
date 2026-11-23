@@ -44,7 +44,7 @@ pub(super) fn source_key(
             address: 0,
             ..source.shader
         };
-        hash.update(bytemuck::bytes_of(&shader));
+        hash.update(&bytemuck::bytes_of(&shader)[..std::mem::offset_of!(nixe_nvn::Shader, isa)]);
         hash.update(source.code_digest);
     }
     if let Some(g) = graphics {
@@ -184,7 +184,9 @@ impl Input {
                 slot,
                 ty,
                 scale_index,
+                bindless,
             } => {
+                debug_assert!(bindless.is_none());
                 for v in [1, stage, slot, ty as u32, scale_index as u32] {
                     word(out, v);
                 }
@@ -195,7 +197,9 @@ impl Input {
                 ty,
                 format,
                 scale_index,
+                bindless,
             } => {
+                debug_assert!(bindless.is_none());
                 for v in [2, stage, slot, ty as u32, format as u32, scale_index as u32] {
                     word(out, v);
                 }
@@ -216,6 +220,13 @@ impl Input {
                 word(out, s);
                 wide(out, n);
             }
+            Input::Push(block) => {
+                word(out, 6);
+                word(out, block);
+            }
+            Input::TexelBuffer { .. } | Input::StoragePointer(..) | Input::PointerTable { .. } => {
+                unreachable!("NVN2 reflection is not persisted")
+            }
         }
     }
     fn decode(r: &mut Reader<'_>) -> Option<Self> {
@@ -228,6 +239,7 @@ impl Input {
                 slot: r.u32()?,
                 ty: TextureType::try_from(r.u32()?).ok()?,
                 scale_index: r.u32()? as usize,
+                bindless: None,
             },
             2 => Self::Image {
                 stage,
@@ -235,10 +247,12 @@ impl Input {
                 ty: TextureType::try_from(r.u32()?).ok()?,
                 format: ir::types::ImageFormat::try_from(r.u32()?).ok()?,
                 scale_index: r.u32()? as usize,
+                bindless: None,
             },
             3 => Self::Uniform(stage, r.u32()?, r.u64()?),
             4 => Self::Storage(stage, r.u32()?),
             5 => Self::Constants(stage, r.u64()?),
+            6 if stage < 8 => Self::Push(stage),
             _ => return None,
         })
     }
@@ -312,7 +326,10 @@ impl Archive {
         let mut out = vec![PIPELINE];
         word(&mut out, t.stages.len() as u32);
         for id in &t.stages {
-            out.extend_from_slice(&self.modules[id]);
+            let Some(module) = self.modules.get(id) else {
+                return;
+            };
+            out.extend_from_slice(module);
         }
         if let Some(s) = state {
             s.encode(&mut out);

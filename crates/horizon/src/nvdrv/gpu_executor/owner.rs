@@ -293,7 +293,12 @@ where
                     }
                     // The hook is real preparation work, not pacing idle time.
                     start = std::time::Instant::now();
-                    Ok::<_, GpuExecutorFailure>(())
+                    Ok::<_, GpuExecutorFailure>(
+                        self.backend
+                            .borrow()
+                            .as_ref()
+                            .and_then(nixe_gpu::GpuPresentation::nvn_poll_interval),
+                    )
                 },
             )?;
             let end = std::time::Instant::now();

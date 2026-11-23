@@ -1,12 +1,14 @@
 //! NVN exposes compiled guest shaders and their control sections at SetShaders.
-//! The direct path supplies the NVN constant-bank ABI to the Maxwell recompiler.
+//! The direct path supplies the NVN constant-bank ABI to guest shader translation.
 //! https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/dmsh_abi.h
 use super::*;
-use nixe_nvn::{Range, Sampled};
+use nixe_nvn::{ComputeLayout, Range, Sampled};
 use nixe_shader_recompiler::{
     self as ir, artifact::ResourceSource, environment::*, passes::GraphicsRuntimeState, types::*,
 };
+mod bindless;
 mod disk;
+pub(super) use bindless::{descriptor_ids as bindless_descriptor_ids, read_cbuf};
 pub(in crate::native) use disk::Archive;
 #[derive(Clone)]
 pub(super) enum Input {
@@ -16,6 +18,7 @@ pub(super) enum Input {
         slot: u32,
         ty: TextureType,
         scale_index: usize,
+        bindless: Option<HandleKey>,
     },
     Image {
         stage: u32,
@@ -23,10 +26,25 @@ pub(super) enum Input {
         ty: TextureType,
         format: ir::types::ImageFormat,
         scale_index: usize,
+        bindless: Option<HandleKey>,
     },
     Uniform(u32, u32, u64),
     Storage(u32, u32),
+    StoragePointer(u32, CbufWordKey),
+    PointerTable {
+        stage: u32,
+        slot: u32,
+        start: i32,
+        end: i32,
+        written: bool,
+    },
     Constants(u32, u64),
+    Push(u32),
+    TexelBuffer {
+        stage: u32,
+        handle: HandleKey,
+        storage: Option<ir::types::ImageFormat>,
+    },
 }
 pub(super) struct Pipeline {
     pub id: u64,
@@ -73,6 +91,7 @@ pub(super) struct Dependencies {
     pub sampled: u128,
     pub handles: u128,
     pub driver: u128,
+    pub bindless: u128,
     pub buffers: [[Vec<u128>; nixe_nvn::BUFFER_STAGES]; 2],
 }
 impl Dependencies {
@@ -81,9 +100,28 @@ impl Dependencies {
         for (i, input) in inputs.iter().take(128).enumerate() {
             let bit = 1 << i;
             match *input {
+                Input::Texture {
+                    bindless: Some(_), ..
+                }
+                | Input::Image {
+                    bindless: Some(_), ..
+                }
+                | Input::TexelBuffer { .. }
+                | Input::PointerTable { .. } => result.bindless |= bit,
+                Input::StoragePointer(_, key) => {
+                    if (24..32).contains(&key.index.0) {
+                        result.driver |= bit;
+                    } else {
+                        result.bindless |= bit;
+                    }
+                }
                 Input::Texture { .. } | Input::Image { .. } => result.sampled |= bit,
                 Input::Driver(_, 2, _) => result.handles |= bit,
-                Input::Driver(..) => result.driver |= bit,
+                Input::Driver(5, 0, _) => {
+                    result.handles |= bit;
+                    result.driver |= bit;
+                }
+                Input::Driver(..) | Input::Push(..) => result.driver |= bit,
                 Input::Uniform(stage, slot, _) | Input::Storage(stage, slot) => {
                     let kind = usize::from(matches!(*input, Input::Storage(..)));
                     let mask = &mut result.buffers[kind][stage as usize];
@@ -175,10 +213,14 @@ pub(super) struct ShaderKey {
     minus_one_to_one: bool,
 }
 impl Compiled {
-    pub fn accepts(&self, b: &nixe_nvn::Bindings, generation: u64) -> bool {
+    pub fn accepts(
+        &self,
+        b: &nixe_nvn::Bindings,
+        memory: &nixe_memory::device_memory::DeviceMemory,
+    ) -> bool {
         match &b.captured {
             Some(source) => Arc::ptr_eq(source, &self.usage) || self.usage.same_code(source),
-            None => self.usage.current(generation),
+            None => self.usage.current(memory),
         }
     }
 }
@@ -189,13 +231,17 @@ impl Program {
         }
     }
 }
-struct EnvironmentReader<'a> {
+struct EnvironmentReader<'a, 'b> {
     meta: EnvironmentMetadata,
     code: &'a [u8],
     textures: &'a [Sampled],
     consumed: &'a mut Vec<(u32, u32)>,
     stage: u32,
     constants: usize,
+    bindings: &'a nixe_nvn::Bindings<'a>,
+    residency: &'a mut Residency<'b>,
+    dynamic_textures: Vec<(HandleKey, Option<Sampled>)>,
+    compute: Option<ComputeLayout>,
 }
 fn unsupported(s: impl Into<String>) -> ir::CompileError {
     ir::CompileError::new(ir::diagnostics::FailureCategory::Unsupported, s.into())
@@ -206,16 +252,66 @@ fn slot(offset: u32) -> Option<u32> {
         .filter(|o| o % 8 == 0)
         .map(|o| o / 8)
 }
-impl EnvironmentReader<'_> {
+
+fn buffer_slot(offset: u32, base: u32) -> Option<u32> {
+    let bytes = offset.checked_sub(base)?;
+    (bytes.is_multiple_of(16) && bytes < 256).then_some(bytes / 16)
+}
+
+fn driver_pointer(stage: u32, offset: u32, compute: Option<ComputeLayout>) -> Option<Input> {
+    if let Some(layout) = compute {
+        if let Some(slot) = buffer_slot(offset, layout.uniform_base())
+            && slot < u32::from(layout.uniform)
+        {
+            return Some(Input::Uniform(stage, slot, u64::MAX));
+        }
+        let slot = buffer_slot(offset, layout.storage_base())?;
+        return (slot < u32::from(layout.storage)).then_some(Input::Storage(stage, slot));
+    }
+    let base = match stage {
+        0 => 0x110,
+        1 => 0x510,
+        2 => 0x410,
+        3 => 0x210,
+        4 | 5 => 0x310,
+        _ => return None,
+    };
+    if stage == 5
+        && let Some(slot) = buffer_slot(offset, 0x210)
+    {
+        return Some(Input::Uniform(stage, slot, u64::MAX));
+    }
+    Some(Input::Storage(stage, buffer_slot(offset, base)?))
+}
+
+fn handle_slot(bank: CbufIndex, offset: ByteOffset, compute: Option<ComputeLayout>) -> Option<u32> {
+    match bank.0 {
+        2 => slot(offset.0),
+        0 => compute?.handle_slot(offset.0),
+        _ => None,
+    }
+}
+
+fn pointer_bank(index: CbufIndex) -> bool {
+    matches!(index.0, 3..=18 | 24..=31)
+}
+impl EnvironmentReader<'_, '_> {
     fn texture(&self, h: TextureHandle) -> Option<&Sampled> {
+        if let Some(index) = h.0.checked_sub(1 << 31) {
+            return self.dynamic_textures.get(index as usize)?.1.as_ref();
+        }
         self.textures
             .iter()
             .find(|t| t.stage == self.stage && t.slot == h.0)
     }
 }
-impl Environment for EnvironmentReader<'_> {
+impl Environment for EnvironmentReader<'_, '_> {
     fn metadata(&self) -> &EnvironmentMetadata {
         &self.meta
+    }
+    fn nvn_storage_table(&self) -> Option<(u32, u8)> {
+        self.compute
+            .map(|layout| (layout.storage_base(), layout.storage))
     }
     fn read_instruction(&mut self, a: ProgramOffset) -> ir::Result<u64> {
         let at = a.0 as usize;
@@ -223,6 +319,16 @@ impl Environment for EnvironmentReader<'_> {
             .get(at..at + 8)
             .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
             .ok_or_else(|| unsupported(format!("NVN shader read beyond code at {at:#x}")))
+    }
+    fn is_cbuf_storage_pointer(&mut self, key: CbufWordKey) -> ir::Result<bool> {
+        // The address analysis already identified paired low/high words used
+        // as a GPU address. NVN2 can place those in a uniform or push block;
+        // the actual address can change or be null without changing the shader.
+        Ok(if key.index.0 == 0 {
+            driver_pointer(self.stage, key.offset.0, self.compute).is_some()
+        } else {
+            pointer_bank(key.index)
+        })
     }
     fn read_cbuf_value(&mut self, i: CbufIndex, o: ByteOffset) -> ir::Result<u32> {
         if i.0 == 1 {
@@ -239,13 +345,31 @@ impl Environment for EnvironmentReader<'_> {
         )))
     }
     fn read_texture_handle(&mut self, k: HandleKey) -> ir::Result<TextureHandle> {
-        if k.index.0 == 2
-            && !k.has_secondary
+        if !k.has_secondary
             && k.shift_left == 0
-            && let Some(s) = slot(k.offset.0)
+            && let Some(s) = handle_slot(k.index, k.offset, self.compute)
         {
             self.consumed.push((self.stage, s));
             return Ok(TextureHandle(s));
+        }
+        if self.meta.isa == ShaderIsa::Ampere && k.count == 1 {
+            let index = if let Some(index) =
+                self.dynamic_textures.iter().position(|entry| entry.0 == k)
+            {
+                index
+            } else {
+                let pools = self
+                    .bindings
+                    .bindless
+                    .ok_or_else(|| unsupported("NVN2 pools are not active"))?;
+                let ids = bindless::descriptor_ids(self.residency, self.bindings, self.stage, k)
+                    .map_err(|e| unsupported(e.to_string()))?;
+                let sample = pools.resolve(ids);
+                let index = self.dynamic_textures.len();
+                self.dynamic_textures.push((k, sample));
+                index
+            };
+            return Ok(TextureHandle((1 << 31) | index as u32));
         }
         Err(unsupported(format!(
             "unsupported NVN texture expression {k:?}"
@@ -307,6 +431,7 @@ pub(super) fn compile(
             _ => InputTopology::Triangles,
         },
         use_integer_fragment_outputs: true,
+        force_early_z: draw.shaders.iter().any(|s| s.early_fragment_tests != 0),
         color_output_types: std::array::from_fn(|i| {
             match state.colors.get(i).map(|(f, _)| images::color_kind(*f)) {
                 Some(1) => AttributeType::UnsignedInt,
@@ -332,12 +457,7 @@ pub(super) fn compile(
         minus_one_to_one: runtime.ndc_minus_one_to_one,
     };
     let compiled = match native.state.nvn.shaders.get(&key) {
-        Some(cached)
-            if cached.accepts(
-                &draw.bindings,
-                native.residency.device_memory().generation(),
-            ) =>
-        {
+        Some(cached) if cached.accepts(&draw.bindings, native.residency.device_memory()) => {
             cached.clone()
         }
         _ => {
@@ -396,13 +516,26 @@ fn translate(
     bindings: &nixe_nvn::Bindings,
     graphics: Option<&GraphicsRuntimeState>,
 ) -> Result<Compiled, VulkanError> {
-    let generation = native.residency.device_memory().generation();
+    let mut sparse_generation = bindings
+        .captured
+        .as_ref()
+        .and_then(|usage| usage.sparse_generation);
     let reader = native.residency.device_memory().reader();
     let mut sources = Vec::with_capacity(stages.len());
     for (index, shader) in stages.iter().enumerate() {
         let source = if let Some(capture) = &bindings.captured {
             capture.stages[index].clone()
         } else {
+            let memory = native.residency.device_memory();
+            let generation = memory.generation();
+            if sparse_generation.is_none()
+                && !memory
+                    .unmapped_blocks(shader.address, shader.bytes.into())
+                    .map_err(error)?
+                    .is_empty()
+            {
+                sparse_generation = Some(generation);
+            }
             native
                 .residency
                 .flush_read_span(shader.address, shader.bytes.into())?;
@@ -411,16 +544,18 @@ fn translate(
                 .read_block_unsafe(shader.address, &mut code)
                 .map_err(error)?;
             let cache = native.residency.shader_cache;
-            if let Some(old) = cache.try_get(shader.address, ShaderIsa::Maxwell)
-                && old.size_bytes < code.len()
+            let isa = ShaderIsa::try_from(u32::from(shader.isa)).map_err(error)?;
+            let hash = nixe_gpu::shader_identity::cityhash::city_hash64(&code);
+            if let Some(old) = cache.try_get(shader.address, isa)
+                && (old.size_bytes < code.len()
+                    || (old.size_bytes == code.len() && old.unique_hash != hash))
             {
                 cache.invalidate_region(shader.address, old.size_bytes as u64);
             }
-            let hash = nixe_gpu::shader_identity::cityhash::city_hash64(&code);
             let version = cache
                 .register(
                     shader.address,
-                    ShaderIsa::Maxwell,
+                    isa,
                     nixe_gpu::shader_memory::ShaderInfo::new(hash, code.len()),
                 )
                 .map_err(error)?;
@@ -437,10 +572,7 @@ fn translate(
         Arc::new(nixe_nvn::ShaderUsage {
             stages: sources.into_boxed_slice(),
             shapes,
-            mapping_generation: bindings
-                .captured
-                .as_ref()
-                .map_or(generation, |v| v.mapping_generation),
+            sparse_generation,
         })
     };
     let resolution = native.residency.resolution();
@@ -449,6 +581,7 @@ fn translate(
         .nvn
         .archive
         .as_ref()
+        .filter(|_| sources.iter().all(|source| source.shader.isa == 0))
         .map(|_| disk::source_key(&sources, graphics, resolution));
     if let Some((translation, shapes)) = key
         .as_ref()
@@ -466,7 +599,7 @@ fn translate(
     compiler.reset().map_err(error)?;
     let mut consumed = Vec::new();
     let textures = &bindings.sampled.entries;
-    let mut ids = Vec::new();
+    let mut programs = smallvec::SmallVec::<[(Stage, ir::ProgramId); 2]>::new();
     let mut constants = [Range::default(); 6];
     let mut config = native.residency.device().profile().shader_compiler.clone();
     config.settings.resolution_info = resolution;
@@ -475,6 +608,7 @@ fn translate(
         let code = source.bytes.as_ref();
         let h = shader.header as usize;
         let id = shader.stage as usize;
+        let compute = (id == 5 && shader.isa == 1).then_some(shader.compute);
         let (stage, sph) = if id == 5 {
             (Stage::Compute, ir::header::ProgramHeader::default())
         } else {
@@ -497,11 +631,18 @@ fn translate(
             size: u64::from(shader.bytes - shader.constants),
         };
         let meta = EnvironmentMetadata {
+            isa: ShaderIsa::try_from(u32::from(shader.isa)).map_err(error)?,
             stage,
-            local_memory_size: EnvironmentMetadata::graphics_local_memory_size(&sph)
-                .map_err(error)?,
+            local_memory_size: EnvironmentMetadata::graphics_local_memory_size(&sph).map_err(
+                |e| {
+                    error(format!(
+                        "NVN {stage:?} shader at {:#x}: {e}",
+                        shader.address
+                    ))
+                },
+            )?,
             sph,
-            workgroup_size: shader.group,
+            workgroup_size: shader.group.map(u32::from),
             shared_memory_size: if stage == Stage::Compute {
                 shader.shared
             } else {
@@ -519,25 +660,44 @@ fn translate(
             consumed: &mut consumed,
             stage: id as u32,
             constants: shader.constants as usize,
+            bindings,
+            residency: &mut native.residency,
+            dynamic_textures: Vec::new(),
+            compute,
         };
-        ids.push(
+        programs.push((
+            stage,
             compiler
                 .translate(&mut env, &config.host, &config.settings)
-                .map_err(error)?,
-        );
+                .map_err(|e| {
+                    error(format!(
+                        "NVN {stage:?} shader at {:#x}: {e}",
+                        shader.address
+                    ))
+                })?,
+        ));
     }
+    // NVN orders its public stage indices differently from shader linkage.
+    programs.sort_unstable_by_key(|&(stage, _)| stage);
+    let ids: smallvec::SmallVec<[ir::ProgramId; 2]> =
+        programs.into_iter().map(|(_, id)| id).collect();
     let shader = crate::cache::compile_guest(compiler, &ids, &config, graphics).map_err(error)?;
     let mut inputs = Vec::new();
     let mut texture_base = 0;
     let mut image_base = 0;
+    let ampere = sources
+        .first()
+        .is_some_and(|source| source.shader.isa == ShaderIsa::Ampere as u8);
     for stage in &shader.stages {
         let id = match stage.stage {
             nixe_gpu::ShaderStage::Vertex => 0,
             nixe_gpu::ShaderStage::Fragment => 1,
+            nixe_gpu::ShaderStage::Geometry => 2,
             nixe_gpu::ShaderStage::Compute => 5,
             _ => return Err(error("unsupported NVN shader stage")),
         };
         let metadata = stage.guest.as_ref().unwrap();
+        let compute = (id == 5 && ampere).then(|| sources[0].shader.compute);
         if resolution.active
             && (texture_base + metadata.info.texture_descriptors.len() > 128
                 || image_base + metadata.info.image_descriptors.len() > 64)
@@ -559,6 +719,9 @@ fn translate(
                 ResourceSource::ConstantBuffer(c) if matches!(c.index.0, 0 | 2) => {
                     Input::Driver(id, c.index.0, uniform_bound(c.index.0).min(2048) as usize)
                 }
+                ResourceSource::ConstantBuffer(c) if ampere && (24..32).contains(&c.index.0) => {
+                    Input::Push(c.index.0 - 24)
+                }
                 ResourceSource::ConstantBuffer(c) if c.index.0 >= 3 => {
                     Input::Uniform(id, c.index.0 - 3, uniform_bound(c.index.0))
                 }
@@ -568,30 +731,47 @@ fn translate(
                     Input::Constants(id, range.size)
                 }
                 ResourceSource::StorageBuffer(d)
-                    if d.cbuf_index.0 == 0 && d.pointer_table.is_none() =>
+                    if d.cbuf_index.0 == 0 && d.pointer_table.is_some() =>
                 {
-                    let offset = d.cbuf_offset.0;
-                    let ssbo = match id {
-                        0 => 0x110,
-                        1 => 0x510,
-                        5 => 0x310,
-                        _ => return Err(error("unsupported NVN storage stage")),
+                    let Some(Input::Storage(stage, slot)) =
+                        driver_pointer(id, d.cbuf_offset.0, compute)
+                    else {
+                        return Err(error("NVN pointer table is not backed by a storage slot"));
                     };
-                    if id == 5 && (0x210..0x310).contains(&offset) {
-                        Input::Uniform(5, (offset - 0x210) / 16, u64::MAX)
-                    } else {
-                        let bytes = offset
-                            .checked_sub(ssbo)
-                            .filter(|n| n.is_multiple_of(16) && *n < 256)
-                            .ok_or_else(|| {
-                                error(format!("unknown NVN buffer pointer c0[{offset:#x}]"))
-                            })?;
-                        Input::Storage(id, bytes / 16)
+                    let span = d.pointer_table.as_ref().unwrap();
+                    Input::PointerTable {
+                        stage,
+                        slot,
+                        start: span.start,
+                        end: span.end,
+                        written: d.is_written,
                     }
                 }
-                ResourceSource::Image(i) if i.cbuf_index.0 == 2 && i.handle_program.is_none() => {
-                    let slot = slot(i.cbuf_offset.0)
-                        .ok_or_else(|| error("invalid NVN image handle offset"))?;
+                ResourceSource::StorageBuffer(d)
+                    if d.cbuf_index.0 == 0 && d.pointer_table.is_none() =>
+                {
+                    driver_pointer(id, d.cbuf_offset.0, compute).ok_or_else(|| {
+                        error(format!(
+                            "unknown NVN buffer pointer c0[{:#x}]",
+                            d.cbuf_offset.0
+                        ))
+                    })?
+                }
+                ResourceSource::StorageBuffer(d)
+                    if ampere && d.pointer_table.is_none() && pointer_bank(d.cbuf_index) =>
+                {
+                    Input::StoragePointer(
+                        id,
+                        CbufWordKey {
+                            index: d.cbuf_index,
+                            offset: d.cbuf_offset,
+                        },
+                    )
+                }
+                ResourceSource::Image(i)
+                    if i.handle_program.is_none()
+                        && let Some(slot) = handle_slot(i.cbuf_index, i.cbuf_offset, compute) =>
+                {
                     consumed.push((id, slot));
                     Input::Image {
                         stage: id,
@@ -599,19 +779,90 @@ fn translate(
                         ty: i.texture_type,
                         format: i.format,
                         scale_index: image_base + binding.resource_index.0 as usize,
+                        bindless: None,
+                    }
+                }
+                ResourceSource::Image(i)
+                    if ampere && i.handle_program.is_none() && i.count == 1 =>
+                {
+                    Input::Image {
+                        stage: id,
+                        slot: 0,
+                        ty: i.texture_type,
+                        format: i.format,
+                        scale_index: image_base + binding.resource_index.0 as usize,
+                        bindless: Some(HandleKey {
+                            index: i.cbuf_index,
+                            offset: i.cbuf_offset,
+                            count: 1,
+                            ..Default::default()
+                        }),
                     }
                 }
                 ResourceSource::Texture(t)
-                    if t.cbuf_index.0 == 2 && !t.has_secondary && t.handle_program.is_none() =>
+                    if !t.has_secondary
+                        && t.handle_program.is_none()
+                        && let Some(slot) = handle_slot(t.cbuf_index, t.cbuf_offset, compute) =>
                 {
-                    let slot = slot(t.cbuf_offset.0)
-                        .ok_or_else(|| error("invalid NVN sampled texture offset"))?;
                     consumed.push((id, slot));
                     Input::Texture {
                         stage: id,
                         slot,
                         ty: t.texture_type,
                         scale_index: texture_base + binding.resource_index.0 as usize,
+                        bindless: None,
+                    }
+                }
+                ResourceSource::Texture(t)
+                    if ampere && t.handle_program.is_none() && t.count == 1 =>
+                {
+                    Input::Texture {
+                        stage: id,
+                        slot: 0,
+                        ty: t.texture_type,
+                        scale_index: texture_base + binding.resource_index.0 as usize,
+                        bindless: Some(HandleKey {
+                            index: t.cbuf_index,
+                            offset: t.cbuf_offset,
+                            shift_left: t.shift_left,
+                            sec_index: t.secondary_cbuf_index,
+                            sec_offset: t.secondary_cbuf_offset,
+                            sec_shift_left: t.secondary_shift_left,
+                            count: t.count,
+                            has_secondary: t.has_secondary,
+                        }),
+                    }
+                }
+                ResourceSource::ImageBuffer(t)
+                    if ampere && t.handle_program.is_none() && t.count == 1 =>
+                {
+                    Input::TexelBuffer {
+                        stage: id,
+                        handle: HandleKey {
+                            index: t.cbuf_index,
+                            offset: t.cbuf_offset,
+                            count: 1,
+                            ..Default::default()
+                        },
+                        storage: Some(t.format),
+                    }
+                }
+                ResourceSource::TextureBuffer(t)
+                    if ampere && t.handle_program.is_none() && t.count == 1 =>
+                {
+                    Input::TexelBuffer {
+                        stage: id,
+                        handle: HandleKey {
+                            index: t.cbuf_index,
+                            offset: t.cbuf_offset,
+                            shift_left: t.shift_left,
+                            sec_index: t.secondary_cbuf_index,
+                            sec_offset: t.secondary_cbuf_offset,
+                            sec_shift_left: t.secondary_shift_left,
+                            has_secondary: t.has_secondary,
+                            count: 1,
+                        },
+                        storage: None,
                     }
                 }
                 s => return Err(error(format!("unsupported NVN program binding {s:?}"))),
@@ -704,6 +955,7 @@ enum DriverSource {
 }
 struct DriverBank {
     source: DriverSource,
+    compute: Option<(ComputeLayout, Arc<nixe_nvn::TextureHandles>)>,
     groups: [u32; 3],
     first_instance: u32,
     samples: u32,
@@ -712,7 +964,7 @@ struct DriverBank {
 impl DriverBanks {
     pub(super) fn select(
         &mut self,
-        (stage, bank, owner): (u32, u32, u64),
+        (stage, bank, owner, compute): (u32, u32, u64, Option<ComputeLayout>),
         size: usize,
         b: &nixe_nvn::Bindings,
         groups: [u32; 3],
@@ -723,6 +975,13 @@ impl DriverBanks {
         let revision = b.buffers.driver_revision();
         if let Some(p) = slot.as_ref()
             && p.bytes.len() == size
+            && match (&p.compute, compute) {
+                (None, None) => true,
+                (Some((old, handles)), Some(layout)) => {
+                    *old == layout && Arc::ptr_eq(handles, &b.handles)
+                }
+                _ => false,
+            }
             && if bank == 2 {
                 matches!(&p.source, DriverSource::Handles(h) if Arc::ptr_eq(h,&b.handles))
             } else {
@@ -734,13 +993,18 @@ impl DriverBanks {
         {
             return HostBinding::UniformBytes(p.bytes.clone());
         }
-        let bytes = driver_uniform(stage, bank, b, groups, first_instance, samples, size);
+        let bytes = if let Some(layout) = compute {
+            compute_uniform(layout, b, size)
+        } else {
+            driver_uniform(stage, bank, b, groups, first_instance, samples, size)
+        };
         *slot = Some(DriverBank {
             source: if bank == 2 {
                 DriverSource::Handles(b.handles.clone())
             } else {
                 DriverSource::Buffers { owner, revision }
             },
+            compute: compute.map(|layout| (layout, b.handles.clone())),
             groups,
             first_instance,
             samples,
@@ -748,6 +1012,48 @@ impl DriverBanks {
         });
         HostBinding::UniformBytes(bytes)
     }
+}
+
+fn compute_uniform(layout: ComputeLayout, b: &nixe_nvn::Bindings, size: usize) -> Arc<[u8]> {
+    let mut bytes = [0u8; 2048];
+    let mut offset = 16;
+    for (index, words) in layout.roots.into_iter().enumerate() {
+        let length = usize::from(words) * 4;
+        if length != 0
+            && let Some(block) = b.buffers.push_block(index)
+        {
+            bytes[offset..offset + length].copy_from_slice(&block[..length]);
+        }
+        offset += length.next_multiple_of(16);
+    }
+    for (storage, base, count) in [
+        (false, layout.uniform_base(), layout.uniform),
+        (true, layout.storage_base(), layout.storage),
+    ] {
+        for (slot, range) in b.buffers.stage_ranges(storage, 5) {
+            if slot < usize::from(count) {
+                let offset = base as usize + 16 * slot;
+                bytes[offset..offset + 8].copy_from_slice(&range.address.to_le_bytes());
+                bytes[offset + 8..offset + 12].copy_from_slice(&(range.size as u32).to_le_bytes());
+            }
+        }
+    }
+    for &((stage, slot), handle) in b.handles.iter() {
+        if stage != 5 {
+            continue;
+        }
+        let offset = if slot < u32::from(layout.textures) {
+            layout.texture_base() + 8 * slot
+        } else if let Some(image) = slot.checked_sub(nixe_nvn::IMAGE_HANDLE_BASE_SLOT)
+            && image < u32::from(layout.images)
+        {
+            layout.image_base() + 8 * image
+        } else {
+            continue;
+        } as usize;
+        bytes[offset..offset + 8].copy_from_slice(&handle.to_le_bytes());
+    }
+    Arc::from(&bytes[..size])
 }
 fn driver_uniform(
     stage: u32,

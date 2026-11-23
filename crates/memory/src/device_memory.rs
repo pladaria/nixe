@@ -224,6 +224,7 @@ impl State {
 pub(crate) struct Inner {
     machine: Machine,
     address_bits: u32,
+    reservation_start: u64,
     state: RwLock<State>,
     tracked: TrackedTable,
     // The compressed physical-to-device index is the canonical reverse table.
@@ -368,13 +369,25 @@ impl Drop for DeviceMapping {
 }
 impl DeviceMemory {
     pub fn new(machine: Machine, address_bits: u32) -> Self {
+        Self::with_reservation_start(machine, address_bits, 0)
+    }
+
+    /// Keep a device address prefix available for fixed-address mappings.
+    pub fn with_reservation_start(
+        machine: Machine,
+        address_bits: u32,
+        reservation_start: u64,
+    ) -> Self {
         assert!((LEAF_SHIFT..64).contains(&address_bits));
+        assert!(reservation_start.is_multiple_of(PAGE_SIZE));
+        assert!(reservation_start < 1 << address_bits);
         let physical_pages = (machine.arena().capacity() / PAGE_SIZE) as usize;
         let tracked = TrackedTable::new(&machine, address_bits);
         Self(Arc::new(Inner {
             machine,
             tracked,
             address_bits,
+            reservation_start,
             state: RwLock::new(State {
                 pages: (0..1usize << (address_bits - LEAF_SHIFT))
                     .map(|_| None)
@@ -778,7 +791,11 @@ impl DeviceMemory {
             return Err(MemoryError::Invalid("invalid device address reservation"));
         }
         let mut state = self.0.state.write().unwrap();
-        let mut start = alignment;
+        let mut start = self
+            .0
+            .reservation_start
+            .next_multiple_of(alignment)
+            .max(alignment);
         for (&base, &length) in &state.reservations {
             if start.checked_add(bytes).is_some_and(|end| end <= base) {
                 break;
@@ -1307,6 +1324,24 @@ mod tests {
             .unwrap()
             .into();
         (space, inputs)
+    }
+
+    #[test]
+    fn dynamic_reservations_leave_fixed_cpu_addresses_available() {
+        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
+        let (_space, input) = cpu_pages(&machine, 0x10000, 2 * PAGE_SIZE);
+        let device = DeviceMemory::with_reservation_start(machine, 34, 1 << 33);
+        let fixed = crate::DeviceHeapMemory::new(device.clone())
+            .map_fixed(0x10000, input.clone())
+            .unwrap();
+        let reserved = device.reserve(2 * PAGE_SIZE, 0x10000).unwrap();
+        assert_eq!(fixed.address(), 0x10000);
+        assert_eq!(reserved.address(), 1 << 33);
+        let _alias = device.map(reserved.address(), input, true).unwrap();
+        assert_eq!(
+            device.physical_address(fixed.address()),
+            device.physical_address(reserved.address()),
+        );
     }
 
     #[test]

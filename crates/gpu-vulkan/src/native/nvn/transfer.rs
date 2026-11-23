@@ -1,6 +1,7 @@
 //! NVN image commands capture texture views and regions at recording time.
 //! https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/hle_nvn.c#L1709-L1721
 use super::*;
+use nixe_gpu::ImageFormat;
 
 fn slice(mut t: Texture, z: u32) -> Result<Texture, VulkanError> {
     if z >= t.layer_count() {
@@ -113,6 +114,23 @@ impl NativeExecution<'_> {
         if src[3..].contains(&0) || dst[3..].contains(&0) {
             return Ok(());
         }
+        let source_format = resources::format(textures[0].format)?;
+        let core = &self.residency.device().profile().core;
+        let encoded_copy = source_format.block_extent() != [1, 1]
+            && if source_format.astc_profile().is_some() {
+                core.texture_compression_astc_ldr == 0
+            } else {
+                core.texture_compression_bc == 0
+            };
+        if encoded_copy
+            && (textures[0].format != textures[1].format
+                || src[3..5] != dst[3..5]
+                || mirror != [false; 2])
+        {
+            return Err(error(
+                "encoded NVN copy requires matching formats and block regions",
+            ));
+        }
         for z in 0..src[5] {
             let get = |i: usize| {
                 let slice = if i == 0 && flags & 16 != 0 {
@@ -124,6 +142,12 @@ impl NativeExecution<'_> {
                     .checked_add(slice)
                     .ok_or_else(|| error("NVN copy layer range overflow"))
             };
+            if encoded_copy {
+                let source = encoded_plane(slice(textures[0], get(0)?)?, src, source_format)?;
+                let destination = encoded_plane(slice(textures[1], get(1)?)?, dst, source_format)?;
+                self.residency.copy_encoded_planes([source, destination])?;
+                continue;
+            }
             let retained = self.residency.runtime.constructing.len();
             let result = (|| {
                 let mut views = [ImageViewId::default(); 2];
@@ -180,4 +204,47 @@ impl NativeExecution<'_> {
         }
         Ok(())
     }
+}
+
+fn encoded_plane(
+    texture: Texture,
+    [x, y, _, w, h, _]: [u32; 6],
+    format: ImageFormat,
+) -> Result<(u64, u64, nixe_gpu::physical::ImageFootprint), VulkanError> {
+    use nixe_gpu::physical::ByteRect;
+    let [bw, bh] = format.block_extent();
+    let [width, height] = texture.view_extent();
+    let valid = |start: u32, count: u32, end: u32, block: u32| {
+        start.is_multiple_of(block)
+            && start
+                .checked_add(count)
+                .is_some_and(|stop| stop <= end && (count.is_multiple_of(block) || stop == end))
+    };
+    if !valid(x, w, width, bw) || !valid(y, h, height, bh) {
+        return Err(error("encoded NVN copy rectangle is not block aligned"));
+    }
+    let info = resources::info(texture, false)?;
+    let bytes = u32::from(format.plane_bytes_per_block(0).unwrap());
+    let mut plane = crate::image_layout::plane_layout(
+        info.layout,
+        [
+            0,
+            if texture.target == 2 {
+                u32::from(texture.first_layer)
+            } else {
+                0
+            },
+        ],
+        [width.div_ceil(bw), height.div_ceil(bh)],
+        bytes,
+        bytes,
+        (0, bytes),
+    )?;
+    plane.rect = ByteRect {
+        x: x / bw,
+        y: y / bh,
+        width: w.div_ceil(bw),
+        height: h.div_ceil(bh),
+    };
+    Ok((info.address, info.size, plane))
 }

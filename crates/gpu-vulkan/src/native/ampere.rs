@@ -107,7 +107,7 @@ impl model::Rasterizer for NativeGpuExecution {
                 }
                 native.residency.reduce_semaphore(
                     native.state.ampere.semaphore.as_ref().unwrap(),
-                    target,
+                    nixe_memory::PhysicalMapping::new(target)?,
                     payload,
                     operation,
                     signed,

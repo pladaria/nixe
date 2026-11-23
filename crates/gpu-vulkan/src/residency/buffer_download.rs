@@ -478,7 +478,7 @@ impl BufferCache {
     fn publish_fence_download(&mut self, mut download: Download) -> Result<(), VulkanError> {
         let memory = self.device_memory.machine().clone();
         let (begin, end) = download.bounds();
-        let _landing = memory.begin_gpu_download(begin, end);
+        let landing = memory.begin_gpu_download(begin, end);
         for (address, bytes) in memory.pending_gpu_dirty_memory().iter() {
             #[cfg(feature = "performance-counters")]
             if download.write_ranges.intersects(address, bytes) {
@@ -486,7 +486,12 @@ impl BufferCache {
             }
             download.write_ranges.subtract(address, bytes);
         }
-        for (address, bytes) in self.write_download(download)?.iter() {
+        let published = self.write_download(download)?;
+        // A mapping transition can hold the alias lock while waiting for a
+        // native store that overlaps this landing. Release the stores before
+        // changing page protections, with the completed bytes already visible.
+        drop(landing);
+        for (address, bytes) in published.iter() {
             self.gpu_modified_ranges.subtract(address, bytes);
             self.release_clean_read_traps(address, bytes);
         }
@@ -495,7 +500,7 @@ impl BufferCache {
     fn publish_read_download(&mut self, mut read: ReadDownload) -> Result<(), VulkanError> {
         let memory = self.device_memory.machine().clone();
         let (begin, end) = read.download.bounds();
-        let _landing = memory.begin_gpu_download(begin, end);
+        let landing = memory.begin_gpu_download(begin, end);
         for (address, bytes) in memory.pending_gpu_dirty_memory().iter() {
             #[cfg(feature = "performance-counters")]
             if read.download.write_ranges.intersects(address, bytes) {
@@ -506,6 +511,7 @@ impl BufferCache {
             self.read_download_ranges.subtract(address, bytes);
         }
         self.write_download(read.download)?;
+        drop(landing);
         // Keep ownership when an older report can still overwrite these bytes.
         for report in &self.pending_reports {
             if let Some((address, bytes)) = report.pending_overwrite() {

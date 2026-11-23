@@ -2,7 +2,7 @@
 use super::*;
 use nixe_gpu::native::GuestBufferRange;
 
-pub(crate) struct PointerTableBinding {
+pub struct PointerTableBinding {
     pub(super) table: Arc<AllocatedBuffer>,
     pub(super) offset: u64,
     pub(super) size: u64,
@@ -110,5 +110,78 @@ impl Residency<'_> {
         })();
         self.runtime.constructing.truncate(pinned);
         result
+    }
+}
+
+impl Residency<'_> {
+    pub(crate) fn nvn_pointer_table(
+        &mut self,
+        range: nixe_nvn::Range,
+        start: i32,
+        end: i32,
+        written: bool,
+    ) -> Result<super::execution::HostBinding, VulkanError> {
+        use super::execution::HostBinding;
+        if range.address == 0 || range.size == 0 {
+            return Ok(HostBinding::NullBuffer);
+        }
+        let limits = &self.device().profile().limits;
+        let alignment = limits.min_storage_buffer_offset_alignment.max(8);
+        let padding = range.address % alignment;
+        if !range.address.is_multiple_of(8)
+            || !range.size.is_multiple_of(8)
+            || range.size + padding > u64::from(limits.max_storage_buffer_range)
+        {
+            return Err(VulkanError::InvalidResource(
+                "invalid NVN pointer table range",
+            ));
+        }
+        self.flush_read_span(range.address, range.size)?;
+        let mut words = smallvec::SmallVec::<[u64; 32]>::from_elem(0, range.size as usize / 8);
+        self.runtime
+            .device_reader
+            .read_block_unsafe(range.address, bytemuck::cast_slice_mut(&mut words))?;
+
+        let mut aliases = smallvec::SmallVec::<[GuestBufferRange; 4]>::new();
+        if written {
+            self.device_memory().apply_device_aliases(
+                range.address,
+                range.size,
+                |address, size| {
+                    aliases.push(GuestBufferRange { address, size });
+                },
+            );
+            aliases.push(GuestBufferRange {
+                address: range.address,
+                size: range.size,
+            });
+        }
+        let size = (i64::from(end) - i64::from(start)) as u64;
+        let mut targets =
+            smallvec::SmallVec::<[Option<GuestBufferRange>; 32]>::with_capacity(words.len());
+        for word in words {
+            let pointer = u64::from_le(word);
+            if pointer == 0 {
+                targets.push(None);
+                continue;
+            }
+            let address = pointer
+                .checked_add_signed(i64::from(start))
+                .filter(|address| address.is_multiple_of(4))
+                .ok_or(VulkanError::InvalidResource(
+                    "invalid NVN pointer table target",
+                ))?;
+            if aliases
+                .iter()
+                .any(|alias| address < alias.address + alias.size && alias.address < address + size)
+            {
+                return Err(VulkanError::InvalidResource(
+                    "NVN shader writes alias their pointer table",
+                ));
+            }
+            targets.push(Some(GuestBufferRange { address, size }));
+        }
+        self.pointer_table(&targets, padding, start)
+            .map(|table| HostBinding::PointerTable(Arc::new(table)))
     }
 }

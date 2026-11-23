@@ -21,7 +21,10 @@ pub mod ordered;
 mod presentation;
 mod resource;
 mod runtime;
-pub use execution::{FenceAction, GpuExecution, GpuPresentation, MemoryAccess, OwnerMemory};
+pub use execution::{
+    FenceAction, GpuExecution, GpuPresentation, MemoryAccess, NvnQueueWork, OwnerMemory,
+    nvn_fence_action,
+};
 mod tessellation;
 pub use tessellation::{
     TessellationControl, TessellationDomain, TessellationMode, TessellationOutput,

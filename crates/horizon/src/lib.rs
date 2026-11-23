@@ -44,6 +44,7 @@ pub use system_archive::SystemArchives;
 mod ipc_result;
 mod ipc_wire;
 mod nvdrv;
+mod nvn_backend;
 mod object;
 mod parcel;
 mod save_data;

@@ -77,6 +77,76 @@ fn decoded_format(format: ImageFormat) -> (vk::Format, u32) {
     }
 }
 impl Residency<'_> {
+    /// Copy encoded blocks between tiled allocations. A decoded image is only
+    /// a sampling representation and cannot publish the original blocks.
+    pub(crate) fn copy_encoded_planes(
+        &mut self,
+        planes: [(u64, u64, nixe_gpu::physical::ImageFootprint); 2],
+    ) -> Result<(), VulkanError> {
+        use nixe_gpu::native::GuestBufferRange;
+        use nixe_gpu::physical::WriteDomain;
+        let pitch = planes[0]
+            .2
+            .native_row_pitch
+            .max(planes[1].2.native_row_pitch);
+        let rect = planes[0].2.rect;
+        let element = u64::from(planes[0].2.packed_bytes);
+        let mut blocks = vec![
+            0;
+            ((u64::from(rect.height - 1) * pitch) + u64::from(rect.width) * element)
+                as usize
+        ];
+        let memory = self.runtime.device_memory.clone();
+        let build = |(address, size, mut plane): (_, _, nixe_gpu::physical::ImageFootprint)| {
+            plane.native_row_pitch = pitch;
+            let start = u64::from(plane.rect.y) * pitch + u64::from(plane.rect.x) * element;
+            let mapping = memory.read_mapping(address, size)?;
+            let footprint = Footprint::new(mapping, WriteDomain::Image(plane))?;
+            let bounds = footprint.bounds();
+            let range = GuestBufferRange {
+                address: address + bounds.start,
+                size: bounds.end - bounds.start,
+            };
+            let inputs = footprint.mapping().pin(bounds.start, range.size)?;
+            Ok::<_, VulkanError>((range, footprint, inputs, start))
+        };
+        let [source, destination] = planes;
+        let destination_address = destination.0;
+        let (read, source, source_pages, source_start) = build(source)?;
+        let (write, destination, destination_pages, destination_start) = build(destination)?;
+        self.flush_read_span(read.address, read.size)?;
+        // Preserve earlier writes that share the destination's physical pages.
+        self.flush_read_span(write.address, write.size)?;
+        self.runtime
+            .memory
+            .read_resources(&source_pages, |reader| {
+                source.capture_resource(reader, source_start, &mut blocks)
+            })?;
+        let mut physical = RangeSet::default();
+        let mut written = RangeSet::default();
+        for (index, span) in destination.mapping().spans().iter().enumerate() {
+            destination.visit(index, span.start, span.bytes, |part| {
+                physical.insert(part.start.get(), part.bytes);
+                written.insert(
+                    destination_address + span.logical + part.start.get() - span.start.get(),
+                    part.bytes,
+                );
+                true
+            })?;
+        }
+        self.texture_cache.supersede_image_downloads(&physical);
+        self.runtime
+            .memory
+            .write_resources(&destination_pages, |writer| {
+                destination.publish_resource(writer, destination_start, &blocks)
+            })?;
+        let mut aliases = written.clone();
+        for (address, bytes) in written.iter() {
+            memory.apply_device_aliases(address, bytes, |at, count| aliases.insert(at, count));
+        }
+        self.write_cpu_ranges(aliases.iter())
+    }
+
     /// Native BC handles non-block-aligned dimensions directly. Decode only when
     /// the host really lacks a format, rather than inheriting WebGPU size rules.
     pub fn sampled_image_for(

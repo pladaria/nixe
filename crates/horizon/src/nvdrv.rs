@@ -228,8 +228,9 @@ impl NvDrvSession {
         let backend = state.gpu_backend.as_ref().ok_or("no GPU backend for NVN")?;
         Ok(nixe_nvn::Graphics {
             heap: state.device_memory.clone(),
-            surfaces: Arc::new(self.clone()),
+            surfaces: Some(Arc::new(self.clone())),
             backend: gpu_executor::nvn::client(backend, mailbox),
+            display: None,
         })
     }
 

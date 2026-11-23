@@ -890,7 +890,9 @@ impl NativeExecution<'_> {
             self.residency.record_draw_inner(
                 &pipeline.pipeline,
                 &targets,
-                images,
+                images
+                    .iter()
+                    .filter_map(|image| image.view.map(|view| (view, image.descriptor))),
                 descriptors,
                 draw,
                 push.as_bytes(),

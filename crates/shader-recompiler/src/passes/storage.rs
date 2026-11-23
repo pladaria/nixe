@@ -288,17 +288,10 @@ pub(super) fn join_storage_info(base: &mut ShaderInfo, source: &ShaderInfo) -> R
 }
 
 pub fn add_nvn_storage_buffers(program: &mut Program) -> Result<()> {
-    use crate::types::Stage;
     if !program.info.uses_global_memory {
         return Ok(());
     }
-    let base = match program.stage {
-        Stage::VertexA | Stage::VertexB => 0x110,
-        Stage::TessellationControl => 0x210,
-        Stage::TessellationEval | Stage::Compute => 0x310,
-        Stage::Geometry => 0x410,
-        Stage::Fragment => 0x510,
-    };
+    let base = program.info.nvn_buffer_base;
     for index in 0..16 {
         if program.info.nvn_buffer_used & (1 << index) == 0 {
             continue;

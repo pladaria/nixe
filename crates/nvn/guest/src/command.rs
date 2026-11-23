@@ -9,26 +9,36 @@ struct Recorder {
     inline_limit: u64,
     inline_dirty: u8,
     recording: u8,
-    control_flags: u16,
+    inline_control_dirty: u8,
+    inline_flags: u8,
     callback_enabled: u8,
     saved_flags: [u8; 3],
-    limit: u64,
+    inline_recording_mode: u32,
+    inline_reserved: u32,
+    control_base: u64,
     control: u64,
     control_end: u64,
     command: u64,
-    control_base: u64,
     begin: u64,
     first: u64,
     last: u64,
-    capture_anchor: u64,
+    inline_control_chain: u64,
     device: u64,
     callback: u64,
     callback_data: u64,
     copy_strides: CopyStrides,
+    // Submit-visible records are linked inside the current command range.
+    capture_anchor: u64,
+    // The HLE command capacity is separate from the inline pushbuffer limit.
+    limit: u64,
 }
 const _: () = assert!(
-    core::mem::offset_of!(Recorder, begin) == 64
+    core::mem::offset_of!(Recorder, control) == 40
+        && core::mem::offset_of!(Recorder, control_end) == 48
+        && core::mem::offset_of!(Recorder, first) == 72
+        && core::mem::offset_of!(Recorder, last) == 80
         && core::mem::offset_of!(Recorder, callback) == 104
+        && core::mem::size_of::<Recorder>() <= 160
 );
 pub fn initialize(c: &Call) -> Result<u64> {
     c.write(
@@ -42,6 +52,14 @@ pub fn initialize(c: &Call) -> Result<u64> {
     Ok(1)
 }
 impl Recorder {
+    fn start(&mut self) {
+        self.recording = 1;
+        self.begin = self.position;
+        self.capture_anchor = self.position;
+        self.first = 0;
+        self.last = 0;
+    }
+
     fn request(&self, c: &Call, event: u64, bytes: u64) -> Result<u64> {
         if self.callback == 0 || (event == 0 && self.callback_enabled == 0) {
             return Err("NVN recording memory exhausted without refill callback");
@@ -168,11 +186,7 @@ pub fn begin(c: &Call) -> Result<u64> {
     if r.recording != 0 {
         return Err("already recording");
     }
-    r.recording = 1;
-    r.begin = r.position;
-    r.capture_anchor = r.position;
-    r.first = 0;
-    r.last = 0;
+    r.start();
     c.write(c.args[0], &r)?;
     Ok(0)
 }
@@ -327,12 +341,13 @@ fn link_capture(c: &Call, position: u64, anchor: u64) -> Result<()> {
 }
 fn reserve(c: &Call, op: u32, words: usize) -> Result<Option<u64>> {
     let object = c.args[0];
+    let recording: u8 = c.read(object + core::mem::offset_of!(Recorder, recording) as u64)?;
+    if recording == 0 {
+        return Err("command outside recording");
+    }
     let position: u64 = c.read(object)?;
     let limit: u64 = c.read(object + core::mem::offset_of!(Recorder, limit) as u64)?;
     let bytes = (words as u64 + 1) * 8;
-    if c.read::<u8>(object + core::mem::offset_of!(Recorder, recording) as u64)? == 0 {
-        return Err("command outside recording");
-    }
     if limit.saturating_sub(position) < bytes {
         c.read::<Recorder>(object)?.request(c, 0, bytes)?;
         return Ok(None);
@@ -352,6 +367,100 @@ fn record(c: &Call, op: u32, words: &[u64]) -> Result<u64> {
     }
     Ok(0)
 }
+
+pub fn copy_buffer(c: &Call) -> Result<u64> {
+    // Copy ordering follows the list's barriers; Vulkan handles visibility.
+    record(c, op::COPY_BUFFER, &c.args[1..4])
+}
+
+pub fn indexed_indirect(c: &Call) -> Result<u64> {
+    let [_, primitive, index_type, indices, parameters, ..] = c.args;
+    record(
+        c,
+        op::INDEXED_INDIRECT,
+        &[
+            primitive as u32 as u64 | (index_type << 32),
+            indices,
+            parameters,
+        ],
+    )
+}
+
+pub fn dispatch_indirect(c: &Call) -> Result<u64> {
+    record(c, op::DISPATCH_INDIRECT, &[c.args[1]])
+}
+
+pub fn push_compute(c: &Call) -> Result<u64> {
+    push_constants(c, true)
+}
+
+pub fn push_graphics(c: &Call) -> Result<u64> {
+    push_constants(c, false)
+}
+
+fn push_constants(c: &Call, compute: bool) -> Result<u64> {
+    let [_, block, offset, bytes, data, ..] = c.args;
+    if block >= 8 || offset > 256 || bytes > 256 - offset {
+        return Err("NVN2 push constant range exceeds its block");
+    }
+    if bytes != 0
+        && let Some(dst) = reserve(c, op::PUSH_CONSTANTS, 2 + (bytes as usize).div_ceil(8))?
+    {
+        c.write(
+            dst,
+            &[block | (u64::from(compute) << 32), offset | (bytes << 32)],
+        )?;
+        unsafe { core::ptr::copy(data as *const u8, (dst + 16) as *mut u8, bytes as usize) };
+        let tail = (bytes as usize).next_multiple_of(8) - bytes as usize;
+        unsafe { core::ptr::write_bytes((dst + 16 + bytes) as *mut u8, 0, tail) };
+    }
+    Ok(0)
+}
+
+pub fn zcull_hint(_: &Call) -> Result<u64> {
+    // @SIMPLIFICATION The host keeps hierarchical depth on the GPU and does not
+    // spill its metadata into the guest's opaque ZCull save area.
+    Ok(0)
+}
+
+pub fn recording_mode(c: &Call) -> Result<u64> {
+    // @SIMPLIFICATION All modes use the same submit-visible HLE recording format.
+    c.write(
+        c.args[0] + core::mem::offset_of!(Recorder, inline_recording_mode) as u64,
+        &(c.args[1] as u32),
+    )?;
+    Ok(0)
+}
+
+pub fn shading_rate_image(c: &Call) -> Result<u64> {
+    if c.args[2] != 0 {
+        return Err("NVN2 shading rate image rendering is unsupported");
+    }
+    Ok(0)
+}
+
+pub fn geometry_mode(_: &Call) -> Result<u64> {
+    // @SIMPLIFICATION The translated program selects its primitive processing
+    // stages; Vulkan chooses the hardware geometry processing mode.
+    Ok(0)
+}
+
+pub fn shading_rate_palette(_: &Call) -> Result<u64> {
+    // @SIMPLIFICATION An unbound shading rate image has full-rate shading.
+    // Palette entries cannot affect rendering until an image is bound.
+    Ok(0)
+}
+
+pub fn fence_sync(c: &Call) -> Result<u64> {
+    if c.args[2] != 0 || c.args[3] & !1 != 0 {
+        return Err("unsupported NVN command-buffer fence condition");
+    }
+    record(c, op::FENCE_SYNC, &[c.args[1], c.args[3]])
+}
+
+pub fn wait_sync(c: &Call) -> Result<u64> {
+    record(c, op::WAIT_SYNC, &[c.args[1]])
+}
 macro_rules! simple {
     ($name:ident,$op:ident,$n:literal) => {
         pub fn $name(c: &Call) -> Result<u64> {
@@ -361,7 +470,7 @@ macro_rules! simple {
 }
 fn bind_pool(c: &Call, op: u32) -> Result<u64> {
     let pool: DescriptorPool = c.read(c.args[1])?;
-    record(c, op, &[pool.base, pool.count.into()])
+    record(c, op, &[pool.base, pool.count.into(), pool.device_base])
 }
 pub fn sampler_pool(c: &Call) -> Result<u64> {
     bind_pool(c, op::SAMPLER_POOL)
@@ -383,6 +492,25 @@ pub fn program(c: &Call) -> Result<u64> {
     if let Some(dst) = reserve(c, op::PROGRAM, 1 + stages.len())? {
         c.write(dst, &mask)?;
         c.write_bytes(dst + 8, bytemuck::cast_slice(stages))?;
+    }
+    Ok(0)
+}
+pub fn program_ampere(c: &Call) -> Result<u64> {
+    let mask = c.args[2] & 0x1ff;
+    if c.args[1] == 0 {
+        return record(c, op::PROGRAM, &[mask]);
+    }
+    let p: AmpereProgram = c.read(c.args[1])?;
+    let stages = p
+        .stages
+        .get(..p.count as usize)
+        .ok_or("invalid NVN2 program stage count")?;
+    let stride = core::mem::size_of::<Shader>();
+    if let Some(dst) = reserve(c, op::PROGRAM, 1 + stages.len() * stride / 8)? {
+        c.write(dst, &mask)?;
+        for (index, &shader) in stages.iter().enumerate() {
+            c.write(dst + 8 + (index * stride) as u64, &shader.expand(p.compute))?;
+        }
     }
     Ok(0)
 }
@@ -420,6 +548,41 @@ simple!(dispatch, DISPATCH, 3);
 simple!(deferred, DEFERRED, 4);
 simple!(report, REPORT, 2);
 simple!(reset_counter, RESET_COUNTER, 1);
+pub fn textures(c: &Call) -> Result<u64> {
+    let count = c.args[3] as u32 as usize;
+    if count != 0 && let Some(dst) = reserve(c, op::TEXTURES, 1 + count)? {
+        c.write(dst, &pair(c.args[1], c.args[2]))?;
+        unsafe {
+            core::ptr::copy(c.args[4] as *const u64, (dst + 8) as *mut u64, count)
+        };
+    }
+    Ok(0)
+}
+
+pub fn wait_event(c: &Call) -> Result<u64> {
+    let event: Event = c.read(c.args[1])?;
+    record(c, op::WAIT_EVENT, &[event.gpu, pair(c.args[2], c.args[3])])
+}
+
+pub fn signal_event(c: &Call) -> Result<u64> {
+    let event: Event = c.read(c.args[1])?;
+    record(
+        c,
+        op::SIGNAL_EVENT,
+        &[event.gpu, pair(c.args[2], c.args[5]), pair(c.args[3], c.args[4])],
+    )
+}
+
+pub fn compute_overlap(_: &Call) -> Result<u64> {
+    // @SIMPLIFICATION Vulkan schedules graphics and compute on the ordered queue.
+    Ok(0)
+}
+
+pub fn stencil_cull(_: &Call) -> Result<u64> {
+    // @SIMPLIFICATION Hierarchical stencil culling is managed by the host driver.
+    // The stencil test and its masks are still applied by the pipeline.
+    Ok(0)
+}
 pub fn tiled_cache_hint(_: &Call) -> Result<u64> {
     // @SIMPLIFICATION Vulkan manages on-chip tile binning and flushing. Resource
     // visibility is expressed separately by NVN barriers and attachment dependencies.
@@ -539,11 +702,7 @@ pub fn blend_color(c: &Call) -> Result<u64> {
 }
 pub fn depth_range(c: &Call) -> Result<u64> {
     let transform = depth_transform([c.float[0], c.float[1]], depth_clip_mode(c)?);
-    record(
-        c,
-        op::DEPTH_RANGE,
-        &[bytemuck::cast(transform)],
-    )
+    record(c, op::DEPTH_RANGE, &[bytemuck::cast(transform)])
 }
 fn depth_clip_mode(c: &Call) -> Result<bool> {
     // The SDK reads the device mode while recording the Z scale and offset.
@@ -649,22 +808,33 @@ fn array(c: &Call, op: u32, stride: usize) -> Result<u64> {
 }
 pub fn copy_buffer_to_texture(c: &Call) -> Result<u64> {
     let [_, buffer, texture, view, region, ..] = c.args;
-    copy_buffer_image(c, op::COPY_BUFFER_TO_TEXTURE, buffer, [texture, view, region])
+    copy_buffer_image(
+        c,
+        op::COPY_BUFFER_TO_TEXTURE,
+        buffer,
+        [texture, view, region],
+    )
 }
 pub fn copy_texture_to_buffer(c: &Call) -> Result<u64> {
     let [_, texture, view, region, buffer, ..] = c.args;
-    copy_buffer_image(c, op::COPY_TEXTURE_TO_BUFFER, buffer, [texture, view, region])
+    copy_buffer_image(
+        c,
+        op::COPY_TEXTURE_TO_BUFFER,
+        buffer,
+        [texture, view, region],
+    )
 }
-fn copy_buffer_image(c: &Call, tag: u32, buffer: u64, [texture, view, region]: [u64; 3]) -> Result<u64> {
+fn copy_buffer_image(
+    c: &Call,
+    tag: u32,
+    buffer: u64,
+    [texture, view, region]: [u64; 3],
+) -> Result<u64> {
     let t = texels::view(c, texture, view)?;
     let region: [u32; 6] = c.read(region)?;
     let strides: CopyStrides = c.read(c.args[0] + COPY_STRIDES)?;
     let strided = strides != CopyStrides::default();
-    if let Some(dst) = reserve(
-        c,
-        tag,
-        5 + size_of::<Texture>() / 8 + usize::from(strided),
-    )? {
+    if let Some(dst) = reserve(c, tag, 5 + size_of::<Texture>() / 8 + usize::from(strided))? {
         c.write(dst, &[buffer, u64::from(c.args[5] as u32)])?;
         c.write(dst + 16, &t)?;
         let tail = dst + 16 + size_of::<Texture>() as u64;

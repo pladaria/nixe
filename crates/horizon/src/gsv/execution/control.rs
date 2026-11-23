@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 enum Request {
     Access(DeviceAccessRequest),
     Present(Box<crate::gsv::display::Frame>, Reply),
+    Nvn(nvn::Request),
     Released(MachineId, AllocationId),
     Retired(MachineId, AllocationId, Box<[Extent]>),
     Pressure(MachineId, u64),
@@ -27,6 +28,7 @@ pub(super) struct Endpoint {
     pub requested: AtomicBool,
     submit: AtomicBool,
     thread: std::sync::OnceLock<thread::Thread>,
+    nvn_budget: Arc<AtomicUsize>,
 }
 impl std::fmt::Debug for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -66,6 +68,42 @@ impl Endpoint {
         self.send(Request::Present(Box::new(frame), reply));
         completion
     }
+    pub(super) fn nvn_work(&self, work: crate::nvn_backend::Work) -> Result<()> {
+        let (request, reply) = nvn::Request::new(work, &self.nvn_budget);
+        let mut inbox = self.inbox.lock().unwrap();
+        if inbox.stopped {
+            return Err("native GPU owner stopped".into());
+        }
+        inbox.requests.push_back(Request::Nvn(request));
+        drop(inbox);
+        self.wake();
+        if let Some(reply) = reply {
+            reply.recv().map_err(|_| "native GPU owner stopped")?
+        } else {
+            Ok(())
+        }
+    }
+    pub(super) fn nvn_present(
+        &self,
+        queue: u64,
+        texture: nixe_nvn::Texture,
+        interval: u32,
+        flip: bool,
+        crop: [u32; 4],
+        receipt: nixe_nvn::display::PresentReceipt,
+    ) -> Result<()> {
+        let sequence = self.frame_sequence.fetch_add(1, Ordering::Relaxed);
+        self.nvn_work(crate::nvn_backend::Work::Present {
+            queue,
+            texture,
+            interval,
+            flip,
+            crop,
+            mailbox: self.presenter.clone(),
+            sequence,
+            receipt: Some(receipt),
+        })
+    }
     pub fn stop(&self) {
         let mut inbox = self.inbox.lock().unwrap();
         inbox.stopped = true;
@@ -94,7 +132,10 @@ impl Endpoint {
             )
             .map_err(|e| e.to_string().into())
     }
-    pub fn progress<E: ampere::Rasterizer>(&self, renderer: &mut E) -> Result<()> {
+    pub fn progress<E: ampere::Rasterizer + nixe_gpu::GpuPresentation>(
+        &self,
+        renderer: &mut E,
+    ) -> Result<()> {
         self.requested.store(false, Ordering::Release);
         loop {
             let Some(request) = self.inbox.lock().unwrap().requests.pop_front() else {
@@ -103,7 +144,11 @@ impl Endpoint {
             match request {
                 Request::Access(request) => renderer.queue_device_access(request),
                 Request::Present(frame, reply) => {
-                    let image = renderer.composite(frame.image.clone(), frame.interval)?;
+                    let image = ampere::Rasterizer::composite(
+                        renderer,
+                        frame.image.clone(),
+                        frame.interval,
+                    )?;
                     if let Some(presenter) = &self.presenter {
                         let sequence = self.frame_sequence.fetch_add(1, Ordering::Relaxed);
                         presenter.publish(Arc::new(nixe_video::PresentationFrame::new(
@@ -119,6 +164,7 @@ impl Endpoint {
                         Ok(())
                     })))
                 }
+                Request::Nvn(request) => request.run(renderer),
                 Request::Released(machine, allocation) => {
                     renderer.release_guest_memory(machine, allocation)
                 }

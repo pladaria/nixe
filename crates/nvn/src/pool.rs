@@ -154,6 +154,14 @@ pub fn map_virtual(c: &Call) -> Result<u64> {
 }
 
 pub fn initialize(c: &Call) -> Result<u64> {
+    initialize_pool::<false>(c)
+}
+
+pub fn initialize_ampere(c: &Call) -> Result<u64> {
+    initialize_pool::<true>(c)
+}
+
+fn initialize_pool<const FIXED: bool>(c: &Call) -> Result<u64> {
     let b: Builder = c.read(c.args[1])?;
     if b.flags & 0x200 != 0 {
         let reserve = c
@@ -187,12 +195,16 @@ pub fn initialize(c: &Call) -> Result<u64> {
         .memory
         .capture(address, b.bytes, MemoryPermissions::READ)
         .map_err(|e| e.to_string())?;
-    let mapping = c
-        .session
-        .graphics()?
-        .heap
-        .map(ranges.into(), b.bytes, Some((c.memory.identity(), address)))
-        .map_err(|e| e.to_string())?;
+    let heap = &c.session.graphics()?.heap;
+    let mapping = if FIXED {
+        // NVN2 can return the backing address through GetBufferAddress even
+        // when the pool's flags disallow access through MemoryPoolMap.
+        // https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/hle_nvn.c#L319
+        heap.map_fixed(address.get(), ranges.into())
+    } else {
+        heap.map(ranges.into(), b.bytes, Some((c.memory.identity(), address)))
+    }
+    .map_err(|e| e.to_string())?;
     let pool = Pool {
         cpu: b.storage,
         gpu: mapping.address(),
@@ -217,6 +229,7 @@ impl DescriptorPool {
             base,
             count,
             padding: 0,
+            device_base: 0,
         }
     }
     pub fn slot(self, index: u32) -> Result<u64> {
@@ -250,6 +263,8 @@ pub(crate) fn surface_handle(c: &Call, object: u64) -> Result<u32> {
             c.session
                 .graphics()?
                 .surfaces
+                .as_ref()
+                .ok_or("this platform does not export NvMap surfaces")?
                 .export(c.memory, p.cpu, p.bytes)?,
         )
     }

@@ -127,6 +127,23 @@ impl DeviceHeapMemory {
             _reservation: reservation,
         }))
     }
+
+    /// Back a fixed GPU address with the same guest allocation used by the CPU.
+    /// The device keeps its dynamically reserved ranges above this address space.
+    pub fn map_fixed(
+        &self,
+        address: u64,
+        ranges: Arc<[AllocationRange]>,
+    ) -> Result<Arc<DeviceHeapMapping>, MemoryError> {
+        let pin = self.device().map(address, ranges, true)?;
+        let reservation_bytes = pin.physical().bytes();
+        Ok(Arc::new(DeviceHeapMapping {
+            pin,
+            memory: self.clone(),
+            reservation_bytes,
+            _reservation: None,
+        }))
+    }
 }
 impl DeviceHeapMapping {
     pub fn address(&self) -> u64 {

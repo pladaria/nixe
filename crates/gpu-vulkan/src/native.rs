@@ -864,7 +864,8 @@ impl GpuExecution for NativeGpuExecution {
         self.execution().queue_device_access(request)
     }
     fn progress(&mut self) -> Result<(), BackendRuntimeError> {
-        self.execution().progress()
+        self.execution().progress()?;
+        self.progress_nvn_waits()
     }
     fn retire_physical_memory(
         &mut self,
@@ -891,6 +892,9 @@ impl GpuExecution for NativeGpuExecution {
     }
 
     fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
+        // Pending NVN suffixes have no executable native prefix. Drop them
+        // before waiting on committed work so their guest receipts see cancellation.
+        self.state.nvn.work = Default::default();
         // WaitPendingFences(true) commits a final cache prefix before waiting.
         self.fence_caches(None).map_err(runtime)?;
         self.execution().flush_deferred()?;
@@ -963,16 +967,23 @@ fn owner_memory_error(error: BackendRuntimeError) -> Arc<nixe_memory::MemoryErro
 }
 
 impl nixe_gpu::GpuPresentation for NativeGpuExecution {
-    fn nvn_submit(
+    fn nvn_queue_work(
         &mut self,
         queue: u64,
-        commands: nixe_nvn::Submission,
+        work: nixe_gpu::NvnQueueWork,
+        hold: impl Send + 'static,
     ) -> Result<(), BackendRuntimeError> {
-        self.submit_nvn(queue, commands)
+        self.queue_nvn_work(queue, work, hold)
     }
-    fn nvn_finalize_queue(&mut self, queue: u64) -> Result<(), BackendRuntimeError> {
-        self.state.nvn.finalize_queue(queue);
-        Ok(())
+    fn nvn_drain(&mut self, finish: Box<dyn FnOnce() + Send>) {
+        self.state.nvn.work.drain(finish);
+    }
+    fn nvn_poll_interval(&self) -> Option<Duration> {
+        self.state
+            .nvn
+            .work
+            .has_waiters()
+            .then(|| Duration::from_millis(1))
     }
     fn nvn_flush(
         &mut self,
@@ -1024,19 +1035,6 @@ impl nixe_gpu::GpuPresentation for NativeGpuExecution {
             .fences
             .queue(Some(work), false, Some(action))
             .map_err(runtime)
-    }
-    fn nvn_present(
-        &mut self,
-        t: nixe_nvn::Texture,
-        interval: u32,
-        flip_vertical: bool,
-        crop: [u32; 4],
-    ) -> Result<ResidentImage, BackendRuntimeError> {
-        self.composite_image(
-            nvn::presentation(t, flip_vertical, crop).map_err(runtime)?,
-            interval,
-            None,
-        )
     }
     type Conversion = NativeNv12Conversion;
     type ImageRequest = nixe_gpu_maxwell::PresentationImageRequest;

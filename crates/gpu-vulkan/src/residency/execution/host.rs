@@ -6,6 +6,7 @@ impl HostBinding {
         match (self, other) {
             (Self::NullBuffer, Self::NullBuffer) => true,
             (Self::UniformBytes(a), Self::UniformBytes(b)) => Arc::ptr_eq(a, b),
+            (Self::PointerTable(a), Self::PointerTable(b)) => Arc::ptr_eq(a, b),
             (
                 Self::Buffer {
                     buffer: a,
@@ -135,6 +136,15 @@ impl Residency<'_> {
                     HostBinding::UniformBytes(_) => crate::cache::DescriptorEntry {
                         buffer: Default::default(),
                     },
+                    HostBinding::TexelBuffer {
+                        buffer,
+                        offset,
+                        size,
+                        format,
+                        ..
+                    } => crate::cache::DescriptorEntry {
+                        texel: buffer.native.texel_view(*offset, *size, *format)?,
+                    },
                     HostBinding::NullBuffer => crate::cache::DescriptorEntry {
                         buffer: vk::DescriptorBufferInfo::default().range(vk::WHOLE_SIZE),
                     },
@@ -157,6 +167,21 @@ impl Residency<'_> {
                                 .range(*size),
                         }
                     }
+                    HostBinding::PointerTable(binding) => {
+                        let dynamic = program
+                            .pipeline
+                            .layout
+                            .dynamic_bindings
+                            .binary_search(&index)
+                            .ok()
+                            .map_or(0, |i| u64::from(program.dynamic_offsets[i]));
+                        crate::cache::DescriptorEntry {
+                            buffer: vk::DescriptorBufferInfo::default()
+                                .buffer(binding.table.handle)
+                                .offset(binding.offset - dynamic)
+                                .range(binding.size),
+                        }
+                    }
                     HostBinding::CombinedImageSampler { image, sampler } => {
                         crate::cache::DescriptorEntry {
                             image: vk::DescriptorImageInfo::default()
@@ -164,11 +189,6 @@ impl Residency<'_> {
                                 .image_layout(vk::ImageLayout::GENERAL)
                                 .sampler(sampler.handle),
                         }
-                    }
-                    _ => {
-                        return Err(VulkanError::InvalidResource(
-                            "unsupported NVN descriptor binding",
-                        ));
                     }
                 };
                 if index == entries.len() {
@@ -232,6 +252,18 @@ impl Residency<'_> {
                             self.buffer_cache.get(buffer.id).native.size(),
                             *offset,
                             *size,
+                            limits,
+                        )?
+                        .1
+                }
+                HostBinding::PointerTable(binding) => {
+                    pipeline
+                        .layout
+                        .split_buffer_offset(
+                            index,
+                            binding.table.size(),
+                            binding.offset,
+                            binding.size,
                             limits,
                         )?
                         .1
@@ -301,6 +333,16 @@ impl Residency<'_> {
                 {
                     return Err(VulkanError::InvalidResource(
                         "null buffer descriptor is not supported for this binding",
+                    ));
+                }
+            }
+            HostBinding::PointerTable(_) => {
+                if !matches!(
+                    kind,
+                    vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                ) {
+                    return Err(VulkanError::InvalidResource(
+                        "pointer table requires a storage buffer binding",
                     ));
                 }
             }

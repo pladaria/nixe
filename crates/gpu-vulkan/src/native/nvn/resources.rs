@@ -30,12 +30,17 @@ fn mip_layout(t: Texture, l: &nixe_nvn::Layout, m: nixe_nvn::Mip) -> ImageMemory
             layer_stride: l.layer_stride,
         }
     } else {
-        ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+        let layout = BlockLinearLayout {
             block_width_log2: 0,
             block_depth_log2: m.block_depth,
             block_height_log2: m.block_height,
             layer_stride: l.layer_stride,
-        })
+        };
+        if t.ampere_gob_order() {
+            ImageMemoryLayout::BlockLinearAmpere(layout)
+        } else {
+            ImageMemoryLayout::BlockLinear(layout)
+        }
     }
 }
 pub(super) fn layout(t: Texture) -> Result<(nixe_nvn::Layout, ImageMemoryLayout), VulkanError> {
@@ -378,6 +383,37 @@ fn sampled_view(
         _ => GuestImageAspect::Color,
     };
     native.sampled_view(image, info.description, info.swizzle, aspect, base, arrayed)
+}
+
+pub(super) fn texel_binding(
+    native: &mut NativeExecution<'_>,
+    texture: Texture,
+    storage: Option<nixe_shader_recompiler::types::ImageFormat>,
+) -> Result<HostBinding, VulkanError> {
+    if texture.target_kind() != 10 {
+        return Err(error("NVN texel buffer requires a buffer texture"));
+    }
+    let (format, source_bytes, element_bytes) =
+        super::super::texels::view_format(format(texture.format)?, storage)?;
+    let bytes = u64::from(texture.width) * u64::from(source_bytes);
+    let range = native.residency.device_buffer(
+        texture.address,
+        bytes,
+        if storage.is_some() {
+            vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER
+        } else {
+            vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+        },
+        true,
+        false,
+    )?;
+    Ok(HostBinding::TexelBuffer {
+        buffer: native.residency.host_buffer(range.buffer)?,
+        offset: range.offset,
+        size: range.size,
+        format,
+        element_bytes,
+    })
 }
 fn sampled_sampler(
     native: &mut NativeExecution<'_>,

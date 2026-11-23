@@ -10,6 +10,64 @@ mod support {
 }
 
 #[test]
+fn nvn_shader_survives_unrelated_mappings_until_its_code_is_unmapped()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4 << 20)?.allocate(8192)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let mut gpu = NativeGpuExecution::new(
+        memory.clone(),
+        device,
+        CacheConfiguration::default(),
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let size = 4096;
+    let address = 0x10000;
+    let code = memory.map(
+        address,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, size)?]),
+        true,
+    )?;
+    let isa = nixe_shader_recompiler::environment::ShaderIsa::Ampere;
+    let version = gpu.execution().residency.shader_cache.register(
+        address,
+        isa,
+        nixe_gpu::shader_memory::ShaderInfo::new(0, size as usize),
+    )?;
+    let usage = nixe_nvn::ShaderUsage {
+        stages: Box::new([nixe_nvn::StageSource {
+            shader: nixe_nvn::Shader {
+                address,
+                bytes: size as u32,
+                ..Default::default()
+            },
+            bytes: Arc::from([0; 4096]),
+            code_digest: [0; 32],
+            version,
+        }]),
+        shapes: Arc::from([]),
+        sparse_generation: None,
+    };
+    let generation = memory.generation();
+    let unrelated = memory.map(
+        0x20000,
+        Arc::from([AllocationRange::new(allocation.pin(), size, size)?]),
+        true,
+    )?;
+    assert_ne!(memory.generation(), generation);
+    assert!(usage.current(&memory));
+    drop(unrelated);
+    assert!(usage.current(&memory));
+    drop(code);
+    assert!(!usage.current(&memory));
+    Ok(())
+}
+
+#[test]
 fn counter_comparison_snapshots_device_writes_in_queue_order()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {

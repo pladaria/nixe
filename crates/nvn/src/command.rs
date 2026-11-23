@@ -74,6 +74,7 @@ pub struct Draw<'a> {
     pub viewports: &'a [Viewport],
     pub blend_color: [f32; 4],
     pub indices: Option<(u32, u64, i32)>,
+    pub indirect: Option<u64>,
 
     pub vertices: &'a [(u32, Range)],
 
@@ -132,8 +133,26 @@ pub enum Operation<'a> {
     },
     Dispatch {
         shader: Shader,
-        groups: [u32; 3],
+        groups: Dispatch,
         bindings: Bindings<'a>,
+    },
+    CopyBuffer {
+        source: u64,
+        destination: u64,
+        bytes: u64,
+    },
+    FenceSync(bool),
+    WaitEvent {
+        address: u64,
+        mode: u32,
+        value: u32,
+    },
+    SignalEvent {
+        address: u64,
+        mode: u32,
+        value: u32,
+        location: u32,
+        flags: u32,
     },
     ResetCounter(u32),
     Report {
@@ -163,6 +182,20 @@ pub enum Operation<'a> {
         mask: u8,
     },
     Draw(Draw<'a>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Dispatch {
+    Direct([u32; 3]),
+    Indirect(u64),
+}
+
+fn is_dispatch(tag: u32) -> bool {
+    matches!(tag, op::DISPATCH | op::DISPATCH_INDIRECT)
+}
+
+fn uses_bindings(tag: u32) -> bool {
+    is_dispatch(tag) || matches!(tag, op::DRAW | op::INDEXED | op::INDEXED_INDIRECT)
 }
 #[derive(Debug)]
 struct BindingRun {
@@ -227,6 +260,9 @@ pub struct Submission {
     captures: Vec<BindingRun>,
     upper_left: bool,
     minus_one_to_one: bool,
+    pub(crate) sync_addresses: Vec<u64>,
+    fences: PendingFences,
+    pub(crate) descriptors: Option<Arc<DescriptorRegistry>>,
 }
 impl Submission {
     pub(crate) fn new(
@@ -241,7 +277,22 @@ impl Submission {
             blocks: SmallVec::new(),
             captures: Vec::new(),
             retained_bytes: 0,
+            sync_addresses: Vec::new(),
+            fences: PendingFences::default(),
+            descriptors: None,
         }
+    }
+    pub(crate) fn fence_slot(&mut self, address: u64) -> Arc<crate::Fence> {
+        let fence = Arc::new(crate::Fence::default());
+        self.fences.0.push(Some(fence.clone()));
+        debug_assert_eq!(self.sync_addresses[self.fences.0.len() - 1], address);
+        fence
+    }
+
+    pub fn next_fence(&mut self, cursor: &mut SubmissionCursor) -> Option<Arc<crate::Fence>> {
+        let fence = self.fences.0.get_mut(cursor.fence)?.take()?;
+        cursor.fence += 1;
+        Some(fence)
     }
     #[cfg(feature = "execution-trace")]
     pub(crate) fn block_count(&self) -> usize {
@@ -250,41 +301,61 @@ impl Submission {
     pub fn allocation_bytes(&self) -> usize {
         self.retained_bytes + self.captures.capacity() * size_of::<BindingRun>()
     }
-    pub fn records(&self) -> impl Iterator<Item = Result<Record<'_>>> {
-        let mut blocks = self.blocks.iter();
-        let mut words: &[u64] = &[];
-        let mut captures = self
-            .captures
-            .iter()
-            .flat_map(|run| std::iter::repeat_n(&run.bindings, run.uses));
-        std::iter::from_fn(move || {
-            while words.is_empty() {
-                let block = blocks.next()?;
-                words = &block.words[..block.end];
+    pub fn next_record(&self, cursor: &mut SubmissionCursor) -> Option<Result<Record<'_>>> {
+        let mut block = self.blocks.get(cursor.block)?;
+        while cursor.word == block.end {
+            cursor.word = 0;
+            cursor.block += 1;
+            block = self.blocks.get(cursor.block)?;
+        }
+        let (&h, tail) = block.words[cursor.word..block.end].split_first()?;
+        let Some(args) = tail.get(..record_words(h)) else {
+            cursor.word = block.end;
+            return Some(Err("truncated NVN command record".into()));
+        };
+        cursor.word += args.len() + 1;
+        let tag = record_tag(h);
+        let bindings = if uses_bindings(tag) {
+            let Some(run) = self.captures.get(cursor.binding_run) else {
+                return Some(Err("missing submit-visible NVN bindings".into()));
+            };
+            cursor.binding_use += 1;
+            if cursor.binding_use == run.uses {
+                cursor.binding_run += 1;
+                cursor.binding_use = 0;
             }
-            let (&h, tail) = words.split_first()?;
-            let Some((args, rest)) = tail.split_at_checked(record_words(h)) else {
-                words = &[];
-                return Some(Err("truncated NVN command record".into()));
-            };
-            words = rest;
-            let tag = record_tag(h);
-            let bindings = if matches!(tag, op::DRAW | op::INDEXED | op::DISPATCH) {
-                let Some(capture) = captures.next() else {
-                    return Some(Err("missing submit-visible NVN bindings".into()));
-                };
-                Some(capture)
-            } else {
-                None
-            };
-            Some(Ok(Record {
-                tag,
-                args,
-                bindings,
-            }))
-        })
+            Some(&run.bindings)
+        } else {
+            None
+        };
+        Some(Ok(Record {
+            tag,
+            args,
+            bindings,
+        }))
     }
 }
+
+#[derive(Debug, Default)]
+struct PendingFences(Vec<Option<Arc<crate::Fence>>>);
+
+impl Drop for PendingFences {
+    fn drop(&mut self) {
+        for fence in self.0.iter().flatten() {
+            fence.signal(Err("GPU owner stopped before executing NVN fence".into()));
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct SubmissionCursor {
+    block: usize,
+    word: usize,
+    binding_run: usize,
+    binding_use: usize,
+    fence: usize,
+}
+
 pub struct Record<'a> {
     tag: u32,
     args: &'a [u64],
@@ -345,9 +416,10 @@ impl Capture {
         nixe_memory::trace::event("nvn_command_reuse", reused, hits, 0);
         self.diagnostics.trace();
     }
-    pub(crate) fn list(&mut self, c: &Call, mut at: u64, batch: &mut Submission) -> Result<()> {
+    pub(crate) fn list(&mut self, c: &Call, handle: u64, batch: &mut Submission) -> Result<()> {
         #[cfg(feature = "execution-trace")]
         let detailed = nixe_memory::trace::detailed_active();
+        let mut at = handle;
         loop {
             let Range { address, size } = c.read(at)?;
             if size == LINK {
@@ -356,7 +428,9 @@ impl Capture {
             }
             let bytes = size & !(END | CALLED);
             if !bytes.is_multiple_of(8) || bytes > 64 << 20 {
-                return Err("invalid control entry".into());
+                return Err(format!(
+                    "invalid NVN control entry at {at:#x} in list {handle:#x}: address={address:#x} size={size:#x}"
+                ).into());
             }
             if bytes != 0 {
                 let key = Range {
@@ -410,6 +484,13 @@ impl Capture {
                 for &index in &block.capture_offsets {
                     let i = index as usize;
                     let header = block.words[i];
+                    if record_tag(header) == op::FENCE_SYNC {
+                        if record_words(header) != 2 {
+                            return Err("invalid NVN sync record".into());
+                        }
+                        batch.sync_addresses.push(block.words[i + 1]);
+                        continue;
+                    }
                     self.observe_record(
                         c,
                         record_tag(header),
@@ -439,7 +520,7 @@ impl Capture {
         }
         let n = w.len();
         match op {
-            op::SAMPLER_POOL | op::TEXTURE_POOL if n == 2 => {
+            op::SAMPLER_POOL | op::TEXTURE_POOL if n == 3 => {
                 let pool = if op == op::SAMPLER_POOL {
                     &mut self.sampler_pool
                 } else {
@@ -469,6 +550,14 @@ impl Capture {
                     w[1],
                 );
             }
+            op::TEXTURES if n >= 2 => {
+                let stage = w[0] as u32;
+                let first = (w[0] >> 32) as u32;
+                let bindings = &mut self.bindings[usize::from(stage == 5)];
+                for (index, &handle) in w[1..].iter().enumerate() {
+                    bindings.bind_texture(stage, first + index as u32, handle);
+                }
+            }
             op::PROGRAM if n >= 1 && (n - 1).is_multiple_of(size_of::<Shader>() / 8) => {
                 select_stages(&mut self.shaders, w);
                 self.bindings[0]
@@ -476,8 +565,8 @@ impl Capture {
                 self.bindings[1]
                     .select_shaders(self.shaders.iter().copied().filter(|s| s.stage == 5));
             }
-            op::DRAW | op::INDEXED | op::DISPATCH => {
-                let current = self.bindings[usize::from(op == op::DISPATCH)].snapshot(
+            op if uses_bindings(op) => {
+                let current = self.bindings[usize::from(is_dispatch(op))].snapshot(
                     c,
                     self.texture_pool,
                     self.sampler_pool,
@@ -522,6 +611,7 @@ pub struct CommandState {
 
     shaders: SmallVec<[Shader; 2]>,
     vertices: Vec<(u32, Range)>,
+    bindless: Option<bindings::BindlessState>,
 }
 impl CommandState {
     pub fn new(submission: &Submission) -> Self {
@@ -538,6 +628,13 @@ impl CommandState {
             }
         };
         Self {
+            bindless: submission
+                .descriptors
+                .as_ref()
+                .map(|registry| bindings::BindlessState {
+                    registry: registry.clone(),
+                    pools: [DescriptorPool::default(); 2],
+                }),
             pipeline: Arc::new(DrawPipeline {
                 upper_left: submission.upper_left,
                 minus_one_to_one: submission.minus_one_to_one,
@@ -596,7 +693,9 @@ impl CommandState {
                     upload: op == op::COPY_BUFFER_TO_TEXTURE,
                 }));
             }
-            op::DISPATCH if n == 3 => {
+            op::DISPATCH | op::DISPATCH_INDIRECT
+                if (op == op::DISPATCH && n == 3) || (op == op::DISPATCH_INDIRECT && n == 1) =>
+            {
                 let shader = *self
                     .shaders
                     .iter()
@@ -604,12 +703,57 @@ impl CommandState {
                     .ok_or("dispatch without compute program")?;
                 return Ok(Some(Operation::Dispatch {
                     shader,
-                    groups: std::array::from_fn(|i| w[i] as u32),
+                    groups: if op == op::DISPATCH_INDIRECT {
+                        Dispatch::Indirect(w[0])
+                    } else {
+                        Dispatch::Direct(std::array::from_fn(|i| w[i] as u32))
+                    },
                     bindings: Bindings {
                         textures: bindings.unwrap(),
                         buffers: &self.buffers[1],
+                        bindless: self.bindless.as_ref().map(bindings::BindlessState::pools),
                     },
                 }));
+            }
+            op::COPY_BUFFER if n == 3 => {
+                return Ok(Some(Operation::CopyBuffer {
+                    source: w[0],
+                    destination: w[1],
+                    bytes: w[2],
+                }));
+            }
+            op::FENCE_SYNC if n == 2 => return Ok(Some(Operation::FenceSync(w[1] != 0))),
+            op::WAIT_SYNC if n == 1 => {
+                // The Sync's producer is already on the same ordered Vulkan
+                // queue. Retain memory ordering without waiting on the CPU.
+                return Ok(Some(Operation::Barrier(0x10f)));
+            }
+            op::WAIT_EVENT if n == 2 => {
+                return Ok(Some(Operation::WaitEvent {
+                    address: w[0],
+                    mode: w[1] as u32,
+                    value: (w[1] >> 32) as u32,
+                }));
+            }
+            op::SIGNAL_EVENT if n == 3 => {
+                return Ok(Some(Operation::SignalEvent {
+                    address: w[0],
+                    mode: w[1] as u32,
+                    value: (w[1] >> 32) as u32,
+                    location: w[2] as u32,
+                    flags: (w[2] >> 32) as u32,
+                }));
+            }
+            op::PUSH_CONSTANTS if n >= 2 && (w[1] >> 32).div_ceil(8) == (n - 2) as u64 => {
+                let engine = (w[0] >> 32) as usize;
+                self.buffers
+                    .get_mut(engine)
+                    .ok_or("invalid NVN2 constant engine")?
+                    .push_constants(
+                        w[0] as u32 as usize,
+                        w[1] as u32 as usize,
+                        &bytemuck::cast_slice(&w[2..])[..(w[1] >> 32) as usize],
+                    )?;
             }
             op::RESET_COUNTER if n == 1 => return Ok(Some(Operation::ResetCounter(w[0] as u32))),
             op::REPORT if n == 2 => {
@@ -839,15 +983,26 @@ impl CommandState {
                     range,
                 )?;
             }
-            op::SAMPLER_POOL | op::TEXTURE_POOL if n == 2 => {}
+            op::SAMPLER_POOL | op::TEXTURE_POOL if n == 3 => {
+                if let Some(state) = &mut self.bindless {
+                    let slot = usize::from(op == op::SAMPLER_POOL);
+                    state.pools[slot] = DescriptorPool {
+                        device_base: w[2],
+                        ..DescriptorPool::new(w[0], w[1] as u32)
+                    };
+                }
+            }
             op::TEXTURE if n == 2 => {}
+            op::TEXTURES if n >= 2 => {}
             op::DEFERRED if n == 4 => {}
-            op::DRAW | op::INDEXED
-                if (op == op::DRAW && n == 3) || (op == op::INDEXED && n == 4) =>
+            op::DRAW | op::INDEXED | op::INDEXED_INDIRECT
+                if ((op == op::DRAW || op == op::INDEXED_INDIRECT) && n == 3)
+                    || (op == op::INDEXED && n == 4) =>
             {
                 let bindings = Bindings {
                     textures: bindings.unwrap(),
                     buffers: &self.buffers[0],
+                    bindless: self.bindless.as_ref().map(bindings::BindlessState::pools),
                 };
                 let shapes = &bindings.sampled.shapes;
                 let primitive = w[0] as u32;
@@ -869,8 +1024,12 @@ impl CommandState {
                     flip_y: self.flip_y ^ self.pipeline.upper_left,
                     viewports: &self.viewports[..usize::from(self.pipeline.viewport_count)],
                     blend_color: self.blend_color,
-                    indices: (op == op::INDEXED)
-                        .then(|| ((w[0] >> 32) as u32, w[2], (w[1] >> 32) as i32)),
+                    indices: match op {
+                        op::INDEXED => Some(((w[0] >> 32) as u32, w[2], (w[1] >> 32) as i32)),
+                        op::INDEXED_INDIRECT => Some(((w[0] >> 32) as u32, w[1], 0)),
+                        _ => None,
+                    },
+                    indirect: (op == op::INDEXED_INDIRECT).then_some(w[2]),
                     vertices: &self.vertices,
 
                     first: (w[0] >> 32) as u32,
@@ -961,7 +1120,8 @@ mod tests {
         submission.blocks.push(Arc::new(
             CommandBlock::new(vec![h(op::BARRIER, 1), 1], false).unwrap(),
         ));
-        let mut records = submission.records();
+        let mut cursor = SubmissionCursor::default();
+        let mut records = std::iter::from_fn(|| submission.next_record(&mut cursor));
         assert_eq!(records.next().unwrap().unwrap().tag, op::BARRIER);
         assert!(records.next().is_none());
     }

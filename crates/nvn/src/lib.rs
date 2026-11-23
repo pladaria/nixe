@@ -3,13 +3,15 @@
 mod abi;
 use abi::*;
 pub use abi::{
-    CopyStrides, IMAGE_HANDLE_BASE_SLOT, IMAGE_HANDLE_SLOTS, Range, Sampler, Shader, Texture,
-    VertexStream,
+    ComputeLayout, CopyStrides, IMAGE_HANDLE_BASE_SLOT, IMAGE_HANDLE_SLOTS, Range, Sampler, Shader,
+    Texture, VertexStream,
 };
 pub use guest_image::{GUEST_CODE, GUEST_ERROR_PC, QUERY_VERSIONS_OFFSET, guest_offset};
 mod bindings;
 mod command;
 mod device;
+pub mod display;
+pub mod event;
 mod guest_image;
 
 mod layout;
@@ -28,9 +30,12 @@ mod texels;
 mod texture;
 
 pub use bindings::{
-    BUFFER_STAGES, Bindings, Sampled, SampledBindings, TextureHandles, TextureShape,
+    BUFFER_STAGES, Bindings, BindlessPools, Sampled, SampledBindings, TextureHandles, TextureShape,
 };
-pub use command::{Attachments, CommandState, Draw, DrawPipeline, Operation, Submission};
+pub use command::{
+    Attachments, CommandState, Dispatch, Draw, DrawPipeline, Operation, Submission,
+    SubmissionCursor,
+};
 pub use layout::{Layout, Mip};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_memory::{AddressSpace, DeviceHeapMemory};
@@ -46,10 +51,11 @@ pub trait Backend: Send + Sync {
     fn drain(&self) -> Result<()>;
     fn finalize_queue(&self, queue: u64) -> Result<()>;
     fn acquire_fence(&self, fence: Arc<Fence>) -> Result<()>;
-    fn fence(&self, fence: Arc<Fence>, flush_for_cpu: bool) -> Result<()>;
-    fn flush(&self) -> Result<()>;
+    fn fence(&self, queue: u64, fence: Arc<Fence>, flush_for_cpu: bool) -> Result<()>;
+    fn flush(&self, queue: u64) -> Result<()>;
     fn present(
         &self,
+        queue: u64,
         texture: Texture,
         interval: u32,
         flip_vertical: bool,
@@ -70,13 +76,14 @@ pub trait SurfaceExporter: Send + Sync {
     ) -> Result<Box<dyn ExportedPool>>;
 }
 pub struct Graphics {
-    pub surfaces: Arc<dyn SurfaceExporter>,
+    pub surfaces: Option<Arc<dyn SurfaceExporter>>,
     pub heap: DeviceHeapMemory,
     pub backend: Arc<dyn Backend>,
+    pub display: Option<Arc<display::DisplayHistory>>,
 }
 
 // Pool slots outlive the source object and may be copied by the guest.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Descriptors<T> {
     ids: std::collections::HashMap<T, u32>,
     values: Vec<T>,
@@ -92,13 +99,19 @@ impl<T: Eq + std::hash::Hash + Copy> Descriptors<T> {
         self.values.get(id.wrapping_sub(1) as usize).copied()
     }
 }
+#[derive(Debug, Default)]
+struct DescriptorRegistry {
+    samplers: Mutex<Descriptors<Sampler>>,
+    textures: Mutex<Descriptors<Texture>>,
+}
 pub struct Session {
     graphics: OnceLock<Graphics>,
     sdk_api_major: OnceLock<u32>,
     pools: Mutex<pool::Mappings>,
     queues: Mutex<queue::Queues>,
-    samplers: Mutex<Descriptors<Sampler>>,
-    textures: Mutex<Descriptors<Texture>>,
+    descriptors: Arc<DescriptorRegistry>,
+    events: Arc<event::EventSignals>,
+    platform: TargetPlatform,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -107,14 +120,21 @@ impl Default for Session {
 }
 impl Session {
     pub fn new() -> Self {
+        Self::for_platform(TargetPlatform::Switch1)
+    }
+    pub fn for_platform(platform: TargetPlatform) -> Self {
         Self {
             graphics: OnceLock::new(),
             sdk_api_major: OnceLock::new(),
             pools: Default::default(),
             queues: Default::default(),
-            samplers: Default::default(),
-            textures: Default::default(),
+            descriptors: Default::default(),
+            events: Default::default(),
+            platform,
         }
+    }
+    pub fn event_signals(&self) -> Arc<event::EventSignals> {
+        self.events.clone()
     }
     pub fn sdk_api_major(&self) -> Option<u32> {
         self.sdk_api_major.get().copied()
@@ -144,7 +164,13 @@ macro_rules! procedures {
     ($($family:ident { $($name:ident => $handler:ident),* $(,)? }),* $(,)?) => {
         pub fn resolve(platform: TargetPlatform, name: &str) -> Option<Handler> {
             if platform == TargetPlatform::Switch2 {
-                return None;
+                match name {
+                    "nvnProgramSetShaders" => return Some(program::shaders_ampere),
+                    "nvnProgramSetShadersExt" => return Some(program::shaders_ext_ampere),
+                    "nvnProgramInitializeFromBuilder" => return Some(program::from_builder),
+                    "nvnMemoryPoolInitialize" => return Some(pool::initialize_ampere),
+                    _ => {}
+                }
             }
             Some(match name {
                 $($(concat!("nvn", stringify!($name)) => $family::$handler, )*)*
@@ -154,6 +180,9 @@ macro_rules! procedures {
     };
 }
 procedures! {
+    event {
+        EventSignal => signal,
+    },
     sampler {
         SamplerPoolRegisterSampler => register,
     },
@@ -177,9 +206,11 @@ procedures! {
     queue {
         WindowAcquireTexture => window_acquire,
         WindowInitialize => window_initialize,
+        WindowFinalize => window_finalize,
         QueueInitialize => initialize,
         QueueFinalize => finalize,
         SyncInitialize => sync_initialize,
+        SyncFinalize => sync_finalize,
         QueueFenceSync => fence,
         QueueFlush => flush,
         QueueAcquireTexture => acquire,

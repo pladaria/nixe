@@ -16,13 +16,26 @@ pub(super) fn interpretation(
     }
     let (address, count, format) = nixe_gpu::nvidia::texel_buffer_info(index, bytes)
         .map_err(|error| VulkanError::Compilation(error.to_string().into()))?;
+    let (native, source_bytes, element_bytes) = view_format(format, slot.storage_format)?;
+    Ok((
+        address,
+        count * u64::from(source_bytes),
+        native,
+        element_bytes,
+    ))
+}
+
+pub(super) fn view_format(
+    format: nixe_gpu::ImageFormat,
+    storage: Option<nixe_shader_recompiler::types::ImageFormat>,
+) -> Result<(vk::Format, u32, u32), VulkanError> {
     let source_bytes = u32::from(
         format
             .plane_bytes_per_texel(0)
             .ok_or(VulkanError::InvalidResource("compressed texel buffer"))?,
     );
     let mut native = images::format(format);
-    let element_bytes = if let Some(explicit) = slot.storage_format {
+    let element_bytes = if let Some(explicit) = storage {
         use nixe_shader_recompiler::types::ImageFormat as F;
         native = if explicit == F::Typeless {
             native
@@ -40,10 +53,5 @@ pub(super) fn interpretation(
     } else {
         source_bytes
     };
-    Ok((
-        address,
-        count * u64::from(source_bytes),
-        native,
-        element_bytes,
-    ))
+    Ok((native, source_bytes, element_bytes))
 }

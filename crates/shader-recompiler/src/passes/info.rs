@@ -404,18 +404,22 @@ fn header(info: &mut ShaderInfo, stage: Stage, sph: &ProgramHeader) {
     }
 }
 pub fn collect_shader_info<E: Environment>(env: &E, ir: &Ir, program: &mut Program) -> Result<()> {
-    program.info.nvn_buffer_base = match program.stage {
+    let default_base = match program.stage {
         Stage::VertexA | Stage::VertexB => 0x110,
         Stage::TessellationControl => 0x210,
         Stage::TessellationEval | Stage::Compute => 0x310,
         Stage::Geometry => 0x410,
         Stage::Fragment => 0x510,
     };
+    let (base, count) = env.nvn_storage_table().unwrap_or((default_base, 16));
+    program.info.nvn_buffer_base = base;
     for &block in &program.post_order {
         for &id in ir.block(block)?.instructions() {
             usages(&mut program.info, ir, id)?;
         }
     }
+    // Dynamic constant reads conservatively visit all table entries.
+    program.info.nvn_buffer_used &= ((1u32 << count) - 1) as u16;
     header(&mut program.info, env.metadata().stage, &env.metadata().sph);
     Ok(())
 }

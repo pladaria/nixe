@@ -281,7 +281,7 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
                     session.child(crate::gsv::GsvInterface::Gpu),
                 ))
                 .map_err(IpcWireError::Handle)?;
-            let heap = nixe_memory::DeviceHeapMemory::new(session.graphics.memory.clone());
+            let heap = session.graphics.heap.clone();
             if let Some((base, bytes)) = process
                 .memory()
                 .normal_heap_region()
@@ -383,7 +383,7 @@ pub(in crate::ipc_wire) async fn dispatch_gsv(
                 nixe_runtime::EventObject::create_pair(process.kernel());
             let mirror = crate::gsv::SyncptMirror::create(
                 process.lifetime().client().process(),
-                &session.graphics.memory,
+                session.graphics.heap.device(),
                 rw,
                 ro,
                 count,

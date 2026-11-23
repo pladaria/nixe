@@ -1,6 +1,7 @@
 //! Queue-local binding selections and immutable inputs for submitted work.
 use super::{
-    Call, DescriptorPool, Range, Result, Sampler, Shader, ShaderUsage, Texture, UsageSlot,
+    Call, DescriptorPool, DescriptorRegistry, Range, Result, Sampler, Shader, ShaderUsage, Texture,
+    UsageSlot,
 };
 use nixe_memory::GuestVirtualAddress;
 use smallvec::SmallVec;
@@ -55,7 +56,9 @@ impl SampledBindings {
     }
 }
 
-pub const BUFFER_STAGES: usize = 6;
+// NVN2 has separate resource selections for task, mesh and ray tracing.
+// Bindings can be recorded for those stages even when no program uses them.
+pub const BUFFER_STAGES: usize = 9;
 const BUFFER_SLOTS: usize = 16;
 
 #[derive(Debug, Default)]
@@ -69,6 +72,7 @@ pub struct BufferState {
     tables: [[StageBuffers; BUFFER_STAGES]; 2],
     dirty: std::cell::Cell<DirtyBuffers>,
     driver_revision: u64,
+    push_blocks: [Option<Arc<[u8; 256]>>; 8],
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -95,6 +99,31 @@ fn bound_slots(mut mask: u16) -> impl Iterator<Item = usize> {
 }
 
 impl BufferState {
+    pub fn push_block(&self, block: usize) -> Option<&Arc<[u8; 256]>> {
+        self.push_blocks.get(block)?.as_ref()
+    }
+
+    pub(crate) fn push_constants(
+        &mut self,
+        block: usize,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<()> {
+        let slot = self
+            .push_blocks
+            .get_mut(block)
+            .ok_or("invalid NVN2 constant block")?;
+        let end = offset
+            .checked_add(data.len())
+            .filter(|&end| end <= 256)
+            .ok_or("invalid NVN2 constant range")?;
+        let bytes = slot.get_or_insert_with(|| Arc::new([0; 256]));
+        if bytes[offset..end] != *data {
+            Arc::make_mut(bytes)[offset..end].copy_from_slice(data);
+            self.driver_revision = self.driver_revision.wrapping_add(1);
+        }
+        Ok(())
+    }
     pub fn take_dirty(&self) -> DirtyBuffers {
         self.dirty.take()
     }
@@ -148,6 +177,70 @@ impl BufferState {
 pub struct Bindings<'a> {
     pub buffers: &'a BufferState,
     pub textures: &'a CapturedBindings,
+    pub bindless: Option<BindlessPools<'a>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BindlessState {
+    pub registry: Arc<DescriptorRegistry>,
+    pub pools: [DescriptorPool; 2],
+}
+
+impl BindlessState {
+    pub fn pools(&self) -> BindlessPools<'_> {
+        BindlessPools(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BindlessPools<'a>(&'a BindlessState);
+
+impl BindlessPools<'_> {
+    pub fn addresses(self, handle: u32) -> Option<[u64; 2]> {
+        let [textures, samplers] = self.0.pools;
+        let texture = handle & 0xfffff;
+        let sampler = handle >> 20;
+        if texture >= textures.count || (sampler != 0 && sampler >= samplers.count) {
+            return None;
+        }
+        Some([
+            textures.device_base + u64::from(texture) * 32,
+            if sampler == 0 {
+                0
+            } else {
+                samplers.device_base + u64::from(sampler) * 32
+            },
+        ])
+    }
+
+    pub fn resolve(self, ids: [u32; 2]) -> Option<Sampled> {
+        if ids[0] == 0 {
+            return None;
+        }
+        // Pool storage belongs to the application. An untouched slot can
+        // contain the allocator's fill pattern and has no image to bind.
+        // https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/nvn_mtl.m#L7517-L7519
+        let texture = self.0.registry.textures.lock().unwrap().get(ids[0])?;
+        let sampler = if ids[1] != 0 {
+            self.0
+                .registry
+                .samplers
+                .lock()
+                .unwrap()
+                .get(ids[1])
+                .unwrap_or_default()
+        } else {
+            Sampler::default()
+        };
+        Some(Sampled {
+            stage: 0,
+            slot: 0,
+            handle: 0,
+            texture,
+            sampler,
+            ids,
+        })
+    }
 }
 impl std::ops::Deref for Bindings<'_> {
     type Target = CapturedBindings;
@@ -226,7 +319,7 @@ impl BindingState {
     ) -> Result<&CapturedBindings> {
         let known = self.current.usage_slot.get().cloned();
         if let Some(usage) = &known
-            && usage.current(c.session.graphics()?.heap.device().generation())
+            && usage.current(c.session.graphics()?.heap.device())
         {
             self.capture(c, texture_pool, sampler_pool, Some(&usage.shapes))?;
             if self.current.sampled.shapes == usage.shapes
@@ -362,7 +455,7 @@ impl BindingState {
             let texture = match previous {
                 Some(s) if s.ids[0] == ids[0] => s.texture,
                 _ => textures
-                    .get_or_insert_with(|| c.session.textures.lock().unwrap())
+                    .get_or_insert_with(|| c.session.descriptors.textures.lock().unwrap())
                     .get(ids[0]).ok_or_else(|| format!(
                         "unknown texture descriptor {:#x} at stage {stage}, row {slot}, pool {:#x}, index {}",
                         ids[0], texture_pool.base, handle as u32 & 0xfffff
@@ -372,7 +465,7 @@ impl BindingState {
                 Some(s) if ids[1] != 0 && s.ids[1] == ids[1] => s.sampler,
                 _ if sampler_index(handle) == 0 => Sampler::default(),
                 _ => samplers
-                    .get_or_insert_with(|| c.session.samplers.lock().unwrap())
+                    .get_or_insert_with(|| c.session.descriptors.samplers.lock().unwrap())
                     .get(ids[1]).ok_or_else(|| format!(
                         "unknown sampler descriptor {:#x} at stage {stage}, row {slot}, pool {:#x}, index {}",
                         ids[1], sampler_pool.base, sampler_index(handle)
@@ -442,9 +535,19 @@ mod tests {
             address: 0xa000,
             ..texture
         };
-        let id = session.textures.lock().unwrap().intern(texture);
-        let new_id = session.textures.lock().unwrap().intern(new_texture);
-        let sid = session.samplers.lock().unwrap().intern(Sampler::default());
+        let id = session.descriptors.textures.lock().unwrap().intern(texture);
+        let new_id = session
+            .descriptors
+            .textures
+            .lock()
+            .unwrap()
+            .intern(new_texture);
+        let sid = session
+            .descriptors
+            .samplers
+            .lock()
+            .unwrap()
+            .intern(Sampler::default());
         let textures = DescriptorPool::new(0x1000, 2);
         let samplers = DescriptorPool::new(0x1800, 2);
         c.write(0x1020, &id).unwrap();
@@ -479,8 +582,11 @@ mod tests {
             format: 2,
             ..texture
         };
-        c.write(0x1ffe, &session.textures.lock().unwrap().intern(typed))
-            .unwrap();
+        c.write(
+            0x1ffe,
+            &session.descriptors.textures.lock().unwrap().intern(typed),
+        )
+        .unwrap();
         state.pool_changed();
         let switched = state.snapshot(&c, split, samplers).unwrap().clone();
         assert_eq!(switched.sampled.get(1, 0).unwrap().texture, typed);

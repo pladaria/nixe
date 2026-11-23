@@ -166,6 +166,15 @@ pub fn sync_initialize(c: &Call) -> Result<u64> {
     c.session.queues.lock().unwrap().syncs.remove(&c.args[0]);
     Ok(1)
 }
+pub fn sync_finalize(c: &Call) -> Result<u64> {
+    c.session.queues.lock().unwrap().syncs.remove(&c.args[0]);
+    Ok(0)
+}
+
+pub fn window_finalize(c: &Call) -> Result<u64> {
+    c.session.queues.lock().unwrap().windows.remove(&c.args[0]);
+    Ok(0)
+}
 pub fn fence(c: &Call) -> Result<u64> {
     if c.args[2] != 0 || c.args[3] & !1 != 0 {
         return Err(format!(
@@ -179,7 +188,7 @@ pub fn fence(c: &Call) -> Result<u64> {
         c.session
             .graphics()?
             .backend
-            .fence(fence.clone(), c.args[3] & 1 != 0)?;
+            .fence(c.args[0], fence.clone(), c.args[3] & 1 != 0)?;
         c.session
             .queues
             .lock()
@@ -209,7 +218,7 @@ pub fn wait(c: &Call) -> Result<u64> {
     Ok(0)
 }
 pub fn flush(c: &Call) -> Result<u64> {
-    queue(c)?.ordered(|_| c.session.graphics()?.backend.flush())?;
+    queue(c)?.ordered(|_| c.session.graphics()?.backend.flush(c.args[0]))?;
     Ok(0)
 }
 pub fn acquire(c: &Call) -> Result<u64> {
@@ -259,6 +268,9 @@ pub fn submit(c: &Call) -> Result<u64> {
     q.ordered(|capture| {
         let bounds = c.session.pools.lock().unwrap().snapshot();
         let mut submission = Submission::new(q.upper_left, q.minus_one_to_one, bounds);
+        if c.session.platform == TargetPlatform::Switch2 {
+            submission.descriptors = Some(c.session.descriptors.clone());
+        }
         let span = nixe_memory::trace::span("nvn_list_capture", c.args[1], 0, 0);
         for i in 0..c.args[1] as u32 {
             capture.list(c, c.read(c.args[2] + u64::from(i) * 8)?, &mut submission)?;
@@ -266,7 +278,20 @@ pub fn submit(c: &Call) -> Result<u64> {
         #[cfg(feature = "execution-trace")]
         capture.trace_submit(submission.block_count());
         drop(span);
-        c.session.graphics()?.backend.submit(c.args[0], submission)
+        let backend = &c.session.graphics()?.backend;
+        if !submission.sync_addresses.is_empty() {
+            let mut queues = c.session.queues.lock().unwrap();
+            for index in 0..submission.sync_addresses.len() {
+                let address = submission.sync_addresses[index];
+                let fence = submission.fence_slot(address);
+                queues.syncs.insert(address, fence);
+            }
+            // SyncWait may start as soon as a submission is admitted. Publish
+            // the receipt and enqueue the commands under the same lock.
+            backend.submit(c.args[0], submission)
+        } else {
+            backend.submit(c.args[0], submission)
+        }
     })?;
     Ok(0)
 }
@@ -284,6 +309,7 @@ pub fn present(c: &Call) -> Result<u64> {
     };
     queue.ordered(|_| {
         c.session.graphics()?.backend.present(
+            c.args[0],
             c.read(texture)?,
             native_present_interval(interval),
             !queue.upper_left,

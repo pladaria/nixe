@@ -472,7 +472,7 @@ impl<T> Receiver<T> {
         &mut self,
         stopped: impl Fn() -> bool,
         requested: impl Fn() -> bool,
-        mut idle: impl FnMut() -> Result<(), E>,
+        mut idle: impl FnMut() -> Result<Option<std::time::Duration>, E>,
     ) -> Result<bool, E> {
         self.shared.consumer.get_or_init(thread::current);
         self.shared
@@ -497,6 +497,7 @@ impl<T> Receiver<T> {
         if !explicit_request {
             self.spins.expired();
         }
+        let mut timeout = None;
         loop {
             if self.ready() {
                 return Ok(true);
@@ -506,7 +507,7 @@ impl<T> Receiver<T> {
                 .0
                 .store(self.position, Ordering::Relaxed);
             if !self.shared.consumer_quiet.0.load(Ordering::Relaxed) || requested() {
-                idle()?;
+                timeout = idle()?;
                 self.shared.consumer_quiet.0.store(true, Ordering::Release);
             }
             self.shared.consumer_waiting.0.store(true, Ordering::SeqCst);
@@ -531,7 +532,12 @@ impl<T> Receiver<T> {
                 return Ok(false);
             }
             if !requested() {
-                thread::park();
+                if let Some(timeout) = timeout {
+                    thread::park_timeout(timeout);
+                    self.shared.consumer_quiet.0.store(false, Ordering::Relaxed);
+                } else {
+                    thread::park();
+                }
             }
             self.shared
                 .consumer_waiting

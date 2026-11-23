@@ -3,6 +3,18 @@ pub fn builder_interval(c: &Call) -> Result<u64> {
     c.write(c.args[0] + 20, &(c.args[1] as u32))?;
     Ok(0)
 }
+pub fn get_builder_interval(c: &Call) -> Result<u64> {
+    Ok(
+        c.read::<u32>(c.args[0] + core::mem::offset_of!(WindowBuilder, interval) as u64)?
+            .into(),
+    )
+}
+
+pub fn primary_queue(_: &Call) -> Result<u64> {
+    // @SIMPLIFICATION Vulkan records all queues on one ordered device stream.
+    // Native channel sharing requested by a primary queue does not change execution.
+    Ok(0)
+}
 pub fn active(c: &Call) -> Result<u64> {
     c.write(c.args[0] + 56, &(c.args[1] as u32))?;
     Ok(0)

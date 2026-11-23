@@ -32,6 +32,16 @@ pub fn map(c: &Call) -> Result<u64> {
 pub fn address(c: &Call) -> Result<u64> {
     c.read(c.args[0] + 8)
 }
+pub fn get_size(c: &Call) -> Result<u64> {
+    c.read(c.args[0] + core::mem::offset_of!(Pool, bytes) as u64)
+}
+
+pub fn descriptor_pool_size(c: &Call) -> Result<u64> {
+    Ok(
+        c.read::<u32>(c.args[0] + core::mem::offset_of!(DescriptorPool, count) as u64)?
+            .into(),
+    )
+}
 pub fn flush(_: &Call) -> Result<u64> {
     // @SIMPLIFICATION CPU writes already dirty the shared physical buffer/image caches. Submission
     // drains those invalidations before consuming the pool; mapping needs no upload.
@@ -54,6 +64,7 @@ pub fn descriptor_pool(c: &Call) -> Result<u64> {
             base: p.cpu + off,
             count,
             padding: 0,
+            device_base: p.gpu + off,
         },
     )?;
     Ok(1)

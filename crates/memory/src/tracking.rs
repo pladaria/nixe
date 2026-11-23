@@ -554,6 +554,15 @@ impl Machine {
             }
         }
     }
+    /// Invalidate cached aliases of a retained word before ordered device publication.
+    pub fn notify_resolved_write(&self, range: &AllocationRange) {
+        if let Some(binding) = CpuBinding::resolve(self) {
+            binding.notify_cached_write(
+                range.physical_extents(),
+                &std::cell::RefCell::new(Vec::new()),
+            );
+        }
+    }
     /// Complete an old captured operation after native admission ends. Physical
     /// protection may have changed since capture; routing and RAM execution are
     /// decided under access exclusion, before any write is performed.

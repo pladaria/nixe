@@ -1,6 +1,8 @@
 //! Submit NVN graphics directly to the native resource and command owners.
+mod event;
 mod raster;
 mod resources;
+mod scheduler;
 mod selections;
 mod shader;
 #[cfg(test)]
@@ -20,7 +22,9 @@ pub(super) struct Cache {
     draw_counts: [u64; 3],
     #[cfg(feature = "execution-trace")]
     slots: [u64; 3],
-    clock: Option<std::time::Instant>,
+    clock: Option<ReportClock>,
+    events: Arc<nixe_nvn::event::EventSignals>,
+    pub(super) work: scheduler::Scheduler,
     conditions: crate::residency::predicate::RenderConditions,
     pipelines: HashMap<Arc<nixe_nvn::DrawPipeline>, Rc<shader::Pipeline>>,
     selected_pipeline: Option<(Arc<nixe_nvn::DrawPipeline>, Rc<shader::Pipeline>)>,
@@ -32,6 +36,20 @@ pub(super) struct Cache {
     sampled: resources::SampledSelections,
     compute: HashMap<(nixe_nvn::Shader, Shapes), Rc<shader::Program>>,
     compiler: Option<nixe_shader_recompiler::Compiler>,
+}
+enum ReportClock {
+    Maxwell(std::time::Instant),
+    Ampere(Box<dyn Fn() -> u64 + Send>),
+}
+impl ReportClock {
+    fn raw(&self) -> u64 {
+        // NVN records 614.4 MHz ticks on Maxwell and nanoseconds on Ampere.
+        // https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/nvn_timestamp.h
+        match self {
+            Self::Maxwell(start) => (start.elapsed().as_nanos() * 384 / 625) as u64,
+            Self::Ampere(now) => now(),
+        }
+    }
 }
 impl Cache {
     pub(super) fn change_resolution(&mut self) {
@@ -108,11 +126,16 @@ fn rect([x, y, width, height]: [i32; 4], [w, h]: [u32; 2]) -> vk::Rect2D {
     }
 }
 impl NativeGpuExecution {
-    pub(super) fn submit_nvn(
+    pub fn use_nvn2_report_clock(&mut self, elapsed_ns: impl Fn() -> u64 + Send + 'static) {
+        self.state.nvn.clock = Some(ReportClock::Ampere(Box::new(elapsed_ns)));
+    }
+
+    fn run_nvn_submission(
         &mut self,
         queue: u64,
-        commands: nixe_nvn::Submission,
-    ) -> Result<(), BackendRuntimeError> {
+        commands: &mut nixe_nvn::Submission,
+        cursor: &mut nixe_nvn::SubmissionCursor,
+    ) -> Result<Option<nixe_nvn::event::EventWait>, BackendRuntimeError> {
         if !self.state.nvn.initialized {
             self.create_channel(u64::MAX, 32, 5, 18);
             self.state.nvn.initialized = true;
@@ -127,14 +150,14 @@ impl NativeGpuExecution {
         let (mut state, mut selections) = n.state.nvn.queues.remove(&queue).unwrap_or_else(|| {
             n.state.nvn.next_queue += 1;
             (
-                Box::new(nixe_nvn::CommandState::new(&commands)),
+                Box::new(nixe_nvn::CommandState::new(commands)),
                 selections::Queue::new(n.state.nvn.next_queue),
             )
         });
         selections.graphics.use_pools(&commands.pool_bounds);
         selections.compute.use_pools(&commands.pool_bounds);
         let mut order = 0;
-        for record in commands.records() {
+        while let Some(record) = commands.next_record(cursor) {
             let Some(op) = state
                 .apply(record.map_err(|e| runtime(error(e)))?)
                 .map_err(|e| runtime(error(e)))?
@@ -156,6 +179,37 @@ impl NativeGpuExecution {
                 n.residency.order_nvn(order).map_err(runtime)?;
                 order = 0;
             }
+            if let Operation::FenceSync(flush_for_cpu) = op {
+                let sync = commands
+                    .next_fence(cursor)
+                    .ok_or_else(|| runtime(error("NVN fence receipt is missing")))?;
+                drop(n);
+                nixe_gpu::GpuPresentation::nvn_flush(
+                    self,
+                    flush_for_cpu,
+                    Some(nixe_gpu::nvn_fence_action(sync)),
+                )?;
+                n = self.execution();
+                continue;
+            }
+            if let Operation::WaitEvent {
+                address,
+                mode,
+                value,
+            } = op
+            {
+                if let Some(wait) = n.wait_nvn_event(address, mode, value).map_err(runtime)? {
+                    log::trace!(
+                        "NVN queue {queue:#x} suspended on event {address:#x} mode={mode} expected={value:#x}"
+                    );
+                    n.state.nvn.queues.insert(queue, (state, selections));
+                    if n.residency.has_recorded_work() {
+                        n.flush()?;
+                    }
+                    return Ok(Some(wait));
+                }
+                continue;
+            }
             n.issue_nvn(queue, op, &mut selections)?;
             let device = n.residency.device_mut();
             if device.submission.nvn_prefix_full(&device.dispatch) {
@@ -168,7 +222,7 @@ impl NativeGpuExecution {
         n.state.nvn.queues.insert(queue, (state, selections));
         let device = n.residency.device_mut();
         device.submission.finish_nvn_list(&device.dispatch);
-        Ok(())
+        Ok(None)
     }
 }
 impl NativeExecution<'_> {
@@ -179,6 +233,19 @@ impl NativeExecution<'_> {
         selections: &mut selections::Queue,
     ) -> Result<(), BackendRuntimeError> {
         match op {
+            Operation::FenceSync(_) | Operation::WaitEvent { .. } => {
+                unreachable!("sync records are issued by the queue owner")
+            }
+            Operation::SignalEvent {
+                address,
+                mode,
+                value,
+                location,
+                flags,
+            } => {
+                self.signal_nvn_event(address, mode, value, location, flags)
+                    .map_err(runtime)?;
+            }
             Operation::ClearImage {
                 texture,
                 region,
@@ -230,13 +297,12 @@ impl NativeExecution<'_> {
                 }
                 // @SIMPLIFICATION Sample the host monotonic clock at ordered command
                 // issue. Publish the report through the GPU buffer timeline.
-                let elapsed = self
+                let ticks = self
                     .state
                     .nvn
                     .clock
-                    .get_or_insert_with(std::time::Instant::now)
-                    .elapsed();
-                let ticks = (elapsed.as_nanos() * 384 / 625) as u64;
+                    .get_or_insert_with(|| ReportClock::Maxwell(std::time::Instant::now()))
+                    .raw();
                 if kind == 1 {
                     let range = self
                         .residency
@@ -271,6 +337,14 @@ impl NativeExecution<'_> {
             Operation::Update { address, bytes } => {
                 self.write_nvn_buffer(address, bytes).map_err(runtime)?
             }
+            Operation::CopyBuffer {
+                source,
+                destination,
+                bytes,
+            } => self
+                .residency
+                .copy_nvn_buffer(source, destination, bytes)
+                .map_err(runtime)?,
             Operation::RenderEnable { mode, address } => {
                 self.residency
                     .set_nvn_condition(
@@ -419,7 +493,7 @@ impl NativeExecution<'_> {
         predicate: Option<&Arc<crate::memory::AllocatedBuffer>>,
         selections: &mut selections::Queue,
     ) -> Result<(), VulkanError> {
-        if d.count == 0 {
+        if d.indirect.is_none() && d.count == 0 {
             return Ok(());
         }
         let extent = d.extent();
@@ -431,7 +505,7 @@ impl NativeExecution<'_> {
             .filter(|(key, _)| Arc::ptr_eq(key, d.pipeline))
             .map(|(_, p)| p)
             .or_else(|| self.state.nvn.pipelines.get(d.pipeline))
-            .filter(|p| p.accepts(&d.bindings, self.residency.device_memory().generation()));
+            .filter(|p| p.accepts(&d.bindings, self.residency.device_memory()));
         let pipeline = if let Some(p) = selected {
             p.clone()
         } else {
@@ -551,7 +625,14 @@ impl NativeExecution<'_> {
                     &mut selections.index,
                     nixe_nvn::Range {
                         address,
-                        size: u64::from(d.count) * stride,
+                        size: if d.indirect.is_some() {
+                            selections
+                                .graphics
+                                .pool_remaining(address)
+                                .ok_or_else(|| error("unmapped NVN indirect index buffer"))?
+                        } else {
+                            u64::from(d.count) * stride
+                        },
                     },
                     vk::BufferUsageFlags::INDEX_BUFFER,
                 )?;
@@ -561,12 +642,30 @@ impl NativeExecution<'_> {
                     size: b.size,
                     kind,
                 }))?;
-                Draw::Indexed {
-                    indices: d.count,
-                    instances: d.instances,
-                    first_index: 0,
-                    vertex_offset,
-                    first_instance: d.first_instance,
+                if let Some(address) = d.indirect {
+                    let size = size_of::<vk::DrawIndexedIndirectCommand>() as u32;
+                    let args = self.residency.device_buffer(
+                        address,
+                        u64::from(size),
+                        vk::BufferUsageFlags::INDIRECT_BUFFER,
+                        true,
+                        false,
+                    )?;
+                    Draw::Indirect {
+                        buffer: args.buffer,
+                        offset: args.offset,
+                        count: 1,
+                        stride: size,
+                        indexed: true,
+                    }
+                } else {
+                    Draw::Indexed {
+                        indices: d.count,
+                        instances: d.instances,
+                        first_index: 0,
+                        vertex_offset,
+                        first_instance: d.first_instance,
+                    }
                 }
             } else {
                 Draw::Direct {
@@ -680,11 +779,11 @@ impl NativeExecution<'_> {
     fn dispatch_nvn(
         &mut self,
         shader: nixe_nvn::Shader,
-        groups: [u32; 3],
+        dispatch: nixe_nvn::Dispatch,
         b: &nixe_nvn::Bindings,
         selected: &mut selections::Program,
     ) -> Result<(), VulkanError> {
-        if groups.contains(&0) {
+        if matches!(dispatch, nixe_nvn::Dispatch::Direct(groups) if groups.contains(&0)) {
             return Ok(());
         }
         let key = (shader, b.sampled.shapes.clone());
@@ -693,7 +792,7 @@ impl NativeExecution<'_> {
             .nvn
             .compute
             .get(&key)
-            .filter(|p| p.accepts(b, self.residency.device_memory().generation()))
+            .filter(|p| p.accepts(b, self.residency.device_memory()))
         {
             p.clone()
         } else {
@@ -708,6 +807,34 @@ impl NativeExecution<'_> {
             p
         };
         pipeline.publish_usage(b);
+        let (dispatch, groups) = match dispatch {
+            nixe_nvn::Dispatch::Direct(groups) => (crate::Dispatch::Direct(groups), groups),
+            nixe_nvn::Dispatch::Indirect(address) => {
+                if pipeline
+                    .inputs
+                    .iter()
+                    .any(|input| matches!(input, shader::Input::Driver(5, 0, _)))
+                {
+                    return Err(error(
+                        "indirect NVN dispatch requires a GPU-sourced driver constant bank",
+                    ));
+                }
+                let args = self.residency.device_buffer(
+                    address,
+                    size_of::<vk::DispatchIndirectCommand>() as u64,
+                    vk::BufferUsageFlags::INDIRECT_BUFFER,
+                    true,
+                    false,
+                )?;
+                (
+                    crate::Dispatch::Indirect {
+                        buffer: args.buffer,
+                        offset: args.offset,
+                    },
+                    [0; 3],
+                )
+            }
+        };
         let scaling = self.residency.resolution().active;
         let push = loop {
             let epoch = (
@@ -732,7 +859,7 @@ impl NativeExecution<'_> {
         };
         self.residency.dispatch_bound(
             selected.program.as_ref().unwrap(),
-            crate::Dispatch::Direct(groups),
+            dispatch,
             &push.as_bytes()[..pipeline.push],
             scaling,
         )?;

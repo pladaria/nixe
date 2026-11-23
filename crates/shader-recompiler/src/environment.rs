@@ -151,6 +151,10 @@ impl EnvironmentMetadata {
 
 pub trait Environment {
     fn metadata(&self) -> &EnvironmentMetadata;
+    /// NVN2 compute programs locate their storage table per shader.
+    fn nvn_storage_table(&self) -> Option<(u32, u8)> {
+        None
+    }
     fn read_instruction(&mut self, address: ProgramOffset) -> Result<u64>;
     fn read_cbuf_value(&mut self, index: CbufIndex, byte_offset: ByteOffset) -> Result<u32>;
     /// Classify a potential native pointer without specializing on its numeric

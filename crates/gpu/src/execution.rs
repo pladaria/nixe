@@ -50,6 +50,30 @@ pub type FenceAction = Box<
         + Send,
 >;
 
+/// The owner may stop before recording the fence, or before its timeline callback.
+struct PendingSignal(Option<Arc<nixe_nvn::Fence>>);
+impl PendingSignal {
+    fn finish(&mut self, result: nixe_nvn::Result<()>) {
+        if let Some(fence) = self.0.take() {
+            fence.signal(result);
+        }
+    }
+}
+impl Drop for PendingSignal {
+    fn drop(&mut self) {
+        if let Some(fence) = self.0.take() {
+            fence.signal(Err("GPU owner stopped before NVN fence completion".into()));
+        }
+    }
+}
+pub fn nvn_fence_action(fence: Arc<nixe_nvn::Fence>) -> FenceAction {
+    let mut pending = PendingSignal(Some(fence));
+    Box::new(move |result| {
+        pending.finish(result.as_ref().copied().map_err(|e| e.to_string().into()));
+        result
+    })
+}
+
 /// Interface consumed by Horizon's statically instantiated owner loop.
 ///
 /// Access descriptions express guest effects in operation order. Canonical CPU
@@ -138,22 +162,43 @@ pub trait GpuExecution: OwnerMemory + 'static {
     fn teardown(&mut self) -> Result<(), BackendRuntimeError>;
 }
 
+/// Operations that observe the ordering of a single guest NVN queue.
+pub enum NvnQueueWork {
+    Submit(nixe_nvn::Submission),
+    Flush {
+        flush_for_cpu: bool,
+        action: Option<FenceAction>,
+    },
+    Present {
+        texture: nixe_nvn::Texture,
+        interval: u32,
+        flip: bool,
+        crop: [u32; 4],
+        publish: Box<dyn FnOnce(ResidentImage) + Send>,
+        complete: Option<FenceAction>,
+    },
+    Finalize,
+}
+
 /// Presentation and media requests have their own guest-facing ownership ABI.
 /// Resource synchronization and queue execution remain shared across engines.
 pub trait GpuPresentation: GpuExecution {
-    fn nvn_submit(
+    fn nvn_queue_work(
         &mut self,
         _queue: u64,
-        _commands: nixe_nvn::Submission,
+        _work: NvnQueueWork,
+        _hold: impl Send + 'static,
     ) -> Result<(), BackendRuntimeError> {
         Err(BackendRuntimeError::Backend(
             "NVN command execution unavailable".into(),
         ))
     }
-    fn nvn_finalize_queue(&mut self, _queue: u64) -> Result<(), BackendRuntimeError> {
-        Err(BackendRuntimeError::Backend(
-            "NVN queues unavailable".into(),
-        ))
+    /// A memory-pool change may proceed after all earlier lists resolve their resources.
+    fn nvn_drain(&mut self, finish: Box<dyn FnOnce() + Send>) {
+        finish();
+    }
+    fn nvn_poll_interval(&self) -> Option<std::time::Duration> {
+        None
     }
     fn nvn_flush(
         &mut self,
@@ -163,17 +208,6 @@ pub trait GpuPresentation: GpuExecution {
         self.submit(action)
     }
     fn nvn_acquire_fence(&mut self, _action: FenceAction) -> Result<(), BackendRuntimeError> {
-        Err(BackendRuntimeError::Backend(
-            "NVN presentation unavailable".into(),
-        ))
-    }
-    fn nvn_present(
-        &mut self,
-        _texture: nixe_nvn::Texture,
-        _interval: u32,
-        _flip_vertical: bool,
-        _crop: [u32; 4],
-    ) -> Result<ResidentImage, BackendRuntimeError> {
         Err(BackendRuntimeError::Backend(
             "NVN presentation unavailable".into(),
         ))

@@ -343,6 +343,7 @@ pub(crate) struct ResidencyRuntime {
     host_uniform_uploads: Vec<buffer::UniformUpload>,
     uniform_scratch: Vec<u8>,
     streamed_uses: Vec<usize>,
+    host_binding_accesses: Vec<execution::HostBindingAccess>,
 }
 impl VulkanResidency {
     pub(crate) fn shader_cache(&self) -> nixe_gpu::shader_memory::ShaderCache {
@@ -413,6 +414,7 @@ impl VulkanResidency {
                 host_uniform_uploads: Vec::new(),
                 uniform_scratch: Vec::new(),
                 streamed_uses: Vec::new(),
+                host_binding_accesses: Vec::new(),
             },
         };
         cache.access().maintain_budget(true)?;

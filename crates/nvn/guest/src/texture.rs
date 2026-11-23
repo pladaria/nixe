@@ -35,13 +35,25 @@ setter!(format, format, u16);
 setter!(samples, samples, u32);
 setter!(stride, stride, u32);
 pub fn size(c: &Call) -> Result<u64> {
+    dimensions(c, c.args[2] as u32, 1)
+}
+
+pub fn size_1d(c: &Call) -> Result<u64> {
+    dimensions(c, 1, 1)
+}
+
+pub fn size_3d(c: &Call) -> Result<u64> {
+    dimensions(c, c.args[2] as u32, c.args[3] as u32)
+}
+
+fn dimensions(c: &Call, height: u32, depth: u32) -> Result<u64> {
     c.write(
         c.args[0] + 8 + core::mem::offset_of!(Texture, width) as u64,
-        &[c.args[1] as u32, c.args[2] as u32],
+        &[c.args[1] as u32, height],
     )?;
     c.write(
         c.args[0] + 8 + core::mem::offset_of!(Texture, depth) as u64,
-        &1u32,
+        &depth,
     )?;
     Ok(0)
 }
@@ -61,6 +73,14 @@ pub fn storage_size(c: &Call) -> Result<u64> {
     Ok(c.read::<Texture>(c.args[0] + 8)?.layout()?.bytes)
 }
 pub fn initialize(c: &Call) -> Result<u64> {
+    initialize_texture::<false>(c)
+}
+
+pub fn initialize_ampere(c: &Call) -> Result<u64> {
+    initialize_texture::<true>(c)
+}
+
+fn initialize_texture<const AMPERE: bool>(c: &Call) -> Result<u64> {
     let builder = c.args[1];
     let [offset, pool]: [u64; 2] = c.read(builder + 8 + size_of::<Texture>() as u64)?;
     if pool == 0 {
@@ -71,6 +91,13 @@ pub fn initialize(c: &Call) -> Result<u64> {
         return Ok(0);
     }
     let mut t: Texture = c.read(builder + 8)?;
+    let device: u64 = c.read(builder)?;
+    // The device can request the X1 order for its textures. The default NVN2
+    // order exchanges address bits 5 and 6 within each 512-byte GOB.
+    // https://github.com/seedds/nxnative/blob/a366365/docs/reference/nvn-objects.md#the-switch-2s-order-inside-a-gob
+    if AMPERE && c.read::<u32>(device)? & 0x10000 == 0 {
+        t.use_ampere_gob_order();
+    }
     t.layout()?;
     t.address = p
         .gpu
@@ -79,7 +106,7 @@ pub fn initialize(c: &Call) -> Result<u64> {
     c.write(c.args[0], &t)?;
     c.write(
         c.args[0] + size_of::<Texture>() as u64,
-        &[p.cpu + offset, offset, pool, c.read::<u64>(builder)?],
+        &[p.cpu + offset, offset, pool, device],
     )?;
     Ok(1)
 }
@@ -161,4 +188,37 @@ pub fn get_target(c: &Call) -> Result<u64> {
 
 pub fn get_depth(c: &Call) -> Result<u64> {
     Ok(c.read::<Texture>(c.args[0])?.depth.into())
+}
+
+pub fn get_levels(c: &Call) -> Result<u64> {
+    Ok(c.read::<Texture>(c.args[0])?.levels.into())
+}
+
+pub fn get_samples(c: &Call) -> Result<u64> {
+    Ok(c.read::<Texture>(c.args[0])?.samples.into())
+}
+
+pub fn get_storage_size(c: &Call) -> Result<u64> {
+    Ok(c.read::<Texture>(c.args[0])?.layout()?.bytes)
+}
+
+pub fn get_view_offset(c: &Call) -> Result<u64> {
+    if c.args[1] == 0 {
+        return Ok(0);
+    }
+    let t: Texture = c.read(c.args[0])?;
+    let v: View = c.read(c.args[1])?;
+    if v.first == 0 && v.layer == 0 {
+        return Ok(0);
+    }
+    let layout = t.layout()?;
+    let offset = layout
+        .mips
+        .get(v.first as usize)
+        .ok_or("invalid view mip")?
+        .offset;
+    if t.target == 2 && v.layer != 0 {
+        return Err("storage offset of a 3D slice is unsupported");
+    }
+    Ok(offset + u64::from(v.layer) * layout.layer_stride)
 }

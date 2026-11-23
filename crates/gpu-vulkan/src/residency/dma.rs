@@ -174,21 +174,38 @@ impl Residency<'_> {
         self.finish_buffer_reads(destination, bytes)?;
         self.buffer_cache.clear_download(destination, bytes);
         let retained = self.runtime.constructing.len();
-        let result = self.record_dma_buffer_copy(source, destination, bytes);
+        let result = self.record_dma_buffer_copy::<true>(source, destination, bytes);
         self.runtime.constructing.truncate(retained);
         result.map(|_| {
             self.runtime.statistics.dma_buffer_copies += 1;
             true
         })
     }
-    fn record_dma_buffer_copy(
+    pub(crate) fn copy_nvn_buffer(
+        &mut self,
+        source: u64,
+        destination: u64,
+        bytes: u64,
+    ) -> Result<(), VulkanError> {
+        if bytes == 0 || source == destination {
+            return Ok(());
+        }
+        let retained = self.runtime.constructing.len();
+        let result = self.record_dma_buffer_copy::<false>(source, destination, bytes);
+        self.runtime.constructing.truncate(retained);
+        result
+    }
+
+    fn record_dma_buffer_copy<const MIRROR: bool>(
         &mut self,
         source_address: u64,
         destination_address: u64,
         bytes: u64,
     ) -> Result<(), VulkanError> {
-        self.buffer_cache
-            .note_uniform_gpu_write(destination_address, bytes);
+        if MIRROR {
+            self.buffer_cache
+                .note_uniform_gpu_write(destination_address, bytes);
+        }
         let (source, destination) = loop {
             let src = self.device_buffer(
                 source_address,
@@ -213,21 +230,27 @@ impl Residency<'_> {
             .constructing
             .push(Resource::Buffer(destination.buffer));
         self.ensure_buffer_range(source.buffer, source.offset, bytes)?;
-        self.ensure_buffer_range(destination.buffer, destination.offset, bytes)?;
+        if MIRROR {
+            self.ensure_buffer_range(destination.buffer, destination.offset, bytes)?;
+        }
         // Save source intervals before subtracting an overlapping destination.
-        let modified: smallvec::SmallVec<[(u64, u64); 4]> = self
-            .buffer_cache
-            .gpu_modified_ranges
-            .intersections(source_address, bytes)
-            .map(|(address, size)| (destination_address + address - source_address, size))
-            .collect();
-        self.buffer_cache
-            .gpu_modified_ranges
-            .subtract(destination_address, bytes);
-        for &(address, size) in &modified {
-            self.buffer_cache.outdate_downloads(address, size);
-            self.buffer_cache.gpu_modified_ranges.insert(address, size);
-            self.buffer_cache.queue_fence_download(address, size)?;
+        let mut modified = false;
+        if MIRROR {
+            let ranges: smallvec::SmallVec<[(u64, u64); 4]> = self
+                .buffer_cache
+                .gpu_modified_ranges
+                .intersections(source_address, bytes)
+                .map(|(address, size)| (destination_address + address - source_address, size))
+                .collect();
+            self.buffer_cache
+                .gpu_modified_ranges
+                .subtract(destination_address, bytes);
+            modified = !ranges.is_empty();
+            for (address, size) in ranges {
+                self.buffer_cache.outdate_downloads(address, size);
+                self.buffer_cache.gpu_modified_ranges.insert(address, size);
+                self.buffer_cache.queue_fence_download(address, size)?;
+            }
         }
         let source_handle = self.use_buffer(source.buffer, source.offset, bytes)?;
         let overlap = source.buffer == destination.buffer
@@ -274,12 +297,17 @@ impl Residency<'_> {
         entry.write_tick = work.tick();
         entry.invalid.subtract(destination.offset, bytes);
         entry.contents.last_use = Some(work);
-        if !modified.is_empty() {
+        self.runtime.statistics.gpu_copied_bytes += bytes;
+        if !MIRROR {
+            return self
+                .buffer_cache
+                .mark_written(destination.buffer, destination.offset, bytes);
+        }
+        if modified {
             self.buffer_cache
                 .memory_tracker
                 .gpu_write(destination_address, bytes);
         }
-        self.runtime.statistics.gpu_copied_bytes += bytes;
         // Eden also mirrors RAM with UnsafeReadWrite, without invalidating the
         // native destination or downloading the GPU-produced source intervals.
         let mut copy = std::mem::take(&mut self.buffer_cache.dma_buffer);
@@ -296,7 +324,7 @@ impl Residency<'_> {
         result?;
         self.buffer_cache
             .release_clean_read_traps(destination_address, bytes);
-        if !modified.is_empty() {
+        if modified {
             self.buffer_cache.collect_command_copies = true;
             self.buffer_cache
                 .note_command_write(destination.buffer, destination_address, bytes);

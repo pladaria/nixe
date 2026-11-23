@@ -20,12 +20,13 @@ mod control;
 mod dependencies;
 mod dma;
 mod frontend;
+mod nvn;
 mod semaphore;
 
 /// One physical cache and native owner are selected for the application. The
 /// startup closure erases its type once; command preparation stays monomorphic.
 pub struct AmpereGraphics {
-    pub(crate) memory: nixe_memory::device_memory::DeviceMemory,
+    pub(crate) heap: nixe_memory::DeviceHeapMemory,
     owner: Mutex<Owner>,
 }
 type Initialize = Box<dyn FnOnce(&Arc<RunnableProcess>) -> Result<Arc<Executor>> + Send>;
@@ -39,7 +40,7 @@ impl std::fmt::Debug for AmpereGraphics {
     }
 }
 impl AmpereGraphics {
-    pub fn new<E: ampere::Rasterizer>(
+    pub fn new<E: ampere::Rasterizer + nixe_gpu::GpuPresentation>(
         memory: nixe_memory::device_memory::DeviceMemory,
         presenter: Option<nixe_video::FrameMailbox>,
         mme_jit: bool,
@@ -48,7 +49,7 @@ impl AmpereGraphics {
         + 'static,
     ) -> Arc<Self> {
         Arc::new(Self {
-            memory,
+            heap: nixe_memory::DeviceHeapMemory::new(memory),
             owner: Mutex::new(Owner {
                 executor: None,
                 initialize: Some(Box::new(move |process| {
@@ -69,6 +70,23 @@ impl AmpereGraphics {
         let executor = initialize(process)?;
         owner.executor = Some(executor.clone());
         Ok(executor)
+    }
+
+    pub fn attach_nvn(
+        &self,
+        process: &Arc<RunnableProcess>,
+        session: &nixe_nvn::Session,
+    ) -> Result<()> {
+        let executor = self.executor(process)?;
+        let display = Arc::new(nixe_nvn::display::DisplayHistory::new(
+            process.scheduler().clock().clone(),
+        ));
+        session.attach(nixe_nvn::Graphics {
+            heap: self.heap.clone(),
+            surfaces: None,
+            backend: nvn::client(&executor.endpoint, display.clone()),
+            display: Some(display),
+        })
     }
 }
 
@@ -191,7 +209,7 @@ impl Executor {
     pub fn device_uuid(&self) -> Option<[u8; 16]> {
         self.device_uuid.get().copied().flatten()
     }
-    pub fn new<E: ampere::Rasterizer>(
+    pub fn new<E: ampere::Rasterizer + nixe_gpu::GpuPresentation>(
         process: &Arc<RunnableProcess>,
         presenter: Option<nixe_video::FrameMailbox>,
         mme_jit: bool,
@@ -785,7 +803,7 @@ fn read_owned(
         _ => Err("invalid owner memory read completion".into()),
     }
 }
-fn preparation<E: ampere::Rasterizer>(
+fn preparation<E: ampere::Rasterizer + nixe_gpu::GpuPresentation>(
     input: &mut nixe_gpu::ordered::Receiver<Control>,
     machine: Machine,
     clock: nixe_scheduler::VirtualClock,
@@ -1018,7 +1036,8 @@ fn preparation<E: ampere::Rasterizer>(
                 renderer
                     .flush_deferred()
                     .map_err(|e| e.to_string().into_boxed_str())?;
-                endpoint.progress(renderer)
+                endpoint.progress(renderer)?;
+                Ok::<_, Box<str>>(renderer.nvn_poll_interval())
             },
         )? {
             break;

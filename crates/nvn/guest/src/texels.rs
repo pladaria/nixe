@@ -125,6 +125,7 @@ fn transfer(c: &Call, upload: bool) -> Result<u64> {
             packed,
             m,
             t.flags & 0x50 != 0,
+            t.ampere_gob_order(),
             [x, y, w, h],
             slice,
             layer_rows,
@@ -139,6 +140,7 @@ fn transfer_slice(
     src: u64,
     layout: Mip,
     linear: bool,
+    ampere_gob: bool,
     [x, y, w, h]: [usize; 4],
     slice: usize,
     layer_rows: usize,
@@ -151,24 +153,25 @@ fn transfer_slice(
         8usize << layout.block_height
     };
     let bd = 1usize << layout.block_depth;
+    let x_shift = if ampere_gob { 2 } else { 1 };
+    let y_shift = if ampere_gob { 4 } else { 5 };
     for dy in 0..h {
         let row = y + dy;
         let packed = src + (dy * w) as u64;
         let slab = ((slice / bd * layer_rows + row / band * band) * pitch * bd
             + slice % bd * band * 64) as u64;
+        let y = row % band;
+        let gob_row = (y / 8) * 512 + ((y & 4) << 5) + ((y & 2) << y_shift) + ((y & 1) << 4);
         let mut done = 0;
         while done < w {
             let col = x + done;
             let (offset, count) = if linear {
                 (((slice * layer_rows + row) * pitch + col) as u64, w - done)
             } else {
-                let y = row % band;
                 let gob = (col / 64) * 64 * band * bd
-                    + (y / 8) * 512
+                    + gob_row
                     + ((col & 32) << 3)
-                    + ((y & 6) << 5)
-                    + ((col & 16) << 1)
-                    + ((y & 1) << 4)
+                    + ((col & 16) << x_shift)
                     + (col & 15);
                 (slab + gob as u64, (16 - col % 16).min(w - done))
             };

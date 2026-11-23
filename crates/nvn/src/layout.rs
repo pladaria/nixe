@@ -1,4 +1,4 @@
-//! Maxwell NVN storage geometry, including packaged mip chains and array padding.
+//! NVN storage geometry, including packaged mip chains and array padding.
 //! https://github.com/devkitPro/deko3d/blob/master/source/dk_image.cpp
 use super::*;
 
@@ -200,7 +200,7 @@ impl Texture {
                 .collect(),
             });
         }
-        let pkg = self.packaged.checked_sub(1);
+        let pkg = self.packaged_layout();
         let pw = pkg.map_or(0, |n| n >> 8 & 15);
         let auto = |n: u32| n.clamp(1, 16).ilog2();
         let mut th = if matches!(self.target, 0 | 3 | 2) {

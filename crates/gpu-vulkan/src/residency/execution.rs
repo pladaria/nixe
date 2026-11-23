@@ -101,6 +101,7 @@ pub enum HostBinding {
     /// Immutable host constants streamed when the command is recorded.
     UniformBytes(Arc<[u8]>),
     NullBuffer,
+    PointerTable(Arc<super::pointer_table::PointerTableBinding>),
     TexelBuffer {
         buffer: HostBuffer,
         offset: u64,
@@ -149,7 +150,7 @@ pub struct HostProgram {
 }
 impl HostProgram {
     pub(crate) fn image_binding_view(&self, index: usize) -> Option<ImageViewId> {
-        match &self.bindings[index] {
+        match self.bindings.get(index)? {
             HostBinding::Image(image) | HostBinding::CombinedImageSampler { image, .. } => {
                 Some(image.id)
             }
@@ -228,9 +229,10 @@ impl Residency<'_> {
                     scope,
                 })
             }
-            HostBinding::NullBuffer | HostBinding::UniformBytes(_) | HostBinding::Sampler(_) => {
-                None
-            }
+            HostBinding::NullBuffer
+            | HostBinding::UniformBytes(_)
+            | HostBinding::Sampler(_)
+            | HostBinding::PointerTable(_) => None,
         }
     }
     fn canonical_resource(
@@ -250,6 +252,11 @@ impl Residency<'_> {
                 buffer: Arc::clone(&buffer.native),
                 offset: *offset,
                 range: *size,
+            },
+            HostBinding::PointerTable(binding) => DescriptorResource::Buffer {
+                buffer: Arc::clone(&binding.table),
+                offset: binding.offset,
+                range: binding.size,
             },
             HostBinding::TexelBuffer {
                 buffer,
@@ -380,6 +387,12 @@ impl Residency<'_> {
                 .is_some_and(|entry| {
                     entry.binding_valid && Arc::ptr_eq(&entry.native, &buffer.native)
                 }),
+            HostBinding::PointerTable(binding) => binding.targets.iter().all(|range| {
+                self.buffer_cache
+                    .buffers
+                    .get(range.buffer)
+                    .is_some_and(|entry| entry.binding_valid)
+            }),
             HostBinding::Image(view) | HostBinding::CombinedImageSampler { image: view, .. } => {
                 self.texture_cache.views.get(view.id).is_some_and(|entry| {
                     self.texture_cache.binding_current(entry.image)
@@ -699,19 +712,43 @@ impl Residency<'_> {
         program: &HostProgram,
         images_prepared: bool,
     ) -> Result<(), VulkanError> {
+        let mut used = std::mem::take(&mut self.runtime.host_binding_accesses);
+        let mut streamed = self.runtime.streamed_uses.iter().copied().peekable();
+        for index in 0..program.bindings.len() {
+            if streamed.next_if_eq(&index).is_some() {
+                continue;
+            }
+            if let Some(resource) = self.host_binding_usage(program, index) {
+                used.push(resource);
+            } else if let HostBinding::PointerTable(binding) = &program.bindings[index] {
+                let scope = program.pipeline.resources[index];
+                used.extend(
+                    binding
+                        .targets
+                        .iter()
+                        .map(|range| HostBindingAccess::Buffer {
+                            id: range.buffer,
+                            offset: range.offset,
+                            size: range.size,
+                            scope,
+                        }),
+                );
+            }
+        }
+        let result = self.synchronize_host_bindings(&used, images_prepared);
+        used.clear();
+        self.runtime.host_binding_accesses = used;
+        result
+    }
+    fn synchronize_host_bindings(
+        &mut self,
+        used: &[HostBindingAccess],
+        images_prepared: bool,
+    ) -> Result<(), VulkanError> {
         // Synchronize current cache selections before recording shader access.
         // Overlapping bindings share the cache-owned modified ranges.
         let mut images: smallvec::SmallVec<[ImageId; 16]> = smallvec::SmallVec::new();
-        let mut used = smallvec::SmallVec::<[HostBindingAccess; 16]>::new();
-        let mut streamed = self.runtime.streamed_uses.iter().copied().peekable();
-        for index in 0..program.bindings.len() {
-            if streamed.next_if_eq(&index).is_none()
-                && let Some(resource) = self.host_binding_usage(program, index)
-            {
-                used.push(resource);
-            }
-        }
-        for &resource in &used {
+        for &resource in used {
             match resource {
                 HostBindingAccess::Buffer {
                     id,
@@ -736,7 +773,7 @@ impl Residency<'_> {
                 }
             }
         }
-        for &resource in &used {
+        for &resource in used {
             match resource {
                 HostBindingAccess::Buffer {
                     id, offset, size, ..
@@ -765,6 +802,14 @@ impl Residency<'_> {
         }
         for index in 0..program.bindings.len() {
             if self.runtime.streamed_uses.binary_search(&index).is_ok() {
+                continue;
+            }
+            if let HostBinding::PointerTable(binding) = &program.bindings[index]
+                && program.pipeline.resources[index].writes()
+            {
+                for range in &binding.targets {
+                    self.finish_buffer_write(range.buffer, range.offset, range.size)?;
+                }
                 continue;
             }
             match self.host_binding_usage(program, index) {
@@ -824,6 +869,14 @@ impl Residency<'_> {
                 HostBinding::Buffer { buffer: id, .. }
                 | HostBinding::TexelBuffer { buffer: id, .. } => {
                     self.runtime.constructing.push(Resource::Buffer(id.id))
+                }
+                HostBinding::PointerTable(binding) => {
+                    self.runtime.constructing.extend(
+                        binding
+                            .targets
+                            .iter()
+                            .map(|range| Resource::Buffer(range.buffer)),
+                    );
                 }
                 HostBinding::Image(id) | HostBinding::CombinedImageSampler { image: id, .. } => {
                     self.runtime.constructing.push(Resource::Image(id.image))

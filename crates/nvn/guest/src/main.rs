@@ -16,6 +16,7 @@ type MipList = ArrayVec<Mip, 32>;
 mod buffer;
 mod command;
 mod device;
+mod event;
 mod pool;
 mod program;
 mod queue;
@@ -81,15 +82,15 @@ core::arch::global_asm!(
     "brk #0"
 );
 unsafe extern "C" {
-    fn nixe_nvn_error(name: *const u8, n: usize, message: *const u8, m: usize) -> !;
+    fn nixe_nvn_error(name: *const u8, n: usize, message: *const u8, m: usize, object: u64) -> !;
 }
 #[cold]
-fn fail(name: &str, message: &str) -> ! {
-    unsafe { nixe_nvn_error(name.as_ptr(), name.len(), message.as_ptr(), message.len()) }
+fn fail(name: &str, message: &str, object: u64) -> ! {
+    unsafe { nixe_nvn_error(name.as_ptr(), name.len(), message.as_ptr(), message.len(), object) }
 }
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
-    fail("NVN", "guest procedure invariant failed")
+    fail("NVN", "guest procedure invariant failed", 0)
 }
 
 macro_rules! exports {
@@ -108,7 +109,7 @@ macro_rules! exports {
                 };
                 loop {
                     let result = $family::$handler(&call)
-                        .unwrap_or_else(|reason| fail(concat!("nvn", stringify!($name)), reason));
+                        .unwrap_or_else(|reason| fail(concat!("nvn", stringify!($name)), reason, x0));
                     let Some([target, event, bytes, data]) = call.refill.take() else {
                         return result;
                     };

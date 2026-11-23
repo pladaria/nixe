@@ -58,6 +58,19 @@ const CALL_HOST: &[u32] = &[0xd4000001 | NVN_SVC << 5, 0xd65f03c0]; // svc; ret
 // Notify the resolver after the probe publishes all six constants.
 const QUERY_VERSION: usize = 128;
 const QUERY_VERSION_DONE: usize = QUERY_VERSION + 2 * 4;
+const DISPLAY_ENTRIES: usize = 256;
+const DISPLAY: [(&[u8], &str, nixe_nvn::Handler); 2] = [
+    (
+        b"_ZN2nn2vi20GetLatestFrameNumberEPmPKNS0_5LayerE",
+        "vi::GetLatestFrameNumber",
+        nixe_nvn::display::latest,
+    ),
+    (
+        b"_ZN2nn2vi16ListFrameHistoryEPNS0_9FrameInfoEiPKNS0_5LayerE",
+        "vi::ListFrameHistory",
+        nixe_nvn::display::list,
+    ),
+];
 const VERSION_WORDS: &[u32] = &[
     0xa9bf7bfd, // stp x29, x30, [sp, #-16]!
     0xd63f0040, // blr x2
@@ -70,15 +83,17 @@ type Procedure = (Box<str>, Option<nixe_nvn::Handler>);
 struct Hle {
     session: nixe_nvn::Session,
     title: u64,
+    inline_sdk: Option<GuestVirtualAddress>,
     platform: TargetPlatform,
     procedures: Box<[OnceLock<Procedure>]>,
 }
 impl Hle {
     fn new(platform: TargetPlatform, title: u64) -> Self {
         Self {
-            session: nixe_nvn::Session::new(),
+            session: nixe_nvn::Session::for_platform(platform),
             platform,
             title,
+            inline_sdk: None,
             procedures: (0..SLOTS).map(|_| OnceLock::new()).collect(),
         }
     }
@@ -150,7 +165,7 @@ impl NvnHooks {
         hle: bool,
     ) -> Self {
         let mut bootstrap = Vec::new();
-        for (module, prepared) in plan.modules().iter().zip(modules) {
+        for (module, prepared) in plan.modules().iter().zip(modules.iter_mut()) {
             if let LaunchModuleImage::Nso(nso) = module.image() {
                 prepared.redirect_nso_export(nso.metadata(), BOOTSTRAP.as_bytes(), |original| {
                     let slot = bootstrap
@@ -165,17 +180,40 @@ impl NvnHooks {
                 });
             }
         }
+        let mut inline_sdk = None;
+        if hle && plan.platform() == TargetPlatform::Switch2 && !bootstrap.is_empty() {
+            for (module, prepared) in plan.modules().iter().zip(modules) {
+                if let LaunchModuleImage::Nso(nso) = module.image() {
+                    inline_sdk = inline_sdk.or_else(|| {
+                        prepared
+                            .nso_u32_export(nso.metadata(), b"nvnPrivate0")
+                            .map(GuestVirtualAddress::new)
+                    });
+                    for (index, (symbol, name, _)) in DISPLAY.iter().enumerate() {
+                        prepared.redirect_nso_export(nso.metadata(), symbol, |_| {
+                            log::debug!("NVN2 display export {name} in module {}", module.name());
+                            Some(base + (DISPLAY_ENTRIES + index * 8) as u64)
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(address) = inline_sdk {
+            log::debug!("NVN2 native inline recording flag at {:#x}", address.get());
+        }
         Self {
             base,
             bootstrap,
             registry: Mutex::default(),
             count_calls,
             hle: hle.then(|| {
-                Hle::new(
+                let mut hle = Hle::new(
                     plan.platform(),
                     plan.packaged_identity()
                         .map_or(0, |i| i.application_id().get()),
-                )
+                );
+                hle.inline_sdk = inline_sdk;
+                hle
             }),
         }
     }
@@ -216,8 +254,13 @@ impl NvnHooks {
             DISPATCH_PC - 4
         };
         emit(DISPATCH_PC, DISPATCH);
-        if self.hle.is_some() {
+        if let Some(hle) = &self.hle {
             emit(QUERY_VERSION, VERSION_WORDS);
+            if hle.platform == TargetPlatform::Switch2 {
+                for index in 0..DISPLAY.len() {
+                    emit(DISPLAY_ENTRIES + index * 8, CALL_HOST);
+                }
+            }
             for slot in 0..SLOTS {
                 emit(HOST_ENTRIES + slot * 8, CALL_HOST);
             }
@@ -410,7 +453,12 @@ impl NvnHooks {
             let name = text(state.read_x(x(0)), state.read_x(x(1))).unwrap_or("NVN");
             let reason =
                 text(state.read_x(x(2)), state.read_x(x(3))).unwrap_or("invalid guest error");
-            return Err(format!("NVN HLE {name} (title={:016X}): {reason}", hle.title).into());
+            let object = state.read_x(x(4));
+            return Err(format!(
+                "NVN HLE {name} (title={:016X}, object={object:#x}): {reason}",
+                hle.title
+            )
+            .into());
         } else if let Some(hle) = &self.hle
             && let Some(offset) = pc.checked_sub(self.base + HOST_ENTRIES as u64)
             && offset.is_multiple_of(8)
@@ -443,6 +491,20 @@ impl NvnHooks {
                 state.set_pc(pc + 4);
                 return Ok(Svc::Wait(wait));
             }
+        } else if let Some(hle) = &self.hle
+            && hle.platform == TargetPlatform::Switch2
+            && let Some(offset) = pc.checked_sub(self.base + DISPLAY_ENTRIES as u64)
+            && offset.is_multiple_of(8)
+            && let Some((_, name, handler)) = DISPLAY.get((offset / 8) as usize)
+        {
+            let call = nixe_nvn::Call {
+                session: &hle.session,
+                memory: memory.space(),
+                args: std::array::from_fn(|i| state.read_x(x(i as u8))),
+                pending: Default::default(),
+            };
+            let result = handler(&call).map_err(|e| format!("NVN2 HLE {name}: {e}"))?;
+            state.write_x(x(0), result);
         } else {
             return Ok(Svc::Unknown);
         }
@@ -452,6 +514,17 @@ impl NvnHooks {
 
     fn resolve(&self, state: &mut GuestCpuState, memory: &ProcessMemory) -> Result<bool, Box<str>> {
         let x = |i| A64Register::General(A64GeneralRegister::new(i).unwrap());
+        if let Some(flag) = self.hle.as_ref().and_then(|hle| hle.inline_sdk) {
+            // The SDK's resolver enables native inline recording when it owns
+            // the command encoding. Keep callers on the resolved NVN entry points.
+            // https://github.com/seedds/nxnative/blob/a366365/docs/reference/nvn-objects.md#nvnprivate0-an-inlined-command-buffer-fast-path-flag
+            memory
+                .space()
+                .write(flag, &0u32.to_le_bytes())
+                .map_err(|e| e.to_string())?
+                .into_ready()
+                .map_err(|_| "NVN inline recording flag is not CPU-writable")?;
+        }
         let target = state.read_x(x(0));
         if target != 0 {
             let name = read_name(memory, state.read_x(x(1)));
@@ -462,9 +535,10 @@ impl NvnHooks {
             if let Some(wrapped) = wrapped {
                 state.write_x(x(0), wrapped);
                 if name.as_deref() == Some("nvnDeviceGetInteger")
-                    && self.hle.as_ref().is_some_and(|h| {
-                        h.platform == TargetPlatform::Switch1 && h.session.sdk_api_major().is_none()
-                    })
+                    && self
+                        .hle
+                        .as_ref()
+                        .is_some_and(|h| h.session.sdk_api_major().is_none())
                 {
                     state.write_x(x(1), self.original_target(&reg, target));
                     state.write_x(

@@ -187,6 +187,10 @@ impl Program {
             self.pool_bounds = Some(bounds.clone());
         }
     }
+
+    pub(super) fn pool_remaining(&self, address: u64) -> Option<u64> {
+        self.pool_bounds.as_ref()?.remaining(address)
+    }
 }
 
 enum Binding {
@@ -194,6 +198,8 @@ enum Binding {
     Image(u32, bool, nixe_shader_recompiler::types::ImageFormat),
     Buffer(Range),
     Driver(Arc<[u8]>),
+    Texel(u32),
+    PointerTable,
 }
 
 impl NativeExecution<'_> {
@@ -266,7 +272,7 @@ impl NativeExecution<'_> {
                 .as_ref()
                 .is_none_or(|s| !Rc::ptr_eq(s, &pipeline.compiled))
             || pipeline.inputs.len() > 128;
-        let mut mask = 0u128;
+        let mut mask = pipeline.dependencies.bindless;
         if !all {
             for (storage, stage, slot) in dirty.slots() {
                 mask |= pipeline.dependencies.buffers[storage as usize][stage]
@@ -330,9 +336,53 @@ impl NativeExecution<'_> {
             let input = &pipeline.inputs[i];
             let previous = selected.slots.get(i);
             let (key, binding) = match *input {
+                shader::Input::TexelBuffer {
+                    stage,
+                    handle,
+                    storage,
+                } => {
+                    let [id, _] = shader::bindless_descriptor_ids(
+                        &mut self.residency,
+                        bindings,
+                        stage,
+                        handle,
+                    )?;
+                    if matches!(previous, Some(Binding::Texel(old)) if *old == id) {
+                        continue;
+                    }
+                    let descriptor = bindings.bindless.unwrap().resolve([id, 0]);
+                    let binding = if let Some(descriptor) = descriptor {
+                        resources::texel_binding(self, descriptor.texture, storage)?
+                    } else {
+                        HostBinding::NullBuffer
+                    };
+                    (Binding::Texel(id), binding)
+                }
+                shader::Input::Push(block) => {
+                    static ZERO: std::sync::OnceLock<Arc<[u8; 256]>> = std::sync::OnceLock::new();
+                    let bytes = bindings
+                        .buffers
+                        .push_block(block as usize)
+                        .unwrap_or_else(|| ZERO.get_or_init(|| Arc::new([0; 256])));
+                    if matches!(previous, Some(Binding::Driver(old)) if std::ptr::eq(old.as_ptr(), bytes.as_ptr()))
+                    {
+                        continue;
+                    }
+                    let bytes: Arc<[u8]> = bytes.clone();
+                    (
+                        Binding::Driver(bytes.clone()),
+                        HostBinding::UniformBytes(bytes),
+                    )
+                }
                 shader::Input::Driver(stage, bank, size) => {
+                    let compute = if stage == 5 && bank == 0 {
+                        let shader = pipeline.usage.stages[0].shader;
+                        (shader.isa == 1).then_some(shader.compute)
+                    } else {
+                        None
+                    };
                     let binding = self.state.nvn.driver_banks.select(
-                        (stage, bank, selected.owner),
+                        (stage, bank, selected.owner, compute),
                         size,
                         bindings,
                         groups,
@@ -352,17 +402,28 @@ impl NativeExecution<'_> {
                     slot,
                     ty,
                     format,
+                    bindless,
                     ..
                 } => {
                     use nixe_shader_recompiler::types::TextureType as T;
-                    let input = bindings.sampled.get(stage, slot).ok_or_else(|| {
+                    let arrayed =
+                        matches!(ty, T::ColorArray1D | T::ColorArray2D | T::ColorArrayCube);
+                    let dynamic;
+                    let input = if let Some(key) = bindless {
+                        let ids = shader::bindless_descriptor_ids(&mut self.residency, bindings, stage, key)?;
+                        if matches!(previous, Some(Binding::Image(old, a, f)) if (*old,*a,*f) == (ids[0],arrayed,format)) {
+                            continue;
+                        }
+                        dynamic = bindings.bindless.unwrap().resolve(ids);
+                        dynamic.as_ref()
+                    } else {
+                        bindings.sampled.get(stage, slot)
+                    }.ok_or_else(|| {
                         error(format!(
                             "unbound NVN storage image at stage {stage}, row {slot}"
                         ))
                     })?;
                     let id = input.descriptor_ids()[0];
-                    let arrayed =
-                        matches!(ty, T::ColorArray1D | T::ColorArray2D | T::ColorArrayCube);
                     if matches!(previous, Some(Binding::Image(old, a, f)) if (*old,*a,*f) == (id,arrayed,format))
                     {
                         continue;
@@ -375,14 +436,35 @@ impl NativeExecution<'_> {
                     )
                 }
                 shader::Input::Texture {
-                    stage, slot, ty, ..
+                    stage,
+                    slot,
+                    ty,
+                    bindless,
+                    ..
                 } => {
                     use nixe_shader_recompiler::types::TextureType as T;
                     let arrayed =
                         matches!(ty, T::ColorArray1D | T::ColorArray2D | T::ColorArrayCube);
                     // Each texture instruction selects a view of its declared dimension.
                     // An unrelated handle may still occupy an unused conditional slot.
-                    let input = bindings.sampled.get(stage, slot).filter(|t| {
+                    let dynamic;
+                    let input = if let Some(key) = bindless {
+                        let ids = shader::bindless_descriptor_ids(
+                            &mut self.residency,
+                            bindings,
+                            stage,
+                            key,
+                        )?;
+                        if matches!(previous, Some(Binding::Texture(old, a)) if *old == ids && *a == arrayed)
+                        {
+                            continue;
+                        }
+                        dynamic = bindings.bindless.unwrap().resolve(ids);
+                        dynamic.as_ref()
+                    } else {
+                        bindings.sampled.get(stage, slot)
+                    };
+                    let typed = input.filter(|t| {
                         matches!(
                             (t.texture.target_kind(), ty),
                             (0 | 3, T::Color1D | T::ColorArray1D)
@@ -395,23 +477,44 @@ impl NativeExecution<'_> {
                                 | (10, T::Buffer)
                         )
                     });
-                    let ids = input.map_or([0; 2], |t| t.descriptor_ids());
+                    if bindless.is_some() && input.is_some() && typed.is_none() {
+                        return Err(error("NVN2 bindless texture target changed pipeline type"));
+                    }
+                    let ids = typed.map_or([0; 2], |t| t.descriptor_ids());
                     if matches!(previous, Some(Binding::Texture(old, a)) if *old == ids && *a == arrayed)
                     {
                         continue;
                     }
                     (
                         Binding::Texture(ids, arrayed),
-                        match input {
+                        match typed {
                             Some(t) => resources::binding(self, t, arrayed)?,
                             None => resources::null_binding(self)?,
                         },
                     )
                 }
+                shader::Input::PointerTable {
+                    stage,
+                    slot,
+                    start,
+                    end,
+                    written,
+                } => {
+                    let range = bindings.buffers.get(true, stage, slot).unwrap_or_default();
+                    (
+                        Binding::PointerTable,
+                        self.residency
+                            .nvn_pointer_table(range, start, end, written)?,
+                    )
+                }
                 shader::Input::Uniform(..)
                 | shader::Input::Storage(..)
+                | shader::Input::StoragePointer(..)
                 | shader::Input::Constants(..) => {
-                    let storage = matches!(input, shader::Input::Storage(..));
+                    let storage = matches!(
+                        input,
+                        shader::Input::Storage(..) | shader::Input::StoragePointer(..)
+                    );
                     let range = match *input {
                         shader::Input::Uniform(stage, slot, size) => {
                             let mut range =
@@ -424,6 +527,16 @@ impl NativeExecution<'_> {
                         // https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/nvn_mtl.m#L13330-L13334
                         shader::Input::Storage(stage, slot) => {
                             bindings.buffers.get(true, stage, slot).unwrap_or_default()
+                        }
+                        shader::Input::StoragePointer(stage, key) => {
+                            let address = u64::from_le_bytes(shader::read_cbuf(
+                                &mut self.residency,
+                                bindings,
+                                stage,
+                                key.index.0,
+                                key.offset.0,
+                            )?);
+                            Range { address, size: 0 }
                         }
                         shader::Input::Constants(stage, size) => {
                             let shader = &pipeline
@@ -445,26 +558,32 @@ impl NativeExecution<'_> {
                     }
                     // A zero extent leaves the storage pointer live in the driver
                     // bank. Vulkan requires a byte range for the backing descriptor.
-                    let mut physical = range;
-                    if storage && physical.address != 0 && physical.size == 0 {
-                        let remaining = selected
-                            .pool_bounds
-                            .as_ref()
-                            .and_then(|p| p.remaining(physical.address))
-                            .ok_or_else(|| {
-                                error(format!(
-                                    "unmapped NVN storage address {:#x}",
-                                    physical.address
-                                ))
-                            })?;
-                        let limit = self
-                            .residency
-                            .device()
-                            .profile()
-                            .limits
-                            .max_storage_buffer_range;
-                        physical.size = remaining.min(u64::from(limit));
-                    }
+                    let physical = if storage && range.address != 0 {
+                        let limits = &self.residency.device().profile().limits;
+                        let prefix = range.address % limits.min_storage_buffer_offset_alignment;
+                        let size = if range.size == 0 {
+                            selected
+                                .pool_bounds
+                                .as_ref()
+                                .and_then(|p| p.remaining(range.address))
+                                .ok_or_else(|| {
+                                    error(format!(
+                                        "unmapped NVN storage address {:#x}",
+                                        range.address
+                                    ))
+                                })?
+                        } else {
+                            range.size
+                        };
+                        // The compiler forms the byte offset relative to the
+                        // aligned base, including any prefix before the guest pointer.
+                        Range {
+                            address: range.address - prefix,
+                            size: (size + prefix).min(u64::from(limits.max_storage_buffer_range)),
+                        }
+                    } else {
+                        range
+                    };
                     let binding = if physical.size == 0 {
                         HostBinding::NullBuffer
                     } else {

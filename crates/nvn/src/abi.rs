@@ -45,6 +45,19 @@ pub struct Texture {
 
 impl Texture {
     pub const IMAGE: u32 = 0x4;
+    const AMPERE_GOB: u32 = 1 << 31;
+
+    pub fn ampere_gob_order(self) -> bool {
+        self.packaged & Self::AMPERE_GOB != 0
+    }
+
+    pub fn use_ampere_gob_order(&mut self) {
+        self.packaged |= Self::AMPERE_GOB;
+    }
+
+    pub(crate) fn packaged_layout(self) -> Option<u32> {
+        (self.packaged & !Self::AMPERE_GOB).checked_sub(1)
+    }
 }
 
 #[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -85,6 +98,50 @@ pub struct Program {
     pub stages: [Shader; 2],
 }
 
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct AmpereProgram {
+    pub count: u64,
+    pub stages: [AmpereShader; 5],
+    pub compute: ComputeLayout,
+}
+
+// The NVN2 program object has 160 bytes. Compute workgroups fit three
+// ten-bit dimensions (stored minus one); graphics uses the same fields for
+// its stage and early fragment test mode.
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct AmpereShader {
+    pub address: u64,
+    pub bytes: u32,
+    pub constants: u32,
+    pub kind: u32,
+    pub extra: u32,
+}
+impl AmpereShader {
+    pub const COMPUTE: u32 = 1 << 31;
+}
+
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct ProgramBuilder {
+    pub reserved: u64,
+    pub device: u64,
+    pub settings: [u64; 3],
+    pub shader_count: u32,
+    pub padding: u32,
+    pub shaders: u64,
+}
+
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct Event {
+    pub gpu: u64,
+    pub cpu: u64,
+    pub pool: u64,
+    pub offset: u64,
+}
+
 #[derive(Clone, Copy, Default, Debug, Hash, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
 pub struct Shader {
@@ -93,8 +150,62 @@ pub struct Shader {
     pub header: u32,
     pub constants: u32,
     pub stage: u32,
-    pub group: [u32; 3],
     pub shared: u32,
+    pub group: [u16; 3],
+    pub isa: u8,
+    pub early_fragment_tests: u8,
+    pub compute: ComputeLayout,
+    pub padding: u32,
+}
+
+// NVN2 compute c[0]: a driver header, padded push blocks, then resource tables.
+// https://github.com/seedds/nxnative/blob/a366365/dm/gfx/tools/dmsh_build.py
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Pod, Zeroable)]
+#[repr(C)]
+pub struct ComputeLayout {
+    pub roots: [u8; 8],
+    pub uniform: u8,
+    pub storage: u8,
+    pub textures: u8,
+    pub separate_textures: u8,
+    pub separate_samplers: u8,
+    pub images: u8,
+    pub size: u16,
+}
+impl ComputeLayout {
+    pub fn uniform_base(self) -> u32 {
+        16 + self
+            .roots
+            .into_iter()
+            .map(|words| 4 * u32::from(words).next_multiple_of(4))
+            .sum::<u32>()
+    }
+    pub fn storage_base(self) -> u32 {
+        self.uniform_base() + 16 * u32::from(self.uniform)
+    }
+    pub fn texture_base(self) -> u32 {
+        self.storage_base() + 16 * u32::from(self.storage)
+    }
+    pub fn image_base(self) -> u32 {
+        self.texture_base()
+            + 8 * (u32::from(self.textures)
+                + u32::from(self.separate_textures)
+                + u32::from(self.separate_samplers))
+    }
+    pub fn handle_slot(self, offset: u32) -> Option<u32> {
+        for (base, count, slot) in [
+            (self.texture_base(), self.textures, 0),
+            (self.image_base(), self.images, IMAGE_HANDLE_BASE_SLOT),
+        ] {
+            if let Some(relative) = offset.checked_sub(base)
+                && relative.is_multiple_of(8)
+                && relative / 8 < u32::from(count)
+            {
+                return Some(slot + relative / 8);
+            }
+        }
+        None
+    }
 }
 
 #[repr(C)]
@@ -118,11 +229,12 @@ pub struct Pool {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct DescriptorPool {
     pub base: u64,
     pub count: u32,
     pub padding: u32,
+    pub device_base: u64,
 }
 
 #[repr(C)]
@@ -200,10 +312,14 @@ pub(crate) fn needs_capture(tag: u32) -> bool {
             | op::TEXTURE_POOL
             | op::PROGRAM
             | op::TEXTURE
+            | op::TEXTURES
             | op::DEFERRED
             | op::DRAW
             | op::INDEXED
             | op::DISPATCH
+            | op::INDEXED_INDIRECT
+            | op::DISPATCH_INDIRECT
+            | op::FENCE_SYNC
     )
 }
 
@@ -259,6 +375,15 @@ pub(crate) mod op {
     pub const CONSERVATIVE: u32 = 46;
     pub const RESET_COUNTER: u32 = 47;
     pub const COPY_TEXTURE_TO_BUFFER: u32 = 48;
+    pub const COPY_BUFFER: u32 = 49;
+    pub const INDEXED_INDIRECT: u32 = 50;
+    pub const DISPATCH_INDIRECT: u32 = 51;
+    pub const PUSH_CONSTANTS: u32 = 52;
+    pub const FENCE_SYNC: u32 = 53;
+    pub const WAIT_SYNC: u32 = 54;
+    pub const TEXTURES: u32 = 55;
+    pub const WAIT_EVENT: u32 = 56;
+    pub const SIGNAL_EVENT: u32 = 57;
 }
 
 pub const BLEND: [u8; 8] = [0, 2, 1, 2, 1, 1, 1, 0];

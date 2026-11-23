@@ -395,10 +395,15 @@ fn run_machine(
     // Ampere initializes its renderer on the first guest GPU request. Publish
     // only diagnostic handles at startup; sampling never calls the GPU owner.
     let (diagnostics_sender, gpu_diagnostics) = mpsc::channel();
+    let nvn_events = process.nvn_session().map(|session| session.event_signals());
     let video_system = if machine_profile.graphics() == GraphicsGeneration::Ampere {
-        let memory = nixe_memory::device_memory::DeviceMemory::new(
+        let hle = process.uses_nvn_hle();
+        // Physical NVN2 pools use their backing's 39-bit virtual address.
+        // Separate reservations for virtual pools and driver allocations.
+        let memory = nixe_memory::device_memory::DeviceMemory::with_reservation_start(
             process.memory().space().machine().clone(),
             40,
+            if hle { 1 << 39 } else { 0 },
         );
         let native_memory = memory.clone();
         let cache_configuration = nixe_gpu_vulkan::cache::CacheConfiguration {
@@ -412,11 +417,9 @@ fn run_machine(
         };
         let cache_load_stop = Arc::clone(&frontend_stop_requested);
         let ampere_cache_directory = cache_configuration.directory.clone();
-        horizon_environment.ampere_graphics = Some(nixe_horizon::AmpereGraphics::new(
-            memory,
-            presenter,
-            config.gpu.mme_jit,
-            move || {
+        let nvn_report_clock = hle.then(|| runtime.scheduler().clock().clone());
+        let ampere =
+            nixe_horizon::AmpereGraphics::new(memory, presenter, config.gpu.mme_jit, move || {
                 let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
                     native_memory,
                     device,
@@ -425,8 +428,18 @@ fn run_machine(
                     nixe_gpu_vulkan::BufferDownloadPolicy::OnRead,
                 )
                 .map_err(|e| nixe_gpu::BackendRuntimeError::Backend(e.to_string().into()))?;
+                if let Some(events) = nvn_events {
+                    renderer.use_nvn_events(events);
+                }
+                if let Some(clock) = nvn_report_clock {
+                    renderer.use_nvn2_report_clock(move || clock.elapsed_ns());
+                }
                 if let Some(directory) = &ampere_cache_directory {
-                    renderer.load_ampere_disk_resources(directory, &cache_load_stop);
+                    if hle {
+                        renderer.load_nvn_disk_resources(directory, &cache_load_stop);
+                    } else {
+                        renderer.load_ampere_disk_resources(directory, &cache_load_stop);
+                    }
                 }
                 if let Some(client) = native_presentation {
                     renderer.attach_presentation(client, vsync).map_err(|e| {
@@ -436,8 +449,8 @@ fn run_machine(
                 let _ =
                     diagnostics_sender.send((renderer.cache_monitor(), renderer.frame_metrics()));
                 Ok(renderer)
-            },
-        ));
+            });
+        horizon_environment.ampere_graphics = Some(ampere);
         log::info!("Ampere command engines, native shaders and Vulkan presentation enabled");
         None
     } else {
@@ -477,6 +490,9 @@ fn run_machine(
                 nixe_gpu_vulkan::BufferDownloadPolicy::OnRead,
             )
             .map_err(|error| nixe_gpu::BackendRuntimeError::Backend(error.to_string().into()))?;
+            if let Some(events) = nvn_events {
+                renderer.use_nvn_events(events);
+            }
             if hle {
                 renderer.load_nvn_disk_resources(&nvn_directory, &nvn_stop);
             }
@@ -998,6 +1014,12 @@ fn execute(
     .with_vibration_outputs(host_input.vibration.clone())
     .with_motion_settings(host_input.motion_settings.clone());
     if let Some(graphics) = horizon_environment.ampere_graphics {
+        let process = runtime.process(process_id).expect("registered process");
+        if let Some(session) = process.nvn_session() {
+            graphics
+                .attach_nvn(&process, session)
+                .map_err(String::from)?;
+        }
         dispatcher = dispatcher.with_ampere_graphics(graphics);
     }
     if let Some(host) = &host_input.keyboard {

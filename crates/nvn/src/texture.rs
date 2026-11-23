@@ -1,7 +1,7 @@
 use super::*;
 pub fn register_texture(c: &Call) -> Result<u64> {
     let t = texels::view(c, c.args[2], c.args[3])?;
-    let id = c.session.textures.lock().unwrap().intern(t);
+    let id = c.session.descriptors.textures.lock().unwrap().intern(t);
     c.write(pool::slot(c, c.args[0], c.args[1] as u32)?, &id)?;
     Ok(0)
 }
