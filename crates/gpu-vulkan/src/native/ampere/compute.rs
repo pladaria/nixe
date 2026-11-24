@@ -150,6 +150,7 @@ impl NativeExecution<'_> {
                     memory,
                     residency: &mut self.residency,
                 };
+                let shader_job = self.compiler.compiling_shaders(1);
                 let mut recorded = RecordingEnvironment::new(&mut reader);
                 let translated =
                     compiler.translate(&mut recorded, &configuration.host, &configuration.settings);
@@ -160,11 +161,12 @@ impl NativeExecution<'_> {
                 observations
                     .cbuf_words
                     .retain(|word, _| !program.flow_constants.contains_key(word));
+                let shader = crate::cache::compile_guest(compiler, &[id], &configuration, None)
+                    .map_err(compilation)?;
+                drop(shader_job);
                 let pipeline = std::rc::Rc::new(Pipeline::build(
                     self.compiler,
-                    compiler,
-                    &configuration,
-                    id,
+                    shader.clone(),
                     observations,
                     None,
                 )?);
@@ -175,6 +177,12 @@ impl NativeExecution<'_> {
                             stages: Box::new([snapshot]),
                             serializable: true,
                         }),
+                        [
+                            configuration.settings.resolution_info.up_scale,
+                            configuration.settings.resolution_info.down_shift,
+                        ],
+                        shader,
+                        true,
                     );
                 }
                 cache
@@ -278,14 +286,10 @@ impl NativeExecution<'_> {
 impl Pipeline {
     pub(super) fn build(
         compiler: &crate::cache::PipelineCompiler,
-        pools: &mut compiler::Compiler,
-        configuration: &nixe_gpu::shader_compilation::Configuration,
-        program: compiler::ProgramId,
+        shader: Arc<crate::cache::ShaderArtifact>,
         observations: Observations,
         worker: Option<usize>,
     ) -> Result<Self, VulkanError> {
-        let shader = crate::cache::compile_guest(pools, &[program], configuration, None)
-            .map_err(compilation)?;
         let recipe = PipelineRecipe::Compute(Arc::clone(&shader));
         let native = match worker {
             Some(worker) => compiler.build_immediate(recipe, worker),

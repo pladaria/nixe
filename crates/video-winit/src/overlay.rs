@@ -34,6 +34,7 @@ pub(super) struct Overlay {
     keyboard: KeyboardOverlay,
     keyboard_host: Option<KeyboardHost>,
     volume: Option<VolumeNotice>,
+    pub(super) compilation: nixe_gpu_vulkan::cache::CompilationCounts,
 }
 
 impl Overlay {
@@ -69,6 +70,7 @@ impl Overlay {
             keyboard: KeyboardOverlay::default(),
             keyboard_host: None,
             volume: None,
+            compilation: Default::default(),
         }
     }
 
@@ -116,7 +118,10 @@ impl Overlay {
         window: &Window,
         viewport: Viewport,
     ) -> Option<nixe_gpu_vulkan::presentation::UiFrame> {
-        if !self.keyboard_active() && self.volume.is_none() {
+        if !self.keyboard_active()
+            && self.volume.is_none()
+            && self.compilation == Default::default()
+        {
             return None;
         }
         self.input.egui_input_mut().focused = window.has_focus();
@@ -138,6 +143,35 @@ impl Overlay {
             let ctx = root.ctx();
             if let Some(host) = &self.keyboard_host {
                 self.keyboard.show(host, ctx);
+            }
+            if self.compilation != Default::default() {
+                let px = ctx.pixels_per_point().recip();
+                let bottom = pos2(viewport.x + viewport.width, viewport.y + viewport.height) * px;
+                let mut lines = Vec::with_capacity(2);
+                for (n, verb, noun) in [
+                    (self.compilation.shaders, "Compiling", "shader"),
+                    (self.compilation.pipelines, "Building", "pipeline"),
+                ] {
+                    if n != 0 {
+                        lines.push(format!(
+                            "{verb} {n} {noun}{}",
+                            if n == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip,
+                    egui::Id::new("compilation"),
+                ));
+                let galley = painter.layout_no_wrap(
+                    lines.join("\n"),
+                    FontId::proportional(17. * px),
+                    Color32::WHITE,
+                );
+                let panel =
+                    Rect::from_min_max(bottom - galley.size() - vec2(28., 16.) * px, bottom);
+                painter.rect_filled(panel, 0., Color32::from_rgba_unmultiplied(32, 32, 32, 153));
+                painter.galley(panel.min + vec2(14., 8.) * px, galley, Color32::WHITE);
             }
             if let Some(volume) = &self.volume {
                 volume.show(ctx, viewport);

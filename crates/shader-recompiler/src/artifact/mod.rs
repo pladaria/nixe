@@ -1,5 +1,6 @@
 //! Owned shader ABI. No artifact contains an IR ID, arena reference, or Vulkan object.
 
+use serde::{Deserialize, Serialize};
 mod descriptors;
 mod handle;
 mod info;
@@ -32,7 +33,7 @@ pub struct Bindings {
 
 /// The guest expression and resource category associated with an emitted binding.
 /// Descriptor records retain paired handles, shifts, array sizes and write semantics.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum ResourceSource {
     ConstantBuffer(ConstantBufferDescriptor),
     StorageBuffer(StorageBufferDescriptor),
@@ -44,14 +45,14 @@ pub enum ResourceSource {
     RescalingUniform,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceAccess {
     Read,
     Write,
     ReadWrite,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ResourceBinding {
     pub set: DescriptorSet,
     pub binding: DescriptorBinding,
@@ -61,7 +62,7 @@ pub struct ResourceBinding {
     pub access: ResourceAccess,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct StageInterface {
     pub inputs: VaryingState,
     pub outputs: VaryingState,
@@ -76,7 +77,7 @@ pub struct StageInterface {
     pub clip_distances: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StageProvenance {
     #[default]
     Guest,
@@ -85,7 +86,7 @@ pub enum StageProvenance {
     HostTessellationControl,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExecutionMetadata {
     pub workgroup_size: [u32; 3],
     pub local_memory_size: u32,

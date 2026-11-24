@@ -15,17 +15,17 @@ impl NativeGpuExecution {
     pub fn load_ampere_disk_resources(
         &mut self,
         directory: &std::path::Path,
-        stop: &std::sync::atomic::AtomicBool,
+        stop: &Arc<std::sync::atomic::AtomicBool>,
     ) {
         let mut configuration = self.residency.device().profile().shader_compiler.clone();
         configuration.settings.resolution_info = self.residency.access().resolution();
-        self.state.ampere.load(
-            directory,
-            &self.compiler,
-            self.residency.device().profile(),
-            configuration,
-            stop,
-        );
+        let mut cache = std::mem::take(&mut self.state.ampere);
+        let compiler = self.compiler.clone();
+        let profile = self.residency.device().profile_handle();
+        cache.load(directory, &compiler, &profile, configuration, stop, || {
+            self.service_warmup_ui()
+        });
+        self.state.ampere = cache;
     }
 }
 

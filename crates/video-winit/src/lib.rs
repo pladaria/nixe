@@ -34,6 +34,7 @@ use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 #[derive(Clone, Copy, Debug)]
 enum FrontendEvent {
+    Compilation,
     FrameAvailable,
     StopRequested,
     WorkerFinished,
@@ -127,6 +128,16 @@ impl WindowFrontend {
             pending: Arc::clone(&frame_wakeup_pending),
         }));
         let (touch_screen_writer, touch_screen) = touch_screen_channel();
+        let compilation_pending = Arc::new(AtomicBool::new(false));
+        let wake_pending = compilation_pending.clone();
+        let wake = proxy.clone();
+        let compilation = Arc::new(nixe_gpu_vulkan::cache::CompilationProgress::new(
+            move || {
+                if !wake_pending.swap(true, Ordering::AcqRel) {
+                    let _ = wake.send_event(FrontendEvent::Compilation);
+                }
+            },
+        ));
         let keyboard_proxy = proxy.clone();
         let keyboard_host = nixe_applets::keyboard::KeyboardHost::new(move || {
             let _ = keyboard_proxy.send_event(FrontendEvent::Keyboard);
@@ -134,10 +145,13 @@ impl WindowFrontend {
         Ok(Self {
             event_loop,
             application: PresenterApplication {
+                compilation,
+                compilation_pending,
                 mailbox,
                 stop_requested,
                 worker_completion: Arc::clone(&worker_completion),
                 frame_wakeup_pending,
+                start_handler: None,
                 stop_handler: None,
                 pause_handler: None,
                 pause_key_down: false,
@@ -175,6 +189,10 @@ impl WindowFrontend {
         self
     }
 
+    #[must_use]
+    pub fn compilation_progress(&self) -> Arc<nixe_gpu_vulkan::cache::CompilationProgress> {
+        self.application.compilation.clone()
+    }
     #[must_use]
     pub fn control(&self) -> FrontendControl {
         self.control.clone()
@@ -238,6 +256,13 @@ impl WindowFrontend {
         } else {
             self.application.screenshots = Some(screenshots);
         }
+        self
+    }
+
+    /// Start guest graphics after the event loop can process warmup notifications.
+    #[must_use]
+    pub fn with_start_handler(mut self, start: impl FnOnce() + 'static) -> Self {
+        self.application.start_handler = Some(Box::new(start));
         self
     }
 
@@ -538,11 +563,14 @@ fn window_title(
 }
 
 struct PresenterApplication {
+    compilation: Arc<nixe_gpu_vulkan::cache::CompilationProgress>,
+    compilation_pending: Arc<AtomicBool>,
     smooth_motion: Option<SmoothMotion>,
     mailbox: FrameMailbox,
     stop_requested: Arc<AtomicBool>,
     worker_completion: Arc<WorkerCompletionState>,
     frame_wakeup_pending: Arc<AtomicBool>,
+    start_handler: Option<Box<dyn FnOnce()>>,
     stop_handler: Option<Box<dyn FnOnce()>>,
     pause_handler: Option<PauseHandler>,
     pause_key_down: bool,
@@ -646,6 +674,9 @@ impl PresenterApplication {
 
 impl ApplicationHandler<FrontendEvent> for PresenterApplication {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if let Some(start) = self.start_handler.take() {
+            start();
+        }
         if let StartCause::ResumeTimeReached {
             requested_resume, ..
         } = cause
@@ -683,6 +714,12 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 self.frame_wakeup_pending.store(false, Ordering::Release);
                 if let Some(presenter) = &self.presenter {
                     presenter.window.request_redraw();
+                }
+            }
+            FrontendEvent::Compilation => {
+                self.compilation_pending.store(false, Ordering::Release);
+                if let Some(presenter) = &mut self.presenter {
+                    presenter.compilation_changed(self.compilation.counts());
                 }
             }
             FrontendEvent::Keyboard => {

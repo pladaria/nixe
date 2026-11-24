@@ -83,6 +83,7 @@ pub(super) struct Translation {
     artifact: Arc<crate::cache::ShaderArtifact>,
     stages: StageIds,
     vertex_mask: Option<u32>,
+    dynamic_shapes: Box<[DynamicShape]>,
     pub inputs: Vec<Input>,
     pub dependencies: Dependencies,
 }
@@ -212,16 +213,37 @@ pub(super) struct ShaderKey {
     point_size: u32,
     minus_one_to_one: bool,
 }
+#[derive(Clone, Copy)]
+struct DynamicShape {
+    stage: u32,
+    key: HandleKey,
+    format: u16,
+    kind: u8,
+}
+impl DynamicShape {
+    fn shape(sample: Option<&Sampled>) -> (u16, u8) {
+        sample.map_or((0, 0), |s| (s.texture.format, s.texture.target_kind()))
+    }
+    fn matches(&self, b: &nixe_nvn::Bindings, residency: &mut Residency<'_>) -> bool {
+        let Some(pools) = b.bindless else {
+            return false;
+        };
+        bindless::descriptor_ids(residency, b, self.stage, self.key)
+            .ok()
+            .is_some_and(|ids| Self::shape(pools.resolve(ids).as_ref()) == (self.format, self.kind))
+    }
+}
 impl Compiled {
-    pub fn accepts(
-        &self,
-        b: &nixe_nvn::Bindings,
-        memory: &nixe_memory::device_memory::DeviceMemory,
-    ) -> bool {
-        match &b.captured {
+    pub fn accepts(&self, b: &nixe_nvn::Bindings, residency: &mut Residency<'_>) -> bool {
+        let code_matches = match &b.captured {
             Some(source) => Arc::ptr_eq(source, &self.usage) || self.usage.same_code(source),
-            None => self.usage.current(memory),
-        }
+            None => self.usage.current(residency.device_memory()),
+        };
+        code_matches
+            && self
+                .dynamic_shapes
+                .iter()
+                .all(|shape| shape.matches(b, residency))
     }
 }
 impl Program {
@@ -457,9 +479,7 @@ pub(super) fn compile(
         minus_one_to_one: runtime.ndc_minus_one_to_one,
     };
     let compiled = match native.state.nvn.shaders.get(&key) {
-        Some(cached) if cached.accepts(&draw.bindings, native.residency.device_memory()) => {
-            cached.clone()
-        }
+        Some(cached) if cached.accepts(&draw.bindings, &mut native.residency) => cached.clone(),
         _ => {
             let compiled = Rc::new(translate(
                 native,
@@ -581,23 +601,28 @@ fn translate(
         .nvn
         .archive
         .as_ref()
-        .filter(|_| sources.iter().all(|source| source.shader.isa == 0))
         .map(|_| disk::source_key(&sources, graphics, resolution));
-    if let Some((translation, shapes)) = key
-        .as_ref()
-        .and_then(|key| native.state.nvn.archive.as_ref()?.lookup(key, bindings))
-    {
+    if let Some((translation, shapes)) = key.as_ref().and_then(|key| {
+        native
+            .state
+            .nvn
+            .archive
+            .as_ref()?
+            .lookup(key, bindings, &mut native.residency)
+    }) {
         return Ok(Compiled {
             translation,
             usage: usage(sources, shapes),
         });
     }
+    let _job = native.compiler.compiling_shaders(sources.len());
     if native.state.nvn.compiler.is_none() {
         native.state.nvn.compiler = Some(ir::Compiler::new().map_err(error)?);
     }
     let compiler = native.state.nvn.compiler.as_mut().unwrap();
     compiler.reset().map_err(error)?;
     let mut consumed = Vec::new();
+    let mut dynamic_shapes = Vec::new();
     let textures = &bindings.sampled.entries;
     let mut programs = smallvec::SmallVec::<[(Stage, ir::ProgramId); 2]>::new();
     let mut constants = [Range::default(); 6];
@@ -676,6 +701,15 @@ fn translate(
                     ))
                 })?,
         ));
+        dynamic_shapes.extend(env.dynamic_textures.iter().map(|(key, sample)| {
+            let (format, kind) = DynamicShape::shape(sample.as_ref());
+            DynamicShape {
+                stage: env.stage,
+                key: *key,
+                format,
+                kind,
+            }
+        }));
     }
     // NVN orders its public stage indices differently from shader linkage.
     programs.sort_unstable_by_key(|&(stage, _)| stage);
@@ -888,6 +922,7 @@ fn translate(
         .collect();
     let inputs: Vec<_> = inputs.into_iter().map(|i| i.1).collect();
     let translation = Rc::new(Translation {
+        dynamic_shapes: dynamic_shapes.into(),
         vertex_mask: shader.vertex_input_mask(),
         stages: native.state.nvn.physical.intern(&shader),
         artifact: shader,

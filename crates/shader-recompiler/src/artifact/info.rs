@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{
     ir::{Attribute, Type},
     types::*,
@@ -11,7 +13,7 @@ pub const MAX_INDIRECT_CBUFS: usize = 14;
 pub const MAX_CBUFS: usize = 32;
 pub const MAX_SSBOS: usize = 32;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConstantBufferDescriptor {
     pub index: CbufIndex,
     pub count: u32,
@@ -23,14 +25,14 @@ impl super::descriptors::DescriptorCount for ConstantBufferDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PointerTableSpan {
     /// Byte interval accessed relative to each pointer loaded from the table.
     pub start: i32,
     pub end: i32,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StorageBufferDescriptor {
     pub cbuf_index: CbufIndex,
     pub cbuf_offset: ByteOffset,
@@ -46,7 +48,7 @@ impl super::descriptors::DescriptorCount for StorageBufferDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TextureBufferDescriptor {
     pub component_type: crate::types::TextureComponentType,
     pub has_secondary: bool,
@@ -67,7 +69,7 @@ impl super::descriptors::DescriptorCount for TextureBufferDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ImageBufferDescriptor {
     pub format: ImageFormat,
     pub is_written: bool,
@@ -86,7 +88,7 @@ impl super::descriptors::DescriptorCount for ImageBufferDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TextureDescriptor {
     pub texture_type: TextureType,
     pub is_depth: bool,
@@ -110,7 +112,7 @@ impl super::descriptors::DescriptorCount for TextureDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ImageDescriptor {
     pub texture_type: TextureType,
     pub format: ImageFormat,
@@ -130,7 +132,7 @@ impl super::descriptors::DescriptorCount for ImageDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShaderInfo {
     pub uses_workgroup_id: bool,
     pub uses_local_invocation_id: bool,

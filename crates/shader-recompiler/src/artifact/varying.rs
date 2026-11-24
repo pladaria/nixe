@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 use crate::ir::Attribute;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct VaryingState {
     pub mask: [u64; 8],
 }

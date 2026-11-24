@@ -101,10 +101,14 @@ impl MaxwellVulkanRasterizer {
     pub fn load_disk_resources(
         &mut self,
         directory: &std::path::Path,
-        stop: &std::sync::atomic::AtomicBool,
+        stop: &Arc<std::sync::atomic::AtomicBool>,
     ) {
         self.pipelines
-            .load_disk_resources(directory, &self.profile, stop);
+            .load_disk_resources(directory, &self.profile, stop, || {
+                if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
+                    renderer.service_warmup_ui();
+                }
+            });
     }
     fn conversion_image(
         &mut self,

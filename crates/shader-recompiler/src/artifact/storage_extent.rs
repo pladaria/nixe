@@ -1,7 +1,10 @@
 //! A proven upper bound of stores relative to a constant-buffer pointer.
 //! https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/shader_recompiler/storage_write_extent.h
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+use serde::{Deserialize, Serialize};
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 pub struct StorageWriteExtent {
     pub bounded: bool,
     pub guarded: bool,

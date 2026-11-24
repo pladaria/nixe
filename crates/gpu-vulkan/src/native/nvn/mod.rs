@@ -528,7 +528,7 @@ impl NativeExecution<'_> {
             .filter(|(key, _)| Arc::ptr_eq(key, d.pipeline))
             .map(|(_, p)| p)
             .or_else(|| self.state.nvn.pipelines.get(d.pipeline))
-            .filter(|p| p.accepts(&d.bindings, self.residency.device_memory()));
+            .filter(|p| p.accepts(&d.bindings, &mut self.residency));
         let pipeline = if let Some(p) = selected {
             p.clone()
         } else {
@@ -815,7 +815,7 @@ impl NativeExecution<'_> {
             .nvn
             .compute
             .get(&key)
-            .filter(|p| p.accepts(b, self.residency.device_memory()))
+            .filter(|p| p.accepts(b, &mut self.residency))
         {
             p.clone()
         } else {

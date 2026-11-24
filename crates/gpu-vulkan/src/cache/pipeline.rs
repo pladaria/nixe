@@ -104,6 +104,7 @@ struct Compiler {
     max_vertex_divisor: u32,
 }
 pub struct PipelineCompiler {
+    progress: Option<Arc<super::CompilationProgress>>,
     pool: Arc<CompilePool>,
     serialization: Arc<CompilePool>,
     compiler: Arc<Compiler>,
@@ -183,6 +184,7 @@ impl PipelineCompiler {
             dynamic.push(vk::DynamicState::ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT);
         }
         Ok(Self {
+            progress: config.progress.clone(),
             objects: Arc::clone(&device.objects),
             pool,
             graphics: nixe_gpu::cache_counters::CacheCounters::new(0, 0),
@@ -223,6 +225,29 @@ impl PipelineCompiler {
     pub(crate) fn normalize_graphics(&self, state: GraphicsState) -> GraphicsState {
         self.compiler.normalize(state)
     }
+    pub(crate) fn compiling_shaders(
+        &self,
+        count: usize,
+    ) -> Option<super::progress::CompilationJob> {
+        self.progress.as_ref().map(|p| p.shaders(count))
+    }
+    pub(crate) fn queued_guest_pipeline(&self) -> Option<super::progress::CompilationJob> {
+        self.progress.as_ref().map(|p| p.pipeline())
+    }
+    fn building_pipeline(
+        &self,
+        recipe: &PipelineRecipe,
+        guest_layout: bool,
+    ) -> Option<super::progress::CompilationJob> {
+        let shader = match recipe {
+            PipelineRecipe::Graphics { shader, .. } | PipelineRecipe::Compute(shader) => shader,
+        };
+        if guest_layout || shader.stages.iter().any(|s| s.guest.is_some()) {
+            self.progress.as_ref().map(|p| p.pipeline())
+        } else {
+            None
+        }
+    }
     pub fn request(&self, recipe: PipelineRecipe) -> Result<NativePipeline, CompileError> {
         self.request_with_layout(recipe, false)
     }
@@ -231,11 +256,14 @@ impl PipelineCompiler {
         recipe: PipelineRecipe,
         guest_layout: bool,
     ) -> Result<NativePipeline, CompileError> {
+        let job = self.building_pipeline(&recipe, guest_layout);
         let pipeline = self.prepare(recipe, guest_layout)?;
         let compiler = Arc::clone(&self.compiler);
         let building = pipeline.clone();
-        self.pool
-            .submit(move |worker| Self::finish(&compiler, &building, worker))?;
+        self.pool.submit(move |worker| {
+            let _job = job;
+            Self::finish(&compiler, &building, worker)
+        })?;
         Ok(pipeline)
     }
     pub(crate) fn build_immediate(

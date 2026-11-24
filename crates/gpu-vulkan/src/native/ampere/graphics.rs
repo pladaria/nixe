@@ -457,6 +457,7 @@ impl NativeExecution<'_> {
                         self.residency.device().profile().shader_compiler.clone();
                     configuration.settings.resolution_info = resolution;
                     let mut ids = Vec::with_capacity(programs.len());
+                    let shader_job = self.compiler.compiling_shaders(programs.len());
                     let mut observations = Vec::with_capacity(programs.len());
                     let mut snapshots = Vec::new();
                     for (program, base, group) in &programs {
@@ -499,12 +500,18 @@ impl NativeExecution<'_> {
                             dependencies,
                         ));
                     }
-                    let pipeline = Rc::new(Pipeline::build(
-                        self.compiler,
+                    let shader = crate::cache::compile_guest(
                         pools,
-                        &configuration,
-                        &key,
                         &ids,
+                        &configuration,
+                        Some(&key.runtime()),
+                    )
+                    .map_err(compilation)?;
+                    drop(shader_job);
+                    let pipeline = std::rc::Rc::new(Pipeline::build(
+                        self.compiler,
+                        &key,
+                        shader.clone(),
                         observations,
                         None,
                     )?);
@@ -515,6 +522,12 @@ impl NativeExecution<'_> {
                                 stages: snapshots.into_boxed_slice(),
                                 serializable: true,
                             }),
+                            [
+                                configuration.settings.resolution_info.up_scale,
+                                configuration.settings.resolution_info.down_shift,
+                            ],
+                            shader,
+                            true,
                         );
                     }
                     #[cfg(feature = "performance-counters")]
@@ -1001,16 +1014,11 @@ impl Key {
 impl Pipeline {
     fn build(
         compiler: &crate::cache::PipelineCompiler,
-        pools: &mut compiler::Compiler,
-        configuration: &nixe_gpu::shader_compilation::Configuration,
         key: &Key,
-        programs: &[compiler::ProgramId],
+        shader: Arc<crate::cache::ShaderArtifact>,
         observations: Vec<(u8, Observations)>,
         worker: Option<usize>,
     ) -> Result<Self, VulkanError> {
-        let shader =
-            crate::cache::compile_guest(pools, programs, configuration, Some(&key.runtime()))
-                .map_err(compilation)?;
         let vertex_attributes = shader
             .vertex_input_mask()
             .ok_or_else(|| compilation("native pipeline has no vertex shader"))?;

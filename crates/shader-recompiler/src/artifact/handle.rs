@@ -1,7 +1,8 @@
 //! Draw-time handle programs over constant and storage buffer words.
 //! https://github.com/zortos293/Lichii/blob/21d62e43caa178aeb04e74585b3aad622b278b84/src/shader_recompiler/shader_info.h#L424
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+use serde::{Deserialize, Serialize};
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum HandleOp {
     Immediate(u32),
     Cbuf(u32, u32),
@@ -48,9 +49,16 @@ pub trait HandleMemory {
     fn storage(&mut self, binding: u32, offset: u32) -> Result<u32, Self::Error>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(try_from = "Vec<HandleOp>")]
 pub struct HandleProgram {
     code: Vec<HandleOp>,
+}
+impl TryFrom<Vec<HandleOp>> for HandleProgram {
+    type Error = &'static str;
+    fn try_from(code: Vec<HandleOp>) -> Result<Self, Self::Error> {
+        Self::new(code).ok_or("invalid shader descriptor handle program")
+    }
 }
 impl HandleProgram {
     pub(crate) fn new(mut code: Vec<HandleOp>) -> Option<Self> {

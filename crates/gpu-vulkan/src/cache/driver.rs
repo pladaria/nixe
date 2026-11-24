@@ -22,7 +22,7 @@ impl DriverCache {
     ) -> Result<Self, VulkanError> {
         let started = Instant::now();
         let path = directory.map(|dir| dir.join("vulkan_pipelines.bin"));
-        let initial = path
+        let mut initial = path
             .as_ref()
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|bytes| {
@@ -38,19 +38,25 @@ impl DriverCache {
                 if valid {
                     Some(bytes)
                 } else {
-                    if let Some(path) = &path {
-                        let _ = std::fs::remove_file(path);
-                    }
-                    log::info!("discarded incompatible Vulkan driver pipeline cache");
+                    log::info!("ignored incompatible Vulkan driver pipeline cache");
                     None
                 }
             });
-        let handle = unsafe {
+        let create = |data: &[u8]| unsafe {
             device.owner.device.create_pipeline_cache(
-                &vk::PipelineCacheCreateInfo::default()
-                    .initial_data(initial.as_deref().map_or(&[], |data| &data[12..])),
+                &vk::PipelineCacheCreateInfo::default().initial_data(data),
                 None,
             )
+        };
+        let handle = match initial.as_deref() {
+            Some(bytes) => create(&bytes[12..]).or_else(|error| {
+                log::warn!(
+                    "Vulkan driver cache rejected ({error:?}); starting with an empty cache"
+                );
+                initial = None;
+                create(&[])
+            }),
+            None => create(&[]),
         }
         .map_err(|error| VulkanError::vk("vkCreatePipelineCache", error))?;
         if let Some(data) = &initial {
@@ -84,14 +90,17 @@ impl DriverCache {
                 .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
         }
         let write = || -> std::io::Result<()> {
-            let mut file = BufWriter::new(std::fs::File::create(path)?);
+            let mut tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+            let mut file = BufWriter::new(tmp.as_file_mut());
             file.write_all(MAGIC)?;
             file.write_all(&super::PERSISTENCE_VERSION.to_le_bytes())?;
             file.write_all(&bytes)?;
-            file.flush()
+            file.flush()?;
+            drop(file);
+            tmp.persist(path)?;
+            Ok(())
         };
         if let Err(error) = write() {
-            let _ = std::fs::remove_file(path);
             return Err(VulkanError::Compilation(error.to_string().into()));
         }
         Ok(bytes.len())

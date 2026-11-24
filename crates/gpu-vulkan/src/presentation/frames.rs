@@ -64,6 +64,19 @@ pub(crate) struct Frames {
     releases: mpsc::Receiver<PresentationRelease>,
 }
 impl Frames {
+    pub(crate) fn queue_ui_pipeline(
+        &mut self,
+        compiler: &PipelineCompiler,
+        format: vk::Format,
+    ) -> Result<(), VulkanError> {
+        self.renderer.pipeline(
+            compiler,
+            frame_view_format(format),
+            super::filters::Program::Ui,
+        )?;
+        Ok(())
+    }
+
     pub fn new(device: &VulkanDevice) -> Result<Self, VulkanError> {
         let (sender, releases) = mpsc::channel();
         log::info!("anti-aliasing: {}", device.anti_aliasing.name());
@@ -154,11 +167,7 @@ impl Frames {
             }
         }
         let image = cache.allocate_host_image(extent, format)?;
-        let view_format = match format {
-            vk::Format::R8G8B8A8_SRGB => vk::Format::R8G8B8A8_UNORM,
-            vk::Format::B8G8R8A8_SRGB => vk::Format::B8G8R8A8_UNORM,
-            f => f,
-        };
+        let view_format = frame_view_format(format);
         let view = image.view_2d(view_format)?;
         let framebuffer = crate::render_pass::Framebuffer::color(
             &view,
@@ -712,5 +721,13 @@ impl Frames {
             work: frame.work,
             sequence,
         })
+    }
+}
+
+fn frame_view_format(format: vk::Format) -> vk::Format {
+    match format {
+        vk::Format::R8G8B8A8_SRGB => vk::Format::R8G8B8A8_UNORM,
+        vk::Format::B8G8R8A8_SRGB => vk::Format::B8G8R8A8_UNORM,
+        _ => format,
     }
 }

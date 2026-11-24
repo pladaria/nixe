@@ -112,14 +112,16 @@ impl Cache {
         compiler: &Arc<crate::cache::PipelineCompiler>,
         profile: &DeviceProfile,
         configuration: Configuration,
-        stop: &AtomicBool,
+        stop: &Arc<AtomicBool>,
+        service: impl FnMut(),
     ) {
+        let mut ui = crate::cache::archive::WarmupUi::new(service);
         let start = Instant::now();
         log::info!(
             "loading Ampere shader and pipeline cache: {}",
             directory.display()
         );
-        let mut archive = match EnvironmentArchive::open(directory, Arc::clone(compiler)) {
+        let mut archive = match EnvironmentArchive::open(directory, Arc::clone(compiler), profile) {
             Ok(archive) => archive,
             Err(error) => {
                 log::warn!("Ampere shader environment cache load: {error}");
@@ -133,8 +135,9 @@ impl Cache {
         let configuration = Arc::new(configuration);
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut total = 0;
-        archive.load(stop, |mut record| {
-            let Some(key) = DiskKey::decode(&record.key, profile, scale) else {
+        archive.load(stop, scale, |record| {
+            ui.poll();
+            let Some(key) = DiskKey::decode(record.key(), profile, scale) else {
                 return;
             };
             if let DiskKey::Graphics(key) = &key
@@ -146,11 +149,17 @@ impl Cache {
             let compiler_job = Arc::clone(compiler);
             let configuration = Arc::clone(&configuration);
             let sender = sender.clone();
+            let stop = Arc::clone(stop);
+            let pipeline_job = compiler.queued_guest_pipeline();
             if let Err(error) = compiler.queue(move |worker| {
+                let _pipeline_job = pipeline_job;
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut pools = compiler::Compiler::new().map_err(compilation)?;
-                    let mut observations = Vec::with_capacity(record.inputs.stages.len());
-                    for snapshot in &mut record.inputs.stages {
+                    let mut inputs = record.inputs().map_err(compilation)?;
+                    let mut observations = Vec::with_capacity(inputs.stages.len());
+                    for snapshot in &mut inputs.stages {
                         if snapshot.metadata().isa != ShaderIsa::Ampere {
                             return Err(compilation("non-native environment in native cache"));
                         }
@@ -169,33 +178,37 @@ impl Cache {
                             dependency,
                         ));
                     }
-                    let ids = record
-                        .inputs
-                        .translate(&mut pools, &configuration)
+                    let runtime = match &key {
+                        DiskKey::Graphics(k) => Some(k.runtime()),
+                        DiskKey::Compute(_) => None,
+                    };
+                    let shader = record
+                        .shader(
+                            &compiler_job,
+                            &configuration,
+                            runtime.as_ref(),
+                            Some(inputs),
+                        )
                         .map_err(compilation)?;
                     match key {
                         DiskKey::Graphics(key) => {
                             let pipeline = Pipeline::build(
                                 &compiler_job,
-                                &mut pools,
-                                &configuration,
                                 &key,
-                                &ids,
+                                shader,
                                 observations,
                                 Some(worker),
                             )?;
                             Ok(Loaded::Graphics(key, Box::new(pipeline)))
                         }
                         DiskKey::Compute(hash)
-                            if ids.len() == 1
+                            if shader.stages.len() == 1
                                 && observations.len() == 1
                                 && observations[0].0 == 5 =>
                         {
                             let pipeline = super::super::compute::Pipeline::build(
                                 &compiler_job,
-                                &mut pools,
-                                &configuration,
-                                ids[0],
+                                shader,
                                 observations.remove(0).1,
                                 Some(worker),
                             )?;
@@ -220,7 +233,7 @@ impl Cache {
         );
         drop(sender);
         let mut loaded = 0;
-        for result in receiver {
+        while let Some(result) = ui.receive(&receiver) {
             match result {
                 Ok(Loaded::Graphics(key, pipeline)) => {
                     self.pipelines
@@ -241,6 +254,10 @@ impl Cache {
             }
         }
         archive.checkpoint();
+        log::info!(
+            "restored linked SPIR-V for {} of {total} cached pipeline recipes",
+            archive.restored()
+        );
         self.archive = Some(archive);
         log::info!(
             "loaded {loaded}/{total} Ampere pipeline environments before guest execution in {:?}",

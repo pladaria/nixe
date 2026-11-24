@@ -1,6 +1,17 @@
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[repr(transparent)]
+#[serde(try_from = "u16")]
 pub struct Attribute(u16);
+impl TryFrom<u16> for Attribute {
+    type Error = &'static str;
+    fn try_from(index: u16) -> Result<Self, Self::Error> {
+        Self::from_index(index).ok_or("invalid shader attribute")
+    }
+}
 
 #[allow(non_upper_case_globals)]
 impl Attribute {

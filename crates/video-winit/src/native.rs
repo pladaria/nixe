@@ -134,6 +134,22 @@ impl Presenter {
             .open_keyboard(request, host);
         self.redraw_pending = true;
     }
+    pub(super) fn compilation_changed(
+        &mut self,
+        counts: nixe_gpu_vulkan::cache::CompilationCounts,
+    ) {
+        if counts == Default::default() && self.common.overlay.is_none() {
+            return;
+        }
+        let overlay = self
+            .common
+            .overlay
+            .get_or_insert_with(|| overlay::Overlay::new(&self.common.window));
+        if overlay.compilation != counts {
+            overlay.compilation = counts;
+            self.redraw_pending = true;
+        }
+    }
     pub(super) fn show_volume(&mut self, volume: u8) {
         self.common
             .overlay

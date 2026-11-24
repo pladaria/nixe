@@ -202,6 +202,13 @@ impl NativeGpuExecution {
             .history
             .clone()
     }
+    fn service_warmup_ui(&mut self) {
+        if self.state.host.is_some()
+            && let Err(e) = self.execution().service_host()
+        {
+            log::debug!("presentation during pipeline warmup: {e}");
+        }
+    }
     pub fn cache_monitor(&self) -> CacheMonitor {
         CacheMonitor::new([
             ("shader cache", self.shader_cache().cache_counters()),
@@ -243,11 +250,12 @@ impl NativeExecution<'_> {
         client: crate::presentation::PresentationClient,
         vsync: bool,
     ) -> Result<(), VulkanError> {
-        self.state.host = Some(crate::presentation::Host::new(
-            self.residency.device(),
-            client,
-            vsync,
-        )?);
+        let host = crate::presentation::Host::new(self.residency.device(), client, vsync)?;
+        // The UI must be ready ahead of the guest pipeline warmup queue.
+        self.state
+            .frames
+            .queue_ui_pipeline(self.compiler, host.output_format())?;
+        self.state.host = Some(host);
         Ok(())
     }
     fn prepare_nv12_pipeline(&mut self, format: vk::Format) -> Result<(), VulkanError> {

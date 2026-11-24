@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// Reference type flags: unions are used by resource-width metadata and signatures.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Type(pub u32);
 

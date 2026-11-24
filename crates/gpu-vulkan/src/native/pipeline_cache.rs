@@ -121,13 +121,16 @@ impl PipelineCache {
         &mut self,
         directory: &std::path::Path,
         profile: &Arc<DeviceProfile>,
-        stop: &AtomicBool,
+        stop: &Arc<AtomicBool>,
+        service: impl FnMut(),
     ) {
+        let mut ui = crate::cache::archive::WarmupUi::new(service);
         let started = Instant::now();
         log::info!("loading shader and pipeline cache: {}", directory.display());
         let mut archive = match crate::cache::archive::EnvironmentArchive::open(
             directory,
             Arc::clone(&self.compiler),
+            profile,
         ) {
             Ok(archive) => archive,
             Err(error) => {
@@ -137,10 +140,11 @@ impl PipelineCache {
         };
         let mut total = 0;
         let (sender, receiver) = std::sync::mpsc::channel();
-        archive.load(stop, |environment| {
-            let graphics = FixedPipelineState::from_environment_key(&environment.key)
+        archive.load(stop, self.scale_key(), |environment| {
+            ui.poll();
+            let graphics = FixedPipelineState::from_environment_key(environment.key())
                 .filter(|key| key.matches_profile(profile));
-            let compute = ComputeKey::from_environment_key(&environment.key);
+            let compute = ComputeKey::from_environment_key(environment.key());
             if graphics.is_none() && compute.is_none() {
                 return;
             }
@@ -149,36 +153,29 @@ impl PipelineCache {
             let profile = Arc::clone(profile);
             let configuration = Arc::clone(&self.configuration);
             let sender = sender.clone();
+            let stop = Arc::clone(stop);
+            let pipeline_job = compiler.queued_guest_pipeline();
             if let Err(error) = self.compiler.queue(move |worker| {
+                let _pipeline_job = pipeline_job;
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                     || -> Result<DiskPipeline, VulkanError> {
-                        let mut pools =
-                            nixe_shader_recompiler::Compiler::new().map_err(compilation)?;
-                        let programs = environment
-                            .inputs
-                            .translate(&mut pools, &configuration)
+                        let runtime = graphics
+                            .as_ref()
+                            .map(|k| k.runtime())
+                            .transpose()
+                            .map_err(compilation)?;
+                        let shader = environment
+                            .shader(&compiler, &configuration, runtime.as_ref(), None)
                             .map_err(compilation)?;
                         if let Some(key) = graphics {
-                            Self::build_graphics(
-                                &compiler,
-                                &mut pools,
-                                &profile,
-                                &configuration,
-                                key,
-                                &programs,
-                                Some(worker),
-                            )
-                            .map(DiskPipeline::Graphics)
+                            Self::build_graphics(&compiler, &profile, key, shader, Some(worker))
+                                .map(DiskPipeline::Graphics)
                         } else {
-                            Self::build_compute(
-                                &compiler,
-                                &mut pools,
-                                &configuration,
-                                compute.unwrap(),
-                                &programs,
-                                Some(worker),
-                            )
-                            .map(DiskPipeline::Compute)
+                            Self::build_compute(&compiler, compute.unwrap(), shader, Some(worker))
+                                .map(DiskPipeline::Compute)
                         }
                     },
                 ))
@@ -194,7 +191,7 @@ impl PipelineCache {
         );
         drop(sender);
         let mut loaded = 0;
-        for result in receiver {
+        while let Some(result) = ui.receive(&receiver) {
             match result {
                 Ok(DiskPipeline::Graphics(pipeline)) => {
                     if !self
@@ -219,15 +216,26 @@ impl PipelineCache {
             }
         }
         archive.checkpoint();
+        log::info!(
+            "restored linked SPIR-V for {} of {total} cached pipeline recipes",
+            archive.restored()
+        );
         self.archive = Some(archive);
         log::info!(
             "loaded {loaded}/{total} native pipeline environments before guest execution in {:?}",
             started.elapsed()
         );
     }
-    fn serialize(&mut self, key: Vec<u8>, inputs: Arc<GuestShaderCode>) {
+    fn serialize(
+        &mut self,
+        key: Vec<u8>,
+        inputs: Arc<GuestShaderCode>,
+        shader: Arc<ShaderArtifact>,
+        new_environment: bool,
+    ) {
+        let scale = self.scale_key();
         if let Some(archive) = &mut self.archive {
-            archive.serialize(key, inputs);
+            archive.serialize(key, inputs, scale, shader, new_environment);
         }
     }
     #[allow(clippy::type_complexity)]
@@ -338,7 +346,7 @@ impl PipelineCache {
                 self.graphics
                     .contains_key(&([scale.up_scale, scale.down_shift], id))
             });
-            let requests = shaders
+            let requests: Vec<_> = shaders
                 .infos
                 .iter()
                 .enumerate()
@@ -359,23 +367,23 @@ impl PipelineCache {
                     })
                 })
                 .collect::<Result<_, _>>()?;
+            let shader_job = self.compiler.compiling_shaders(requests.len());
             let (inputs, programs) = self.capture_inputs(space, access, statistics, requests)?;
-            let pipeline = Self::build_graphics(
-                &self.compiler,
+            let shader = crate::cache::compile_guest(
                 self.main_compiler.as_mut().unwrap(),
-                profile,
-                &self.configuration,
-                id,
                 &programs,
-                None,
-            )?;
+                &self.configuration,
+                Some(&id.runtime().map_err(compilation)?),
+            )
+            .map_err(compilation)?;
+            drop(shader_job);
+            let pipeline = Self::build_graphics(&self.compiler, profile, id, shader.clone(), None)?;
+
             let index = self.graphics_pipelines.len();
             self.graphics_pipelines.push(pipeline);
             self.graphics.insert((self.scale_key(), id), index);
             statistics.prepared_graphics += 1;
-            if new_environment {
-                self.serialize(id.environment_key(), inputs);
-            }
+            self.serialize(id.environment_key(), inputs, shader, new_environment);
             index
         };
         self.select_graphics(index);
@@ -383,17 +391,11 @@ impl PipelineCache {
     }
     fn build_graphics(
         compiler: &PipelineCompiler,
-        pools: &mut nixe_shader_recompiler::Compiler,
         profile: &DeviceProfile,
-        configuration: &nixe_gpu::shader_compilation::Configuration,
         key: FixedPipelineState,
-        programs: &[nixe_shader_recompiler::ProgramId],
+        shader: Arc<ShaderArtifact>,
         worker: Option<usize>,
     ) -> Result<GraphicsPipeline, VulkanError> {
-        let runtime = key.runtime().map_err(compilation)?;
-        nixe_gpu::trace::event("shader_compile", 0, 0, 0);
-        let shader = crate::cache::compile_guest(pools, programs, configuration, Some(&runtime))
-            .map_err(compilation)?;
         let shader = Self::graphics_shader(&key, profile, shader)?;
         let vertex_attributes = shader.vertex_input_mask().unwrap_or(0);
         let state = key.graphics(profile, vertex_attributes)?;
@@ -483,41 +485,37 @@ impl PipelineCache {
                 self.compute
                     .contains_key(&([scale.up_scale, scale.down_shift], key))
             });
+            let shader_job = self.compiler.compiling_shaders(1);
             let (inputs, programs) = self.capture_inputs(
                 space,
                 access,
                 statistics,
                 vec![(None, launch.capture_request(), shader.size_bytes)],
             )?;
-            let pipeline = Self::build_compute(
-                &self.compiler,
+            let shader = crate::cache::compile_guest(
                 self.main_compiler.as_mut().unwrap(),
-                &self.configuration,
-                key,
                 &programs,
+                &self.configuration,
                 None,
-            )?;
+            )
+            .map_err(compilation)?;
+            drop(shader_job);
+            let pipeline = Self::build_compute(&self.compiler, key, shader.clone(), None)?;
+
             let slot = self.compute_pipelines.len();
             self.compute_pipelines.push(pipeline);
             self.compute.insert((self.scale_key(), key), slot);
-            if new_environment {
-                self.serialize(key.environment_key(), inputs);
-            }
+            self.serialize(key.environment_key(), inputs, shader, new_environment);
             slot
         };
         Ok(slot)
     }
     fn build_compute(
         compiler: &PipelineCompiler,
-        pools: &mut nixe_shader_recompiler::Compiler,
-        configuration: &nixe_gpu::shader_compilation::Configuration,
         key: ComputeKey,
-        programs: &[nixe_shader_recompiler::ProgramId],
+        shader: Arc<ShaderArtifact>,
         worker: Option<usize>,
     ) -> Result<ComputePipeline, VulkanError> {
-        nixe_gpu::trace::event("shader_compile", 0, 0, 0);
-        let shader = crate::cache::compile_guest(pools, programs, configuration, None)
-            .map_err(compilation)?;
         let recipe = PipelineRecipe::Compute(Arc::clone(&shader));
         let pipeline = match worker {
             Some(worker) => compiler.build_immediate(recipe, worker),

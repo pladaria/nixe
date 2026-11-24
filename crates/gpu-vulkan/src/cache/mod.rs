@@ -6,7 +6,10 @@ impl From<crate::VulkanError> for CompileError {
     }
 }
 mod monitor;
+mod progress;
 pub use monitor::CacheMonitor;
+pub use progress::{CompilationCounts, CompilationProgress};
+mod linked;
 mod shader;
 pub(crate) use shader::GuestStageMetadata;
 pub use shader::{CompiledStage, ShaderArtifact};
@@ -36,10 +39,19 @@ pub(crate) use update_queue::{DescriptorUpdate, UpdateDescriptorQueue};
 const PERSISTENCE_VERSION: u32 = 7;
 pub(crate) mod archive;
 pub(crate) use shader::compile_guest;
+/// Each recipe keys its own render scale, including changes made during gameplay.
+pub(crate) fn disk_compiler_profile(
+    profile: &crate::DeviceProfile,
+) -> nixe_gpu::shader_compilation::Configuration {
+    let mut configuration = profile.shader_compiler.clone();
+    configuration.settings.resolution_info = Default::default();
+    configuration
+}
 #[derive(Clone, Debug)]
 pub struct CacheConfiguration {
     pub workers: usize,
-    /// The title's sixteen-digit ID directory, shared by both Vulkan cache files.
+    pub progress: Option<std::sync::Arc<CompilationProgress>>,
+    /// Per-title root for shader artifacts, pipeline recipes and the driver cache.
     pub directory: Option<std::path::PathBuf>,
 }
 impl Default for CacheConfiguration {
@@ -47,6 +59,7 @@ impl Default for CacheConfiguration {
         Self {
             workers: std::thread::available_parallelism().map_or(1, |n| n.get().max(2) - 1),
             directory: None,
+            progress: None,
         }
     }
 }

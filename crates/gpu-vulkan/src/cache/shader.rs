@@ -1,5 +1,4 @@
-//! Pipeline-owned SPIR-V and reflection. A guest pipeline miss translates once;
-//! no program artifact, stage reuse, or persistent SPIR-V cache is consulted.
+//! Linked SPIR-V with the reflection required to construct a physical pipeline.
 use super::*;
 use nixe_gpu::{ShaderStage, shader_module as spirv};
 use std::sync::Arc;
@@ -30,7 +29,7 @@ impl CompiledStage {
         }
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GuestStageMetadata {
     pub info: nixe_shader_recompiler::artifact::ShaderInfo,
     pub bindings: Box<[nixe_shader_recompiler::artifact::ResourceBinding]>,
@@ -101,6 +100,7 @@ pub(crate) fn compile_guest(
     configuration: &nixe_gpu::shader_compilation::Configuration,
     runtime: Option<&nixe_shader_recompiler::passes::GraphicsRuntimeState>,
 ) -> Result<Arc<ShaderArtifact>, CompileError> {
+    nixe_gpu::trace::event("shader_compile", 0, 0, 0);
     let prepared = if let Some(runtime) = runtime {
         compiler.prepare_graphics(programs, runtime, &configuration.profile)
     } else if programs.len() == 1 {

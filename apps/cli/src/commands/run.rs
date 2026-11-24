@@ -392,34 +392,38 @@ fn run_machine(
         device.profile().name
     );
     let vsync = config.video.vsync;
-    // Ampere initializes its renderer on the first guest GPU request. Publish
-    // only diagnostic handles at startup; sampling never calls the GPU owner.
+    let mme_jit = config.gpu.mme_jit;
+    let ampere = machine_profile.graphics() == GraphicsGeneration::Ampere;
+    let progress = frontend.as_ref().map(WindowFrontend::compilation_progress);
+    let cache_directory = config
+        .gpu
+        .cache_directory
+        .join(title_identifier.to_ascii_lowercase());
     let (diagnostics_sender, gpu_diagnostics) = mpsc::channel();
     let nvn_events = process.nvn_session().map(|session| session.event_signals());
-    let video_system = if machine_profile.graphics() == GraphicsGeneration::Ampere {
-        let hle = process.uses_nvn_hle();
-        // Physical NVN2 pools use their backing's 39-bit virtual address.
-        // Separate reservations for virtual pools and driver allocations.
-        let memory = nixe_memory::device_memory::DeviceMemory::with_reservation_start(
-            process.memory().space().machine().clone(),
-            40,
-            if hle { 1 << 39 } else { 0 },
-        );
-        let native_memory = memory.clone();
-        let cache_configuration = nixe_gpu_vulkan::cache::CacheConfiguration {
-            directory: Some(
-                config
-                    .gpu
-                    .cache_directory
-                    .join(title_identifier.to_ascii_lowercase()),
-            ),
-            ..Default::default()
-        };
-        let cache_load_stop = Arc::clone(&frontend_stop_requested);
-        let ampere_cache_directory = cache_configuration.directory.clone();
-        let nvn_report_clock = hle.then(|| runtime.scheduler().clock().clone());
-        let ampere =
-            nixe_horizon::AmpereGraphics::new(memory, presenter, config.gpu.mme_jit, move || {
+    let report_clock = runtime.scheduler().clock().clone();
+    let initialize_video = move |video_process: &RunnableProcess| -> Result<_, String> {
+        // Ampere initializes its renderer on the first guest GPU request. Publish
+        // only diagnostic handles at startup; sampling never calls the GPU owner.
+        let video_system = if ampere {
+            let hle = video_process.uses_nvn_hle();
+            // Physical NVN2 pools use their backing's 39-bit virtual address.
+            // Separate reservations for virtual pools and driver allocations.
+            let memory = nixe_memory::device_memory::DeviceMemory::with_reservation_start(
+                video_process.memory().space().machine().clone(),
+                40,
+                if hle { 1 << 39 } else { 0 },
+            );
+            let native_memory = memory.clone();
+            let cache_configuration = nixe_gpu_vulkan::cache::CacheConfiguration {
+                progress,
+                directory: Some(cache_directory.clone()),
+                ..Default::default()
+            };
+            let cache_load_stop = Arc::clone(&frontend_stop_requested);
+            let ampere_cache_directory = cache_configuration.directory.clone();
+            let nvn_report_clock = hle.then_some(report_clock);
+            let ampere = nixe_horizon::AmpereGraphics::new(memory, presenter, mme_jit, move || {
                 let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
                     native_memory,
                     device,
@@ -434,6 +438,11 @@ fn run_machine(
                 if let Some(clock) = nvn_report_clock {
                     renderer.use_nvn2_report_clock(move || clock.elapsed_ns());
                 }
+                if let Some(client) = native_presentation {
+                    renderer.attach_presentation(client, vsync).map_err(|e| {
+                        nixe_gpu::BackendRuntimeError::Backend(e.to_string().into())
+                    })?;
+                }
                 if let Some(directory) = &ampere_cache_directory {
                     if hle {
                         renderer.load_nvn_disk_resources(directory, &cache_load_stop);
@@ -441,84 +450,85 @@ fn run_machine(
                         renderer.load_ampere_disk_resources(directory, &cache_load_stop);
                     }
                 }
-                if let Some(client) = native_presentation {
-                    renderer.attach_presentation(client, vsync).map_err(|e| {
-                        nixe_gpu::BackendRuntimeError::Backend(e.to_string().into())
-                    })?;
-                }
                 let _ =
                     diagnostics_sender.send((renderer.cache_monitor(), renderer.frame_metrics()));
                 Ok(renderer)
             });
-        horizon_environment.ampere_graphics = Some(ampere);
-        log::info!("Ampere command engines, native shaders and Vulkan presentation enabled");
-        None
-    } else {
-        let device_memory =
-            nixe_memory::DeviceHeapMemory::new(nixe_memory::device_memory::DeviceMemory::new(
-                process.memory().space().machine().clone(),
-                34,
-            ));
-        let cache_directory = config
-            .gpu
-            .cache_directory
-            .join(title_identifier.to_ascii_lowercase());
-        let cache_configuration = nixe_gpu_vulkan::cache::CacheConfiguration {
-            directory: Some(cache_directory.clone()),
-            ..Default::default()
-        };
-        let cache_load_stop = Arc::clone(&frontend_stop_requested);
-        let hle = process.uses_nvn_hle();
-        let nvn_directory = cache_directory.clone();
-        let nvn_stop = Arc::clone(&cache_load_stop);
-        let maxwell = move |renderer: std::rc::Rc<
-            std::cell::RefCell<Option<nixe_gpu_vulkan::NativeGpuExecution>>,
-        >| {
-            let mut frontend = nixe_gpu_vulkan::MaxwellVulkanRasterizer::new(renderer);
-            if !hle {
-                frontend.load_disk_resources(&cache_directory, &cache_load_stop);
-            }
-            frontend
-        };
-        let native_memory = device_memory.device().clone();
-        let initialize = move || {
-            let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
-                native_memory,
-                device,
-                cache_configuration,
-                u64::MAX, // Residency derives headroom from the device heap budget.
-                nixe_gpu_vulkan::BufferDownloadPolicy::OnRead,
+            horizon_environment.ampere_graphics = Some(ampere);
+            log::info!("Ampere command engines, native shaders and Vulkan presentation enabled");
+            None
+        } else {
+            let device_memory =
+                nixe_memory::DeviceHeapMemory::new(nixe_memory::device_memory::DeviceMemory::new(
+                    video_process.memory().space().machine().clone(),
+                    34,
+                ));
+            let cache_configuration = nixe_gpu_vulkan::cache::CacheConfiguration {
+                progress,
+                directory: Some(cache_directory.clone()),
+                ..Default::default()
+            };
+            let cache_load_stop = Arc::clone(&frontend_stop_requested);
+            let hle = video_process.uses_nvn_hle();
+            let nvn_directory = cache_directory.clone();
+            let nvn_stop = Arc::clone(&cache_load_stop);
+            let maxwell = move |renderer: std::rc::Rc<
+                std::cell::RefCell<Option<nixe_gpu_vulkan::NativeGpuExecution>>,
+            >| {
+                if hle {
+                    renderer
+                        .borrow_mut()
+                        .as_mut()
+                        .expect("installed renderer")
+                        .load_nvn_disk_resources(&nvn_directory, &nvn_stop);
+                }
+                let mut frontend = nixe_gpu_vulkan::MaxwellVulkanRasterizer::new(renderer);
+                if !hle {
+                    frontend.load_disk_resources(&cache_directory, &cache_load_stop);
+                }
+                frontend
+            };
+            let native_memory = device_memory.device().clone();
+            let initialize = move || {
+                let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
+                    native_memory,
+                    device,
+                    cache_configuration,
+                    u64::MAX, // Residency derives headroom from the device heap budget.
+                    nixe_gpu_vulkan::BufferDownloadPolicy::OnRead,
+                )
+                .map_err(|error| {
+                    nixe_gpu::BackendRuntimeError::Backend(error.to_string().into())
+                })?;
+                if let Some(events) = nvn_events {
+                    renderer.use_nvn_events(events);
+                }
+                if let Some(client) = native_presentation {
+                    renderer
+                        .attach_presentation(client, vsync)
+                        .map_err(|error| {
+                            nixe_gpu::BackendRuntimeError::Backend(error.to_string().into())
+                        })?;
+                }
+                let _ =
+                    diagnostics_sender.send((renderer.cache_monitor(), renderer.frame_metrics()));
+                Ok((renderer, ()))
+            };
+            let (video, ()) = VideoSystem::with_gpu_frontend(
+                device_memory,
+                &kernel,
+                presenter,
+                mme_jit,
+                initialize,
+                maxwell,
             )
-            .map_err(|error| nixe_gpu::BackendRuntimeError::Backend(error.to_string().into()))?;
-            if let Some(events) = nvn_events {
-                renderer.use_nvn_events(events);
+            .map_err(|error| error.to_string())?;
+            if let Some(session) = video_process.nvn_session() {
+                video.attach_nvn(session).map_err(String::from)?;
             }
-            if hle {
-                renderer.load_nvn_disk_resources(&nvn_directory, &nvn_stop);
-            }
-            if let Some(client) = native_presentation {
-                renderer
-                    .attach_presentation(client, vsync)
-                    .map_err(|error| {
-                        nixe_gpu::BackendRuntimeError::Backend(error.to_string().into())
-                    })?;
-            }
-            let _ = diagnostics_sender.send((renderer.cache_monitor(), renderer.frame_metrics()));
-            Ok((renderer, ()))
+            Some(video)
         };
-        let (video, ()) = VideoSystem::with_gpu_frontend(
-            device_memory,
-            &kernel,
-            presenter,
-            config.gpu.mme_jit,
-            initialize,
-            maxwell,
-        )
-        .map_err(|error| error.to_string())?;
-        if let Some(session) = process.nvn_session() {
-            video.attach_nvn(session).map_err(String::from)?;
-        }
-        Some(video)
+        Ok((video_system, horizon_environment))
     };
     log::info!(
         "MME execution: {}",
@@ -556,23 +566,23 @@ fn run_machine(
             .expect("profiled input owns motion configuration"),
     };
     let audio_backend = audio.backend();
-
-    let Some(frontend) = frontend else {
-        return finish_execution(
-            supervise_process(
-                runtime,
-                process,
-                horizon_environment,
-                video_system,
-                host_input,
-                audio_backend,
-                gpu_diagnostics,
-            ),
-            &title_name,
-            &title_identifier,
-        );
-    };
     let volume_backend = Arc::clone(&audio_backend);
+
+    let run_guest = move || {
+        let (video_system, horizon_environment) = initialize_video(&process)?;
+        Ok::<_, String>(supervise_process(
+            runtime,
+            process,
+            horizon_environment,
+            video_system,
+            host_input,
+            audio_backend,
+            gpu_diagnostics,
+        ))
+    };
+    let Some(frontend) = frontend else {
+        return finish_execution(run_guest()?, &title_name, &title_identifier);
+    };
     let mut volume = config.audio.volume;
     let frontend = frontend
         .with_game_title(title_name.clone())
@@ -588,24 +598,23 @@ fn run_machine(
 
     let worker_control =
         frontend_control.expect("window frontend construction provides its control channel");
+    let (startup, ready) = mpsc::channel();
     let worker = thread::Builder::new()
         .name("nixe-guest".to_owned())
         .spawn(move || {
             let _completion = WorkerCompletion(worker_control);
-            supervise_process(
-                runtime,
-                process,
-                horizon_environment,
-                video_system,
-                host_input,
-                audio_backend,
-                gpu_diagnostics,
-            )
+            ready
+                .recv()
+                .map_err(|_| String::from("window stopped before guest startup"))?;
+            run_guest()
         })
         .map_err(|error| format!("cannot start guest execution worker: {error}"))?;
 
     let frontend_stop_events = external_events.clone();
     let frontend_result = frontend
+        .with_start_handler(move || {
+            let _ = startup.send(());
+        })
         .run(move || {
             let _ = frontend_stop_events.submit(nixe_runtime::ExternalEvent::HostStop);
         })
@@ -622,7 +631,8 @@ fn run_machine(
     let worker_result = worker
         .join()
         .map_err(|_| "guest execution worker panicked".to_owned())?;
-    let execution_result = finish_execution(worker_result, &title_name, &title_identifier);
+    let execution_result =
+        worker_result.and_then(|result| finish_execution(result, &title_name, &title_identifier));
     frontend_result.map(|_| ()).and(execution_result)
 }
 

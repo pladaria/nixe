@@ -1,9 +1,22 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{CompileError, Result, diagnostics::FailureCategory};
 
 /// The reference uses fixed semantic limits for cbufs and SSBOs, but growable
 /// small vectors for image/texture descriptors. Only the former use this type.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(try_from = "Vec<T>", bound(deserialize = "T: Deserialize<'de>"))]
 pub struct BoundedDescriptors<T, const N: usize>(Vec<T>);
+
+impl<T, const N: usize> TryFrom<Vec<T>> for BoundedDescriptors<T, N> {
+    type Error = &'static str;
+    fn try_from(items: Vec<T>) -> std::result::Result<Self, Self::Error> {
+        if items.len() > N {
+            return Err("shader descriptor count exceeds its bound");
+        }
+        Ok(Self(items))
+    }
+}
 
 impl<T, const N: usize> Default for BoundedDescriptors<T, N> {
     fn default() -> Self {

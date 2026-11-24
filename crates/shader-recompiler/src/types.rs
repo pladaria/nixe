@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 /// Guest virtual byte address; never an instruction index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -9,27 +11,37 @@ pub struct GuestAddress(pub u64);
 pub struct ProgramOffset(pub u32);
 
 /// Byte offset within a constant buffer or other memory object.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[repr(transparent)]
 pub struct ByteOffset(pub u32);
 
 /// Guest constant-buffer bank.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[repr(transparent)]
 pub struct CbufIndex(pub u32);
 
 /// Index into a typed resource descriptor collection.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[repr(transparent)]
 pub struct ResourceIndex(pub u32);
 
 /// Emitted host descriptor set.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[repr(transparent)]
 pub struct DescriptorSet(pub u32);
 
 /// Emitted host binding, distinct from a guest resource index.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[repr(transparent)]
 pub struct DescriptorBinding(pub u32);
 
@@ -72,7 +84,7 @@ impl TryFrom<u32> for Stage {
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u32)]
 pub enum OutputTopology {
     PointList = 1,
@@ -293,7 +305,9 @@ impl TryFrom<u32> for ReplaceConstant {
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[repr(u32)]
 pub enum TextureType {
     #[default]
@@ -439,7 +453,9 @@ pub enum TexturePixelFormat {
 }
 
 /// Numeric component type of a native texture or texel-buffer descriptor.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 pub enum TextureComponentType {
     #[default]
     Float,
@@ -590,7 +606,9 @@ impl TryFrom<u32> for TexturePixelFormat {
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[repr(u32)]
 pub enum ImageFormat {
     #[default]
@@ -625,7 +643,9 @@ impl TryFrom<u32> for ImageFormat {
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[repr(u32)]
 pub enum Interpolation {
     #[default]

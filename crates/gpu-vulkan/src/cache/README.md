@@ -26,14 +26,12 @@ resource metadata and executable. Construction workers build one complete Vulkan
 pipeline; native recording waits for that executable at its ordered bind. Published
 results use a lock-free read, and shader errors retain the stage and guest PC.
 
-The tables perform hit detection before translation or construction. There are no
-additional SPIR-V, stage, native-code, layout or pipeline-library lookup caches, and
-no pipeline LRU or compilation admission budget. Host utility pipelines belong to
-their presentation, conversion or readback owners.
+The tables perform hit detection before translation or construction. Host utility
+pipelines belong to their presentation, conversion or readback owners.
 
 All construction workers use one internally synchronized `VkPipelineCache` for the
 title. They do not submit work to a Vulkan queue. A single serialization worker
-writes both persistent files and drains before the final driver-cache checkpoint.
+writes persistent records and drains before the final driver-cache checkpoint.
 
 ## Layouts and descriptors
 
@@ -86,18 +84,24 @@ Each title uses its sixteen-digit lowercase ID beneath `gpu.cache_directory`:
 
 - `vulkan.bin` stores the pipeline keys and recorded guest environments, including
   the code and constant/descriptor observations required for translation.
+- `spirv/` holds content-addressed SDK modules with reflection and per-configuration
+  links for each recorded pipeline and render scale. Loading shares restored stages
+  across pipeline workers.
+- `nvn/` holds linked NVN and NVN2 modules, binding reflection and pipeline recipes.
+  Program variants include the shader ISA and texture specialization inputs.
 - `vulkan_pipelines.bin` stores the opaque Vulkan driver cache. Its version-one
   Vulkan header, vendor/device IDs and pipeline-cache UUID must match the device.
 
-Both files have an explicit renderer cache version. Environment records also carry
-the shader recompiler ABI version. Incompatible or truncated derived data is
-recreated. The format is Nixe-owned; it is not interchangeable with Eden's files.
+The environment stream and Vulkan driver blob have explicit renderer versions.
+Linked modules and recipes also key the shader recompiler ABI. The renderer
+checks content hashes before restoring linked modules. It rebuilds a damaged
+module from the guest environment and preserves complete environment records
+before an interrupted append.
 
 Startup streams records directly into reconstruction work and supports cancellation.
-It reconstructs every compatible saved pipeline in parallel, using fresh
-compiler arenas per job, and waits for completion before guest execution. It does
-not restore serialized SPIR-V or impose an entry quota. Runtime misses append their
-environments when every instruction belongs to the cached code span, as Eden's
+It restores matching linked stages and reconstructs each compatible pipeline on a worker.
+A missing or damaged stage triggers translation from its saved environment.
+Runtime misses append their environments when every instruction belongs to the cached code span, as Eden's
 `CanBeSerialized` rule requires. Disk jobs consume owned environments without
 cloning instruction or constant-buffer maps. Driver checkpoints use Eden's threshold of 128 new pipelines and an
 interval of at least 30 seconds, increasing with the previous driver-cache size.
@@ -115,3 +119,6 @@ from the selected reference path fails precisely.
 
 Info logs include the driver-cache byte count and load duration, environment
 read/queue duration, and completed pipeline count with total startup duration.
+The presentation overlay reports guest stages being translated and pending guest
+pipeline builds separately. Loading existing SPIR-V only counts towards a
+pipeline build. Each job retires its counter on completion, cancellation or error.
