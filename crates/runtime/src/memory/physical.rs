@@ -2,6 +2,7 @@
 //! Allocation waits release the host worker while retaining the guest operation.
 //! https://git.eden-emu.dev/eden-emu/eden/src/commit/d85005b2b27ebdbe785316886cdf04c2894d550e/src/core/hle/kernel/k_page_table_base.cpp
 use super::*;
+use nixe_memory::ArenaOffset;
 use std::{
     future::{Future, poll_fn},
     ops::Range,
@@ -72,10 +73,8 @@ impl PhysicalMemoryLock {
     }
     pub(super) async fn allocate(
         &self,
-        account: &MemoryAccount,
-        bytes: u64,
+        mut allocation: AllocationFuture,
     ) -> Result<Allocation, MappingError> {
-        let mut allocation = account.allocate_async(bytes);
         poll_fn(|context| {
             self.check_open()?;
             match Pin::new(&mut allocation).poll(context) {
@@ -165,6 +164,36 @@ impl ProcessMemory {
         }
         Ok(holes)
     }
+
+    fn adjacent_heap_offsets(
+        &self,
+        regions: &BTreeMap<u64, Region>,
+        hole: &Range<u64>,
+    ) -> [Option<ArenaOffset>; 2] {
+        let is_writable_heap = |region: &Region| {
+            region.mapping.kind == MemoryKind::Heap
+                && region.mapping.permissions == MemoryPermissions::READ_WRITE
+        };
+        let before = regions
+            .range(..hole.start)
+            .next_back()
+            .filter(|(_, region)| region.end == hole.start && is_writable_heap(region))
+            .and_then(|_| {
+                self.space
+                    .physical_page_hint(GuestVirtualAddress::new(hole.start - PAGE_SIZE))
+            })
+            .and_then(|page| page.checked_add(PAGE_SIZE));
+        let after = regions
+            .get(&hole.end)
+            .filter(|region| is_writable_heap(region))
+            .and_then(|_| {
+                self.space
+                    .physical_page_hint(GuestVirtualAddress::new(hole.end))
+            })
+            .and_then(|page| page.get().checked_sub(hole.end - hole.start))
+            .map(ArenaOffset::new);
+        [before, after]
+    }
     /// Fill only free pages; already mapped intervals keep their bytes, state,
     /// physical identity and permissions, as KPageTableBase::MapPhysicalMemory.
     pub async fn map_physical(
@@ -199,17 +228,27 @@ impl ProcessMemory {
         let physical = self.lock_physical().await?;
         let required = (kind == MemoryKind::Remote).then_some(kind);
         loop {
-            let needed: u64 = {
+            let (needed, request) = {
                 let regions = self.regions.lock().unwrap();
-                Self::physical_holes(&regions, start.get(), end, required)?
-                    .iter()
-                    .map(|range| range.end - range.start)
-                    .sum()
+                let holes = Self::physical_holes(&regions, start.get(), end, required)?;
+                let needed: u64 = holes.iter().map(|range| range.end - range.start).sum();
+                if needed == 0 {
+                    return Ok(());
+                }
+                let request = if let [hole] = holes.as_slice()
+                    && kind == MemoryKind::Heap
+                {
+                    account.allocate_mapped_async(
+                        GuestVirtualAddress::new(hole.start),
+                        needed,
+                        self.adjacent_heap_offsets(&regions, hole),
+                    )
+                } else {
+                    account.allocate_async(needed)
+                };
+                (needed, request)
             };
-            if needed == 0 {
-                return Ok(());
-            }
-            let allocation = physical.allocate(account, needed).await?;
+            let allocation = physical.allocate(request).await?;
             let mut regions = self.regions.lock().unwrap();
             physical.check_open()?;
             let holes = Self::physical_holes(&regions, start.get(), end, required)?;

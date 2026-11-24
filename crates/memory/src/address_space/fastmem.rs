@@ -168,10 +168,11 @@ impl Residency {
             if next > end {
                 break;
             }
-            // A resident interval may span only one host mapping. Nonresident
-            // intervals can be combined when their physical RAM is contiguous.
+            // Completed aliases have the same mmap flags and dump policy. The
+            // kernel merges adjacent runs of the same backing and protection.
+            // Keep the newer age when two resident runs become one alias.
             if left.end == next
-                && left.resident_age == right.resident_age
+                && left.resident_age.is_some() == right.resident_age.is_some()
                 && left.permissions == right.permissions
                 && left.physical + next - base == right.physical
             {
@@ -181,6 +182,7 @@ impl Residency {
                     base,
                     Segment {
                         end: right.end,
+                        resident_age: left.resident_age.max(right.resident_age),
                         ..left
                     },
                 );
@@ -307,10 +309,9 @@ impl FastmemMappings {
                 permissions,
             },
         );
+        state.coalesce(start.get(), end);
         if let Some(reserved) = reserved {
             reserved.finish(before, state.vma_cost);
-        } else {
-            state.coalesce(start.get(), end);
         }
         Ok(())
     }
@@ -381,6 +382,7 @@ impl FastmemMappings {
                 ..segment
             },
         );
+        state.coalesce(start, segment.end);
         reserved.finish(before, state.vma_cost);
         #[cfg(feature = "performance-counters")]
         {
@@ -485,6 +487,40 @@ mod tests {
         assert_eq!(state.vma_cost, 2);
         state.remove(2 * PAGE_SIZE);
         assert_eq!(state.vma_cost, 0);
+    }
+
+    #[test]
+    fn adjacent_host_aliases_merge_and_split_at_protection_boundaries() {
+        let machine = Machine::new(3 * PAGE_SIZE).unwrap();
+        let account = machine.account(3 * PAGE_SIZE).unwrap();
+        let space = AddressSpace::new(machine, AddressWidth::Bits32).unwrap();
+        let at = GuestVirtualAddress::new(0x4000);
+        for index in 0..3 {
+            space
+                .map(
+                    at.checked_add(index * PAGE_SIZE).unwrap(),
+                    account.allocate(PAGE_SIZE).unwrap(),
+                    0,
+                    PAGE_SIZE,
+                    MemoryPermissions::READ_WRITE,
+                )
+                .unwrap();
+        }
+        assert_eq!(space.fastmem.lock().vma_cost, 2);
+        assert_eq!(space.fastmem.lock().ages.len(), 1);
+
+        let middle = at.checked_add(PAGE_SIZE).unwrap();
+        space
+            .protect(middle, PAGE_SIZE, MemoryPermissions::READ)
+            .unwrap();
+        assert_eq!(space.fastmem.lock().vma_cost, 4);
+        space
+            .protect(middle, PAGE_SIZE, MemoryPermissions::READ_WRITE)
+            .unwrap();
+        assert_eq!(space.fastmem.lock().vma_cost, 2);
+        space.unmap(middle, PAGE_SIZE).unwrap();
+        assert_eq!(space.fastmem.lock().vma_cost, 4);
+        assert!(space.physical_page_hint(middle).is_none());
     }
 
     #[test]

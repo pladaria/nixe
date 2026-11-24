@@ -11,9 +11,6 @@
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
 #include <algorithm>
-#include <mutex>
-#include <shared_mutex>
-#include <unordered_map>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -44,45 +41,12 @@ namespace Dynarmic::Backend::X64 {
 
 using namespace Xbyak::util;
 
-// JITs on one arena share faulted sites, as on ARM64 in Lichii.
-// https://github.com/zortos293/Lichii/pull/1861
-class FastmemFaults {
-public:
-    static std::shared_ptr<FastmemFaults> ForArena(uintptr_t arena) {
-        static std::mutex registry_mutex;
-        static std::unordered_map<uintptr_t, std::weak_ptr<FastmemFaults>> registry;
-        std::scoped_lock lock{registry_mutex};
-        std::erase_if(registry, [](const auto& entry) { return entry.second.expired(); });
-        auto& slot = registry[arena];
-        auto faults = slot.lock();
-        if (!faults) {
-            faults = std::make_shared<FastmemFaults>();
-            slot = faults;
-        }
-        return faults;
-    }
-
-    FastmemFaultSites Sites(IR::LocationDescriptor block) const {
-        std::shared_lock lock{mutex};
-        const auto found = records.find(block);
-        return found == records.end() ? FastmemFaultSites{} : found->second;
-    }
-
-    void Remember(IR::LocationDescriptor block, unsigned instruction) {
-        std::unique_lock lock{mutex};
-        auto& sites = records[block];
-        if (std::find(sites.begin(), sites.end(), instruction) == sites.end()) {
-            sites.push_back(instruction);
-        }
-    }
-
-private:
-    mutable std::shared_mutex mutex;
-    tsl::robin_map<IR::LocationDescriptor, FastmemFaultSites, CodeCacheHash> records;
-};
-
 void A64EmitX64::RememberFastmemFault(const DoNotFastmemMarker& marker) {
-    fastmem_faults->Remember(std::get<0>(marker), std::get<1>(marker));
+    auto& sites = fastmem_faults[std::get<0>(marker)];
+    const auto instruction = std::get<1>(marker);
+    if (std::find(sites.begin(), sites.end(), instruction) == sites.end()) {
+        sites.push_back(instruction);
+    }
 }
 
 A64EmitContext::A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits, boost::container::stable_vector<DeferredEmit>& cold_emits)
@@ -163,8 +127,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
             conf.spill_to_free_gpr,
             conf.scratch_copy_to_free_reg)
         , conf(conf)
-        , jit_interface{jit_interface}
-        , fastmem_faults{conf.fastmem_pointer ? FastmemFaults::ForArena(*conf.fastmem_pointer) : nullptr} {
+        , jit_interface{jit_interface} {
     code.elide_redundant_zext = conf.elide_redundant_zext;
     code.reuse_host_flags = conf.reuse_host_flags && !conf.enable_cycle_counting;
     if (conf.far_code) {
@@ -200,10 +163,13 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     };
 
     A64EmitContext ctx{conf, reg_alloc, block, labels, deferred_emits, cold_emits};
-    // Use the same snapshot for address folding and code emission. A fault on
-    // another core can update the shared table without blocking this emission.
-    if (fastmem_faults) {
-        ctx.fastmem_fault_sites = fastmem_faults->Sites(block.Location());
+    // Fault resolution and emission are serialized by the owning JIT, so
+    // address folding and code emission can borrow the same list of sites.
+    if (!fastmem_faults.empty()) {
+        const auto found = fastmem_faults.find(block.Location());
+        if (found != fastmem_faults.end()) {
+            ctx.fastmem_fault_sites = {found->second.data(), found->second.size()};
+        }
     }
 
     emitting_block = true;

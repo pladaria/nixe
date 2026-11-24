@@ -9,8 +9,8 @@
 
 #include <algorithm>
 #include <array>
-#include <memory>
 #include <optional>
+#include <span>
 
 #include <boost/container/small_vector.hpp>
 
@@ -25,7 +25,6 @@
 namespace Dynarmic::Backend::X64 {
 
 class RegAlloc;
-class FastmemFaults;
 using FastmemFaultSites = boost::container::small_vector<unsigned, 2>;
 
 struct A64EmitContext final : public EmitContext {
@@ -41,7 +40,7 @@ struct A64EmitContext final : public EmitContext {
     }
 
     const A64::UserConfig& conf;
-    FastmemFaultSites fastmem_fault_sites;
+    std::span<const unsigned> fastmem_fault_sites;
 };
 
 class A64EmitX64 final : public EmitX64 {
@@ -115,7 +114,7 @@ protected:
         bool recompile;
     };
     tsl::robin_map<u64, FastmemPatchInfo> fastmem_patch_info;
-    const std::shared_ptr<FastmemFaults> fastmem_faults;
+    tsl::robin_map<IR::LocationDescriptor, FastmemFaultSites, CodeCacheHash> fastmem_faults;
     bool WasFastmemFaulted(const A64EmitContext& ctx, const DoNotFastmemMarker& marker) const {
         const auto& sites = ctx.fastmem_fault_sites;
         return std::find(sites.begin(), sites.end(), std::get<1>(marker)) != sites.end();

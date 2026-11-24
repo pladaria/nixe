@@ -1,6 +1,8 @@
 //! Machine allocations retain physical extents independently of guest ownership.
 use crate::heap::PageHeap;
-use crate::{AllocationId, ArenaOffset, Extent, MachineId, PAGE_SIZE, PhysicalArena};
+use crate::{
+    AllocationId, ArenaOffset, Extent, GuestVirtualAddress, MachineId, PAGE_SIZE, PhysicalArena,
+};
 mod ownership;
 mod pressure;
 pub use ownership::AllocationObservation;
@@ -151,6 +153,16 @@ struct Ledger {
     limit: u64,
     used: AtomicU64,
     peak: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+enum Placement {
+    Any,
+    Contiguous(u64),
+    Mapped {
+        start: GuestVirtualAddress,
+        adjacent: [Option<ArenaOffset>; 2],
+    },
 }
 struct AllocationRecord {
     machine: Machine,
@@ -364,21 +376,24 @@ impl MemoryAccount {
         self.ledger.limit
     }
     pub fn allocate(&self, bytes: u64) -> Result<Allocation, MemoryError> {
-        self.reserve(bytes, None)
+        self.reserve(bytes, Placement::Any)
     }
     pub fn allocate_contiguous(
         &self,
         bytes: u64,
         alignment: u64,
     ) -> Result<Allocation, MemoryError> {
-        if alignment < PAGE_SIZE || !alignment.is_power_of_two() {
+        self.reserve(bytes, Placement::Contiguous(alignment))
+    }
+
+    fn reserve(&self, bytes: u64, placement: Placement) -> Result<Allocation, MemoryError> {
+        if let Placement::Contiguous(alignment) = placement
+            && (alignment < PAGE_SIZE || !alignment.is_power_of_two())
+        {
             return Err(MemoryError::Invalid(
                 "physical alignment must be a power of two of at least one page",
             ));
         }
-        self.reserve(bytes, Some(alignment))
-    }
-    fn reserve(&self, bytes: u64, alignment: Option<u64>) -> Result<Allocation, MemoryError> {
         if bytes == 0 || !bytes.is_multiple_of(PAGE_SIZE) {
             return Err(MemoryError::Invalid(
                 "physical allocation size must be a nonzero page multiple",
@@ -403,13 +418,15 @@ impl MemoryAccount {
                 .next_allocation
                 .checked_add(1)
                 .ok_or(MemoryError::Invalid("allocation identity exhausted"))?;
-            let extents = if let Some(alignment) = alignment {
-                state
+            let extents = match placement {
+                Placement::Any => state.heap.allocate(bytes),
+                Placement::Contiguous(alignment) => state
                     .heap
                     .allocate_contiguous(bytes, alignment)
-                    .map(|e| vec![e])
-            } else {
-                state.heap.allocate(bytes)
+                    .map(|e| vec![e]),
+                Placement::Mapped { start, adjacent } => {
+                    state.heap.allocate_mapped(bytes, start.get(), adjacent)
+                }
             };
             let Some(extents) = extents else {
                 let free = state.heap.free_bytes();
@@ -417,7 +434,7 @@ impl MemoryAccount {
                     - free
                     - self.machine.0.guest_bytes.load(Ordering::Acquire);
                 let mut can_retire = retained != 0 && free + retained >= bytes;
-                if can_retire && let Some(alignment) = alignment {
+                if can_retire && let Placement::Contiguous(alignment) = placement {
                     // Capacity alone cannot establish contiguous availability.
                     // Reuse the allocator's geometry on cold bitmap metadata;
                     // guest bytes are neither retained nor copied by this query.

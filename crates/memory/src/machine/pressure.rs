@@ -59,23 +59,35 @@ impl AllocationPressure {
 pub struct AllocationFuture {
     account: MemoryAccount,
     bytes: u64,
-    alignment: Option<u64>,
+    placement: Placement,
     registration: Option<u64>,
     notified: Option<u64>,
     finished: bool,
 }
 impl MemoryAccount {
     pub fn allocate_async(&self, bytes: u64) -> AllocationFuture {
-        self.allocation_future(bytes, None)
+        self.allocation_future(bytes, Placement::Any)
     }
     pub fn allocate_contiguous_async(&self, bytes: u64, alignment: u64) -> AllocationFuture {
-        self.allocation_future(bytes, Some(alignment))
+        self.allocation_future(bytes, Placement::Contiguous(alignment))
     }
-    fn allocation_future(&self, bytes: u64, alignment: Option<u64>) -> AllocationFuture {
+
+    /// Place new physical pages near an existing virtual run when possible.
+    /// Placement is a hint and never makes an otherwise satisfiable request wait.
+    pub fn allocate_mapped_async(
+        &self,
+        start: GuestVirtualAddress,
+        bytes: u64,
+        adjacent: [Option<ArenaOffset>; 2],
+    ) -> AllocationFuture {
+        self.allocation_future(bytes, Placement::Mapped { start, adjacent })
+    }
+
+    fn allocation_future(&self, bytes: u64, placement: Placement) -> AllocationFuture {
         AllocationFuture {
             account: self.clone(),
             bytes,
-            alignment,
+            placement,
             registration: None,
             notified: None,
             finished: false,
@@ -120,10 +132,7 @@ impl Future for AllocationFuture {
                 return Poll::Ready(Err(Arc::clone(error)));
             }
             let revision = pressure.revision.load(Ordering::Acquire);
-            let result = match this.alignment {
-                Some(alignment) => this.account.allocate_contiguous(this.bytes, alignment),
-                None => this.account.allocate(this.bytes),
-            };
+            let result = this.account.reserve(this.bytes, this.placement);
             if !matches!(result, Err(MemoryError::RetainedAllocations { .. })) {
                 this.finished = true;
                 if let Some(id) = this.registration.take() {

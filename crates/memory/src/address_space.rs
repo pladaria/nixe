@@ -468,6 +468,16 @@ impl AddressSpace {
     pub fn native_page_table_base(&self) -> *const PageEntry {
         self.table.base.as_ptr().cast()
     }
+    /// Snapshot a physical page offset for placement of nearby allocations.
+    /// The result carries no ownership and cannot be used to access the page.
+    pub fn physical_page_hint(&self, address: GuestVirtualAddress) -> Option<ArenaOffset> {
+        // The table stays allocated for this Space and publishes entries
+        // atomically. A concurrent mapping change can only make the hint stale.
+        let entry = unsafe { self.entry(address.get()) };
+        entry
+            .present()
+            .then(|| ArenaOffset::new(u64::from(entry.physical_page) * PAGE_SIZE))
+    }
     pub fn native_data_base(&self) -> crate::HostAddress {
         self.arena
             .host_address(GuestVirtualAddress::new(0), 0)

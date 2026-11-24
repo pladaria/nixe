@@ -3,6 +3,7 @@
 use crate::{ArenaOffset, PAGE_SIZE};
 
 const SHIFTS: [u32; 7] = [12, 16, 21, 22, 25, 29, 30];
+const MAPPED_CLUSTER_BYTES: u64 = 1 << SHIFTS[1];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Extent {
@@ -199,6 +200,62 @@ impl PageHeap {
         self.free_bytes -= bytes;
         Some(extents)
     }
+    pub(crate) fn allocate_mapped(
+        &mut self,
+        bytes: u64,
+        virtual_start: u64,
+        adjacent: [Option<ArenaOffset>; 2],
+    ) -> Option<Vec<Extent>> {
+        if bytes > self.free_bytes {
+            return None;
+        }
+        for start in adjacent.into_iter().flatten().map(ArenaOffset::get) {
+            if let Some(extent) = self.allocate_at(start, bytes) {
+                return Some(vec![extent]);
+            }
+        }
+
+        // Start small virtual runs at corresponding offsets in separate free
+        // clusters. Interleaved runs can grow in either direction while space
+        // remains free, with no reservation for pages the guest has not mapped.
+        let offset = (virtual_start % MAPPED_CLUSTER_BYTES) & !(PAGE_SIZE - 1);
+        let (required, offset) = if bytes <= MAPPED_CLUSTER_BYTES - offset {
+            (MAPPED_CLUSTER_BYTES, offset)
+        } else {
+            (bytes, 0)
+        };
+        for (class, &shift) in SHIFTS.iter().enumerate().skip(1) {
+            if 1 << shift >= required
+                && let Some(bit) = self.blocks[class].next(0)
+            {
+                let start = ((bit as u64) << shift) + offset;
+                return Some(vec![self.take_contiguous(start, bytes)]);
+            }
+        }
+        self.allocate(bytes)
+    }
+
+    fn free_block_class(&self, address: u64) -> Option<usize> {
+        (0..SHIFTS.len())
+            .rev()
+            .find(|&class| self.blocks[class].contains((address >> SHIFTS[class]) as usize))
+    }
+
+    fn allocate_at(&mut self, start: u64, bytes: u64) -> Option<Extent> {
+        if !start.is_multiple_of(PAGE_SIZE) {
+            return None;
+        }
+        let end = start
+            .checked_add(bytes)
+            .filter(|&end| end <= self.capacity)?;
+        let mut cursor = start;
+        while cursor < end {
+            let size = 1 << SHIFTS[self.free_block_class(cursor)?];
+            cursor = (cursor & !(size - 1)) + size;
+        }
+        Some(self.take_contiguous(start, bytes))
+    }
+
     fn contiguous_start(&self, bytes: u64, alignment: u64) -> Option<u64> {
         let mut heads: [Option<usize>; SHIFTS.len()] =
             std::array::from_fn(|i| self.blocks[i].next(0));
@@ -232,13 +289,14 @@ impl PageHeap {
             return None;
         }
         let start = self.contiguous_start(bytes, alignment)?;
+        Some(self.take_contiguous(start, bytes))
+    }
+
+    fn take_contiguous(&mut self, start: u64, bytes: u64) -> Extent {
         let end = start + bytes;
         let mut cursor = start;
         while cursor < end {
-            let class = (0..SHIFTS.len())
-                .rev()
-                .find(|&class| self.blocks[class].contains((cursor >> SHIFTS[class]) as usize))
-                .unwrap();
+            let class = self.free_block_class(cursor).expect("range is free");
             let bit = (cursor >> SHIFTS[class]) as usize;
             self.blocks[class].clear(bit);
             let block = (bit as u64) << SHIFTS[class];
@@ -248,10 +306,10 @@ impl PageHeap {
             cursor = next;
         }
         self.free_bytes -= bytes;
-        Some(Extent {
+        Extent {
             start: ArenaOffset::new(start),
             bytes,
-        })
+        }
     }
     /// # Safety
     /// These extents must be disjoint live allocations from this heap, with no
@@ -271,6 +329,39 @@ impl PageHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interleaved_mapped_allocations_can_grow_in_either_direction() {
+        let mut heap = PageHeap::new(3 * MAPPED_CLUSTER_BYTES).unwrap();
+        let place = |heap: &mut PageHeap, page, start| {
+            heap.allocate_mapped(PAGE_SIZE, page * PAGE_SIZE, [start, None])
+                .unwrap()[0]
+        };
+        let first = place(&mut heap, 3, None);
+        let other = place(&mut heap, 17, None);
+        let before = place(
+            &mut heap,
+            2,
+            Some(ArenaOffset::new(first.start.get() - PAGE_SIZE)),
+        );
+        let after = place(&mut heap, 4, first.start.checked_add(PAGE_SIZE));
+        assert_eq!(before.start.checked_add(PAGE_SIZE), Some(first.start));
+        assert_eq!(first.start.checked_add(PAGE_SIZE), Some(after.start));
+        assert_eq!(other.start.get() % MAPPED_CLUSTER_BYTES, PAGE_SIZE);
+
+        let free = heap.free_bytes();
+        let fallback = heap
+            .allocate_mapped(2 * PAGE_SIZE, PAGE_SIZE, [Some(before.start), None])
+            .unwrap();
+        assert_ne!(fallback[0].start, before.start);
+        assert_eq!(heap.free_bytes(), free - 2 * PAGE_SIZE);
+        unsafe {
+            heap.release(&[first, other, before, after]);
+            heap.release(&fallback);
+        }
+        assert_eq!(heap.free_bytes(), 3 * MAPPED_CLUSTER_BYTES);
+    }
+
     #[test]
     fn bitmap_summaries_cross_multiple_levels_and_coalesce_groups() {
         let mut bits = Bitmap::new(1 << 20);
