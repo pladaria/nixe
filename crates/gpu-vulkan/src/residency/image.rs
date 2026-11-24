@@ -245,6 +245,7 @@ impl Residency<'_> {
         });
         self.texture_cache.register_image_mappings(id);
         self.register_image_aliases(id)?;
+        self.absorb_array_aliases(id)?;
         self.runtime.statistics.image_allocations += 1;
         self.runtime.statistics.image_layout_plans +=
             self.texture_cache.get(id).contents.geometry.len() as u64;

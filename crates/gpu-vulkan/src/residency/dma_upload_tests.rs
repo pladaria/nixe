@@ -126,6 +126,78 @@ fn explicit_render_targets_publish_each_gpu_version_on_demand() -> Result<(), Vu
 }
 
 #[test]
+fn array_registration_preserves_and_adopts_resident_layers() -> Result<(), VulkanError> {
+    let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4 << 20)?.allocate(8192)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let address = 0x10000;
+    let _mapping = memory.map(
+        address,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 8192)?]),
+        true,
+    )?;
+    let mut cache = VulkanResidency::new(
+        memory.clone(),
+        device,
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let mut r = cache.access();
+    let layout = ImageMemoryLayout::BlockLinearAmpere(BlockLinearLayout {
+        block_width_log2: 0,
+        block_height_log2: 0,
+        block_depth_log2: 0,
+        layer_stride: 4096,
+    });
+    let layers = [address, address + 4096].map(|a| info(a, ImageFormat::R32Uint, 16, 16, layout));
+    for (layer, value) in layers.iter().zip([0x13579bdf, 0x2468ace0]) {
+        let image = r.insert_guest_image(layer, &SPACE)?;
+        r.clear_color_image(
+            image,
+            0,
+            vk::ClearColorValue {
+                uint32: [value, 0, 0, 0],
+            },
+        )?;
+    }
+    let mut array = layers[0].clone();
+    array.size = 8192;
+    array.description = ImageDescription::new(
+        ImageDimension::Two,
+        array.description.extent(),
+        ImageFormat::R32Uint,
+        ImageKind::Color,
+        1,
+        2,
+        SampleCount::One,
+    )
+    .unwrap();
+    let image = r.insert_guest_image(&array, &SPACE)?;
+    assert!(r.texture_cache.get(image).aliases.is_empty());
+    for (index, layer) in layers.iter().enumerate() {
+        assert_eq!(
+            r.find_image(layer, &SPACE)?,
+            Some((image, [0, index as u32]))
+        );
+    }
+    r.download_image_memory(image)?;
+    for (layer, value) in layers.iter().zip([0x13579bdfu32, 0x2468ace0]) {
+        let mut word = [0; 4];
+        memory
+            .reader()
+            .read_block_unsafe(layer.address, &mut word)?;
+        assert_eq!(u32::from_le_bytes(word), value);
+    }
+    drop(r);
+    validation.check()?;
+    Ok(())
+}
+
+#[test]
 fn nvn_buffer_upload_uses_independent_row_and_layer_strides() -> Result<(), VulkanError> {
     let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
         return Ok(());

@@ -15,9 +15,9 @@ pub struct ImageRegistration {
     pub(super) cpu_address: u64,
 }
 pub(super) struct CachedImage {
-    info: ImageInfo,
-    address_space: u64,
-    remapped: bool,
+    pub(super) info: ImageInfo,
+    pub(super) address_space: u64,
+    pub(super) remapped: bool,
     picked: bool,
     cpu_address: u64,
     slices: smallvec::SmallVec<[(u64, [u32; 2]); 16]>,
@@ -147,7 +147,7 @@ impl CachedImage {
         }
         Some([level as u32, layer as u32])
     }
-    fn base(&self, other: &ImageInfo) -> Option<[u32; 2]> {
+    pub(super) fn base(&self, other: &ImageInfo) -> Option<[u32; 2]> {
         let existing = &self.info;
         let a = existing.description;
         let b = other.description;

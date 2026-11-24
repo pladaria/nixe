@@ -71,6 +71,92 @@ fn same_backing(a: &Footprint, b: &Footprint) -> bool {
     lhs.peek().is_some() && lhs.eq(spans(b.mapping(), br.start, bytes))
 }
 impl Residency<'_> {
+    /// An array registered after its individual layers can own the existing
+    /// contents. Subsequent selections resolve those layers as views of it.
+    pub(super) fn absorb_array_aliases(&mut self, id: ImageId) -> Result<(), VulkanError> {
+        let parent = self.texture_cache.get(id);
+        let Some(canonical) = &parent.cached else {
+            return Ok(());
+        };
+        if canonical.info.description.dimension() != nixe_gpu::ImageDimension::Two
+            || parent.description.array_layers < 2
+            || parent.decoded.is_some()
+        {
+            return Ok(());
+        }
+        let mut children = smallvec::SmallVec::<[ImageId; 4]>::new();
+        for alias in &parent.aliases {
+            let child = self.texture_cache.get(alias.image);
+            let Some(cached) = &child.cached else {
+                continue;
+            };
+            if cached.address_space != canonical.address_space
+                || cached.remapped
+                || cached.info.packing != canonical.info.packing
+                || child.description.format != parent.description.format
+                || child.description.array_layers >= parent.description.array_layers
+                || !parent.description.usage.contains(child.description.usage)
+                || !parent.description.flags.contains(child.description.flags)
+                || child.dma.pending()
+                || child.dma.mixed_authority
+                || child.forced_flushed
+                || child.dma_downloaded
+                || self.runtime.constructing.contains(&Resource::Image(alias.image))
+                || self.texture_cache.pending_downloads.iter().any(|pending| {
+                    matches!(pending, texture_download::PendingDownload::Image(image) if *image == alias.image)
+                })
+            {
+                continue;
+            }
+            let Some([mip, layer]) = canonical.base(&cached.info) else {
+                continue;
+            };
+            // The registered alias proves the physical backing and layout.
+            // Every child plane must cover exactly the corresponding array
+            // subresource, including its complete texel extent.
+            if child
+                .planes
+                .iter()
+                .zip(&child.contents.geometry)
+                .all(|(plane, geometry)| {
+                    parent.planes.iter().zip(&parent.contents.geometry).any(
+                        |(destination, backing)| {
+                            destination.mip_level == plane.mip_level + mip
+                                && destination.array_layer == plane.array_layer + layer
+                                && destination.aspect == plane.aspect
+                                && destination.extent == plane.extent
+                                && alias.copies.iter().any(|copy| {
+                                    copy.source == *plane && copy.destination == *destination
+                                })
+                                && backing
+                                    .mapping()
+                                    .containing_offset(geometry.mapping(), geometry.bounds())
+                                    == Some(backing.bounds().start)
+                        },
+                    )
+                })
+            {
+                children.push(alias.image);
+            }
+        }
+        if children.is_empty() {
+            return Ok(());
+        }
+        let retained = self.runtime.constructing.len();
+        self.runtime
+            .constructing
+            .extend(children.iter().copied().map(Resource::Image));
+        // Import current contents before invalidating child views. The cache's
+        // retirement ring retains old images and views for submitted draws.
+        let result = self.prepare_image(id, false, false);
+        self.runtime.constructing.truncate(retained);
+        result?;
+        for child in children {
+            self.texture_cache.delete_image(child);
+        }
+        Ok(())
+    }
+
     pub(super) fn register_image_aliases(&mut self, id: ImageId) -> Result<(), VulkanError> {
         let mut candidates = smallvec::SmallVec::<[ImageId; 16]>::new();
         for &(address, size) in &self.texture_cache.get(id).maps {
