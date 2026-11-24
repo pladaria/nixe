@@ -95,6 +95,14 @@ Nixe adaptations
   separate read mark so ordinary read-only pages remain directly readable.
   Marked, absent and unsupported unaligned accesses retain their callbacks.
   Sign-extended pointer masks use an immediate and one address register.
+- backend/x64 shares A64 fastmem fault sites between JITs of one arena,
+  following Lichii's ARM64 implementation (#1861). The emitter snapshots
+  the block's marked IR instructions once and uses the snapshot for address
+  folding and emission. Fault recovery and native block invalidation stay
+  on the owning JIT.
+- The x64 A64 JIT resolves captured faults against its own memory sites. Nixe
+  can restore an evicted host alias and finish the faulting access through the
+  generated callback without marking the site or recompiling its block.
 - frontend/A64/translate/impl/sys_dc.cpp ends blocks after cache operations.
   Nixe applies ownership transitions after releasing its execution lease.
 - ir/opt/a64_get_set_elimination_pass.cpp, ir/opt/passes.h and both A64

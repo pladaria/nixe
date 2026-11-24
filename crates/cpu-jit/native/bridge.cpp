@@ -16,7 +16,6 @@ struct StateMeasurement {
 // Nixe's C ABI boundary. No C++ exceptions cross into Rust.
 #include <array>
 #include <cstring>
-#include <dynarmic/backend/exception_handler.h>
 #include <dynarmic/interface/A64/a64.h>
 #include <dynarmic/interface/exclusive_monitor.h>
 #include <exception>
@@ -242,20 +241,13 @@ struct Core final : Dynarmic::A64::UserCallbacks {
 };
 } // namespace
 extern "C" {
-bool nixe_dynarmic_resolve_fault(std::uint64_t pc, std::uint64_t *call,
-                                 std::uint64_t *ret) noexcept {
-  const auto result = Dynarmic::Backend::ExceptionHandler::HandleExternalFault(pc);
-  if (!result)
-    return false;
-#if defined(__x86_64__)
-  *call = result->call_rip;
-  *ret = result->ret_rip;
-#else
-  *call = result->call_pc;
-  *ret = 0;
-#endif
-  return true;
+#if defined(__x86_64__) || defined(_M_X64)
+bool nixe_dynarmic_resolve_fault(Core* core, std::uint64_t pc, std::uint64_t* call,
+                                std::uint64_t* ret, bool (*recover_alias)(void*),
+                                void* context) noexcept {
+  return core->jit->ResolveFastmemFault(pc, *call, *ret, recover_alias, context);
 }
+#endif
 const char *nixe_dynarmic_error() noexcept { return last_error.c_str(); }
 void *nixe_dynarmic_create(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table,
                            size_t bits, std::uint8_t page_table_read_marked_bit,

@@ -7,8 +7,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <memory>
 #include <optional>
+
+#include <boost/container/small_vector.hpp>
 
 #include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
@@ -21,6 +25,8 @@
 namespace Dynarmic::Backend::X64 {
 
 class RegAlloc;
+class FastmemFaults;
+using FastmemFaultSites = boost::container::small_vector<unsigned, 2>;
 
 struct A64EmitContext final : public EmitContext {
     A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& labels, boost::container::stable_vector<DeferredEmit>& deferred_emits, boost::container::stable_vector<DeferredEmit>& cold_emits);
@@ -35,6 +41,7 @@ struct A64EmitContext final : public EmitContext {
     }
 
     const A64::UserConfig& conf;
+    FastmemFaultSites fastmem_fault_sites;
 };
 
 class A64EmitX64 final : public EmitX64 {
@@ -51,6 +58,8 @@ public:
     void ClearCache() override;
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
+
+    std::optional<FakeCall> ResolveFastmemFault(u64 rip, bool (*recover_alias)(void*), void* context);
 
 protected:
     bool check_bit_in_zf = false;
@@ -106,9 +115,12 @@ protected:
         bool recompile;
     };
     tsl::robin_map<u64, FastmemPatchInfo> fastmem_patch_info;
-    // Eden uses a hash set for faulted instruction sites; no ordering is consumed.
-    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
-    tsl::robin_set<DoNotFastmemMarker, FastmemMarkerHash> do_not_fastmem;
+    const std::shared_ptr<FastmemFaults> fastmem_faults;
+    bool WasFastmemFaulted(const A64EmitContext& ctx, const DoNotFastmemMarker& marker) const {
+        const auto& sites = ctx.fastmem_fault_sites;
+        return std::find(sites.begin(), sites.end(), std::get<1>(marker)) != sites.end();
+    }
+    void RememberFastmemFault(const DoNotFastmemMarker& marker);
     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
     FakeCall FastmemCallback(u64 rip);
 

@@ -23,31 +23,42 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
     }
 
     const auto marker = std::make_tuple(ctx.Location(), inst->GetName());
-    if (do_not_fastmem.count(marker) > 0) {
+    if (WasFastmemFaulted(ctx, marker)) {
         return std::nullopt;
     }
     return marker;
 }
 
 FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
-    const auto iter = fastmem_patch_info.find(rip_);
-
-    if (iter == fastmem_patch_info.end()) {
-        fmt::print("dynarmic: Segfault happened within JITted code at rip = {:016x}\n", rip_);
-        fmt::print("Segfault wasn't at a fastmem patch location!\n");
-        fmt::print("Now dumping code.......\n\n");
-        Common::DumpDisassembledX64((void*)(rip_ & ~u64(0xFFF)), 0x1000);
-        ASSERT_FALSE("iter != fastmem_patch_info.end()");
+    if (const auto result = ResolveFastmemFault(rip_, nullptr, nullptr)) {
+        return *result;
     }
+    fmt::print("dynarmic: Segfault happened within JITted code at rip = {:016x}\n", rip_);
+    fmt::print("Segfault wasn't at a fastmem patch location!\n");
+    fmt::print("Now dumping code.......\n\n");
+    Common::DumpDisassembledX64((void*)(rip_ & ~u64(0xFFF)), 0x1000);
+    ASSERT_FALSE("missing fastmem patch location");
+}
 
+std::optional<FakeCall> AxxEmitX64::ResolveFastmemFault(u64 rip_, bool (*recover_alias)(void*), void* context) {
+    const auto iter = fastmem_patch_info.find(rip_);
+    if (iter == fastmem_patch_info.end()) {
+        return std::nullopt;
+    }
     FakeCall result{
         .call_rip = iter->second.callback,
         .ret_rip = iter->second.resume_rip,
     };
 
-    if (iter->second.recompile) {
+    const bool recovered = recover_alias && recover_alias(context);
+#ifdef DYNARMIC_A64_FAULT_DIAGNOSTICS
+    if (recovered && conf.diagnostics) {
+        ++conf.diagnostics->fastmem_retained;
+    }
+#endif
+    if (iter->second.recompile && !recovered) {
         const auto marker = iter->second.marker;
-        do_not_fastmem.insert(marker);
+        RememberFastmemFault(marker);
 #ifdef DYNARMIC_A64_FAULT_DIAGNOSTICS
         if (conf.diagnostics && GetBasicBlock(std::get<0>(marker))) {
             conf.diagnostics->invalidate(conf.diagnostics->context, std::get<0>(marker).Value(), true);

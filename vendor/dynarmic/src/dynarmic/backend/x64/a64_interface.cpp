@@ -70,6 +70,10 @@ public:
 
     ~Impl() = default;
 
+    std::optional<Backend::FakeCall> ResolveFastmemFault(u64 host_pc, bool (*recover_alias)(void*), void* context) {
+        return emitter.ResolveFastmemFault(host_pc, recover_alias, context);
+    }
+
     HaltReason Run() {
         ASSERT(!is_executing);
         PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
@@ -418,6 +422,16 @@ HaltReason Jit::Run() {
 
 HaltReason Jit::Step() {
     return impl->Step();
+}
+
+bool Jit::ResolveFastmemFault(u64 host_pc, u64& call, u64& resume, bool (*recover_alias)(void*), void* context) {
+    const auto result = impl->ResolveFastmemFault(host_pc, recover_alias, context);
+    if (!result) {
+        return false;
+    }
+    call = result->call_rip;
+    resume = result->ret_rip;
+    return true;
 }
 
 void Jit::ClearCache() {

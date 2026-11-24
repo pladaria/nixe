@@ -473,6 +473,32 @@ impl AddressSpace {
             .host_address(GuestVirtualAddress::new(0), 0)
             .expect("live virtual reservation")
     }
+    /// Classify a fault at an attributed native memory instruction. A valid
+    /// access can finish through the page table while keeping its fastmem code.
+    #[cold]
+    pub fn recover_fastmem(
+        &self,
+        native: &NativeAdmission<'_>,
+        host_address: usize,
+        required: MemoryPermissions,
+    ) -> Result<bool, MemoryError> {
+        if !std::ptr::eq(self, native.address_space()) || !native.is_active() {
+            return Err(MemoryError::Invalid(
+                "fastmem recovery requires active admission",
+            ));
+        }
+        let host_base = self.native_data_base().as_ptr() as usize;
+        let Some(address) = host_address
+            .checked_sub(host_base)
+            .map(|offset| offset as u64)
+            .filter(|&offset| offset < self.width().bytes())
+        else {
+            return Ok(false);
+        };
+        // Mapping writers may wait for this admission. GPU tracking instead
+        // publishes its PTE and host permissions under the arena lock.
+        unsafe { self.fastmem.recover(&self.arena, address, required) }
+    }
     pub fn register_core(self: &Arc<Self>, interrupt: Arc<dyn Fn() + Send + Sync>) -> CoreContext {
         self.quiescence.register(Arc::clone(self), interrupt)
     }
@@ -1745,6 +1771,7 @@ impl AddressSpace {
         bytes: u64,
         update: impl Fn(MappedPage) -> MappedPage + Copy,
     ) -> Result<(), MemoryError> {
+        let mut aliases = self.fastmem.lock();
         let mut run: Option<(u64, MemoryPermissions, bool)> = None;
         for address in (start..start + bytes).step_by(PAGE_SIZE as usize) {
             let old = unsafe { self.entry(address) };
@@ -1759,6 +1786,7 @@ impl AddressSpace {
             {
                 unsafe {
                     self.protect_tracking_run(
+                        &mut aliases,
                         base,
                         address - base,
                         previous,
@@ -1783,6 +1811,7 @@ impl AddressSpace {
         if let Some((base, permissions, relaxing)) = run {
             unsafe {
                 self.protect_tracking_run(
+                    &mut aliases,
                     base,
                     start + bytes - base,
                     permissions,
@@ -1795,6 +1824,7 @@ impl AddressSpace {
     }
     unsafe fn protect_tracking_run(
         &self,
+        aliases: &mut fastmem::Residency,
         start: u64,
         bytes: u64,
         permissions: MemoryPermissions,
@@ -1802,12 +1832,7 @@ impl AddressSpace {
         update: impl Fn(MappedPage) -> MappedPage,
     ) -> Result<(), MemoryError> {
         unsafe {
-            self.fastmem.protect(
-                &self.arena,
-                GuestVirtualAddress::new(start),
-                bytes,
-                permissions,
-            )?;
+            aliases.protect(&self.arena, start, bytes, permissions)?;
         }
         if relaxing {
             for address in (start..start + bytes).step_by(PAGE_SIZE as usize) {
@@ -1838,12 +1863,9 @@ impl AddressSpace {
                 run.filter(|(_, previous)| !changed || *previous != permissions)
             {
                 unsafe {
-                    self.fastmem.protect(
-                        &self.arena,
-                        GuestVirtualAddress::new(base),
-                        address - base,
-                        previous,
-                    )?;
+                    self.fastmem
+                        .lock()
+                        .protect(&self.arena, base, address - base, previous)?;
                 }
                 run = None;
             }
@@ -1858,9 +1880,9 @@ impl AddressSpace {
         }
         if let Some((base, permissions)) = run {
             unsafe {
-                self.fastmem.protect(
+                self.fastmem.lock().protect(
                     &self.arena,
-                    GuestVirtualAddress::new(base),
+                    base,
                     start + bytes - base,
                     permissions,
                 )?;

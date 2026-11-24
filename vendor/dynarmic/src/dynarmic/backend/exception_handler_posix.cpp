@@ -54,13 +54,6 @@ public:
 
     void AddCodeBlock(CodeBlockInfo info);
     void RemoveCodeBlock(u64 host_pc);
-    std::optional<FakeCall> HandleExternalFault(u64 pc) {
-        std::lock_guard<std::mutex> guard(code_block_infos_mutex);
-        auto it = FindCodeBlockInfo(pc);
-        if (it == code_block_infos.end()) return std::nullopt;
-        return it->cb(pc);
-    }
-
     bool SupportsFastmem() const { return supports_fast_mem; }
 
 private:
@@ -330,10 +323,6 @@ void ExceptionHandler::Register(RV64::CodeBlock& mem, std::size_t size) {
 #else
 #    error "Invalid architecture"
 #endif
-
-std::optional<FakeCall> ExceptionHandler::HandleExternalFault(u64 pc) {
-    return sig_handler ? sig_handler->HandleExternalFault(pc) : std::nullopt;
-}
 
 bool ExceptionHandler::SupportsFastmem() const noexcept {
     return static_cast<bool>(impl) && sig_handler->SupportsFastmem();

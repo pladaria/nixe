@@ -16,7 +16,15 @@ pub struct Exit {
     pub pc: u64,
 }
 unsafe extern "C" {
-    pub fn nixe_dynarmic_resolve_fault(pc: u64, call: *mut u64, ret: *mut u64) -> bool;
+    #[cfg(target_arch = "x86_64")]
+    pub fn nixe_dynarmic_resolve_fault(
+        core: *mut c_void,
+        pc: u64,
+        call: *mut u64,
+        ret: *mut u64,
+        recover_alias: unsafe extern "C" fn(*mut c_void) -> bool,
+        context: *mut c_void,
+    ) -> bool;
     fn nixe_dynarmic_error() -> *const c_char;
     pub fn nixe_dynarmic_create(
         cb: Callbacks,

@@ -6,6 +6,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <oaknut/oaknut.hpp>
 
+#if defined(__linux__) && defined(__x86_64__)
+#    include <cstring>
+#    include <memory>
+#    include <sys/mman.h>
+#endif
+
 #include "./testenv.h"
 #include "dynarmic/common/fp/fpsr.h"
 #include "dynarmic/interface/exclusive_monitor.h"
@@ -1320,6 +1326,64 @@ TEST_CASE("A64: Memory access (fastmem)", "[a64]") {
     jit.Run();
     REQUIRE(strncmp(backing_memory + 0x100, backing_memory + 0x1F0, 23) == 0);
 }
+
+#if defined(__linux__) && defined(__x86_64__)
+TEST_CASE("A64: x64 JITs share faulted fastmem sites only within one arena", "[a64]") {
+    constexpr size_t page_size = 4096;
+    constexpr u64 faulted_value = 42;
+    constexpr u64 direct_value = 73;
+    const auto release = [](char* base) { munmap(base, page_size * 2); };
+    const auto make_arena = [&] {
+        void* base = mmap(nullptr, page_size * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        REQUIRE(base != MAP_FAILED);
+        std::unique_ptr<char, decltype(release)> arena{static_cast<char*>(base), release};
+        REQUIRE(mprotect(base, page_size, PROT_NONE) == 0);
+        std::memcpy(arena.get() + page_size, &direct_value, sizeof(direct_value));
+        return arena;
+    };
+    const auto arena = make_arena();
+    const auto other_arena = make_arena();
+
+    struct Env : A64TestEnv {
+        unsigned callbacks = 0;
+        u64 MemoryRead64(u64) override {
+            ++callbacks;
+            return 42;
+        }
+    };
+    u64 fallback_data = faulted_value;
+    std::array<void*, 2> pages{&fallback_data, nullptr};
+    const auto config = [&](Env& env, char* arena_base) {
+        env.code_mem = {0xf9400002, 0xf9400023, 0x14000000};  // LDR X2,[X0]; LDR X3,[X1]; B .
+        A64::UserConfig result{&env};
+        result.fastmem_pointer = reinterpret_cast<uintptr_t>(arena_base);
+        result.fastmem_address_space_bits = 13;
+        result.page_table = pages.data();
+        result.page_table_address_space_bits = 13;
+        return result;
+    };
+    const auto run = [&](A64::Jit& jit, Env& env) {
+        jit.SetRegister(0, 0);
+        jit.SetRegister(1, page_size);
+        jit.SetPC(0);
+        env.ticks_left = 3;
+        jit.Run();
+        REQUIRE(jit.GetRegister(2) == faulted_value);
+        REQUIRE(jit.GetRegister(3) == direct_value);
+    };
+
+    Env first, peer, separate;
+    A64::Jit first_jit{config(first, arena.get())};
+    A64::Jit peer_jit{config(peer, arena.get())};
+    A64::Jit separate_jit{config(separate, other_arena.get())};
+    run(first_jit, first);
+    run(peer_jit, peer);
+    run(separate_jit, separate);
+    REQUIRE(first.callbacks == 1);
+    REQUIRE(peer.callbacks == 0);
+    REQUIRE(separate.callbacks == 1);
+}
+#endif
 
 TEST_CASE("A64: SQRDMULH QC flag when output invalidated", "[a64]") {
     A64TestEnv env;

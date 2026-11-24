@@ -63,15 +63,15 @@ impl MemoryPermissions {
             }
     }
 }
-/// Low-level reservation. Mapping writers must establish address-space
-/// quiescence and span exclusion before changing these OS mappings.
+/// Low-level reservation for the optional direct aliases of guest RAM.
+/// Guest translation changes require address-space quiescence and span exclusion.
 pub struct VirtualArena {
     machine: Machine,
     base: NonNull<u8>,
     width: AddressWidth,
 }
-// SAFETY: no borrowed RAM references are returned. Mapping mutations require
-// external quiescence; checked/native accesses use their own admission contract.
+// SAFETY: no borrowed RAM references are returned. Guest translation changes
+// use external quiescence; optional aliases retain the admitted translation.
 unsafe impl Send for VirtualArena {}
 unsafe impl Sync for VirtualArena {}
 impl VirtualArena {
@@ -146,8 +146,10 @@ impl VirtualArena {
         ))
     }
     /// # Safety
-    /// Every executing core is quiescent and checked access guards are drained.
-    /// The caller retains the physical allocation pins until the mapping is removed.
+    /// The caller retains the physical allocation pins and serializes changes
+    /// to this range. Replacing a guest translation requires quiescence. An
+    /// inaccessible alias can be restored during native execution if it names
+    /// the same pinned RAM with the current effective permissions.
     pub unsafe fn map(
         &self,
         start: GuestVirtualAddress,
@@ -180,7 +182,9 @@ impl VirtualArena {
         Ok(())
     }
     /// # Safety
-    /// Every executing core is quiescent and checked access guards are drained.
+    /// Guest unmapping requires quiescence and drained checked access guards.
+    /// An optional alias can be evicted concurrently while the guest translation
+    /// remains pinned and fault dispatch can complete accesses through it.
     pub unsafe fn unmap(&self, start: GuestVirtualAddress, bytes: u64) -> Result<(), MemoryError> {
         let host = self.page_range(start, bytes)?;
         // Keep the reservation: removing an alias never returns a hole that an

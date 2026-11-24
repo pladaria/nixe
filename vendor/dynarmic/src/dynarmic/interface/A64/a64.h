@@ -119,6 +119,13 @@ public:
      */
     bool IsExecuting() const;
 
+#if defined(__x86_64__) || defined(_M_X64)
+    /// Resolve an attributed memory fault in this executing JIT. The supplied
+    /// policy can preserve the block after repairing an optional host alias.
+    bool ResolveFastmemFault(std::uint64_t host_pc, std::uint64_t& call, std::uint64_t& resume,
+                             bool (*recover_alias)(void*), void* context);
+#endif
+
     /// Debugging: Dump a disassembly all of compiled code to the console.
     void DumpDisassembly() const;
 

@@ -105,8 +105,15 @@ protected:
     // Eden uses a hash set for faulted instruction sites; no ordering is consumed.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
     tsl::robin_set<DoNotFastmemMarker, FastmemMarkerHash> do_not_fastmem;
+    bool WasFastmemFaulted(const A32EmitContext&, const DoNotFastmemMarker& marker) const {
+        return do_not_fastmem.count(marker) != 0;
+    }
+    void RememberFastmemFault(const DoNotFastmemMarker& marker) {
+        do_not_fastmem.insert(marker);
+    }
     std::optional<DoNotFastmemMarker> ShouldFastmem(A32EmitContext& ctx, IR::Inst* inst) const;
     FakeCall FastmemCallback(u64 rip);
+    std::optional<FakeCall> ResolveFastmemFault(u64 rip, bool (*recover_alias)(void*), void* context);
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A32EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);

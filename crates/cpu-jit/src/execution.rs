@@ -540,22 +540,68 @@ unsafe extern "C" fn memory(
     }
 }
 unsafe extern "C" fn gateway(opaque: *mut c_void, _: usize) {
-    let call = unsafe { &mut *opaque.cast::<Invocation>() };
-    call.ok = unsafe { ffi::nixe_dynarmic_run(call.core, call.context, &mut call.exit) };
+    let call = opaque.cast::<Invocation>();
+    unsafe {
+        (*call).ok = ffi::nixe_dynarmic_run((*call).core, (*call).context, &raw mut (*call).exit);
+    }
 }
+struct FastmemFault {
+    context: *mut c_void,
+    address: usize,
+    writes: Option<bool>,
+}
+
+unsafe extern "C" fn recover_alias(opaque: *mut c_void) -> bool {
+    let fault = unsafe { &*opaque.cast::<FastmemFault>() };
+    let Some(writes) = fault.writes else {
+        return false;
+    };
+    let required = if writes {
+        MemoryPermissions::WRITE
+    } else {
+        MemoryPermissions::READ
+    };
+    let context = unsafe { &mut *fault.context.cast::<Callbacks<'_>>() };
+    match context
+        .space
+        .recover_fastmem(context.admission, fault.address, required)
+    {
+        Ok(keep_block) => keep_block,
+        Err(error) => {
+            let error = context.space.fail(error);
+            context.error = Some(error.into());
+            // The memory fallback returns the failure through the native exit.
+            true
+        }
+    }
+}
+
 unsafe extern "C" fn dispatch(
-    _opaque: *mut c_void,
+    opaque: *mut c_void,
     fault: *mut CapturedFault<'_>,
 ) -> FaultDisposition {
     record(Counter::FaultDispatches, 1);
     let fault = unsafe { &mut *fault };
-    // Faulted sites use the canonical page table on subsequent executions.
-    // Dynamic permissions restore direct RAM loads/stores when pages reopen;
-    // device accesses do not keep generating host protection signals.
+    let call = opaque.cast::<Invocation>();
+    let mut access = FastmemFault {
+        context: unsafe { (*call).context },
+        address: fault.fault_address(),
+        writes: fault.writes_memory(),
+    };
     let (mut entry, mut ret) = (0, 0);
-    if !unsafe { ffi::nixe_dynarmic_resolve_fault(fault.native_pc() as u64, &mut entry, &mut ret) }
-    {
+    if !unsafe {
+        ffi::nixe_dynarmic_resolve_fault(
+            (*call).core,
+            fault.native_pc() as u64,
+            &mut entry,
+            &mut ret,
+            recover_alias,
+            std::ptr::from_mut(&mut access).cast(),
+        )
+    } {
         return FaultDisposition::FatalUnattributed;
     }
+    // Complete this access once via the canonical table. Subsequent accesses
+    // can use a restored alias even if this one raced with a permission change.
     unsafe { fault.call_on_resume(entry as usize, ret as usize) }
 }

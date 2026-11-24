@@ -61,8 +61,6 @@ public:
 #    error "Invalid architecture"
 #endif
 
-    // Nixe calls this after returning from the POSIX signal handler.
-    static std::optional<FakeCall> HandleExternalFault(u64 pc);
     bool SupportsFastmem() const noexcept;
     void SetFastmemCallback(std::function<FakeCall(u64)> cb);
 
