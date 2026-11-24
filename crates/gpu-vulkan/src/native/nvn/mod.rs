@@ -520,6 +520,7 @@ impl NativeExecution<'_> {
             return Ok(());
         }
         let extent = d.extent();
+        let mut descriptors = shader::Descriptors::default();
         let selected = self
             .state
             .nvn
@@ -528,7 +529,7 @@ impl NativeExecution<'_> {
             .filter(|(key, _)| Arc::ptr_eq(key, d.pipeline))
             .map(|(_, p)| p)
             .or_else(|| self.state.nvn.pipelines.get(d.pipeline))
-            .filter(|p| p.accepts(&d.bindings, &mut self.residency));
+            .filter(|p| p.accepts(&d.bindings, &mut self.residency, &mut descriptors));
         let pipeline = if let Some(p) = selected {
             p.clone()
         } else {
@@ -602,7 +603,7 @@ impl NativeExecution<'_> {
                     })
                 })
                 .collect::<Result<_, VulkanError>>()?;
-            let p = Rc::new(shader::compile(self, d, state)?);
+            let p = Rc::new(shader::compile(self, d, state, &mut descriptors)?);
             if p.usage.shapes != d.pipeline.shapes {
                 let mut projected = d.pipeline.as_ref().clone();
                 projected.shapes = p.usage.shapes.clone();
@@ -627,6 +628,7 @@ impl NativeExecution<'_> {
             self.state.nvn.selected_pipeline = Some((d.pipeline.clone(), pipeline.clone()));
         }
         pipeline.publish_usage(&d.bindings);
+        pipeline.prepare_descriptors(&d.bindings, &mut self.residency, &mut descriptors)?;
         // Resolving an adjacent range may merge buffers and retire earlier
         // selections. Capture descriptors and framebuffer only after the full
         // draw's resource set has stabilized.
@@ -702,9 +704,8 @@ impl NativeExecution<'_> {
                 &mut selections.graphics,
                 &pipeline,
                 &d.bindings,
-                [0; 3],
-                d.first_instance,
-                d.samples,
+                &descriptors,
+                ([0; 3], d.first_instance, d.samples),
             )?;
             for &(slot, r) in d.vertices.iter() {
                 if pipeline.vertex_buffer_mask.checked_shr(slot).unwrap_or(0) & 1 == 0 {
@@ -810,16 +811,17 @@ impl NativeExecution<'_> {
             return Ok(());
         }
         let key = (shader, b.sampled.shapes.clone());
+        let mut descriptors = shader::Descriptors::default();
         let pipeline = if let Some(p) = self
             .state
             .nvn
             .compute
             .get(&key)
-            .filter(|p| p.accepts(b, &mut self.residency))
+            .filter(|p| p.accepts(b, &mut self.residency, &mut descriptors))
         {
             p.clone()
         } else {
-            let p = Rc::new(shader::compute(self, shader, b)?);
+            let p = Rc::new(shader::compute(self, shader, b, &mut descriptors)?);
             if key.1 != p.usage.shapes {
                 self.state
                     .nvn
@@ -830,6 +832,7 @@ impl NativeExecution<'_> {
             p
         };
         pipeline.publish_usage(b);
+        pipeline.prepare_descriptors(b, &mut self.residency, &mut descriptors)?;
         let (dispatch, groups) = match dispatch {
             nixe_nvn::Dispatch::Direct(groups) => (crate::Dispatch::Direct(groups), groups),
             nixe_nvn::Dispatch::Indirect(address) => {
@@ -864,7 +867,7 @@ impl NativeExecution<'_> {
                 self.residency.device_memory().generation(),
                 self.residency.texture_cache.binding_revision,
             );
-            self.nvn_bindings(selected, &pipeline, b, groups, 0, 1)?;
+            self.nvn_bindings(selected, &pipeline, b, &descriptors, (groups, 0, 1))?;
             if epoch
                 != (
                     self.residency.device_memory().generation(),

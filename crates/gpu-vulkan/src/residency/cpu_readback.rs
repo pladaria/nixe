@@ -106,10 +106,68 @@ impl Residency<'_> {
 
     #[cfg_attr(feature = "performance-counters", track_caller)]
     pub(crate) fn flush_read_span(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
+        if self.owner_read_is_clean(address, bytes) {
+            return Ok(());
+        }
+        self.flush_owner_read(address, bytes)
+    }
+
+    pub(crate) fn flush_read_spans(
+        &mut self,
+        ranges: impl Iterator<Item = (u64, u64)>,
+    ) -> Result<(), VulkanError> {
+        let pending: smallvec::SmallVec<[_; 4]> = ranges
+            .filter(|&(address, bytes)| !self.owner_read_is_clean(address, bytes))
+            .collect();
+        match pending.as_slice() {
+            [] => return Ok(()),
+            &[(address, bytes)] => return self.flush_owner_read(address, bytes),
+            _ => {}
+        }
+        self.runtime.device.realize_deferred_clear()?;
+        let mut buffers = RangeSet::default();
+        for &(address, bytes) in &pending {
+            if self.has_ordered_nonbuffer_read(address, bytes) {
+                // These producers own their own publication order. Complete
+                // the original reads before returning their combined result.
+                for (address, bytes) in pending {
+                    self.flush_owner_read(address, bytes)?;
+                }
+                return Ok(());
+            }
+            buffers.insert(address, bytes);
+        }
+        self.read_buffer_spans(buffers)
+    }
+
+    fn has_ordered_nonbuffer_read(&self, address: u64, bytes: u64) -> bool {
+        if self.texture_cache.region_gpu_modified(address, bytes)
+            || (self.caches.query_pages.any(address, bytes)
+                && self
+                    .caches
+                    .query_cache
+                    .lock()
+                    .unwrap()
+                    .must_flush_region(address, bytes))
+        {
+            return true;
+        }
+        // Keep the publication order of separate device mappings of the
+        // same physical bytes, including versions from earlier submissions.
+        let mut aliased = false;
+        self.runtime
+            .device_memory
+            .apply_device_aliases(address, bytes, |at, size| {
+                aliased |= self.has_read_producer(at, size);
+            });
+        aliased
+    }
+
+    fn owner_read_is_clean(&mut self, address: u64, bytes: u64) -> bool {
         use nixe_memory::device_memory::OwnerReadSpan;
         let span = self.runtime.device_memory.owner_read_span(address, bytes);
         if matches!(span, OwnerReadSpan::Unwritten) {
-            return Ok(());
+            return true;
         }
         #[cfg(feature = "performance-counters")]
         let clean = {
@@ -147,7 +205,7 @@ impl Residency<'_> {
                     );
                     self.runtime.statistics.owner_read_hits += 1;
                 }
-                return Ok(());
+                return true;
             }
             // Prove wider coverage without downloading any adjacent bytes. If
             // a neighbour is dirty, only the requested interval can be reused.
@@ -183,10 +241,14 @@ impl Residency<'_> {
                     {
                         self.runtime.statistics.owner_read_fills += 1;
                     }
-                    return Ok(());
+                    return true;
                 }
             }
         }
+        false
+    }
+
+    fn flush_owner_read(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
         #[cfg(feature = "performance-counters")]
         let _trace = nixe_gpu::trace::span("read_coherent", address, bytes, 0);
         self.flush_region(address, bytes)?;

@@ -110,17 +110,6 @@ pub(super) struct ReadBackPage {
     written: bool,
 }
 impl BufferCache {
-    fn read_ranges(&mut self, address: u64, bytes: u64) -> RangeSet {
-        let mut ranges = RangeSet::from_range(address, bytes);
-        // Only a newly observed CPU read asks to batch the learned ranges.
-        // Owner/MME reads without that demand keep their original scope.
-        if std::mem::take(&mut self.download_cpu_read_ranges) {
-            for (at, size) in self.cpu_read_ranges.iter() {
-                ranges.extend(self.gpu_modified_ranges.intersections(at, size));
-            }
-        }
-        ranges
-    }
     pub(super) fn read_needs_download(&self, address: u64, bytes: u64) -> bool {
         (self.download_policy == BufferDownloadPolicy::OnRead
             && self.gpu_modified_ranges.intersects(address, bytes))
@@ -756,14 +745,48 @@ impl Residency<'_> {
             // An older reader can still own an ordered snapshot of these bytes.
             return Ok(self.buffer_cache.pending_read(address, bytes));
         }
-        let ranges = self.buffer_cache.read_ranges(address, bytes);
+        self.submit_buffer_reads(&RangeSet::from_range(address, bytes))?;
+        Ok(self.buffer_cache.pending_read(address, bytes))
+    }
+
+    fn submit_buffer_reads(&mut self, ranges: &RangeSet) -> Result<(), VulkanError> {
+        // Only a newly observed CPU read asks to include learned ranges.
+        let mut learned;
+        let ranges = if std::mem::take(&mut self.buffer_cache.download_cpu_read_ranges) {
+            learned = ranges.clone();
+            for (at, size) in self.buffer_cache.cpu_read_ranges.iter() {
+                learned.extend(
+                    self.buffer_cache
+                        .gpu_modified_ranges
+                        .intersections(at, size),
+                );
+            }
+            &learned
+        } else {
+            ranges
+        };
         if let Some(download) = self.record_buffer_downloads(ranges.iter(), DownloadKind::Read)? {
             self.buffer_cache.enqueue_read_download(download);
             // Submit before handing the wait to the CPU; an idle owner must not
             // strand a reader whose producer needs no further guest commands.
             self.flush()?;
         }
-        Ok(self.buffer_cache.pending_read(address, bytes))
+        Ok(())
+    }
+
+    pub(super) fn read_buffer_spans(&mut self, ranges: RangeSet) -> Result<(), VulkanError> {
+        self.buffer_cache.publish_completed_reads()?;
+        // All ranges observe this owner boundary. Record them before any
+        // producer can advance, then publish the required prefix once.
+        self.submit_buffer_reads(&ranges)?;
+        let end = ranges
+            .iter()
+            .filter_map(|(address, bytes)| self.buffer_cache.pending_read(address, bytes))
+            .max_by_key(|end| end.serial);
+        if let Some(end) = end {
+            self.complete_buffer_read(end)?;
+        }
+        Ok(())
     }
     /// A dependent owner read consumes the same ordered snapshots as CPU reads.
     /// Copies already pending for the current version cover the read; only gaps

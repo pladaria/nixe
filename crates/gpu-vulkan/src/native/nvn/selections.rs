@@ -237,9 +237,8 @@ impl NativeExecution<'_> {
         selected: &mut Program,
         pipeline: &shader::Program,
         bindings: &Bindings,
-        groups: [u32; 3],
-        first_instance: u32,
-        samples: u32,
+        descriptors: &shader::Descriptors,
+        args: ([u32; 3], u32, u32),
     ) -> Result<(), VulkanError> {
         let epoch = (
             self.residency.device_memory().generation(),
@@ -294,7 +293,7 @@ impl NativeExecution<'_> {
         if changed(&mut selected.handles, &bindings.handles) {
             mask |= pipeline.dependencies.handles;
         }
-        let args = (groups, first_instance, samples);
+        let (groups, first_instance, samples) = args;
         let driver = bindings.buffers.driver_revision();
         if selected.driver_revision != Some(driver) || selected.driver_args != args {
             mask |= pipeline.dependencies.driver;
@@ -336,17 +335,8 @@ impl NativeExecution<'_> {
             let input = &pipeline.inputs[i];
             let previous = selected.slots.get(i);
             let (key, binding) = match *input {
-                shader::Input::TexelBuffer {
-                    stage,
-                    handle,
-                    storage,
-                } => {
-                    let [id, _] = shader::bindless_descriptor_ids(
-                        &mut self.residency,
-                        bindings,
-                        stage,
-                        handle,
-                    )?;
+                shader::Input::TexelBuffer { storage, .. } => {
+                    let [id, _] = descriptors.get(pipeline.descriptors.bindings[i]);
                     if matches!(previous, Some(Binding::Texel(old)) if *old == id) {
                         continue;
                     }
@@ -410,8 +400,8 @@ impl NativeExecution<'_> {
                         matches!(ty, T::ColorArray1D | T::ColorArray2D | T::ColorArrayCube);
                     let writable = pipeline.native.resources[i].writes();
                     let dynamic;
-                    let input = if let Some(key) = bindless {
-                        let ids = shader::bindless_descriptor_ids(&mut self.residency, bindings, stage, key)?;
+                    let input = if bindless.is_some() {
+                        let ids = descriptors.get(pipeline.descriptors.bindings[i]);
                         if matches!(previous, Some(Binding::Image(old, a, f, w)) if (*old, *a, *f, *w) == (ids[0], arrayed, format, writable)) {
                             continue;
                         }
@@ -449,13 +439,8 @@ impl NativeExecution<'_> {
                     // Each texture instruction selects a view of its declared dimension.
                     // An unrelated handle may still occupy an unused conditional slot.
                     let dynamic;
-                    let input = if let Some(key) = bindless {
-                        let ids = shader::bindless_descriptor_ids(
-                            &mut self.residency,
-                            bindings,
-                            stage,
-                            key,
-                        )?;
+                    let input = if bindless.is_some() {
+                        let ids = descriptors.get(pipeline.descriptors.bindings[i]);
                         if matches!(previous, Some(Binding::Texture(old, a)) if *old == ids && *a == arrayed)
                         {
                             continue;
@@ -534,8 +519,7 @@ impl NativeExecution<'_> {
                                 &mut self.residency,
                                 bindings,
                                 stage,
-                                key.index.0,
-                                key.offset.0,
+                                key,
                             )?);
                             Range { address, size: 0 }
                         }

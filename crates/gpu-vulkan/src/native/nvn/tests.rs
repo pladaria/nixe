@@ -57,6 +57,7 @@ fn nvn2_compute_compiles_with_private_spill_memory() -> Result<(), Box<dyn std::
             textures: &Default::default(),
             bindless: None,
         },
+        &mut shader::Descriptors::default(),
     )?;
     drop(gpu);
     validation.check()?;

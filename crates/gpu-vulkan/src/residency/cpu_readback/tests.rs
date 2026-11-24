@@ -10,6 +10,59 @@ mod support {
 }
 
 #[test]
+fn owner_reads_batch_disjoint_dirty_pages_and_publish_each_version() -> Result<(), VulkanError> {
+    let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let page = nixe_memory::PAGE_SIZE;
+    let allocation = machine.account(4 << 20)?.allocate(3 * page)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let address = 0x10000;
+    let _mapping = memory.map(
+        address,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 3 * page)?]),
+        true,
+    )?;
+    let mut cache = VulkanResidency::new(
+        memory.clone(),
+        device,
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let mut r = cache.access();
+    let buffer = r.device_buffer(
+        address,
+        3 * page,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        false,
+        false,
+    )?;
+    let reader = memory.reader();
+    let read_ram = |at| -> Result<u32, VulkanError> {
+        let mut word = [0; 4];
+        reader.read_block_unsafe(at, &mut word)?;
+        Ok(u32::from_le_bytes(word))
+    };
+    let first = address;
+    let last = address + 2 * page;
+    for value in [1, 3] {
+        r.fill_buffer(buffer.buffer, buffer.offset, 4, value)?;
+        r.fill_buffer(buffer.buffer, buffer.offset + 2 * page, 4, value + 1)?;
+        let before = r.device().scheduled_tick();
+        r.flush_read_spans([(last, 4), (first, 4), (last, 4)].into_iter())?;
+        assert_eq!(r.device().scheduled_tick(), before + 1);
+        assert_eq!(read_ram(first)?, value);
+        assert_eq!(read_ram(last)?, value + 1);
+        assert_eq!(read_ram(address + page)?, 0);
+    }
+    drop(r);
+    drop(cache);
+    validation.check()
+}
+
+#[test]
 fn pending_buffer_read_preserves_clean_owner_reads_on_other_pages() -> Result<(), VulkanError> {
     let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
         return Ok(());

@@ -196,6 +196,16 @@ impl BindlessState {
 pub struct BindlessPools<'a>(&'a BindlessState);
 
 impl BindlessPools<'_> {
+    pub fn matches_texture_shapes(self, mut shapes: impl Iterator<Item = (u32, u16, u8)>) -> bool {
+        let textures = self.0.registry.textures.lock().unwrap();
+        shapes.all(|(id, format, kind)| {
+            textures
+                .get(id)
+                .map_or((0, 0), |texture| (texture.format, texture.target_kind()))
+                == (format, kind)
+        })
+    }
+
     pub fn addresses(self, handle: u32) -> Option<[u64; 2]> {
         let [textures, samplers] = self.0.pools;
         let texture = handle & 0xfffff;

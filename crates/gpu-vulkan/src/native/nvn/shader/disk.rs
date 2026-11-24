@@ -404,6 +404,7 @@ impl Archive {
         key: &Digest,
         bindings: &nixe_nvn::Bindings,
         residency: &mut Residency<'_>,
+        descriptors: &mut Descriptors,
     ) -> Option<(Rc<Translation>, Shapes)> {
         let (shapes, t) = self.programs.get(key)?.iter().find(|(shapes, t)| {
             shapes.iter().all(|&(s, i, f, k)| {
@@ -412,10 +413,7 @@ impl Archive {
                     .get(s, i)
                     .map_or((s, i, 0, 0), Sampled::shape)
                     == (s, i, f, k)
-            }) && t
-                .dynamic_shapes
-                .iter()
-                .all(|s| s.matches(bindings, residency))
+            }) && Translation::matches(t, bindings, residency, descriptors)
         })?;
         Some((t.clone(), shapes.clone()))
     }
@@ -535,7 +533,7 @@ impl Archive {
                             ))
                         })?
                         .into();
-                    let dynamic_shapes = r
+                    let dynamic_shapes: Box<[DynamicShape]> = r
                         .list(4096, |r| {
                             Some(DynamicShape {
                                 stage: r.u32()?,
@@ -559,6 +557,7 @@ impl Archive {
                     self.programs.entry(key).or_default().push((
                         shapes,
                         Rc::new(Translation {
+                            descriptors: bindless::Plan::new(&dynamic_shapes, &inputs),
                             dynamic_shapes,
                             artifact,
                             stages,

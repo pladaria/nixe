@@ -8,7 +8,7 @@ use nixe_shader_recompiler::{
 };
 mod bindless;
 mod disk;
-pub(super) use bindless::{descriptor_ids as bindless_descriptor_ids, read_cbuf};
+pub(super) use bindless::{Descriptors, read_cbuf};
 pub(in crate::native) use disk::Archive;
 #[derive(Clone)]
 pub(super) enum Input {
@@ -84,6 +84,7 @@ pub(super) struct Translation {
     stages: StageIds,
     vertex_mask: Option<u32>,
     dynamic_shapes: Box<[DynamicShape]>,
+    pub(super) descriptors: bindless::Plan,
     pub inputs: Vec<Input>,
     pub dependencies: Dependencies,
 }
@@ -224,26 +225,51 @@ impl DynamicShape {
     fn shape(sample: Option<&Sampled>) -> (u16, u8) {
         sample.map_or((0, 0), |s| (s.texture.format, s.texture.target_kind()))
     }
-    fn matches(&self, b: &nixe_nvn::Bindings, residency: &mut Residency<'_>) -> bool {
+}
+impl Translation {
+    fn matches(
+        translation: &Rc<Self>,
+        b: &nixe_nvn::Bindings,
+        residency: &mut Residency<'_>,
+        descriptors: &mut Descriptors,
+    ) -> bool {
+        if translation.dynamic_shapes.is_empty() {
+            return true;
+        }
         let Some(pools) = b.bindless else {
             return false;
         };
-        bindless::descriptor_ids(residency, b, self.stage, self.key)
-            .ok()
-            .is_some_and(|ids| Self::shape(pools.resolve(ids).as_ref()) == (self.format, self.kind))
+        descriptors.prepare(translation, b, residency).is_ok()
+            && pools.matches_texture_shapes(
+                translation
+                    .dynamic_shapes
+                    .iter()
+                    .zip(&translation.descriptors.shapes)
+                    .map(|(shape, &slot)| (descriptors.get(slot)[0], shape.format, shape.kind)),
+            )
     }
 }
 impl Compiled {
-    pub fn accepts(&self, b: &nixe_nvn::Bindings, residency: &mut Residency<'_>) -> bool {
+    pub fn accepts(
+        &self,
+        b: &nixe_nvn::Bindings,
+        residency: &mut Residency<'_>,
+        descriptors: &mut Descriptors,
+    ) -> bool {
         let code_matches = match &b.captured {
             Some(source) => Arc::ptr_eq(source, &self.usage) || self.usage.same_code(source),
             None => self.usage.current(residency.device_memory()),
         };
-        code_matches
-            && self
-                .dynamic_shapes
-                .iter()
-                .all(|shape| shape.matches(b, residency))
+        code_matches && Translation::matches(&self.translation, b, residency, descriptors)
+    }
+
+    pub fn prepare_descriptors(
+        &self,
+        b: &nixe_nvn::Bindings,
+        residency: &mut Residency<'_>,
+        descriptors: &mut Descriptors,
+    ) -> Result<(), VulkanError> {
+        descriptors.prepare(&self.translation, b, residency)
     }
 }
 impl Program {
@@ -444,6 +470,7 @@ pub(super) fn compile(
     native: &mut NativeExecution<'_>,
     draw: &nixe_nvn::Draw,
     mut state: GraphicsState,
+    descriptors: &mut Descriptors,
 ) -> Result<Pipeline, VulkanError> {
     let mut runtime = GraphicsRuntimeState {
         vertex_input_types: [AttributeType::Disabled; 32],
@@ -479,13 +506,16 @@ pub(super) fn compile(
         minus_one_to_one: runtime.ndc_minus_one_to_one,
     };
     let compiled = match native.state.nvn.shaders.get(&key) {
-        Some(cached) if cached.accepts(&draw.bindings, &mut native.residency) => cached.clone(),
+        Some(cached) if cached.accepts(&draw.bindings, &mut native.residency, descriptors) => {
+            cached.clone()
+        }
         _ => {
             let compiled = Rc::new(translate(
                 native,
                 &draw.shaders,
                 &draw.bindings,
                 Some(&runtime),
+                descriptors,
             )?);
             if key.shapes != compiled.usage.shapes {
                 let mut projected = key.clone();
@@ -535,6 +565,7 @@ fn translate(
     stages: &[nixe_nvn::Shader],
     bindings: &nixe_nvn::Bindings,
     graphics: Option<&GraphicsRuntimeState>,
+    descriptors: &mut Descriptors,
 ) -> Result<Compiled, VulkanError> {
     let mut sparse_generation = bindings
         .captured
@@ -608,7 +639,7 @@ fn translate(
             .nvn
             .archive
             .as_ref()?
-            .lookup(key, bindings, &mut native.residency)
+            .lookup(key, bindings, &mut native.residency, descriptors)
     }) {
         return Ok(Compiled {
             translation,
@@ -924,6 +955,7 @@ fn translate(
         .collect();
     let inputs: Vec<_> = inputs.into_iter().map(|i| i.1).collect();
     let translation = Rc::new(Translation {
+        descriptors: bindless::Plan::new(&dynamic_shapes, &inputs),
         dynamic_shapes: dynamic_shapes.into(),
         vertex_mask: shader.vertex_input_mask(),
         stages: native.state.nvn.physical.intern(&shader),
@@ -977,8 +1009,9 @@ pub(super) fn compute(
     owner: &mut NativeExecution<'_>,
     shader: nixe_nvn::Shader,
     bindings: &nixe_nvn::Bindings,
+    descriptors: &mut Descriptors,
 ) -> Result<Program, VulkanError> {
-    let compiled = Rc::new(translate(owner, &[shader], bindings, None)?);
+    let compiled = Rc::new(translate(owner, &[shader], bindings, None, descriptors)?);
     link(owner, compiled, None)
 }
 
