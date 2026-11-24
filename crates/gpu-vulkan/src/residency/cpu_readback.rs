@@ -128,11 +128,6 @@ impl Residency<'_> {
         };
         if let OwnerReadSpan::Page { physical, reusable } = span
             && !self.buffer_cache.download_cpu_read_ranges
-            && self
-                .buffer_cache
-                .pending_read_count
-                .load(std::sync::atomic::Ordering::Relaxed)
-                == 0
             && self.runtime.device.submission.deferred_clear.is_none()
         {
             let page = nixe_memory::PAGE_SIZE;
@@ -293,7 +288,8 @@ impl Residency<'_> {
     }
 
     pub(crate) fn progress_native_work(&mut self) -> Result<(), VulkanError> {
-        self.runtime.device.poll_progress().map(|_| ())
+        self.runtime.device.poll_progress()?;
+        self.buffer_cache.publish_completed_reads()
     }
 
     pub(crate) fn queue_device_access(

@@ -439,19 +439,7 @@ impl DeviceMemory {
     #[inline]
     pub fn mark_gpu_written(&self, address: u64, bytes: u64) {
         self.visit_physical_pages(address, bytes, |page| {
-            let word = &self.0.gpu_written[page / 32];
-            let shift = (page % 32) * 2;
-            let mask = 3 << shift;
-            let state = word.load(Ordering::Relaxed) & mask;
-            if state != mask {
-                #[cfg(feature = "performance-counters")]
-                if state != 0 {
-                    self.0
-                        .owner_read_invalidations
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                word.fetch_or(mask, Ordering::Release);
-            }
+            self.mark_owner_page_written(page);
             if let Some(versions) = self.0.command_versions[page / 64].get() {
                 let version = &versions.versions[page % 64];
                 if version.load(Ordering::Relaxed) != 0 {
@@ -462,6 +450,31 @@ impl DeviceMemory {
             }
             false
         });
+    }
+    /// A pending readback may publish to these pinned pages. Revoke their
+    /// clean-read proofs even when the copy represents an older GPU write.
+    pub fn invalidate_owner_reads(&self, destination: &AllocationRange) {
+        for extent in destination.physical_extents() {
+            let start = extent.start.get();
+            for page in start / PAGE_SIZE..(start + extent.bytes).div_ceil(PAGE_SIZE) {
+                self.mark_owner_page_written(page as usize);
+            }
+        }
+    }
+    #[inline]
+    fn mark_owner_page_written(&self, page: usize) {
+        let word = &self.0.gpu_written[page / 32];
+        let mask = 3 << ((page % 32) * 2);
+        let state = word.load(Ordering::Relaxed) & mask;
+        if state != mask {
+            #[cfg(feature = "performance-counters")]
+            if state != 0 {
+                self.0
+                    .owner_read_invalidations
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            word.fetch_or(mask, Ordering::Release);
+        }
     }
     /// Physical identity and producer versions survive SMMU aliases. Allocate
     /// counters only for pages actually consumed as command lists.

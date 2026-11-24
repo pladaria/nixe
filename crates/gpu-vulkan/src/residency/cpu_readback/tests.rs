@@ -10,6 +10,77 @@ mod support {
 }
 
 #[test]
+fn pending_buffer_read_preserves_clean_owner_reads_on_other_pages() -> Result<(), VulkanError> {
+    let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let page = nixe_memory::PAGE_SIZE;
+    let allocation = machine.account(4 << 20)?.allocate(2 * page)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let backing = AllocationRange::new(allocation.pin(), 0, 2 * page)?;
+    let base = 0x10000;
+    let alias = 0x30000;
+    let _base = memory.map(base, Arc::from([backing.clone()]), true)?;
+    let _alias = memory.map(alias, Arc::from([backing]), true)?;
+    let mut cache = VulkanResidency::new(
+        memory.clone(),
+        device,
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let mut r = cache.access();
+    let buffer = r.device_buffer(
+        alias,
+        2 * page,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        false,
+        false,
+    )?;
+    let reader = memory.reader();
+    let ram = |address| -> Result<u32, VulkanError> {
+        let mut word = [0; 4];
+        reader.read_block_unsafe(address, &mut word)?;
+        Ok(u32::from_le_bytes(word))
+    };
+
+    r.fill_buffer(buffer.buffer, buffer.offset, 4, 1)?;
+    r.flush_read_span(base, 4)?;
+    r.flush_read_span(base, 4)?;
+    assert_eq!(ram(base)?, 1);
+
+    r.fill_buffer(buffer.buffer, buffer.offset + page, 4, 2)?;
+    let pending = r.prepare_buffer_read(alias + page, 4)?.unwrap();
+    assert!(
+        r.device_mut()
+            .wait_for_work(pending.work(), std::time::Duration::MAX)?
+    );
+    assert_eq!(ram(base + page)?, 0);
+
+    r.flush_read_span(alias, 4)?;
+    assert_eq!(ram(alias)?, 1);
+    assert!(r.buffer_cache.pending_read(base + page, 4).is_some());
+
+    r.flush_read_span(base + page, 4)?;
+    assert_eq!(ram(base + page)?, 2);
+    assert!(r.buffer_cache.pending_read(alias + page, 4).is_none());
+
+    r.fill_buffer(buffer.buffer, buffer.offset + page, 4, 3)?;
+    let pending = r.prepare_buffer_read(alias + page, 4)?.unwrap();
+    assert!(
+        r.device_mut()
+            .wait_for_work(pending.work(), std::time::Duration::MAX)?
+    );
+    r.progress_native_work()?;
+    assert_eq!(ram(base + page)?, 3);
+    assert!(r.buffer_cache.pending_read(alias + page, 4).is_none());
+    drop(r);
+    drop(cache);
+    validation.check()
+}
+
+#[test]
 fn clean_reads_follow_physical_writers_and_partial_publication() -> Result<(), VulkanError> {
     let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
         return Ok(());

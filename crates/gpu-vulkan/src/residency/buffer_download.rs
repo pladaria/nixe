@@ -334,6 +334,13 @@ impl BufferCache {
     }
     fn enqueue_read_download(&mut self, download: Download) -> DownloadEnd {
         let end = self.next_download_end(download.ticket.work());
+        // A clean proof may be reused through any device alias. Invalidate
+        // the captured publication destinations before adding the snapshot.
+        for publication in &download.publications {
+            for (_, input) in &publication.inputs {
+                self.device_memory.invalidate_owner_reads(input);
+            }
+        }
         self.read_download_ranges
             .extend(download.write_ranges.iter());
         #[cfg(feature = "performance-counters")]
@@ -421,7 +428,7 @@ impl BufferCache {
         }
         Ok(())
     }
-    fn publish_completed_reads(&mut self) -> Result<(), VulkanError> {
+    pub(super) fn publish_completed_reads(&mut self) -> Result<(), VulkanError> {
         while let Some((end, download)) = self.read_downloads.front() {
             if !download.download.ticket.is_complete()? {
                 break;
