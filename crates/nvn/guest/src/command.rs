@@ -509,7 +509,10 @@ pub fn program_ampere(c: &Call) -> Result<u64> {
     if let Some(dst) = reserve(c, op::PROGRAM, 1 + stages.len() * stride / 8)? {
         c.write(dst, &mask)?;
         for (index, &shader) in stages.iter().enumerate() {
-            c.write(dst + 8 + (index * stride) as u64, &shader.expand(p.compute))?;
+            c.write(
+                dst + 8 + (index * stride) as u64,
+                &shader.expand(p.compute, p.compute_local_memory_size),
+            )?;
         }
     }
     Ok(0)

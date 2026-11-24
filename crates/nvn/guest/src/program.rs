@@ -26,7 +26,7 @@ pub fn builder_shaders(c: &Call) -> Result<u64> {
 }
 
 impl AmpereShader {
-    pub fn expand(self, layout: ComputeLayout) -> Shader {
+    pub fn expand(self, layout: ComputeLayout, local_memory_size: u32) -> Shader {
         let compute = self.kind & Self::COMPUTE != 0;
         Shader {
             address: self.address,
@@ -43,7 +43,7 @@ impl AmpereShader {
             isa: 1,
             early_fragment_tests: if compute { 0 } else { self.extra as u8 },
             compute: if compute { layout } else { ComputeLayout::default() },
-            ..Default::default()
+            local_memory_size: if compute { local_memory_size } else { 0 },
         }
     }
 }

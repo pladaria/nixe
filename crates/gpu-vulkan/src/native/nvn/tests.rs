@@ -10,6 +10,60 @@ mod support {
 }
 
 #[test]
+fn nvn2_compute_compiles_with_private_spill_memory() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4 << 20)?.allocate(4096)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let address = 0x10000;
+    let _mapping = memory.map(
+        address,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 4096)?]),
+        true,
+    )?;
+    let code = [
+        0x000fe2000010080000000444ff007387u128, // STL [RZ + 4], R68
+        0x000fea0003800000000000000000794d,     // EXIT
+    ];
+    let bytes = code.map(u128::to_le_bytes);
+    memory.write_block_unsafe(
+        address,
+        nixe_memory::WriteSource::Bytes(bytes.as_flattened()),
+    )?;
+    let mut gpu = NativeGpuExecution::new(
+        memory,
+        device,
+        CacheConfiguration::default(),
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    shader::compute(
+        &mut gpu.execution(),
+        nixe_nvn::Shader {
+            address,
+            bytes: 32,
+            constants: 32,
+            stage: 5,
+            group: [1; 3],
+            isa: 1,
+            local_memory_size: 8,
+            ..Default::default()
+        },
+        &nixe_nvn::Bindings {
+            buffers: &Default::default(),
+            textures: &Default::default(),
+            bindless: None,
+        },
+    )?;
+    drop(gpu);
+    validation.check()?;
+    Ok(())
+}
+
+#[test]
 fn nvn_shader_survives_unrelated_mappings_until_its_code_is_unmapped()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {

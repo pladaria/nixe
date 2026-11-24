@@ -658,14 +658,16 @@ fn translate(
         let meta = EnvironmentMetadata {
             isa: ShaderIsa::try_from(u32::from(shader.isa)).map_err(error)?,
             stage,
-            local_memory_size: EnvironmentMetadata::graphics_local_memory_size(&sph).map_err(
-                |e| {
+            local_memory_size: if stage == Stage::Compute {
+                shader.local_memory_size
+            } else {
+                EnvironmentMetadata::graphics_local_memory_size(&sph).map_err(|e| {
                     error(format!(
                         "NVN {stage:?} shader at {:#x}: {e}",
                         shader.address
                     ))
-                },
-            )?,
+                })?
+            },
             sph,
             workgroup_size: shader.group.map(u32::from),
             shared_memory_size: if stage == Stage::Compute {

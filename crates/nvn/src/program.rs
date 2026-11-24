@@ -106,13 +106,17 @@ fn set_ampere_shaders(c: &Call, count: u32, data: u64, stride: u64) -> Result<u6
             return Err("invalid NVN2 shader extent".into());
         }
         let (kind, extra) = if kind == 5 {
-            let [x, y, z, shared]: [u32; 4] = c.read(control + 0x58)?;
+            let [x, y, z, shared, _, local_low]: [u32; 6] = c.read(control + 0x58)?;
             if ![x, y, z]
                 .into_iter()
                 .all(|dimension| (1..=1024).contains(&dimension))
             {
                 return Err("invalid NVN2 compute workgroup".into());
             }
+            // The SDK copies control +0x6c to the QMD's 24-bit local-memory
+            // low size. Each invocation uses it for its private spill area.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/compute/clc6c0qmd.h
+            program.compute_local_memory_size = local_low & 0x00ff_ffff;
             let words: [u8; 14] = c.read(control + 0xa9)?;
             program.compute = ComputeLayout {
                 roots: words[..8].try_into().unwrap(),

@@ -104,6 +104,8 @@ pub struct AmpereProgram {
     pub count: u64,
     pub stages: [AmpereShader; 5],
     pub compute: ComputeLayout,
+    pub compute_local_memory_size: u32,
+    pub padding: u32,
 }
 
 // The NVN2 program object has 160 bytes. Compute workgroups fit three
@@ -155,7 +157,7 @@ pub struct Shader {
     pub isa: u8,
     pub early_fragment_tests: u8,
     pub compute: ComputeLayout,
-    pub padding: u32,
+    pub local_memory_size: u32,
 }
 
 // NVN2 compute c[0]: a driver header, padded push blocks, then resource tables.

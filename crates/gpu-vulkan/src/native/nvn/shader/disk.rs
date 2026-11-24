@@ -44,8 +44,13 @@ pub(super) fn source_key(
         let data = bytemuck::bytes_of(shader);
         hash.update(
             &data[std::mem::offset_of!(nixe_nvn::Shader, bytes)
-                ..std::mem::offset_of!(nixe_nvn::Shader, padding)],
+                ..std::mem::offset_of!(nixe_nvn::Shader, local_memory_size)],
         );
+        // Zero used to be implicit. Keep the key for shaders without this
+        // extra compiler input, while separating nonzero private allocations.
+        if shader.local_memory_size != 0 {
+            hash.update(shader.local_memory_size.to_le_bytes());
+        }
         hash.update(source.code_digest);
     }
     if let Some(g) = graphics {
