@@ -187,3 +187,104 @@ fn counter_comparison_snapshots_device_writes_in_queue_order()
     validation.check()?;
     Ok(())
 }
+
+#[test]
+fn early_nvn_prefix_keeps_pending_publication_on_its_original_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nixe_gpu::GpuPresentation;
+
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4 << 20)?.allocate(4096)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let address = 0x10000;
+    let _mapping = memory.map(
+        address,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 4096)?]),
+        true,
+    )?;
+    let mut gpu = NativeGpuExecution::new(
+        memory,
+        device,
+        CacheConfiguration::default(),
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let target = Texture {
+        address,
+        width: 8,
+        height: 4,
+        depth: 1,
+        stride: 32,
+        flags: 0x10,
+        format: 0x25,
+        levels: 1,
+        target: 1,
+        samples: 1,
+        swizzle: [2, 3, 4, 5],
+        ..Default::default()
+    };
+    let record_pass =
+        |gpu: &mut NativeGpuExecution, color| -> Result<WorkTicket, BackendRuntimeError> {
+            gpu.begin_frame_work();
+            let mut native = gpu.execution();
+            native.issue_nvn(
+                1,
+                Operation::Clear {
+                    target,
+                    color,
+                    scissor: [0, 0, 8, 4],
+                    mask: 15,
+                },
+                &mut selections::Queue::default(),
+            )?;
+            let device = native.residency.device_mut();
+            for _ in 0..1024 {
+                assert!(!device.submission.nvn_prefix_full(&device.dispatch));
+            }
+            device.end_rendering().map_err(runtime)?;
+            Ok(device.current_work())
+        };
+    let end_frame = |gpu: &mut NativeGpuExecution, work: WorkTicket| -> Result<(), VulkanError> {
+        let mut residency = gpu.residency.access();
+        let device = residency.device_mut();
+        assert!(device.wait_for_work(work, Duration::from_secs(5))?);
+        device.submission.end_frame(work.tick(), 1);
+        Ok(())
+    };
+
+    let first = record_pass(&mut gpu, [0., 0., 1., 1.])?;
+    gpu.nvn_flush(false, None)?;
+    end_frame(&mut gpu, first)?;
+
+    let pending = record_pass(&mut gpu, [1., 0., 0., 1.])?;
+    let (send, done) = std::sync::mpsc::channel();
+    gpu.state.fences.queue(
+        Some(pending),
+        false,
+        Some(Box::new(move |result| {
+            let _ = send.send(result.is_ok());
+            result
+        })),
+    )?;
+    gpu.execution().submit_nvn_prefix_at_pass_end()?;
+    assert_eq!(gpu.residency.device().scheduled_tick(), first.tick());
+    assert!(matches!(
+        done.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    gpu.nvn_flush(false, None)?;
+    assert!(done.recv_timeout(Duration::from_secs(5))?);
+    end_frame(&mut gpu, pending)?;
+
+    let eligible = record_pass(&mut gpu, [0., 1., 0., 1.])?;
+    gpu.execution().submit_nvn_prefix_at_pass_end()?;
+    assert_eq!(gpu.residency.device().scheduled_tick(), eligible.tick());
+    end_frame(&mut gpu, eligible)?;
+    drop(gpu);
+    validation.check()?;
+    Ok(())
+}

@@ -107,6 +107,12 @@ impl FrameMetrics {
                 .total_vsync
                 .map_or(u64::MAX, |time| time.as_nanos() as u64),
         );
+        crate::trace::event(
+            "frame_present_interval",
+            sample.frame,
+            u64::from(sample.swap_interval),
+            sample.producer,
+        );
         let mut history = self.0.lock().unwrap();
         history.published += 1;
         sample.sequence = history.published;

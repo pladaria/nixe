@@ -182,6 +182,9 @@ impl NativeGpuExecution {
             if order != 0 {
                 n.residency.order_nvn(order).map_err(runtime)?;
                 order = 0;
+                if !matches!(&op, Operation::WaitEvent { .. } | Operation::FenceSync(_)) {
+                    n.submit_nvn_prefix_at_pass_end()?;
+                }
             }
             if let Operation::FenceSync(flush_for_cpu) = op {
                 n.residency.invalidate_nvn_uniforms();
@@ -220,6 +223,8 @@ impl NativeGpuExecution {
             let device = n.residency.device_mut();
             if device.submission.nvn_prefix_full(&device.dispatch) {
                 n.flush()?;
+            } else {
+                n.submit_nvn_prefix_at_pass_end()?;
             }
         }
         if order != 0 {
@@ -232,6 +237,18 @@ impl NativeGpuExecution {
     }
 }
 impl NativeExecution<'_> {
+    fn submit_nvn_prefix_at_pass_end(&mut self) -> Result<(), BackendRuntimeError> {
+        let device = self.residency.device_mut();
+        if device.submission.nvn_can_submit_early(&device.dispatch)
+            && !self.state.fences.has_publication_for(device.current_work())
+        {
+            device.submission.mark_nvn_early_submit();
+            nixe_gpu::trace::event("nvn_early_submit", device.current_work().tick(), 0, 0);
+            self.flush()?;
+        }
+        Ok(())
+    }
+
     fn issue_nvn(
         &mut self,
         queue: u64,

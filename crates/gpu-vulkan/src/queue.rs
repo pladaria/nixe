@@ -258,6 +258,10 @@ pub(crate) struct QueueState {
     pub scheduled: u64,
     submitted_serial: u64,
     nvn_operations: u32,
+    nvn_pass_end: u32,
+    nvn_frame_operations: u32,
+    nvn_previous_frame_operations: u32,
+    nvn_submitted_early: bool,
     last_flush: Option<Instant>,
     pub(crate) flush_pending: bool,
     pub completed: u64,
@@ -270,6 +274,7 @@ impl QueueState {
         if let Some(index) = self.recording
             && let Some(active) = self.slots[index].active_render_pass.take()
         {
+            self.nvn_pass_end = self.nvn_operations;
             active.end(dispatch);
         }
     }
@@ -310,6 +315,10 @@ impl QueueState {
             scheduled: 0,
             submitted_serial: 0,
             nvn_operations: 0,
+            nvn_pass_end: 0,
+            nvn_frame_operations: 0,
+            nvn_previous_frame_operations: 0,
+            nvn_submitted_early: false,
             last_flush: None,
             flush_pending: false,
             completed: 0,
@@ -485,6 +494,8 @@ impl QueueState {
         }
     }
     pub fn end_frame(&mut self, producer: u64, swap_interval: u32) {
+        self.nvn_previous_frame_operations = std::mem::take(&mut self.nvn_frame_operations);
+        self.nvn_submitted_early = false;
         self.frame_metrics
             .end_cpu(producer, swap_interval, self.calibration.as_ref());
     }
@@ -682,6 +693,27 @@ impl QueueState {
     pub(crate) fn finish_nvn_list(&mut self, dispatch: &crate::dispatch::Dispatch) {
         self.flush_pending |= self.has_recorded_work(dispatch);
     }
+    /// Only seal between complete guest operations, after a natural pass end.
+    pub(crate) fn nvn_can_submit_early(&self, dispatch: &crate::dispatch::Dispatch) -> bool {
+        // A new native batch has to rebind state. Amortize that over a substantial prefix.
+        const MIN_PREFIX: u32 = 773;
+        !self.nvn_submitted_early
+            && self.nvn_pass_end >= MIN_PREFIX
+            && self.nvn_operations <= self.nvn_pass_end + 1
+            // Save the extra submission for the end of the estimated frame.
+            && self.nvn_previous_frame_operations != 0
+            && self.nvn_frame_operations.saturating_add(self.nvn_operations)
+                >= self.nvn_previous_frame_operations.saturating_sub(MIN_PREFIX)
+            && self.deferred_clear.is_none()
+            && self.in_flight.len() + 1 < self.slots.len()
+            && self
+                .recording
+                .is_some_and(|index| self.slots[index].active_render_pass.is_none())
+            && self.has_recorded_work(dispatch)
+    }
+    pub(crate) fn mark_nvn_early_submit(&mut self) {
+        self.nvn_submitted_early = true;
+    }
     /// Bound long command streams in guest operations. Pipeline and descriptor
     /// binds emitted for one draw belong to that same operation.
     pub(crate) fn nvn_prefix_full(&mut self, dispatch: &crate::dispatch::Dispatch) -> bool {
@@ -689,8 +721,17 @@ impl QueueState {
         if self.nvn_operations < 4096 {
             return false;
         }
-        self.nvn_operations = 0;
-        self.has_recorded_work(dispatch)
+        if self.has_recorded_work(dispatch) {
+            return true;
+        }
+        self.account_nvn_operations();
+        false
+    }
+    fn account_nvn_operations(&mut self) {
+        self.nvn_frame_operations = self
+            .nvn_frame_operations
+            .saturating_add(std::mem::take(&mut self.nvn_operations));
+        self.nvn_pass_end = 0;
     }
     pub(crate) fn defer_flush(&mut self) -> bool {
         if self
@@ -800,7 +841,7 @@ impl QueueState {
         self.progress.scheduled_successfully(tick);
         self.last_flush = Some(Instant::now());
         self.flush_pending = false;
-        self.nvn_operations = 0;
+        self.account_nvn_operations();
         self.recording = None;
         self.allocate_context(dispatch)?;
         Ok(self.ticket(tick))

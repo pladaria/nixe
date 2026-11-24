@@ -31,6 +31,7 @@ pub(super) struct FenceManager {
     progress: Arc<SubmissionProgress>,
     worker: Option<JoinHandle<()>>,
     uncommitted_operations: Vec<nixe_gpu::FenceAction>,
+    last_ordered_tick: u64,
 }
 struct WorkerScope {
     progress: Arc<SubmissionProgress>,
@@ -232,6 +233,7 @@ impl FenceManager {
             progress,
             worker: Some(worker),
             uncommitted_operations: Vec::new(),
+            last_ordered_tick: 0,
         })
     }
     pub fn bind_wakeup(
@@ -253,6 +255,10 @@ impl FenceManager {
     pub fn sync_operation(&mut self, action: nixe_gpu::FenceAction) {
         self.uncommitted_operations.push(action);
     }
+    /// Keep optional batch splits from sealing work with queued CPU effects.
+    pub fn has_publication_for(&self, work: WorkTicket) -> bool {
+        self.last_ordered_tick >= work.tick() || !self.uncommitted_operations.is_empty()
+    }
     pub fn queue(
         &mut self,
         work: Option<WorkTicket>,
@@ -268,6 +274,11 @@ impl FenceManager {
         }
         if let Some(action) = action {
             self.uncommitted_operations.push(action);
+        }
+        if let Some(ticket) = work
+            && (flushes || !self.uncommitted_operations.is_empty())
+        {
+            self.last_ordered_tick = self.last_ordered_tick.max(ticket.tick());
         }
         state.pending.push_back(Fence {
             work,
