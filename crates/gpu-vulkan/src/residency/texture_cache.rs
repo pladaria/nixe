@@ -683,11 +683,14 @@ impl Residency<'_> {
                 .picked = false;
         }
         if let Some((id, _)) = found {
-            if info.storage {
-                let entry = &mut self.texture_cache.images[id];
-                entry.cached.as_mut().unwrap().info.storage = true;
-                entry.can_rescale = false;
-                self.scale_image(id, false, false)?;
+            if info.storage
+                && !self.texture_cache.images[id]
+                    .cached
+                    .as_ref()
+                    .unwrap()
+                    .storage_access()
+            {
+                self.use_original_image_grid(id)?;
             }
             self.touch(Resource::Image(id));
             self.runtime.statistics.cache_hits += 1;

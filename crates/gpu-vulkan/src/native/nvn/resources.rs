@@ -236,7 +236,7 @@ pub(super) fn info(t: Texture, sampled: bool) -> Result<ImageInfo, VulkanError> 
         maybe_unaligned_layer_stride: l.layer_stride,
         size,
         packing: ImagePacking::Native,
-        storage: t.flags & nixe_nvn::Texture::IMAGE != 0,
+        storage: false,
         sample_grid: grid,
     })
 }
@@ -286,6 +286,7 @@ pub(super) fn descriptor_view(
     native: &mut NativeExecution<'_>,
     input: &nixe_nvn::Sampled,
     arrayed: bool,
+    writable: bool,
 ) -> Result<ImageViewId, VulkanError> {
     let texture_id = input.descriptor_ids()[0];
     let epoch = (
@@ -305,6 +306,12 @@ pub(super) fn descriptor_view(
             entry.insert(SampledImage::new(input.texture)?)
         }
     };
+    // NVN_TEXTURE_FLAGS_IMAGE grants access. The reflected shader decides
+    // whether native guest-grid writes can actually take place.
+    if writable && !selected.info.storage {
+        Rc::make_mut(&mut selected.info).storage = true;
+        selected.views.fill(None);
+    }
     let index = usize::from(arrayed);
     Ok(match selected.views[index] {
         Some((generation, view)) if generation == epoch => view,
@@ -335,7 +342,7 @@ pub(super) fn binding(
     arrayed: bool,
 ) -> Result<HostBinding, VulkanError> {
     let sampler_id = input.descriptor_ids()[1];
-    let view = descriptor_view(native, input, arrayed)?;
+    let view = descriptor_view(native, input, arrayed, false)?;
     let format = native.residency.image_view_description(view)?.format;
     let force_nearest = input.sampler.comparison == 0
         && !native

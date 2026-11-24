@@ -142,6 +142,18 @@ impl Residency<'_> {
         if children.is_empty() {
             return Ok(());
         }
+        if !canonical.storage_access()
+            && children.iter().any(|&child| {
+                self.texture_cache
+                    .get(child)
+                    .cached
+                    .as_ref()
+                    .unwrap()
+                    .storage_access()
+            })
+        {
+            self.use_original_image_grid(id)?;
+        }
         let retained = self.runtime.constructing.len();
         self.runtime
             .constructing

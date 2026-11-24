@@ -238,6 +238,34 @@ impl Residency<'_> {
         self.runtime.constructing.truncate(retained);
         result
     }
+    pub(super) fn use_original_image_grid(&mut self, id: ImageId) -> Result<(), VulkanError> {
+        let entry = &mut self.texture_cache.images[id];
+        entry.cached.as_mut().unwrap().info.storage = true;
+        entry.can_rescale = false;
+
+        // Storage writes address individual guest texels. Aliases must share
+        // their producer's grid when synchronizing overlapping subresources.
+        let mut aliases: smallvec::SmallVec<[ImageId; 8]> = smallvec::smallvec![id];
+        let mut index = 0;
+        while index < aliases.len() {
+            for alias in &self.texture_cache.images[aliases[index]].aliases {
+                if !aliases.contains(&alias.image) {
+                    aliases.push(alias.image);
+                }
+            }
+            index += 1;
+        }
+        let retained = self.runtime.constructing.len();
+        self.runtime
+            .constructing
+            .extend(aliases.iter().copied().map(Resource::Image));
+        let result = aliases.into_iter().try_for_each(|alias| {
+            self.texture_cache.images[alias].rescale_checked = false;
+            self.scale_image(alias, false, false)
+        });
+        self.runtime.constructing.truncate(retained);
+        result
+    }
     fn rescale_target_images(&mut self, ids: &[ImageId]) -> Result<bool, VulkanError> {
         let mut can_rescale = !ids.is_empty();
         let mut any_rescaled = false;

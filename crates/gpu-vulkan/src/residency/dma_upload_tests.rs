@@ -198,6 +198,51 @@ fn array_registration_preserves_and_adopts_resident_layers() -> Result<(), Vulka
 }
 
 #[test]
+fn storage_write_restores_the_guest_grid_for_aliased_targets() -> Result<(), VulkanError> {
+    let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let bytes = 64 * 320;
+    let allocation = machine.account(4 << 20)?.allocate(bytes)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let address = 0x10000;
+    let _mapping = memory.map(
+        address,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, bytes)?]),
+        true,
+    )?;
+    let mut cache = VulkanResidency::new(memory, device, 64 << 20, BufferDownloadPolicy::OnRead)?;
+    let mut r = cache.access();
+    r.change_resolution(crate::ResolutionScaling::new(2, 0))?;
+    let layout = ImageMemoryLayout::BlockLinear(BlockLinearLayout {
+        block_width_log2: 0,
+        block_height_log2: 0,
+        block_depth_log2: 0,
+        layer_stride: bytes,
+    });
+    let mut target = info(address, ImageFormat::R32Uint, 16, 320, layout);
+    target.layer_stride = bytes;
+    target.maybe_unaligned_layer_stride = bytes;
+    target.size = bytes;
+    let id = r.insert_guest_image(&target, &SPACE)?;
+    let alias = r.insert_guest_image(&target, &Space(2))?;
+    for image in [id, alias] {
+        r.scale_image(image, true, false)?;
+    }
+
+    target.storage = true;
+    assert_eq!(r.find_image(&target, &SPACE)?, Some((id, [0, 0])));
+    for image in [id, alias] {
+        assert!(!r.texture_cache.get(image).rescaled);
+        assert!(!r.texture_cache.image_can_rescale(image));
+    }
+    r.flush()?;
+    validation.check()
+}
+
+#[test]
 fn nvn_buffer_upload_uses_independent_row_and_layer_strides() -> Result<(), VulkanError> {
     let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
         return Ok(());

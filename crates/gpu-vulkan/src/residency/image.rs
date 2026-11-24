@@ -199,6 +199,9 @@ impl Residency<'_> {
             "resident image",
             |bytes| self.charge(bytes),
         )?;
+        let storage_write = cached
+            .as_ref()
+            .is_some_and(|cached| cached.storage_access());
         let can_rescale = cached.as_ref().is_some_and(|cached| {
             cached.can_rescale(
                 sync::native_image_aspects(description.format) != vk::ImageAspectFlags::COLOR,
@@ -245,6 +248,9 @@ impl Residency<'_> {
         });
         self.texture_cache.register_image_mappings(id);
         self.register_image_aliases(id)?;
+        if storage_write && !self.texture_cache.images[id].aliases.is_empty() {
+            self.use_original_image_grid(id)?;
+        }
         self.absorb_array_aliases(id)?;
         self.runtime.statistics.image_allocations += 1;
         self.runtime.statistics.image_layout_plans +=

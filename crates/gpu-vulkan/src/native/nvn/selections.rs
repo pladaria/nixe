@@ -195,7 +195,7 @@ impl Program {
 
 enum Binding {
     Texture([u32; 2], bool),
-    Image(u32, bool, nixe_shader_recompiler::types::ImageFormat),
+    Image(u32, bool, nixe_shader_recompiler::types::ImageFormat, bool),
     Buffer(Range),
     Driver(Arc<[u8]>),
     Texel(u32),
@@ -408,10 +408,11 @@ impl NativeExecution<'_> {
                     use nixe_shader_recompiler::types::TextureType as T;
                     let arrayed =
                         matches!(ty, T::ColorArray1D | T::ColorArray2D | T::ColorArrayCube);
+                    let writable = pipeline.native.resources[i].writes();
                     let dynamic;
                     let input = if let Some(key) = bindless {
                         let ids = shader::bindless_descriptor_ids(&mut self.residency, bindings, stage, key)?;
-                        if matches!(previous, Some(Binding::Image(old, a, f)) if (*old,*a,*f) == (ids[0],arrayed,format)) {
+                        if matches!(previous, Some(Binding::Image(old, a, f, w)) if (*old, *a, *f, *w) == (ids[0], arrayed, format, writable)) {
                             continue;
                         }
                         dynamic = bindings.bindless.unwrap().resolve(ids);
@@ -424,14 +425,14 @@ impl NativeExecution<'_> {
                         ))
                     })?;
                     let id = input.descriptor_ids()[0];
-                    if matches!(previous, Some(Binding::Image(old, a, f)) if (*old,*a,*f) == (id,arrayed,format))
+                    if matches!(previous, Some(Binding::Image(old, a, f, w)) if (*old, *a, *f, *w) == (id, arrayed, format, writable))
                     {
                         continue;
                     }
-                    let view = resources::descriptor_view(self, input, arrayed)?;
+                    let view = resources::descriptor_view(self, input, arrayed, writable)?;
                     let view = self.residency.storage_image_view(view, format)?;
                     (
-                        Binding::Image(id, arrayed, format),
+                        Binding::Image(id, arrayed, format, writable),
                         HostBinding::Image(self.residency.host_image(view)?),
                     )
                 }
