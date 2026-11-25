@@ -541,39 +541,20 @@ impl NativeExecution<'_> {
                     if matches!(previous, Some(Binding::Buffer(old)) if *old == range) {
                         continue;
                     }
-                    // A zero extent leaves the storage pointer live in the driver
-                    // bank. Vulkan requires a byte range for the backing descriptor.
-                    let physical = if storage && range.address != 0 {
-                        let limits = &self.residency.device().profile().limits;
-                        let prefix = range.address % limits.min_storage_buffer_offset_alignment;
-                        let size = if range.size == 0 {
-                            selected
-                                .pool_bounds
-                                .as_ref()
-                                .and_then(|p| p.remaining(range.address))
-                                .ok_or_else(|| {
-                                    error(format!(
-                                        "unmapped NVN storage address {:#x}",
-                                        range.address
-                                    ))
-                                })?
-                        } else {
-                            range.size
-                        };
-                        // The compiler forms the byte offset relative to the
-                        // aligned base, including any prefix before the guest pointer.
-                        Range {
-                            address: range.address - prefix,
-                            size: (size + prefix).min(u64::from(limits.max_storage_buffer_range)),
-                        }
-                    } else {
-                        range
-                    };
-                    let binding = if physical.size == 0 {
+                    let binding = if storage && range.address != 0 {
+                        self.nvn_storage_binding(
+                            range,
+                            selected.pool_bounds.as_deref(),
+                            pipeline,
+                            input,
+                        )?
+                    } else if range.size == 0 {
                         HostBinding::NullBuffer
                     } else {
-                        self.nvn_buffer(physical, storage)?
+                        self.nvn_buffer(range, storage)?
                     };
+                    // Keep the original pointer so a later mapping invalidates a
+                    // null binding even if the pointer value is unchanged.
                     (Binding::Buffer(range), binding)
                 }
             };
@@ -589,5 +570,74 @@ impl NativeExecution<'_> {
             }
         }
         Ok(())
+    }
+
+    #[inline]
+    pub(super) fn nvn_storage_binding(
+        &mut self,
+        range: Range,
+        pools: Option<&nixe_nvn::PoolBounds>,
+        pipeline: &shader::Program,
+        input: &shader::Input,
+    ) -> Result<HostBinding, VulkanError> {
+        // A zero extent leaves the storage pointer live in the driver bank.
+        // Vulkan requires a byte range for the backing descriptor.
+        let size = if range.size != 0 {
+            range.size
+        } else if let Some(size) = pools.and_then(|p| p.remaining(range.address)) {
+            size
+        } else {
+            return self.nvn_unmapped_storage(range.address, pipeline, input);
+        };
+        let limits = &self.residency.device().profile().limits;
+        let prefix = range.address % limits.min_storage_buffer_offset_alignment;
+        // Shader offsets are relative to the aligned descriptor base.
+        self.nvn_buffer(
+            Range {
+                address: range.address - prefix,
+                size: (size + prefix).min(u64::from(limits.max_storage_buffer_range)),
+            },
+            true,
+        )
+    }
+
+    #[cold]
+    fn nvn_unmapped_storage(
+        &mut self,
+        address: u64,
+        pipeline: &shader::Program,
+        input: &shader::Input,
+    ) -> Result<HostBinding, VulkanError> {
+        let stage = match *input {
+            shader::Input::Storage(stage, _) | shader::Input::StoragePointer(stage, _) => stage,
+            _ => unreachable!(),
+        };
+        let shader = &pipeline
+            .usage
+            .stages
+            .iter()
+            .find(|source| source.shader.stage == stage)
+            .expect("storage pointer belongs to a linked stage")
+            .shader;
+        let memory = self.residency.device_memory();
+        let mapped = memory.physical_address(address).is_some();
+        if shader.isa != 1 || address >= 1 << memory.address_bits() || mapped {
+            return Err(error(format_args!(
+                "NVN storage address {address:#x} has no live pool extent (mapped={mapped}, shader={:#x}, input={input:?})",
+                shader.address
+            )));
+        }
+        // @SIMPLIFICATION An unsized pointer whose base page is unmapped uses a
+        // null binding. Loads return zero and stores are discarded. Accesses
+        // through offsets into later mapped pages require per-page translation.
+        // https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/nvn_mtl.m#L13336-L13356
+        if !self.state.nvn.reported_unmapped_storage {
+            log::debug!(
+                "NVN2 storage address {address:#x} is unmapped; using a null descriptor (shader={:#x}, input={input:?})",
+                shader.address
+            );
+            self.state.nvn.reported_unmapped_storage = true;
+        }
+        Ok(HostBinding::NullBuffer)
     }
 }

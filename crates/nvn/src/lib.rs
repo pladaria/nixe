@@ -212,6 +212,7 @@ procedures! {
         SyncInitialize => sync_initialize,
         SyncFinalize => sync_finalize,
         QueueFenceSync => fence,
+        QueueFinish => finish,
         QueueFlush => flush,
         QueueAcquireTexture => acquire,
         SyncWait => wait,

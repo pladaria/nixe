@@ -31,6 +31,10 @@ impl Fence {
         self.0.lock().unwrap().result.clone()
     }
 
+    fn completion(&self) -> Result<()> {
+        self.result().ok_or("fence woke before GPU completion")?
+    }
+
     /// Allocate a kernel event only when the calling guest thread must park.
     pub fn event(&self, scheduler: &Arc<SchedulerState>) -> Option<ReadableEventObject> {
         let mut state = self.0.lock().unwrap();
@@ -50,6 +54,7 @@ impl Fence {
 pub enum PendingWait {
     Acquire(Duration),
     Fence(Arc<Fence>, u64),
+    QueueFinish(Arc<Fence>),
 }
 
 impl PendingWait {
@@ -57,10 +62,8 @@ impl PendingWait {
         match self {
             Self::Acquire(_) => Ok(0),
             Self::Fence(_, _) if timed_out => Ok(2),
-            Self::Fence(f, _) => f
-                .result()
-                .ok_or("fence woke before GPU completion")?
-                .map(|()| 1),
+            Self::Fence(f, _) => f.completion().map(|()| 1),
+            Self::QueueFinish(f) => f.completion().map(|()| 0),
         }
     }
 }
@@ -221,6 +224,22 @@ pub fn flush(c: &Call) -> Result<u64> {
     queue(c)?.ordered(|_| c.session.graphics()?.backend.flush(c.args[0]))?;
     Ok(0)
 }
+pub fn finish(c: &Call) -> Result<u64> {
+    if c.args[0] == 0 {
+        return Ok(0);
+    }
+    let fence = Arc::new(Fence::default());
+    // Finish flushes the queue with a CPU-visible fence. Keep the receipt
+    // private and release the queue lock before the guest waits on it.
+    queue(c)?.ordered(|_| {
+        c.session
+            .graphics()?
+            .backend
+            .fence(c.args[0], fence.clone(), true)
+    })?;
+    c.pending.set(Some(PendingWait::QueueFinish(fence)));
+    Ok(0)
+}
 pub fn acquire(c: &Call) -> Result<u64> {
     acquire_slot(c, c.args[1])
 }
@@ -317,4 +336,87 @@ pub fn present(c: &Call) -> Result<u64> {
         )
     })?;
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixe_memory::{AddressWidth, Machine, PAGE_SIZE, device_memory::DeviceMemory};
+    use std::sync::mpsc;
+
+    struct FenceBackend(mpsc::Sender<(u64, Arc<Fence>, bool)>);
+
+    impl Backend for FenceBackend {
+        fn submit(&self, _: u64, _: Submission) -> Result<()> {
+            unreachable!()
+        }
+        fn drain(&self) -> Result<()> {
+            unreachable!()
+        }
+        fn finalize_queue(&self, _: u64) -> Result<()> {
+            unreachable!()
+        }
+        fn acquire_fence(&self, _: Arc<Fence>) -> Result<()> {
+            unreachable!()
+        }
+        fn fence(&self, queue: u64, fence: Arc<Fence>, flush_for_cpu: bool) -> Result<()> {
+            self.0.send((queue, fence, flush_for_cpu)).unwrap();
+            Ok(())
+        }
+        fn flush(&self, _: u64) -> Result<()> {
+            unreachable!()
+        }
+        fn present(&self, _: u64, _: Texture, _: u32, _: bool, _: [u32; 4]) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn queue_finish_waits_on_a_private_cpu_visible_fence() {
+        let machine = Machine::new(PAGE_SIZE * 2).unwrap();
+        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
+        for platform in [TargetPlatform::Switch1, TargetPlatform::Switch2] {
+            let session = Session::for_platform(platform);
+            let (send, receive) = mpsc::channel();
+            session
+                .attach(Graphics {
+                    surfaces: None,
+                    heap: DeviceHeapMemory::new(DeviceMemory::new(machine.clone(), 32)),
+                    backend: Arc::new(FenceBackend(send)),
+                    display: None,
+                })
+                .unwrap();
+            let address = 0x1000;
+            session.queues.lock().unwrap().state.insert(
+                address,
+                Arc::new(Queue {
+                    upper_left: false,
+                    minus_one_to_one: false,
+                    capture: Mutex::new(Some(command::Capture::default())),
+                }),
+            );
+            let finish = resolve(platform, "nvnQueueFinish").unwrap();
+            let call = Call {
+                session: &session,
+                memory: &space,
+                args: [address, 0, 0, 0, 0, 0, 0, 0],
+                pending: Default::default(),
+            };
+            for result in [Ok(()), Err("GPU fence failed".into())] {
+                assert_eq!(finish(&call), Ok(0));
+                let pending = call.pending.take().unwrap();
+                let PendingWait::QueueFinish(wait_fence) = &pending else {
+                    panic!("expected a queue completion wait");
+                };
+                let (queue, receipt, flush_for_cpu) = receive.try_recv().unwrap();
+                assert_eq!(queue, address);
+                assert!(flush_for_cpu);
+                assert!(Arc::ptr_eq(wait_fence, &receipt));
+                assert!(receipt.result().is_none());
+                assert!(session.queues.lock().unwrap().syncs.is_empty());
+                receipt.signal(result.clone());
+                assert_eq!(pending.complete(false), result.map(|()| 0));
+            }
+        }
+    }
 }

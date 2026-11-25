@@ -127,13 +127,14 @@ pub(crate) fn wait_on_guest(
     use nixe_nvn::PendingWait;
     use nixe_scheduler::{WaitOutcome, WaitStart};
     let scheduler = context.process().scheduler();
-    let (event, timeout) = match &pending {
-        PendingWait::Acquire(d) => (None, Some(d.as_nanos() as u64)),
-        PendingWait::Fence(f, ns) => (f.event(scheduler), (*ns != u64::MAX).then_some(*ns)),
+    let wait = match &pending {
+        PendingWait::Acquire(d) => Some((None, Some(d.as_nanos() as u64))),
+        PendingWait::Fence(f, ns) => f
+            .event(scheduler)
+            .map(|event| (Some(event), (*ns != u64::MAX).then_some(*ns))),
+        PendingWait::QueueFinish(f) => f.event(scheduler).map(|event| (Some(event), None)),
     };
-    let expired = if event.is_none() && matches!(&pending, PendingWait::Fence(..)) {
-        false // GPU completed between the poll and registration of its event.
-    } else {
+    let expired = if let Some((event, timeout)) = wait {
         let start = scheduler
             .wait_on_objects(context.thread().id(), event.as_slice(), timeout, false)
             .map_err(|e| e.to_string())?;
@@ -147,6 +148,8 @@ pub(crate) fn wait_on_guest(
             }
         };
         matches!(outcome, WaitOutcome::TimedOut)
+    } else {
+        false // The GPU receipt resolved before its event was needed.
     };
     let value = pending.complete(expired)?;
     context.thread_mut().state_mut().write_x(

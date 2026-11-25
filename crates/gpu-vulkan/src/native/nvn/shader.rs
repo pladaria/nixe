@@ -10,7 +10,7 @@ mod bindless;
 mod disk;
 pub(super) use bindless::{Descriptors, read_cbuf};
 pub(in crate::native) use disk::Archive;
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) enum Input {
     Driver(u32, u32, usize),
     Texture {

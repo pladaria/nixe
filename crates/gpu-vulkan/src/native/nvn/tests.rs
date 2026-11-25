@@ -65,6 +65,138 @@ fn nvn2_compute_compiles_with_private_spill_memory() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn nvn2_unsized_storage_uses_null_for_an_unmapped_base() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4 << 20)?.allocate(3 * 4096)?;
+    let memory = DeviceMemory::with_reservation_start(machine, 40, 1 << 39);
+    let code = 0x10000;
+    let output = 0x11000;
+    let source = 0x22_013c_06c4;
+    let _mapping = memory.map(
+        code,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 8192)?]),
+        true,
+    )?;
+    let words = [
+        0x0000000000000a0006000000ff007b82u128, // LDC.64 R0, c[24][0]
+        0x0000000000000a0006000200ff047b82,     // LDC.64 R4, c[24][8]
+        0x00000000001e89000000000000027381,     // LDG.E R2, [R0]
+        0x000000000010a900000000ff00007386,     // STG.E [R0], RZ
+        0x000000000010a9000000000204007386,     // STG.E [R4], R2
+        0x000fea0003800000000000000000794d,     // EXIT
+    ];
+    let words = words.map(u128::to_le_bytes);
+    let bytes = words.as_flattened();
+    memory.write_block_unsafe(code, nixe_memory::WriteSource::Bytes(bytes))?;
+    memory.write_block_unsafe(output, nixe_memory::WriteSource::Bytes(&1u32.to_le_bytes()))?;
+    let mut gpu = NativeGpuExecution::new(
+        memory.clone(),
+        device,
+        CacheConfiguration::default(),
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let mut native = gpu.execution();
+    let pipeline = shader::compute(
+        &mut native,
+        nixe_nvn::Shader {
+            address: code,
+            bytes: bytes.len() as u32,
+            constants: bytes.len() as u32,
+            stage: 5,
+            group: [1; 3],
+            isa: 1,
+            ..Default::default()
+        },
+        &nixe_nvn::Bindings {
+            buffers: &Default::default(),
+            textures: &Default::default(),
+            bindless: None,
+        },
+        &mut shader::Descriptors::default(),
+    )?;
+    let mut program = native.residency.new_nvn_program(pipeline.native.clone())?;
+    let mut source_slot = None;
+    for (index, input) in pipeline.inputs.iter().enumerate() {
+        let binding = match input {
+            shader::Input::StoragePointer(5, key) if key.offset.0 == 0 => {
+                source_slot = Some(index);
+                let range = nixe_nvn::Range {
+                    address: source,
+                    size: 0,
+                };
+                let binding = native.nvn_storage_binding(range, None, &pipeline, input)?;
+                assert!(matches!(binding, HostBinding::NullBuffer));
+                binding
+            }
+            shader::Input::StoragePointer(5, key) if key.offset.0 == 8 => {
+                let range = nixe_nvn::Range {
+                    address: output,
+                    size: 4,
+                };
+                native.nvn_storage_binding(range, None, &pipeline, input)?
+            }
+            shader::Input::Push(0) => {
+                let mut bytes = [0; 256];
+                bytes[..8].copy_from_slice(&source.to_le_bytes());
+                bytes[8..16].copy_from_slice(&output.to_le_bytes());
+                HostBinding::UniformBytes(Arc::from(bytes))
+            }
+            other => panic!("unexpected compute input: {other:?}"),
+        };
+        native
+            .residency
+            .update_host_binding(&mut program, index, &binding)?;
+    }
+    let slot = source_slot.expect("shader reads and writes through the unsized pointer");
+    let dispatch = crate::Dispatch::Direct([1; 3]);
+    native
+        .residency
+        .dispatch_bound(&program, dispatch, &[], false)?;
+    native.residency.flush_read_span(output, 4)?;
+    let mut result = [0xff; 4];
+    memory.reader().read_block_unsafe(output, &mut result)?;
+    assert_eq!(u32::from_le_bytes(result), 0);
+    drop(native);
+    let _source = memory.map(
+        source & !4095,
+        Arc::from([AllocationRange::new(allocation.pin(), 8192, 4096)?]),
+        true,
+    )?;
+    memory.write_block_unsafe(source, nixe_memory::WriteSource::Bytes(&7u32.to_le_bytes()))?;
+    let mut native = gpu.execution();
+    let input = &pipeline.inputs[slot];
+    let range = nixe_nvn::Range {
+        address: source,
+        size: 0,
+    };
+    let error = native.nvn_storage_binding(range, None, &pipeline, input);
+    assert!(
+        matches!(error, Err(VulkanError::Compilation(message)) if message.contains("mapped=true"))
+    );
+    let binding =
+        native.nvn_storage_binding(nixe_nvn::Range { size: 4, ..range }, None, &pipeline, input)?;
+    native
+        .residency
+        .update_host_binding(&mut program, slot, &binding)?;
+    native
+        .residency
+        .dispatch_bound(&program, dispatch, &[], false)?;
+    native.residency.flush_read_span(output, 4)?;
+    memory.reader().read_block_unsafe(output, &mut result)?;
+    assert_eq!(u32::from_le_bytes(result), 7);
+    drop(program);
+    drop(native);
+    drop(gpu);
+    validation.check()?;
+    Ok(())
+}
+
+#[test]
 fn nvn_shader_survives_unrelated_mappings_until_its_code_is_unmapped()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {

@@ -36,6 +36,7 @@ pub(super) struct Cache {
     sampled: resources::SampledSelections,
     compute: HashMap<(nixe_nvn::Shader, Shapes), Rc<shader::Program>>,
     compiler: Option<nixe_shader_recompiler::Compiler>,
+    reported_unmapped_storage: bool,
 }
 enum ReportClock {
     Maxwell(std::time::Instant),
