@@ -340,7 +340,7 @@ impl Residency<'_> {
     }
     pub(crate) fn flush_region(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
         self.runtime.device.realize_deferred_clear()?;
-        self.download_texture_memory(address, bytes)?;
+        self.download_texture_memory(address, bytes, false)?;
         self.read_buffer_memory(address, bytes)?;
         self.caches
             .query_cache
@@ -404,7 +404,7 @@ impl Residency<'_> {
             // Buffer-only reads return after submission. A query store has a
             // real dependency on overlapping read copies and resolves them
             // before publishing its value on this ordered owner boundary.
-            self.download_texture_memory(area.start, area.end - area.start)?;
+            self.download_texture_memory(area.start, area.end - area.start, true)?;
             let end = self.prepare_buffer_read(area.start, area.end - area.start)?;
             if self
                 .caches

@@ -3,6 +3,42 @@
 use super::*;
 use crate::transfer::host_read_barrier;
 
+const NVN_READBACK_HISTORY: usize = 16;
+const NVN_READBACK_MAX_BYTES: u64 = 1 << 20;
+
+pub(super) struct NvnReadback {
+    image: ImageId,
+    last_read: u64,
+    repeated: bool,
+    snapshot: Option<StagedNvnReadback>,
+}
+
+struct StagedNvnReadback {
+    version: u64,
+    mapping_generation: u64,
+    download: ImageDownload,
+}
+
+impl ImageEntry {
+    fn nvn_readback_size(&self) -> Option<u64> {
+        let [plane] = self.planes.as_ref() else {
+            return None;
+        };
+        if !self.reactive_download
+            || !self.synchronized
+            || self.rescaled
+            || self.description.samples != vk::SampleCountFlags::TYPE_1
+            || self.dma.pending()
+            || self.dma.mixed_authority
+        {
+            return None;
+        }
+        let plane = self.storage_plane(*plane);
+        let size = plane.end()? - plane.offset;
+        (size <= NVN_READBACK_MAX_BYTES).then_some(size)
+    }
+}
+
 pub(super) struct ImageDownload {
     work: WorkTicket,
     ticket: crate::ReadbackTicket,
@@ -69,6 +105,33 @@ impl Residency<'_> {
     }
 }
 impl TextureCache {
+    pub(super) fn forget_nvn_readback(&mut self, id: ImageId) {
+        self.nvn_readbacks.retain(|read| read.image != id);
+    }
+
+    fn observe_nvn_readback(&mut self, id: ImageId) {
+        let entry = self.get(id);
+        if entry.nvn_readback_size().is_none() {
+            return;
+        }
+        let version = entry.modification_tick;
+        let repeated = if let Some(index) = self.nvn_readbacks.iter().position(|r| r.image == id) {
+            let previous = self.nvn_readbacks.remove(index);
+            previous.repeated || previous.last_read != version
+        } else {
+            if self.nvn_readbacks.len() == NVN_READBACK_HISTORY {
+                self.nvn_readbacks.remove(0);
+            }
+            false
+        };
+        self.nvn_readbacks.push(NvnReadback {
+            image: id,
+            last_read: version,
+            repeated,
+            snapshot: None,
+        });
+    }
+
     pub(super) fn flush_area<const REACTIVE: bool>(
         &mut self,
         address: u64,
@@ -131,6 +194,43 @@ impl TextureCache {
     }
 }
 impl Residency<'_> {
+    pub(crate) fn stage_nvn_readbacks(&mut self) -> Result<(), VulkanError> {
+        if self.texture_cache.nvn_readbacks.is_empty() {
+            return Ok(());
+        }
+        let mapping_generation = self.runtime.device_memory.generation();
+        for index in 0..self.texture_cache.nvn_readbacks.len() {
+            let read = &self.texture_cache.nvn_readbacks[index];
+            let id = read.image;
+            let entry = self.texture_cache.get(id);
+            let version = entry.modification_tick;
+            // @SPECULATIVE A texture read back in successive versions is likely
+            // to be needed again after the next NVN fence. Stage at most once
+            // per observed read, and keep the bytes private until requested.
+            if !read.repeated
+                || read.snapshot.is_some()
+                || !entry.gpu_modified
+                || read.last_read == version
+            {
+                continue;
+            }
+            let Some(size) = entry.nvn_readback_size() else {
+                continue;
+            };
+            if let Some(download) =
+                self.record_texture_downloads(&[id], dma_upload::DmaUse::Fence)?
+            {
+                nixe_gpu::trace::event("nvn_readback_stage", download.work.tick(), size, 0);
+                self.texture_cache.nvn_readbacks[index].snapshot = Some(StagedNvnReadback {
+                    version,
+                    mapping_generation,
+                    download,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn record_texture_downloads(
         &mut self,
         ids: &[ImageId],
@@ -320,10 +420,11 @@ impl Residency<'_> {
     pub(crate) fn texture_visibility_work(&self) -> Option<WorkTicket> {
         self.texture_cache.downloads.back().and_then(Download::work)
     }
-    pub(crate) fn download_texture_memory(
+    pub(super) fn download_texture_memory(
         &mut self,
         address: u64,
         bytes: u64,
+        cpu_read: bool,
     ) -> Result<(), VulkanError> {
         let mut ids = Vec::new();
         for page in address >> 20..=(address + bytes - 1) >> 20 {
@@ -349,7 +450,7 @@ impl Residency<'_> {
         #[cfg(feature = "performance-counters")]
         let _trace = (!ids.is_empty())
             .then(|| nixe_gpu::trace::span("read_texture", address, bytes, ids.len() as u64));
-        self.download_images(ids)
+        self.download_images(ids, cpu_read)
     }
     /// An inline upload updates RAM, whereas a dirty image may hold the only
     /// copy of its other texels. Preserve those texels before the RAM store
@@ -417,11 +518,18 @@ impl Residency<'_> {
                     }
                 }
             }
-            return self.download_images(preserved);
+            return self.download_images(preserved, false);
         }
         Ok(())
     }
-    fn download_images(&mut self, mut ids: Vec<ImageId>) -> Result<(), VulkanError> {
+    fn download_images(
+        &mut self,
+        mut ids: Vec<ImageId>,
+        cpu_read: bool,
+    ) -> Result<(), VulkanError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         ids.sort_by_key(|&id| self.texture_cache.get(id).modification_tick);
         // Later producers publish last. An older representation fully covered
         // by a later one would only download and copy bytes immediately replaced
@@ -445,17 +553,59 @@ impl Residency<'_> {
             }
         }
         selected.reverse();
+        let mut staged = smallvec::SmallVec::<[ImageDownload; 1]>::new();
+        if !self.texture_cache.nvn_readbacks.is_empty() {
+            let mapping_generation = self.runtime.device_memory.generation();
+            for &id in &selected {
+                let entry = self.texture_cache.get(id);
+                let version = entry.modification_tick;
+                if entry.nvn_readback_size().is_none() {
+                    continue;
+                }
+                if let Some(snapshot) = self
+                    .texture_cache
+                    .nvn_readbacks
+                    .iter_mut()
+                    .find(|read| read.image == id)
+                    .and_then(|read| read.snapshot.take())
+                    .filter(|s| s.version == version && s.mapping_generation == mapping_generation)
+                {
+                    staged.push(snapshot.download);
+                }
+            }
+        }
         for &id in &ids {
             self.texture_cache.images[id].gpu_modified = false;
         }
-        if let Some(download) =
+        if staged.len() == selected.len() {
+            let work = staged
+                .iter()
+                .map(|d| d.work)
+                .max_by_key(|w| w.tick())
+                .unwrap();
+            self.runtime
+                .device
+                .wait_for_work(work, std::time::Duration::MAX)?;
+            nixe_gpu::trace::event("nvn_readback_hit", work.tick(), staged.len() as u64, 0);
+            for download in staged {
+                self.texture_cache.publish_image_download(download)?;
+            }
+        } else if let Some(download) = {
+            // Preserve the reactive path's publication order when some aliases
+            // have no staged version. A single reservation covers that read.
+            drop(staged);
             self.record_texture_downloads(&selected, dma_upload::DmaUse::Readback)?
-        {
+        } {
             self.flush()?;
             self.runtime
                 .device
                 .wait_for_work(download.work, std::time::Duration::MAX)?;
             self.texture_cache.publish_image_download(download)?;
+        }
+        if cpu_read {
+            for id in selected {
+                self.texture_cache.observe_nvn_readback(id);
+            }
         }
         Ok(())
     }

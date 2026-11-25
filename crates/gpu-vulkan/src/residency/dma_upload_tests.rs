@@ -115,7 +115,7 @@ fn explicit_render_targets_publish_each_gpu_version_on_demand() -> Result<(), Vu
         assert!(r.texture_cache.flush_area::<false>(address, 4).is_none());
         let area = r.texture_cache.flush_area::<true>(address, 4).unwrap();
         assert!(!area.preemptive);
-        r.download_texture_memory(area.start, area.end - area.start)?;
+        r.download_texture_memory(area.start, area.end - area.start, true)?;
         let mut word = [0; 4];
         memory.reader().read_block_unsafe(address, &mut word)?;
         assert_eq!(u32::from_le_bytes(word), value);
@@ -126,7 +126,98 @@ fn explicit_render_targets_publish_each_gpu_version_on_demand() -> Result<(), Vu
 }
 
 #[test]
-fn array_registration_preserves_and_adopts_resident_layers() -> Result<(), VulkanError> {
+fn nvn_fence_stages_repeated_reads_without_publishing_stale_texels() -> Result<(), VulkanError> {
+    let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4 << 20)?.allocate(8192)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let address = 0x10000;
+    let _mapping = memory.map(
+        address,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 8192)?]),
+        true,
+    )?;
+    let mut cache = VulkanResidency::new(
+        memory.clone(),
+        device,
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let mut r = cache.access();
+    let block_layout = BlockLinearLayout {
+        block_width_log2: 0,
+        block_height_log2: 0,
+        block_depth_log2: 0,
+        layer_stride: 4096,
+    };
+    for (index, layout) in [
+        ImageMemoryLayout::BlockLinear(block_layout),
+        ImageMemoryLayout::BlockLinearAmpere(block_layout),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let address = address + index as u64 * 4096;
+        let image = r.insert_guest_image(
+            &info(address, ImageFormat::R32Uint, 16, 16, layout),
+            &Space(crate::native::NVN_IMAGE_SPACE_ID),
+        )?;
+        let clear = |r: &mut Residency<'_>, value| {
+            r.clear_color_image(
+                image,
+                0,
+                vk::ClearColorValue {
+                    uint32: [value, 0, 0, 0],
+                },
+            )
+        };
+        let read_ram = || -> Result<u32, VulkanError> {
+            let mut word = [0; 4];
+            memory.reader().read_block_unsafe(address, &mut word)?;
+            Ok(u32::from_le_bytes(word))
+        };
+        for value in [0x1020_3040, 0x5060_7080] {
+            clear(&mut r, value)?;
+            r.download_texture_memory(address, 4, true)?;
+            assert_eq!(read_ram()?, value);
+        }
+
+        clear(&mut r, 0x1122_3344)?;
+        r.stage_nvn_readbacks()?;
+        let fence = r.flush()?;
+        assert_eq!(read_ram()?, 0x5060_7080);
+        r.download_texture_memory(address, 4, true)?;
+        assert_eq!(r.device().submission.scheduled, fence.tick());
+        assert_eq!(read_ram()?, 0x1122_3344);
+
+        clear(&mut r, 0x5566_7788)?;
+        r.stage_nvn_readbacks()?;
+        let fence = r.flush()?;
+        clear(&mut r, 0x99aa_bbcc)?;
+        r.download_texture_memory(address, 4, true)?;
+        assert_eq!(r.device().submission.scheduled, fence.tick() + 1);
+        assert_eq!(read_ram()?, 0x99aa_bbcc);
+
+        clear(&mut r, 0x0102_0304)?;
+        r.stage_nvn_readbacks()?;
+        let fence = r.flush()?;
+        let bytes = 0xddcc_bbaau32.to_le_bytes();
+        memory.write_block_unsafe(address, WriteSource::Bytes(&bytes))?;
+        r.texture_cache.write_memory(address, 4);
+        r.prepare_image(image, false, false)?;
+        r.download_texture_memory(address, 4, true)?;
+        assert_eq!(r.device().submission.scheduled, fence.tick() + 1);
+        assert_eq!(read_ram()?, u32::from_le_bytes(bytes));
+    }
+    drop(r);
+    validation.check()
+}
+
+#[test]
+fn registering_an_array_preserves_live_layer_aliases() -> Result<(), VulkanError> {
     let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
         return Ok(());
     };
@@ -153,19 +244,22 @@ fn array_registration_preserves_and_adopts_resident_layers() -> Result<(), Vulka
         block_depth_log2: 0,
         layer_stride: 4096,
     });
-    let layers = [address, address + 4096].map(|a| info(a, ImageFormat::R32Uint, 16, 16, layout));
-    for (layer, value) in layers.iter().zip([0x13579bdf, 0x2468ace0]) {
-        let image = r.insert_guest_image(layer, &SPACE)?;
+    let first = info(address, ImageFormat::R32Uint, 16, 16, layout);
+    let second = info(address + 4096, ImageFormat::R32Uint, 16, 16, layout);
+    let first_layer = r.insert_guest_image(&first, &SPACE)?;
+    let second_layer = r.insert_guest_image(&second, &SPACE)?;
+    let clear = |r: &mut Residency<'_>, image, value| {
         r.clear_color_image(
             image,
             0,
             vk::ClearColorValue {
                 uint32: [value, 0, 0, 0],
             },
-        )?;
-    }
-    let mut array = layers[0].clone();
-    array.size = 8192;
+        )
+    };
+    clear(&mut r, first_layer, 0x1357_9bdf)?;
+    clear(&mut r, second_layer, 0x2468_ace0)?;
+    let mut array = first;
     array.description = ImageDescription::new(
         ImageDimension::Two,
         array.description.extent(),
@@ -176,25 +270,21 @@ fn array_registration_preserves_and_adopts_resident_layers() -> Result<(), Vulka
         SampleCount::One,
     )
     .unwrap();
-    let image = r.insert_guest_image(&array, &SPACE)?;
-    assert!(r.texture_cache.get(image).aliases.is_empty());
-    for (index, layer) in layers.iter().enumerate() {
-        assert_eq!(
-            r.find_image(layer, &SPACE)?,
-            Some((image, [0, index as u32]))
-        );
-    }
-    r.download_image_memory(image)?;
-    for (layer, value) in layers.iter().zip([0x13579bdfu32, 0x2468ace0]) {
+    array.size = 8192;
+    let array = r.insert_guest_image(&array, &SPACE)?;
+    assert!(r.texture_cache.binding_current(first_layer));
+    assert!(r.texture_cache.binding_current(second_layer));
+    r.prepare_image(array, false, false)?;
+    clear(&mut r, first_layer, 0xaabb_ccdd)?;
+    r.prepare_image(array, false, false)?;
+    r.download_image_memory(array)?;
+    for (address, value) in [(address, 0xaabb_ccdd_u32), (second.address, 0x2468_ace0)] {
         let mut word = [0; 4];
-        memory
-            .reader()
-            .read_block_unsafe(layer.address, &mut word)?;
+        memory.reader().read_block_unsafe(address, &mut word)?;
         assert_eq!(u32::from_le_bytes(word), value);
     }
     drop(r);
-    validation.check()?;
-    Ok(())
+    validation.check()
 }
 
 #[test]
@@ -510,7 +600,7 @@ fn check_alias(format: ImageFormat) -> Result<(), VulkanError> {
         (area.start, area.end, area.preemptive),
         (alias, alias + 4, true)
     );
-    r.download_texture_memory(alias, 4)?;
+    r.download_texture_memory(alias, 4, false)?;
     assert!(r.texture_cache.get(other).dma.pending());
     assert_eq!(r.statistics().native_readback_bytes, 0);
     r.flush()?;

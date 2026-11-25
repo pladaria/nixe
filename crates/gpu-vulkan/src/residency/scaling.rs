@@ -375,8 +375,12 @@ impl Residency<'_> {
         ignore: bool,
         invalidate: bool,
     ) -> Result<(), VulkanError> {
-        if self.texture_cache.get(id).rescaled == up {
+        let entry = self.texture_cache.get(id);
+        if entry.rescaled == up {
             return Ok(());
+        }
+        if entry.reactive_download && entry.gpu_modified {
+            self.texture_cache.forget_nvn_readback(id);
         }
         self.runtime.device.realize_deferred_clear()?;
         let scale = self.resolution();

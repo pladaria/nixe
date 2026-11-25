@@ -1007,6 +1007,9 @@ impl nixe_gpu::GpuPresentation for NativeGpuExecution {
             n.residency.commit_buffer_downloads().map_err(runtime)?;
         }
         let work = if n.residency.has_recorded_work() {
+            if action.is_some() {
+                n.residency.stage_nvn_readbacks().map_err(runtime)?;
+            }
             nixe_gpu::trace::event(
                 "nvn_queue_flush",
                 n.residency.device().current_work().tick(),

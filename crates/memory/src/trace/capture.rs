@@ -238,6 +238,8 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
                 | "nvn_command_capture"
                 | "nvn_command_reuse"
                 | "nvn_queue_flush"
+                | "nvn_readback_stage"
+                | "nvn_readback_hit"
                 | "nvn_early_submit"
                 | "vulkan_submit_site"
                 | "frame_queue"

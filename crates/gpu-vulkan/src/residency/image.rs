@@ -247,11 +247,12 @@ impl Residency<'_> {
             decoded,
         });
         self.texture_cache.register_image_mappings(id);
+        // Keep existing image representations and their independent write history.
+        // Registering an array must not replace a previously resident layer.
         self.register_image_aliases(id)?;
         if storage_write && !self.texture_cache.images[id].aliases.is_empty() {
             self.use_original_image_grid(id)?;
         }
-        self.absorb_array_aliases(id)?;
         self.runtime.statistics.image_allocations += 1;
         self.runtime.statistics.image_layout_plans +=
             self.texture_cache.get(id).contents.geometry.len() as u64;
@@ -337,6 +338,10 @@ impl Residency<'_> {
         Ok(())
     }
     fn refresh_original_image(&mut self, id: ImageId) -> Result<(), VulkanError> {
+        let entry = self.texture_cache.get(id);
+        if entry.reactive_download && entry.gpu_modified {
+            self.texture_cache.forget_nvn_readback(id);
+        }
         // Eden RefreshContents uploads the full CPU-modified image. Aliases are
         // synchronized separately by their image modification ticks.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L1115-L1178

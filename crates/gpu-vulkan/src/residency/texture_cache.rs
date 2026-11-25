@@ -16,8 +16,8 @@ pub struct ImageRegistration {
 }
 pub(super) struct CachedImage {
     pub(super) info: ImageInfo,
-    pub(super) address_space: u64,
-    pub(super) remapped: bool,
+    address_space: u64,
+    remapped: bool,
     picked: bool,
     cpu_address: u64,
     slices: smallvec::SmallVec<[(u64, [u32; 2]); 16]>,
@@ -147,7 +147,7 @@ impl CachedImage {
         }
         Some([level as u32, layer as u32])
     }
-    pub(super) fn base(&self, other: &ImageInfo) -> Option<[u32; 2]> {
+    fn base(&self, other: &ImageInfo) -> Option<[u32; 2]> {
         let existing = &self.info;
         let a = existing.description;
         let b = other.description;
@@ -313,6 +313,9 @@ impl TextureCache {
 }
 impl TextureCache {
     pub(super) fn delete_image(&mut self, id: ImageId) {
+        if self.images[id].reactive_download {
+            self.forget_nvn_readback(id);
+        }
         self.unregister_image_aliases(id);
         self.unregister_image_mappings(id);
         let view_ids = std::mem::take(&mut self.images[id].views);
