@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use nixe_config::WindowState;
+use nixe_gpu_vulkan::ResolutionScaling;
 use nixe_gpu_vulkan::smooth_motion::SmoothMotion;
 use nixe_input::{
     EmulatedTouchContact, TOUCH_SCREEN_HEIGHT, TOUCH_SCREEN_WIDTH, TouchScreenReader,
@@ -106,6 +107,13 @@ impl FrameNotifier for EventLoopFrameNotifier {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum GraphicsEmulation {
+    NvnHle,
+    Nvn2Hle,
+    LowLevel,
+}
+
 /// Main-thread owner of the window, input and UI state.
 pub struct WindowFrontend {
     event_loop: EventLoop<FrontendEvent>,
@@ -161,6 +169,7 @@ impl WindowFrontend {
                 cursor_hidden: false,
                 presenter: None,
                 game_title: None,
+                graphics_emulation: None,
                 failure: None,
                 initial_window_state: None,
                 last_window_state: None,
@@ -244,6 +253,13 @@ impl WindowFrontend {
         } else {
             self.application.game_title = Some(title);
         }
+        self
+    }
+
+    /// Sets the guest graphics mode for the title before creating the window.
+    #[must_use]
+    pub fn with_graphics_emulation(mut self, graphics_emulation: GraphicsEmulation) -> Self {
+        self.application.graphics_emulation = Some(graphics_emulation);
         self
     }
 
@@ -534,13 +550,20 @@ fn window_title(
     game: Option<&str>,
     backend: &str,
     output: Option<(u32, u32)>,
+    resolution_scale: ResolutionScaling,
     fps: Option<f64>,
     presentation_fps: Option<f64>,
     smooth_motion: bool,
 ) -> String {
     let output = output.map_or_else(
         || "-".to_owned(),
-        |(width, height)| format!("{width}×{height}"),
+        |(width, height)| {
+            if resolution_scale.up_factor == 1.0 {
+                format!("{width}×{height}")
+            } else {
+                format!("{width}×{height} ({}x)", resolution_scale.up_factor)
+            }
+        },
     );
     let fps = fps.map(|fps| fps.round() as u64);
     let presentation_fps = presentation_fps.map(|fps| fps.round() as u64);
@@ -580,6 +603,7 @@ struct PresenterApplication {
     cursor_hidden: bool,
     presenter: Option<Presenter>,
     game_title: Option<String>,
+    graphics_emulation: Option<GraphicsEmulation>,
     failure: Option<WindowError>,
     initial_window_state: Option<WindowState>,
     last_window_state: Option<WindowState>,
@@ -1127,6 +1151,29 @@ impl std::error::Error for WindowError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_title_shows_only_non_native_resolution_multipliers() {
+        for (scale, resolution) in [
+            (ResolutionScaling::new(1, 0), "1920×1080"),
+            (ResolutionScaling::new(3, 1), "1920×1080 (1.5x)"),
+            (ResolutionScaling::new(2, 0), "1920×1080 (2x)"),
+            (ResolutionScaling::new(3, 0), "1920×1080 (3x)"),
+        ] {
+            assert_eq!(
+                window_title(
+                    Some("Game"),
+                    "Vulkan (NVN HLE)",
+                    Some((1920, 1080)),
+                    scale,
+                    Some(60.0),
+                    None,
+                    false,
+                ),
+                format!("Nixe - Game | Vulkan (NVN HLE) | {resolution} | 60 FPS"),
+            );
+        }
+    }
 
     #[test]
     fn hotkeys_require_a_real_press_edge_and_ignore_repeats_and_synthetic_events() {

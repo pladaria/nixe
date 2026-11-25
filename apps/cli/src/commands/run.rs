@@ -23,7 +23,7 @@ use nixe_runtime::{
     RunnableProcess, Runtime, VirtualClock, VirtualClockMode,
 };
 use nixe_scheduler::ProcessId;
-use nixe_video_winit::{FrontendControl, WindowFrontend};
+use nixe_video_winit::{FrontendControl, GraphicsEmulation, WindowFrontend};
 
 use crate::logging::LogLevel;
 
@@ -370,7 +370,19 @@ fn run_machine(
             None
         }
     };
-    frontend = frontend.map(|frontend| frontend.with_window_state(saved_window_state));
+    let ampere = machine_profile.graphics() == GraphicsGeneration::Ampere;
+    let hle = process.uses_nvn_hle();
+    let graphics_emulation = match (hle, ampere) {
+        (true, false) => GraphicsEmulation::NvnHle,
+        (true, true) => GraphicsEmulation::Nvn2Hle,
+        (false, _) => GraphicsEmulation::LowLevel,
+    };
+    frontend = frontend.map(|frontend| {
+        frontend
+            .with_window_state(saved_window_state)
+            .with_game_title(title_name.clone())
+            .with_graphics_emulation(graphics_emulation)
+    });
     let mut options = vulkan;
     options.scaling_filter = config.video.scaling_filter;
     options.anti_aliasing = config.video.anti_aliasing;
@@ -393,7 +405,6 @@ fn run_machine(
     );
     let vsync = config.video.vsync;
     let mme_jit = config.gpu.mme_jit;
-    let ampere = machine_profile.graphics() == GraphicsGeneration::Ampere;
     let progress = frontend.as_ref().map(WindowFrontend::compilation_progress);
     let cache_directory = config
         .gpu
@@ -406,7 +417,6 @@ fn run_machine(
         // Ampere initializes its renderer on the first guest GPU request. Publish
         // only diagnostic handles at startup; sampling never calls the GPU owner.
         let video_system = if ampere {
-            let hle = video_process.uses_nvn_hle();
             // Physical NVN2 pools use their backing's 39-bit virtual address.
             // Separate reservations for virtual pools and driver allocations.
             let memory = nixe_memory::device_memory::DeviceMemory::with_reservation_start(
@@ -469,7 +479,6 @@ fn run_machine(
                 ..Default::default()
             };
             let cache_load_stop = Arc::clone(&frontend_stop_requested);
-            let hle = video_process.uses_nvn_hle();
             let nvn_directory = cache_directory.clone();
             let nvn_stop = Arc::clone(&cache_load_stop);
             let maxwell = move |renderer: std::rc::Rc<
@@ -585,7 +594,6 @@ fn run_machine(
     };
     let mut volume = config.audio.volume;
     let frontend = frontend
-        .with_game_title(title_name.clone())
         .with_screenshots(title_name.clone(), config.filesystem.screenshots.clone())
         .with_volume_handler(move |delta| {
             volume = volume.saturating_add_signed(delta).min(100);

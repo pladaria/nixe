@@ -24,12 +24,25 @@ impl PresenterState {
             screenshots: None,
         }
     }
-
+}
+impl Deref for Presenter {
+    type Target = PresenterState;
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
+}
+impl DerefMut for Presenter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.common
+    }
+}
+impl Presenter {
     pub(super) fn update_title(&mut self) {
         let mut title = window_title(
             self.game_title.as_deref(),
             self.backend_name,
             self.frame_dimensions,
+            self.client.resolution_scale(),
             self.frame_rate.frames_per_second(),
             self.smooth_motion
                 .as_ref()
@@ -44,19 +57,7 @@ impl PresenterState {
             self.displayed_title = title;
         }
     }
-}
-impl Deref for Presenter {
-    type Target = PresenterState;
-    fn deref(&self) -> &Self::Target {
-        &self.common
-    }
-}
-impl DerefMut for Presenter {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.common
-    }
-}
-impl Presenter {
+
     pub(super) fn cycle_anti_aliasing(&self) {
         self.client.cycle_anti_aliasing();
     }
@@ -206,7 +207,7 @@ impl Presenter {
             if let Some(rate) = &mut self.common.smooth_motion {
                 rate.refresh(elapsed, self.client.presentation_count());
             }
-            self.common.update_title();
+            self.update_title();
         }
     }
     pub(super) fn redraw(&mut self) -> Result<(), WindowError> {
@@ -278,11 +279,19 @@ impl WindowFrontend {
         &mut self,
         options: nixe_gpu_vulkan::DeviceOptions,
     ) -> Result<(nixe_gpu_vulkan::VulkanDevice, PresentationClient), WindowError> {
+        let backend_name = match self.application.graphics_emulation {
+            Some(GraphicsEmulation::NvnHle) => "Vulkan (NVN HLE)",
+            Some(GraphicsEmulation::Nvn2Hle) => "Vulkan (NVN2 HLE)",
+            Some(GraphicsEmulation::LowLevel) => "Vulkan (GPU LLE)",
+            None => "Vulkan",
+        };
+        let resolution_scale = options.resolution_scale;
         let mut attributes = WindowAttributes::default()
             .with_title(window_title(
                 self.application.game_title.as_deref(),
-                "Vulkan",
+                backend_name,
                 None,
+                resolution_scale,
                 None,
                 None,
                 self.application.smooth_motion.is_some(),
@@ -323,7 +332,7 @@ impl WindowFrontend {
             ));
         }
         let size = window.inner_size();
-        let client = PresentationClient::default();
+        let client = PresentationClient::new(resolution_scale);
         let proxy = self.control.proxy.clone();
         client.set_notifier(Arc::new(move || {
             let _ = proxy.send_event(FrontendEvent::FrameAvailable);
@@ -331,7 +340,7 @@ impl WindowFrontend {
         self.application.presenter = Some(Presenter {
             common: PresenterState::new(
                 window,
-                "Vulkan",
+                backend_name,
                 self.application.game_title.take(),
                 self.application.smooth_motion.take(),
             ),

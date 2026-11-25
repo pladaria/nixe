@@ -45,6 +45,7 @@ struct Control {
     size: [u32; 2],
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
     stopped: bool,
+    resolution_scale: ResolutionScaling,
     resolution_steps: u8,
     anti_aliasing_steps: u8,
     failure: Option<String>,
@@ -57,6 +58,21 @@ struct Control {
 #[derive(Clone, Default)]
 pub struct PresentationClient(Arc<Mutex<Control>>);
 impl PresentationClient {
+    pub fn new(resolution_scale: ResolutionScaling) -> Self {
+        Self(Arc::new(Mutex::new(Control {
+            resolution_scale,
+            ..Control::default()
+        })))
+    }
+
+    pub fn resolution_scale(&self) -> ResolutionScaling {
+        self.0.lock().unwrap().resolution_scale
+    }
+
+    pub(crate) fn set_resolution_scale(&self, resolution_scale: ResolutionScaling) {
+        self.0.lock().unwrap().resolution_scale = resolution_scale;
+    }
+
     pub fn cycle_resolution(&self) {
         let wake = {
             let mut state = self.0.lock().unwrap();

@@ -234,11 +234,10 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
     fn service_host_requests(&mut self) -> Result<(), Error> {
         let mut renderer = self.renderer.borrow_mut();
         let renderer = renderer.as_mut().expect("installed renderer");
-        let (steps, anti_aliasing_steps) = renderer
-            .state
-            .host
-            .as_ref()
-            .map_or((0, 0), |host| host.client.take_setting_steps());
+        let Some(host) = &renderer.state.host else {
+            return Ok(());
+        };
+        let (steps, anti_aliasing_steps) = host.client.take_setting_steps();
         if anti_aliasing_steps != 0 {
             renderer
                 .state
@@ -266,6 +265,7 @@ impl MaxwellFrontend for MaxwellVulkanRasterizer {
             .map_err(compilation)?;
         self.pipelines.change_resolution(resolution);
         renderer.state.nvn.change_resolution();
+        host.client.set_resolution_scale(resolution);
         log::info!(
             "render resolution scale changed to {}x",
             resolution.up_factor
