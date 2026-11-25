@@ -40,6 +40,42 @@ struct Scan {
     pipeline: NativePipeline,
     descriptors: DescriptorCache,
 }
+
+/// A run of reset-to-report windows that each ended in one native query.
+/// Vulkan can write those results directly to equally spaced guest records.
+struct ReportBatch {
+    destination: vk::Buffer,
+    first_query: u32,
+    offset: u64,
+    stride: u64,
+    timestamps: Vec<u64>,
+}
+impl ReportBatch {
+    fn offset_at(&self, index: u64) -> u64 {
+        self.offset + index * self.stride
+    }
+
+    fn append(&mut self, destination: vk::Buffer, query: u32, offset: u64, timestamp: u64) -> bool {
+        let count = self.timestamps.len() as u32;
+        if self.destination != destination || query != self.first_query + count {
+            return false;
+        }
+        if count == 1 {
+            let Some(stride) = offset
+                .checked_sub(self.offset)
+                .filter(|&stride| stride >= 16)
+            else {
+                return false;
+            };
+            self.stride = stride;
+        } else if offset != self.offset_at(u64::from(count)) {
+            return false;
+        }
+        self.timestamps.push(timestamp.to_le());
+        true
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Samples {
     pub(crate) enabled: bool,
@@ -48,6 +84,8 @@ pub(crate) struct Samples {
     pending: VecDeque<Pending>,
     free: Vec<Arc<Pool>>,
     scan: Option<Scan>,
+    reset_pending: bool,
+    reports: Option<ReportBatch>,
 }
 impl Samples {
     pub fn pause(&mut self, dispatch: &mut crate::dispatch::Dispatch) {
@@ -63,6 +101,58 @@ impl Samples {
         {
             self.free.push(self.pending.pop_front().unwrap().pool);
         }
+    }
+
+    pub(crate) fn reports_overlap(&self, buffer: vk::Buffer, offset: u64, bytes: u64) -> bool {
+        self.reports.as_ref().is_some_and(|batch| {
+            let limit = batch.offset_at(batch.timestamps.len() as u64 - 1) + 16;
+            batch.destination == buffer && offset < limit && batch.offset < offset + bytes
+        })
+    }
+}
+
+impl QueueState {
+    pub(crate) fn has_sample_reports(&self) -> bool {
+        self.samples.reports.is_some()
+    }
+
+    pub(super) fn resolve_sample_reports(
+        &mut self,
+        dispatch: &mut crate::dispatch::Dispatch,
+    ) -> Result<(), VulkanError> {
+        let Some(batch) = self.samples.reports.take() else {
+            return Ok(());
+        };
+        let upload = self.reserve_upload_aligned(bytemuck::cast_slice(&batch.timestamps), 8)?;
+        let stamps: Vec<_> = (0..batch.timestamps.len() as u64)
+            .map(|index| {
+                vk::BufferCopy::default()
+                    .src_offset(upload.offset + 8 * index)
+                    .dst_offset(batch.offset_at(index) + 8)
+                    .size(8)
+            })
+            .collect();
+        let pool = self
+            .samples
+            .current
+            .as_ref()
+            .expect("sample report bank")
+            .pool
+            .handle;
+        #[cfg(feature = "execution-trace")]
+        {
+            self.statistics.sample_report_copies += 1;
+            self.statistics.sample_reports_batched += stamps.len() as u64;
+        }
+        dispatch.copy_sample_reports(
+            pool,
+            batch.first_query,
+            batch.destination,
+            (batch.offset, batch.stride),
+            upload.buffer,
+            &stamps,
+        );
+        Ok(())
     }
 }
 impl VulkanDevice {
@@ -139,23 +229,70 @@ impl VulkanDevice {
         self.prepare_samples(enabled)
     }
     pub(crate) fn reset_samples_passed(&mut self) -> Result<(), VulkanError> {
-        self.end_rendering()?;
         let samples = &mut self.submission.samples;
-        // Abandon queries preceding this reset; their pools stay alive until
-        // native completion. Previously exported reports own separate buffers.
+        if samples.scan.is_none() {
+            return Err(VulkanError::InvalidResource(
+                "sample queries require the shared pipeline compiler",
+            ));
+        }
+        // Reports already queued own their query slots. Apply the reset to the
+        // running sum only when a later report or bank needs that sum.
+        samples.pause(&mut self.dispatch);
         if let Some(bank) = &mut samples.current {
             bank.first = bank.used;
         }
-        let accumulation = samples.scan.as_ref().ok_or(VulkanError::InvalidResource(
-            "sample queries require the shared pipeline compiler",
-        ))?;
-        unsafe {
-            self.dispatch
-                .cmd_fill_buffer(accumulation.accumulation.handle, 0, 8, 0)
-        };
+        samples.reset_pending = true;
         Ok(())
     }
+
+    pub(crate) fn defer_sample_report(
+        &mut self,
+        destination: vk::Buffer,
+        offset: u64,
+        timestamp: u64,
+    ) -> bool {
+        let samples = &mut self.submission.samples;
+        let Some(bank) = &samples.current else {
+            return false;
+        };
+        if !samples.reset_pending
+            || !offset.is_multiple_of(8)
+            || bank.used != bank.first + 1
+            || samples.active.is_none()
+        {
+            return false;
+        }
+        if let Some(batch) = &mut samples.reports {
+            if !batch.append(destination, bank.first, offset, timestamp) {
+                return false;
+            }
+        } else {
+            samples.reports = Some(ReportBatch {
+                destination,
+                first_query: bank.first,
+                offset,
+                stride: 16,
+                timestamps: vec![timestamp.to_le()],
+            });
+        }
+        samples.pause(&mut self.dispatch);
+        true
+    }
+
     fn scan_samples(&mut self) -> Result<(), VulkanError> {
+        debug_assert!(self.submission.samples.reports.is_none());
+        if std::mem::take(&mut self.submission.samples.reset_pending) {
+            let scan = self
+                .submission
+                .samples
+                .scan
+                .as_ref()
+                .expect("initialized query scanner");
+            unsafe {
+                self.dispatch
+                    .cmd_fill_buffer(scan.accumulation.handle, 0, 8, 0)
+            };
+        }
         let samples = &self.submission.samples;
         let Some(bank) = &samples.current else {
             return Ok(());
@@ -185,6 +322,11 @@ impl VulkanDevice {
             None,
         )?;
         unsafe { self.dispatch.cmd_dispatch(1, 1, 1) };
+        #[cfg(feature = "execution-trace")]
+        {
+            self.submission.statistics.sample_report_copies += 1;
+            self.submission.statistics.sample_report_scans += 1;
+        }
         self.dispatch.complete_query_scan();
         let work = self.current_work();
         let bank = self.submission.samples.current.as_mut().unwrap();

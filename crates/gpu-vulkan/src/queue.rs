@@ -231,6 +231,12 @@ pub struct RecordingStatistics {
     pub rendering_scopes: u64,
     pub draw_calls: u64,
     #[cfg(feature = "execution-trace")]
+    pub(crate) sample_report_copies: u64,
+    #[cfg(feature = "execution-trace")]
+    pub(crate) sample_report_scans: u64,
+    #[cfg(feature = "execution-trace")]
+    pub(crate) sample_reports_batched: u64,
+    #[cfg(feature = "execution-trace")]
     pub(crate) draw_sample_frame: u64,
 }
 pub(crate) struct QueueState {
@@ -269,7 +275,10 @@ pub(crate) struct QueueState {
     lost: bool,
 }
 impl QueueState {
-    pub(crate) fn end_rendering(&mut self, dispatch: &mut crate::dispatch::Dispatch) {
+    pub(crate) fn end_rendering(
+        &mut self,
+        dispatch: &mut crate::dispatch::Dispatch,
+    ) -> Result<(), VulkanError> {
         self.samples.pause(dispatch);
         if let Some(index) = self.recording
             && let Some(active) = self.slots[index].active_render_pass.take()
@@ -277,6 +286,7 @@ impl QueueState {
             self.nvn_pass_end = self.nvn_operations;
             active.end(dispatch);
         }
+        self.resolve_sample_reports(dispatch)
     }
     pub fn new(
         owner: Arc<DeviceOwner>,
@@ -763,7 +773,7 @@ impl QueueState {
                 "queue semaphore extensions require owned native parameters",
             ));
         }
-        self.end_rendering(dispatch);
+        self.end_rendering(dispatch)?;
         if self.slots[index].frame.is_none() {
             self.slots[index].frame = self.frame_metrics.begin_submission();
         }
@@ -1039,8 +1049,7 @@ impl VulkanDevice {
     }
     pub(crate) fn end_rendering(&mut self) -> Result<(), VulkanError> {
         self.realize_deferred_clear()?;
-        self.submission.end_rendering(&mut self.dispatch);
-        Ok(())
+        self.submission.end_rendering(&mut self.dispatch)
     }
     /// Index of the scheduler's already allocated command context. A stopped
     /// device has no context; this query never allocates or admits native work.

@@ -68,6 +68,38 @@ impl Dispatch {
             Ok(())
         });
     }
+    // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyQueryPoolResults.html
+    pub(crate) fn copy_sample_reports(
+        &mut self,
+        pool: vk::QueryPool,
+        first: u32,
+        destination: vk::Buffer,
+        (offset, stride): (u64, u64),
+        timestamps: vk::Buffer,
+        stamps: &[vk::BufferCopy],
+    ) {
+        unsafe {
+            self.recorder.record_array(stamps, move |context, stamps| {
+                copy_barrier(context, false);
+                context.device.cmd_copy_query_pool_results(
+                    context.command,
+                    pool,
+                    first,
+                    stamps.len() as u32,
+                    destination,
+                    offset,
+                    stride,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                );
+                copy_barrier(context, false);
+                context
+                    .device
+                    .cmd_copy_buffer(context.command, timestamps, destination, stamps);
+                copy_barrier(context, true);
+                Ok(())
+            });
+        }
+    }
     pub(crate) fn prepare_occlusion_results(
         &mut self,
         pool: vk::QueryPool,

@@ -804,6 +804,37 @@ impl Residency<'_> {
         }
         Ok(())
     }
+
+    pub(crate) fn write_nvn_sample_report(
+        &mut self,
+        address: u64,
+        timestamp: u64,
+    ) -> Result<(), VulkanError> {
+        let size = 16;
+        let range = self.device_buffer(
+            address,
+            size,
+            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+            true,
+            false,
+        )?;
+        // Accesses through this native buffer resolve the batch before touching
+        // a report. Aliased mappings can reach those bytes through other buffers.
+        let mut aliased = false;
+        self.runtime
+            .device_memory
+            .apply_device_aliases(address, size, |_, _| aliased = true);
+        let output = self.use_buffer(range.buffer, range.offset, size)?;
+        if !aliased
+            && self
+                .runtime
+                .device
+                .defer_sample_report(output, range.offset, timestamp)
+        {
+            return self.finish_buffer_write(range.buffer, range.offset, size);
+        }
+        self.write_sample_report(range, false, timestamp)
+    }
     pub(crate) fn has_recorded_work(&self) -> bool {
         let device = &self.runtime.device;
         !self.runtime.barriers.is_empty() || device.submission.has_recorded_work(&device.dispatch)

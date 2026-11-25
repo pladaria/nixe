@@ -76,7 +76,7 @@ impl VulkanDevice {
         let Some(clear) = self.submission.deferred_clear.take() else {
             return Ok(());
         };
-        self.submission.end_rendering(&mut self.dispatch);
+        self.submission.end_rendering(&mut self.dispatch)?;
         let mut pass = clear.targets.pass;
         pass.color_clear |= clear.color_mask;
         let mut values = smallvec::SmallVec::<[vk::ClearValue; 9]>::new();

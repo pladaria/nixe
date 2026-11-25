@@ -247,6 +247,7 @@ impl Residency<'_> {
         size: u64,
     ) -> Result<vk::Buffer, VulkanError> {
         self.check_buffer_range(id, offset, size)?;
+        self.resolve_sample_report_access(id, offset, size)?;
         let work = self.runtime.device.current_work();
         let entry = &mut self.buffer_cache.buffers[id];
         let handle = entry.native.handle;
@@ -254,6 +255,24 @@ impl Residency<'_> {
         entry.contents.last_use = Some(work);
         self.touch(Resource::Buffer(id));
         Ok(handle)
+    }
+
+    pub(super) fn resolve_sample_report_access(
+        &mut self,
+        id: BufferId,
+        offset: u64,
+        size: u64,
+    ) -> Result<(), VulkanError> {
+        let device = &mut self.runtime.device;
+        let buffer = self.buffer_cache.buffers[id].native.handle;
+        if device
+            .submission
+            .samples
+            .reports_overlap(buffer, offset, size)
+        {
+            device.end_rendering()?;
+        }
+        Ok(())
     }
 
     /// Native image storage stays GENERAL between operations. Initialization

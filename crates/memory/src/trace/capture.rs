@@ -243,6 +243,7 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
                 | "nvn_early_submit"
                 | "vulkan_submit_site"
                 | "frame_queue"
+                | "frame_sample_queries"
                 | "frame_memory"
                 | "frame_buffers"
                 | "frame_dependency_wait"

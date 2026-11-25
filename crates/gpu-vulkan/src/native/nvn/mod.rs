@@ -328,18 +328,8 @@ impl NativeExecution<'_> {
                     .get_or_insert_with(|| ReportClock::Maxwell(std::time::Instant::now()))
                     .raw();
                 if kind == 1 {
-                    let range = self
-                        .residency
-                        .device_buffer(
-                            address,
-                            16,
-                            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
-                            false,
-                            false,
-                        )
-                        .map_err(runtime)?;
                     self.residency
-                        .write_sample_report(range, false, ticks)
+                        .write_nvn_sample_report(address, ticks)
                         .map_err(runtime)?;
                     selections.count_samples = true;
                     return Ok(());

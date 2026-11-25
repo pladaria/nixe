@@ -132,6 +132,9 @@ impl Residency<'_> {
         if generation == self.buffer_cache.device_mapping_generation {
             return Ok(());
         }
+        if self.runtime.device.submission.has_sample_reports() {
+            self.runtime.device.end_rendering()?;
+        }
         let changed = self.runtime.device_memory.take_changes();
         self.buffer_cache.device_mapping_generation = generation;
         self.buffer_cache.uniform_streams.invalidate_host();
@@ -569,6 +572,7 @@ impl Residency<'_> {
         size: u64,
     ) -> Result<(), VulkanError> {
         self.check_buffer_range(id, offset, size)?;
+        self.resolve_sample_report_access(id, offset, size)?;
         if !self.buffer_cache.binding_current(id) {
             return Err(VulkanError::InvalidResource(
                 "buffer binding has retired physical coverage",
@@ -598,6 +602,7 @@ impl Residency<'_> {
         offset: u64,
         size: u64,
     ) -> Result<(), VulkanError> {
+        self.resolve_sample_report_access(id, offset, size)?;
         if !self.buffer_cache.binding_current(id) {
             return Err(VulkanError::InvalidResource(
                 "buffer binding has retired physical coverage",

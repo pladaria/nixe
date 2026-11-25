@@ -10,6 +10,65 @@ mod support {
 }
 
 #[test]
+fn nvn_sample_report_batch_preserves_strided_records_and_the_running_counter()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4 << 20)?.allocate(4096)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let address = 0x10000;
+    let _mapping = memory.map(
+        address,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 4096)?]),
+        true,
+    )?;
+    memory.write_block_unsafe(address, nixe_memory::WriteSource::Bytes(&[0x5a; 528]))?;
+    let mut gpu = NativeGpuExecution::new(
+        memory.clone(),
+        device,
+        CacheConfiguration::default(),
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    {
+        let mut native = gpu.execution();
+        let residency = &mut native.residency;
+        residency.device_buffer(
+            address,
+            528,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            true,
+            false,
+        )?;
+        for (offset, stamp) in [(0, 19), (256, 47)] {
+            let device = residency.device_mut();
+            device.reset_samples_passed()?;
+            device.set_samples_enabled(true)?;
+            device.begin_samples(true);
+            residency.write_nvn_sample_report(address + offset, stamp)?;
+            assert!(residency.device().submission.has_sample_reports());
+        }
+        residency.write_nvn_sample_report(address + 512, 94)?;
+        assert!(!residency.device().submission.has_sample_reports());
+        residency.flush_read_span(address, 528)?;
+    }
+    let mut bytes = [0; 528];
+    memory.reader().read_block_unsafe(address, &mut bytes)?;
+    for (offset, stamp) in [(0, 19u64), (256, 47), (512, 94)] {
+        assert_eq!(&bytes[offset..offset + 8], &[0; 8]);
+        assert_eq!(&bytes[offset + 8..offset + 16], &stamp.to_le_bytes());
+    }
+    assert_eq!(&bytes[16..256], &[0x5a; 240]);
+    assert_eq!(&bytes[272..512], &[0x5a; 240]);
+    drop(gpu);
+    validation.check()?;
+    Ok(())
+}
+
+#[test]
 fn nvn2_compute_compiles_with_private_spill_memory() -> Result<(), Box<dyn std::error::Error>> {
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {
         return Ok(());

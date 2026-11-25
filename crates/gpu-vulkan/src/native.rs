@@ -697,6 +697,16 @@ impl NativeExecution<'_> {
             self.residency.device().recording_statistics().draw_calls,
             self.residency.statistics().native_readback_bytes,
         );
+        #[cfg(feature = "execution-trace")]
+        {
+            let recording = self.residency.device().recording_statistics();
+            nixe_gpu::trace::event(
+                "frame_sample_queries",
+                recording.sample_report_copies,
+                recording.sample_report_scans,
+                recording.sample_reports_batched,
+            );
+        }
         nixe_gpu::trace::event(
             "frame_memory",
             self.residency.statistics().cpu_uploaded_bytes,
