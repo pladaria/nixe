@@ -213,6 +213,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     code.nzcv_flags_pos = nullptr;
     code.nzcv_live_pos = nullptr;
     check_bit_in_zf = false;
+    host_call_return_target.reset();
 
     ASSERT(block.GetCondition() == IR::Cond::AL);
 
@@ -250,6 +251,9 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     if (conf.enable_cycle_counting) {
         EmitAddCycles(block.CycleCount());
         code.nzcv_live_pos = nullptr;
+    }
+    if (host_call_return_target) {
+        EmitHostCall(*host_call_return_target);
     }
     EmitX64::EmitTerminal(block.GetTerminal(), ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
     code.nzcv_flags_pos = nullptr;
@@ -433,7 +437,53 @@ void A64EmitX64::EmitPushRSB(EmitContext& ctx, IR::Inst* inst) {
         return;
     }
 
+    // SVC also pushes a software RSB entry. Only guest calls end with a link
+    // or a fast dispatch and can keep a host frame across the terminal.
+    if (code.UsesHostCallStack() && !A64::LocationDescriptor{ctx.block.Location()}.SingleStepping()) {
+        const auto* leaf = std::get_if<IR::Term::LeafTerminal>(&ctx.block.GetTerminal());
+        if (leaf && (std::holds_alternative<IR::Term::LinkBlock>(*leaf) || std::holds_alternative<IR::Term::FastDispatchHint>(*leaf))) {
+            host_call_return_target = IR::LocationDescriptor{inst->GetArg(0).GetU64()};
+            return;
+        }
+    }
     EmitX64::EmitPushRSB(ctx, inst);
+}
+
+// A host call pushes a native continuation. Its frame also stores the full
+// guest return descriptor and preserves the stack alignment for helpers.
+// https://github.com/zortos293/Lichii/commit/aab5393019554b39084a0936c585ad531d3196cb
+void A64EmitX64::EmitHostCall(IR::LocationDescriptor return_target) {
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+    if (conf.diagnostics) {
+        code.mov(rax, reinterpret_cast<u64>(&conf.diagnostics->host_calls));
+        code.inc(qword[rax]);
+    }
+#endif
+    code.cmp(rsp, qword[r15 + offsetof(A64JitState, host_stack_limit)]);
+    code.cmovbe(rsp, qword[r15 + offsetof(A64JitState, host_stack_base)]);
+    Xbyak::Label frame;
+    code.mov(rax, return_target.Value());
+    code.call(frame);
+
+    // RET lands here with the caller's rsp restored. Patch this link just as
+    // any other block exit so invalidation removes stale targets.
+    patch_information[return_target].jmp.push_back(code.getCurr());
+    if (const auto next = GetBasicBlock(return_target)) {
+        EmitPatchJmp(return_target, next->entrypoint);
+    } else {
+        EmitPatchJmp(return_target);
+    }
+
+    code.L(frame);
+    code.lea(rsp, ptr[rsp - (HostCallFrameSize - 8)]);
+    code.mov(qword[rsp + ABI_SHADOW_SPACE], rax);
+}
+
+Xbyak::Address A64EmitX64::CheckBitAddress() const {
+    if (code.UsesHostCallStack()) {
+        return code.byte[r15 + offsetof(A64JitState, check_bit)];
+    }
+    return code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)];
 }
 
 void A64EmitX64::EmitA64SetCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
@@ -445,7 +495,7 @@ void A64EmitX64::EmitA64SetCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
         check_bit_in_zf = true;
         return;
     }
-    code.mov(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], to_store);
+    code.mov(CheckBitAddress(), to_store);
 }
 
 void A64EmitX64::EmitA64GetCFlag(A64EmitContext& ctx, IR::Inst* inst) {
@@ -936,9 +986,40 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::Location
     }
 }
 
-void A64EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
+void A64EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor initial_location, bool is_single_step) {
     if (!conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) || is_single_step) {
         code.ReturnFromRunCode();
+        return;
+    }
+    if (code.UsesHostCallStack()) {
+        code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
+        code.jne(code.GetForceReturnFromRunCodeAddress());
+
+        // RET leaves FPCR unchanged, so its translation context is the FPCR
+        // of this block. A different PC or FPCR must use the normal lookup.
+        constexpr auto pc_mask_shift = 64 - A64::LocationDescriptor::pc_bit_count;
+        code.mov(rax, qword[r15 + offsetof(A64JitState, pc)]);
+        code.shl(rax, pc_mask_shift);
+        code.shr(rax, pc_mask_shift);
+        const u64 fpcr = A64::LocationDescriptor{initial_location}.SetPC(0).UniqueHash();
+        if (fpcr != 0) {
+            code.mov(rcx, fpcr);
+            code.or_(rax, rcx);
+        }
+        code.cmp(rax, qword[rsp + ABI_SHADOW_SPACE]);
+        if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+            code.jne(terminal_handler_fast_dispatch_hint);
+        } else {
+            code.jne(code.GetReturnFromRunCodeAddress());
+        }
+#ifdef DYNARMIC_JIT_DIAGNOSTICS
+        if (conf.diagnostics) {
+            code.mov(rax, reinterpret_cast<u64>(&conf.diagnostics->host_returns));
+            code.inc(qword[rax]);
+        }
+#endif
+        code.lea(rsp, ptr[rsp + (HostCallFrameSize - 8)]);
+        code.ret();
         return;
     }
 
@@ -974,7 +1055,7 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::CheckBit terminal, IR::LocationDescr
     if (check_bit_in_zf) {
         check_bit_in_zf = false;
     } else {
-        code.cmp(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
+        code.cmp(CheckBitAddress(), u8(0));
     }
     code.jz(fail);
     EmitTerminal(terminal.then_, initial_location, is_single_step);

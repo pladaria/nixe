@@ -102,7 +102,7 @@ class JitDiagnostics {
     std::setvbuf(events_.get(), event_buffer_.data(), _IOFBF, event_buffer_.size());
     std::setvbuf(snapshots_.get(), snapshot_buffer_.data(), _IOFBF, snapshot_buffer_.size());
     std::fputs("time_ns,event,owner_tid,epoch,descriptor,fingerprint,host_address,native_bytes,guest_bytes,ir_instructions,translation_ns,optimization_ns,emission_ns,near_bytes,cold_bytes\n", events_.get());
-    std::fputs("time_ns,owner_tid,lookups,hits,compiled,guest_bytes,native_bytes,mainline_bytes,deferred_bytes,capacity_clears,requested_clears,targeted_blocks,fastmem_blocks,translation_ns,optimization_ns,emission_ns,dropped_events,io_failed,event_limit,dispatch_hits,dispatch_misses,rsb_hits,near_bytes,cold_bytes,fastmem_retained\n", snapshots_.get());
+    std::fputs("time_ns,owner_tid,lookups,hits,compiled,guest_bytes,native_bytes,mainline_bytes,deferred_bytes,capacity_clears,requested_clears,targeted_blocks,fastmem_blocks,translation_ns,optimization_ns,emission_ns,dropped_events,io_failed,event_limit,dispatch_hits,dispatch_misses,rsb_hits,near_bytes,cold_bytes,fastmem_retained,host_calls,host_returns\n", snapshots_.get());
     counters.context = this;
     counters.compile = compiled;
     counters.invalidate = invalidated;
@@ -127,11 +127,11 @@ public:
     if (!force && time < next_snapshot_) return;
     next_snapshot_ = time + std::chrono::seconds(1);
     const auto& s = counters;
-    if (std::fprintf(snapshots_.get(), "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+    if (std::fprintf(snapshots_.get(), "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
         u(now()), u(owner_), u(s.lookups), u(s.hits), u(s.compiled), u(s.guest_bytes),
         u(s.native_bytes), u(s.mainline_bytes), u(s.deferred_bytes), u(s.capacity_clears),
         u(s.requested_clears), u(s.targeted_blocks), u(s.fastmem_blocks), u(s.translation_ns),
-        u(s.optimization_ns), u(s.emission_ns), u(dropped_), unsigned(io_failed_), u(event_limit_), u(s.dispatch_hits), u(s.dispatch_misses), u(s.rsb_hits), u(s.near_bytes), u(s.cold_bytes), u(s.fastmem_retained)) < 0 ||
+        u(s.optimization_ns), u(s.emission_ns), u(dropped_), unsigned(io_failed_), u(event_limit_), u(s.dispatch_hits), u(s.dispatch_misses), u(s.rsb_hits), u(s.near_bytes), u(s.cold_bytes), u(s.fastmem_retained), u(s.host_calls), u(s.host_returns)) < 0 ||
         std::fflush(events_.get()) != 0 || std::fflush(snapshots_.get()) != 0) {
       io_error();
     }

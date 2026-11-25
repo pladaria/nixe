@@ -62,6 +62,7 @@ public:
 
 protected:
     bool check_bit_in_zf = false;
+    std::optional<IR::LocationDescriptor> host_call_return_target;
     const A64::UserConfig conf;
     A64::Jit* jit_interface;
     BlockRangeInformation<u64> block_ranges;
@@ -95,6 +96,8 @@ protected:
 
     // Microinstruction emitters
     void EmitPushRSB(EmitContext& ctx, IR::Inst* inst);
+    void EmitHostCall(IR::LocationDescriptor return_target);
+    Xbyak::Address CheckBitAddress() const;
 #define OPCODE(...)
 #define A32OPC(...)
 #define A64OPC(name, type, ...) void EmitA64##name(A64EmitContext& ctx, IR::Inst* inst);

@@ -422,7 +422,7 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
         cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
         jng(return_to_caller);
     }
-    cb.LookupBlock->EmitCall(*this);
+    LookupBlock();
     jmp(ABI_RETURN);
 
     align();
@@ -435,7 +435,7 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
         jng(return_to_caller_mxcsr_already_exited);
     }
     SwitchMxcsrOnEntry();
-    cb.LookupBlock->EmitCall(*this);
+    LookupBlock();
     jmp(ABI_RETURN);
 
     align();
@@ -447,6 +447,7 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
 
     return_from_run_code[MXCSR_ALREADY_EXITED | FORCE_RETURN] = getCurr<const void*>();
     L(return_to_caller_mxcsr_already_exited);
+    RestoreHostStack();
 
     if (cb.enable_cycle_counting) {
         cb.AddTicks->EmitCall(*this, [this](RegList param) {
@@ -470,13 +471,13 @@ void BlockOfCode::SwitchMxcsrOnEntry() {
     if (HasHostFeature(HostFeature::AVX)) {
         vzeroupper();
     }
-    stmxcsr(dword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, save_host_MXCSR)]);
+    stmxcsr(HostMxcsrAddress());
     ldmxcsr(dword[r15 + jsi.offsetof_guest_MXCSR]);
 }
 
 void BlockOfCode::SwitchMxcsrOnExit() {
     stmxcsr(dword[r15 + jsi.offsetof_guest_MXCSR]);
-    ldmxcsr(dword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, save_host_MXCSR)]);
+    ldmxcsr(HostMxcsrAddress());
 }
 
 void BlockOfCode::EnterStandardASIMD() {
@@ -505,7 +506,29 @@ void BlockOfCode::UpdateTicks() {
 }
 
 void BlockOfCode::LookupBlock() {
+    // A lookup may recycle code containing return addresses on the host stack.
+    RestoreHostStack();
     cb.LookupBlock->EmitCall(*this);
+}
+
+void BlockOfCode::RestoreHostStack() {
+    if (cb.host_call_stack) {
+        mov(rsp, qword[r15 + cb.host_call_stack->base]);
+    }
+}
+
+Xbyak::Address BlockOfCode::HostMxcsrAddress() const {
+    if (cb.host_call_stack) {
+        return dword[r15 + cb.host_call_stack->saved_mxcsr];
+    }
+    return dword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, save_host_MXCSR)];
+}
+
+Xbyak::RegExp BlockOfCode::SpillBase(size_t reserved_stack_space) const {
+    if (cb.host_call_stack) {
+        return r15 + cb.host_call_stack->spill;
+    }
+    return rsp + reserved_stack_space + ABI_SHADOW_SPACE + offsetof(StackLayout, spill);
 }
 
 void BlockOfCode::LoadRequiredFlagsForCondFromRax(IR::Cond cond) {

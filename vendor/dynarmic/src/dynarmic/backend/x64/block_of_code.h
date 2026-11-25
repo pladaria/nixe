@@ -10,6 +10,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -30,11 +31,18 @@ namespace Dynarmic::Backend::X64 {
 
 using CodePtr = const void*;
 
+struct HostCallStackOffsets {
+    u32 base;
+    u32 saved_mxcsr;
+    u32 spill;
+};
+
 struct RunCodeCallbacks {
     std::unique_ptr<Callback> LookupBlock;
     std::unique_ptr<Callback> AddTicks;
     std::unique_ptr<Callback> GetTicksRemaining;
     bool enable_cycle_counting;
+    std::optional<HostCallStackOffsets> host_call_stack = std::nullopt;
 };
 
 class BlockOfCode final : public Xbyak::CodeGenerator {
@@ -89,6 +97,9 @@ public:
     /// Code emitter: Performs a block lookup based on current state
     /// @note this clobbers ABI caller-save registers
     void LookupBlock();
+
+    bool UsesHostCallStack() const { return cb.host_call_stack.has_value(); }
+    Xbyak::RegExp SpillBase(size_t reserved_stack_space = 0) const;
 
     /// Code emitter: Load required flags for conditional cond from rax into host rflags
     void LoadRequiredFlagsForCondFromRax(IR::Cond cond);
@@ -203,6 +214,8 @@ public:
     }
 
 private:
+    void RestoreHostStack();
+    Xbyak::Address HostMxcsrAddress() const;
     RunCodeCallbacks cb;
     JitStateInfo jsi;
 

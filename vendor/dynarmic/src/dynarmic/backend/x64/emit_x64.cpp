@@ -133,7 +133,7 @@ void EmitX64::EmitVerboseDebuggingOutput(RegAlloc& reg_alloc) {
     for (int i = 0; i < 16; i++) {
         code.movaps(xword[rsp + offsetof(RegisterData, xmms) + 2 * sizeof(u64) * i], Xbyak::Xmm{i});
     }
-    code.lea(rax, ptr[rsp + sizeof(RegisterData) + offsetof(StackLayout, spill)]);
+    code.lea(rax, ptr[code.SpillBase(sizeof(RegisterData))]);
     code.mov(xword[rsp + offsetof(RegisterData, spill)], rax);
 
     reg_alloc.EmitVerboseDebuggingOutput();

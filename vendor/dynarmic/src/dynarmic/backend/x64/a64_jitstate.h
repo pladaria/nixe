@@ -9,10 +9,16 @@
 
 #include <mcl/stdint.hpp>
 
+#include "dynarmic/backend/x64/abi.h"
+#include "dynarmic/backend/x64/stack_layout.h"
+
 #include "dynarmic/backend/x64/nzcv_util.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 
 namespace Dynarmic::Backend::X64 {
+
+constexpr size_t HostCallFrameSize = 16 + ABI_SHADOW_SPACE;
+constexpr size_t HostCallMaxDepth = 512;
 
 class BlockOfCode;
 
@@ -63,6 +69,14 @@ struct A64JitState {
     u32 fpsr_exc = 0;
     u32 fpsr_qc = 0;
     u32 fpcr = 0;
+
+    // Guest call frames move rsp, so these slots must stay at fixed addresses.
+    alignas(16) decltype(StackLayout::spill) spill{};
+    u64 host_stack_base = 0;
+    u64 host_stack_limit = 0;
+    u32 host_MXCSR = 0;
+    bool check_bit = false;
+
     u32 GetFpcr() const;
     u32 GetFpsr() const;
     void SetFpcr(u32 value);

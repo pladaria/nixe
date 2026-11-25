@@ -21,6 +21,11 @@ struct StateMeasurement {
 #include <exception>
 #include <memory>
 #include <string>
+#if defined(__linux__) && defined(__x86_64__)
+#include <cerrno>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include "state.h"
 #ifdef DYNARMIC_JIT_DIAGNOSTICS
 #include "diagnostics.h"
@@ -50,6 +55,19 @@ struct NixeExit {
 
 namespace {
 thread_local std::string last_error;
+
+#if defined(__linux__) && defined(__x86_64__)
+bool host_call_return_supported() {
+  // Dropping guest call frames only restores the normal stack pointer.
+  // Query the Linux UAPI directly for compatibility with older libc headers.
+  // https://docs.kernel.org/arch/x86/shstk.html
+  constexpr unsigned long shadow_stack_status = 0x5005;
+  unsigned long features = 0;
+  const long result = syscall(SYS_arch_prctl, shadow_stack_status, &features);
+  return result == 0 ? (features & 1) == 0 : errno == EINVAL || errno == ENOSYS;
+}
+#endif
+
 struct Core final : Dynarmic::A64::UserCallbacks {
   NixeCallbacks callbacks;
   void *context = nullptr; // Borrowed only for the duration of Run.
@@ -143,6 +161,9 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.fold_address_offsets = true;
     conf.reuse_host_flags = true;
     conf.halt_check_on_back_edges = true;
+#if defined(__linux__) && defined(__x86_64__)
+    conf.host_call_return = host_call_return_supported();
+#endif
     jit = std::make_unique<Dynarmic::A64::Jit>(conf);
   }
   void stop(std::uint32_t kind, std::uint32_t detail, std::uint64_t pc) {

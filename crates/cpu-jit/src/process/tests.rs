@@ -189,6 +189,94 @@ fn canonical_process_prepares_code_and_retains_registers_across_svc_and_migratio
 }
 
 #[test]
+fn guest_calls_return_across_nested_calls_svc_and_fpcr_changes() {
+    // Exercises both cold and linked targets, including a return whose FPCR
+    // differs from the caller's and a supervisor call with guest frames live.
+    let process = fixture(&[
+        0xd2800000, // MOV X0,#0
+        0xd2800073, // MOV X19,#3
+        0x100001cb, // ADR X11,indirect
+        0x94000005, // loop: BL direct
+        0xd63f0160, // BLR X11
+        0xf1000673, // SUBS X19,X19,#1
+        0x54ffffa1, // B.NE loop
+        0xd4000861, // SVC #0x43
+        0xaa1e03ea, // direct: MOV X10,X30
+        0x94000005, // BL inner
+        0xd4000541, // SVC #0x2a
+        0x91000800, // ADD X0,X0,#2
+        0xaa0a03fe, // MOV X30,X10
+        0xd65f03c0, // RET
+        0x91000400, // inner: ADD X0,X0,#1
+        0xd65f03c0, // RET
+        0xd2a0200c, // indirect: MOV X12,#0x1000000
+        0xd51b440c, // MSR FPCR,X12
+        0x91001000, // ADD X0,X0,#4
+        0xd65f03c0, // RET
+    ]);
+    let mut cpu = process.create_thread().unwrap();
+    let mut guest = state();
+    let mut worker = NativeWorker::default();
+    for _ in 0..2 {
+        guest.set_pc(CODE);
+        for expected in [1, 8, 15] {
+            assert!(matches!(
+                run(&mut cpu, &mut worker, &mut guest).unwrap().stop,
+                CpuExit::SupervisorCall {
+                    immediate: 0x2a,
+                    ..
+                }
+            ));
+            assert_eq!(guest.read_x(register(0)), expected);
+            guest.set_pc(guest.pc() + 4);
+        }
+        assert!(matches!(
+            run(&mut cpu, &mut worker, &mut guest).unwrap().stop,
+            CpuExit::SupervisorCall {
+                immediate: 0x43,
+                ..
+            }
+        ));
+        assert_eq!(guest.read_x(register(0)), 21);
+    }
+    worker.finish().unwrap();
+}
+
+#[test]
+fn guest_calls_with_nonlocal_returns_keep_the_host_stack_bounded() {
+    let process = fixture(&[
+        0xd2800000, // MOV X0,#0
+        0xd2807d13, // MOV X19,#1000
+        0x94000008, // loop: BL skip
+        0x91019000, // ADD X0,X0,#100, skipped by RET
+        0x91000400, // ADD X0,X0,#1
+        0x94000007, // BL branch_ret
+        0x91000400, // ADD X0,X0,#1
+        0xf1000673, // SUBS X19,X19,#1
+        0x54ffff41, // B.NE loop
+        0xd4000881, // SVC #0x44
+        0x910013de, // skip: ADD X30,X30,#4
+        0xd65f03c0, // RET
+        0xd61f03c0, // branch_ret: BR X30
+    ]);
+    let mut cpu = process.create_thread().unwrap();
+    let mut guest = state();
+    let mut worker = NativeWorker::default();
+    for _ in 0..2 {
+        guest.set_pc(CODE);
+        assert!(matches!(
+            run(&mut cpu, &mut worker, &mut guest).unwrap().stop,
+            CpuExit::SupervisorCall {
+                immediate: 0x44,
+                ..
+            }
+        ));
+        assert_eq!(guest.read_x(register(0)), 2000);
+    }
+    worker.finish().unwrap();
+}
+
+#[test]
 fn canonical_process_reports_fetch_faults_and_relaxes_invalid_guest_data() {
     for fetch in [true, false] {
         let process = fixture(&[0xb9400020, 0xd4000001]);

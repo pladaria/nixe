@@ -23,6 +23,7 @@ struct Diagnostics {
     std::uint64_t dispatch_hits{}, dispatch_misses{}, rsb_hits{};
     std::uint64_t capacity_clears{}, requested_clears{}, targeted_blocks{}, fastmem_blocks{};
     std::uint64_t fastmem_retained{};
+    std::uint64_t host_calls{}, host_returns{};
     std::uint64_t translation_ns{}, optimization_ns{}, emission_ns{};
     void* context{};
     void (*compile)(void*, const Compilation&){};

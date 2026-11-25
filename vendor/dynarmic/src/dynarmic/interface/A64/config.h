@@ -307,6 +307,9 @@ struct UserConfig {
     bool reuse_host_flags = false;
     /// x64 no-cycle mode: check backward, indirect and code-page-crossing links.
     bool halt_check_on_back_edges = false;
+    /// x64: predict guest calls and returns with the host return stack when
+    /// cycle counting is disabled.
+    bool host_call_return = false;
 
     /// This option relates to translation. Generally when we run into an unpredictable
     /// instruction the ExceptionRaised callback is called. If this is true, we define

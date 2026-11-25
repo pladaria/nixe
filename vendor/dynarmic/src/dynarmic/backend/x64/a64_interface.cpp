@@ -37,6 +37,13 @@ static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*Lo
         std::make_unique<ArgCallback>(Devirtualize<&A64::UserCallbacks::AddTicks>(cb)),
         std::make_unique<ArgCallback>(Devirtualize<&A64::UserCallbacks::GetTicksRemaining>(cb)),
         conf.enable_cycle_counting,
+        conf.host_call_return && !conf.enable_cycle_counting && conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)
+            ? std::optional{HostCallStackOffsets{
+                  offsetof(A64JitState, host_stack_base),
+                  offsetof(A64JitState, host_MXCSR),
+                  offsetof(A64JitState, spill),
+              }}
+            : std::nullopt,
     };
 }
 
@@ -47,6 +54,13 @@ static std::function<void(BlockOfCode&)> GenRCP(const A64::UserConfig& conf) {
         }
         if (conf.fastmem_pointer) {
             code.mov(code.r13, *conf.fastmem_pointer);
+        }
+        if (code.UsesHostCallStack()) {
+            // The empty stack's sentinel cannot match a return descriptor.
+            code.mov(code.qword[code.rsp + ABI_SHADOW_SPACE], -1);
+            code.mov(code.qword[code.r15 + offsetof(A64JitState, host_stack_base)], code.rsp);
+            code.lea(code.rax, code.ptr[code.rsp - HostCallFrameSize * HostCallMaxDepth]);
+            code.mov(code.qword[code.r15 + offsetof(A64JitState, host_stack_limit)], code.rax);
         }
     };
 }
