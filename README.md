@@ -4,6 +4,9 @@ This is an educational and experimental project written in Rust. Its long-term g
 functional emulators for Nintendo Switch and Nintendo Switch 2 while sharing well-defined components between
 both platforms whenever technically appropriate.
 
+Nixe primarily targets Linux on AMD64 (x86-64). Support for other operating
+systems or CPU architectures may be added in the future.
+
 ## Goals
 
 - Study modern console emulation and low-level systems programming.
@@ -14,10 +17,11 @@ both platforms whenever technically appropriate.
 
 ## Project Status
 
-Nixe is in an early stage of development, but it can already run a range of Switch homebrew applications and
+Nixe is in an early stage of development, but it can already run some Switch homebrew applications and
 commercial games; some run at native speed, depending on the title and host hardware. It supports homebrew
-NRO files and commercial NSP and XCI packages, including the compressed NSZ and XCZ formats. Gamepad input is
-available through the emulated HID services.
+NRO files and commercial NSP and XCI packages for Switch, including the compressed NSZ and XCZ formats.
+For Switch 2, Nixe supports NUP packages, which can be run without cryptographic keys.
+Gamepad input is available through the emulated HID services.
 
 ### Screenshots
 
@@ -40,26 +44,34 @@ available through the emulated HID services.
   </tr>
 </table>
 
+### Graphics emulation modes
+
+Set `nvn_hle` under `[gpu]` in [`nixe.toml`](nixe.toml) to choose how Nixe handles
+the game's graphics commands. Both modes render through Vulkan.
+
+- **NVN HLE (`nvn_hle = true`).** Nixe intercepts calls to NVIDIA's NVN graphics
+  API on Switch and NVN2 on Switch 2, and runs its own Rust implementations.
+  Execution stops with a diagnostic if the game calls an unimplemented function.
+- **Low-level GPU emulation (`nvn_hle = false`, also the default when omitted).**
+  The game runs its original NVIDIA graphics SDK. Nixe intercepts GPU command
+  submissions and decodes their pushbuffers to emulate the Maxwell GPU on Switch
+  or the Ampere GPU on Switch 2.
+
 ## JIT compiler
 
-Nixe translates guest AArch64 with [Dynarmic](https://github.com/lioncash/dynarmic).
-The original repository is vendored in `vendor/dynarmic`, pinned to commit
-`a41c380246d3d9f9874f0f792d234dc0cc17c180`, including its bundled dependencies
-and licenses. Cargo builds its A64 frontend, host backend and the C++ bridge
-automatically.
+Nixe uses Dynarmic to compile the game's AArch64 code into native host instructions
+as it runs. Each virtual CPU caches the compiled blocks and can link them directly
+to one another.
 
-Each virtual CPU owns a native code cache, block links, register allocator and
-return prediction. The process shares memory and the exclusive monitor. Fastmem
-uses nixe's direct arena and signal capture; memory ownership, invalidation,
-scheduler interrupts, SVCs and architectural state remain connected to the
-runtime. Unsupported instructions stop explicitly.
+The **memory arena** is a reserved range of virtual addresses in the host process.
+Nixe maps guest RAM pages into it at offsets matching their guest addresses. The
+reservation itself consumes virtual address space, and mapped pages share the
+game's RAM backing.
 
-Building requires a C++20 compiler, CMake and Boost headers, in addition to the
-Rust toolchain and graphics/audio dependencies. The NVDEC VP9 decoder links
-FFmpeg libraries through `pkg-config`. On Debian/Ubuntu the native build packages
-are `build-essential cmake libboost-dev pkg-config libavcodec-dev libavutil-dev libvulkan-dev`.
-Dynarmic dependencies are built from the vendored tree; no CMake download step is required.
-Upstream adaptations are listed in [UPSTREAM.txt](vendor/dynarmic/UPSTREAM.txt).
+**Fastmem** lets compiled code read and write those pages directly by adding the
+guest address to the arena's base. If a direct access faults, Nixe checks the
+mapping and permissions and can complete a valid access through its software
+page table.
 
 ## Running
 
@@ -75,6 +87,8 @@ for dependencies and direct executable usage.
 The default configuration is in [`nixe.toml`](nixe.toml). Window size and
 position are remembered in a versioned binary `nixe.cfg` beside the selected
 `nixe.toml`; it is managed by Nixe.
+
+### Launching games
 
 List available titles:
 
