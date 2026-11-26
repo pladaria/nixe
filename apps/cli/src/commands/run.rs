@@ -230,6 +230,11 @@ fn run_machine(
                 .expect("fixed time configuration was validated"),
         },
     };
+    let count_nvn_calls =
+        config.diagnostics.count_nvn_calls && matches!(clock_mode, VirtualClockMode::Realtime);
+    if config.diagnostics.count_nvn_calls && !count_nvn_calls {
+        log::warn!("NVN call counters are only available in realtime mode");
+    }
     let virtual_clock = VirtualClock::new(clock_mode);
     let kernel = nixe_scheduler::SchedulerState::new(scheduler_profile, virtual_clock.clone());
     let runtime = Runtime::try_new(kernel.clone()).map_err(|error| error.to_string())?;
@@ -248,7 +253,7 @@ fn run_machine(
         .account(machine_profile.system_memory_capacity())
         .map_err(|error| error.to_string())?;
     let process_builder = ProcessBuilder::new(memory, system_memory, kernel.clone())
-        .with_nvn_call_counting(config.diagnostics.count_nvn_calls)
+        .with_nvn_call_counting(count_nvn_calls)
         .with_nvn_hle(config.gpu.nvn_hle)
         .with_sd_card_root(sd_card_root)
         .with_config(machine_profile.process_build_config());
@@ -928,9 +933,23 @@ fn write_nvn_report(
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
     let path = directory.join(format!("{timestamp}-calls.csv"));
     let mut file = BufWriter::new(std::fs::File::create_new(&path)?);
-    writeln!(file, "function,invocations")?;
-    for (name, count) in &report.calls {
-        writeln!(file, "\"{}\",{count}", name.replace('"', "\"\""))?;
+    writeln!(
+        file,
+        "function,invocations,total_ns,total_normalized_ns,mean_normalized_ns"
+    )?;
+    for call in &report.calls {
+        write!(
+            file,
+            "\"{}\",{}",
+            call.name.replace('"', "\"\""),
+            call.invocations
+        )?;
+        if let (Some(raw), Some(normalized)) = (call.total_ns, call.total_normalized_ns) {
+            let mean = normalized / u128::from(call.invocations);
+            writeln!(file, ",{raw},{normalized},{mean}")?;
+        } else {
+            writeln!(file, ",,,")?;
+        }
     }
     file.flush()?;
     log::info!(

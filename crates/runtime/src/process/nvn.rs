@@ -12,6 +12,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+mod timing;
+
 pub(crate) const NVN_SVC: u32 = 0x4e56;
 const BOOTSTRAP: &str = "nvnBootstrapLoader";
 const DEVICE_RESOLVER: &str = "nvnDeviceGetProcAddress";
@@ -24,19 +26,19 @@ const HOST_ENTRIES: usize = ENTRIES + SLOTS * 8;
 const DESCRIPTORS: usize = HOST_ENTRIES + SLOTS * 8;
 const DESCRIPTOR_BYTES: usize = 3 * 8; // target, counter address, resolver kind
 const COUNTERS: usize = DESCRIPTORS + SLOTS * DESCRIPTOR_BYTES;
-const END: usize = COUNTERS + SLOTS * 8;
 const DISPATCH_PC: usize = COUNT_CALL.len() * 4;
 const RESOLVE_PC: u64 = (DISPATCH_PC + 8 * 4) as u64;
 
-// AAPCS64 volatile temporaries only. Ordinary entries tail-call the original with
-// the original SP, LR, flags, integer and vector arguments. Exclusive operations
-// work on both consoles. Resolvers and HLE entries share a private SVC.
+// AAPCS64 volatile temporaries only. SDK entries still tail-call the original
+// with the original SP, LR, flags, integer and vector arguments.
 const COUNT_CALL: &[u32] = &[
     0xa9402a09, // ldp x9, x10, [x16]      target, per-name counter
     0xc85f7d4b, // retry: ldxr x11, [x10]
     0x9100056b, // add x11, x11, #1
     0xc80c7d4b, // stxr w12, x11, [x10]
     0x35ffffac, // cbnz w12, retry
+    0xb940120b, // ldr w11, [x16, #16]    resolver kind or timed HLE bit
+    0x37100b4b, // tbnz w11, #2, timing::ENTRY
 ];
 const DISPATCH: &[u32] = &[
     0xb940120a, // ldr w10, [x16, #16]      resolver kind
@@ -86,6 +88,7 @@ struct Hle {
     inline_sdk: Option<GuestVirtualAddress>,
     platform: TargetPlatform,
     procedures: Box<[OnceLock<Procedure>]>,
+    calibration: timing::Calibration,
 }
 impl Hle {
     fn new(platform: TargetPlatform, title: u64) -> Self {
@@ -95,6 +98,7 @@ impl Hle {
             title,
             inline_sdk: None,
             procedures: (0..SLOTS).map(|_| OnceLock::new()).collect(),
+            calibration: timing::Calibration::default(),
         }
     }
 }
@@ -222,7 +226,21 @@ impl NvnHooks {
     }
 
     fn guest_base(&self) -> u64 {
-        self.base + if self.count_calls { END } else { COUNTERS } as u64
+        self.base + (COUNTERS + SLOTS * self.counter_bytes()) as u64
+    }
+
+    fn timed_hle(&self) -> Option<&Hle> {
+        self.hle.as_ref().filter(|_| self.count_calls)
+    }
+
+    fn counter_bytes(&self) -> usize {
+        if self.timed_hle().is_some() {
+            16
+        } else if self.count_calls {
+            8
+        } else {
+            0
+        }
     }
 
     pub fn end(&self) -> u64 {
@@ -257,6 +275,10 @@ impl NvnHooks {
             DISPATCH_PC - 4
         };
         emit(DISPATCH_PC, DISPATCH);
+        if self.timed_hle().is_some() {
+            emit(timing::ENTRY, timing::CALL);
+            emit(timing::CALIBRATE, timing::BOOTSTRAP);
+        }
         if let Some(hle) = &self.hle {
             emit(QUERY_VERSION, VERSION_WORDS);
             if hle.platform == TargetPlatform::Switch2 {
@@ -387,11 +409,11 @@ impl NvnHooks {
             let words = [
                 effective,
                 if self.count_calls {
-                    self.base + (COUNTERS + name_id * 8) as u64
+                    self.base + (COUNTERS + name_id * self.counter_bytes()) as u64
                 } else {
                     0
                 },
-                kind,
+                if replace { 4 } else { kind },
             ];
             let mut descriptor = [0u8; DESCRIPTOR_BYTES];
             for (dst, word) in descriptor.chunks_exact_mut(8).zip(words) {
@@ -426,7 +448,17 @@ impl NvnHooks {
             return Ok(Svc::Unknown);
         }
         let x = |i| A64Register::General(A64GeneralRegister::new(i).unwrap());
-        if pc == self.base + RESOLVE_PC {
+        let calibrated = self.base + timing::CALIBRATED as u64;
+        if pc == self.base + RESOLVE_PC || (pc == calibrated && self.timed_hle().is_some()) {
+            if let Some(hle) = self.timed_hle() {
+                if pc == calibrated {
+                    hle.calibration
+                        .finish(state.read_x(x(2)), hle.platform.counter_frequency());
+                } else if hle.calibration.begin() {
+                    state.set_pc(self.base + timing::CALIBRATE as u64);
+                    return Ok(Svc::Returned);
+                }
+            }
             if self.resolve(state, memory)? {
                 state.set_pc(self.base + QUERY_VERSION as u64);
                 return Ok(Svc::Returned);
@@ -591,7 +623,15 @@ pub struct NvnCallReport {
     pub bootstrap_found: bool,
     pub complete: bool,
     pub resolved_entries: usize,
-    pub calls: Vec<(String, u64)>,
+    pub calls: Vec<NvnCall>,
+}
+
+#[derive(Debug)]
+pub struct NvnCall {
+    pub name: String,
+    pub invocations: u64,
+    pub total_ns: Option<u128>,
+    pub total_normalized_ns: Option<u128>,
 }
 
 impl RunnableProcess {
@@ -613,7 +653,8 @@ impl RunnableProcess {
 impl NvnHooks {
     fn report(&self, memory: &ProcessMemory) -> Result<NvnCallReport, MappingError> {
         let registry = self.registry.lock().unwrap();
-        let mut data = vec![0; registry.names.len() * 8];
+        let counter_bytes = self.counter_bytes();
+        let mut data = vec![0; registry.names.len() * counter_bytes];
         if !data.is_empty() {
             memory
                 .space()
@@ -626,14 +667,33 @@ impl NvnHooks {
         }
         let mut calls = Vec::new();
         for (name, &index) in &registry.names {
-            let offset = index * 8;
+            let offset = index * counter_bytes;
             let count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
             if count != 0 {
-                calls.push((name.to_string(), count));
+                let totals = self.timed_hle().and_then(|hle| {
+                    if matches!(name.as_ref(), BOOTSTRAP | DEVICE_RESOLVER) {
+                        return None;
+                    }
+                    let ticks =
+                        u64::from_le_bytes(data[offset + 8..offset + 16].try_into().unwrap());
+                    Some(
+                        hle.calibration
+                            .totals(ticks, count, hle.platform.counter_frequency()),
+                    )
+                });
+                calls.push(NvnCall {
+                    name: name.to_string(),
+                    invocations: count,
+                    total_ns: totals.map(|(raw, _)| raw),
+                    total_normalized_ns: totals.map(|(_, normalized)| normalized),
+                });
             }
         }
-        calls.sort_unstable_by(|(a_name, a_count), (b_name, b_count)| {
-            b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
+        calls.sort_unstable_by(|a, b| {
+            b.total_normalized_ns
+                .cmp(&a.total_normalized_ns)
+                .then_with(|| b.invocations.cmp(&a.invocations))
+                .then_with(|| a.name.cmp(&b.name))
         });
         Ok(NvnCallReport {
             bootstrap_found: !self.bootstrap.is_empty(),
@@ -721,7 +781,13 @@ mod tests {
         }
         drop(reg);
         assert_eq!(
-            hooks.report(&memory).unwrap().calls,
+            hooks
+                .report(&memory)
+                .unwrap()
+                .calls
+                .into_iter()
+                .map(|call| (call.name, call.invocations))
+                .collect::<Vec<_>>(),
             [
                 ("nvnB".into(), u64::MAX),
                 ("nvnA".into(), 1),
@@ -754,19 +820,153 @@ mod tests {
                     let slot = registry.slots[&(registry.names[name], 0x21_0000)];
                     assert_eq!(entry, hooks.base + (ENTRIES + slot * 8) as u64);
                     let address = hooks.base + (DESCRIPTORS + slot * DESCRIPTOR_BYTES) as u64;
-                    let mut bytes = [0; 8];
+                    let mut bytes = [0; DESCRIPTOR_BYTES];
                     memory
                         .space()
                         .read_into(GuestVirtualAddress::new(address), &mut bytes)
                         .unwrap()
                         .into_ready()
                         .unwrap();
-                    assert_eq!(u64::from_le_bytes(bytes), expected);
+                    assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), expected);
+                    assert_eq!(u64::from_le_bytes(bytes[16..].try_into().unwrap()), 4);
                 } else {
                     assert_eq!(entry, expected);
                 }
             }
         }
+    }
+
+    #[test]
+    fn nvn_hle_calibrates_once_and_reports_normalized_totals() {
+        use nixe_cpu::{
+            execution::{ArchitecturalTimer, CpuExit, TimerSnapshot},
+            profile::ProcessCpuContext,
+        };
+        use nixe_cpu_jit::{JitProcess, JitRunRequest};
+        use std::{cell::Cell, sync::Arc};
+
+        struct TestTimer(Cell<u64>);
+        impl ArchitecturalTimer for TestTimer {
+            fn snapshot(&self) -> TimerSnapshot {
+                let counter = self.0.get();
+                self.0.set(counter + 1);
+                TimerSnapshot {
+                    counter,
+                    frequency: 31_250_000,
+                }
+            }
+        }
+
+        let memory = process_memory();
+        let hooks = NvnHooks {
+            base: 0x40_0000,
+            bootstrap: vec![0x20_0000],
+            registry: Mutex::default(),
+            count_calls: true,
+            hle: Some(Hle::new(TargetPlatform::Switch2, 42)),
+        };
+        hooks.install(&memory).unwrap();
+        let stack = GuestVirtualAddress::new(0x30_0000);
+        memory
+            .map_zeroed(
+                stack,
+                4096,
+                super::super::builder::kernel_mapping(
+                    MemoryKind::Data,
+                    MemoryPermissions::READ_WRITE,
+                ),
+            )
+            .unwrap();
+        let caller = GuestVirtualAddress::new(0x21_0000);
+        let mut caller_code = [0; 4096];
+        caller_code[..4].copy_from_slice(&0xd4000001u32.to_le_bytes()); // svc #0
+        memory
+            .map_initialized(
+                caller,
+                &caller_code,
+                super::super::builder::kernel_mapping(
+                    MemoryKind::Data,
+                    MemoryPermissions::READ_EXECUTE,
+                ),
+            )
+            .unwrap();
+        let jit = JitProcess::new(
+            ProcessCpuContext::for_platform(TargetPlatform::Switch2, memory.space().identity()),
+            Arc::clone(memory.space()),
+            31_250_000,
+            None,
+        )
+        .unwrap();
+        let mut thread = jit.create_thread().unwrap();
+        let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
+        let timer = TestTimer(Cell::new(0));
+        let mut run = |cpu: &mut GuestCpuState| {
+            thread
+                .run_slice(
+                    &mut worker,
+                    JitRunRequest {
+                        state: cpu,
+                        timer: &timer,
+                    },
+                )
+                .unwrap()
+                .stop
+        };
+        let x = |i| A64Register::General(A64GeneralRegister::new(i).unwrap());
+        let mut cpu = GuestCpuState::default();
+        cpu.write_x(A64Register::StackPointer, stack.get() + 4096);
+        cpu.write_x(x(30), caller.get());
+        let resolve = hooks.base + RESOLVE_PC;
+        let calibrated = hooks.base + timing::CALIBRATED as u64;
+        assert!(matches!(
+            hooks.handle_svc(resolve, &mut cpu, &memory),
+            Ok(Svc::Returned)
+        ));
+        assert_eq!(cpu.pc(), hooks.base + timing::CALIBRATE as u64);
+        assert!(matches!(
+            run(&mut cpu),
+            CpuExit::SupervisorCall {
+                immediate: NVN_SVC,
+                ..
+            }
+        ));
+        assert_eq!(cpu.pc(), calibrated);
+        assert_eq!(cpu.read_x(x(2)), 4096);
+        hooks.handle_svc(calibrated, &mut cpu, &memory).unwrap();
+        hooks.handle_svc(resolve, &mut cpu, &memory).unwrap();
+        assert_eq!(cpu.pc(), resolve + 4);
+
+        let procedure = "nvnQueueSubmitCommands";
+        let mut registry = hooks.registry.lock().unwrap();
+        let entry = hooks
+            .bind(&memory, &mut registry, procedure, 0x21_0000)
+            .unwrap();
+        drop(registry);
+        cpu.set_pc(entry);
+        assert!(matches!(
+            run(&mut cpu),
+            CpuExit::SupervisorCall {
+                immediate: NVN_SVC,
+                ..
+            }
+        ));
+        // Stand in for host handler work before resuming the guest return.
+        timer.0.set(timer.0.get() + 4);
+        cpu.set_pc(cpu.pc() + 4);
+        cpu.write_x(x(0), 42);
+        assert!(matches!(
+            run(&mut cpu),
+            CpuExit::SupervisorCall { immediate: 0, .. }
+        ));
+        assert_eq!(cpu.pc(), caller.get());
+        assert_eq!(cpu.read_x(x(0)), 42);
+        assert_eq!(cpu.read_x(A64Register::StackPointer), stack.get() + 4096);
+        let report = hooks.report(&memory).unwrap();
+        let call = &report.calls[0];
+        assert_eq!(call.name, procedure);
+        assert_eq!(call.invocations, 1);
+        assert_eq!(call.total_ns, Some(160));
+        assert_eq!(call.total_normalized_ns, Some(128));
     }
 
     #[test]
