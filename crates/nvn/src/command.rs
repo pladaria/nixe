@@ -35,6 +35,7 @@ pub struct DrawPipeline {
     pub streams: SmallVec<[VertexStream; 2]>,
     pub attributes: SmallVec<[u32; 4]>,
     pub primitive: u32,
+    pub primitive_restart: Option<u32>,
     pub upper_left: bool,
     pub minus_one_to_one: bool,
     pub samples: u32,
@@ -608,6 +609,7 @@ pub struct CommandState {
     pipeline: Arc<DrawPipeline>,
     viewports: [Viewport; 16],
     blend_color: [f32; 4],
+    primitive_restart: Option<u32>,
 
     shaders: SmallVec<[Shader; 2]>,
     vertices: Vec<(u32, Range)>,
@@ -657,6 +659,9 @@ impl CommandState {
         } = record;
         let n = w.len();
         match op {
+            op::PRIMITIVE_RESTART if n == 1 => {
+                self.primitive_restart = (w[0] as u32 != 0).then_some((w[0] >> 32) as u32);
+            }
             op::CLEAR_IMAGE if n == size_of::<Texture>() / 8 + 6 => {
                 let (texture, tail) = w.split_at(size_of::<Texture>() / 8);
                 return Ok(Some(Operation::ClearImage {
@@ -1006,14 +1011,21 @@ impl CommandState {
                 };
                 let shapes = &bindings.sampled.shapes;
                 let primitive = w[0] as u32;
+                let primitive_restart = if op == op::DRAW {
+                    None
+                } else {
+                    self.primitive_restart
+                };
                 if self.pipeline.raster != self.raster
                     || self.pipeline.primitive != primitive
+                    || self.pipeline.primitive_restart != primitive_restart
                     || !(Arc::ptr_eq(&self.pipeline.shapes, shapes)
                         || self.pipeline.shapes == *shapes)
                 {
                     let pipeline = Arc::make_mut(&mut self.pipeline);
                     pipeline.raster = self.raster;
                     pipeline.primitive = primitive;
+                    pipeline.primitive_restart = primitive_restart;
                     pipeline.shapes = shapes.clone();
                 }
                 return Ok(Some(Operation::Draw(Draw {
@@ -1049,6 +1061,53 @@ impl CommandState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primitive_restart_changes_only_indexed_draws() {
+        let mut state = CommandState::new(&Submission::default());
+        let bindings = bindings::CapturedBindings::default();
+        let draw_restart = |state: &mut CommandState, tag, args: &[u64]| {
+            let Some(Operation::Draw(draw)) = state
+                .apply(Record {
+                    tag,
+                    args,
+                    bindings: Some(&bindings),
+                })
+                .unwrap()
+            else {
+                panic!("expected draw");
+            };
+            draw.primitive_restart
+        };
+        let marker = u64::from(u32::MAX) << 32;
+        state
+            .apply(Record {
+                tag: op::PRIMITIVE_RESTART,
+                args: &[marker | 1],
+                bindings: None,
+            })
+            .unwrap();
+        assert_eq!(draw_restart(&mut state, op::DRAW, &[5, 3, 1 << 32]), None);
+        assert_eq!(
+            draw_restart(&mut state, op::INDEXED, &[5 | (1 << 32), 3, 0, 1 << 32]),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            draw_restart(&mut state, op::INDEXED_INDIRECT, &[5 | (1 << 32), 0, 0]),
+            Some(u32::MAX)
+        );
+        state
+            .apply(Record {
+                tag: op::PRIMITIVE_RESTART,
+                args: &[marker],
+                bindings: None,
+            })
+            .unwrap();
+        assert_eq!(
+            draw_restart(&mut state, op::INDEXED, &[5 | (1 << 32), 3, 0, 1 << 32]),
+            None
+        );
+    }
 
     #[test]
     fn depth_range_records_keep_the_mode_used_to_record_them() {

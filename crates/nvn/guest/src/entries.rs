@@ -266,6 +266,7 @@ exports! {
         CommandBufferClearColor => clear,
         CommandBufferBindProgram => program,
         CommandBufferBindProgramAmpere => program_ampere,
+        CommandBufferSetPrimitiveRestart => primitive_restart,
         CommandBufferBindVertexAttribState => attributes,
         CommandBufferBindVertexStreamState => streams,
         CommandBufferBindVertexBuffer => vertex,

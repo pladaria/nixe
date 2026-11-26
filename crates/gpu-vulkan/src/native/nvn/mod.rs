@@ -510,6 +510,21 @@ impl NativeExecution<'_> {
         if d.indirect.is_none() && d.count == 0 {
             return Ok(());
         }
+        if let (Some(index), Some((kind, _, _))) = (d.primitive_restart, d.indices) {
+            let fixed = match kind {
+                0 => u8::MAX.into(),
+                1 => u16::MAX.into(),
+                2 => u32::MAX,
+                t => return Err(error(format!("invalid NVN index type {t}"))),
+            };
+            // Compare the marker at the width of the bound index buffer.
+            // https://github.com/scarletnx/ScarletNX/blob/6930e50f7902c879886860c9aa7bda49857ec23b/src/nx/gpu/vk/render.c#L6516-L6520
+            if index & fixed != fixed {
+                return Err(error(format!(
+                    "unsupported NVN primitive restart index {index:#x} for index type {kind}"
+                )));
+            }
+        }
         let extent = d.extent();
         let mut descriptors = shader::Descriptors::default();
         let selected = self
@@ -549,6 +564,7 @@ impl NativeExecution<'_> {
                 6 => vk::PrimitiveTopology::TRIANGLE_FAN,
                 k => return Err(error(format!("unsupported NVN primitive {k}"))),
             };
+            state.primitive_restart = d.primitive_restart.is_some();
             state.vertex_bindings = d
                 .streams
                 .iter()

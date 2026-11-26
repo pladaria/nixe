@@ -25,6 +25,22 @@ pub fn builder_shaders(c: &Call) -> Result<u64> {
     Ok(0)
 }
 
+impl MaxwellStage {
+    pub fn expand(self, address: u64, compute_group: [u16; 3], compute_shared: u32) -> Shader {
+        let stage = self.header_stage >> Self::STAGE_SHIFT;
+        Shader {
+            address,
+            bytes: self.bytes,
+            header: self.header_stage & ((1 << Self::STAGE_SHIFT) - 1),
+            constants: self.constants,
+            stage,
+            group: if stage == 5 { compute_group } else { [0; 3] },
+            shared: if stage == 5 { compute_shared } else { 0 },
+            ..Default::default()
+        }
+    }
+}
+
 impl AmpereShader {
     pub fn expand(self, layout: ComputeLayout, local_memory_size: u32) -> Shader {
         let compute = self.kind & Self::COMPUTE != 0;

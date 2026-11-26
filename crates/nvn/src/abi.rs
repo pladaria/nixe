@@ -93,9 +93,27 @@ pub struct Sampler {
 #[repr(C)]
 pub struct Program {
     pub count: u64,
-    // The graphics path accepts a vertex/fragment pair. Earlier NVN SDKs
-    // allocate only 128 bytes for a program, including in arrays of objects.
-    pub stages: [Shader; 2],
+    // Older NVN SDKs allocate 128 bytes per program, including in arrays.
+    // Store 64-bit addresses separately so stage metadata needs no padding.
+    pub addresses: [u64; MAXWELL_PROGRAM_STAGES],
+    pub stages: [MaxwellStage; MAXWELL_PROGRAM_STAGES],
+    pub compute_group: [u16; 3],
+    pub padding: u16,
+    pub compute_shared: u32,
+}
+
+pub const MAXWELL_PROGRAM_STAGES: usize = 5;
+
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct MaxwellStage {
+    pub bytes: u32,
+    pub constants: u32,
+    // The header offset is below the 16 MiB shader size limit.
+    pub header_stage: u32,
+}
+impl MaxwellStage {
+    pub const STAGE_SHIFT: u32 = 24;
 }
 
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
@@ -386,6 +404,7 @@ pub(crate) mod op {
     pub const TEXTURES: u32 = 55;
     pub const WAIT_EVENT: u32 = 56;
     pub const SIGNAL_EVENT: u32 = 57;
+    pub const PRIMITIVE_RESTART: u32 = 58;
 }
 
 pub const BLEND: [u8; 8] = [0, 2, 1, 2, 1, 1, 1, 0];

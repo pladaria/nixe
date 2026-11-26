@@ -23,13 +23,14 @@ pub fn from_builder(c: &Call) -> Result<u64> {
 }
 fn set_shaders(c: &Call, stride: u64) -> Result<u64> {
     let n = c.args[1] as u32 as usize;
-    if n > 2 {
+    if n > MAXWELL_PROGRAM_STAGES {
         return Err(format!("unsupported NVN program with {n} shader stages").into());
     }
     let mut p = Program {
         count: n as u64,
         ..Default::default()
     };
+    let mut compute = None;
     for (i, out) in p.stages[..n].iter_mut().enumerate() {
         let [address, control]: [u64; 2] = c.read(c.args[2] + stride * i as u64)?;
         // GLSLC Maxwell control sections carry the extent of the code allocation
@@ -61,18 +62,23 @@ fn set_shaders(c: &Call, stride: u64) -> Result<u64> {
                 k => return Err(format!("unknown graphics shader stage {k}").into()),
             }
         };
-        *out = Shader {
-            address,
+        if stage == 5
+            && compute
+                .replace(([x as u16, y as u16, z as u16], shared))
+                .is_some()
+        {
+            return Err("NVN program contains more than one compute shader".into());
+        }
+        p.addresses[i] = address;
+        *out = MaxwellStage {
             bytes: size,
-            header,
             constants,
-            stage,
-            group: [x as u16, y as u16, z as u16],
-            shared,
-            isa: 0,
-            early_fragment_tests: 0,
-            ..Default::default()
+            header_stage: header | (stage << MaxwellStage::STAGE_SHIFT),
         };
+    }
+    if let Some((group, shared)) = compute {
+        p.compute_group = group;
+        p.compute_shared = shared;
     }
     c.write(c.args[0], &p)?;
     Ok(1)

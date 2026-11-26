@@ -488,10 +488,15 @@ pub fn program(c: &Call) -> Result<u64> {
         .stages
         .get(..p.count as usize)
         .ok_or("invalid program stage count")?;
-    let stages = bytemuck::cast_slice::<Shader, u64>(stages);
-    if let Some(dst) = reserve(c, op::PROGRAM, 1 + stages.len())? {
+    let stride = core::mem::size_of::<Shader>();
+    if let Some(dst) = reserve(c, op::PROGRAM, 1 + stages.len() * stride / 8)? {
         c.write(dst, &mask)?;
-        c.write_bytes(dst + 8, bytemuck::cast_slice(stages))?;
+        for (index, (&shader, &address)) in stages.iter().zip(&p.addresses).enumerate() {
+            c.write(
+                dst + 8 + (index * stride) as u64,
+                &shader.expand(address, p.compute_group, p.compute_shared),
+            )?;
+        }
     }
     Ok(0)
 }
@@ -545,6 +550,15 @@ macro_rules! buffer_binding {
     };
 }
 simple!(barrier, BARRIER, 1);
+pub fn primitive_restart(c: &Call) -> Result<u64> {
+    // The boolean is an NVNboolean and the restart index is a 32-bit int.
+    // https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/hle_nvn.c#L3814
+    record(
+        c,
+        op::PRIMITIVE_RESTART,
+        &[pair(u64::from(c.args[1] as u8 != 0), c.args[2])],
+    )
+}
 simple!(vertex, VERTEX, 3);
 buffer_binding!(uniform, UNIFORM);
 simple!(dispatch, DISPATCH, 3);
