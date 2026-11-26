@@ -3887,6 +3887,35 @@ void EmitX64::EmitVectorRoundingShiftLeftS16(EmitContext& ctx, IR::Inst* inst) {
 }
 
 void EmitX64::EmitVectorRoundingShiftLeftS32(EmitContext& ctx, IR::Inst* inst) {
+    if (code.HasHostFeature(HostFeature::AVX2)) {
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        const Xbyak::Xmm data = ctx.reg_alloc.UseXmm(args[0]);
+        const Xbyak::Xmm shift = ctx.reg_alloc.UseScratchXmm(args[1]);
+        const Xbyak::Xmm left = ctx.reg_alloc.ScratchXmm();
+        const Xbyak::Xmm right = ctx.reg_alloc.ScratchXmm();
+
+        // Sign-extend the low byte. A negative count is out of range for VPSLLVD
+        // and produces zero. Its complement gives the right-shift count minus one.
+        // https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+        code.vpslld(shift, shift, 24);
+        code.vpsrad(shift, shift, 24);
+        code.vpsllvd(left, data, shift);
+        code.vpcmpeqd(right, right, right);
+        code.vpxor(shift, shift, right);
+        code.vpsravd(shift, data, shift);
+
+        // Round t / 2 upward without overflowing on t == INT32_MAX. For
+        // nonnegative counts and shifts right by at least 32, t is 0 or -1
+        // and the rounded result is zero.
+        code.vpsrad(right, shift, 1);
+        code.vpand(shift, shift, code.BConst<32>(xword, 1));
+        code.vpaddd(right, right, shift);
+        code.vpor(left, left, right);
+
+        ctx.reg_alloc.DefineValue(inst, left);
+        return;
+    }
+
     EmitTwoArgumentFallback(code, ctx, inst, [](VectorArray<s32>& result, const VectorArray<s32>& lhs, const VectorArray<s32>& rhs) {
         RoundingShiftLeft(result, lhs, rhs);
     });

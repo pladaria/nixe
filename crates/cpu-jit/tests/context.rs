@@ -139,6 +139,62 @@ fn overlapping_decoder_patterns_preserve_simd_immediates_and_bitfields() {
     assert_eq!(state.read_x(x(5)), 0xedcb);
 }
 
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn signed_vector_rounding_shift_uses_the_low_byte_and_preserves_lane_results() {
+    let (_memory, mut jit) = fixture(&[
+        0x4ea15402, // SRSHL V2.4S,V0.4S,V1.4S
+        0x0ea15403, // SRSHL V3.2S,V0.2S,V1.2S
+        0x4ea05400, // SRSHL V0.4S,V0.4S,V0.4S
+        0xd4000841, // SVC #0x42
+    ]);
+    let pack = |words: [u32; 4]| {
+        words
+            .into_iter()
+            .enumerate()
+            .fold(0, |value, (lane, word)| {
+                value | (u128::from(word) << (lane * 32))
+            })
+    };
+    let shift = |word: u32, count: u32| {
+        let count = i32::from(count as i8);
+        match count {
+            0..=31 => word << count,
+            -31..=-1 => ((i64::from(word as i32) + (1_i64 << (-count - 1))) >> -count) as u32,
+            _ => 0,
+        }
+    };
+
+    for data in [
+        [i32::MIN, i32::MAX, -3, 3],
+        [i32::MIN + 1, i32::MAX - 1, -1, 0],
+    ] {
+        let data = data.map(|lane| lane as u32);
+        for count in 0..=u8::MAX {
+            let counts =
+                [0, 71, 151, 219].map(|offset| 0x839d_a700 | u32::from(count.wrapping_add(offset)));
+            let mut state: ThreadState = a64_state().into();
+            state.set_vector(0, pack(data));
+            state.set_vector(1, pack(counts));
+            state.set_vector(3, u128::MAX);
+            assert!(matches!(
+                run(&mut jit, &mut state).stop,
+                CpuExit::SupervisorCall {
+                    immediate: 0x42,
+                    ..
+                }
+            ));
+            let expected = pack(std::array::from_fn(|lane| shift(data[lane], counts[lane])));
+            assert_eq!(state.vector(2), Some(expected));
+            assert_eq!(state.vector(3), Some(expected & u128::from(u64::MAX)));
+            assert_eq!(
+                state.vector(0),
+                Some(pack(data.map(|lane| shift(lane, lane))))
+            );
+        }
+    }
+}
+
 #[test]
 fn direct_memory_exclusives_simd_fp_tls_and_system_registers() {
     // STR/LDR, LDXR/ADD/STXR, FP and SIMD, TLS/cache/timer registers, SVC #0x42.
