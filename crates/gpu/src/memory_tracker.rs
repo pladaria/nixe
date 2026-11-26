@@ -7,6 +7,7 @@ const PAGE_BITS: u32 = 12;
 const REGION_BITS: u32 = 22;
 const REGION_SIZE: u64 = 1 << REGION_BITS;
 const WORDS: usize = 1 << (REGION_BITS - PAGE_BITS - 6);
+const _: () = assert!(WORDS == u16::BITS as usize);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Cpu,
@@ -16,13 +17,18 @@ enum Kind {
 }
 struct Region {
     words: [[u64; WORDS]; 4],
+    // One bit per nonempty CPU-dirty word. A newly allocated region starts dirty.
+    cpu_summary: u16,
 }
 impl Default for Region {
     fn default() -> Self {
         let mut words = [[0; WORDS]; 4];
         words[Kind::Cpu as usize].fill(u64::MAX);
         words[Kind::Untracked as usize].fill(u64::MAX);
-        Self { words }
+        Self {
+            words,
+            cpu_summary: u16::MAX,
+        }
     }
 }
 fn push_range(ranges: &mut Vec<(u64, u64)>, address: u64, bytes: u64) {
@@ -107,8 +113,48 @@ impl MemoryTracker {
         });
         result
     }
+    fn cpu_word(&self, index: usize) -> u64 {
+        self.regions[index / WORDS]
+            .as_ref()
+            .map_or(u64::MAX, |region| {
+                region.words[Kind::Cpu as usize][index % WORDS]
+            })
+    }
+
     pub fn cpu_modified(&self, address: u64, size: u64) -> bool {
-        self.modified(Kind::Cpu, address, size)
+        if size == 0 {
+            return false;
+        }
+        let first_page = address >> PAGE_BITS;
+        let last_page = (address + size - 1) >> PAGE_BITS;
+        let first_word = (first_page / 64) as usize;
+        let last_word = (last_page / 64) as usize;
+        let first_mask = u64::MAX << (first_page % 64);
+        let last_mask = u64::MAX >> (63 - last_page % 64);
+        if first_word == last_word {
+            return self.cpu_word(first_word) & first_mask & last_mask != 0;
+        }
+        if self.cpu_word(first_word) & first_mask != 0 || self.cpu_word(last_word) & last_mask != 0
+        {
+            return true;
+        }
+        // Only full words are covered by the summary. Dirty pages outside
+        // either end of the query cannot turn a clean range into a hit.
+        let mut word = first_word + 1;
+        while word < last_word {
+            let region_index = word / WORDS;
+            let region_end = (region_index + 1) * WORDS;
+            let end = last_word.min(region_end);
+            let mask = (u16::MAX << (word % WORDS)) & (u16::MAX >> (region_end - end));
+            if self.regions[region_index]
+                .as_ref()
+                .is_none_or(|region| region.cpu_summary & mask != 0)
+            {
+                return true;
+            }
+            word = end;
+        }
+        false
     }
     pub fn gpu_modified(&self, address: u64, size: u64) -> bool {
         self.modified(Kind::Gpu, address, size)
@@ -136,7 +182,11 @@ impl MemoryTracker {
                     );
                 });
                 region.words[Kind::Untracked as usize][word] |= mask;
-                region.words[Kind::Cpu as usize][word] |= mask;
+                let cpu_word = &mut region.words[Kind::Cpu as usize][word];
+                if *cpu_word == 0 {
+                    region.cpu_summary |= 1 << word;
+                }
+                *cpu_word |= mask;
             },
         );
         if !ranges.is_empty() {
@@ -192,7 +242,11 @@ impl MemoryTracker {
                         u64::from(count) << PAGE_BITS,
                     );
                 });
-                region.words[Kind::Cpu as usize][word] &= !mask;
+                let cpu_word = &mut region.words[Kind::Cpu as usize][word];
+                *cpu_word &= !mask;
+                if dirty != 0 && *cpu_word == 0 {
+                    region.cpu_summary &= !(1 << word);
+                }
                 region.words[Kind::Untracked as usize][word] &= !mask;
                 region.words[Kind::Synchronized as usize][word] |= mask;
             },
@@ -228,6 +282,86 @@ impl Drop for MemoryTracker {
                     .update_pages_cached_batch(&ranges, -1)
                     .expect("buffer cache destruction protection update");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixe_memory::{Machine, device_memory::DeviceMemory};
+
+    #[test]
+    fn cpu_dirty_query_matches_page_state_across_updates() {
+        const PAGE: u64 = 1 << PAGE_BITS;
+        const SPAN: u64 = 4 * REGION_SIZE;
+        let device = DeviceMemory::new(Machine::new(PAGE).unwrap(), 34);
+        let mut tracker = MemoryTracker::new(device);
+        let mut dirty = vec![true; (SPAN / PAGE) as usize];
+        let mut sequence = 0xabc01234_u64;
+        let mut choose = |limit| {
+            sequence = sequence.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (sequence >> 32) % limit
+        };
+        let page_bounds = |start: u64, size: u64| {
+            (start / PAGE) as usize..((start + size).div_ceil(PAGE)) as usize
+        };
+        let mut check = |tracker: &MemoryTracker, dirty: &[bool]| {
+            for (start, size) in [
+                (0, SPAN),
+                (64 * PAGE - 1, 2),
+                (REGION_SIZE - 1, 2),
+                (2 * REGION_SIZE - PAGE, REGION_SIZE + PAGE),
+                (SPAN - 1, 1),
+                (SPAN, 0),
+            ] {
+                let expected = size != 0 && dirty[page_bounds(start, size)].contains(&true);
+                assert_eq!(
+                    tracker.cpu_modified(start, size),
+                    expected,
+                    "{start:#x}+{size:#x}"
+                );
+            }
+            for _ in 0..32 {
+                let start = choose(SPAN);
+                let size = 1 + choose(SPAN - start);
+                assert_eq!(
+                    tracker.cpu_modified(start, size),
+                    dirty[page_bounds(start, size)].contains(&true),
+                    "{start:#x}+{size:#x}",
+                );
+            }
+        };
+        check(&tracker, &dirty);
+        // Start with clean regions adjacent to an unallocated one.
+        for (start, size, write) in [
+            (0, 2 * REGION_SIZE, false),
+            (64 * PAGE, 1, true),
+            (REGION_SIZE - PAGE, 2 * PAGE, true),
+            (REGION_SIZE, PAGE, false),
+            (64 * PAGE, PAGE, false),
+            (2 * REGION_SIZE + 1, REGION_SIZE - 1, false),
+            (2 * REGION_SIZE - 1, REGION_SIZE, true),
+            (1, (WORDS as u64 + 1) * 64 * PAGE - 2, false),
+            (3 * REGION_SIZE, REGION_SIZE, false),
+            (0, SPAN, true),
+            (SPAN - PAGE, PAGE - 1, false),
+        ] {
+            let pages = page_bounds(start, size);
+            if write {
+                tracker.cpu_write(start, size);
+                dirty[pages].fill(true);
+            } else {
+                let mut uploads = Vec::new();
+                for index in pages.clone() {
+                    if dirty[index] {
+                        push_range(&mut uploads, index as u64 * PAGE, PAGE);
+                    }
+                }
+                assert_eq!(tracker.take_uploads(start, size), uploads);
+                dirty[pages].fill(false);
+            }
+            check(&tracker, &dirty);
         }
     }
 }
