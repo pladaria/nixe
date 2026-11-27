@@ -16,6 +16,7 @@ pub(super) struct NvnReadback {
 struct StagedNvnReadback {
     version: u64,
     mapping_generation: u64,
+    early: bool,
     download: ImageDownload,
 }
 
@@ -194,7 +195,7 @@ impl TextureCache {
     }
 }
 impl Residency<'_> {
-    pub(crate) fn stage_nvn_readbacks(&mut self) -> Result<(), VulkanError> {
+    pub(crate) fn stage_nvn_readbacks(&mut self, early: bool) -> Result<(), VulkanError> {
         if self.texture_cache.nvn_readbacks.is_empty() {
             return Ok(());
         }
@@ -205,13 +206,16 @@ impl Residency<'_> {
             let entry = self.texture_cache.get(id);
             let version = entry.modification_tick;
             // @SPECULATIVE A texture read back in successive versions is likely
-            // to be needed again after the next NVN fence. Stage at most once
-            // per observed read, and keep the bytes private until requested.
-            if !read.repeated
-                || read.snapshot.is_some()
-                || !entry.gpu_modified
-                || read.last_read == version
-            {
+            // to be needed again after the next NVN fence. Use the existing early
+            // submission when possible and let the fence replace a stale early copy once.
+            if !read.repeated || !entry.gpu_modified || read.last_read == version {
+                continue;
+            }
+            if read.snapshot.as_ref().is_some_and(|s| {
+                early
+                    || !s.early
+                    || (s.version == version && s.mapping_generation == mapping_generation)
+            }) {
                 continue;
             }
             let Some(size) = entry.nvn_readback_size() else {
@@ -224,6 +228,7 @@ impl Residency<'_> {
                 self.texture_cache.nvn_readbacks[index].snapshot = Some(StagedNvnReadback {
                     version,
                     mapping_generation,
+                    early,
                     download,
                 });
             }

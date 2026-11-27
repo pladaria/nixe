@@ -244,7 +244,9 @@ impl NativeExecution<'_> {
             && !self.state.fences.has_publication_for(device.current_work())
         {
             device.submission.mark_nvn_early_submit();
-            nixe_gpu::trace::event("nvn_early_submit", device.current_work().tick(), 0, 0);
+            let work = device.current_work();
+            self.residency.stage_nvn_readbacks(true).map_err(runtime)?;
+            nixe_gpu::trace::event("nvn_early_submit", work.tick(), 0, 0);
             self.flush()?;
         }
         Ok(())

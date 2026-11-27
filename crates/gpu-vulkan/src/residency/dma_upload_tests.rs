@@ -186,15 +186,29 @@ fn nvn_fence_stages_repeated_reads_without_publishing_stale_texels() -> Result<(
         }
 
         clear(&mut r, 0x1122_3344)?;
-        r.stage_nvn_readbacks()?;
+        r.stage_nvn_readbacks(true)?;
         let fence = r.flush()?;
+        r.stage_nvn_readbacks(false)?;
+        assert!(!r.has_recorded_work());
         assert_eq!(read_ram()?, 0x5060_7080);
         r.download_texture_memory(address, 4, true)?;
         assert_eq!(r.device().submission.scheduled, fence.tick());
         assert_eq!(read_ram()?, 0x1122_3344);
 
+        clear(&mut r, 0xbada_5511)?;
+        r.stage_nvn_readbacks(true)?;
+        let prefix = r.flush()?;
+        clear(&mut r, 0xface_2080)?;
+        r.stage_nvn_readbacks(false)?;
+        let fence = r.flush()?;
+        assert_eq!(fence.tick(), prefix.tick() + 1);
+        assert_eq!(read_ram()?, 0x1122_3344);
+        r.download_texture_memory(address, 4, true)?;
+        assert_eq!(r.device().submission.scheduled, fence.tick());
+        assert_eq!(read_ram()?, 0xface_2080);
+
         clear(&mut r, 0x5566_7788)?;
-        r.stage_nvn_readbacks()?;
+        r.stage_nvn_readbacks(false)?;
         let fence = r.flush()?;
         clear(&mut r, 0x99aa_bbcc)?;
         r.download_texture_memory(address, 4, true)?;
@@ -202,7 +216,7 @@ fn nvn_fence_stages_repeated_reads_without_publishing_stale_texels() -> Result<(
         assert_eq!(read_ram()?, 0x99aa_bbcc);
 
         clear(&mut r, 0x0102_0304)?;
-        r.stage_nvn_readbacks()?;
+        r.stage_nvn_readbacks(false)?;
         let fence = r.flush()?;
         let bytes = 0xddcc_bbaau32.to_le_bytes();
         memory.write_block_unsafe(address, WriteSource::Bytes(&bytes))?;
