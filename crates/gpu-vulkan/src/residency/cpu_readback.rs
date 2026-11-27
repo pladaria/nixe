@@ -26,6 +26,7 @@ impl Residency<'_> {
             let mut ranges = RangeSet::from_range(address, bytes.len() as u64);
             memory.apply_device_aliases(address, bytes.len() as u64, |a, b| ranges.insert(a, b));
             for (a, b) in ranges.iter() {
+                self.resolve_nvn_sample_access(a, b)?;
                 self.finish_buffer_reads(a, b)?;
             }
             self.preserve_texture_writes(&ranges, || {
@@ -80,6 +81,10 @@ impl Residency<'_> {
         self.buffer_cache
             .gpu_modified_ranges
             .intersects(start, end - start)
+            || self
+                .buffer_cache
+                .nvn_sample_producer(address, bytes)
+                .is_some()
             || self.buffer_cache.pending_read(address, bytes).is_some()
             || self.texture_cache.region_gpu_modified(address, bytes)
             || (self.caches.query_pages.any(address, bytes)
@@ -141,7 +146,11 @@ impl Residency<'_> {
     }
 
     fn has_ordered_nonbuffer_read(&self, address: u64, bytes: u64) -> bool {
-        if self.texture_cache.region_gpu_modified(address, bytes)
+        if self
+            .buffer_cache
+            .nvn_sample_producer(address, bytes)
+            .is_some()
+            || self.texture_cache.region_gpu_modified(address, bytes)
             || (self.caches.query_pages.any(address, bytes)
                 && self
                     .caches
@@ -281,6 +290,9 @@ impl Residency<'_> {
                 }
             }
         }
+        for (address, bytes) in ranges.iter() {
+            self.resolve_nvn_sample_access(address, bytes)?;
+        }
         self.preserve_texture_writes(&ranges, || {
             Ok((0..capture.len())
                 .flat_map(|i| capture[i].physical_extents())
@@ -340,6 +352,7 @@ impl Residency<'_> {
     }
     pub(crate) fn flush_region(&mut self, address: u64, bytes: u64) -> Result<(), VulkanError> {
         self.runtime.device.realize_deferred_clear()?;
+        self.resolve_nvn_sample_access(address, bytes)?;
         self.download_texture_memory(address, bytes, false)?;
         self.read_buffer_memory(address, bytes)?;
         self.caches
@@ -350,7 +363,8 @@ impl Residency<'_> {
     }
 
     pub(crate) fn progress_native_work(&mut self) -> Result<(), VulkanError> {
-        self.runtime.device.poll_progress()?;
+        let completed = self.runtime.device.poll_progress()?;
+        self.buffer_cache.publish_nvn_samples(completed)?;
         self.buffer_cache.publish_completed_reads()
     }
 
@@ -401,6 +415,7 @@ impl Residency<'_> {
             #[cfg(feature = "performance-counters")]
             let _trace =
                 nixe_gpu::trace::span("read_cpu_prepare", area.start, area.end - area.start, 0);
+            self.resolve_nvn_sample_access(area.start, area.end - area.start)?;
             // Buffer-only reads return after submission. A query store has a
             // real dependency on overlapping read copies and resolves them
             // before publishing its value on this ordered owner boundary.
@@ -446,6 +461,9 @@ impl Residency<'_> {
                 | AccessOperation::Publish { .. }
                 | AccessOperation::Atomic(_)
         ) {
+            for (address, bytes) in device_ranges.iter() {
+                self.resolve_nvn_sample_access(address, bytes)?;
+            }
             // Texture invalidation replaces a whole representation. Preserve
             // its untouched bytes before a partial canonical write. Buffer
             // invalidation already retains exact unwritten native intervals.

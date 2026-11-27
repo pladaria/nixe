@@ -29,39 +29,46 @@ impl Query {
         &self.bytes[..if self.bytes.len() == 4 { 4 } else { 8 }]
     }
     fn write(&self, bytes: &[u8]) -> Result<(), nixe_memory::MemoryError> {
-        self.machine.write_resources(&self.target, |writer| {
-            // Publish a long report's timestamp before its completion value.
-            let parts = if bytes.len() == 16 {
-                [8..16, 0..8]
-            } else {
-                [0..bytes.len(), 0..0]
-            };
-            for part in parts {
-                let mut offset = 0usize;
-                for extent in self
-                    .target
-                    .iter()
-                    .flat_map(nixe_memory::AllocationRange::physical_extents)
-                {
-                    let begin = offset.max(part.start);
-                    let end = (offset + extent.bytes as usize).min(part.end);
-                    if begin < end {
-                        writer.write(
-                            nixe_memory::Extent {
-                                start: nixe_memory::ArenaOffset::new(
-                                    extent.start.get() + (begin - offset) as u64,
-                                ),
-                                bytes: (end - begin) as u64,
-                            },
-                            &bytes[begin..end],
-                        )?;
-                    }
-                    offset += extent.bytes as usize;
-                }
-            }
-            Ok(())
-        })
+        write_report(&self.machine, &self.target, bytes)
     }
+}
+
+pub(super) fn write_report(
+    machine: &Machine,
+    target: &[nixe_memory::AllocationRange],
+    bytes: &[u8],
+) -> Result<(), nixe_memory::MemoryError> {
+    machine.write_resources(target, |writer| {
+        // Publish a long report's timestamp before its completion value.
+        let parts = if bytes.len() == 16 {
+            [8..16, 0..8]
+        } else {
+            [0..bytes.len(), 0..0]
+        };
+        for part in parts {
+            let mut offset = 0usize;
+            for extent in target
+                .iter()
+                .flat_map(nixe_memory::AllocationRange::physical_extents)
+            {
+                let begin = offset.max(part.start);
+                let end = (offset + extent.bytes as usize).min(part.end);
+                if begin < end {
+                    writer.write(
+                        nixe_memory::Extent {
+                            start: nixe_memory::ArenaOffset::new(
+                                extent.start.get() + (begin - offset) as u64,
+                            ),
+                            bytes: (end - begin) as u64,
+                        },
+                        &bytes[begin..end],
+                    )?;
+                }
+                offset += extent.bytes as usize;
+            }
+        }
+        Ok(())
+    })
 }
 pub(crate) struct QueryCache {
     uniform_sync: Arc<std::sync::atomic::AtomicU64>,
@@ -168,6 +175,7 @@ impl Residency<'_> {
             .ok_or(VulkanError::InvalidResource(
                 "query destination has no device address",
             ))?;
+        self.resolve_nvn_sample_access(address, bytes.len() as u64)?;
         self.runtime
             .device_memory
             .mark_gpu_written(address, bytes.len() as u64);

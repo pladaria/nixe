@@ -68,6 +68,30 @@ impl Dispatch {
             Ok(())
         });
     }
+    pub(crate) fn copy_nvn_queries(
+        &mut self,
+        pool: vk::QueryPool,
+        first: u32,
+        count: u32,
+        buffer: vk::Buffer,
+        offset: u64,
+    ) {
+        self.recorder.record(move |context| {
+            unsafe {
+                context.device.cmd_copy_query_pool_results(
+                    context.command,
+                    pool,
+                    first,
+                    count,
+                    buffer,
+                    offset,
+                    8,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                );
+            }
+            Ok(())
+        });
+    }
     // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyQueryPoolResults.html
     pub(crate) fn copy_sample_reports(
         &mut self,

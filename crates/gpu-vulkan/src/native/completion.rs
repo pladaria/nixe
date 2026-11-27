@@ -194,6 +194,14 @@ impl FenceManager {
                                 }
                             }
                         }
+                        if caches.nvn_sample_batches.load(Ordering::Acquire) {
+                            caches
+                                .buffer_cache
+                                .lock()
+                                .unwrap()
+                                .publish_nvn_samples(pending.completed())
+                                .map_err(failure)?;
+                        }
                         if fence.flushes {
                             caches.pop_async_flushes().map_err(failure)?;
                         }

@@ -58,6 +58,7 @@ impl VulkanDevice {
         values: &[vk::ClearValue],
     ) -> Result<(), VulkanError> {
         self.prepare_samples(self.submission.samples.enabled)?;
+        self.prepare_nvn_render_pass_samples()?;
         let render_pass =
             self.begin_render_pass(&targets.framebuffer, pass, targets.area, values)?;
         self.submission.statistics.rendering_scopes += 1;

@@ -5,6 +5,7 @@ use super::*;
 pub(crate) struct CacheOwners {
     pub(super) ordered_store_pages: nixe_gpu::page_filter::PageFilter,
     pub(super) query_pages: nixe_gpu::page_filter::PageFilter,
+    pub(crate) nvn_sample_batches: std::sync::atomic::AtomicBool,
     uniform_sync: Arc<std::sync::atomic::AtomicU64>,
     pub(super) command_pages: Arc<command_pages::CommandPages>,
     pub(crate) shader_cache: nixe_gpu::shader_memory::ShaderCache,
@@ -78,6 +79,7 @@ impl CacheOwners {
                     .ilog2(),
             ),
             query_pages: nixe_gpu::page_filter::PageFilter::new(device.address_bits()),
+            nvn_sample_batches: Default::default(),
             command_pages,
             progress: Arc::clone(&progress),
             timeline,
@@ -153,14 +155,13 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
         self.unmap_memory(address, bytes);
     }
     fn must_flush_region(&self, address: u64, bytes: u64) -> bool {
-        if self
-            .buffer_cache
-            .lock()
-            .unwrap()
-            .memory_tracker
-            .gpu_modified(address, bytes)
         {
-            return true;
+            let buffers = self.buffer_cache.lock().unwrap();
+            if buffers.memory_tracker.gpu_modified(address, bytes)
+                || buffers.nvn_sample_producer(address, bytes).is_some()
+            {
+                return true;
+            }
         }
         self.texture_cache
             .lock()
@@ -171,13 +172,22 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
         // The graphics owner can hold this mutex while waiting for native
         // quiescence. An admitted vCPU must never block on that mutex.
         let mut buffers = self.buffer_cache.try_lock().ok()?;
-        let area = self
+        let mut area = self
             .texture_cache
             .try_lock()
             .ok()?
             .flush_area::<false>(address, bytes)?;
-        if buffers.read_needs_download(area.start, area.end - area.start) {
+        if buffers.read_needs_download(area.start, area.end - area.start)
+            || buffers.nvn_sample_producer(address, bytes).is_some()
+        {
             return None;
+        }
+        if buffers
+            .nvn_sample_producer(area.start, area.end - area.start)
+            .is_some()
+        {
+            area.start = address;
+            area.end = address + bytes;
         }
         buffers
             .read_armed_ranges
@@ -193,6 +203,19 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
             .flush_area::<true>(address, bytes)
             .expect("reactive reads always resolve an area");
         area.preemptive &= !buffers.read_needs_download(area.start, area.end - area.start);
+        if area.preemptive {
+            let sample = buffers.nvn_sample_producer(address, bytes).is_some();
+            if sample
+                || buffers
+                    .nvn_sample_producer(area.start, area.end - area.start)
+                    .is_some()
+            {
+                area.start = address;
+                area.end = address + bytes;
+                area.preemptive = !sample;
+                return area;
+            }
+        }
         buffers
             .read_armed_ranges
             .subtract(area.start, area.end - area.start);
@@ -216,6 +239,9 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
     fn on_cpu_write(&self, address: u64, bytes: u64) -> bool {
         {
             let mut cache = self.buffer_cache.lock().unwrap();
+            if cache.nvn_sample_producer(address, bytes).is_some() {
+                return true;
+            }
             let registered = (address >> 16..(address + bytes).div_ceil(1 << 16))
                 .any(|page| cache.buffer_index.at(page << 16).is_some());
             if registered {
@@ -260,6 +286,7 @@ impl nixe_memory::device_memory::DeviceMemoryInterface for CacheOwners {
     }
 }
 pub(crate) struct BufferCache {
+    pub(super) nvn_samples: nvn_samples::SampleReports,
     pub(super) uniform_streams: uniform_stream::UniformStreams,
     pub(super) command_pages: Arc<command_pages::CommandPages>,
     pub(super) collect_command_copies: bool,
@@ -290,6 +317,8 @@ pub(crate) struct BufferCache {
     pub(super) pending_reports: Vec<Arc<query::Query>>,
     pub(super) read_back_pages: Vec<buffer_download::ReadBackPage>,
     pub(super) read_back_reads: u64,
+    pub(super) timestamp_writes: std::collections::BTreeMap<u64, buffer_download::TimestampWrite>,
+    pub(super) timestamp_mapping_generation: u64,
     pub(super) read_download_ranges: RangeSet,
     pub(super) read_downloads:
         std::collections::VecDeque<(buffer_download::DownloadEnd, buffer_download::ReadDownload)>,
@@ -330,6 +359,7 @@ impl BufferCache {
         download_policy: BufferDownloadPolicy,
     ) -> Self {
         Self {
+            nvn_samples: Default::default(),
             uniform_streams: uniform_stream::UniformStreams::new(uniform_sync),
             command_pages,
             collect_command_copies: false,
@@ -356,6 +386,8 @@ impl BufferCache {
             pending_reports: Vec::new(),
             read_back_pages: Vec::new(),
             read_back_reads: 0,
+            timestamp_writes: Default::default(),
+            timestamp_mapping_generation: 0,
             read_download_ranges: Default::default(),
             read_downloads: Default::default(),
             dma_downloads: Default::default(),

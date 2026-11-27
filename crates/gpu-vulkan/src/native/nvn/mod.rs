@@ -53,6 +53,16 @@ impl ReportClock {
     }
 }
 impl Cache {
+    fn sample_reports_on_cpu(&self) -> bool {
+        // CPU accumulation removed about 59 GPU query scans per frame in
+        // Odyssey and resolved its render predicate before draw recording.
+        // The fixed scenes went from 49–50 FPS to 60 FPS. In Bananza, CPU
+        // accumulation added about 2.5 ms of graphics-owner CPU time per
+        // moving frame and cost 3–5% FPS, so NVN2 keeps GPU accumulation.
+        // NVN2 installs its Ampere clock before replay.
+        !matches!(self.clock, Some(ReportClock::Ampere(_)))
+    }
+
     pub(super) fn change_resolution(&mut self) {
         self.selected_pipeline = None;
         self.pipelines.clear();
@@ -301,10 +311,14 @@ impl NativeExecution<'_> {
             Operation::ResetCounter(kind) => {
                 match kind {
                     1 => {
-                        self.residency
-                            .device_mut()
-                            .reset_samples_passed()
-                            .map_err(runtime)?;
+                        if self.state.nvn.sample_reports_on_cpu() {
+                            self.residency.reset_nvn_samples();
+                        } else {
+                            self.residency
+                                .device_mut()
+                                .reset_samples_passed()
+                                .map_err(runtime)?;
+                        }
                         selections.count_samples = true;
                     }
                     // Pipeline statistics have no observable value until ReportCounter.
@@ -322,7 +336,7 @@ impl NativeExecution<'_> {
                     return Err(runtime(error(format!("unsupported NVN counter {kind}"))));
                 }
                 // @SIMPLIFICATION Sample the host monotonic clock at ordered command
-                // issue. Publish the report through the GPU buffer timeline.
+                // issue. Publish reports on the producing GPU timeline.
                 let ticks = self
                     .state
                     .nvn
@@ -330,14 +344,20 @@ impl NativeExecution<'_> {
                     .get_or_insert_with(|| ReportClock::Maxwell(std::time::Instant::now()))
                     .raw();
                 if kind == 1 {
-                    self.residency
-                        .write_nvn_sample_report(address, ticks)
-                        .map_err(runtime)?;
+                    if self.state.nvn.sample_reports_on_cpu() {
+                        self.residency.write_nvn_sample_report(address, ticks)
+                    } else {
+                        self.residency.write_nvn2_sample_report(address, ticks)
+                    }
+                    .map_err(runtime)?;
                     selections.count_samples = true;
                     return Ok(());
                 }
-                self.write_nvn_buffer(address, bytemuck::bytes_of(&[0u64, ticks]))
-                    .map_err(runtime)?;
+                let report: [u8; 16] = bytemuck::cast([0u64, ticks]);
+                let generation = self.residency.device_memory().generation();
+                self.write_nvn_buffer(address, &report).map_err(runtime)?;
+                self.residency
+                    .remember_nvn_timestamp(address, report, generation);
                 self.state
                     .nvn
                     .conditions
@@ -804,6 +824,7 @@ impl NativeExecution<'_> {
                 predicate,
                 parameter_owner: Some(pipeline.id),
                 count_samples: selections.count_samples,
+                sample_reports_on_cpu: self.state.nvn.sample_reports_on_cpu(),
             },
         )?;
         self.state.statistics.draws += 1;

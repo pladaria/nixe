@@ -263,14 +263,20 @@ impl Residency<'_> {
         offset: u64,
         size: u64,
     ) -> Result<(), VulkanError> {
-        let device = &mut self.runtime.device;
-        let buffer = self.buffer_cache.buffers[id].native.handle;
-        if device
+        let entry = &self.buffer_cache.buffers[id];
+        if self
+            .runtime
+            .device
             .submission
             .samples
-            .reports_overlap(buffer, offset, size)
+            .reports_overlap(entry.native.handle, offset, size)
         {
-            device.end_rendering()?;
+            self.runtime.device.end_rendering()?;
+        }
+        if self.buffer_cache.has_pending_nvn_samples()
+            && let Some(address) = entry.device_address
+        {
+            self.resolve_nvn_sample_access(address + offset, size)?;
         }
         Ok(())
     }

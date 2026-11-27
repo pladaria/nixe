@@ -8,9 +8,11 @@ pub(crate) mod progress;
 pub(crate) mod staging;
 pub(crate) use staging::Slice;
 mod frame_metrics;
+mod nvn_queries;
 mod queries;
 mod timing;
 use nixe_gpu::{BackendInstanceId, BackendSubmissionToken};
+pub(crate) use nvn_queries::NvnQueryCopy;
 use std::{
     sync::{
         Arc,
@@ -241,6 +243,7 @@ pub struct RecordingStatistics {
 }
 pub(crate) struct QueueState {
     pub(crate) samples: queries::Samples,
+    nvn_samples: nvn_queries::NvnSamples,
     pub frame_metrics: frame_metrics::Recorder,
     calibration: Option<timing::Calibration>,
     recording_handle: crate::dispatch::RecordingHandle,
@@ -280,6 +283,7 @@ impl QueueState {
         dispatch: &mut crate::dispatch::Dispatch,
     ) -> Result<(), VulkanError> {
         self.samples.pause(dispatch);
+        self.nvn_samples.pause(dispatch);
         if let Some(index) = self.recording
             && let Some(active) = self.slots[index].active_render_pass.take()
         {
@@ -302,6 +306,7 @@ impl QueueState {
         let timeline = Arc::new(progress::Timeline::new(Arc::clone(&owner))?);
         let mut state = Self {
             samples: Default::default(),
+            nvn_samples: Default::default(),
             frame_metrics: frame_metrics::Recorder::new(),
             calibration,
             recording_handle: dispatch.recording_handle(),

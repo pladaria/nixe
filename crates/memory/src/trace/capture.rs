@@ -244,6 +244,8 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
                 | "vulkan_submit_site"
                 | "frame_queue"
                 | "frame_sample_queries"
+                | "nvn_sample_readback_stage"
+                | "nvn_sample_readback_wait"
                 | "frame_memory"
                 | "frame_buffers"
                 | "frame_dependency_wait"

@@ -10,8 +10,9 @@ mod support {
 }
 
 #[test]
-fn nvn_sample_report_batch_preserves_strided_records_and_the_running_counter()
+fn nvn_sample_publication_preserves_strided_records_and_exact_read_ranges()
 -> Result<(), Box<dyn std::error::Error>> {
+    use nixe_memory::device_memory::DeviceMemoryInterface;
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {
         return Ok(());
     };
@@ -43,17 +44,42 @@ fn nvn_sample_report_batch_preserves_strided_records_and_the_running_counter()
             true,
             false,
         )?;
-        for (offset, stamp) in [(0, 19), (256, 47)] {
-            let device = residency.device_mut();
-            device.reset_samples_passed()?;
-            device.set_samples_enabled(true)?;
-            device.begin_samples(true);
-            residency.write_nvn_sample_report(address + offset, stamp)?;
-            assert!(residency.device().submission.has_sample_reports());
-        }
+        residency.reset_nvn_samples();
+        residency.device_mut().set_nvn_samples_enabled(true)?;
+        residency.device_mut().begin_nvn_samples();
+        residency.write_nvn_sample_report(address, 19)?;
+        residency.reset_nvn_samples();
+        residency.device_mut().begin_nvn_samples();
+        residency.write_nvn_sample_report(address + 256, 47)?;
+    }
+    let caches = &gpu.residency.caches;
+    let read = caches.try_on_cpu_read(address + 32, 8).unwrap();
+    assert_eq!((read.start, read.end), (address + 32, address + 40));
+    assert!(caches.try_on_cpu_read(address + 256, 8).is_none());
+    // A new device alias must invalidate the interval index while work is live.
+    let alias = 0x30000;
+    let _alias = memory.map(
+        alias,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 4096)?]),
+        true,
+    )?;
+    assert!(caches.try_on_cpu_read(alias + 256, 8).is_none());
+    {
+        let mut native = gpu.execution();
+        let residency = &mut native.residency;
+        let work = residency.flush()?;
         residency.write_nvn_sample_report(address + 512, 94)?;
-        assert!(!residency.device().submission.has_sample_reports());
-        residency.flush_read_span(address, 528)?;
+        residency.flush_read_span(address, 16)?;
+        assert_eq!(residency.device().scheduled_tick(), work.tick());
+        let report = residency.device_buffer(
+            alias + 512,
+            16,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            true,
+            false,
+        )?;
+        let gpu_value = residency.read_buffer(report.buffer, report.offset + 8, 8)?;
+        assert_eq!(gpu_value, 94u64.to_le_bytes());
     }
     let mut bytes = [0; 528];
     memory.reader().read_block_unsafe(address, &mut bytes)?;
@@ -63,6 +89,70 @@ fn nvn_sample_report_batch_preserves_strided_records_and_the_running_counter()
     }
     assert_eq!(&bytes[16..256], &[0x5a; 240]);
     assert_eq!(&bytes[272..512], &[0x5a; 240]);
+    drop(gpu);
+    validation.check()?;
+    Ok(())
+}
+
+#[test]
+fn nvn2_sample_reports_keep_the_native_buffer_batch() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let allocation = machine.account(4 << 20)?.allocate(4096)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let address = 0x10000;
+    let _mapping = memory.map(
+        address,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 4096)?]),
+        true,
+    )?;
+    memory.write_block_unsafe(address, nixe_memory::WriteSource::Bytes(&[0x5a; 48]))?;
+    let mut gpu = NativeGpuExecution::new(
+        memory.clone(),
+        device,
+        CacheConfiguration::default(),
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    gpu.use_nvn2_report_clock(|| 17);
+    {
+        let mut native = gpu.execution();
+        // A first-time buffer upload ends rendering. Start the queries only
+        // after the report destinations are resident, as in the batched path.
+        native.residency.device_buffer(
+            address,
+            48,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            true,
+            false,
+        )?;
+        let mut selected = selections::Queue::default();
+        for offset in [0, 32] {
+            native.issue_nvn(1, Operation::ResetCounter(1), &mut selected)?;
+            let device = native.residency.device_mut();
+            device.set_samples_enabled(true)?;
+            device.begin_samples(true);
+            native.issue_nvn(
+                1,
+                Operation::Report {
+                    kind: 1,
+                    address: address + offset,
+                },
+                &mut selected,
+            )?;
+            assert!(native.residency.device().submission.has_sample_reports());
+        }
+        native.residency.flush_read_span(address, 48)?;
+    }
+    let mut bytes = [0; 48];
+    memory.reader().read_block_unsafe(address, &mut bytes)?;
+    let report: [u8; 16] = bytemuck::cast([0u64, 17]);
+    assert_eq!(&bytes[..16], &report);
+    assert_eq!(&bytes[16..32], &[0x5a; 16]);
+    assert_eq!(&bytes[32..], &report);
     drop(gpu);
     validation.check()?;
     Ok(())
@@ -389,6 +479,15 @@ fn counter_comparison_snapshots_device_writes_in_queue_order()
             clear(red, [4, 0, 4, 4]),
             &mut selections::Queue::default(),
         )?;
+        native.issue_nvn(1, clear(red, full), &mut selected)?;
+
+        // The comparison takes the CPU path when either word belongs to an
+        // in-flight sample report. It still rejects the same clear.
+        native.issue_nvn(1, counters(&different), &mut selected)?;
+        native.issue_nvn(1, Operation::ResetCounter(1), &mut selected)?;
+        native.issue_nvn(1, Operation::Report { kind: 1, address }, &mut selected)?;
+        native.issue_nvn(1, compare(0), &mut selected)?;
+        assert!(native.state.nvn.conditions.draw(1).is_none());
         native.issue_nvn(1, clear(red, full), &mut selected)?;
     }
     // The explicit flush submits the draws. Both later fences must observe

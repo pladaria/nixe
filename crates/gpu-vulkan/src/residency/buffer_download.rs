@@ -17,9 +17,18 @@ impl DownloadEnd {
     }
 }
 pub(super) struct Download {
-    ticket: crate::ReadbackTicket,
+    source: DownloadSource,
     publications: Vec<Publication>,
     write_ranges: RangeSet,
+}
+enum DownloadSource {
+    Vulkan(crate::ReadbackTicket),
+    Host(WorkTicket, Arc<crate::queue::progress::SubmissionProgress>),
+}
+#[derive(Clone, Copy)]
+pub(super) struct TimestampWrite {
+    work: WorkTicket,
+    bytes: [u8; 16],
 }
 // Reactive reads retain the requested snapshot even after a newer GPU write.
 // Fence copies instead discard bytes superseded by either CPU or GPU writes.
@@ -31,7 +40,11 @@ struct Publication {
     address: u64,
     bytes: u64,
     inputs: Vec<(u64, nixe_memory::AllocationRange)>,
-    offset: usize,
+    source: PublicationSource,
+}
+enum PublicationSource {
+    Staging(usize),
+    Timestamp([u8; 16], usize),
 }
 // Retain logical offsets across holes in device memory and pin the actual
 // physical destinations, rather than resolving them again at publication.
@@ -50,15 +63,30 @@ fn download_inputs(
     Ok(inputs)
 }
 impl Download {
-    fn new(ticket: crate::ReadbackTicket, publications: Vec<Publication>) -> Self {
+    fn new(source: DownloadSource, publications: Vec<Publication>) -> Self {
         let mut ranges = RangeSet::default();
         for publication in &publications {
             ranges.insert(publication.address, publication.bytes);
         }
         Self {
-            ticket,
+            source,
             publications,
             write_ranges: ranges,
+        }
+    }
+    fn work(&self) -> WorkTicket {
+        match &self.source {
+            DownloadSource::Vulkan(ticket) => ticket.work(),
+            DownloadSource::Host(work, _) => *work,
+        }
+    }
+    fn is_complete(&self) -> Result<bool, VulkanError> {
+        match &self.source {
+            DownloadSource::Vulkan(ticket) => ticket.is_complete(),
+            DownloadSource::Host(work, progress) => {
+                progress.check(work.tick())?;
+                Ok(progress.completed() >= work.tick())
+            }
         }
     }
     fn bounds(&self) -> (u64, u64) {
@@ -91,12 +119,12 @@ impl ReadDownload {
         inputs: Vec<(u64, nixe_memory::AllocationRange)>,
     ) -> Self {
         Self::new(Download::new(
-            ticket,
+            DownloadSource::Vulkan(ticket),
             vec![Publication {
                 address,
                 bytes,
                 inputs,
-                offset: 0,
+                source: PublicationSource::Staging(0),
             }],
         ))
     }
@@ -110,6 +138,16 @@ pub(super) struct ReadBackPage {
     written: bool,
 }
 impl BufferCache {
+    fn forget_timestamp_writes(&mut self, address: u64, bytes: u64) {
+        if self.timestamp_writes.is_empty() {
+            return;
+        }
+        let bounds = address.saturating_sub(15)..address + bytes;
+        while let Some((&at, _)) = self.timestamp_writes.range(bounds.clone()).next() {
+            self.timestamp_writes.remove(&at);
+        }
+    }
+
     pub(super) fn read_needs_download(&self, address: u64, bytes: u64) -> bool {
         (self.download_policy == BufferDownloadPolicy::OnRead
             && self.gpu_modified_ranges.intersects(address, bytes))
@@ -265,6 +303,7 @@ impl BufferCache {
         Ok(())
     }
     pub(super) fn outdate_downloads(&mut self, address: u64, bytes: u64) {
+        self.forget_timestamp_writes(address, bytes);
         // A later GPU producer supersedes ordinary fence publications. Reactive
         // readers still receive their captured bytes, but cannot clean this write.
         for download in self.buffer_downloads.iter_mut().flatten() {
@@ -300,6 +339,7 @@ impl BufferCache {
         self.pending_download_ranges.subtract(address, bytes);
     }
     pub(super) fn clear_download(&mut self, address: u64, bytes: u64) {
+        self.forget_timestamp_writes(address, bytes);
         self.clear_fence_downloads(address, bytes);
         for (_, download) in self
             .read_downloads
@@ -322,7 +362,17 @@ impl BufferCache {
         }
     }
     fn enqueue_read_download(&mut self, download: Download) -> DownloadEnd {
-        let end = self.next_download_end(download.ticket.work());
+        // A host snapshot may reuse a producer older than an outstanding
+        // reactive read. The boundary must still cover the full read prefix.
+        let work = download.work();
+        let work = self.read_downloads.back().map_or(work, |(prior, _)| {
+            if prior.work.tick() > work.tick() {
+                prior.work
+            } else {
+                work
+            }
+        });
+        let end = self.next_download_end(work);
         // A clean proof may be reused through any device alias. Invalidate
         // the captured publication destinations before adding the snapshot.
         for publication in &download.publications {
@@ -341,7 +391,7 @@ impl BufferCache {
         end
     }
     pub(super) fn enqueue_dma_download(&mut self, download: ReadDownload) -> DownloadEnd {
-        let end = self.next_download_end(download.download.ticket.work());
+        let end = self.next_download_end(download.download.work());
         self.dma_downloads.push_back((end, download));
         end
     }
@@ -361,7 +411,7 @@ impl BufferCache {
         self.buffer_downloads
             .back()
             .and_then(Option::as_ref)
-            .map(|download| download.ticket.work())
+            .map(Download::work)
     }
     /// Only reactive reads participate here. Ordinary fence publication retains
     /// its existing preemptive CPU-read policy.
@@ -419,7 +469,7 @@ impl BufferCache {
     }
     pub(super) fn publish_completed_reads(&mut self) -> Result<(), VulkanError> {
         while let Some((end, download)) = self.read_downloads.front() {
-            if !download.download.ticket.is_complete()? {
+            if !download.download.is_complete()? {
                 break;
             }
             self.publish_reads_through(*end)?;
@@ -440,14 +490,30 @@ impl BufferCache {
             self.note_uniform_gpu_write(address, bytes);
         }
         #[cfg(feature = "performance-counters")]
-        let _trace =
-            nixe_gpu::trace::span("readback_publication", download.ticket.work().tick(), 0, 0);
-        let staging = download.ticket.completed()?;
+        let _trace = nixe_gpu::trace::span("readback_publication", download.work().tick(), 0, 0);
+        let staging = match download.source {
+            DownloadSource::Vulkan(ticket) => Some(ticket.completed()?),
+            DownloadSource::Host(work, progress) => {
+                progress.check(work.tick())?;
+                if progress.completed() < work.tick() {
+                    return Err(VulkanError::InvalidResource(
+                        "timestamp work has not completed",
+                    ));
+                }
+                None
+            }
+        };
         let memory = self.device_memory.machine();
         for publication in download.publications {
-            self.native_readback_bytes += publication.bytes;
-            let bytes =
-                &staging[publication.offset..publication.offset + publication.bytes as usize];
+            let bytes = match &publication.source {
+                PublicationSource::Staging(offset) => {
+                    self.native_readback_bytes += publication.bytes;
+                    &staging.as_ref().unwrap()[*offset..*offset + publication.bytes as usize]
+                }
+                PublicationSource::Timestamp(bytes, offset) => {
+                    &bytes[*offset..*offset + publication.bytes as usize]
+                }
+            };
             for &(offset, ref input) in &publication.inputs {
                 let offset = offset as usize;
                 let length = input.bytes() as usize;
@@ -531,6 +597,47 @@ enum DownloadKind {
 }
 
 impl Residency<'_> {
+    pub(crate) fn remember_nvn_timestamp(
+        &mut self,
+        address: u64,
+        bytes: [u8; 16],
+        generation: u64,
+    ) {
+        const MAX_TIMESTAMPS: usize = 64;
+        let page = address & !(nixe_memory::PAGE_SIZE - 1);
+        // Only keep reports on pages already observed in a reactive CPU read.
+        if !address.is_multiple_of(16)
+            || self
+                .buffer_cache
+                .read_back_pages
+                .binary_search_by_key(&page, |entry| entry.address)
+                .is_err()
+        {
+            return;
+        }
+        let memory = &self.runtime.device_memory;
+        let mut aliased = false;
+        memory.apply_device_aliases(address, 16, |_, _| aliased = true);
+        if aliased || memory.generation() != generation {
+            return;
+        }
+        let writes = &mut *self.buffer_cache;
+        if writes.timestamp_mapping_generation != generation {
+            writes.timestamp_writes.clear();
+            writes.timestamp_mapping_generation = generation;
+        }
+        if writes.timestamp_writes.len() == MAX_TIMESTAMPS {
+            writes.timestamp_writes.pop_first();
+        }
+        writes.timestamp_writes.insert(
+            address,
+            TimestampWrite {
+                work: self.runtime.device.current_work(),
+                bytes,
+            },
+        );
+    }
+
     /// Record exact dirty intervals in one staging reservation, grouped by
     /// source buffer. Completion is consumed separately, directly from staging.
     fn record_buffer_downloads(
@@ -541,6 +648,9 @@ impl Residency<'_> {
         let mut publications = Vec::new();
         let mut groups: Vec<(BufferId, Vec<vk::BufferCopy>)> = Vec::new();
         let mut total = 0u64;
+        let mut latest_timestamp = None::<WorkTicket>;
+        let current_timestamps = self.buffer_cache.timestamp_mapping_generation
+            == self.runtime.device_memory.generation();
         let page = nixe_memory::PAGE_SIZE;
         let mut previous_end = 0;
         for (address, bytes) in ranges {
@@ -590,7 +700,10 @@ impl Residency<'_> {
                             }
                         }
                     }
-                    let mut add_copy = |start: u64, size: u64| -> Result<(), VulkanError> {
+                    let mut add_copy = |publications: &mut Vec<Publication>,
+                                        start: u64,
+                                        size: u64|
+                     -> Result<(), VulkanError> {
                         #[cfg(feature = "performance-counters")]
                         {
                             nixe_gpu::trace::detail_event(
@@ -627,8 +740,56 @@ impl Residency<'_> {
                             address: start,
                             bytes: size,
                             inputs,
-                            offset: target as usize,
+                            source: PublicationSource::Staging(target as usize),
                         });
+                        Ok(())
+                    };
+                    let mut add_range = |start: u64, size: u64| -> Result<(), VulkanError> {
+                        if !current_timestamps || self.buffer_cache.timestamp_writes.is_empty() {
+                            return add_copy(&mut publications, start, size);
+                        }
+                        let end = start + size;
+                        let mut next = start;
+                        for (&at, timestamp) in self
+                            .buffer_cache
+                            .timestamp_writes
+                            .range(start.saturating_sub(15)..end)
+                        {
+                            let begin = next.max(at);
+                            let stop = end.min(at + 16);
+                            if next < begin {
+                                add_copy(&mut publications, next, begin - next)?;
+                            }
+                            let footprint = self
+                                .runtime
+                                .device_memory
+                                .read_mapping(begin, stop - begin)?;
+                            if self.buffer_cache.timestamp_mapping_generation
+                                != self.runtime.device_memory.generation()
+                            {
+                                add_copy(&mut publications, begin, stop - begin)?;
+                                next = stop;
+                                continue;
+                            }
+                            publications.push(Publication {
+                                address: begin,
+                                bytes: stop - begin,
+                                inputs: download_inputs(&footprint)?,
+                                source: PublicationSource::Timestamp(
+                                    timestamp.bytes,
+                                    (begin - at) as usize,
+                                ),
+                            });
+                            if latest_timestamp
+                                .is_none_or(|work| work.tick() < timestamp.work.tick())
+                            {
+                                latest_timestamp = Some(timestamp.work);
+                            }
+                            next = stop;
+                        }
+                        if next < end {
+                            add_copy(&mut publications, next, end - next)?;
+                        }
                         Ok(())
                     };
                     for (start, size) in self
@@ -644,15 +805,15 @@ impl Residency<'_> {
                                 .intersections(start, size)
                             {
                                 if next < covered {
-                                    add_copy(next, covered - next)?;
+                                    add_range(next, covered - next)?;
                                 }
                                 next = next.max(covered + count);
                             }
                             if next < start + size {
-                                add_copy(next, start + size - next)?;
+                                add_range(next, start + size - next)?;
                             }
                         } else {
-                            add_copy(start, size)?;
+                            add_range(start, size)?;
                         }
                     }
                 }
@@ -662,6 +823,15 @@ impl Residency<'_> {
         if publications.is_empty() {
             return Ok(None);
         }
+        if groups.is_empty() {
+            return Ok(Some(Download::new(
+                DownloadSource::Host(
+                    latest_timestamp.expect("timestamp-only publication has a producer"),
+                    Arc::clone(&self.runtime.device.submission.progress),
+                ),
+                publications,
+            )));
+        }
         let (slice, ticket) = self
             .runtime
             .device
@@ -669,6 +839,9 @@ impl Residency<'_> {
             .reserve_readback_aligned(total, 64)?;
         #[cfg(feature = "performance-counters")]
         for part in &publications {
+            if !matches!(part.source, PublicationSource::Staging(_)) {
+                continue;
+            }
             nixe_gpu::trace::detail_event(
                 "readback_copy",
                 part.address,
@@ -716,7 +889,10 @@ impl Residency<'_> {
             self.runtime.device.dispatch.copy_barrier(true);
         }
         host_read_barrier(&mut self.runtime.device, target, slice.offset, total);
-        Ok(Some(Download::new(ticket, publications)))
+        Ok(Some(Download::new(
+            DownloadSource::Vulkan(ticket),
+            publications,
+        )))
     }
     /// Copy only gaps in current reactive snapshots. Fence downloads retain a
     /// separate publication order and never become dependencies of this reader.
@@ -766,10 +942,14 @@ impl Residency<'_> {
             ranges
         };
         if let Some(download) = self.record_buffer_downloads(ranges.iter(), DownloadKind::Read)? {
+            let flush = matches!(download.source, DownloadSource::Vulkan(_))
+                || download.work().tick() > self.runtime.device.scheduled_tick();
             self.buffer_cache.enqueue_read_download(download);
             // Submit before handing the wait to the CPU; an idle owner must not
             // strand a reader whose producer needs no further guest commands.
-            self.flush()?;
+            if flush {
+                self.flush()?;
+            }
         }
         Ok(())
     }

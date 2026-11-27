@@ -279,6 +279,12 @@ impl Residency<'_> {
     ) -> Result<(), VulkanError> {
         self.runtime.constructing.push(Resource::Image(id));
         let result = (|| {
+            if self.buffer_cache.has_pending_nvn_samples() {
+                let maps = self.texture_cache.get(id).maps.clone();
+                for &(address, bytes) in &maps {
+                    self.resolve_nvn_sample_access(address, bytes)?;
+                }
+            }
             if invalidate {
                 let entry = &mut self.texture_cache.images[id];
                 entry.dma.discard(dma_upload::DmaUse::Clear);

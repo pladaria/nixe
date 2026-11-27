@@ -7,6 +7,7 @@ pub(crate) use masked_clear::MaskedClearPipelines;
 pub(crate) struct HostDrawState<'a> {
     pub images_prepared: bool,
     pub count_samples: bool,
+    pub sample_reports_on_cpu: bool,
     pub parameter_owner: Option<u64>,
     pub geometry_owner: Option<crate::queue::GeometryOwner>,
     pub predicate: Option<&'a Arc<crate::memory::AllocatedBuffer>>,
@@ -823,6 +824,7 @@ impl Residency<'_> {
         HostDrawState {
             images_prepared,
             count_samples,
+            sample_reports_on_cpu,
             parameter_owner,
             geometry_owner,
             predicate,
@@ -946,6 +948,7 @@ impl Residency<'_> {
                 push,
                 predicate,
                 count_samples,
+                sample_reports_on_cpu,
                 |aspect| Ok(attachment_read_only(aspect, &parameters.state)),
                 |residency| match parameter_owner {
                     Some(owner) => {
@@ -973,6 +976,7 @@ impl Residency<'_> {
         push: &[u8],
         predicate: Option<&Arc<crate::memory::AllocatedBuffer>>,
         count_samples: bool,
+        sample_reports_on_cpu: bool,
         read_only: impl Fn(vk::ImageAspectFlags) -> Result<bool, VulkanError>,
         record_state: impl FnOnce(&mut Self) -> Result<(), VulkanError>,
     ) -> Result<WorkTicket, VulkanError> {
@@ -1095,10 +1099,19 @@ impl Residency<'_> {
         if let Some(offsets) = dynamic_offsets {
             self.runtime.descriptor_offsets = offsets;
         }
-        self.runtime.device.set_samples_enabled(count_samples)?;
+        self.runtime
+            .device
+            .set_samples_enabled(count_samples && !sample_reports_on_cpu)?;
+        self.runtime
+            .device
+            .set_nvn_samples_enabled(count_samples && sample_reports_on_cpu)?;
         self.runtime.device.request_render_pass(targets)?;
-        if !empty {
-            self.runtime.device.begin_samples(count_samples);
+        if !empty && count_samples {
+            if sample_reports_on_cpu {
+                self.runtime.device.begin_nvn_samples();
+            } else {
+                self.runtime.device.begin_samples(true);
+            }
         }
         {
             let device = &mut self.runtime.device;

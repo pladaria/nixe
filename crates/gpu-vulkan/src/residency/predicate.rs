@@ -82,7 +82,8 @@ impl Residency<'_> {
                 || self.buffer_cache.pending_read(at, bytes).is_some()
         };
         let other = |at, bytes| {
-            self.texture_cache.region_gpu_modified(at, bytes)
+            self.buffer_cache.nvn_sample_producer(at, bytes).is_some()
+                || self.texture_cache.region_gpu_modified(at, bytes)
                 || (self.caches.query_pages.any(at, bytes)
                     && self
                         .caches

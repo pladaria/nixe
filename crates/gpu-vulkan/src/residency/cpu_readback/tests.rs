@@ -10,6 +10,78 @@ mod support {
 }
 
 #[test]
+fn known_timestamp_readbacks_keep_producer_order_and_handle_overwrites() -> Result<(), VulkanError>
+{
+    let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return Ok(());
+    };
+    let validation = device.validation_monitor();
+    let machine = Machine::new(16 << 20)?;
+    let page = nixe_memory::PAGE_SIZE;
+    let allocation = machine.account(4 << 20)?.allocate(page)?;
+    let memory = DeviceMemory::new(machine, 32);
+    let address = 0x10000;
+    let _mapping = memory.map(
+        address,
+        Arc::from([AllocationRange::new(allocation.pin(), 0, page)?]),
+        true,
+    )?;
+    let mut cache = VulkanResidency::new(
+        memory.clone(),
+        device,
+        64 << 20,
+        BufferDownloadPolicy::OnRead,
+    )?;
+    let mut r = cache.access();
+    let buffer = r.device_buffer(
+        address,
+        page,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        false,
+        false,
+    )?;
+    let reader = memory.reader();
+    let ram = |at| -> Result<u64, VulkanError> {
+        let mut bytes = [0; 8];
+        reader.read_block_unsafe(at, &mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    };
+    r.fill_buffer(buffer.buffer, buffer.offset + 8, 4, 7)?;
+    r.buffer_cache.note_read_back(address + 8, 8);
+    r.read_buffer_memory(address + 8, 8)?;
+    for value in [8u64, 0x1234_abcd_ffff_ffff] {
+        let data: [u8; 16] = bytemuck::cast([0u64, value]);
+        r.write_buffer(buffer.buffer, buffer.offset, &data)?;
+        r.remember_nvn_timestamp(address, data, memory.generation());
+        if value == 8 {
+            let work = r.flush()?;
+            assert_eq!(ram(address + 8)?, 7);
+            let native_bytes = r.buffer_cache.native_readback_bytes;
+            r.read_buffer_memory(address + 8, 8)?;
+            assert_eq!(r.device().scheduled_tick(), work.tick());
+            assert_eq!(r.buffer_cache.native_readback_bytes, native_bytes);
+            assert_eq!(ram(address + 8)?, 8);
+        } else {
+            r.fill_buffer(buffer.buffer, buffer.offset + 8, 4, 9)?;
+            r.read_buffer_memory(address + 8, 8)?;
+            assert_eq!(ram(address + 8)?, 0x1234_abcd_0000_0009);
+        }
+    }
+    let data: [u8; 16] = bytemuck::cast([0u64, 10]);
+    r.write_buffer(buffer.buffer, buffer.offset, &data)?;
+    r.remember_nvn_timestamp(address, data, memory.generation());
+    r.fill_buffer(buffer.buffer, buffer.offset + 16, 4, 11)?;
+    let native_bytes = r.buffer_cache.native_readback_bytes;
+    r.read_buffer_memory(address + 8, 8)?;
+    assert_eq!(r.buffer_cache.native_readback_bytes - native_bytes, 4);
+    assert_eq!(ram(address + 8)?, 10);
+    assert_eq!(ram(address + 16)?, 11);
+    drop(r);
+    drop(cache);
+    validation.check()
+}
+
+#[test]
 fn owner_reads_batch_disjoint_dirty_pages_and_publish_each_version() -> Result<(), VulkanError> {
     let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
         return Ok(());

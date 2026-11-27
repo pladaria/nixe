@@ -612,6 +612,7 @@ impl crate::native::pipeline_cache::GraphicsPipeline {
             push.as_bytes(),
             None,
             registers.register_words()[0x1514 / 4] != 0,
+            false,
             |aspect| {
                 let r = registers.register_words();
                 Ok(if aspect == vk::ImageAspectFlags::DEPTH {

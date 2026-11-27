@@ -7,6 +7,7 @@ mod buffer_download;
 pub(crate) mod cache_owners;
 mod command_pages;
 mod multi_range;
+mod nvn_samples;
 mod pointer_table;
 pub(crate) mod predicate;
 mod quad_indices;
@@ -805,7 +806,7 @@ impl Residency<'_> {
         Ok(())
     }
 
-    pub(crate) fn write_nvn_sample_report(
+    pub(crate) fn write_nvn2_sample_report(
         &mut self,
         address: u64,
         timestamp: u64,
@@ -837,7 +838,9 @@ impl Residency<'_> {
     }
     pub(crate) fn has_recorded_work(&self) -> bool {
         let device = &self.runtime.device;
-        !self.runtime.barriers.is_empty() || device.submission.has_recorded_work(&device.dispatch)
+        self.buffer_cache.nvn_samples.has_events()
+            || !self.runtime.barriers.is_empty()
+            || device.submission.has_recorded_work(&device.dispatch)
     }
     #[cfg_attr(feature = "execution-trace", track_caller)]
     pub fn flush(&mut self) -> Result<WorkTicket, VulkanError> {
@@ -850,6 +853,7 @@ impl Residency<'_> {
         signals: &[vk::SemaphoreSubmitInfo<'_>],
     ) -> Result<WorkTicket, VulkanError> {
         self.runtime.device.realize_deferred_clear()?;
+        self.stage_nvn_samples()?;
         self.runtime.barriers.emit(&mut self.runtime.device)?;
         unsafe {
             self.runtime.device.submission.flush(

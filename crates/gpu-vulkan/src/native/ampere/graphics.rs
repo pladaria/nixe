@@ -911,6 +911,7 @@ impl NativeExecution<'_> {
                 push.as_bytes(),
                 None,
                 r.get(0x1514) != 0,
+                false,
                 |aspect| {
                     Ok(crate::residency::execution::attachment_read_only(
                         aspect,
