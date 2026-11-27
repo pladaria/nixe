@@ -24,6 +24,7 @@ impl Visitor<'_> {
             4
         };
         let data = i.bits(if store { 32 } else { 16 }, 8);
+        let base = Reg(i.bits(24, 8) as u8);
         let offset = i.bits(40, 24);
         let variable = (if store { 0xe00 } else { 0x200e00 })
             | if uniform {
@@ -39,13 +40,19 @@ impl Visitor<'_> {
             || (data != 255 && (!data.is_multiple_of(words) || data + words > 255))
             || offset & (bytes - 1) != 0
             || offset + bytes * words > 0x800000
-            || self.metadata.local_memory_size == 0
+            // A fixed displacement from RZ can use the existing bounds
+            // handling even when the declared positive allocation is empty.
+            || (self.metadata.local_memory_size == 0 && (base != Reg::RZ || uniform))
         {
             return Err(unsupported(
                 "Native local memory size/addressing/register mode",
             ));
         }
-        let mut address = self.reg(i.bits(24, 8))?;
+        let mut address = if base == Reg::RZ {
+            Value::U32(0)
+        } else {
+            self.emit.get_reg(base)?
+        };
         if uniform {
             let base = self.ureg(i.bits(if store { 64 } else { 32 }, if store { 6 } else { 8 }))?;
             address = self.emit.i_add(address, base)?;
@@ -67,6 +74,7 @@ impl Visitor<'_> {
             // @SIMPLIFICATION: dynamic local stores trust the guest compiler's
             // declared spill/array bounds. Constant out-of-range stores are
             // discarded, and loads preserve the reference's zero-result check.
+            // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/shader_recompiler/frontend/maxwell/translate/impl/load_store_local_shared.cpp#L90-L188
             let in_range = match at {
                 _ if store => Value::U1(true),
                 Value::U32(at) => Value::U1(at < self.metadata.local_memory_size),

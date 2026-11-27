@@ -159,55 +159,93 @@ fn nvn2_sample_reports_keep_the_native_buffer_batch() -> Result<(), Box<dyn std:
 }
 
 #[test]
-fn nvn2_compute_compiles_with_private_spill_memory() -> Result<(), Box<dyn std::error::Error>> {
+fn nvn2_compute_spills_respect_private_memory_size() -> Result<(), Box<dyn std::error::Error>> {
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {
         return Ok(());
     };
     let validation = device.validation_monitor();
     let machine = Machine::new(16 << 20)?;
-    let allocation = machine.account(4 << 20)?.allocate(4096)?;
+    let allocation = machine.account(4 << 20)?.allocate(8192)?;
     let memory = DeviceMemory::new(machine, 32);
     let address = 0x10000;
+    let output = address + 4096;
     let _mapping = memory.map(
         address,
-        Arc::from([AllocationRange::new(allocation.pin(), 0, 4096)?]),
+        Arc::from([AllocationRange::new(allocation.pin(), 0, 8192)?]),
         true,
     )?;
     let code = [
-        0x000fe2000010080000000444ff007387u128, // STL [RZ + 4], R68
+        0x0000000000000a0006000000ff007b82u128, // LDC.64 R0, c[24][0]
+        0x0000000000000f000000001100447802,     // MOV R68, 17
+        0x000fe2000010080000000444ff007387,     // STL [RZ + 4], R68
+        0x000000000010080000000400ff027983,     // LDL R2, [RZ + 4]
+        0x000000000010a9000000000200007386,     // STG.E [R0], R2
         0x000fea0003800000000000000000794d,     // EXIT
     ];
     let bytes = code.map(u128::to_le_bytes);
-    memory.write_block_unsafe(
-        address,
-        nixe_memory::WriteSource::Bytes(bytes.as_flattened()),
-    )?;
+    let bytes = bytes.as_flattened();
+    memory.write_block_unsafe(address, nixe_memory::WriteSource::Bytes(bytes))?;
     let mut gpu = NativeGpuExecution::new(
-        memory,
+        memory.clone(),
         device,
         CacheConfiguration::default(),
         64 << 20,
         BufferDownloadPolicy::OnRead,
     )?;
-    shader::compute(
-        &mut gpu.execution(),
-        nixe_nvn::Shader {
-            address,
-            bytes: 32,
-            constants: 32,
-            stage: 5,
-            group: [1; 3],
-            isa: 1,
-            local_memory_size: 8,
-            ..Default::default()
-        },
-        &nixe_nvn::Bindings {
-            buffers: &Default::default(),
-            textures: &Default::default(),
-            bindless: None,
-        },
-        &mut shader::Descriptors::default(),
-    )?;
+    for (local_memory_size, expected) in [(8, 17u32), (0, 0)] {
+        let mut native = gpu.execution();
+        let pipeline = shader::compute(
+            &mut native,
+            nixe_nvn::Shader {
+                address,
+                bytes: bytes.len() as u32,
+                constants: bytes.len() as u32,
+                stage: 5,
+                group: [1; 3],
+                isa: 1,
+                local_memory_size,
+                ..Default::default()
+            },
+            &nixe_nvn::Bindings {
+                buffers: &Default::default(),
+                textures: &Default::default(),
+                bindless: None,
+            },
+            &mut shader::Descriptors::default(),
+        )?;
+        let mut program = native.residency.new_nvn_program(pipeline.native.clone())?;
+        for (index, input) in pipeline.inputs.iter().enumerate() {
+            let binding = match input {
+                shader::Input::StoragePointer(5, key) if key.offset.0 == 0 => {
+                    let range = nixe_nvn::Range {
+                        address: output,
+                        size: 4,
+                    };
+                    native.nvn_storage_binding(range, None, &pipeline, input)?
+                }
+                shader::Input::Push(0) => {
+                    let mut data = [0; 256];
+                    data[..8].copy_from_slice(&output.to_le_bytes());
+                    HostBinding::UniformBytes(Arc::from(data))
+                }
+                other => panic!("unexpected compute input: {other:?}"),
+            };
+            native
+                .residency
+                .update_host_binding(&mut program, index, &binding)?;
+        }
+        native
+            .residency
+            .dispatch_bound(&program, crate::Dispatch::Direct([1; 3]), &[], false)?;
+        native.residency.flush_read_span(output, 4)?;
+        let mut result = [0xff; 4];
+        memory.reader().read_block_unsafe(output, &mut result)?;
+        assert_eq!(
+            u32::from_le_bytes(result),
+            expected,
+            "{local_memory_size} bytes"
+        );
+    }
     drop(gpu);
     validation.check()?;
     Ok(())

@@ -38,6 +38,7 @@ enum HidCommand {
     GetNpadHandheldActivationMode,
     GetVibrationDeviceInfo,
     SendVibrationValue,
+    SendVibrationValueInMode,
     SendVibrationValues,
     SendVibrationValuesInMode,
     CreateActiveVibrationDeviceList,
@@ -90,6 +91,7 @@ impl HidCommand {
             201 => Some(Self::SendVibrationValue),
             203 => Some(Self::CreateActiveVibrationDeviceList),
             206 => Some(Self::SendVibrationValues),
+            213 => Some(Self::SendVibrationValueInMode),
             214 => Some(Self::SendVibrationValuesInMode),
             3110 => Some(Self::InitializeJcms),
             3111 => Some(Self::FinalizeJcms),
@@ -221,23 +223,13 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
             }
             semantic_success(request.token, false, &[], &[], &[], None)
         }
-        // The two amplitudes determine actuator force; with both zero the
-        // operation stops vibration regardless of the carrier frequencies.
-        // The configured input worker owns actuator output, including stops.
-        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L1043-L1054
-        HidCommand::SendVibrationValue => {
-            if !request.has_payload_size(32)
-                || request_u32(request.data, 20) != Some(0)
-                || hipc.pid.is_none()
-                || has_ipc_descriptors_other_than_pid(hipc)
-            {
-                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
-            }
-            let handle = request_u32(request.data, 0).unwrap();
-            let Some(value) = decode_vibration_value(&request.data[4..20]) else {
-                return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
-            };
-            send_vibration_values(hid_system, request, &[(handle, value)])
+        command @ (HidCommand::SendVibrationValue | HidCommand::SendVibrationValueInMode) => {
+            send_single_vibration_value(
+                hid_system,
+                request,
+                hipc,
+                command == HidCommand::SendVibrationValueInMode,
+            )
         }
         // ARUID and two pointer input arrays, without PID: handles (u32),
         // then values (four f32s). Both arrays must contain the same count.
@@ -798,6 +790,41 @@ pub(in crate::ipc_wire) fn dispatch_hid_active_vibration_device_list(
     semantic_success(request.token, false, &[], &[], &[], None)
 }
 
+fn send_single_vibration_value(
+    hid_system: &HidSystem,
+    request: CmifRequest<'_>,
+    hipc: &HipcRequest<'_>,
+    with_mode: bool,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    // Command 201 starts with the handle and value, with padding before ARUID.
+    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L1043-L1054
+    if !request.has_payload_size(32)
+        || (!with_mode && request_u32(request.data, 20) != Some(0))
+        || hipc.pid.is_none()
+        || has_ipc_descriptors_other_than_pid(hipc)
+    {
+        return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+    }
+    if with_mode {
+        // SDK 231.39 at +0x6fb280 packs a u16 mode, padding, the u32
+        // handle, the 16-byte value, and the u64 ARUID.
+        // https://switchbrew.org/wiki/HID_services#IHidServer
+        // @SPECULATIVE: use the same actuator output for modes 0 and 2,
+        // as for command 214. The remaining mode policy is undocumented.
+        let mode = u16::from_le_bytes(request.data[..2].try_into().unwrap());
+        if !matches!(mode, 0 | 2) {
+            return Err(IpcWireError::Malformed("unsupported vibration output mode"));
+        }
+    }
+    let handle_offset = if with_mode { 4 } else { 0 };
+    let handle = request_u32(request.data, handle_offset).unwrap();
+    let Some(value) = decode_vibration_value(&request.data[handle_offset + 4..handle_offset + 20])
+    else {
+        return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+    };
+    send_vibration_values(hid_system, request, &[(handle, value)])
+}
+
 fn decode_vibration_value(bytes: &[u8]) -> Option<nixe_input::VibrationValue> {
     let values = [0, 4, 8, 12].map(|offset| request_f32(bytes, offset).unwrap());
     if values
@@ -828,6 +855,8 @@ fn send_vibration_values(
     for (handle, value) in values {
         log::trace!("HID vibration request: handle={handle:#010x} value={value:?}");
     }
+    // The input worker owns actuator output, including stops. Both amplitudes
+    // can be zero even when the frequencies in the request are nonzero.
     if let Some(result) = hid_system.send_vibration_values(values) {
         result.map_err(|e| IpcWireError::InputBackend(e.to_string().into_boxed_str()))?;
     } else if values.iter().any(|(_, value)| !value.is_stopped()) {
@@ -840,4 +869,58 @@ fn send_vibration_values(
         ));
     }
     semantic_success(request.token, false, &[], &[], &[], None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vibration_in_mode_uses_a_pid_and_the_mode_first_layout() {
+        let machine = crate::test_memory::machine();
+        let hid = HidSystem::new(
+            &machine.account(machine.arena().capacity()).unwrap(),
+            &crate::test_memory::kernel(),
+        )
+        .unwrap();
+        let mut packet = [0; 84];
+        packet[..4].copy_from_slice(&6u32.to_le_bytes());
+        packet[4..8].copy_from_slice(&0x8000_0010u32.to_le_bytes());
+        packet[8..12].copy_from_slice(&1u32.to_le_bytes());
+        packet[12..20].copy_from_slice(&42u64.to_le_bytes());
+        packet[32..36].copy_from_slice(b"SFCI");
+        packet[36..40].copy_from_slice(&1u32.to_le_bytes());
+        packet[40..44].copy_from_slice(&213u32.to_le_bytes());
+        packet[48..50].copy_from_slice(&2u16.to_le_bytes());
+        packet[52..56].copy_from_slice(&3u32.to_le_bytes());
+        packet[60..64].copy_from_slice(&160f32.to_le_bytes());
+        packet[68..72].copy_from_slice(&320f32.to_le_bytes());
+
+        let hipc = HipcRequest::decode(&packet).unwrap();
+        let request = CmifRequest::decode(&hipc, false).unwrap();
+        assert_eq!(
+            HidCommand::decode(request.command_id),
+            Some(HidCommand::SendVibrationValueInMode)
+        );
+        assert_eq!(
+            send_single_vibration_value(&hid, request.clone(), &hipc, true).unwrap(),
+            semantic_success(request.token, false, &[], &[], &[], None).unwrap()
+        );
+
+        let mut no_pid = hipc.clone();
+        no_pid.pid = None;
+        assert_eq!(
+            send_single_vibration_value(&hid, request.clone(), &no_pid, true).unwrap(),
+            cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER).unwrap()
+        );
+
+        packet[52..56].fill(0);
+        let hipc = HipcRequest::decode(&packet).unwrap();
+        let request = CmifRequest::decode(&hipc, false).unwrap();
+        let token = request.token;
+        assert_eq!(
+            send_single_vibration_value(&hid, request, &hipc, true).unwrap(),
+            cmif_error(token, HorizonIpcResult::SF_PRECONDITION_VIOLATION).unwrap()
+        );
+    }
 }
