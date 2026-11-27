@@ -98,7 +98,7 @@ fn initialize_texture<const AMPERE: bool>(c: &Call) -> Result<u64> {
     if AMPERE && c.read::<u32>(device)? & 0x10000 == 0 {
         t.use_ampere_gob_order();
     }
-    t.layout()?;
+    t.validate_layout()?;
     t.address = p
         .gpu
         .checked_add(offset)

@@ -109,4 +109,40 @@ mod tests {
         let l = t.layout().unwrap();
         assert_eq!((l.block_height, l.pitch, l.bytes), (4, 7680, 0x870000));
     }
+
+    #[test]
+    fn layout_validation_rejects_overflow_without_materializing_mips() {
+        let valid = Texture {
+            width: 128,
+            height: 64,
+            levels: 8,
+            target: 1,
+            format: 0x25,
+            ..Default::default()
+        };
+        assert_eq!(valid.validate_layout(), Ok(()));
+        assert_eq!(valid.layout().unwrap().mips.len(), 8);
+
+        let pitch_overflow = Texture {
+            width: (1 << 27) - 1,
+            format: 0x16,
+            samples: 16,
+            ..valid
+        };
+        let size_overflow = Texture {
+            width: (1 << 27) - 256,
+            height: 65_536,
+            depth: 65_536,
+            target: 6,
+            levels: 1,
+            ..pitch_overflow
+        };
+        for (texture, error) in [
+            (pitch_overflow, "mip pitch overflow"),
+            (size_overflow, "texture size overflow"),
+        ] {
+            assert_eq!(texture.validate_layout(), Err(error));
+            assert_eq!(texture.layout().unwrap_err(), error);
+        }
+    }
 }

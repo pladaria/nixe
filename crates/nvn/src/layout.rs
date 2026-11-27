@@ -18,6 +18,13 @@ pub struct Layout {
     pub pitch: u32,
     pub mips: MipList,
 }
+
+struct StorageLayout {
+    bytes: u64,
+    layer_stride: u64,
+    alignment: u32,
+}
+
 impl Texture {
     pub(crate) fn block(&self) -> core::result::Result<(u32, u32, u32), &'static str> {
         const ASTC: [(u32, u32); 14] = [
@@ -123,6 +130,26 @@ impl Texture {
         ]
     }
     pub fn layout(&self) -> core::result::Result<Layout, &'static str> {
+        let (storage, mips) = self.calculate_layout(MipList::push)?;
+        Ok(Layout {
+            bytes: storage.bytes,
+            layer_stride: storage.layer_stride,
+            alignment: storage.alignment,
+            block_height: mips[0].block_height,
+            pitch: mips[0].pitch,
+            mips,
+        })
+    }
+
+    pub fn validate_layout(&self) -> core::result::Result<(), &'static str> {
+        // Texture initialization needs the storage checks without a mip table.
+        self.calculate_layout(|_: &mut (), _| {}).map(|_| ())
+    }
+
+    fn calculate_layout<Mips: Default>(
+        &self,
+        push_mip: impl Fn(&mut Mips, Mip),
+    ) -> core::result::Result<(StorageLayout, Mips), &'static str> {
         let (bpp, mut bw, mut bh) = self.block()?;
         if self.block_view != 0 {
             bw = u32::from(self.block_view & 15) + 1;
@@ -185,20 +212,24 @@ impl Texture {
                 return Err("linear stride below row size");
             }
             let bytes = u64::from(pitch) * u64::from(h);
-            return Ok(Layout {
-                bytes,
-                layer_stride: bytes,
-                alignment,
-                block_height: 0,
-                pitch,
-                mips: core::iter::once(Mip {
+            let mut mips = Mips::default();
+            push_mip(
+                &mut mips,
+                Mip {
                     offset: 0,
                     pitch,
                     block_height: 0,
                     block_depth: 0,
-                })
-                .collect(),
-            });
+                },
+            );
+            return Ok((
+                StorageLayout {
+                    bytes,
+                    layer_stride: bytes,
+                    alignment,
+                },
+                mips,
+            ));
         }
         let pkg = self.packaged_layout();
         let pw = pkg.map_or(0, |n| n >> 8 & 15);
@@ -245,8 +276,8 @@ impl Texture {
             }
             log
         };
-        let chain = |th: u32, td: u32| -> core::result::Result<(MipList, u64), &'static str> {
-            let mut mips = MipList::new();
+        let chain = |th: u32, td: u32| -> core::result::Result<(Mips, u64), &'static str> {
+            let mut mips = Mips::default();
             let mut offset = 0u64;
             let sh = if sparse && pkg.is_none() {
                 sparse_shape.0
@@ -269,12 +300,15 @@ impl Texture {
                 let pitch = row
                     .checked_next_multiple_of(if tiled { tw * 64 } else { 64 })
                     .ok_or("mip pitch overflow")?;
-                mips.push(Mip {
-                    offset,
-                    pitch,
-                    block_height: ah as u8,
-                    block_depth: ad as u8,
-                });
+                push_mip(
+                    &mut mips,
+                    Mip {
+                        offset,
+                        pitch,
+                        block_height: ah as u8,
+                        block_depth: ad as u8,
+                    },
+                );
                 offset += u64::from(pitch)
                     * u64::from(height.next_multiple_of(8 << ah))
                     * u64::from(depth.next_multiple_of(1 << ad));
@@ -299,15 +333,15 @@ impl Texture {
                 (mips, stride) = minimal
             }
         }
-        Ok(Layout {
-            bytes: stride
-                .checked_mul(layers.into())
-                .ok_or("texture size overflow")?,
-            layer_stride: stride,
-            alignment,
-            block_height: mips[0].block_height,
-            pitch: mips[0].pitch,
+        Ok((
+            StorageLayout {
+                bytes: stride
+                    .checked_mul(layers.into())
+                    .ok_or("texture size overflow")?,
+                layer_stride: stride,
+                alignment,
+            },
             mips,
-        })
+        ))
     }
 }
