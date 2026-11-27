@@ -1,4 +1,4 @@
-use super::{CommandBlock, Range};
+use super::{CommandBlock, Range, Result};
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Default)]
@@ -52,12 +52,42 @@ impl Blocks {
         self.block(index).clone()
     }
 
+    pub(super) fn refresh(
+        &mut self,
+        index: usize,
+        update: impl FnOnce(&mut CommandBlock) -> Result<()>,
+        evicted: impl FnMut(Range),
+    ) -> Result<Option<Arc<CommandBlock>>> {
+        let (_, block) = self.slots[index].value.as_mut().unwrap();
+        let old_bytes = Self::charge(block);
+        // A submission may continue decoding the previous words after the
+        // guest re-records this range. Only recycle storage the cache owns alone.
+        let Some(unique) = Arc::get_mut(block) else {
+            return Ok(None);
+        };
+        let result = update(unique);
+        let bytes = Self::charge(block);
+        self.bytes = self.bytes - old_bytes + bytes;
+        if let Err(error) = result {
+            self.remove(index);
+            return Err(error);
+        }
+        let block = block.clone();
+        if bytes > self.budget {
+            self.remove(index);
+        } else {
+            self.touch(index);
+            self.evict_excess(evicted);
+        }
+        Ok(Some(block))
+    }
+
     pub(super) fn insert(
         &mut self,
         key: Range,
         index: Option<usize>,
         block: Arc<CommandBlock>,
-        mut evicted: impl FnMut(Range),
+        evicted: impl FnMut(Range),
     ) {
         let bytes = Self::charge(&block);
         if bytes > self.budget {
@@ -83,6 +113,10 @@ impl Blocks {
             self.append(index);
         }
         self.bytes += bytes;
+        self.evict_excess(evicted);
+    }
+
+    fn evict_excess(&mut self, mut evicted: impl FnMut(Range)) {
         while self.bytes > self.budget {
             evicted(self.remove(self.oldest.unwrap()));
         }
@@ -171,5 +205,56 @@ mod tests {
         assert_eq!(previous.words[1], 1);
         assert_eq!(cache.block(cache.index(&key(1)).unwrap()).words[1], 2);
         assert!(cache.index(&key(3)).is_some());
+    }
+
+    #[test]
+    fn refresh_reuses_only_unshared_storage_and_discards_failed_captures() {
+        let key = Range {
+            address: 0x1000,
+            size: 24,
+        };
+        let mut cache = Blocks::new(4096);
+        let initial = CommandBlock::new(vec![u64::from(op::BARRIER) | (2 << 8), 0, 0], false);
+        cache.insert(key, None, Arc::new(initial.unwrap()), |_| {});
+        let index = cache.index(&key).unwrap();
+        let held = cache.use_block(index);
+        let words = held.words.as_ptr();
+        let skipped = cache
+            .refresh(
+                index,
+                |_| panic!("the submission still owns the block"),
+                |_| {},
+            )
+            .unwrap();
+        assert!(skipped.is_none());
+        drop(held);
+
+        let updated = cache
+            .refresh(
+                index,
+                |block| {
+                    block.words[0] = u64::from(op::TEXTURE) | (2 << 8);
+                    block.index_records(false)
+                },
+                |_| {},
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.words.as_ptr(), words);
+        assert_eq!(updated.capture_offsets, [0]);
+        assert_eq!(cache.bytes, Blocks::charge(&updated));
+        drop(updated);
+
+        let failed = cache.refresh(
+            index,
+            |block| {
+                block.words[0] = u64::from(op::TEXTURE) | (3 << 8);
+                block.index_records(false)
+            },
+            |_| {},
+        );
+        assert!(failed.is_err());
+        assert!(cache.index(&key).is_none());
+        assert_eq!(cache.bytes, 0);
     }
 }

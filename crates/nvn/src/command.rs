@@ -211,11 +211,21 @@ struct CommandBlock {
 }
 impl CommandBlock {
     fn new(words: Vec<u64>, called: bool) -> Result<Self> {
-        let mut end = words.len();
-        let mut capture_offsets = Vec::new();
+        let mut block = Self {
+            words,
+            end: 0,
+            capture_offsets: Vec::new(),
+        };
+        block.index_records(called)?;
+        Ok(block)
+    }
+
+    fn index_records(&mut self, called: bool) -> Result<()> {
+        let mut end = self.words.len();
+        self.capture_offsets.clear();
         let mut index = 0;
         while index < end {
-            let header = words[index];
+            let header = self.words[index];
             let next = index + 1 + record_words(header);
             if next > end {
                 if !called {
@@ -228,7 +238,7 @@ impl CommandBlock {
                 break;
             }
             if needs_capture(record_tag(header)) {
-                capture_offsets.push(index as u32);
+                self.capture_offsets.push(index as u32);
             }
             if called {
                 // A called range remains a span of bytes if re-recorded. Its new
@@ -245,11 +255,8 @@ impl CommandBlock {
                 }
             }
         }
-        Ok(Self {
-            words,
-            end,
-            capture_offsets,
-        })
+        self.end = end;
+        Ok(())
     }
 }
 /// Immutable words and submit-visible descriptors for the graphics owner.
@@ -380,6 +387,7 @@ struct ListDiagnostics {
     evicted: std::collections::HashSet<Range>,
     // attempted comparison bytes, first-seen misses, modified, evicted, coherent, evictions
     counts: [u64; 6],
+    recycled: u64,
 }
 
 #[cfg(feature = "execution-trace")]
@@ -407,6 +415,14 @@ impl ListDiagnostics {
             std::mem::take(&mut self.counts);
         nixe_memory::trace::detail_event("nvn_list_comparison", compared, coherent, removals);
         nixe_memory::trace::detail_event("nvn_list_misses", first, modified, evicted);
+        if self.recycled != 0 {
+            nixe_memory::trace::detail_event(
+                "nvn_recycled_blocks",
+                std::mem::take(&mut self.recycled),
+                0,
+                0,
+            );
+        }
     }
 }
 impl Capture {
@@ -470,17 +486,38 @@ impl Capture {
                             self.diagnostics.record_miss(key, comparison);
                         }
                     }
-                    let mut words = vec![0; bytes as usize / 8];
-                    c.read_bytes(address, bytemuck::cast_slice_mut(&mut words))?;
-                    let block = Arc::new(CommandBlock::new(words, size & CALLED != 0)?);
-                    self.blocks
-                        .insert(key, previous, block.clone(), |_evicted| {
-                            #[cfg(feature = "execution-trace")]
-                            if detailed {
-                                self.diagnostics.note_eviction(_evicted);
-                            }
-                        });
-                    block
+                    let called = size & CALLED != 0;
+                    let mut evicted = |_evicted| {
+                        #[cfg(feature = "execution-trace")]
+                        if detailed {
+                            self.diagnostics.note_eviction(_evicted);
+                        }
+                    };
+                    let recycled = if let Some(index) = previous {
+                        self.blocks.refresh(
+                            index,
+                            |block| {
+                                c.read_bytes(address, bytemuck::cast_slice_mut(&mut block.words))?;
+                                block.index_records(called)
+                            },
+                            &mut evicted,
+                        )?
+                    } else {
+                        None
+                    };
+                    if let Some(block) = recycled {
+                        #[cfg(feature = "execution-trace")]
+                        if detailed {
+                            self.diagnostics.recycled += 1;
+                        }
+                        block
+                    } else {
+                        let mut words = vec![0; bytes as usize / 8];
+                        c.read_bytes(address, bytemuck::cast_slice_mut(&mut words))?;
+                        let block = Arc::new(CommandBlock::new(words, called)?);
+                        self.blocks.insert(key, previous, block.clone(), evicted);
+                        block
+                    }
                 };
                 for &index in &block.capture_offsets {
                     let i = index as usize;
