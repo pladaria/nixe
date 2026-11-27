@@ -163,6 +163,7 @@ impl WindowFrontend {
                 stop_handler: None,
                 pause_handler: None,
                 pause_key_down: false,
+                nvn_capture_handler: None,
                 volume_handler: None,
                 volume_keys_down: [false; 2],
                 cursor_hide_at: None,
@@ -225,6 +226,11 @@ impl WindowFrontend {
     ) -> Self {
         self.application.pause_handler = Some(Box::new(handler));
         self
+    }
+
+    /// Routes the N hotkey to the optional NVN capture control.
+    pub fn set_nvn_capture_handler(&mut self, handler: impl FnMut() + Send + 'static) {
+        self.application.nvn_capture_handler = Some(Box::new(handler));
     }
 
     /// Routes numpad volume hotkeys as percentage-point changes and returns the applied volume.
@@ -551,7 +557,7 @@ fn window_title(
     backend: &str,
     output: Option<(u32, u32)>,
     resolution_scale: ResolutionScaling,
-    fps: Option<f64>,
+    game_fps: Option<f64>,
     presentation_fps: Option<f64>,
     smooth_motion: bool,
 ) -> String {
@@ -565,19 +571,15 @@ fn window_title(
             }
         },
     );
-    let fps = fps.map(|fps| fps.round() as u64);
-    let presentation_fps = presentation_fps.map(|fps| fps.round() as u64);
-    let format_fps =
-        |fps: Option<u64>| fps.map_or_else(|| "-- FPS".to_owned(), |fps| format!("{fps} FPS"));
-    let fps = if smooth_motion && presentation_fps != fps {
-        format!(
-            "{} (presentation) - {} (game)",
-            format_fps(presentation_fps),
-            format_fps(fps)
-        )
+    let (fps, suffix) = if smooth_motion {
+        (presentation_fps, " (NVSM)")
     } else {
-        format_fps(fps)
+        (game_fps, "")
     };
+    let fps = fps.map_or_else(
+        || format!("-- FPS{suffix}"),
+        |fps| format!("{} FPS{suffix}", fps.round() as u64),
+    );
     if let Some(game) = game {
         format!("Nixe - {game} | {backend} | {output} | {fps}")
     } else {
@@ -597,6 +599,7 @@ struct PresenterApplication {
     stop_handler: Option<Box<dyn FnOnce()>>,
     pause_handler: Option<PauseHandler>,
     pause_key_down: bool,
+    nvn_capture_handler: Option<Box<dyn FnMut() + Send>>,
     volume_handler: Option<VolumeHandler>,
     volume_keys_down: [bool; 2],
     cursor_hide_at: Option<Instant>,
@@ -868,6 +871,23 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                             self.stop_requested.store(true, Ordering::Release);
                         }
                     }
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } if event.physical_key == PhysicalKey::Code(KeyCode::KeyN)
+                && event.state == ElementState::Pressed
+                && !event.repeat =>
+            {
+                if self
+                    .presenter
+                    .as_ref()
+                    .is_some_and(|p| p.window.has_focus())
+                    && let Some(handler) = &mut self.nvn_capture_handler
+                {
+                    handler();
                 }
             }
             WindowEvent::CloseRequested => {
@@ -1171,6 +1191,28 @@ mod tests {
                     false,
                 ),
                 format!("Nixe - Game | Vulkan (NVN HLE) | {resolution} | 60 FPS"),
+            );
+        }
+    }
+
+    #[test]
+    fn window_title_shows_presentation_rate_when_smooth_motion_is_active() {
+        for (presentation_fps, display) in [
+            (Some(119.8), "120 FPS (NVSM)"),
+            (Some(60.0), "60 FPS (NVSM)"),
+            (None, "-- FPS (NVSM)"),
+        ] {
+            assert_eq!(
+                window_title(
+                    Some("Game"),
+                    "Vulkan",
+                    Some((1920, 1080)),
+                    ResolutionScaling::new(1, 0),
+                    Some(60.0),
+                    presentation_fps,
+                    true,
+                ),
+                format!("Nixe - Game | Vulkan | 1920×1080 | {display}"),
             );
         }
     }

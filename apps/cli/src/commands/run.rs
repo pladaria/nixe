@@ -404,6 +404,36 @@ fn run_machine(
             None,
         )
     };
+    let nvn_frame_capture = match (
+        process.nvn_call_capture(),
+        frontend.as_mut().zip(native_presentation.as_ref()),
+    ) {
+        (Some(capture), Some((frontend, client))) => {
+            log::info!("NVN call capture paused; press N to start or pause capture");
+            let mut active = false;
+            let presentation = client.clone();
+            frontend.set_nvn_capture_handler(move || match capture.set_active(!active) {
+                Ok(()) => {
+                    active = !active;
+                    presentation.set_game_frame_counting(active);
+                    if active {
+                        log::info!("NVN call capture started");
+                    } else {
+                        log::info!("NVN call capture paused");
+                    }
+                }
+                Err(error) => log::warn!("cannot toggle NVN call capture: {error}"),
+            });
+            Some(client.clone())
+        }
+        (Some(capture), None) => {
+            capture
+                .set_active(true)
+                .map_err(|error| error.to_string())?;
+            None
+        }
+        (None, _) => None,
+    };
     log::info!(
         "GPU backend initialized: api=Vulkan native adapter={}",
         device.profile().name
@@ -595,7 +625,7 @@ fn run_machine(
         ))
     };
     let Some(frontend) = frontend else {
-        return finish_execution(run_guest()?, &title_name, &title_identifier);
+        return finish_execution(run_guest()?, &title_name, &title_identifier, None);
     };
     let mut volume = config.audio.volume;
     let frontend = frontend
@@ -644,8 +674,10 @@ fn run_machine(
     let worker_result = worker
         .join()
         .map_err(|_| "guest execution worker panicked".to_owned())?;
-    let execution_result =
-        worker_result.and_then(|result| finish_execution(result, &title_name, &title_identifier));
+    let captured_frames = nvn_frame_capture.map(|capture| capture.counted_game_frames());
+    let execution_result = worker_result.and_then(|result| {
+        finish_execution(result, &title_name, &title_identifier, captured_frames)
+    });
     frontend_result.map(|_| ()).and(execution_result)
 }
 
@@ -926,6 +958,7 @@ fn write_nvn_report(
     title_id: &str,
     duration: Duration,
     report: nixe_runtime::NvnCallReport,
+    captured_frames: Option<u64>,
 ) -> std::io::Result<()> {
     use std::io::{BufWriter, Write};
     let directory = std::path::Path::new("dump/nvn").join(nixe_video_winit::filename_title(title));
@@ -933,24 +966,7 @@ fn write_nvn_report(
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
     let path = directory.join(format!("{timestamp}-calls.csv"));
     let mut file = BufWriter::new(std::fs::File::create_new(&path)?);
-    writeln!(
-        file,
-        "function,invocations,total_ns,total_normalized_ns,mean_normalized_ns"
-    )?;
-    for call in &report.calls {
-        write!(
-            file,
-            "\"{}\",{}",
-            call.name.replace('"', "\"\""),
-            call.invocations
-        )?;
-        if let (Some(raw), Some(normalized)) = (call.total_ns, call.total_normalized_ns) {
-            let mean = normalized / u128::from(call.invocations);
-            writeln!(file, ",{raw},{normalized},{mean}")?;
-        } else {
-            writeln!(file, ",,,")?;
-        }
-    }
+    write_nvn_csv(&mut file, &report, captured_frames)?;
     file.flush()?;
     log::info!(
         "NVN call report {}: title={title_id} elapsed={duration:.2?} bootstrap_found={} partial={} registered={} invoked={}",
@@ -963,9 +979,47 @@ fn write_nvn_report(
     Ok(())
 }
 
-fn finish_execution(result: RunOutcome, title: &str, title_id: &str) -> Result<(), String> {
+fn write_nvn_csv(
+    mut file: impl std::io::Write,
+    report: &nixe_runtime::NvnCallReport,
+    captured_frames: Option<u64>,
+) -> std::io::Result<()> {
+    writeln!(
+        file,
+        "function,invocations,total_ns,total_normalized_ns,mean_normalized_ns,frames,normalized_ns_per_frame"
+    )?;
+    let frames = captured_frames
+        .map(|count| count.to_string())
+        .unwrap_or_default();
+    for call in &report.calls {
+        write!(
+            file,
+            "\"{}\",{}",
+            call.name.replace('"', "\"\""),
+            call.invocations
+        )?;
+        if let (Some(raw), Some(normalized)) = (call.total_ns, call.total_normalized_ns) {
+            let mean = normalized / u128::from(call.invocations);
+            let per_frame = captured_frames
+                .and_then(|count| normalized.checked_div(u128::from(count)))
+                .map(|cost| cost.to_string())
+                .unwrap_or_default();
+            writeln!(file, ",{raw},{normalized},{mean},{frames},{per_frame}")?;
+        } else {
+            writeln!(file, ",,,,{frames},")?;
+        }
+    }
+    Ok(())
+}
+
+fn finish_execution(
+    result: RunOutcome,
+    title: &str,
+    title_id: &str,
+    captured_frames: Option<u64>,
+) -> Result<(), String> {
     if let Some((report, duration)) = result.nvn_report
-        && let Err(error) = write_nvn_report(title, title_id, duration, report)
+        && let Err(error) = write_nvn_report(title, title_id, duration, report, captured_frames)
     {
         log::error!("cannot write NVN call report: {error}");
     }
@@ -1509,6 +1563,7 @@ mod tests {
                 },
                 "test",
                 "test",
+                None,
             )
             .unwrap_err();
             assert!(error.contains("cannot remove process during teardown: backend failure"));

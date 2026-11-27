@@ -1,9 +1,9 @@
-use super::{CommandBlock, Range, Result};
+use super::{CommandBlock, ControlEntry, Result};
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Default)]
 struct Slot {
-    value: Option<(Range, Arc<CommandBlock>)>,
+    value: Option<(ControlEntry, Arc<CommandBlock>)>,
     previous: Option<usize>,
     next: Option<usize>,
 }
@@ -11,7 +11,7 @@ struct Slot {
 /// An eviction removes only the queue's reference. Submitted lists retain their
 /// own immutable words and capture offsets while the same guest range is reused.
 pub(super) struct Blocks {
-    indices: HashMap<Range, usize>,
+    indices: HashMap<ControlEntry, usize>,
     slots: Vec<Slot>,
     oldest: Option<usize>,
     newest: Option<usize>,
@@ -39,7 +39,7 @@ impl Blocks {
         }
     }
 
-    pub(super) fn index(&self, key: &Range) -> Option<usize> {
+    pub(super) fn index(&self, key: &ControlEntry) -> Option<usize> {
         self.indices.get(key).copied()
     }
 
@@ -56,7 +56,7 @@ impl Blocks {
         &mut self,
         index: usize,
         update: impl FnOnce(&mut CommandBlock) -> Result<()>,
-        evicted: impl FnMut(Range),
+        evicted: impl FnMut(ControlEntry),
     ) -> Result<Option<Arc<CommandBlock>>> {
         let (_, block) = self.slots[index].value.as_mut().unwrap();
         let old_bytes = Self::charge(block);
@@ -84,10 +84,10 @@ impl Blocks {
 
     pub(super) fn insert(
         &mut self,
-        key: Range,
+        key: ControlEntry,
         index: Option<usize>,
         block: Arc<CommandBlock>,
-        evicted: impl FnMut(Range),
+        evicted: impl FnMut(ControlEntry),
     ) {
         let bytes = Self::charge(&block);
         if bytes > self.budget {
@@ -116,7 +116,7 @@ impl Blocks {
         self.evict_excess(evicted);
     }
 
-    fn evict_excess(&mut self, mut evicted: impl FnMut(Range)) {
+    fn evict_excess(&mut self, mut evicted: impl FnMut(ControlEntry)) {
         while self.bytes > self.budget {
             evicted(self.remove(self.oldest.unwrap()));
         }
@@ -127,12 +127,12 @@ impl Blocks {
         size_of::<CommandBlock>()
             + 2 * size_of::<usize>()
             + size_of::<Slot>()
-            + 2 * size_of::<(Range, usize)>()
+            + 2 * size_of::<(ControlEntry, usize)>()
             + block.words.capacity() * size_of::<u64>()
             + block.capture_offsets.capacity() * size_of::<u32>()
     }
 
-    fn remove(&mut self, index: usize) -> Range {
+    fn remove(&mut self, index: usize) -> ControlEntry {
         self.unlink(index);
         let (key, block) = self.slots[index].value.take().unwrap();
         self.bytes -= Self::charge(&block);
@@ -187,7 +187,7 @@ mod tests {
                 CommandBlock::new(vec![u64::from(op::BARRIER) | (1 << 8), word], false).unwrap(),
             )
         };
-        let key = |address| Range { address, size: 16 };
+        let key = |index: u64| ControlEntry::range(0x1000 + index * 16, 16).unwrap();
         let original = block(1);
         let mut cache = Blocks::new(2 * Blocks::charge(&original));
         cache.insert(key(1), None, original.clone(), |_| {});
@@ -209,10 +209,7 @@ mod tests {
 
     #[test]
     fn refresh_reuses_only_unshared_storage_and_discards_failed_captures() {
-        let key = Range {
-            address: 0x1000,
-            size: 24,
-        };
+        let key = ControlEntry::range(0x1000, 24).unwrap();
         let mut cache = Blocks::new(4096);
         let initial = CommandBlock::new(vec![u64::from(op::BARRIER) | (2 << 8), 0, 0], false);
         cache.insert(key, None, Arc::new(initial.unwrap()), |_| {});

@@ -224,6 +224,40 @@ pub(crate) unsafe fn capture(mut source: *const u8, destination: &mut [u8]) {
 /// # Safety
 /// The retained ordinary RAM interval must cover all the expected words.
 pub(crate) unsafe fn matches_words(mut source: *const u8, mut expected: &[u64]) -> bool {
+    // Amortize the mask extraction and branch across a cache line. Each
+    // unaligned load stays within the admitted interval.
+    #[cfg(target_arch = "x86_64")]
+    while expected.len() >= 8 {
+        let mask: u32;
+        unsafe {
+            asm!(
+                "movdqu xmm0, [{src}]",
+                "movdqu xmm1, [{dst}]",
+                "movdqu xmm2, [{src} + 16]",
+                "movdqu xmm3, [{dst} + 16]",
+                "pcmpeqb xmm0, xmm1",
+                "pcmpeqb xmm2, xmm3",
+                "movdqu xmm1, [{src} + 32]",
+                "movdqu xmm3, [{dst} + 32]",
+                "pand xmm0, xmm2",
+                "movdqu xmm2, [{src} + 48]",
+                "movdqu xmm4, [{dst} + 48]",
+                "pcmpeqb xmm1, xmm3",
+                "pcmpeqb xmm2, xmm4",
+                "pand xmm0, xmm1",
+                "pand xmm0, xmm2",
+                "pmovmskb {mask:e}, xmm0",
+                src = in(reg) source, dst = in(reg) expected.as_ptr(), mask = lateout(reg) mask,
+                out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _, out("xmm4") _,
+                options(readonly, nostack, preserves_flags),
+            );
+        }
+        if mask != 0xffff {
+            return false;
+        }
+        source = unsafe { source.add(64) };
+        expected = &expected[8..];
+    }
     #[cfg(target_arch = "x86_64")]
     while expected.len() >= 2 {
         let mask: u32;
@@ -401,6 +435,30 @@ pub(crate) unsafe fn compare_exchange(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compares_every_byte_of_unaligned_blocks_and_tails() {
+        let expected: [u64; 25] = std::array::from_fn(|index| index as u64 * 0x0001_2345_6789_abcd);
+        let bytes: Vec<_> = expected.into_iter().flat_map(u64::to_ne_bytes).collect();
+        for offset in [0, 1, 8, 13] {
+            let mut source = vec![0; offset];
+            source.extend_from_slice(&bytes);
+            for words in 0..=expected.len() {
+                let initial = unsafe {
+                    super::matches_words(source.as_ptr().add(offset), &expected[..words])
+                };
+                assert!(initial);
+                for index in offset..offset + words * 8 {
+                    source[index] ^= 0x80;
+                    let changed = unsafe {
+                        super::matches_words(source.as_ptr().add(offset), &expected[..words])
+                    };
+                    assert!(!changed);
+                    source[index] ^= 0x80;
+                }
+            }
+        }
+    }
+
     #[test]
     fn short_and_bulk_copies_preserve_unaligned_bytes_and_destination_boundaries() {
         let source: [u8; 192] = std::array::from_fn(|index| index as u8);

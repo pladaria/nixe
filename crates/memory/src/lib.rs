@@ -27,7 +27,8 @@ mod transition;
 mod virtual_arena;
 pub use address_space::{
     AddressSpace, AllocationRange, CodeFetch, DeviceSharedMemory, DirectWordsComparison,
-    MappingObservation, MappingVersion, NativeCodePage, PageEntry, Translation, capture_subrange,
+    MappingObservation, MappingVersion, NativeCodePage, PageEntry, ReadBatch, Translation,
+    capture_subrange,
 };
 pub use captured::CapturedMemory;
 pub use cpu_writes::DownloadLanding;

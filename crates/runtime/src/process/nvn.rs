@@ -6,10 +6,10 @@ use super::{
 use crate::memory::{MappingError, MemoryKind};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
-use nixe_memory::{GuestVirtualAddress, MemoryPermissions};
+use nixe_memory::{AddressSpace, GuestVirtualAddress, MemoryPermissions, PAGE_SIZE};
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 mod timing;
@@ -25,23 +25,32 @@ const ENTRIES: usize = 4096;
 const HOST_ENTRIES: usize = ENTRIES + SLOTS * 8;
 const DESCRIPTORS: usize = HOST_ENTRIES + SLOTS * 8;
 const DESCRIPTOR_BYTES: usize = 3 * 8; // target, counter address, resolver kind
-const COUNTERS: usize = DESCRIPTORS + SLOTS * DESCRIPTOR_BYTES;
+const CAPTURE_CONTROL: usize = DESCRIPTORS + SLOTS * DESCRIPTOR_BYTES;
+const COUNTERS: usize = CAPTURE_CONTROL + PAGE_SIZE as usize;
 const DISPATCH_PC: usize = COUNT_CALL.len() * 4;
-const RESOLVE_PC: u64 = (DISPATCH_PC + 8 * 4) as u64;
+const RESOLVE_PC: u64 = (DISPATCH_PC + 9 * 4) as u64;
+
+const fn adr(register: u32, offset: u32) -> u32 {
+    0x10000000 | ((offset & 3) << 29) | ((offset >> 2) << 5) | register
+}
 
 // AAPCS64 volatile temporaries only. SDK entries still tail-call the original
 // with the original SP, LR, flags, integer and vector arguments.
 const COUNT_CALL: &[u32] = &[
-    0xa9402a09, // ldp x9, x10, [x16]      target, per-name counter
-    0xc85f7d4b, // retry: ldxr x11, [x10]
-    0x9100056b, // add x11, x11, #1
-    0xc80c7d4b, // stxr w12, x11, [x10]
-    0x35ffffac, // cbnz w12, retry
-    0xb940120b, // ldr w11, [x16, #16]    resolver kind or timed HLE bit
-    0x37100b4b, // tbnz w11, #2, timing::ENTRY
+    0xa9402a09,                            // ldp x9, x10, [x16]      target, per-name counter
+    adr(12, (CAPTURE_CONTROL - 4) as u32), // adr x12, capture_active
+    0xb940018c,                            // ldr w12, [x12]
+    0x340000ec,                            // cbz w12, dispatch
+    0xc85f7d4b,                            // retry: ldxr x11, [x10]
+    0x9100056b,                            // add x11, x11, #1
+    0xc80c7d4b,                            // stxr w12, x11, [x10]
+    0x35ffffac,                            // cbnz w12, retry
+    0xb940120b,                            // ldr w11, [x16, #16]    resolver kind or timed HLE bit
+    0x37100aeb,                            // tbnz w11, #2, timing::ENTRY
 ];
 const DISPATCH: &[u32] = &[
     0xb940120a, // ldr w10, [x16, #16]      resolver kind
+    0x3710014a, // tbnz w10, #2, tail       untimed HLE call
     0x3400012a, // cbz w10, tail
     0xaa0003eb, // mov x11, x0              bootstrap takes name in x0
     0x3608004a, // tbz w10, #1, invoke
@@ -226,7 +235,12 @@ impl NvnHooks {
     }
 
     fn guest_base(&self) -> u64 {
-        self.base + (COUNTERS + SLOTS * self.counter_bytes()) as u64
+        let offset = if self.count_calls {
+            COUNTERS + SLOTS * self.counter_bytes()
+        } else {
+            CAPTURE_CONTROL
+        };
+        self.base + offset as u64
     }
 
     fn timed_hle(&self) -> Option<&Hle> {
@@ -293,7 +307,7 @@ impl NvnHooks {
         for slot in 0..SLOTS {
             let pc = ENTRIES + slot * 8;
             let diff = (DESCRIPTORS + slot * DESCRIPTOR_BYTES - pc) as u32;
-            let adr_x16 = 0x10000010 | ((diff & 3) << 29) | ((diff >> 2) << 5);
+            let adr_x16 = adr(16, diff);
             let branch_common =
                 0x14000000 | (((entry_pc as i32 - pc as i32 - 4) / 4) as u32 & 0x03ff_ffff);
             code[pc..pc + 4].copy_from_slice(&adr_x16.to_le_bytes());
@@ -335,6 +349,13 @@ impl NvnHooks {
             self.hle.is_some()
         );
         Ok(())
+    }
+
+    fn call_capture(&self, memory: &ProcessMemory) -> Option<NvnCallCapture> {
+        (self.count_calls && !self.bootstrap.is_empty()).then(|| NvnCallCapture {
+            space: Arc::clone(memory.space()),
+            address: GuestVirtualAddress::new(self.base + CAPTURE_CONTROL as u64),
+        })
     }
 
     fn original_target(&self, registry: &Registry, address: u64) -> u64 {
@@ -634,6 +655,22 @@ pub struct NvnCall {
     pub total_normalized_ns: Option<u128>,
 }
 
+/// Controls the admission of new calls into the current NVN diagnostic report.
+pub struct NvnCallCapture {
+    space: Arc<AddressSpace>,
+    address: GuestVirtualAddress,
+}
+
+impl NvnCallCapture {
+    /// Calls already admitted can finish recording their timing after a pause.
+    pub fn set_active(&self, active: bool) -> Result<(), MappingError> {
+        self.space
+            .write_value(self.address, 4, u128::from(active))?
+            .into_ready()
+            .map_err(|_| MappingError::InvalidRange)
+    }
+}
+
 impl RunnableProcess {
     pub fn uses_nvn_hle(&self) -> bool {
         self.nvn
@@ -642,6 +679,9 @@ impl RunnableProcess {
     }
     pub fn nvn_session(&self) -> Option<&nixe_nvn::Session> {
         self.nvn.as_ref()?.hle.as_ref().map(|h| &h.session)
+    }
+    pub fn nvn_call_capture(&self) -> Option<NvnCallCapture> {
+        self.nvn.as_ref()?.call_capture(&self.memory)
     }
     /// Snapshot after the vCPUs quiesce, while the diagnostic pages are still mapped.
     pub fn nvn_call_report(&self) -> Option<Result<NvnCallReport, MappingError>> {
@@ -837,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn nvn_hle_calibrates_once_and_reports_normalized_totals() {
+    fn nvn_hle_calibrates_once_and_accumulates_only_active_calls() {
         use nixe_cpu::{
             execution::{ArchitecturalTimer, CpuExit, TimerSnapshot},
             profile::ProcessCpuContext,
@@ -942,31 +982,47 @@ mod tests {
             .bind(&memory, &mut registry, procedure, 0x21_0000)
             .unwrap();
         drop(registry);
-        cpu.set_pc(entry);
-        assert!(matches!(
-            run(&mut cpu),
-            CpuExit::SupervisorCall {
-                immediate: NVN_SVC,
-                ..
+        let capture = hooks.call_capture(&memory).unwrap();
+        for (active, expected) in [
+            (None, 0),
+            (Some(true), 1),
+            (Some(false), 1),
+            (Some(true), 2),
+        ] {
+            if let Some(active) = active {
+                capture.set_active(active).unwrap();
             }
-        ));
-        // Stand in for host handler work before resuming the guest return.
-        timer.0.set(timer.0.get() + 4);
-        cpu.set_pc(cpu.pc() + 4);
-        cpu.write_x(x(0), 42);
-        assert!(matches!(
-            run(&mut cpu),
-            CpuExit::SupervisorCall { immediate: 0, .. }
-        ));
-        assert_eq!(cpu.pc(), caller.get());
-        assert_eq!(cpu.read_x(x(0)), 42);
-        assert_eq!(cpu.read_x(A64Register::StackPointer), stack.get() + 4096);
-        let report = hooks.report(&memory).unwrap();
-        let call = &report.calls[0];
-        assert_eq!(call.name, procedure);
-        assert_eq!(call.invocations, 1);
-        assert_eq!(call.total_ns, Some(160));
-        assert_eq!(call.total_normalized_ns, Some(128));
+            cpu.set_pc(entry);
+            assert!(matches!(
+                run(&mut cpu),
+                CpuExit::SupervisorCall {
+                    immediate: NVN_SVC,
+                    ..
+                }
+            ));
+            // Stand in for host handler work before resuming the guest return.
+            timer.0.set(timer.0.get() + 4);
+            cpu.set_pc(cpu.pc() + 4);
+            cpu.write_x(x(0), 42);
+            assert!(matches!(
+                run(&mut cpu),
+                CpuExit::SupervisorCall { immediate: 0, .. }
+            ));
+            assert_eq!(cpu.pc(), caller.get());
+            assert_eq!(cpu.read_x(x(0)), 42);
+            assert_eq!(cpu.read_x(A64Register::StackPointer), stack.get() + 4096);
+            let report = hooks.report(&memory).unwrap();
+            if expected == 0 {
+                assert!(report.calls.is_empty());
+            } else {
+                assert_eq!(report.calls.len(), 1);
+                let call = &report.calls[0];
+                assert_eq!(call.name, procedure);
+                assert_eq!(call.invocations, expected);
+                assert_eq!(call.total_ns, Some(160 * u128::from(expected)));
+                assert_eq!(call.total_normalized_ns, Some(128 * u128::from(expected)));
+            }
+        }
     }
 
     #[test]

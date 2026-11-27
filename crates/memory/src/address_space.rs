@@ -1,12 +1,14 @@
 //! Indexed process translations; mapping records retain allocations, not pages.
 mod alias;
 mod fastmem;
+mod read_batch;
 use crate::transition::{CoreContext, NativeAdmission, Quiescence};
 use crate::{
     Access, AccessOperation, AddressSpaceId, AddressWidth, Allocation, AllocationId, AllocationPin,
     ArenaOffset, Extent, GuestVirtualAddress, Machine, MemoryError, MemoryPermissions, PAGE_SIZE,
     VirtualArena,
 };
+pub use read_batch::ReadBatch;
 use std::{
     cell::UnsafeCell,
     collections::BTreeMap,
@@ -1117,36 +1119,8 @@ impl AddressSpace {
         Ok(words.len())
     }
 
-    /// Compare a retained snapshot to ordinary RAM without copying it. Device-owned
-    /// pages need a coherent read and therefore cannot establish a direct hit.
-    pub fn compare_direct_words(
-        &self,
-        start: GuestVirtualAddress,
-        words: &[u64],
-    ) -> Result<DirectWordsComparison, MemoryError> {
-        if !start.get().is_multiple_of(8) {
-            return Ok(DirectWordsComparison::NeedsCoherentRead);
-        }
-        let end = self.range(start, size_of_val(words) as u64)?;
-        let _access = self.quiescence.enter_host()?;
-        let mut at = start.get();
-        while at < end {
-            let entry = unsafe { self.raw_entry(at) };
-            if entry & READ_MARKED != 0 || entry == 0 {
-                require_entry(entry, GuestVirtualAddress::new(at), MemoryPermissions::READ)?;
-                if entry_cached(entry) {
-                    return Ok(DirectWordsComparison::NeedsCoherentRead);
-                }
-            }
-            let n = ((PAGE_SIZE - at % PAGE_SIZE).min(end - at) / 8) as usize;
-            let i = ((at - start.get()) / 8) as usize;
-            // Admission keeps this entire physical page alive during the comparison.
-            if !unsafe { crate::raw::matches_words(entry_pointer(entry, at), &words[i..i + n]) } {
-                return Ok(DirectWordsComparison::Different);
-            }
-            at += n as u64 * 8;
-        }
-        Ok(DirectWordsComparison::Equal)
+    pub fn read_batch(&self) -> ReadBatch<'_> {
+        ReadBatch::new(self)
     }
     pub fn read_into(
         &self,

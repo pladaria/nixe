@@ -51,6 +51,8 @@ struct Control {
     failure: Option<String>,
     presented: std::collections::VecDeque<std::time::Instant>,
     presentations: u64,
+    count_game_frames: bool,
+    counted_game_frames: u64,
     notify: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 /// One pending host packet. Font deltas are never overwritten or lost: the
@@ -118,11 +120,19 @@ impl PresentationClient {
     pub fn presentation_count(&self) -> u64 {
         self.0.lock().unwrap().presentations
     }
+    /// Start or pause accumulating newly presented game frames.
+    pub fn set_game_frame_counting(&self, active: bool) {
+        self.0.lock().unwrap().count_game_frames = active;
+    }
+    pub fn counted_game_frames(&self) -> u64 {
+        self.0.lock().unwrap().counted_game_frames
+    }
     pub(crate) fn record_presented(&self, new_frame: bool) {
         let notify = {
             let mut state = self.0.lock().unwrap();
             state.presentations += 1;
             if new_frame {
+                state.counted_game_frames += u64::from(state.count_game_frames);
                 if state.presented.len() == 64 {
                     state.presented.pop_front();
                 }

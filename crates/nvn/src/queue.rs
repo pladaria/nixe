@@ -291,9 +291,15 @@ pub fn submit(c: &Call) -> Result<u64> {
             submission.descriptors = Some(c.session.descriptors.clone());
         }
         let span = nixe_memory::trace::span("nvn_list_capture", c.args[1], 0, 0);
+        // Amortize memory admission across control entries and payloads while
+        // retaining the submit-time snapshots used by our asynchronous replay.
+        // https://github.com/scarletnx/ScarletNX/blob/6930e50f7902c879886860c9aa7bda49857ec23b/src/nx/gpu/nvn/nvn_replay.c#L63-L74
+        let mut reader = c.memory.read_batch();
         for i in 0..c.args[1] as u32 {
-            capture.list(c, c.read(c.args[2] + u64::from(i) * 8)?, &mut submission)?;
+            let handle = memory::read_batched(&mut reader, c.args[2] + u64::from(i) * 8)?;
+            capture.list(c, &mut reader, handle, &mut submission)?;
         }
+        drop(reader);
         #[cfg(feature = "execution-trace")]
         capture.trace_submit(submission.block_count());
         drop(span);

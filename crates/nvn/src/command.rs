@@ -4,7 +4,7 @@ mod block_cache;
 
 use super::*;
 
-use nixe_memory::DirectWordsComparison;
+use nixe_memory::{DirectWordsComparison, ReadBatch};
 use smallvec::SmallVec;
 
 #[derive(Copy, Clone, Debug)]
@@ -384,7 +384,7 @@ pub(crate) struct Capture {
 #[cfg(feature = "execution-trace")]
 #[derive(Default)]
 struct ListDiagnostics {
-    evicted: std::collections::HashSet<Range>,
+    evicted: std::collections::HashSet<ControlEntry>,
     // attempted comparison bytes, first-seen misses, modified, evicted, coherent, evictions
     counts: [u64; 6],
     recycled: u64,
@@ -392,7 +392,7 @@ struct ListDiagnostics {
 
 #[cfg(feature = "execution-trace")]
 impl ListDiagnostics {
-    fn record_miss(&mut self, key: Range, comparison: Option<DirectWordsComparison>) {
+    fn record_miss(&mut self, key: ControlEntry, comparison: Option<DirectWordsComparison>) {
         let index = match comparison {
             Some(DirectWordsComparison::Different) => 2,
             Some(DirectWordsComparison::NeedsCoherentRead) => 4,
@@ -403,7 +403,7 @@ impl ListDiagnostics {
         self.counts[index] += 1;
     }
 
-    fn note_eviction(&mut self, key: Range) {
+    fn note_eviction(&mut self, key: ControlEntry) {
         self.counts[5] += 1;
         if self.evicted.len() < 131_072 {
             self.evicted.insert(key);
@@ -433,32 +433,36 @@ impl Capture {
         nixe_memory::trace::event("nvn_command_reuse", reused, hits, 0);
         self.diagnostics.trace();
     }
-    pub(crate) fn list(&mut self, c: &Call, handle: u64, batch: &mut Submission) -> Result<()> {
+    pub(crate) fn list(
+        &mut self,
+        c: &Call,
+        reader: &mut ReadBatch<'_>,
+        handle: u64,
+        batch: &mut Submission,
+    ) -> Result<()> {
         #[cfg(feature = "execution-trace")]
         let detailed = nixe_memory::trace::detailed_active();
         let mut at = handle;
         loop {
-            let Range { address, size } = c.read(at)?;
-            if size == LINK {
-                at = address;
+            let entry: ControlEntry = memory::read_batched(reader, at)?;
+            if let Some(target) = entry.link_target() {
+                at = target;
                 continue;
             }
-            let bytes = size & !(END | CALLED);
-            if !bytes.is_multiple_of(8) || bytes > 64 << 20 {
+            let address = entry.address();
+            let bytes = entry.bytes();
+            if bytes > MAX_COMMAND_RANGE_BYTES {
                 return Err(format!(
-                    "invalid NVN control entry at {at:#x} in list {handle:#x}: address={address:#x} size={size:#x}"
+                    "invalid NVN control entry at {at:#x} in list {handle:#x}: address={address:#x} bytes={bytes:#x}"
                 ).into());
             }
             if bytes != 0 {
-                let key = Range {
-                    address,
-                    size: size & !END,
-                };
+                let key = entry.without_end();
                 let previous = self.blocks.index(&key);
                 let comparison = previous
                     .map(|index| {
                         let block = self.blocks.block(index);
-                        c.memory.compare_direct_words(
+                        reader.compare_words(
                             nixe_memory::GuestVirtualAddress::new(address),
                             &block.words,
                         )
@@ -486,7 +490,7 @@ impl Capture {
                             self.diagnostics.record_miss(key, comparison);
                         }
                     }
-                    let called = size & CALLED != 0;
+                    let called = entry.is_called();
                     let mut evicted = |_evicted| {
                         #[cfg(feature = "execution-trace")]
                         if detailed {
@@ -497,7 +501,11 @@ impl Capture {
                         self.blocks.refresh(
                             index,
                             |block| {
-                                c.read_bytes(address, bytemuck::cast_slice_mut(&mut block.words))?;
+                                memory::read_batched_bytes(
+                                    reader,
+                                    address,
+                                    bytemuck::cast_slice_mut(&mut block.words),
+                                )?;
                                 block.index_records(called)
                             },
                             &mut evicted,
@@ -513,7 +521,11 @@ impl Capture {
                         block
                     } else {
                         let mut words = vec![0; bytes as usize / 8];
-                        c.read_bytes(address, bytemuck::cast_slice_mut(&mut words))?;
+                        memory::read_batched_bytes(
+                            reader,
+                            address,
+                            bytemuck::cast_slice_mut(&mut words),
+                        )?;
                         let block = Arc::new(CommandBlock::new(words, called)?);
                         self.blocks.insert(key, previous, block.clone(), evicted);
                         block
@@ -531,6 +543,7 @@ impl Capture {
                     }
                     self.observe_record(
                         c,
+                        reader,
                         record_tag(header),
                         &block.words[i + 1..i + 1 + record_words(header)],
                         &mut batch.captures,
@@ -539,7 +552,7 @@ impl Capture {
                 batch.retained_bytes += bytes as usize;
                 batch.blocks.push(block);
             }
-            if size & END != 0 {
+            if entry.is_end() {
                 return Ok(());
             }
             at += CONTROL_SIZE;
@@ -548,6 +561,7 @@ impl Capture {
     fn observe_record(
         &mut self,
         c: &Call,
+        reader: &mut ReadBatch<'_>,
         op: u32,
         w: &[u64],
         captures: &mut Vec<BindingRun>,
@@ -576,7 +590,7 @@ impl Capture {
                 let stage = w[0] as u32;
                 let first = w[1] as u32;
                 for i in 0..w[2] as u32 {
-                    let handle = c.read(w[3] + 8 * u64::from(i))?;
+                    let handle = memory::read_batched(reader, w[3] + 8 * u64::from(i))?;
                     self.bindings[usize::from(stage == 5)].bind_texture(stage, first + i, handle);
                 }
             }
@@ -604,6 +618,8 @@ impl Capture {
                     .select_shaders(self.shaders.iter().copied().filter(|s| s.stage == 5));
             }
             op if uses_bindings(op) => {
+                // Descriptor capture can enter coherent memory or lock a registry.
+                reader.release();
                 let current = self.bindings[usize::from(is_dispatch(op))].snapshot(
                     c,
                     self.texture_pool,
@@ -1098,6 +1114,100 @@ impl CommandState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_control_keeps_full_addresses_lengths_and_flags() {
+        let address = (1 << 39) - MAX_COMMAND_RANGE_BYTES - 4;
+        let range = ControlEntry::range(address, MAX_COMMAND_RANGE_BYTES).unwrap();
+        let called_end = range.as_called_range().with_end();
+        assert_eq!(CONTROL_SIZE, 8);
+        assert_eq!(called_end.address(), address);
+        assert_eq!(called_end.bytes(), MAX_COMMAND_RANGE_BYTES);
+        assert_eq!(called_end.link_target(), None);
+        assert!(called_end.is_called());
+        assert!(called_end.is_end());
+        assert_eq!(called_end.without_end(), range.as_called_range());
+        assert_ne!(called_end.without_end(), range);
+
+        let address = (1 << 39) - 8;
+        assert_eq!(
+            ControlEntry::link(address).unwrap().link_target(),
+            Some(address)
+        );
+        let empty = ControlEntry::range(0, 0).unwrap().with_end();
+        assert_eq!(empty.bytes(), 0);
+        assert_eq!(empty.link_target(), None);
+        assert!(empty.is_end());
+        assert!(ControlEntry::range(1 << 39, 16).is_err());
+        assert!(ControlEntry::range(4, MAX_COMMAND_RANGE_BYTES + 8).is_err());
+    }
+
+    #[test]
+    fn batched_capture_follows_split_control_links_and_retains_submitted_words() {
+        use nixe_memory::{
+            AddressWidth, GuestVirtualAddress, Machine, MemoryPermissions, PAGE_SIZE,
+        };
+
+        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(2 * PAGE_SIZE)
+            .unwrap()
+            .allocate(2 * PAGE_SIZE)
+            .unwrap();
+        let space = AddressSpace::new(machine, AddressWidth::Bits32).unwrap();
+        space
+            .map(
+                GuestVirtualAddress::new(0x1000),
+                allocation,
+                0,
+                2 * PAGE_SIZE,
+                MemoryPermissions::READ_WRITE,
+            )
+            .unwrap();
+        let session = Session::new();
+        let c = Call {
+            session: &session,
+            memory: &space,
+            args: [0; 8],
+            pending: Default::default(),
+        };
+        let words = |value: u64| [u64::from(op::BARRIER) | (1 << 8), value];
+        c.write(0x1100, &words(1)).unwrap();
+        c.write(0x1204, &words(2)).unwrap();
+        c.write(0x1ffc, &ControlEntry::link(0x2040).unwrap())
+            .unwrap();
+        c.write(
+            0x2040,
+            &[
+                ControlEntry::range(0x1100, 16).unwrap(),
+                ControlEntry::range(0x1204, 16)
+                    .unwrap()
+                    .as_called_range()
+                    .with_end(),
+            ],
+        )
+        .unwrap();
+
+        let mut capture = Capture::default();
+        let mut submit = || {
+            let mut submission = Submission::default();
+            capture
+                .list(&c, &mut space.read_batch(), 0x1ffc, &mut submission)
+                .unwrap();
+            submission
+        };
+        let first = submit();
+        c.write(0x1100, &words(3)).unwrap();
+        let second = submit();
+        let values = |submission: &Submission| {
+            let mut cursor = SubmissionCursor::default();
+            std::iter::from_fn(|| submission.next_record(&mut cursor))
+                .map(|record| record.unwrap().args[0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(&first), [1, 2]);
+        assert_eq!(values(&second), [3, 2]);
+    }
 
     #[test]
     fn primitive_restart_changes_only_indexed_draws() {

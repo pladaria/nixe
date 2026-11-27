@@ -1,6 +1,28 @@
 use super::*;
 
 #[test]
+fn game_frame_count_accumulates_only_fresh_presents_in_active_intervals() {
+    let client = PresentationClient::default();
+    client.record_presented(true);
+    assert_eq!(client.counted_game_frames(), 0);
+
+    client.set_game_frame_counting(true);
+    for _ in 0..70 {
+        client.record_presented(true);
+    }
+    client.record_presented(false);
+    assert_eq!(client.take_presented().len(), 64);
+    client.set_game_frame_counting(false);
+    client.record_presented(true);
+    assert_eq!(client.counted_game_frames(), 70);
+
+    client.set_game_frame_counting(true);
+    client.record_presented(true);
+    client.set_game_frame_counting(false);
+    assert_eq!(client.counted_game_frames(), 71);
+}
+
+#[test]
 fn canceled_or_rejected_host_packets_dispose_unapplied_ui_deltas() {
     fn packet() -> HostFrame {
         let mut textures = egui::TexturesDelta::default();

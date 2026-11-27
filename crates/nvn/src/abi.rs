@@ -312,10 +312,80 @@ impl Default for Sampler {
 pub const IMAGE_HANDLE_BASE_SLOT: u32 = (0x120 - 0x20) / 8;
 pub const IMAGE_HANDLE_SLOTS: u32 = 8;
 
-pub(crate) const LINK: u64 = 1 << 61;
-pub(crate) const CALLED: u64 = 1 << 62;
-pub(crate) const END: u64 = 1 << 63;
-pub(crate) const CONTROL_SIZE: u64 = 16;
+pub(crate) const CONTROL_SIZE: u64 = core::mem::size_of::<ControlEntry>() as u64;
+pub(crate) const MAX_COMMAND_RANGE_BYTES: u64 = 64 << 20;
+
+/// One CPU-side control entry. Command storage is four-byte aligned (NVN
+/// device property 0x13) and Horizon guest virtual addresses use up to 39 bits.
+/// Bits 0–36 hold the address divided by four and bits 37–60 hold the number
+/// of eight-byte words. A link uses the remaining low bits as a byte address.
+/// https://github.com/seedds/nxnative/blob/a366365/dm/gfx/nvn/nvn_obj.h#L124-L137
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Pod, Zeroable)]
+pub(crate) struct ControlEntry(u64);
+
+#[allow(
+    dead_code,
+    reason = "The embedded guest and the renderer share the control ABI"
+)]
+impl ControlEntry {
+    const ADDRESS_LIMIT: u64 = 1 << 39;
+    const WORD_SHIFT: u32 = 37;
+    const WORD_MASK: u64 = (1 << 24) - 1;
+    const LINK: u64 = 1 << 61;
+    const CALLED: u64 = 1 << 62;
+    const END: u64 = 1 << 63;
+
+    pub(crate) fn range(address: u64, bytes: u64) -> Result<Self, &'static str> {
+        if address >= Self::ADDRESS_LIMIT
+            || !address.is_multiple_of(4)
+            || bytes > MAX_COMMAND_RANGE_BYTES
+            || !bytes.is_multiple_of(8)
+        {
+            return Err("NVN command range exceeds the supported address, alignment or size");
+        }
+        Ok(Self((address >> 2) | ((bytes >> 3) << Self::WORD_SHIFT)))
+    }
+
+    pub(crate) fn link(address: u64) -> Result<Self, &'static str> {
+        if address >= Self::ADDRESS_LIMIT {
+            return Err("NVN control link exceeds the guest address space");
+        }
+        Ok(Self(Self::LINK | address))
+    }
+
+    pub(crate) fn link_target(self) -> Option<u64> {
+        (self.0 & Self::LINK != 0).then_some(self.0 & !Self::LINK)
+    }
+
+    pub(crate) fn address(self) -> u64 {
+        (self.0 & ((1 << Self::WORD_SHIFT) - 1)) << 2
+    }
+
+    pub(crate) fn bytes(self) -> u64 {
+        ((self.0 >> Self::WORD_SHIFT) & Self::WORD_MASK) << 3
+    }
+
+    pub(crate) fn is_called(self) -> bool {
+        self.0 & Self::CALLED != 0
+    }
+
+    pub(crate) fn is_end(self) -> bool {
+        self.0 & Self::END != 0
+    }
+
+    pub(crate) fn with_end(self) -> Self {
+        Self(self.0 | Self::END)
+    }
+
+    pub(crate) fn without_end(self) -> Self {
+        Self(self.0 & !Self::END)
+    }
+
+    pub(crate) fn as_called_range(self) -> Self {
+        Self((self.0 & !Self::END) | Self::CALLED)
+    }
+}
 
 // The upper word is the distance to the next submit-visible record in this range.
 pub(crate) fn record_tag(header: u64) -> u32 {

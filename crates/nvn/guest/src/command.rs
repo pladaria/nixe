@@ -71,18 +71,21 @@ impl Recorder {
     fn has_control(&self, entries: u64) -> bool {
         self.control_end.saturating_sub(self.control) >= (entries + 1) * CONTROL_SIZE
     }
-    fn entry(&mut self, c: &Call, address: u64, size: u64) -> Result<()> {
+    fn entry(&mut self, c: &Call, entry: ControlEntry) -> Result<()> {
         if self.first == 0 {
             self.first = self.control
         }
-        c.write(self.control, &Range { address, size })?;
+        c.write(self.control, &entry)?;
         self.last = self.control;
         self.control += CONTROL_SIZE;
         Ok(())
     }
     fn close_range(&mut self, c: &Call) -> Result<()> {
         if self.position > self.begin {
-            self.entry(c, self.begin, self.position - self.begin)?;
+            self.entry(
+                c,
+                ControlEntry::range(self.begin, self.position - self.begin)?,
+            )?;
             self.begin = self.position;
             self.capture_anchor = self.position;
         }
@@ -146,7 +149,7 @@ pub fn add_commands(c: &Call) -> Result<u64> {
     let mut r: Recorder = c.read(c.args[0])?;
     if r.recording != 0 && r.position > r.begin {
         if !r.has_control(1) {
-            return r.request(c, 1, 48);
+            return r.request(c, 1, 3 * CONTROL_SIZE);
         }
         r.close_range(c)?;
     }
@@ -160,24 +163,18 @@ pub fn add_commands(c: &Call) -> Result<u64> {
 }
 pub fn add_control(c: &Call) -> Result<u64> {
     let mut r: Recorder = c.read(c.args[0])?;
-    if c.args[2] < 32 {
+    if c.args[2] < 2 * CONTROL_SIZE {
         return Err("control segment too small");
     }
+    let end = c.args[1]
+        .checked_add(c.args[2])
+        .ok_or("control segment overflow")?;
     if r.recording != 0 && r.last != 0 {
-        c.write(
-            r.control,
-            &Range {
-                address: c.args[1],
-                size: LINK,
-            },
-        )?;
+        c.write(r.control, &ControlEntry::link(c.args[1])?)?;
     }
     r.control = c.args[1];
     r.control_base = r.control;
-    r.control_end = r
-        .control
-        .checked_add(c.args[2])
-        .ok_or("control segment overflow")?;
+    r.control_end = end;
     c.write(c.args[0], &r)?;
     Ok(0)
 }
@@ -207,25 +204,25 @@ fn append_commands<const COPY: bool>(c: &Call) -> Result<u64> {
     for i in 0..u64::from(c.args[1] as u32) {
         let mut cursor: u64 = c.read(c.args[2] + 8 * i)?;
         loop {
-            let Range { address, size } = c.read(cursor)?;
-            if size == LINK {
-                cursor = address;
+            let entry: ControlEntry = c.read(cursor)?;
+            if let Some(target) = entry.link_target() {
+                cursor = target;
                 continue;
             }
-            let bytes = size & !(END | CALLED);
+            let bytes = entry.bytes();
             if bytes != 0 {
                 if COPY {
-                    r.copy_range(c, address, bytes, size & CALLED != 0)?;
+                    r.copy_range(c, entry.address(), bytes, entry.is_called())?;
                 } else {
                     if r.position > r.begin {
                         r.ensure_control(c)?;
                         r.close_range(c)?;
                     }
                     r.ensure_control(c)?;
-                    r.entry(c, address, bytes | CALLED)?;
+                    r.entry(c, entry.as_called_range())?;
                 }
             }
-            if size & END != 0 {
+            if entry.is_end() {
                 break;
             }
             cursor += CONTROL_SIZE;
@@ -318,14 +315,14 @@ pub fn end(c: &Call) -> Result<u64> {
         return Err("outside recording");
     }
     if (r.position > r.begin || r.last == 0) && !r.has_control(1) {
-        return r.request(c, 1, 32);
+        return r.request(c, 1, 2 * CONTROL_SIZE);
     }
     r.close_range(c)?;
     if r.last == 0 {
-        r.entry(c, 0, 0)?
+        r.entry(c, ControlEntry::range(0, 0)?)?
     }
-    let size: u64 = c.read(r.last + 8)?;
-    c.write(r.last + 8, &(size | END))?;
+    let last: ControlEntry = c.read(r.last)?;
+    c.write(r.last, &last.with_end())?;
     r.recording = 0;
     c.write(c.args[0], &r)?;
     Ok(r.first)
@@ -567,11 +564,11 @@ simple!(report, REPORT, 2);
 simple!(reset_counter, RESET_COUNTER, 1);
 pub fn textures(c: &Call) -> Result<u64> {
     let count = c.args[3] as u32 as usize;
-    if count != 0 && let Some(dst) = reserve(c, op::TEXTURES, 1 + count)? {
+    if count != 0
+        && let Some(dst) = reserve(c, op::TEXTURES, 1 + count)?
+    {
         c.write(dst, &pair(c.args[1], c.args[2]))?;
-        unsafe {
-            core::ptr::copy(c.args[4] as *const u64, (dst + 8) as *mut u64, count)
-        };
+        unsafe { core::ptr::copy(c.args[4] as *const u64, (dst + 8) as *mut u64, count) };
     }
     Ok(0)
 }
@@ -586,7 +583,11 @@ pub fn signal_event(c: &Call) -> Result<u64> {
     record(
         c,
         op::SIGNAL_EVENT,
-        &[event.gpu, pair(c.args[2], c.args[5]), pair(c.args[3], c.args[4])],
+        &[
+            event.gpu,
+            pair(c.args[2], c.args[5]),
+            pair(c.args[3], c.args[4]),
+        ],
     )
 }
 
