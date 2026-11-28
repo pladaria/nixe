@@ -131,12 +131,16 @@ impl AudioFeed {
     /// Fill one playback quantum with interleaved signed-16-bit PCM.
     /// Empty queues produce silence, without advancing guest buffer completion.
     pub fn render(&self, output: &mut [i16]) {
+        let frames = output.len() / self.format.layout.channels();
+        self.render_chunk(output, frames);
+    }
+
+    /// Supply a slice of a callback while measuring the demand of the full callback.
+    fn render_chunk(&self, output: &mut [i16], callback_frames: usize) {
         output.fill(0);
         let mut state = self.lock();
         let capacity = output.len() / self.format.layout.channels() * self.format.layout.channels();
-        state.largest_callback_frames = state
-            .largest_callback_frames
-            .max(capacity / self.format.layout.channels());
+        state.largest_callback_frames = state.largest_callback_frames.max(callback_frames);
         if !state.started || state.host_paused || state.failure.is_some() {
             return;
         }

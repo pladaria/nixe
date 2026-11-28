@@ -82,7 +82,7 @@ impl RenderMemory {
 }
 
 const BLOCK: Duration = Duration::from_millis(5);
-const BUFFER_COUNT: usize = 3;
+const MIN_BUFFER_COUNT: usize = 4;
 
 #[derive(Debug)]
 pub(super) struct RendererWorker {
@@ -96,6 +96,7 @@ struct WorkerControl {
     paused: bool,
     parked: bool,
     finished: bool,
+    pcm_released: bool,
 }
 
 struct WorkerFinished(Arc<(Mutex<WorkerControl>, Condvar)>);
@@ -125,6 +126,7 @@ impl RendererWorker {
                 // Never take the renderer lock from SDL's callback. This notification
                 // only releases producer backpressure; it is not a guest DSP event.
                 if ready {
+                    wake.0.lock().unwrap().pcm_released = true;
                     wake.1.notify_one();
                 }
             }),
@@ -133,8 +135,10 @@ impl RendererWorker {
         let params = state.parameters.clone();
         let devices = state.devices.clone();
         let mut buffers = RenderBuffers::new(&params);
-        let mut free: Vec<_> = (0..BUFFER_COUNT)
-            .map(|_| vec![0_i16; params.samples as usize * 2])
+        let block_frames = params.samples as usize;
+        let mut allocated = MIN_BUFFER_COUNT;
+        let mut free: Vec<_> = (0..allocated)
+            .map(|_| vec![0_i16; block_frames * 2])
             .collect();
         let update = state.update.clone();
         let signal = state.signal.clone();
@@ -150,9 +154,8 @@ impl RendererWorker {
                 let _finished = WorkerFinished(thread_stop.clone());
                 let memory = RenderMemory(thread_stop.clone());
                 let result = (|| -> Result<(), RenderError> {
-                    let mut next = Instant::now();
+                    let mut next_without_sink: Option<Instant> = None;
                     loop {
-                        let now = Instant::now();
                         let mut stopped = thread_stop.0.lock().unwrap();
                         if stopped.paused && !stopped.stop {
                             stopped.parked = true;
@@ -161,15 +164,21 @@ impl RendererWorker {
                                 stopped = thread_stop.1.wait(stopped).unwrap();
                             }
                             stopped.parked = false;
-                            next = Instant::now();
+                            next_without_sink = None;
                         }
                         if stopped.stop {
                             break;
                         }
-                        if now < next {
+                        let now = Instant::now();
+                        if let Some(next) = next_without_sink
+                            && now < next
+                        {
                             drop(thread_stop.1.wait_timeout(stopped, next - now).unwrap());
                             continue;
                         }
+                        // Clear before recycling so a callback between the queue
+                        // check and the wait still wakes a full producer.
+                        stopped.pcm_released = false;
                         drop(stopped);
                         while let Some(pcm) = output
                             .recycle_buffer()
@@ -177,16 +186,31 @@ impl RendererWorker {
                         {
                             free.push(pcm);
                         }
+                        if free.is_empty() {
+                            // Size for the host's demand, including batched pulls.
+                            // https://github.com/zortos293/Lichii/blob/646b5d17135a2b2701ccc7a959afd0bbbf2f6160/src/audio_core/sink/sink_stream.cpp#L93-L102
+                            let limit = output
+                                .streaming_queue_blocks(block_frames)
+                                .map_err(|error| error.0.into_boxed_str())?
+                                .max(MIN_BUFFER_COUNT);
+                            free.extend((allocated..limit).map(|_| vec![0_i16; block_frames * 2]));
+                            allocated = limit;
+                        }
                         let Some(mut pcm) = free.pop() else {
-                            // Full bounded queue: don't run ahead of host playback.
+                            // Host consumption sets the pace once the PCM queue is full.
+                            // Take the control lock only outside AudioOutput calls.
                             let stopped = thread_stop.0.lock().unwrap();
-                            if stopped.stop {
-                                break;
-                            }
-                            drop(thread_stop.1.wait_timeout(stopped, BLOCK).unwrap());
+                            drop(
+                                thread_stop
+                                    .1
+                                    .wait_while(stopped, |control| {
+                                        !control.stop && !control.paused && !control.pcm_released
+                                    })
+                                    .unwrap(),
+                            );
                             continue;
                         };
-                        {
+                        let has_sink = {
                             let mut state = update.take_blocking();
                             let has_sink = match buffers.render(
                                 &memory,
@@ -210,11 +234,12 @@ impl RendererWorker {
                             // Publish actual command execution while serialized with
                             // RequestUpdate's status snapshot and event reset.
                             signal.signal();
-                        }
-                        next += BLOCK;
-                        if next < Instant::now() {
-                            next = Instant::now();
-                        }
+                            has_sink
+                        };
+                        // With no PCM sink there is no host consumption to pace the DSP.
+                        next_without_sink = (!has_sink).then(|| {
+                            (next_without_sink.unwrap_or(now) + BLOCK).max(Instant::now())
+                        });
                     }
                     output
                         .stop()
@@ -275,7 +300,7 @@ impl AudioRendererState {
             }
             *worker = Some(RendererWorker::start(self, backend, &mut state)?);
             log::debug!(
-                "audio renderer started: sample-rate={} samples={} pcm-buffers={BUFFER_COUNT}",
+                "audio renderer started: sample-rate={} samples={} min-pcm-buffers={MIN_BUFFER_COUNT}",
                 self.parameters.sample_rate,
                 self.parameters.samples
             );
@@ -437,14 +462,17 @@ mod tests {
         let backend = Backend::default();
         run(session.0.start(&backend)).unwrap();
         let feed = backend.feed.lock().unwrap().take().unwrap();
-        wait_until(|| session.0.update.take_blocking().frames == BUFFER_COUNT as u64);
+        wait_until(|| session.0.update.take_blocking().frames == MIN_BUFFER_COUNT as u64);
         assert!(session.0.event.is_signalled());
         // No host consumption: execution must stay bounded, not fabricate a
         // renderer frame counter from elapsed wall time.
         thread::sleep(BLOCK * 4);
-        assert_eq!(session.0.update.take_blocking().frames, BUFFER_COUNT as u64);
+        assert_eq!(
+            session.0.update.take_blocking().frames,
+            MIN_BUFFER_COUNT as u64
+        );
         feed.render(&mut [1; 480]);
-        wait_until(|| session.0.update.take_blocking().frames == BUFFER_COUNT as u64 + 1);
+        wait_until(|| session.0.update.take_blocking().frames == MIN_BUFFER_COUNT as u64 + 1);
         session.0.set_host_paused(true);
         let paused_frames = session.0.update.take_blocking().frames;
         feed.render(&mut [1; 480]);
@@ -452,7 +480,11 @@ mod tests {
         assert_eq!(session.0.update.take_blocking().frames, paused_frames);
         assert!(session.0.update.take_blocking().started);
         session.0.set_host_paused(false);
-        wait_until(|| session.0.update.take_blocking().frames > paused_frames);
+        wait_until(|| session.0.update.take_blocking().frames == paused_frames + 1);
+        // A 1024-frame callback drains the initial queue and raises its target
+        // to five blocks plus one of slack. Refill from this single wakeup.
+        feed.render(&mut [1; 1024 * 2]);
+        wait_until(|| session.0.update.take_blocking().frames == paused_frames + 1 + 6);
         session.0.set_host_paused(true);
         session.0.stop();
         assert_eq!(backend.live.load(Ordering::SeqCst), 0);

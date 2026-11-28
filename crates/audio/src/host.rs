@@ -268,13 +268,13 @@ unsafe extern "C" fn render(
     // alive until SDL_DestroyAudioStream has detached and stopped the callback.
     let callback = unsafe { &mut *userdata.cast::<Callback>() };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let frame_bytes = callback.feed.format().frame_bytes();
-        let mut samples = (additional.max(0) as usize).div_ceil(frame_bytes)
-            * callback.feed.format().layout.channels();
+        let format = callback.feed.format();
+        let frames = (additional.max(0) as usize).div_ceil(format.frame_bytes());
+        let mut samples = frames * format.layout.channels();
         while samples != 0 {
             let count = samples.min(callback.scratch.len());
             let pcm = &mut callback.scratch[..count];
-            callback.feed.render(pcm);
+            callback.feed.render_chunk(pcm, frames);
             // SAFETY: SDL copies this fully initialized S16 PCM before returning.
             // https://wiki.libsdl.org/SDL3/SDL_PutAudioStreamData
             if !unsafe {
@@ -567,6 +567,9 @@ mod tests {
                 eprintln!("SDL output={output_rate}Hz missing-frames={missing_frames}");
                 if output_rate == 48_000 {
                     assert_eq!(captured, expected, "48 kHz transport must be bit-exact");
+                    // The 2048-frame pull must size the producer queue for all
+                    // 2048 frames, even though scratch only holds 480 at a time.
+                    assert_eq!(output.streaming_queue_blocks(240).unwrap(), 10);
                 }
                 for (channel, expected_hz) in frequencies.into_iter().enumerate() {
                     // Interpolate positive-going zero crossings, excluding the
