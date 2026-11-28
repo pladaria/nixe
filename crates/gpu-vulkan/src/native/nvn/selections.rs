@@ -166,7 +166,7 @@ pub(super) struct Program {
     sampled: Option<Arc<nixe_nvn::SampledBindings>>,
     handles: Option<Arc<nixe_nvn::TextureHandles>>,
     driver_revision: Option<u64>,
-    driver_args: ([u32; 3], u32, u32),
+    driver_args: ([u32; 3], Option<u32>, u32),
     epoch: Epoch,
 }
 
@@ -197,7 +197,7 @@ enum Binding {
     Texture([u32; 2], bool),
     Image(u32, bool, nixe_shader_recompiler::types::ImageFormat, bool),
     Buffer(Range),
-    Driver(Arc<[u8]>),
+    Driver(Arc<[u8]>, bool),
     Texel(u32),
     PointerTable,
 }
@@ -238,7 +238,7 @@ impl NativeExecution<'_> {
         pipeline: &shader::Program,
         bindings: &Bindings,
         descriptors: &shader::Descriptors,
-        args: ([u32; 3], u32, u32),
+        args: ([u32; 3], Option<u32>, u32),
     ) -> Result<(), VulkanError> {
         let epoch = (
             self.residency.device_memory().generation(),
@@ -354,13 +354,13 @@ impl NativeExecution<'_> {
                         .buffers
                         .push_block(block as usize)
                         .unwrap_or_else(|| ZERO.get_or_init(|| Arc::new([0; 256])));
-                    if matches!(previous, Some(Binding::Driver(old)) if std::ptr::eq(old.as_ptr(), bytes.as_ptr()))
+                    if matches!(previous, Some(Binding::Driver(old, false)) if std::ptr::eq(old.as_ptr(), bytes.as_ptr()))
                     {
                         continue;
                     }
                     let bytes: Arc<[u8]> = bytes.clone();
                     (
-                        Binding::Driver(bytes.clone()),
+                        Binding::Driver(bytes.clone(), false),
                         HostBinding::UniformBytes(bytes),
                     )
                 }
@@ -371,21 +371,28 @@ impl NativeExecution<'_> {
                     } else {
                         None
                     };
-                    let binding = self.state.nvn.driver_banks.select(
+                    let bytes = self.state.nvn.driver_banks.select(
                         (stage, bank, selected.owner, compute),
                         size,
                         bindings,
                         groups,
-                        first_instance,
+                        first_instance.unwrap_or_default(),
                         samples,
                     );
-                    let HostBinding::UniformBytes(bytes) = &binding else {
-                        unreachable!()
-                    };
-                    if matches!(previous, Some(Binding::Driver(old)) if Arc::ptr_eq(old, bytes)) {
+                    let offset = shader::DRIVER_BASE_INSTANCE_OFFSET;
+                    let indirect =
+                        first_instance.is_none() && bank == 0 && size >= offset + size_of::<u32>();
+                    if matches!(previous, Some(Binding::Driver(old, was_indirect)) if *was_indirect == indirect && Arc::ptr_eq(old, &bytes))
+                    {
                         continue;
                     }
-                    (Binding::Driver(bytes.clone()), binding)
+                    let key = Binding::Driver(bytes.clone(), indirect);
+                    let binding = if indirect {
+                        HostBinding::UniformBytesWithIndirectInstance { bytes, offset }
+                    } else {
+                        HostBinding::UniformBytes(bytes)
+                    };
+                    (key, binding)
                 }
                 shader::Input::Image {
                     stage,

@@ -1081,6 +1081,17 @@ impl CommandState {
                     pipeline.primitive_restart = primitive_restart;
                     pipeline.shapes = shapes.clone();
                 }
+                let indirect = (op == op::INDEXED_INDIRECT).then_some(w[2]);
+                let (first, count, first_instance, instances) = if indirect.is_some() {
+                    (0, 0, 0, 0)
+                } else {
+                    (
+                        (w[0] >> 32) as u32,
+                        w[1] as u32,
+                        w[n - 1] as u32,
+                        (w[n - 1] >> 32) as u32,
+                    )
+                };
                 return Ok(Some(Operation::Draw(Draw {
                     pipeline: &self.pipeline,
                     attachments: &self.attachments,
@@ -1094,13 +1105,12 @@ impl CommandState {
                         op::INDEXED_INDIRECT => Some(((w[0] >> 32) as u32, w[1], 0)),
                         _ => None,
                     },
-                    indirect: (op == op::INDEXED_INDIRECT).then_some(w[2]),
+                    indirect,
                     vertices: &self.vertices,
-
-                    first: (w[0] >> 32) as u32,
-                    count: w[1] as u32,
-                    first_instance: w[n - 1] as u32,
-                    instances: (w[n - 1] >> 32) as u32,
+                    first,
+                    count,
+                    first_instance,
+                    instances,
                 })));
             }
             _ => {
@@ -1207,6 +1217,48 @@ mod tests {
         };
         assert_eq!(values(&first), [1, 2]);
         assert_eq!(values(&second), [3, 2]);
+    }
+
+    #[test]
+    fn indexed_indirect_draw_separates_argument_address_from_immediate_fields() {
+        let mut state = CommandState::new(&Submission::default());
+        let bindings = bindings::CapturedBindings::default();
+        let indices = 0x1c_0012_8000;
+        let arguments = 0x1c_28b0_ba50;
+        let indirect_args = [5 | (1 << 32), indices, arguments];
+        let Some(Operation::Draw(draw)) = state
+            .apply(Record {
+                tag: op::INDEXED_INDIRECT,
+                args: &indirect_args,
+                bindings: Some(&bindings),
+            })
+            .unwrap()
+        else {
+            panic!("expected indexed indirect draw");
+        };
+        assert_eq!(draw.indices, Some((1, indices, 0)));
+        assert_eq!(draw.indirect, Some(arguments));
+        assert_eq!(
+            (draw.first, draw.count, draw.first_instance, draw.instances),
+            (0, 0, 0, 0)
+        );
+
+        let direct_args = [5 | (1 << 32), 6, indices, (2 << 32) | 17];
+        let Some(Operation::Draw(draw)) = state
+            .apply(Record {
+                tag: op::INDEXED,
+                args: &direct_args,
+                bindings: Some(&bindings),
+            })
+            .unwrap()
+        else {
+            panic!("expected indexed draw");
+        };
+        assert_eq!(draw.indirect, None);
+        assert_eq!(
+            (draw.count, draw.first_instance, draw.instances),
+            (6, 17, 2)
+        );
     }
 
     #[test]

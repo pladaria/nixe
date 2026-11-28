@@ -82,6 +82,102 @@ fn shader_stage(stage: nixe_gpu::ShaderStage) -> vk::PipelineStageFlags2 {
         ShaderStage::Compute => vk::PipelineStageFlags2::COMPUTE_SHADER,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixe_memory::{AllocationRange, Machine, PAGE_SIZE, device_memory::DeviceMemory};
+
+    mod support {
+        use crate as nixe_gpu_vulkan;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/device.rs"
+        ));
+    }
+
+    #[test]
+    fn indirect_instance_uniform_reads_each_gpu_produced_argument_version()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Some(device) = support::device_for_test(crate::ApiPreference::Auto) else {
+            return Ok(());
+        };
+        let validation = device.validation_monitor();
+        let machine = Machine::new(16 << 20)?;
+        let allocation = machine.account(4 << 20)?.allocate(2 * PAGE_SIZE)?;
+        let memory = DeviceMemory::new(machine, 32);
+        let address = 0x10000;
+        let _mapping = memory.map(
+            address,
+            Arc::from([AllocationRange::new(allocation.pin(), 0, 2 * PAGE_SIZE)?]),
+            true,
+        )?;
+        let mut cache =
+            VulkanResidency::new(memory, device, 64 << 20, BufferDownloadPolicy::OnRead)?;
+        let mut r = cache.access();
+        let size = size_of::<vk::DrawIndexedIndirectCommand>() as u64;
+        let args = r.device_buffer(
+            address + 32,
+            size,
+            vk::BufferUsageFlags::INDIRECT_BUFFER,
+            false,
+            false,
+        )?;
+        let template = [0x5a; 0x650];
+        let output = r.device_buffer(
+            address + PAGE_SIZE,
+            2 * template.len() as u64,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            false,
+            false,
+        )?;
+        let draw = Draw::Indirect {
+            buffer: args.buffer,
+            offset: args.offset,
+            count: 1,
+            stride: size as u32,
+            indexed: true,
+        };
+        r.write_buffer(
+            args.buffer,
+            args.offset,
+            bytemuck::cast_slice(&[6u32, 1, 0, 0, 0]),
+        )?;
+        let first_instance = std::mem::offset_of!(vk::DrawIndexedIndirectCommand, first_instance);
+        let field = 0x644;
+        let values = [37u32, 4097];
+        let mut joined = Vec::new();
+        for (index, value) in values.into_iter().enumerate() {
+            r.fill_buffer(args.buffer, args.offset + first_instance as u64, 4, value)?;
+            let slice = r.stream_indirect_instance_uniform(&template, field, Some(draw))?;
+            let offset = output.offset + (index * template.len()) as u64;
+            let target = r.use_buffer(output.buffer, offset, slice.size)?;
+            unsafe {
+                r.runtime.device.dispatch.cmd_copy_buffer(
+                    slice.buffer,
+                    target,
+                    &[vk::BufferCopy::default()
+                        .src_offset(slice.offset)
+                        .dst_offset(offset)
+                        .size(slice.size)],
+                    true,
+                );
+            }
+            r.finish_buffer_write(output.buffer, offset, slice.size)?;
+            let mut expected = template;
+            expected[field..field + 4].copy_from_slice(&value.to_le_bytes());
+            joined.extend_from_slice(&expected);
+        }
+        assert_eq!(
+            r.read_buffer(output.buffer, output.offset, output.size)?,
+            joined
+        );
+        drop(r);
+        drop(cache);
+        validation.check()?;
+        Ok(())
+    }
+}
 /// Host utility inputs retain their actual native allocation. Compact cache
 /// IDs select coherence metadata; native identity prevents reuse from accepting
 /// an unrelated resource after explicit retirement or an overlapping merge.
@@ -100,6 +196,11 @@ pub struct HostImage {
 pub enum HostBinding {
     /// Immutable host constants streamed when the command is recorded.
     UniformBytes(Arc<[u8]>),
+    /// Host constants with the base instance supplied by one indexed indirect draw.
+    UniformBytesWithIndirectInstance {
+        bytes: Arc<[u8]>,
+        offset: usize,
+    },
     NullBuffer,
     PointerTable(Arc<super::pointer_table::PointerTableBinding>),
     TexelBuffer {
@@ -233,6 +334,7 @@ impl Residency<'_> {
             }
             HostBinding::NullBuffer
             | HostBinding::UniformBytes(_)
+            | HostBinding::UniformBytesWithIndirectInstance { .. }
             | HostBinding::Sampler(_)
             | HostBinding::PointerTable(_) => None,
         }
@@ -243,7 +345,9 @@ impl Residency<'_> {
         index: usize,
     ) -> Result<DescriptorResource, VulkanError> {
         let mut resource = match &program.bindings[index] {
-            HostBinding::NullBuffer | HostBinding::UniformBytes(_) => {
+            HostBinding::NullBuffer
+            | HostBinding::UniformBytes(_)
+            | HostBinding::UniformBytesWithIndirectInstance { .. } => {
                 DescriptorResource::NullBuffer
             }
             HostBinding::Buffer {
@@ -425,7 +529,11 @@ impl Residency<'_> {
         stats.descriptor_payload_captures += 1;
         Ok(data)
     }
-    fn stream_graphics(&mut self, program: &HostProgram) -> Result<DescriptorQueue, VulkanError> {
+    fn stream_graphics(
+        &mut self,
+        program: &HostProgram,
+        draw: Option<Draw>,
+    ) -> Result<DescriptorQueue, VulkanError> {
         self.runtime.streamed_uses.clear();
         if program.bindings.is_empty() || program.pipeline.layout.uniform_bindings.is_empty() {
             // Host descriptors and layouts without uniforms need no per-use
@@ -529,6 +637,10 @@ impl Residency<'_> {
                         *kept = Some((bytes.clone(), tick, slice));
                         slice
                     };
+                    (None, 0, bytes.len() as u64, Some(slice))
+                }
+                HostBinding::UniformBytesWithIndirectInstance { bytes, offset } => {
+                    let slice = self.stream_indirect_instance_uniform(bytes, *offset, draw)?;
                     (None, 0, bytes.len() as u64, Some(slice))
                 }
                 HostBinding::NullBuffer => (None, 0, 0, None),
@@ -921,7 +1033,7 @@ impl Residency<'_> {
                 return Ok(self.runtime.device.current_work());
             }
         }
-        let streams = self.stream_graphics(program)?;
+        let streams = self.stream_graphics(program, None)?;
         self.host_program_access(program, images_prepared)?;
         let indirect = match dispatch {
             Dispatch::Indirect { buffer, offset } => {
@@ -981,5 +1093,56 @@ impl Residency<'_> {
         }
         self.ensure_buffer_range(buffer, offset, size)?;
         self.use_buffer(buffer, offset, size)
+    }
+
+    fn stream_indirect_instance_uniform(
+        &mut self,
+        bytes: &[u8],
+        offset: usize,
+        draw: Option<Draw>,
+    ) -> Result<crate::queue::Slice, VulkanError> {
+        let Some(Draw::Indirect {
+            buffer,
+            offset: arguments,
+            count: 1,
+            indexed: true,
+            ..
+        }) = draw
+        else {
+            return Err(VulkanError::InvalidResource(
+                "indirect instance uniform requires one indexed indirect draw",
+            ));
+        };
+        let instance_offset = std::mem::offset_of!(vk::DrawIndexedIndirectCommand, first_instance);
+        let field_size = size_of::<u32>() as u64;
+        self.runtime.device.end_rendering()?;
+        let source = self.indirect_buffer(
+            buffer,
+            arguments,
+            size_of::<vk::DrawIndexedIndirectCommand>() as u64,
+        )?;
+        self.runtime.barriers.emit(&mut self.runtime.device)?;
+        let device = &mut self.runtime.device;
+        let alignment = device.profile().limits.min_uniform_buffer_offset_alignment;
+        // Each draw gets a new slice. Its arguments may be produced on the GPU
+        // or overwritten by an intervening command at the same address.
+        let slice = device
+            .submission
+            .reserve_upload_aligned(bytes, alignment.max(4))?;
+        unsafe {
+            device.dispatch.cmd_copy_buffer(
+                source,
+                slice.buffer,
+                &[vk::BufferCopy::default()
+                    .src_offset(arguments + instance_offset as u64)
+                    .dst_offset(slice.offset + offset as u64)
+                    .size(field_size)],
+                true,
+            );
+        }
+        self.runtime.statistics.cpu_streamed_bytes += bytes.len() as u64;
+        self.runtime.statistics.gpu_copied_bytes += field_size;
+        self.runtime.statistics.uniform_uploads += 1;
+        Ok(slice)
     }
 }

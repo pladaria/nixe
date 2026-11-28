@@ -888,7 +888,7 @@ impl Residency<'_> {
                     update: None,
                 }
             } else {
-                let descriptors = self.stream_graphics(program)?;
+                let descriptors = self.stream_graphics(program, Some(draw))?;
                 self.host_program_access(program, images_prepared)?;
                 descriptors
             };

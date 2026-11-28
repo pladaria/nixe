@@ -76,6 +76,15 @@ impl Compiler {
         let mut host = host.clone();
         host.apply_descriptor_limit_policy();
         let stage = env.metadata().stage;
+        let native_compute =
+            stage == Stage::Compute && env.metadata().isa == crate::environment::ShaderIsa::Ampere;
+        if native_compute {
+            // The native decoder accepts only full-workgroup BAR.SYNC.
+            // Its valid dynamic instances synchronize the same workgroup
+            // even inside structured branches and loops.
+            // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar
+            host.support_conditional_barrier = true;
+        }
         let syntax = match env.metadata().isa {
             crate::environment::ShaderIsa::Maxwell => {
                 let entry = Location::new(env.metadata().entry_address()?)?;
@@ -148,6 +157,9 @@ impl Compiler {
             passes::rescaling(&mut self.ir, &p, &settings.resolution_info)?;
         }
         passes::dead_code_elimination(&mut self.ir, &p)?;
+        if native_compute {
+            passes::preserve_workgroup_shared_order(&mut self.ir, &p)?;
+        }
         passes::compact_storage(&mut self.ir, &mut p)?;
         passes::tighten_output_vertices(&self.ir, &mut p)?;
         if settings.renderer_debug {

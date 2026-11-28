@@ -81,6 +81,73 @@ fn environment(stage: Stage) -> SnapshotEnvironment {
 }
 
 #[test]
+fn ampere_workgroup_barrier_survives_a_uniform_branch() {
+    use nixe_shader_recompiler::environment::ShaderIsa;
+    let pt = 7u128 << 12;
+    let control_pt = 7u128 << 87;
+    let words = [
+        pt | 0x919 | 37u128 << 72,                           // S2R R0, SR_CTAID.X
+        pt | 0x80c | control_pt | 7u128 << 84 | 5u128 << 76, // ISETP.NE P0, PT, R0, 0, PT
+        0x947 | control_pt | 16u128 << 32,                   // @P0 BRA past the barrier
+        pt | 0xb1d,                                          // BAR.SYNC 0
+        pt | control_pt | 0x94d,                             // EXIT
+    ];
+    let instructions = words
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, word)| {
+            let pc = i as u32 * 16;
+            [
+                (ProgramOffset(pc), word as u64),
+                (ProgramOffset(pc + 8), (word >> 64) as u64),
+            ]
+        })
+        .collect();
+    let mut env = SnapshotEnvironment::new(
+        EnvironmentMetadata {
+            isa: ShaderIsa::Ampere,
+            stage: Stage::Compute,
+            workgroup_size: [64, 1, 1],
+            ..Default::default()
+        },
+        Observations {
+            instructions,
+            ..Default::default()
+        },
+    );
+    let mut compiler = Compiler::new().unwrap();
+    let settings = CompilerSettings::default();
+    let id = compiler
+        .translate(&mut env, &HostTranslateInfo::default(), &settings)
+        .unwrap();
+    assert!(
+        compiler
+            .program(id)
+            .unwrap()
+            .syntax
+            .iter()
+            .any(|node| matches!(node, N::If { .. }))
+    );
+    let artifact = compiler
+        .emit(
+            id,
+            &profile(),
+            &RuntimeInfo::default(),
+            &settings,
+            &mut Bindings::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        operations(&artifact.words)
+            .iter()
+            .filter(|(op, _)| *op == Op::ControlBarrier)
+            .count(),
+        1
+    );
+    validate(&artifact, "ampere-uniform-workgroup-barrier");
+}
+
+#[test]
 fn consecutive_stages_observe_their_own_texture_handles() {
     use nixe_shader_recompiler::{
         environment::{HandleKey, RecordingEnvironment},

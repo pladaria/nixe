@@ -734,7 +734,11 @@ impl NativeExecution<'_> {
                 &pipeline,
                 &d.bindings,
                 &descriptors,
-                ([0; 3], d.first_instance, d.samples),
+                (
+                    [0; 3],
+                    d.indirect.is_none().then_some(d.first_instance),
+                    d.samples,
+                ),
             )?;
             for &(slot, r) in d.vertices.iter() {
                 if pipeline.vertex_buffer_mask.checked_shr(slot).unwrap_or(0) & 1 == 0 {
@@ -897,7 +901,7 @@ impl NativeExecution<'_> {
                 self.residency.device_memory().generation(),
                 self.residency.texture_cache.binding_revision,
             );
-            self.nvn_bindings(selected, &pipeline, b, &descriptors, (groups, 0, 1))?;
+            self.nvn_bindings(selected, &pipeline, b, &descriptors, (groups, Some(0), 1))?;
             if epoch
                 != (
                     self.residency.device_memory().generation(),

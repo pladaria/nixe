@@ -1017,6 +1017,8 @@ pub(super) fn compute(
 
 // Driver constant banks are indexed by the compiled shader, independent of the
 // public uniform slots. Addresses here are guest GPU addresses.
+pub(super) const DRIVER_BASE_INSTANCE_OFFSET: usize = 0x644;
+
 #[derive(Default)]
 pub(super) struct DriverBanks([[Option<DriverBank>; 2]; 6]);
 enum DriverSource {
@@ -1040,7 +1042,7 @@ impl DriverBanks {
         groups: [u32; 3],
         first_instance: u32,
         samples: u32,
-    ) -> HostBinding {
+    ) -> Arc<[u8]> {
         let slot = &mut self.0[stage as usize][usize::from(bank == 2)];
         let revision = b.buffers.driver_revision();
         if let Some(p) = slot.as_ref()
@@ -1061,7 +1063,7 @@ impl DriverBanks {
                     && p.samples == samples
             }
         {
-            return HostBinding::UniformBytes(p.bytes.clone());
+            return p.bytes.clone();
         }
         let bytes = if let Some(layout) = compute {
             compute_uniform(layout, b, size)
@@ -1080,7 +1082,7 @@ impl DriverBanks {
             samples,
             bytes: bytes.clone(),
         });
-        HostBinding::UniformBytes(bytes)
+        bytes
     }
 }
 
@@ -1166,7 +1168,8 @@ fn driver_uniform(
         }
         if stage != 5 {
             words[0x610 / 4] = 2047f32.to_bits();
-            words[0x644 / 4] = first_instance;
+            // https://github.com/seedds/nxnative/blob/a3663659342ef43afe1f29909c7c36d0cf7555be/dm/gfx/nvn/dmsh_abi.h#L98
+            words[DRIVER_BASE_INSTANCE_OFFSET / 4] = first_instance;
             // Vulkan standard sample locations, packed as two unsigned 4-bit coordinates.
             let positions: &[u8] = match samples {
                 0 | 1 => &[0x88],

@@ -8,6 +8,7 @@ pub use info::collect_shader_info;
 mod indirect_storage;
 mod lowering;
 mod lowering_tables;
+mod shared_order;
 mod ssa;
 mod storage;
 mod storage_extent;
@@ -21,6 +22,7 @@ pub use fold::constant_propagation;
 pub use cleanup::{dead_code_elimination, position, remove_identities, verify_program};
 
 pub use lowering::{lower_fp16, lower_fp64, lower_int64};
+pub(crate) use shared_order::preserve_workgroup_shared_order;
 pub use ssa::rewrite_ssa;
 
 use crate::{

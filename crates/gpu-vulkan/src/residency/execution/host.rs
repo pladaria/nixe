@@ -6,6 +6,16 @@ impl HostBinding {
         match (self, other) {
             (Self::NullBuffer, Self::NullBuffer) => true,
             (Self::UniformBytes(a), Self::UniformBytes(b)) => Arc::ptr_eq(a, b),
+            (
+                Self::UniformBytesWithIndirectInstance {
+                    bytes: a,
+                    offset: x,
+                },
+                Self::UniformBytesWithIndirectInstance {
+                    bytes: b,
+                    offset: y,
+                },
+            ) => x == y && Arc::ptr_eq(a, b),
             (Self::PointerTable(a), Self::PointerTable(b)) => Arc::ptr_eq(a, b),
             (
                 Self::Buffer {
@@ -123,9 +133,12 @@ impl Residency<'_> {
                             .sampler(sampler.handle)
                             .image_layout(vk::ImageLayout::GENERAL),
                     },
-                    HostBinding::UniformBytes(_) => crate::cache::DescriptorEntry {
-                        buffer: Default::default(),
-                    },
+                    HostBinding::UniformBytes(_)
+                    | HostBinding::UniformBytesWithIndirectInstance { .. } => {
+                        crate::cache::DescriptorEntry {
+                            buffer: Default::default(),
+                        }
+                    }
                     HostBinding::TexelBuffer {
                         buffer,
                         offset,
@@ -290,7 +303,8 @@ impl Residency<'_> {
         binding: &HostBinding,
     ) -> Result<(), VulkanError> {
         match binding {
-            HostBinding::UniformBytes(bytes) => {
+            HostBinding::UniformBytes(bytes)
+            | HostBinding::UniformBytesWithIndirectInstance { bytes, .. } => {
                 if !matches!(
                     kind,
                     vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
@@ -299,6 +313,16 @@ impl Residency<'_> {
                 {
                     return Err(VulkanError::InvalidResource(
                         "invalid inline uniform binding",
+                    ));
+                }
+                if let HostBinding::UniformBytesWithIndirectInstance { offset, .. } = binding
+                    && (!offset.is_multiple_of(4)
+                        || bytes
+                            .get(*offset..)
+                            .is_none_or(|tail| tail.len() < size_of::<u32>()))
+                {
+                    return Err(VulkanError::InvalidResource(
+                        "indirect instance field exceeds uniform binding",
                     ));
                 }
             }
